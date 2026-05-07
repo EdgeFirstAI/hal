@@ -1801,10 +1801,12 @@ mod decoder_tests {
         assert_eq!(output_boxes.len(), output_masks.len());
 
         for (b, m) in output_boxes.iter().zip(&output_masks) {
+            // Mask region is the proto-grid-aligned crop (floor for min,
+            // ceil for max), so it encloses the post-NMS bbox (EDGEAI-1304).
             assert!(b.bbox.xmin >= m.xmin);
             assert!(b.bbox.ymin >= m.ymin);
-            assert!(b.bbox.xmax >= m.xmax);
-            assert!(b.bbox.ymax >= m.ymax);
+            assert!(b.bbox.xmax <= m.xmax);
+            assert!(b.bbox.ymax <= m.ymax);
         }
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {

@@ -113,7 +113,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are now bit-identical to those `Decoder::decode_proto()` produces
   for the same input. Previously, `decode()` snapped every coordinate
   to a `1/160` grid, producing bit-identical duplicates on cluttered
-  scenes and corrupting same-class IoU evaluation (EDGEAI-1304).
+  scenes and corrupting same-class IoU evaluation (EDGEAI-1304). The
+  accompanying `Segmentation` bounds (`xmin/ymin/xmax/ymax`) now
+  describe the proto-grid-aligned crop region of the returned mask
+  tensor, so the bbox and the mask region are independently
+  consistent with their respective data.
+- HAL decoder now honours `Detection::normalized: false`. When the
+  schema declares pixel-space boxes and the model input dimensions
+  are known (extracted from `inputs[0]` in v2 schemas), the decoder
+  divides bbox channels by `(W, H)` before NMS so `protobox` and
+  IoU semantics see normalized coords. Vanilla Ultralytics ONNX
+  exports no longer require an in-graph `Mul([1/W, ...])` workaround
+  (EDGEAI-1303). The `protobox` rejection message has been updated
+  to point users at `Detection::normalized = false` as the fix when
+  the schema lacks the model input spec.
 
 ## [0.19.0] - 2026-05-05
 

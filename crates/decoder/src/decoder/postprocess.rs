@@ -263,6 +263,8 @@ impl Decoder {
                     self.nms,
                     self.pre_nms_top_k,
                     self.max_det,
+                    self.normalized,
+                    self.input_dims,
                     output_boxes,
                     output_masks,
                 )
@@ -672,6 +674,8 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
             output_masks,
         )
@@ -1154,6 +1158,8 @@ impl Decoder {
                     self.nms,
                     self.pre_nms_top_k,
                     self.max_det,
+                    self.normalized,
+                    self.input_dims,
                     output_boxes,
                 )
             })
@@ -1188,6 +1194,8 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
         ))
     }
