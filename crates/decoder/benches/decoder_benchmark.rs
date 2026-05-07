@@ -97,8 +97,9 @@ fn bench_quant_nms(suite: &mut BenchSuite) {
 
     let result = run_bench("decoder/quant/nms", WARMUP, ITERATIONS, || {
         let boxes = boxes.clone();
-        let boxes = nms_int(iou_threshold, boxes);
-        let len = output_boxes.capacity().min(boxes.len());
+        let cap = output_boxes.capacity();
+        let boxes = nms_int(iou_threshold, (cap > 0).then_some(cap), boxes);
+        let len = cap.min(boxes.len());
         output_boxes.clear();
         for b in boxes.iter().take(len) {
             output_boxes.push(dequant_detect_box(b, quant));
@@ -276,8 +277,9 @@ fn bench_f32_nms(suite: &mut BenchSuite) {
     let result = run_bench("decoder/f32/nms", WARMUP, ITERATIONS, || {
         let boxes = boxes.clone();
         let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        let boxes = nms_float(iou_threshold, boxes);
-        let len = output_boxes.capacity().min(boxes.len());
+        let cap = output_boxes.capacity();
+        let boxes = nms_float(iou_threshold, (cap > 0).then_some(cap), boxes);
+        let len = cap.min(boxes.len());
         output_boxes.clear();
         for b in boxes.into_iter().take(len) {
             output_boxes.push(b);

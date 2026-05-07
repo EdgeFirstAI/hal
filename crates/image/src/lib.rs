@@ -357,7 +357,7 @@ use edgefirst_tensor::{
 use enum_dispatch::enum_dispatch;
 use std::{fmt::Display, time::Instant};
 use zune_jpeg::{
-    zune_core::{colorspace::ColorSpace, options::DecoderOptions},
+    zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions},
     JpegDecoder,
 };
 use zune_png::PngDecoder;
@@ -2332,7 +2332,7 @@ fn load_jpeg(
         None => ColorSpace::RGB,
     };
     let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
-    let mut decoder = JpegDecoder::new_with_options(image, options);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(image), options);
     decoder.decode_headers()?;
 
     let image_info = decoder.info().ok_or(Error::Internal(
@@ -2340,7 +2340,7 @@ fn load_jpeg(
     ))?;
 
     let converted_cs = decoder
-        .get_output_colorspace()
+        .output_colorspace()
         .ok_or(Error::Internal("No output colorspace".to_string()))?;
 
     let converted_fmt = colorspace_to_pixelfmt(converted_cs).ok_or(Error::NotSupported(
@@ -2432,12 +2432,12 @@ fn load_png(
     let options = DecoderOptions::default()
         .png_set_add_alpha_channel(false)
         .png_set_decode_animated(false);
-    let mut decoder = PngDecoder::new_with_options(image, options);
+    let mut decoder = PngDecoder::new_with_options(ZCursor::new(image), options);
     decoder.decode_headers()?;
 
     let (width, height, rotation, flip) = {
         let info = decoder
-            .get_info()
+            .info()
             .ok_or_else(|| Error::Internal("PNG did not return decoded image info".to_string()))?;
         let (rot, flip) = info
             .exif
@@ -2451,7 +2451,7 @@ fn load_png(
     // converter understands. LumaA has no direct PixelFormat variant so we
     // decode as LumaA and then strip alpha inline to get Grey.
     let decoder_cs = decoder
-        .get_colorspace()
+        .colorspace()
         .ok_or_else(|| Error::Internal("PNG decoder did not return colorspace".to_string()))?;
     let (decoded_fmt, strip_luma_alpha) = match decoder_cs {
         ColorSpace::Luma => (PixelFormat::Grey, false),

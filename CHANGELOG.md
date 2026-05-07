@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-05-07
+
+### Breaking Changes
+
+- The eight public NMS functions in `crate::float` and `crate::byte`
+  (`nms_float`, `nms_extra_float`, `nms_class_aware_float`,
+  `nms_extra_class_aware_float`, `nms_int`, `nms_extra_int`,
+  `nms_class_aware_int`, `nms_extra_class_aware_int`) gained a
+  `max_det: Option<usize>` parameter immediately after `iou`. Pass
+  `None` to preserve pre-0.20.1 behaviour (full O(N²) suppression).
+  Pass `Some(n)` to early-terminate the greedy loop after `n` survivors
+  are confirmed; survivors are guaranteed to match the top-`n`-by-score
+  result of full NMS because the sorted input puts higher scores first.
+  All in-tree `Decoder` paths and the `decode_yolo_*` wrappers thread
+  the post-NMS cap through automatically; the breaking change only
+  affects callers that import these functions directly.
+
+### Changed
+
+- `Decoder::decode` / `decode_proto` / `decode_yolo_*` now skip the
+  full O(N²) NMS suppression once `max_det` survivors are confirmed.
+  No mAP impact (early-term survivors are identical to the top-`max_det`
+  of full NMS), measurable latency win on dense scenes (large
+  pre-NMS candidate sets).
+
+- Workspace dependency refresh. No public API changes.
+  - `ndarray` 0.16.1 → 0.17.2 (new `ArrayRef`/`LayoutRef`/`RawRef`
+    types available; existing concrete `Array{1..4}` / `ArrayView*`
+    usage unchanged).
+  - `ndarray-stats` 0.6.0 → 0.7.0 (tracks ndarray 0.17).
+  - `pyo3` / `pyo3-build-config` 0.26 → 0.28.3, `numpy` 0.26 → 0.28.0,
+    `pythonize` 0.26 → 0.28.0. Forced by ndarray bump (numpy 0.28 is
+    the first release supporting ndarray 0.17). Build emits 21
+    deprecation warnings for downstream cleanup
+    (`#[pyclass(from_py_object)]` opt-in, `Bound::cast` over
+    `downcast`, `Bound::from_owned_ptr_or_err` over
+    `Py::from_owned_ptr_or_err`); none affect runtime behaviour.
+  - `nalgebra` 0.32.6 → 0.34.2. `Allocator<R, U8, U8>` /
+    `Allocator<R, U8>` trait bounds in `tracker::kalman` migrated
+    to the 2-generic form (`Allocator<U8, U8>` / `Allocator<U8>`)
+    after the Scalar generic was removed in nalgebra 0.33.
+  - `nix` 0.30.1 → 0.31.2.
+  - `opencv` 0.95 → 0.98.2.
+  - `safetensors` 0.4 → 0.7.0 (already pinned to 0.7 in
+    `crates/decoder`; workspace alignment).
+  - `fast_image_resize` 5.5.0 → 6.0.0.
+  - `image-compare` 0.4.2 → 0.5.0.
+  - `jpeg-encoder` 0.6.1 → 0.7.0.
+  - `lapjv` 0.2.1 → 0.3.0.
+  - `yuv` 0.8.12 → 0.8.14.
+  - `zune-jpeg` 0.4.21 → 0.5.15, `zune-png` 0.4.10 → 0.5.2,
+    `zune-core` 0.4 → 0.5. JPEG/PNG load paths in
+    `crates/image/src/lib.rs` migrated to wrap the input slice in
+    `ZCursor::new(...)` (the new `ZByteReaderTrait` no longer impls
+    on `&[u8]` directly) and drop the `get_` prefix on
+    `output_colorspace` / `info` / `colorspace` accessors.
+  - `cargo update` lock refresh: `rayon` 1.11→1.12, `tokio` 1.50→1.52,
+    `uuid` 1.22→1.23, plus assorted patch bumps.
+
+### Deferred
+
+- `libloading` 0.8 → 0.9: blocked by `khronos-egl 6.0.0` pinning
+  `libloading ^0.8`. Will revisit when khronos-egl ships a release
+  that supports libloading 0.9.
+- `ctor` 0.4 → 1.0.x: 1.0 was tagged 4 days before this release after
+  hopping through 0.5–0.13 in the prior week. Holding off until the
+  surface stabilises.
+
 ## [0.20.0] - 2026-05-06
 
 ### Breaking Changes
