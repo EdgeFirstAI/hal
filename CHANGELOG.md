@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DecoderBuilder::with_input_dims(width, height)` setter, plus
+  `Decoder::input_dims()` accessor, mirroring the existing
+  `with_*` / `*_boxes()` pair for the `normalized` flag. Lets
+  callers building from `add_output(...)` (programmatic) or
+  config files without an `input` block opt into EDGEAI-1303
+  normalization without rewriting their schema. Schema-derived
+  dims are still picked up automatically; the explicit setter
+  takes precedence so callers can correct misdeclared schemas.
+  Mirrored in the Python and C bindings:
+  - Python: every `PyDecoder` constructor (`__init__`,
+    `Decoder.from_outputs`, `Decoder.from_json_str`,
+    `Decoder.from_yaml_str`) gained an `input_dims=None` keyword
+    argument; `Decoder.input_dims` is exposed as a read-only
+    property next to `Decoder.normalized_boxes`.
+  - C: `hal_decoder_params_set_input_dims(params, width, height)`
+    and `hal_decoder_input_dims(decoder, *width, *height)` for
+    the setter and accessor respectively.
 - New `per_scale` decoder subsystem for schema-v2 per-scale models.
   Supports DFL (yolov8 / yolo11) and LTRB (yolo26) box encodings, all
   combinations of i8/u8/i16/u16/f16/f32 inputs and f32/f16 outputs.
@@ -172,6 +189,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from "schema declares normalized incorrectly" so the recommended
   fix is actionable. See **Breaking Changes** above for the
   in-graph-workaround migration note.
+
+### Known Limitations
+
+- **`max_boxes` / `max_det` API surface is inconsistent across
+  language bindings** and will need a unified pass before the next
+  minor release. The current state per language:
+  - **Rust** (`Decoder::decode` / `Decoder::decode_proto`): bounded
+    only by `Decoder::max_det` (default 300, set on the builder via
+    `with_max_det`). Per-call override on the `Decoder` struct field
+    is also supported.
+  - **Python** (`PyDecoder.decode` / `PyDecoder.decode_proto`):
+    accepts a per-call `max_boxes=100` kwarg that **post-truncates**
+    after Rust has already capped at `Decoder.max_det`. The smaller
+    of the two wins; users get a per-call knob.
+  - **C** (`hal_decoder_decode` / `hal_decoder_decode_proto`): no
+    per-call cap and no setter for `max_det` either — the C ABI
+    silently uses the Rust-side default of 300, with no way for a
+    C caller to change it.
+
+  To make this consistent before 0.21.0:
+  1. Add `hal_decoder_params_set_max_det(params, max_det)` and
+     `hal_decoder_params_set_pre_nms_top_k(params, k)` to the C
+     params struct so the build-time setting is reachable from C.
+  2. Optionally add a `max_boxes` parameter to `hal_decoder_decode`
+     and `hal_decoder_decode_proto` for per-call truncation, matching
+     the Python ergonomic. Two design choices — change the existing
+     entry-point signatures (breaking the C ABI) or add
+     `*_with_max_boxes` variants and deprecate the old ones.
+     Recommend the variant approach for safety.
+  3. Audit Python so `max_boxes=None` (rather than the current
+     `max_boxes=100`) is the documented "use Decoder.max_det"
+     sentinel, and the default behaviour matches Rust + (post-#1) C.
+  4. Update CHANGELOG and the tutorials.
 
 ## [0.19.0] - 2026-05-05
 

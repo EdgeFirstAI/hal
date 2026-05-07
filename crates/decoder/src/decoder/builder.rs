@@ -63,6 +63,11 @@ pub struct DecoderBuilder {
     decode_dtype: DecodeDtype,
     pre_nms_top_k: usize,
     max_det: usize,
+    /// Explicit override for the model input dimensions `(width, height)`,
+    /// consumed by EDGEAI-1303 normalization. When set, takes precedence
+    /// over schema-derived dims; when `None`, the value is read from the
+    /// schema's `input.shape` / `input.dshape` at build time.
+    input_dims: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +111,7 @@ impl Default for DecoderBuilder {
             decode_dtype: DecodeDtype::F32,
             pre_nms_top_k: 300,
             max_det: 300,
+            input_dims: None,
         }
     }
 }
@@ -885,6 +891,36 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the model input dimensions `(width, height)` consumed by the
+    /// EDGEAI-1303 normalization path. Use this when building via
+    /// [`with_config`](Self::with_config) / [`add_output`](Self::add_output)
+    /// (no schema) and the model emits pixel-space boxes that need to be
+    /// divided by `(W, H)` before NMS.
+    ///
+    /// When the builder is also configured with [`with_schema`](Self::with_schema)
+    /// (or `with_config_json_str` / `with_config_yaml_str`) and the schema's
+    /// `input` block carries usable dims, this explicit override **takes
+    /// precedence** so callers can correct schemas with missing or wrong
+    /// input specs without rewriting the schema.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yaml_str(config_yaml)
+    ///     .with_input_dims(640, 640)
+    ///     .build()?;
+    /// assert_eq!(decoder.input_dims(), Some((640, 640)));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_input_dims(mut self, width: usize, height: usize) -> Self {
+        self.input_dims = Some((width, height));
+        self
+    }
+
     /// Builds the decoder with the given settings. If the config is a JSON or
     /// YAML string, this will deserialize the JSON or YAML and then parse the
     /// configuration information.
@@ -903,7 +939,8 @@ impl DecoderBuilder {
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
         let decode_dtype = self.decode_dtype;
-        let (config, decode_program, per_scale_plan, input_dims) = match self.config_src {
+        let explicit_input_dims = self.input_dims;
+        let (config, decode_program, per_scale_plan, schema_input_dims) = match self.config_src {
             Some(ConfigSource::Json(s)) => {
                 Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
             }
@@ -914,6 +951,10 @@ impl DecoderBuilder {
             Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
+        // Explicit `with_input_dims(W, H)` overrides any schema-derived
+        // value so callers can fix schemas with missing or wrong input
+        // specs without rewriting the schema (EDGEAI-1303).
+        let input_dims = explicit_input_dims.or(schema_input_dims);
 
         // Enforce the physical-order contract: when dshape is present
         // it must describe the same axes as shape in the same order,
