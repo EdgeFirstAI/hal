@@ -20,23 +20,6 @@ use crate::yolo::{
 };
 use crate::{DecoderError, DetectBox, Nms, ProtoData, Segmentation, XYWH};
 
-/// Per-detection cap shared with the legacy paths. The legacy code uses
-/// `output_boxes.capacity()` as the cap; for the per-scale bridge the
-/// builder does not pre-size the destination, so we pick a conservative
-/// upper bound (matching `MAX_NMS_CANDIDATES` order of magnitude). Any
-/// caller that needs a tighter bound can pre-allocate `output_boxes`
-/// before calling decode and we'd plumb that through; for Phase 1 we
-/// just use the existing capacity if non-zero, else this default.
-const DEFAULT_MAX_DETECTIONS: usize = 300;
-
-fn max_detections(output_boxes: &Vec<DetectBox>) -> usize {
-    if output_boxes.capacity() > 0 {
-        output_boxes.capacity()
-    } else {
-        DEFAULT_MAX_DETECTIONS
-    }
-}
-
 /// Materialise the per-scale buffers as f32 contiguous `Vec`s and views
 /// suitable for the legacy NMS / mask kernels. Boxes are emitted in
 /// `xc, yc, w, h` (XYWH centre-point) order — see
@@ -113,7 +96,6 @@ pub(super) fn per_scale_to_proto_data(
     let scores_view = ArrayView2::<f32>::from_shape((n, nc), &scores)
         .map_err(|e| DecoderError::Internal(format!("per_scale scores view: {e}")))?;
 
-    let _cap = max_detections(output_boxes);
     output_boxes.clear();
 
     let det_indices = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
@@ -173,7 +155,6 @@ pub(super) fn per_scale_to_masks(
     let scores_view = ArrayView2::<f32>::from_shape((n, nc), &scores)
         .map_err(|e| DecoderError::Internal(format!("per_scale scores view: {e}")))?;
 
-    let _cap = max_detections(output_boxes);
     output_boxes.clear();
     output_masks.clear();
 

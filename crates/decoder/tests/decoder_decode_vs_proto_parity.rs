@@ -70,14 +70,17 @@ fn build_synthetic_segdet_decoder() -> (
     let set = |d: &mut [f32], r: usize, c: usize, v: f32| d[r * N + c] = v;
     for t in 0..n_targets {
         let anchor = target_start + t;
-        // Off-grid centres: the snapped roi would be at xc rounded to
-        // the nearest 1/160; using 0.0625*t + 0.123456 ensures every
-        // coordinate is sub-pixel relative to the proto grid step.
+        // Off-grid bbox: every component is deliberately not a multiple
+        // of 1/160 so the post-fix coords are observably un-snapped.
+        // xc, yc, w, h all chosen so xc±w/2 and yc±h/2 land off-grid.
         let xc = 0.0625 * t as f32 + 0.123_456;
+        let yc = 0.503_137; // off-grid (≠ k/160)
+        let w = 0.041_257; // off-grid; also keeps xc±w/2 off-grid
+        let h = 0.297_413;
         set(&mut det_data, 0, anchor, xc);
-        set(&mut det_data, 1, anchor, 0.5);
-        set(&mut det_data, 2, anchor, 0.04);
-        set(&mut det_data, 3, anchor, 0.3);
+        set(&mut det_data, 1, anchor, yc);
+        set(&mut det_data, 2, anchor, w);
+        set(&mut det_data, 3, anchor, h);
         set(&mut det_data, 4, anchor, 0.9); // class-0 score
     }
     let det_tensor: TensorDyn = {
@@ -196,15 +199,18 @@ fn decode_does_not_snap_bboxes_to_proto_grid() {
     let on_grid = |v: f32| (v / proto_step - (v / proto_step).round()).abs() < 1e-5;
 
     for (i, b) in boxes.iter().enumerate() {
-        let any_on_grid = on_grid(b.bbox.xmin)
-            && on_grid(b.bbox.ymin)
-            && on_grid(b.bbox.xmax)
-            && on_grid(b.bbox.ymax);
+        // Stronger than the original `&&` (which would only fail when ALL
+        // four coords snapped together): assert NO single coord snapped.
+        // Each coord is independently planted off-grid in the fixture.
+        let any_coord_on_grid = on_grid(b.bbox.xmin)
+            || on_grid(b.bbox.ymin)
+            || on_grid(b.bbox.xmax)
+            || on_grid(b.bbox.ymax);
         assert!(
-            !any_on_grid,
-            "det[{i}] ({:?}) snapped to proto grid (1/160); decode() \
-             should not call protobox-style quantization on the output \
-             bbox (EDGEAI-1304)",
+            !any_coord_on_grid,
+            "det[{i}] ({:?}) has at least one coord snapped to the proto \
+             grid (1/160); decode() should not call protobox-style \
+             quantization on the output bbox (EDGEAI-1304)",
             b.bbox
         );
     }

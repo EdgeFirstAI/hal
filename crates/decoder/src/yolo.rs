@@ -40,6 +40,14 @@ use crate::{
 /// anyway.
 pub const MAX_NMS_CANDIDATES: usize = 30_000;
 
+/// Default post-NMS detection cap used by the public `decode_yolo_*`
+/// convenience wrappers when no explicit cap is plumbed in. Mirrors the
+/// `Decoder::max_det` default set by `DecoderBuilder` (also 300, matching
+/// the Ultralytics `max_det` default). Pre-EDGEAI-1302 these wrappers
+/// used `output_boxes.capacity()` as the cap, which silently dropped all
+/// detections when the caller passed `Vec::new()`.
+pub const DEFAULT_MAX_DETECTIONS: usize = 300;
+
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
 /// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
 /// to avoid full O(N log N) sort. No-op when input length ≤ `top_k`.
@@ -344,6 +352,10 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        DEFAULT_MAX_DETECTIONS,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -386,6 +398,10 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        DEFAULT_MAX_DETECTIONS,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -1089,18 +1105,15 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
 >(
-    mut boxes: Vec<(DetectBox, usize)>,
+    boxes: Vec<(DetectBox, usize)>,
     masks_tensor: ArrayView2<MASK>,
     protos_tensor: ArrayView3<PROTO>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError> {
     let _span = tracing::trace_span!("process_masks", n = boxes.len(), mode = "float").entered();
-    // Respect output capacity as a hard limit to avoid computing excess masks.
-    let cap = output_boxes.capacity();
-    if cap > 0 && boxes.len() > cap {
-        boxes.truncate(cap);
-    }
+    // Boxes are already bounded by the upstream `max_det` cap from
+    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_f32(boxes, masks_tensor, protos_tensor)?;
     output_boxes.clear();
@@ -1191,7 +1204,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
-    mut boxes: Vec<(DetectBox, usize)>,
+    boxes: Vec<(DetectBox, usize)>,
     mask_coeff: (ArrayView2<MASK>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
     output_boxes: &mut Vec<DetectBox>,
@@ -1201,11 +1214,8 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
 
-    // Respect output capacity as a hard limit to avoid computing excess masks.
-    let cap = output_boxes.capacity();
-    if cap > 0 && boxes.len() > cap {
-        boxes.truncate(cap);
-    }
+    // Boxes are already bounded by the upstream `max_det` cap from
+    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos)?;
     output_boxes.clear();
@@ -1223,7 +1233,6 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// quantized tensors.
 ///
@@ -1235,6 +1244,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -1249,6 +1259,10 @@ pub(crate) fn impl_yolo_split_segdet_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -1261,15 +1275,16 @@ where
     let scores = (scores_, scores.1);
     let mask_coeff = (mask_coeff_, mask_coeff.1);
 
-    let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
 
     impl_yolo_split_segdet_quant_process_masks(
         boxes,
@@ -1280,7 +1295,6 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// float tensors.
 ///
@@ -1292,6 +1306,7 @@ where
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -1306,6 +1321,10 @@ pub(crate) fn impl_yolo_split_segdet_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -1315,15 +1334,16 @@ where
     let (boxes_tensor, scores_tensor, mask_tensor) =
         postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
 
-    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
@@ -1969,7 +1989,8 @@ fn protobox<'a, T>(
     // protobox expects normalized coordinates in [0, 1]. The decoder will
     // normalize pixel-space coords automatically when the schema declares
     // `Detection::normalized = false` AND model input dimensions are known
-    // (EDGEAI-1303); reaching this guard means neither was the case.
+    // (EDGEAI-1303); reaching this guard means at least one of those is
+    // missing.
     //
     // The limit is set to 2.0 (not 1.01) because YOLO models legitimately
     // predict coordinates slightly > 1.0 for objects near frame edges.
@@ -1984,9 +2005,12 @@ fn protobox<'a, T>(
         return Err(crate::DecoderError::InvalidShape(format!(
             "Bounding box coordinates appear un-normalized (pixel-space). \
              Got bbox=({:.2}, {:.2}, {:.2}, {:.2}) but expected values in [0, 1]. \
-             Set `Detection::normalized = false` in the model schema so the \
-             decoder normalizes by the model input dimensions, or normalize \
-             the boxes in-graph before decode().",
+             Two ways to fix this: \
+             (1) declare `Detection::normalized = false` in the model schema \
+             AND make sure the schema's `input.shape` / `input.dshape` carries \
+             the model input dims so the decoder can divide by (W, H) before NMS \
+             (EDGEAI-1303 — verify with `Decoder::input_dims().is_some()`); or \
+             (2) normalize the boxes in-graph before decode().",
             roi.xmin, roi.ymin, roi.xmax, roi.ymax,
         )));
     }
