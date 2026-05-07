@@ -122,12 +122,54 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
     }
 }
 
+/// Detection cap helper for the public free `decode_yolo_*` wrappers.
+///
+/// Encodes the convention documented above: if the caller passed a non-empty
+/// `Vec`, that capacity acts as the per-call cap; otherwise fall back to
+/// [`DEFAULT_MAX_DETECTIONS`] so freshly-constructed `Vec::new()` outputs
+/// don't silently drop every detection.
+#[inline]
+fn cap_or_default<T>(v: &Vec<T>) -> usize {
+    if v.capacity() > 0 {
+        v.capacity()
+    } else {
+        DEFAULT_MAX_DETECTIONS
+    }
+}
+
+// ─── Public free decode_yolo_* convenience wrappers ────────────────────────
+//
+// Detection cap convention (applies to every `decode_yolo_*` free function
+// below):
+//
+// These functions are the convenience layer for callers that don't go
+// through `Decoder::decode()` (benches, FFI shims, ad-hoc test harnesses).
+// They use **`output_boxes.capacity()` as a per-call detection cap**:
+//
+//   - When the caller passes `Vec::with_capacity(N)`, the post-NMS output
+//     is truncated to at most `N` detections.
+//   - When the caller passes `Vec::new()` (capacity 0), the implementation
+//     falls back to the [`DEFAULT_MAX_DETECTIONS`] constant (300) so a
+//     freshly-constructed `Vec` doesn't silently drop every detection.
+//
+// This is intentionally **different** from the `Decoder::decode()` /
+// `Decoder::decode_proto()` contract, which bounds output count solely
+// by [`Decoder::max_det`] (set via `DecoderBuilder::with_max_det`,
+// default 300) regardless of the caller's `Vec` capacity (EDGEAI-1302).
+//
+// Use the `Decoder` API when you need explicit control over `max_det`,
+// schema-driven decoding, or EDGEAI-1303 normalization. Use these free
+// functions when you have raw tensors in hand and want a one-shot decode.
+
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
 /// Boxes are expected to be in XYWH format.
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
+///
+/// See the "Detection cap convention" comment above for how
+/// `output_boxes.capacity()` bounds the result count.
 pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
@@ -189,6 +231,7 @@ where
     // or `input_dims`, so the EDGEAI-1303 normalization is a no-op.
     // Callers that need that path should go through `DecoderBuilder`
     // with a schema.
+    let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_quant::<XYWH, _, _>(
         boxes,
         protos,
@@ -196,7 +239,7 @@ where
         iou_threshold,
         nms,
         MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        cap,
         None,
         None,
         output_boxes,
@@ -230,6 +273,7 @@ where
 {
     // Pre-Decoder convenience wrapper: schema-derived normalization is
     // not available here (see EDGEAI-1303 note in the quantized sibling).
+    let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_float::<XYWH, _, _>(
         boxes,
         protos,
@@ -237,7 +281,7 @@ where
         iou_threshold,
         nms,
         MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        cap,
         None,
         None,
         output_boxes,
@@ -444,7 +488,7 @@ where
     let classes = output.slice(s![5, ..]);
     let mut boxes =
         postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
-    boxes.truncate(output_boxes.capacity());
+    boxes.truncate(cap_or_default(output_boxes));
     output_boxes.clear();
     for (mut b, i) in boxes.into_iter() {
         b.label = classes[i].as_() as usize;
@@ -484,12 +528,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     // No NMS — model output is already post-NMS
@@ -514,6 +559,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
 ) -> Result<(), crate::DecoderError> {
     let n = boxes.shape()[1];
 
+    let cap = cap_or_default(output_boxes);
     output_boxes.clear();
 
     let (boxes, scores, classes) = postprocess_yolo_split_end_to_end_det(boxes, scores, &classes)?;
@@ -523,7 +569,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
         if score < score_threshold {
             continue;
         }
-        if output_boxes.len() >= output_boxes.capacity() {
+        if output_boxes.len() >= cap {
             break;
         }
         output_boxes.push(DetectBox {
@@ -565,12 +611,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
@@ -782,7 +829,8 @@ pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + 
     };
 
     let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_boxes));
@@ -807,7 +855,8 @@ pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Se
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
     let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -855,7 +904,8 @@ pub(crate) fn impl_yolo_split_quant<
     };
 
     let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_scores));
@@ -890,7 +940,8 @@ pub(crate) fn impl_yolo_split_float<
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
     let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -1503,12 +1554,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     Ok(extract_proto_data_float(
@@ -1536,12 +1588,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     Ok(extract_proto_data_float(
