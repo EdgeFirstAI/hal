@@ -2302,6 +2302,8 @@ mod cpu_tests {
             Some(Nms::ClassAgnostic),
             edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut detections,
         );
         assert!(!detections.is_empty(), "fixture produced no detections");

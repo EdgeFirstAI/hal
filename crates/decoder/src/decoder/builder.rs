@@ -7,8 +7,47 @@ use super::config::ConfigOutputRef;
 use super::configs::{self, DecoderType, DecoderVersion, DimName, ModelType};
 use super::merge::DecodeProgram;
 use super::{ConfigOutput, ConfigOutputs, Decoder};
+use crate::per_scale::{DecodeDtype, PerScalePlan};
 use crate::schema::SchemaV2;
 use crate::DecoderError;
+
+/// Extract `(width, height)` from a schema [`crate::schema::InputSpec`].
+///
+/// Prefers named dims (`DimName::Width` / `DimName::Height`) when the
+/// `dshape` is populated, falling back to the NHWC convention
+/// (`shape[1] = H, shape[2] = W`) for 4-element shapes whenever either
+/// named dim is missing. Returns `None` for any other shape arity — the
+/// decoder treats that as "input dims unknown" and skips the EDGEAI-1303
+/// normalization path.
+///
+/// The fallback fires when **either** `Height` or `Width` is missing from
+/// the dshape (not only when both are absent), so a partially-named
+/// dshape (e.g. only `Width`) still resolves both dims via positional
+/// inference instead of silently disabling normalization.
+fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usize)> {
+    use crate::configs::DimName;
+    let mut h = None;
+    let mut w = None;
+    for (i, (name, _)) in input.dshape.iter().enumerate() {
+        match name {
+            DimName::Height => h = Some(input.shape[i]),
+            DimName::Width => w = Some(input.shape[i]),
+            _ => {}
+        }
+    }
+    if (h.is_none() || w.is_none()) && input.shape.len() == 4 {
+        // NHWC default: [N, H, W, C]. Mirrors the per-scale `extract_hw`
+        // fallback (`crates/decoder/src/per_scale/plan.rs::extract_hw`).
+        // Only fill the missing axis so a partial named dshape still
+        // resolves both dims.
+        h = h.or(Some(input.shape[1]));
+        w = w.or(Some(input.shape[2]));
+    }
+    match (w, h) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecoderBuilder {
@@ -18,8 +57,17 @@ pub struct DecoderBuilder {
     /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
     /// models)
     nms: Option<configs::Nms>,
+    /// Output dtype for the per-scale fast path. Has no effect on
+    /// schemas without per-scale children (which use the legacy decode
+    /// path).
+    decode_dtype: DecodeDtype,
     pre_nms_top_k: usize,
     max_det: usize,
+    /// Explicit override for the model input dimensions `(width, height)`,
+    /// consumed by EDGEAI-1303 normalization. When set, takes precedence
+    /// over schema-derived dims; when `None`, the value is read from the
+    /// schema's `input.shape` / `input.dshape` at build time.
+    input_dims: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,8 +108,10 @@ impl Default for DecoderBuilder {
             iou_threshold: 0.5,
             score_threshold: 0.5,
             nms: Some(configs::Nms::ClassAgnostic),
+            decode_dtype: DecodeDtype::F32,
             pre_nms_top_k: 300,
             max_det: 300,
+            input_dims: None,
         }
     }
 }
@@ -180,6 +230,33 @@ impl DecoderBuilder {
     /// ```
     pub fn with_schema(mut self, schema: SchemaV2) -> Self {
         self.config_src.replace(ConfigSource::Schema(schema));
+        self
+    }
+
+    /// Choose the output dtype for the per-scale decoder pipeline.
+    ///
+    /// Defaults to [`DecodeDtype::F32`]. Has no effect on schemas
+    /// without per-scale children (which use the legacy decode path).
+    /// `F16` saves ~2× memory bandwidth at the cost of 10-bit mantissa
+    /// precision; empirically safe for YOLO-family models.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use edgefirst_decoder::{DecodeDtype, DecoderBuilder, DecoderResult};
+    /// use edgefirst_decoder::schema::SchemaV2;
+    ///
+    /// # fn main() -> DecoderResult<()> {
+    /// let schema = SchemaV2::parse_file("model/edgefirst.json")?;
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_schema(schema)
+    ///     .with_decode_dtype(DecodeDtype::F32)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_decode_dtype(mut self, dtype: DecodeDtype) -> Self {
+        self.decode_dtype = dtype;
         self
     }
 
@@ -814,6 +891,36 @@ impl DecoderBuilder {
         self
     }
 
+    /// Sets the model input dimensions `(width, height)` consumed by the
+    /// EDGEAI-1303 normalization path. Use this when building via
+    /// [`with_config`](Self::with_config) / [`add_output`](Self::add_output)
+    /// (no schema) and the model emits pixel-space boxes that need to be
+    /// divided by `(W, H)` before NMS.
+    ///
+    /// When the builder is also configured with [`with_schema`](Self::with_schema)
+    /// (or `with_config_json_str` / `with_config_yaml_str`) and the schema's
+    /// `input` block carries usable dims, this explicit override **takes
+    /// precedence** so callers can correct schemas with missing or wrong
+    /// input specs without rewriting the schema.
+    ///
+    /// # Examples
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_yaml_str(config_yaml)
+    ///     .with_input_dims(640, 640)
+    ///     .build()?;
+    /// assert_eq!(decoder.input_dims(), Some((640, 640)));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_input_dims(mut self, width: usize, height: usize) -> Self {
+        self.input_dims = Some((width, height));
+        self
+    }
+
     /// Builds the decoder with the given settings. If the config is a JSON or
     /// YAML string, this will deserialize the JSON or YAML and then parse the
     /// configuration information.
@@ -831,13 +938,23 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
-        let (config, decode_program) = match self.config_src {
-            Some(ConfigSource::Json(s)) => Self::build_from_schema(SchemaV2::parse_json(&s)?)?,
-            Some(ConfigSource::Yaml(s)) => Self::build_from_schema(SchemaV2::parse_yaml(&s)?)?,
-            Some(ConfigSource::Config(c)) => (c, None),
-            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema)?,
+        let decode_dtype = self.decode_dtype;
+        let explicit_input_dims = self.input_dims;
+        let (config, decode_program, per_scale_plan, schema_input_dims) = match self.config_src {
+            Some(ConfigSource::Json(s)) => {
+                Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
+            }
+            Some(ConfigSource::Yaml(s)) => {
+                Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
+            }
+            Some(ConfigSource::Config(c)) => (c, None, None, None),
+            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
+        // Explicit `with_input_dims(W, H)` overrides any schema-derived
+        // value so callers can fix schemas with missing or wrong input
+        // specs without rewriting the schema (EDGEAI-1303).
+        let input_dims = explicit_input_dims.or(schema_input_dims);
 
         // Enforce the physical-order contract: when dshape is present
         // it must describe the same axes as shape in the same order,
@@ -849,12 +966,44 @@ impl DecoderBuilder {
             Decoder::validate_output_layout(output.into())?;
         }
 
-        // Extract normalized flag from config outputs
-        let normalized = Self::get_normalized(&config.outputs);
+        // Extract normalized flag from config outputs.
+        //
+        // The per-scale subsystem (DFL/LTRB → dist2bbox → sigmoid) emits
+        // boxes in pixel coordinates by design — `(grid + dist) * stride`
+        // — independently of any `normalized: true` annotation in the
+        // schema. The schema's `normalized` flag describes the model's
+        // training-time convention, not the runtime output coord space
+        // for this code path. Override to `Some(false)` when the
+        // per-scale path is active so `Decoder::normalized_boxes()`
+        // matches what `decode_proto`/`decode` actually produce; the
+        // legacy / non-per-scale paths still honor the schema flag.
+        let normalized = if per_scale_plan.is_some() {
+            Some(false)
+        } else {
+            Self::get_normalized(&config.outputs)
+        };
 
         // Use NMS from config if present, otherwise use builder's NMS setting
         let nms = config.nms.or(self.nms);
-        let model_type = Self::get_model_type(config)?;
+        // When the per-scale path is active, the per_scale subsystem owns
+        // model decoding entirely — `decode` / `decode_proto` short-circuit
+        // on `per_scale.is_some()` before reading `model_type`. Skip the
+        // legacy ModelType validation, which otherwise rejects per-scale
+        // schemas that carry `decoder_version: yolo26` (an
+        // "end-to-end" hint) but use the per-scale split outputs rather
+        // than the end-to-end split-output shape the legacy validator
+        // expects. We keep a placeholder `ModelType` so the field remains
+        // valid; it is dead state for per-scale Decoders.
+        let model_type = if per_scale_plan.is_some() {
+            // Drop the un-needed config; the per-scale subsystem owns it.
+            drop(config);
+            ModelType::PerScale
+        } else {
+            Self::get_model_type(config)?
+        };
+
+        let per_scale = per_scale_plan
+            .map(|plan| std::sync::Mutex::new(crate::per_scale::PerScaleDecoder::new(plan)));
 
         Ok(Decoder {
             model_type,
@@ -864,27 +1013,46 @@ impl DecoderBuilder {
             pre_nms_top_k: self.pre_nms_top_k,
             max_det: self.max_det,
             normalized,
+            input_dims,
             decode_program,
+            per_scale,
         })
     }
 
     /// Validate a [`SchemaV2`] and lower it to the (legacy `ConfigOutputs`,
-    /// optional `DecodeProgram`) pair the rest of `build()` consumes.
+    /// optional `DecodeProgram`, optional `PerScalePlan`) tuple the rest
+    /// of `build()` consumes.
     ///
     /// Centralises the v2 lowering so JSON, YAML, and direct
-    /// `with_schema` callers all go through the same validation and
-    /// merge-program construction. `SchemaV2::parse_json` /
-    /// `parse_yaml` already auto-detect v1 vs v2 input and return a v2
+    /// `with_schema` callers all go through the same validation,
+    /// merge-program, and per-scale plan construction. `SchemaV2::parse_json`
+    /// / `parse_yaml` already auto-detect v1 vs v2 input and return a v2
     /// schema either way (v1 inputs are upgraded in memory via
     /// `from_v1`), so this helper is the sole place that turns a
     /// schema into builder-ready state.
+    #[allow(clippy::type_complexity)]
     fn build_from_schema(
         schema: SchemaV2,
-    ) -> Result<(ConfigOutputs, Option<DecodeProgram>), DecoderError> {
+        decode_dtype: DecodeDtype,
+    ) -> Result<
+        (
+            ConfigOutputs,
+            Option<DecodeProgram>,
+            Option<PerScalePlan>,
+            Option<(usize, usize)>,
+        ),
+        DecoderError,
+    > {
         schema.validate()?;
         let program = DecodeProgram::try_from_schema(&schema)?;
+        let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
+        // Extract model input (W, H) from `input.shape`/`dshape`. Used by
+        // the legacy decode path to honour `normalized: false` (see
+        // EDGEAI-1303). `None` is fine when the schema omits the input
+        // spec — the decoder falls back to the protobox `>2.0` reject.
+        let input_dims = schema.input.as_ref().and_then(input_dims_from_spec);
         let legacy = schema.to_legacy_config_outputs()?;
-        Ok((legacy, program))
+        Ok((legacy, program, per_scale, input_dims))
     }
 
     /// Extracts the normalized flag from config outputs.

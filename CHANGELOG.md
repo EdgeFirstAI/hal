@@ -5,7 +5,233 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.20.0] - 2026-05-06
+
+### Breaking Changes
+
+- Public free functions `crate::yolo::impl_yolo_segdet_quant_proto` and
+  `crate::yolo::impl_yolo_segdet_float_proto` gained four parameters:
+  `pre_nms_top_k: usize`, `max_det: usize`, `normalized: Option<bool>`,
+  and `input_dims: Option<(usize, usize)>` (the latter two are
+  EDGEAI-1303 plumbing). Direct downstream callers must update their
+  call sites; pass `crate::yolo::MAX_NMS_CANDIDATES`,
+  `crate::yolo::DEFAULT_MAX_DETECTIONS`, `None`, `None` to preserve
+  the prior 0.19.0 behaviour (no normalization, capacity-bounded cap
+  superseded by an explicit detection cap).
+- `crate::yolo::decode_segdet_f32` and `crate::yolo::decode_segdet_quant`
+  (`pub(crate)` helpers consumed by the segmentation decode pipeline)
+  changed return type from `Vec<(DetectBox, Array3<u8>)>` to
+  `Vec<(DetectBox, BoundingBox, Array3<u8>)>`. The new middle element
+  is the proto-grid-aligned roi reported back so `Segmentation`
+  bounds can describe the cropped tensor independently of the bbox
+  (EDGEAI-1304 follow-up).
+- Behavioural change for callers that exploited the pre-EDGEAI-1302
+  `output_boxes.capacity()` cap as a per-call detection limit:
+  `Decoder::decode()` and `Decoder::decode_proto()` now ignore
+  capacity entirely and bound the output by `Decoder::max_det` (set
+  via `DecoderBuilder::with_max_det`, default 300). Migrate by setting
+  the cap on the builder; the previous workaround silently dropped
+  detections to zero when `Vec::new()` was passed.
+- Behavioural change for callers that worked around EDGEAI-1303 by
+  patching pixel-space boxes to `[0, 1]` in-graph (e.g. a final
+  `Mul([1/W, 1/W, 1/W, 1/W])` node): if the schema also declares
+  `Detection::normalized = false` and the input spec carries known
+  W/H, the decoder will now divide a second time, producing
+  `[0, 1/W²]`-scale boxes that fail to decode. Migrate by removing
+  the in-graph workaround OR setting `normalized: true` in the
+  schema.
+
+### Added
+
+- `DecoderBuilder::with_input_dims(width, height)` setter, plus
+  `Decoder::input_dims()` accessor, mirroring the existing
+  `with_*` / `*_boxes()` pair for the `normalized` flag. Lets
+  callers building from `add_output(...)` (programmatic) or
+  config files without an `input` block opt into EDGEAI-1303
+  normalization without rewriting their schema. Schema-derived
+  dims are still picked up automatically; the explicit setter
+  takes precedence so callers can correct misdeclared schemas.
+  Mirrored in the Python and C bindings:
+  - Python: every `PyDecoder` constructor (`__init__`,
+    `Decoder.from_outputs`, `Decoder.from_json_str`,
+    `Decoder.from_yaml_str`) gained an `input_dims=None` keyword
+    argument; `Decoder.input_dims` is exposed as a read-only
+    property next to `Decoder.normalized_boxes`.
+  - C: `hal_decoder_params_set_input_dims(params, width, height)`
+    and `hal_decoder_input_dims(decoder, *width, *height)` for
+    the setter and accessor respectively.
+- New `per_scale` decoder subsystem for schema-v2 per-scale models.
+  Supports DFL (yolov8 / yolo11) and LTRB (yolo26) box encodings, all
+  combinations of i8/u8/i16/u16/f16/f32 inputs and f32/f16 outputs.
+  Selected automatically when the schema declares per-scale children;
+  legacy `merge::PerScale` path is deprecated and errors loudly.
+- Per-scale subsystem now supports both **NHWC and NCHW children** via
+  named-axis dshape lookup. NCHW children are transposed to a per-dtype
+  scratch buffer (`LayoutScratch`) before the existing NHWC kernel
+  dispatch, keeping kernel coverage uniform for Phase 2 NEON.
+- **NEON 16x16 byte tile transpose** for the NCHW → NHWC scratch
+  step, replacing the scalar walk for `u8` / `i8` inputs when
+  `c >= 16` and `h*w >= 16`. Uses the canonical 4-stage TRN1/TRN2
+  pattern (`.16b` → `.8h` → `.4s` → `.2d`) to permute a 16-byte tile
+  in registers. Targets the Ara-240 NCHW path; NHWC inputs (TFLite,
+  the canonical fixtures) skip the transpose entirely and are
+  unaffected.
+- **Phase 2-A NEON (Tier 1) kernels** for the per-scale subsystem on
+  aarch64. Adds `kernels::neon_baseline` with NEON i8/u8/i16/u16 → f32
+  dequant primitives (FMA-fused affine), NEON sigmoid f32 (vbslq
+  blend), and NEON softmax f32 (3-pass max/exp/normalize). All
+  `BoxLevelDispatch` / `ScoreLevelDispatch` / `MaskCoefDispatch` /
+  `ProtoDispatch` enums carry `*NeonBase` variants; `select()` picks
+  NEON when `CpuFeatures::neon_baseline` is true. Bit-correct against
+  scalar oracle within 1-2 ulp envelope.
+- **Polynomial NEON `expf` (f32, 4-lane)** replaces lane-extract
+  scalar libm `expf` in NEON sigmoid + softmax. Cephes 5-degree
+  minimax with split-`ln2` range reduction and IEEE-754 exponent-bit
+  injection of `2^k`. Profiling revealed libm `expf` was 58% of
+  decode time on Cortex-A53 — the polynomial drops decode 74 ms →
+  37 ms (50%) on imx8mp-evk with mAP unchanged at 0.417.
+- **Polynomial NEON `expf` (f16, 8-lane)** for ARMv8.2-A
+  Cortex-A55+ targets (i.MX95, RPi5, Jetson Orin). Uses
+  `.arch_extension fp16` inline-asm escape hatch since Rust 1.94
+  stable does not expose the FP16 NEON intrinsics. New
+  `*NeonFp16` dispatch tier sits above `NeonBase`; selected when
+  `CpuFeatures::neon_fp16` is detected. Inputs clamped to ±10 to
+  keep `2^k` injection inside f16's 5-bit-exponent range. Drops
+  imx95-evk decode 29.5 ms → 23.5 ms (-20%) on top of the f32
+  polynomial.
+- **Per-level rayon parallelization** for the per-scale pipeline.
+  Each FPN level's box / score / mc work runs on a separate thread;
+  the heaviest level (index 0, 80x80 grid) runs on the calling
+  thread to avoid one round-trip barrier. Level-scoped disjoint
+  slices are pre-split via iterative `split_at_mut`. Activates only
+  when all levels are NHWC (NCHW would need per-level scratch).
+  Drops imx8mp 36.9 ms → 30.8 ms (Cortex-A53, 4 cores) and
+  imx95 23.5 ms → 20.5 ms (Cortex-A55, 6 cores).
+- **End-to-end Phase 2 speedups** vs original libm scalar `expf`:
+  imx8mp-evk 74.4 ms → 30.8 ms (2.42×); imx95-evk ~60 ms →
+  20.5 ms (~2.93×). coco128 box mAP@[0.5:0.95] holds at 0.417
+  across all variants (within rounding of the FP32 reference).
+- **Perfetto / Chrome-trace spans** throughout the per-scale
+  subsystem: `per_scale_decode`, `resolve_bindings`, per-level
+  `level`, and per-role `box` / `score` / `mc` / `protos`. Drove
+  the Phase 2 hotspot analysis.
+- `DecoderBuilder::with_decode_dtype` for choosing f32 or f16 outputs
+  through the per-scale pipeline.
+- `per_scale::apply_schema_quant` helper that walks a schema-v2
+  document and attaches per-tensor `Quantization` to integer input
+  tensors via shape match.  Use when the upstream inference layer
+  hasn't already attached quantization metadata.
+- `EDGEFIRST_DECODER_FORCE_KERNEL` env var for forcing the decoder's
+  kernel tier (`scalar`, `neon`/`neon_baseline`; `neon_fp16` and
+  `neon_dotprod` are recognised but not yet wired to kernels).
+- New `BoxEncoding::Direct` serde alias `"ltrb"` so yolo26 schemas
+  (which declare `"encoding": "ltrb"`) deserialize correctly.
+- Per-scale baseline benchmarks (`decoder/per_scale/dfl_i8_to_f32`,
+  `dfl_i8_to_f16`, `ltrb_i8_to_f32`) in `decoder_benchmark`.
+- `testdata/decoder/<model>.safetensors` reference fixtures backed by
+  git-lfs (`yolov8n-seg`, `yolo11n-seg`, `yolo26n-seg`), with
+  `scripts/decoder_generate_fixture.py` for regeneration. Each fixture
+  bundles raw int8 outputs, per-stage NumPy reference intermediates,
+  post-NMS detections, the patched schema (with `dshape` synthesized
+  on logical parents), and a Markdown narrative under
+  `__metadata__["documentation_md"]`. New parity tests in
+  `crates/decoder/tests/per_scale_parity.rs` (smoke / end-to-end /
+  pre-NMS) consume the fixtures via `tests/common/per_scale_fixture.rs`
+  and the `Decoder::_testing_run_per_scale_pre_nms` capture entry
+  point.
+
+### Changed
+
+- Per-scale schemas now apply sigmoid activation on score logits when
+  the schema declares `activation_required: sigmoid` on the per-scale
+  children (previously omitted by `merge.rs::execute_per_scale`).
+
+### Fixed
+
+- yolo26 LTRB-encoded per-scale boxes now decode correctly. Previously
+  `merge.rs::plan_dfl` only handled DFL encoding and yolo26 schemas
+  failed at plan time.
+- Per-scale TFLite schemas no longer require validator NumPy-NMS
+  fallback; the HAL handles them natively.
+- `Decoder::decode()` and `Decoder::decode_proto()` no longer treat
+  `output_boxes.capacity()` as a `max_det` cap on **any** of the
+  legacy YOLO paths (`YoloSegDet` combined-output, `YoloSplitSegDet`
+  three-output, `YoloSegDet2Way` split-detection). The post-NMS
+  detection count is now bounded only by `Decoder::max_det` (default
+  300, set via `DecoderBuilder::with_max_det`); capacity is purely an
+  allocation hint. Previously, callers passing `Vec::new()` (capacity
+  0) silently received zero detections, and callers passing
+  `Vec::with_capacity(N)` got an implicit per-call cap of `N`
+  (EDGEAI-1302). See **Breaking Changes** above for the workaround-migration
+  note.
+- `Decoder::decode()` no longer overwrites post-NMS bbox coordinates
+  with the proto-grid-quantized roi from `protobox`. Returned bboxes
+  are now bit-identical to those `Decoder::decode_proto()` produces
+  for the same input. Previously, `decode()` snapped every coordinate
+  to a `1/160` grid, producing bit-identical duplicates on cluttered
+  scenes and corrupting same-class IoU evaluation (EDGEAI-1304). The
+  accompanying `Segmentation` bounds (`xmin/ymin/xmax/ymax`) now
+  describe the proto-grid-aligned crop region of the returned mask
+  tensor, so the bbox and the mask region are independently
+  consistent with their respective data.
+- HAL decoder now honours `Detection::normalized: false` across the
+  combined-`Detection` path **and** the three-output split path
+  (`Boxes` + `Scores` + `MaskCoefficients` + `Protos`) used by
+  vanilla Ultralytics ONNX `--export-split` exports. When the
+  schema declares pixel-space boxes and the model input dimensions
+  are known (extracted from `input.shape` / `input.dshape` in v2
+  schemas), the decoder divides bbox channels by `(W, H)` before
+  NMS so `protobox` and IoU semantics see normalized coords. The
+  fallback handles partially-named dshapes (e.g. only `Width`
+  declared) by NHWC-positional inference of the missing axis instead
+  of silently disabling normalization (EDGEAI-1303). The `protobox`
+  rejection message now distinguishes "schema missing input spec"
+  from "schema declares normalized incorrectly" so the recommended
+  fix is actionable. See **Breaking Changes** above for the
+  in-graph-workaround migration note.
+
+### Known Limitations
+
+- **`per_scale_bridge::widen_to_f32` allocates per-frame even when
+  buffers are already `f32`.** For segmentation models the proto
+  tensor copy (32×160×160 f32 ≈ 3.2 MB) is the largest single source
+  of waste in the per-scale → legacy bridge. The architectural fix
+  is to make `WidenedF32` hold borrowed views (`Cow<'a, [f32]>`,
+  `ArrayView3<'a, f32>`) and only allocate on the f16→f32 widening
+  path. Deferred to 0.21.0 because the downstream
+  `impl_yolo_split_segdet_process_masks` and `extract_proto_data_float`
+  paths also copy, so a single-site fix only captures part of the
+  win — the full refactor is a chained lifetime-plumbing exercise.
+- **`max_boxes` / `max_det` API surface is inconsistent across
+  language bindings** and will need a unified pass before the next
+  minor release. The current state per language:
+  - **Rust** (`Decoder::decode` / `Decoder::decode_proto`): bounded
+    only by `Decoder::max_det` (default 300, set on the builder via
+    `with_max_det`). Per-call override on the `Decoder` struct field
+    is also supported.
+  - **Python** (`PyDecoder.decode` / `PyDecoder.decode_proto`):
+    accepts a per-call `max_boxes=100` kwarg that **post-truncates**
+    after Rust has already capped at `Decoder.max_det`. The smaller
+    of the two wins; users get a per-call knob.
+  - **C** (`hal_decoder_decode` / `hal_decoder_decode_proto`): no
+    per-call cap and no setter for `max_det` either — the C ABI
+    silently uses the Rust-side default of 300, with no way for a
+    C caller to change it.
+
+  To make this consistent before 0.21.0:
+  1. Add `hal_decoder_params_set_max_det(params, max_det)` and
+     `hal_decoder_params_set_pre_nms_top_k(params, k)` to the C
+     params struct so the build-time setting is reachable from C.
+  2. Optionally add a `max_boxes` parameter to `hal_decoder_decode`
+     and `hal_decoder_decode_proto` for per-call truncation, matching
+     the Python ergonomic. Two design choices — change the existing
+     entry-point signatures (breaking the C ABI) or add
+     `*_with_max_boxes` variants and deprecate the old ones.
+     Recommend the variant approach for safety.
+  3. Audit Python so `max_boxes=None` (rather than the current
+     `max_boxes=100`) is the documented "use Decoder.max_det"
+     sentinel, and the default behaviour matches Rust + (post-#1) C.
+  4. Update CHANGELOG and the tutorials.
 
 ## [0.19.0] - 2026-05-05
 

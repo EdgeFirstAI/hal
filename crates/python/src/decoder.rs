@@ -548,24 +548,34 @@ impl PyDecoder {
     /// Create a new Decoder from a configuration dictionary.
     ///
     /// Args:
-    ///     config: Model output configuration dictionary
-    ///     score_threshold: Score threshold for filtering detections (default:
-    /// 0.1)     iou_threshold: IoU threshold for NMS (default: 0.7)
-    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None
-    /// to bypass NMS
+    ///     config: Model output configuration dictionary.
+    ///     score_threshold: Score threshold for filtering detections (default
+    ///         ``0.1``).
+    ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
+    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///         or ``None`` to bypass NMS.
+    ///     input_dims: Optional ``(width, height)`` model input override
+    ///         consumed by the EDGEAI-1303 normalization path. When set,
+    ///         takes precedence over schema-derived dims; pass when building
+    ///         from a config that does not declare an input shape but the
+    ///         model emits pixel-space boxes (``Detection.normalized = False``).
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic,))]
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
     pub fn new(
         config: Bound<PyAny>,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
+        input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
-        let builder = DecoderBuilder::default()
+        let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .with_nms(nms);
+        if let Some((w, h)) = input_dims {
+            builder = builder.with_input_dims(w, h);
+        }
 
         // EDGEAI-1081: discriminate v2 vs legacy on the authoritative
         // `schema_version` field. v2 dicts carry object-form quantization
@@ -606,19 +616,23 @@ impl PyDecoder {
     ///
     /// Args:
     ///     outputs: List of Output objects describing the model outputs.
-    ///     score_threshold: Score threshold for filtering detections (default:
-    /// 0.25)     iou_threshold: IoU threshold for NMS (default: 0.45)
-    ///     nms: NMS mode - Nms.ClassAgnostic (default), Nms.ClassAware, or None
-    /// to bypass NMS     decoder_version: Optional decoder version for
-    /// Ultralytics models
+    ///     score_threshold: Score threshold for filtering detections (default
+    ///         ``0.25``).
+    ///     iou_threshold: IoU threshold for NMS (default ``0.45``).
+    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///         or ``None`` to bypass NMS.
+    ///     decoder_version: Optional decoder version for Ultralytics models.
+    ///     input_dims: Optional ``(width, height)`` model input override.
+    ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::ClassAgnostic, decoder_version=None))]
+    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::ClassAgnostic, decoder_version=None, input_dims=None))]
     pub fn new_from_outputs(
         outputs: Vec<PyRef<PyOutput>>,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
         decoder_version: Option<PyDecoderVersion>,
+        input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
         let mut builder = DecoderBuilder::default()
@@ -631,54 +645,103 @@ impl PyDecoder {
         if let Some(version) = decoder_version {
             builder = builder.with_decoder_version(version.into());
         }
+        if let Some((w, h)) = input_dims {
+            builder = builder.with_input_dims(w, h);
+        }
         match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
         }
     }
 
+    /// Create a new Decoder from a JSON configuration string.
+    ///
+    /// Args:
+    ///     json_str: JSON-encoded model configuration (v1 or v2 schema).
+    ///     score_threshold: Score threshold for filtering detections (default
+    ///         ``0.1``).
+    ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
+    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///         or ``None`` to bypass NMS.
+    ///     input_dims: Optional ``(width, height)`` model input override.
+    ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
+    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
     pub fn new_from_json_str(
         json_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
+        input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
-        let decoder = DecoderBuilder::default()
+        let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .with_nms(nms)
-            .with_config_json_str(json_str.to_string())
-            .build();
-        match decoder {
+            .with_config_json_str(json_str.to_string());
+        if let Some((w, h)) = input_dims {
+            builder = builder.with_input_dims(w, h);
+        }
+        match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
         }
     }
 
+    /// Create a new Decoder from a YAML configuration string.
+    ///
+    /// Args:
+    ///     yaml_str: YAML-encoded model configuration (v1 or v2 schema).
+    ///     score_threshold: Score threshold for filtering detections (default
+    ///         ``0.1``).
+    ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
+    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///         or ``None`` to bypass NMS.
+    ///     input_dims: Optional ``(width, height)`` model input override.
+    ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic))]
+    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
     pub fn new_from_yaml_str(
         yaml_str: &str,
         score_threshold: f32,
         iou_threshold: f32,
         nms: Option<PyNms>,
+        input_dims: Option<(usize, usize)>,
     ) -> PyResult<Self> {
         let nms: Option<Nms> = nms.map(|py_nms| py_nms.into());
-        let decoder = DecoderBuilder::default()
+        let mut builder = DecoderBuilder::default()
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
             .with_nms(nms)
-            .with_config_yaml_str(yaml_str.to_string())
-            .build();
-        match decoder {
+            .with_config_yaml_str(yaml_str.to_string());
+        if let Some((w, h)) = input_dims {
+            builder = builder.with_input_dims(w, h);
+        }
+        match builder.build() {
             Ok(decoder) => Ok(Self { decoder }),
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}"))),
         }
     }
 
+    /// Decode model outputs into ``(boxes, scores, classes, masks)`` tuples.
+    ///
+    /// Args:
+    ///     model_output: List of output :class:`Tensor` from model inference.
+    ///     max_boxes: Per-call **post-truncate cap** layered on top of the
+    ///         decoder's own :attr:`max_det` (default 300, set via the
+    ///         constructor's ``max_boxes`` analogue, the builder, or by
+    ///         assigning :attr:`max_det` directly). The smaller of the two
+    ///         wins. Also pre-allocates the underlying buffer; the Rust
+    ///         decoder does not use buffer capacity as a semantic cap
+    ///         (EDGEAI-1302). Default ``100``.
+    ///
+    /// Returns:
+    ///     Tuple ``(boxes, scores, classes, masks)`` where ``boxes`` is a
+    ///     ``(N, 4)`` ``numpy.ndarray`` of normalized ``[xmin, ymin, xmax,
+    ///     ymax]`` coords, ``scores`` is ``(N,)`` ``float32``, ``classes``
+    ///     is ``(N,)`` ``int64``, and ``masks`` is a list of N
+    ///     :class:`Segmentation` instances.
     #[pyo3(signature = (model_output, max_boxes=100))]
     pub fn decode<'py>(
         self_: PyRef<'py, Self>,
@@ -748,24 +811,29 @@ impl PyDecoder {
     ///
     /// For segmentation models, returns a :class:`ProtoData` instance that can
     /// be passed to :meth:`ImageProcessor.materialize_masks` to compute
-    /// per-instance masks for analytics, export, or IoU computation.
-    ///
-    /// For detection-only models, returns ``None`` for proto_data but still
+    /// per-instance masks for analytics, export, or IoU computation. For
+    /// detection-only models, returns ``None`` for ``proto_data`` but still
     /// populates detection boxes.
     ///
-    /// .. note::
-    ///
+    /// Note:
     ///     Calling ``decode_proto`` + ``materialize_masks`` +
     ///     ``draw_decoded_masks`` separately prevents the HAL from using its
     ///     internal fused optimization. For render-only use cases, prefer
     ///     :meth:`ImageProcessor.draw_masks` which is 1.6–27× faster on tested
     ///     platforms.
     ///
-    /// :param model_output: list of output :class:`Tensor` from model inference
-    /// :param max_boxes: maximum number of detections to return
-    /// :returns: ``(boxes, scores, classes, proto_data)`` where ``proto_data``
-    ///     is ``None`` for detection-only models
-    /// :rtype: tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, ProtoData | None]
+    /// Args:
+    ///     model_output: List of output :class:`Tensor` from model inference.
+    ///     max_boxes: Pre-allocates ``output_boxes`` capacity. The actual
+    ///         detection-count cap is the decoder's :attr:`max_det` (default
+    ///         300); the Rust decoder does not use buffer capacity as a
+    ///         semantic cap (EDGEAI-1302). Default ``100``.
+    ///
+    /// Returns:
+    ///     Tuple ``(boxes, scores, classes, proto_data)`` where ``proto_data``
+    ///     is ``None`` for detection-only models. ``boxes`` is ``(N, 4)``
+    ///     ``numpy.ndarray``, ``scores`` is ``(N,)`` ``float32``, ``classes``
+    ///     is ``(N,)`` ``int64``.
     #[pyo3(signature = (model_output, max_boxes=100))]
     pub fn decode_proto<'py>(
         self_: PyRef<'py, Self>,
@@ -857,6 +925,23 @@ impl PyDecoder {
     #[getter(normalized_boxes)]
     fn get_normalized_boxes(&self) -> Option<bool> {
         self.decoder.normalized_boxes()
+    }
+
+    /// Model input dimensions ``(width, height)`` consumed by the
+    /// EDGEAI-1303 normalization path.
+    ///
+    /// Set to a non-``None`` value via the ``input_dims`` constructor
+    /// kwarg, or sourced from the schema's ``input.shape`` /
+    /// ``input.dshape`` when building from a v2 schema. Used together
+    /// with :attr:`normalized_boxes`: when ``normalized_boxes is False``
+    /// and ``input_dims`` is a tuple, the decoder divides post-NMS box
+    /// coordinates by ``(W, H)`` so they enter the canonical ``[0, 1]``
+    /// range before mask cropping. When ``None``, no normalization is
+    /// applied and pixel-space boxes will trip the ``protobox`` safety
+    /// guard.
+    #[getter(input_dims)]
+    fn get_input_dims(&self) -> Option<(usize, usize)> {
+        self.decoder.input_dims()
     }
 }
 

@@ -23,6 +23,32 @@ pub enum DecoderError {
     InvalidConfig(String),
     /// An error occurred with ndarray shape operations
     NDArrayShape(ndarray::ShapeError),
+    /// Schema-declared per-scale child dtype != bound tensor dtype at run time.
+    DtypeMismatch {
+        expected: edgefirst_tensor::DType,
+        actual: edgefirst_tensor::DType,
+        role: &'static str,
+        level: usize,
+    },
+    /// Integer tensor bound to a role that requires dequantization, but the
+    /// tensor carries no `Quantization` metadata. The upstream inference layer
+    /// must call `tensor.set_quantization(...)` before invoking the decoder,
+    /// or callers may use `per_scale::apply_schema_quant()` as a fallback.
+    QuantMissing {
+        dtype: edgefirst_tensor::DType,
+        role: &'static str,
+        level: usize,
+    },
+    /// Internal logic bug — a dispatch variant was constructed but the
+    /// concrete kernel wasn't matched. Indicates a missing arm in the
+    /// dispatch enum's `run()` impl.
+    KernelDispatchUnreachable(String),
+    /// `EDGEFIRST_DECODER_FORCE_KERNEL` requested a tier whose features
+    /// the running CPU doesn't support.
+    ForcedKernelUnavailable {
+        tier: &'static str,
+        missing_feature: &'static str,
+    },
 }
 
 impl fmt::Display for DecoderError {

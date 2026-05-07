@@ -40,6 +40,14 @@ use crate::{
 /// anyway.
 pub const MAX_NMS_CANDIDATES: usize = 30_000;
 
+/// Default post-NMS detection cap used by the public `decode_yolo_*`
+/// convenience wrappers when no explicit cap is plumbed in. Mirrors the
+/// `Decoder::max_det` default set by `DecoderBuilder` (also 300, matching
+/// the Ultralytics `max_det` default). Pre-EDGEAI-1302 these wrappers
+/// used `output_boxes.capacity()` as the cap, which silently dropped all
+/// detections when the caller passed `Vec::new()`.
+pub const DEFAULT_MAX_DETECTIONS: usize = 300;
+
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
 /// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
 /// to avoid full O(N log N) sort. No-op when input length ≤ `top_k`.
@@ -114,12 +122,54 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
     }
 }
 
+/// Detection cap helper for the public free `decode_yolo_*` wrappers.
+///
+/// Encodes the convention documented above: if the caller passed a non-empty
+/// `Vec`, that capacity acts as the per-call cap; otherwise fall back to
+/// [`DEFAULT_MAX_DETECTIONS`] so freshly-constructed `Vec::new()` outputs
+/// don't silently drop every detection.
+#[inline]
+fn cap_or_default<T>(v: &Vec<T>) -> usize {
+    if v.capacity() > 0 {
+        v.capacity()
+    } else {
+        DEFAULT_MAX_DETECTIONS
+    }
+}
+
+// ─── Public free decode_yolo_* convenience wrappers ────────────────────────
+//
+// Detection cap convention (applies to every `decode_yolo_*` free function
+// below):
+//
+// These functions are the convenience layer for callers that don't go
+// through `Decoder::decode()` (benches, FFI shims, ad-hoc test harnesses).
+// They use **`output_boxes.capacity()` as a per-call detection cap**:
+//
+//   - When the caller passes `Vec::with_capacity(N)`, the post-NMS output
+//     is truncated to at most `N` detections.
+//   - When the caller passes `Vec::new()` (capacity 0), the implementation
+//     falls back to the [`DEFAULT_MAX_DETECTIONS`] constant (300) so a
+//     freshly-constructed `Vec` doesn't silently drop every detection.
+//
+// This is intentionally **different** from the `Decoder::decode()` /
+// `Decoder::decode_proto()` contract, which bounds output count solely
+// by [`Decoder::max_det`] (set via `DecoderBuilder::with_max_det`,
+// default 300) regardless of the caller's `Vec` capacity (EDGEAI-1302).
+//
+// Use the `Decoder` API when you need explicit control over `max_det`,
+// schema-driven decoding, or EDGEAI-1303 normalization. Use these free
+// functions when you have raw tensors in hand and want a one-shot decode.
+
 /// Decodes YOLO detection outputs from quantized tensors into detection boxes.
 ///
 /// Boxes are expected to be in XYWH format.
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
+///
+/// See the "Detection cap convention" comment above for how
+/// `output_boxes.capacity()` bounds the result count.
 pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
@@ -177,6 +227,11 @@ pub fn decode_yolo_segdet_quant<
 where
     f32: AsPrimitive<BOX>,
 {
+    // Pre-Decoder convenience wrapper: no schema-derived `normalized`
+    // or `input_dims`, so the EDGEAI-1303 normalization is a no-op.
+    // Callers that need that path should go through `DecoderBuilder`
+    // with a schema.
+    let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_quant::<XYWH, _, _>(
         boxes,
         protos,
@@ -184,7 +239,9 @@ where
         iou_threshold,
         nms,
         MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        cap,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -214,6 +271,9 @@ where
     T: Float + AsPrimitive<f32> + Send + Sync + 'static,
     f32: AsPrimitive<T>,
 {
+    // Pre-Decoder convenience wrapper: schema-derived normalization is
+    // not available here (see EDGEAI-1303 note in the quantized sibling).
+    let cap = cap_or_default(output_boxes);
     impl_yolo_segdet_float::<XYWH, _, _>(
         boxes,
         protos,
@@ -221,7 +281,9 @@ where
         iou_threshold,
         nms,
         MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        cap,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -334,6 +396,10 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        DEFAULT_MAX_DETECTIONS,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -376,6 +442,10 @@ where
         score_threshold,
         iou_threshold,
         nms,
+        MAX_NMS_CANDIDATES,
+        DEFAULT_MAX_DETECTIONS,
+        None,
+        None,
         output_boxes,
         output_masks,
     )
@@ -418,7 +488,7 @@ where
     let classes = output.slice(s![5, ..]);
     let mut boxes =
         postprocess_boxes_index_float::<XYXY, _, _>(score_threshold.as_(), boxes, scores);
-    boxes.truncate(output_boxes.capacity());
+    boxes.truncate(cap_or_default(output_boxes));
     output_boxes.clear();
     for (mut b, i) in boxes.into_iter() {
         b.label = classes[i].as_() as usize;
@@ -458,12 +528,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     // No NMS — model output is already post-NMS
@@ -488,6 +559,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
 ) -> Result<(), crate::DecoderError> {
     let n = boxes.shape()[1];
 
+    let cap = cap_or_default(output_boxes);
     output_boxes.clear();
 
     let (boxes, scores, classes) = postprocess_yolo_split_end_to_end_det(boxes, scores, &classes)?;
@@ -497,7 +569,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
         if score < score_threshold {
             continue;
         }
-        if output_boxes.len() >= output_boxes.capacity() {
+        if output_boxes.len() >= cap {
             break;
         }
         output_boxes.push(DetectBox {
@@ -539,12 +611,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     impl_yolo_split_segdet_process_masks(boxes, mask_coeff, protos, output_boxes, output_masks)
@@ -756,7 +829,8 @@ pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + 
     };
 
     let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_boxes));
@@ -781,7 +855,8 @@ pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Se
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
     let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -829,7 +904,8 @@ pub(crate) fn impl_yolo_split_quant<
     };
 
     let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_scores));
@@ -864,10 +940,43 @@ pub(crate) fn impl_yolo_split_float<
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
     let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    // Detection cap convention (see `cap_or_default`).
+    let len = cap_or_default(output_boxes).min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
+    }
+}
+
+/// Divide each survivor's bbox by `(input_w, input_h)` when the schema
+/// declares `normalized: false`. Pixel-space box coords from the model
+/// are pulled into the canonical `[0, 1]` range expected by `protobox`
+/// and downstream callers — see EDGEAI-1303.
+///
+/// No-op when `normalized` is `Some(true)` / `None`, when `input_dims`
+/// is `None`, or when there are no survivors.
+#[inline]
+pub(crate) fn maybe_normalize_boxes_in_place(
+    boxes: &mut [(DetectBox, usize)],
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
+) {
+    if normalized != Some(false) {
+        return;
+    }
+    let Some((w, h)) = input_dims else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let inv_w = 1.0 / w as f32;
+    let inv_h = 1.0 / h as f32;
+    for (b, _) in boxes.iter_mut() {
+        b.bbox.xmin *= inv_w;
+        b.bbox.ymin *= inv_h;
+        b.bbox.xmax *= inv_w;
+        b.bbox.ymax *= inv_h;
     }
 }
 
@@ -893,6 +1002,8 @@ pub(crate) fn impl_yolo_segdet_quant<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -903,7 +1014,7 @@ where
     let num_protos = protos.0.dim().2;
 
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
-    let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         (boxes_tensor, quant_boxes),
         (scores_tensor, quant_boxes),
         score_threshold,
@@ -912,6 +1023,7 @@ where
         pre_nms_top_k,
         max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
 
     impl_yolo_split_segdet_quant_process_masks::<_, _>(
         boxes,
@@ -944,6 +1056,8 @@ pub(crate) fn impl_yolo_segdet_float<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -952,7 +1066,7 @@ where
 {
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
-    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -961,6 +1075,7 @@ where
         pre_nms_top_k,
         max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
@@ -1041,29 +1156,26 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
     MASK: Float + AsPrimitive<f32> + Send + Sync,
     PROTO: Float + AsPrimitive<f32> + Send + Sync,
 >(
-    mut boxes: Vec<(DetectBox, usize)>,
+    boxes: Vec<(DetectBox, usize)>,
     masks_tensor: ArrayView2<MASK>,
     protos_tensor: ArrayView3<PROTO>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError> {
     let _span = tracing::trace_span!("process_masks", n = boxes.len(), mode = "float").entered();
-    // Respect output capacity as a hard limit to avoid computing excess masks.
-    let cap = output_boxes.capacity();
-    if cap > 0 && boxes.len() > cap {
-        boxes.truncate(cap);
-    }
+    // Boxes are already bounded by the upstream `max_det` cap from
+    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_f32(boxes, masks_tensor, protos_tensor)?;
     output_boxes.clear();
     output_masks.clear();
-    for (b, m) in boxes.into_iter() {
+    for (b, roi, m) in boxes.into_iter() {
         output_boxes.push(b);
         output_masks.push(Segmentation {
-            xmin: b.bbox.xmin,
-            ymin: b.bbox.ymin,
-            xmax: b.bbox.xmax,
-            ymax: b.bbox.ymax,
+            xmin: roi.xmin,
+            ymin: roi.ymin,
+            xmax: roi.xmax,
+            ymax: roi.ymax,
             segmentation: m,
         });
     }
@@ -1143,7 +1255,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
-    mut boxes: Vec<(DetectBox, usize)>,
+    boxes: Vec<(DetectBox, usize)>,
     mask_coeff: (ArrayView2<MASK>, Quantization),
     protos: (ArrayView3<PROTO>, Quantization),
     output_boxes: &mut Vec<DetectBox>,
@@ -1153,29 +1265,25 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
     let (masks, quant_masks) = mask_coeff;
     let (protos, quant_protos) = protos;
 
-    // Respect output capacity as a hard limit to avoid computing excess masks.
-    let cap = output_boxes.capacity();
-    if cap > 0 && boxes.len() > cap {
-        boxes.truncate(cap);
-    }
+    // Boxes are already bounded by the upstream `max_det` cap from
+    // `_get_boxes`; no second cap is needed here (EDGEAI-1302).
 
     let boxes = decode_segdet_quant(boxes, masks, protos, quant_masks, quant_protos)?;
     output_boxes.clear();
     output_masks.clear();
-    for (b, m) in boxes.into_iter() {
+    for (b, roi, m) in boxes.into_iter() {
         output_boxes.push(b);
         output_masks.push(Segmentation {
-            xmin: b.bbox.xmin,
-            ymin: b.bbox.ymin,
-            xmax: b.bbox.xmax,
-            ymax: b.bbox.ymax,
+            xmin: roi.xmin,
+            ymin: roi.ymin,
+            xmax: roi.xmax,
+            ymax: roi.ymax,
             segmentation: m,
         });
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// quantized tensors.
 ///
@@ -1187,6 +1295,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_quant<
     B: BBoxTypeTrait,
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
@@ -1201,6 +1310,10 @@ pub(crate) fn impl_yolo_split_segdet_quant<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -1213,15 +1326,16 @@ where
     let scores = (scores_, scores.1);
     let mask_coeff = (mask_coeff_, mask_coeff.1);
 
-    let boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         boxes,
         scores,
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
 
     impl_yolo_split_segdet_quant_process_masks(
         boxes,
@@ -1232,7 +1346,6 @@ where
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Internal implementation of YOLO split detection segmentation decoding for
 /// float tensors.
 ///
@@ -1244,6 +1357,7 @@ where
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_split_segdet_float<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -1258,6 +1372,10 @@ pub(crate) fn impl_yolo_split_segdet_float<
     score_threshold: f32,
     iou_threshold: f32,
     nms: Option<Nms>,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -1267,15 +1385,16 @@ where
     let (boxes_tensor, scores_tensor, mask_tensor) =
         postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
 
-    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
         iou_threshold,
         nms,
-        MAX_NMS_CANDIDATES,
-        output_boxes.capacity(),
+        pre_nms_top_k,
+        max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
@@ -1310,6 +1429,8 @@ pub fn impl_yolo_segdet_quant_proto<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1321,7 +1442,7 @@ where
 
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes_arr, num_protos);
 
-    let det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
+    let mut det_indices = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
         (boxes_tensor, quant_boxes),
         (scores_tensor, quant_boxes),
         score_threshold,
@@ -1330,6 +1451,7 @@ where
         pre_nms_top_k,
         max_det,
     );
+    maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     extract_proto_data_quant(
         det_indices,
@@ -1356,6 +1478,8 @@ pub(crate) fn impl_yolo_segdet_float_proto<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1364,7 +1488,7 @@ where
     let num_protos = protos.dim().2;
     let (boxes_tensor, scores_tensor, mask_tensor) = postprocess_yolo_seg(&boxes, num_protos);
 
-    let boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
+    let mut boxes = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -1373,6 +1497,7 @@ where
         pre_nms_top_k,
         max_det,
     );
+    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
 
     extract_proto_data_float(boxes, mask_tensor, protos, output_boxes)
 }
@@ -1429,12 +1554,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_end_to_end_segdet(&output, protos.dim().2)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     Ok(extract_proto_data_float(
@@ -1462,12 +1588,13 @@ where
 {
     let (boxes, scores, classes, mask_coeff) =
         postprocess_yolo_split_end_to_end_segdet(boxes, scores, &classes, mask_coeff)?;
+    let cap = cap_or_default(output_boxes);
     let boxes = impl_yolo_end_to_end_segdet_get_boxes::<XYXY, _, _, _>(
         boxes,
         scores,
         classes,
         score_threshold,
-        output_boxes.capacity(),
+        cap,
     );
 
     Ok(extract_proto_data_float(
@@ -1825,7 +1952,7 @@ fn decode_segdet_f32<
     boxes: Vec<(DetectBox, usize)>,
     masks: ArrayView2<MASK>,
     protos: ArrayView3<PROTO>,
-) -> Result<Vec<(DetectBox, Array3<u8>)>, crate::DecoderError> {
+) -> Result<Vec<(DetectBox, BoundingBox, Array3<u8>)>, crate::DecoderError> {
     if boxes.is_empty() {
         return Ok(Vec::new());
     }
@@ -1838,11 +1965,14 @@ fn decode_segdet_f32<
     }
     boxes
         .into_par_iter()
-        .map(|mut b| {
+        .map(|b| {
             let ind = b.1;
+            // `protobox` returns the cropped proto slice for `make_segmentation`
+            // and a `roi` snapped to the 1/proto-grid step. The detection bbox
+            // stays untouched (EDGEAI-1304); the snapped roi is reported back
+            // separately so callers can describe where the cropped mask lives.
             let (protos, roi) = protobox(&protos, &b.0.bbox)?;
-            b.0.bbox = roi;
-            Ok((b.0, make_segmentation(masks.row(ind), protos.view())))
+            Ok((b.0, roi, make_segmentation(masks.row(ind), protos.view())))
         })
         .collect()
 }
@@ -1856,7 +1986,7 @@ pub(crate) fn decode_segdet_quant<
     protos: ArrayView3<PROTO>,
     quant_masks: Quantization,
     quant_protos: Quantization,
-) -> Result<Vec<(DetectBox, Array3<u8>)>, crate::DecoderError> {
+) -> Result<Vec<(DetectBox, BoundingBox, Array3<u8>)>, crate::DecoderError> {
     if boxes.is_empty() {
         return Ok(Vec::new());
     }
@@ -1871,10 +2001,12 @@ pub(crate) fn decode_segdet_quant<
     let total_bits = MASK::zero().count_zeros() + PROTO::zero().count_zeros() + 5; // 32 protos is 2^5
     boxes
         .into_iter()
-        .map(|mut b| {
+        .map(|b| {
             let i = b.1;
+            // See EDGEAI-1304: the caller's bbox stays untouched; the
+            // proto-grid-snapped `roi` is reported back so the Segmentation's
+            // bounds can describe the actual cropped mask region.
             let (protos, roi) = protobox(&protos, &b.0.bbox.to_canonical())?;
-            b.0.bbox = roi;
             let seg = match total_bits {
                 0..=64 => make_segmentation_quant::<MASK, PROTO, i64>(
                     masks.row(i),
@@ -1894,7 +2026,7 @@ pub(crate) fn decode_segdet_quant<
                     )));
                 }
             };
-            Ok((b.0, seg))
+            Ok((b.0, roi, seg))
         })
         .collect()
 }
@@ -1907,10 +2039,11 @@ fn protobox<'a, T>(
     let height = protos.dim().0 as f32;
 
     // Detect un-normalized bounding boxes (pixel-space coordinates).
-    // protobox expects normalized coordinates in [0, 1]. ONNX models output
-    // pixel-space boxes (e.g. 0-640) which must be normalized before calling
-    // decode(). Without this check, pixel-space coordinates silently clamp to
-    // the proto boundary, producing empty (0, 0, C) masks for every detection.
+    // protobox expects normalized coordinates in [0, 1]. The decoder will
+    // normalize pixel-space coords automatically when the schema declares
+    // `Detection::normalized = false` AND model input dimensions are known
+    // (EDGEAI-1303); reaching this guard means at least one of those is
+    // missing.
     //
     // The limit is set to 2.0 (not 1.01) because YOLO models legitimately
     // predict coordinates slightly > 1.0 for objects near frame edges.
@@ -1925,8 +2058,12 @@ fn protobox<'a, T>(
         return Err(crate::DecoderError::InvalidShape(format!(
             "Bounding box coordinates appear un-normalized (pixel-space). \
              Got bbox=({:.2}, {:.2}, {:.2}, {:.2}) but expected values in [0, 1]. \
-             ONNX models output pixel-space boxes — normalize them by dividing by \
-             the input dimensions before calling decode().",
+             Two ways to fix this: \
+             (1) declare `Detection::normalized = false` in the model schema \
+             AND make sure the schema's `input.shape` / `input.dshape` carries \
+             the model input dims so the decoder can divide by (W, H) before NMS \
+             (EDGEAI-1303 — verify with `Decoder::input_dims().is_some()`); or \
+             (2) normalize the boxes in-graph before decode().",
             roi.xmin, roi.ymin, roi.xmax, roi.ymax,
         )));
     }
@@ -2294,11 +2431,18 @@ mod tests {
         assert_eq!(boxes.len(), 1);
         assert_eq!(masks.len(), 1);
 
-        // Verify mask coordinates match box coordinates
-        assert!((masks[0].xmin - boxes[0].bbox.xmin).abs() < 0.01);
-        assert!((masks[0].ymin - boxes[0].bbox.ymin).abs() < 0.01);
-        assert!((masks[0].xmax - boxes[0].bbox.xmax).abs() < 0.01);
-        assert!((masks[0].ymax - boxes[0].bbox.ymax).abs() < 0.01);
+        // Mask region is the proto-grid-aligned crop and encloses the
+        // post-NMS bbox (EDGEAI-1304); on a 16x16 grid each side may snap
+        // by up to 1/16 = 0.0625.
+        let step = 1.0 / 16.0;
+        assert!(masks[0].xmin <= boxes[0].bbox.xmin);
+        assert!(masks[0].ymin <= boxes[0].bbox.ymin);
+        assert!(masks[0].xmax >= boxes[0].bbox.xmax);
+        assert!(masks[0].ymax >= boxes[0].bbox.ymax);
+        assert!((boxes[0].bbox.xmin - masks[0].xmin) < step);
+        assert!((boxes[0].bbox.ymin - masks[0].ymin) < step);
+        assert!((masks[0].xmax - boxes[0].bbox.xmax) < step);
+        assert!((masks[0].ymax - boxes[0].bbox.ymax) < step);
     }
 
     #[test]
@@ -2624,6 +2768,8 @@ mod tests {
             Some(Nms::default()),
             MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 

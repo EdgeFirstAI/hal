@@ -288,6 +288,11 @@ pub struct HalDecoderParams {
     iou_threshold: f32,
     nms: Option<configs::Nms>,
     decoder_version: Option<configs::DecoderVersion>,
+    /// Optional model input dims `(width, height)` consumed by the
+    /// EDGEAI-1303 normalization path. Set via
+    /// `hal_decoder_params_set_input_dims`. Overrides any dims
+    /// recovered from a v2 schema's `input` block.
+    input_dims: Option<(usize, usize)>,
 }
 
 /// Opaque decoder type.
@@ -361,6 +366,7 @@ pub extern "C" fn hal_decoder_params_new() -> *mut HalDecoderParams {
         iou_threshold: 0.5,
         nms: Some(configs::Nms::ClassAgnostic),
         decoder_version: None,
+        input_dims: None,
     }))
 }
 
@@ -794,6 +800,48 @@ pub unsafe extern "C" fn hal_decoder_params_set_decoder_version(
     0
 }
 
+/// Set the model input dimensions used by the EDGEAI-1303 normalization path.
+///
+/// When the underlying model emits pixel-space box coordinates and its
+/// schema declares `Detection::normalized = false` (or the schema is
+/// programmatic and supplies no input shape at all), the decoder must
+/// know `(width, height)` so it can divide the post-NMS box coordinates
+/// by `(W, H)` before mask cropping. This setter is the C-side override
+/// for that value; if the decoder is built from a v2 schema whose `input`
+/// block already declares the dims, the explicit override here wins.
+///
+/// Pass once after `hal_decoder_params_new()` and before `hal_decoder_new()`.
+/// The corresponding accessor on the built decoder is
+/// `hal_decoder_input_dims()`.
+///
+/// @param params Params handle (must not be NULL)
+/// @param width  Model input width in pixels (must be > 0)
+/// @param height Model input height in pixels (must be > 0)
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @par Example
+/// @code{.c}
+/// hal_decoder_params *params = hal_decoder_params_new();
+/// hal_decoder_params_set_config_file(params, "model.json");
+/// hal_decoder_params_set_input_dims(params, 640, 640);
+/// hal_decoder *dec = hal_decoder_new(params);
+/// @endcode
+///
+/// @see hal_decoder_input_dims, hal_decoder_normalized_boxes
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_input_dims(
+    params: *mut HalDecoderParams,
+    width: size_t,
+    height: size_t,
+) -> c_int {
+    check_null!(params);
+    if width == 0 || height == 0 {
+        return set_error(libc::EINVAL);
+    }
+    (*params).input_dims = Some((width, height));
+    0
+}
+
 /// Create a new decoder from parameters.
 ///
 /// Validates the parameters and constructs a decoder ready for use with
@@ -855,6 +903,9 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
         .with_score_threshold(p.score_threshold)
         .with_iou_threshold(p.iou_threshold)
         .with_nms(p.nms);
+    if let Some((w, h)) = p.input_dims {
+        builder = builder.with_input_dims(w, h);
+    }
 
     if has_outputs {
         for output in &p.outputs {
@@ -905,6 +956,17 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
 /// - Integer tensors (u8, i8, u16, i16, u32, i32) -> quantized decode path
 ///
 /// All output tensors must be the same general category (all float or all integer).
+///
+/// The C API does not expose any caller-side detection-count cap — the decoder
+/// allocates and populates the returned `HalDetectBoxList` internally and
+/// truncates after NMS using its own `max_det` setting (default 300, fixed
+/// at the current C ABI; tunable from Rust via `DecoderBuilder::with_max_det`).
+/// The output list returned through `out_boxes` therefore contains 0 to
+/// `max_det` detections, and callers should always check `hal_decoder_box_list_len()`
+/// to find out how many actually survived. See EDGEAI-1302 for the bug this
+/// supersedes (a previous Rust-side bug treated the Vec capacity as the cap
+/// and silently returned zero detections; the C ABI was never affected, but
+/// the underlying Rust call now matches the C ABI's expectations).
 ///
 /// @param decoder Decoder handle
 /// @param outputs Array of output tensor pointers
@@ -967,6 +1029,11 @@ pub unsafe extern "C" fn hal_decoder_decode(
 ///       + `hal_image_processor_draw_decoded_masks()` separately prevents the HAL from
 ///       using its internal fused optimization. For render-only use cases, prefer
 ///       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
+///
+/// As with `hal_decoder_decode()`, the number of detections returned is bounded
+/// by the decoder's internal `max_det` setting (default 300; not currently
+/// exposed via the C ABI). Use `hal_decoder_box_list_len()` to read the actual
+/// count from the returned `out_boxes`. See EDGEAI-1302.
 ///
 /// @param decoder Decoder handle
 /// @param outputs Array of output tensor pointers
@@ -1089,6 +1156,46 @@ pub unsafe extern "C" fn hal_decoder_normalized_boxes(decoder: *const HalDecoder
         Some(true) => 1,
         Some(false) => 0,
         None => -1,
+    }
+}
+
+/// Get the model input dimensions consumed by the EDGEAI-1303 normalization
+/// path.
+///
+/// Sourced from either an explicit `hal_decoder_params_set_input_dims()` call
+/// at build time, or from the v2 schema's `input.shape` / `input.dshape`. When
+/// neither is available the decoder cannot honour `Detection::normalized = false`
+/// and pixel-space boxes will trip the `protobox` `> 2.0` safety reject.
+///
+/// @param decoder Decoder handle (must not be NULL)
+/// @param width   Out-parameter set to the model input width on success
+///                (must not be NULL)
+/// @param height  Out-parameter set to the model input height on success
+///                (must not be NULL)
+/// @return 1 if input dims are known (width / height populated),
+///         0 if input dims are unknown (width / height left untouched),
+///        -1 on error (NULL pointer arg, errno = EINVAL)
+///
+/// @see hal_decoder_params_set_input_dims, hal_decoder_normalized_boxes
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_input_dims(
+    decoder: *const HalDecoder,
+    width: *mut size_t,
+    height: *mut size_t,
+) -> c_int {
+    if decoder.is_null() || width.is_null() || height.is_null() {
+        return set_error(libc::EINVAL);
+    }
+
+    match unsafe { &(*decoder) }.inner.input_dims() {
+        Some((w, h)) => {
+            unsafe {
+                *width = w;
+                *height = h;
+            }
+            1
+        }
+        None => 0,
     }
 }
 
