@@ -9,22 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- Public free functions `crate::yolo::impl_yolo_segdet_quant_proto` and
-  `crate::yolo::impl_yolo_segdet_float_proto` gained four parameters:
-  `pre_nms_top_k: usize`, `max_det: usize`, `normalized: Option<bool>`,
-  and `input_dims: Option<(usize, usize)>` (the latter two are
-  EDGEAI-1303 plumbing). Direct downstream callers must update their
-  call sites; pass `crate::yolo::MAX_NMS_CANDIDATES`,
-  `crate::yolo::DEFAULT_MAX_DETECTIONS`, `None`, `None` to preserve
-  the prior 0.19.0 behaviour (no normalization, capacity-bounded cap
-  superseded by an explicit detection cap).
+- **`crate::yolo` is now a private module.** All `decode_yolo_*` and
+  `impl_yolo_*` free functions plus the `MAX_NMS_CANDIDATES` /
+  `DEFAULT_MAX_DETECTIONS` constants are `pub(crate)`. The
+  `yolo_segmentation_to_mask` helper is also private. The supported
+  decoder API surface is `Decoder` + `DecoderBuilder`; external
+  callers that reached into `crate::yolo::*` (e.g. the
+  `impl_yolo_segdet_quant_proto` direct entry point) must migrate to
+  `Decoder::decode` / `Decoder::decode_proto`. Building a `Decoder`
+  with `DecoderBuilder::with_config_yolo_segdet` (or `with_schema`)
+  reaches the same kernels with the schema-derived quant, normalize,
+  and input-dim plumbing wired in.
 - `crate::yolo::decode_segdet_f32` and `crate::yolo::decode_segdet_quant`
-  (`pub(crate)` helpers consumed by the segmentation decode pipeline)
+  (private helpers consumed by the segmentation decode pipeline)
   changed return type from `Vec<(DetectBox, Array3<u8>)>` to
   `Vec<(DetectBox, BoundingBox, Array3<u8>)>`. The new middle element
   is the proto-grid-aligned roi reported back so `Segmentation`
   bounds can describe the cropped tensor independently of the bbox
-  (EDGEAI-1304 follow-up).
+  (EDGEAI-1304 follow-up). Module is now `pub(crate)` so this affects
+  the in-tree `decoder/postprocess.rs` callers only.
 - Behavioural change for callers that exploited the pre-EDGEAI-1302
   `output_boxes.capacity()` cap as a per-call detection limit:
   `Decoder::decode()` and `Decoder::decode_proto()` now ignore
@@ -145,6 +148,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-scale schemas now apply sigmoid activation on score logits when
   the schema declares `activation_required: sigmoid` on the per-scale
   children (previously omitted by `merge.rs::execute_per_scale`).
+- Per-scale → legacy bridge (`per_scale_bridge::widen_to_f32`) is now
+  hybrid: zero-copy borrow when the per-scale buffer is already `f32`
+  (the default for `DecodeDtype::F32`), and one owned allocation only
+  when widening from `f16`. Previously each decode unconditionally
+  copied boxes/scores/mask_coefs/protos to fresh `Vec`s — for a
+  yolov8-seg model that's ~7 MB/decode of avoidable allocation. Both
+  `Decoder::decode` and `Decoder::decode_proto` and the per-scale
+  bridge now also emit `tracing::trace_span!` spans
+  (`Decoder::decode`, `per_scale_bridge::widen_to_f32` with a
+  `kind=f32_borrow|f16_widen` attribute, `nms_get_boxes`,
+  `process_masks`, `extract_proto_data`) so callers can profile each
+  stage independently.
 
 ### Fixed
 
@@ -189,49 +204,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from "schema declares normalized incorrectly" so the recommended
   fix is actionable. See **Breaking Changes** above for the
   in-graph-workaround migration note.
-
-### Known Limitations
-
-- **`per_scale_bridge::widen_to_f32` allocates per-frame even when
-  buffers are already `f32`.** For segmentation models the proto
-  tensor copy (32×160×160 f32 ≈ 3.2 MB) is the largest single source
-  of waste in the per-scale → legacy bridge. The architectural fix
-  is to make `WidenedF32` hold borrowed views (`Cow<'a, [f32]>`,
-  `ArrayView3<'a, f32>`) and only allocate on the f16→f32 widening
-  path. Deferred to 0.21.0 because the downstream
-  `impl_yolo_split_segdet_process_masks` and `extract_proto_data_float`
-  paths also copy, so a single-site fix only captures part of the
-  win — the full refactor is a chained lifetime-plumbing exercise.
-- **`max_boxes` / `max_det` API surface is inconsistent across
-  language bindings** and will need a unified pass before the next
-  minor release. The current state per language:
-  - **Rust** (`Decoder::decode` / `Decoder::decode_proto`): bounded
-    only by `Decoder::max_det` (default 300, set on the builder via
-    `with_max_det`). Per-call override on the `Decoder` struct field
-    is also supported.
-  - **Python** (`PyDecoder.decode` / `PyDecoder.decode_proto`):
-    accepts a per-call `max_boxes=100` kwarg that **post-truncates**
-    after Rust has already capped at `Decoder.max_det`. The smaller
-    of the two wins; users get a per-call knob.
-  - **C** (`hal_decoder_decode` / `hal_decoder_decode_proto`): no
-    per-call cap and no setter for `max_det` either — the C ABI
-    silently uses the Rust-side default of 300, with no way for a
-    C caller to change it.
-
-  To make this consistent before 0.21.0:
-  1. Add `hal_decoder_params_set_max_det(params, max_det)` and
-     `hal_decoder_params_set_pre_nms_top_k(params, k)` to the C
-     params struct so the build-time setting is reachable from C.
-  2. Optionally add a `max_boxes` parameter to `hal_decoder_decode`
-     and `hal_decoder_decode_proto` for per-call truncation, matching
-     the Python ergonomic. Two design choices — change the existing
-     entry-point signatures (breaking the C ABI) or add
-     `*_with_max_boxes` variants and deprecate the old ones.
-     Recommend the variant approach for safety.
-  3. Audit Python so `max_boxes=None` (rather than the current
-     `max_boxes=100`) is the documented "use Decoder.max_det"
-     sentinel, and the default behaviour matches Rust + (post-#1) C.
-  4. Update CHANGELOG and the tutorials.
 
 ## [0.19.0] - 2026-05-05
 

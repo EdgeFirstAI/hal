@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! Internal YOLO decoder kernels.
+//!
+//! All items in this module are `pub(crate)`. The public API surface for
+//! decoding is [`crate::Decoder`] + [`crate::DecoderBuilder`]; external
+//! callers must go through that entry point so we can evolve the kernels
+//! (split paths, dispatch tables, NEON tiers) without breaking semver.
+//! See `CHANGELOG.md` for the 0.20.0 narrowing.
+
 use std::fmt::Debug;
 
 use ndarray::{
@@ -38,7 +46,11 @@ use crate::{
 /// score thresholds where the cap activates the bottom of the
 /// candidate list is dominated by noise that NMS would discard
 /// anyway.
-pub const MAX_NMS_CANDIDATES: usize = 30_000;
+///
+/// Production callers configure this via [`crate::DecoderBuilder::with_pre_nms_top_k`];
+/// only the test-only seg-det wrappers reach for this constant directly.
+#[cfg(test)]
+pub(crate) const MAX_NMS_CANDIDATES: usize = 30_000;
 
 /// Default post-NMS detection cap used by the public `decode_yolo_*`
 /// convenience wrappers when no explicit cap is plumbed in. Mirrors the
@@ -46,7 +58,7 @@ pub const MAX_NMS_CANDIDATES: usize = 30_000;
 /// the Ultralytics `max_det` default). Pre-EDGEAI-1302 these wrappers
 /// used `output_boxes.capacity()` as the cap, which silently dropped all
 /// detections when the caller passed `Vec::new()`.
-pub const DEFAULT_MAX_DETECTIONS: usize = 300;
+pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
 /// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
@@ -170,7 +182,7 @@ fn cap_or_default<T>(v: &Vec<T>) -> usize {
 ///
 /// See the "Detection cap convention" comment above for how
 /// `output_boxes.capacity()` bounds the result count.
-pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
+pub(crate) fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
     output: (ArrayView2<BOX>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
@@ -188,7 +200,7 @@ pub fn decode_yolo_det<BOX: PrimInt + AsPrimitive<f32> + Send + Sync>(
 ///
 /// Expected shapes of inputs:
 /// - output: (4 + num_classes, num_boxes)
-pub fn decode_yolo_det_float<T>(
+pub(crate) fn decode_yolo_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     iou_threshold: f32,
@@ -201,18 +213,21 @@ pub fn decode_yolo_det_float<T>(
     impl_yolo_float::<XYWH, _>(output, score_threshold, iou_threshold, nms, output_boxes);
 }
 
-/// Decodes YOLO detection and segmentation outputs from quantized tensors into
-/// detection boxes and segmentation masks.
+/// Test-only seg-det quantized decode shim.
 ///
-/// Boxes are expected to be in XYWH format.
+/// Production callers go through [`crate::Decoder::decode`]; this wrapper
+/// exists only so the parity tests in `lib.rs` and `yolo.rs` can compare the
+/// kernel output against the Decoder output without duplicating the
+/// `impl_yolo_segdet_quant` argument plumbing.
 ///
-/// Expected shapes of inputs:
-/// - boxes: (4 + num_classes + num_protos, num_boxes)
-/// - protos: (proto_height, proto_width, num_protos)
+/// Boxes are expected to be in XYWH format. Expected shapes:
+/// - `boxes`: `(4 + num_classes + num_protos, num_boxes)`
+/// - `protos`: `(proto_height, proto_width, num_protos)`
 ///
 /// # Errors
 /// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-pub fn decode_yolo_segdet_quant<
+#[cfg(test)]
+pub(crate) fn decode_yolo_segdet_quant<
     BOX: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
     PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
 >(
@@ -247,18 +262,9 @@ where
     )
 }
 
-/// Decodes YOLO detection and segmentation outputs from float tensors into
-/// detection boxes and segmentation masks.
-///
-/// Boxes are expected to be in XYWH format.
-///
-/// Expected shapes of inputs:
-/// - boxes: (4 + num_classes + num_protos, num_boxes)
-/// - protos: (proto_height, proto_width, num_protos)
-///
-/// # Errors
-/// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-pub fn decode_yolo_segdet_float<T>(
+/// Test-only seg-det float decode shim. See [`decode_yolo_segdet_quant`].
+#[cfg(test)]
+pub(crate) fn decode_yolo_segdet_float<T>(
     boxes: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
@@ -300,7 +306,7 @@ where
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_yolo_split_det_quant<
+pub(crate) fn decode_yolo_split_det_quant<
     BOX: PrimInt + AsPrimitive<i32> + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
@@ -334,7 +340,7 @@ pub fn decode_yolo_split_det_quant<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_yolo_split_det_float<T>(
+pub(crate) fn decode_yolo_split_det_float<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     score_threshold: f32,
@@ -355,102 +361,6 @@ pub fn decode_yolo_split_det_float<T>(
     );
 }
 
-/// Decodes YOLO split detection segmentation outputs from quantized tensors
-/// into detection boxes and segmentation masks.
-///
-/// Boxes are expected to be in XYWH format.
-///
-/// Expected shapes of inputs:
-/// - boxes_tensor: (4, num_boxes)
-/// - scores_tensor: (num_classes, num_boxes)
-/// - mask_tensor: (num_protos, num_boxes)
-/// - protos: (proto_height, proto_width, num_protos)
-///
-/// # Errors
-/// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet<
-    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
-    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
->(
-    boxes: (ArrayView2<BOX>, Quantization),
-    scores: (ArrayView2<SCORE>, Quantization),
-    mask_coeff: (ArrayView2<MASK>, Quantization),
-    protos: (ArrayView3<PROTO>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    nms: Option<Nms>,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) -> Result<(), crate::DecoderError>
-where
-    f32: AsPrimitive<SCORE>,
-{
-    impl_yolo_split_segdet_quant::<XYWH, _, _, _, _>(
-        boxes,
-        scores,
-        mask_coeff,
-        protos,
-        score_threshold,
-        iou_threshold,
-        nms,
-        MAX_NMS_CANDIDATES,
-        DEFAULT_MAX_DETECTIONS,
-        None,
-        None,
-        output_boxes,
-        output_masks,
-    )
-}
-
-/// Decodes YOLO split detection segmentation outputs from float tensors
-/// into detection boxes and segmentation masks.
-///
-/// Boxes are expected to be in XYWH format.
-///
-/// Expected shapes of inputs:
-/// - boxes_tensor: (4, num_boxes)
-/// - scores_tensor: (num_classes, num_boxes)
-/// - mask_tensor: (num_protos, num_boxes)
-/// - protos: (proto_height, proto_width, num_protos)
-///
-/// # Errors
-/// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_segdet_float<T>(
-    boxes: ArrayView2<T>,
-    scores: ArrayView2<T>,
-    mask_coeff: ArrayView2<T>,
-    protos: ArrayView3<T>,
-    score_threshold: f32,
-    iou_threshold: f32,
-    nms: Option<Nms>,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) -> Result<(), crate::DecoderError>
-where
-    T: Float + AsPrimitive<f32> + Send + Sync + 'static,
-    f32: AsPrimitive<T>,
-{
-    impl_yolo_split_segdet_float::<XYWH, _, _, _, _>(
-        boxes,
-        scores,
-        mask_coeff,
-        protos,
-        score_threshold,
-        iou_threshold,
-        nms,
-        MAX_NMS_CANDIDATES,
-        DEFAULT_MAX_DETECTIONS,
-        None,
-        None,
-        output_boxes,
-        output_masks,
-    )
-}
-
 /// Decodes end-to-end YOLO detection outputs (post-NMS from model).
 /// Expects an array of shape `(6, N)`, where the first dimension (rows)
 /// corresponds to the 6 per-detection features
@@ -465,7 +375,7 @@ where
 /// # Errors
 ///
 /// Returns `DecoderError::InvalidShape` if `output` has fewer than 6 rows.
-pub fn decode_yolo_end_to_end_det_float<T>(
+pub(crate) fn decode_yolo_end_to_end_det_float<T>(
     output: ArrayView2<T>,
     score_threshold: f32,
     output_boxes: &mut Vec<DetectBox>,
@@ -515,7 +425,7 @@ where
 /// Returns `DecoderError::InvalidShape` if:
 /// - output has fewer than 7 rows (6 base + at least 1 mask coefficient)
 /// - protos shape doesn't match mask coefficients count
-pub fn decode_yolo_end_to_end_segdet_float<T>(
+pub(crate) fn decode_yolo_end_to_end_segdet_float<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
@@ -550,7 +460,7 @@ where
 /// - classes: (1, N) — class index of the top class
 ///
 /// Boxes are output directly without NMS (model already applied NMS).
-pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
+pub(crate) fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     classes: ArrayView2<T>,
@@ -595,7 +505,7 @@ pub fn decode_yolo_split_end_to_end_det_float<T: Float + AsPrimitive<f32>>(
 /// - mask_coeff: (num_protos, N) — mask coefficients per detection
 /// - protos: (proto_h, proto_w, num_protos) — prototype masks
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_end_to_end_segdet_float<T>(
+pub(crate) fn decode_yolo_split_end_to_end_segdet_float<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     classes: ArrayView2<T>,
@@ -1285,68 +1195,6 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
 }
 
 /// Internal implementation of YOLO split detection segmentation decoding for
-/// quantized tensors.
-///
-/// Expected shapes of inputs:
-/// - boxes_tensor: (4, num_boxes)
-/// - scores_tensor: (num_classes, num_boxes)
-/// - mask_tensor: (num_protos, num_boxes)
-/// - protos: (proto_height, proto_width, num_protos)
-///
-/// # Errors
-/// Returns `DecoderError::InvalidShape` if bounding boxes are not normalized.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn impl_yolo_split_segdet_quant<
-    B: BBoxTypeTrait,
-    BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
-    SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
-    MASK: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
-    PROTO: PrimInt + AsPrimitive<i64> + AsPrimitive<i128> + AsPrimitive<f32> + Send + Sync,
->(
-    boxes: (ArrayView2<BOX>, Quantization),
-    scores: (ArrayView2<SCORE>, Quantization),
-    mask_coeff: (ArrayView2<MASK>, Quantization),
-    protos: (ArrayView3<PROTO>, Quantization),
-    score_threshold: f32,
-    iou_threshold: f32,
-    nms: Option<Nms>,
-    pre_nms_top_k: usize,
-    max_det: usize,
-    normalized: Option<bool>,
-    input_dims: Option<(usize, usize)>,
-    output_boxes: &mut Vec<DetectBox>,
-    output_masks: &mut Vec<Segmentation>,
-) -> Result<(), crate::DecoderError>
-where
-    f32: AsPrimitive<SCORE>,
-{
-    let (boxes_, scores_, mask_coeff_) =
-        postprocess_yolo_split_segdet(boxes.0, scores.0, mask_coeff.0);
-    let boxes = (boxes_, boxes.1);
-    let scores = (scores_, scores.1);
-    let mask_coeff = (mask_coeff_, mask_coeff.1);
-
-    let mut boxes = impl_yolo_split_segdet_quant_get_boxes::<B, _, _>(
-        boxes,
-        scores,
-        score_threshold,
-        iou_threshold,
-        nms,
-        pre_nms_top_k,
-        max_det,
-    );
-    maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
-
-    impl_yolo_split_segdet_quant_process_masks(
-        boxes,
-        mask_coeff,
-        protos,
-        output_boxes,
-        output_masks,
-    )
-}
-
-/// Internal implementation of YOLO split detection segmentation decoding for
 /// float tensors.
 ///
 /// Expected shapes of inputs:
@@ -1405,7 +1253,7 @@ where
 /// Proto-extraction variant of `impl_yolo_segdet_quant`.
 /// Runs NMS but returns raw `ProtoData` instead of materialized masks.
 #[allow(clippy::too_many_arguments)]
-pub fn impl_yolo_segdet_quant_proto<
+pub(crate) fn impl_yolo_segdet_quant_proto<
     B: BBoxTypeTrait,
     BOX: PrimInt
         + AsPrimitive<i64>
@@ -1542,7 +1390,7 @@ where
 }
 
 /// Proto-extraction variant of `decode_yolo_end_to_end_segdet_float`.
-pub fn decode_yolo_end_to_end_segdet_float_proto<T>(
+pub(crate) fn decode_yolo_end_to_end_segdet_float_proto<T>(
     output: ArrayView2<T>,
     protos: ArrayView3<T>,
     score_threshold: f32,
@@ -1573,7 +1421,7 @@ where
 
 /// Proto-extraction variant of `decode_yolo_split_end_to_end_segdet_float`.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
+pub(crate) fn decode_yolo_split_end_to_end_segdet_float_proto<T>(
     boxes: ArrayView2<T>,
     scores: ArrayView2<T>,
     classes: ArrayView2<T>,
@@ -2181,7 +2029,7 @@ where
 ///
 /// Returns `DecoderError::InvalidShape` if the input segmentation does not
 /// have shape (H, W, 1).
-pub fn yolo_segmentation_to_mask(
+pub(crate) fn yolo_segmentation_to_mask(
     segmentation: ArrayView3<u8>,
     threshold: u8,
 ) -> Result<Array2<u8>, crate::DecoderError> {

@@ -6,15 +6,12 @@
 use edgefirst_bench::{run_bench, BenchSuite};
 use edgefirst_decoder::{
     byte::{nms_int, postprocess_boxes_quant},
-    dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
+    configs, dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
     modelpack::{decode_modelpack_det, decode_modelpack_split_quant, ModelPackDetectionConfig},
     per_scale::DecodeDtype,
     schema::SchemaV2,
-    yolo::{
-        decode_yolo_det, decode_yolo_det_float, decode_yolo_segdet_float, decode_yolo_segdet_quant,
-    },
-    DecoderBuilder, Nms, Quantization, XYWH,
+    ConfigOutput, DecoderBuilder, Nms, Quantization, XYWH,
 };
 use edgefirst_tensor::{Quantization as TQ, Tensor, TensorDyn, TensorMemory};
 use ndarray::s;
@@ -23,25 +20,33 @@ const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 fn bench_yolo_quant(suite: &mut BenchSuite) {
-    let score_threshold = 0.25;
-    let iou_threshold = 0.70;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
-    let quant = Quantization {
-        scale: 0.0040811873,
-        zero_point: -123,
-    };
+    let raw = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
+    let tensor = TensorDyn::I8(Tensor::<i8>::from_slice(raw, &[1, 84, 8400]).unwrap());
 
+    let detection = configs::Detection {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: Some(configs::QuantTuple(0.0040811873, -123)),
+        shape: vec![1, 84, 8400],
+        dshape: vec![],
+        anchors: None,
+        normalized: Some(true),
+    };
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.25)
+        .with_iou_threshold(0.70)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .add_output(ConfigOutput::Detection(detection))
+        .build()
+        .expect("yolo det quant decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&tensor];
     let result = run_bench("decoder/yolo/quant", WARMUP, ITERATIONS, || {
-        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_det(
-            (out.view(), quant),
-            score_threshold,
-            iou_threshold,
-            Some(Nms::ClassAgnostic),
-            &mut output_boxes,
-        );
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut masks = Vec::new();
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut masks)
+            .unwrap();
     });
     result.print_summary();
     suite.record(&result);
@@ -104,29 +109,42 @@ fn bench_quant_nms(suite: &mut BenchSuite) {
 }
 
 fn bench_yolo_f32(suite: &mut BenchSuite) {
-    let score_threshold = 0.25;
-    let iou_threshold = 0.70;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
-    let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
-    let out = out.to_vec();
+    // Pre-dequantize once outside the timed loop. The bench measures
+    // the float decode path; mixing dequant cost into each iteration
+    // (as the legacy version did) inflated wall-time by the dequant.
+    let raw = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
     let quant = Quantization {
         scale: 0.0040811873,
         zero_point: -123,
     };
+    let mut buf = vec![0.0f32; 84 * 8400];
+    dequantize_cpu_chunked(raw, quant, &mut buf);
+    let tensor = TensorDyn::F32(Tensor::<f32>::from_slice(&buf, &[1, 84, 8400]).unwrap());
 
+    let detection = configs::Detection {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, 84, 8400],
+        dshape: vec![],
+        anchors: None,
+        normalized: Some(true),
+    };
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.25)
+        .with_iou_threshold(0.70)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .add_output(ConfigOutput::Detection(detection))
+        .build()
+        .expect("yolo det f32 decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&tensor];
     let result = run_bench("decoder/yolo/f32", WARMUP, ITERATIONS, || {
-        let out = out.clone();
-        let mut buf = vec![0.0; 84 * 8400];
-        dequantize_cpu_chunked(&out, quant, &mut buf);
-        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        let out = ndarray::Array2::from_shape_vec((84, 8400), buf).unwrap();
-        decode_yolo_det_float(
-            out.view(),
-            score_threshold,
-            iou_threshold,
-            Some(Nms::ClassAgnostic),
-            &mut output_boxes,
-        );
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut masks = Vec::new();
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut masks)
+            .unwrap();
         std::hint::black_box(output_boxes);
     });
     result.print_summary();
@@ -351,39 +369,65 @@ fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
 }
 
 fn bench_masks_f32(suite: &mut BenchSuite) {
-    let score_threshold = 0.45;
-    let iou_threshold = 0.45;
-    let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
-    let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-    let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
+    // Pre-dequantize boxes + protos once outside the timed loop. The bench
+    // measures the float seg-det decode + mask materialization; the legacy
+    // version dequantized each iteration which masked the actual decode time.
+    let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+    let boxes_raw =
+        unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+    let boxes_arr = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
     let quant_boxes = Quantization {
         scale: 0.01948494464159012,
         zero_point: 20,
     };
+    let boxes_f32 = dequantize_ndarray::<_, _, f32>(boxes_arr.view(), quant_boxes);
+    let boxes_tensor = TensorDyn::F32(
+        Tensor::<f32>::from_slice(boxes_f32.as_slice().unwrap(), &[1, 116, 8400]).unwrap(),
+    );
 
-    let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
-    let protos = unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-    let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
+    let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+    let protos_raw =
+        unsafe { std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len()) };
+    let protos_arr = ndarray::Array3::from_shape_vec((160, 160, 32), protos_raw.to_vec()).unwrap();
     let quant_protos = Quantization {
         scale: 0.020889872685074806,
         zero_point: -115,
     };
+    let protos_f32 = dequantize_ndarray::<_, _, f32>(protos_arr.view(), quant_protos);
+    let protos_tensor = TensorDyn::F32(
+        Tensor::<f32>::from_slice(protos_f32.as_slice().unwrap(), &[1, 160, 160, 32]).unwrap(),
+    );
 
+    let detection = configs::Detection {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, 116, 8400],
+        dshape: vec![],
+        anchors: None,
+        normalized: Some(true),
+    };
+    let protos_cfg = configs::Protos {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, 160, 160, 32],
+        dshape: vec![],
+    };
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.45)
+        .with_iou_threshold(0.45)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .add_output(ConfigOutput::Detection(detection))
+        .add_output(ConfigOutput::Protos(protos_cfg))
+        .build()
+        .expect("yolo segdet f32 decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&boxes_tensor, &protos_tensor];
     let result = run_bench("decoder/masks/f32", WARMUP, ITERATIONS, || {
-        let protos = dequantize_ndarray::<_, _, f32>(protos.view(), quant_protos);
-        let seg = dequantize_ndarray::<_, _, f32>(boxes.view(), quant_boxes);
-        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        let mut output_masks: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_segdet_float(
-            seg.view(),
-            protos.view(),
-            score_threshold,
-            iou_threshold,
-            Some(Nms::ClassAgnostic),
-            &mut output_boxes,
-            &mut output_masks,
-        )
-        .unwrap();
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut output_masks)
+            .unwrap();
         std::hint::black_box(output_boxes);
         std::hint::black_box(output_masks);
     });
@@ -392,37 +436,47 @@ fn bench_masks_f32(suite: &mut BenchSuite) {
 }
 
 fn bench_masks_i8(suite: &mut BenchSuite) {
-    let score_threshold = 0.45;
-    let iou_threshold = 0.45;
-    let boxes = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
-    let boxes = unsafe { std::slice::from_raw_parts(boxes.as_ptr() as *const i8, boxes.len()) };
-    let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes.to_vec()).unwrap();
-    let quant_boxes = Quantization {
-        scale: 0.01948494464159012,
-        zero_point: 20,
-    };
+    let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+    let boxes_raw =
+        unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
+    let boxes_tensor = TensorDyn::I8(Tensor::<i8>::from_slice(boxes_raw, &[1, 116, 8400]).unwrap());
 
-    let protos = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
-    let protos = unsafe { std::slice::from_raw_parts(protos.as_ptr() as *const i8, protos.len()) };
-    let protos = ndarray::Array3::from_shape_vec((160, 160, 32), protos.to_vec()).unwrap();
-    let quant_protos = Quantization {
-        scale: 0.020889872685074806,
-        zero_point: -115,
-    };
+    let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+    let protos_raw =
+        unsafe { std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len()) };
+    let protos_tensor =
+        TensorDyn::I8(Tensor::<i8>::from_slice(protos_raw, &[1, 160, 160, 32]).unwrap());
 
+    let detection = configs::Detection {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: Some(configs::QuantTuple(0.01948494464159012, 20)),
+        shape: vec![1, 116, 8400],
+        dshape: vec![],
+        anchors: None,
+        normalized: Some(true),
+    };
+    let protos_cfg = configs::Protos {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: Some(configs::QuantTuple(0.020889872685074806, -115)),
+        shape: vec![1, 160, 160, 32],
+        dshape: vec![],
+    };
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.45)
+        .with_iou_threshold(0.45)
+        .with_nms(Some(Nms::ClassAgnostic))
+        .add_output(ConfigOutput::Detection(detection))
+        .add_output(ConfigOutput::Protos(protos_cfg))
+        .build()
+        .expect("yolo segdet i8 decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&boxes_tensor, &protos_tensor];
     let result = run_bench("decoder/masks/i8", WARMUP, ITERATIONS, || {
-        let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-        let mut output_masks: Vec<_> = Vec::with_capacity(50);
-        decode_yolo_segdet_quant(
-            (boxes.view(), quant_boxes),
-            (protos.view(), quant_protos),
-            score_threshold,
-            iou_threshold,
-            Some(Nms::ClassAgnostic),
-            &mut output_boxes,
-            &mut output_masks,
-        )
-        .unwrap();
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut output_masks)
+            .unwrap();
         std::hint::black_box(output_boxes);
         std::hint::black_box(output_masks);
     });

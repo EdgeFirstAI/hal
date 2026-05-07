@@ -34,8 +34,9 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_decoder::yolo::impl_yolo_segdet_quant_proto;
-use edgefirst_decoder::{DetectBox, Nms, ProtoData, ProtoLayout, Quantization, XYWH};
+use edgefirst_decoder::{
+    configs, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Nms, ProtoData, ProtoLayout,
+};
 use edgefirst_image::CPUProcessor;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 
@@ -45,14 +46,12 @@ const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 // Quantization parameters from the YOLOv8 segmentation test model.
-const QUANT_BOXES: Quantization = Quantization {
-    scale: 0.019_484_945,
-    zero_point: 20,
-};
-const QUANT_PROTOS: Quantization = Quantization {
-    scale: 0.020_889_873,
-    zero_point: -115,
-};
+// The fixtures were exported with these specific scale/zp values, so the
+// bench wires them into the Decoder schema verbatim.
+const BOXES_SCALE: f32 = 0.019_484_945;
+const BOXES_ZP: i32 = 20;
+const PROTOS_SCALE: f32 = 0.020_889_873;
+const PROTOS_ZP: i32 = -115;
 
 // Use a low threshold matching COCO evaluation (ara2-validator --with-masks).
 // This produces many detections (up to ~100+ per image) — the worst-case that
@@ -77,35 +76,80 @@ fn safetensors_path() -> std::path::PathBuf {
 const BOXES_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
 const PROTOS_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
 
-fn load_boxes_i8() -> ndarray::Array2<i8> {
+/// Wrap the embedded int8 boxes fixture as a `[1, 116, 8400]` `TensorDyn::I8`.
+fn load_boxes_tensor() -> TensorDyn {
     let bytes =
         unsafe { std::slice::from_raw_parts(BOXES_RAW.as_ptr() as *const i8, BOXES_RAW.len()) };
-    ndarray::Array2::from_shape_vec((116, 8400), bytes.to_vec()).unwrap()
+    let t = Tensor::<i8>::from_slice(bytes, &[1, 116, 8400]).unwrap();
+    TensorDyn::I8(t)
 }
 
-fn load_protos_i8() -> ndarray::Array3<i8> {
+/// Wrap the embedded int8 protos fixture as a `[1, 160, 160, 32]` (NHWC)
+/// `TensorDyn::I8`.
+fn load_protos_tensor() -> TensorDyn {
     let bytes =
         unsafe { std::slice::from_raw_parts(PROTOS_RAW.as_ptr() as *const i8, PROTOS_RAW.len()) };
-    ndarray::Array3::from_shape_vec((160, 160, 32), bytes.to_vec()).unwrap()
+    let t = Tensor::<i8>::from_slice(bytes, &[1, 160, 160, 32]).unwrap();
+    TensorDyn::I8(t)
 }
+
+/// Build a YOLOv8-seg decoder. The `score_threshold`, `pre_nms_top_k`,
+/// `max_det`, and `nms` parameters are tuned per call site to expose
+/// different points along the decode-cost curve (e.g. COCO-eval at 0.001
+/// vs. typical inference at 0.25).
+fn build_decoder(
+    score_threshold: f32,
+    pre_nms_top_k: usize,
+    max_det: usize,
+    nms: Option<Nms>,
+) -> Decoder {
+    let detection = configs::Detection {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: Some(configs::QuantTuple(BOXES_SCALE, BOXES_ZP)),
+        shape: vec![1, 116, 8400],
+        dshape: vec![],
+        anchors: None,
+        normalized: Some(true),
+    };
+    let protos = configs::Protos {
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: Some(configs::QuantTuple(PROTOS_SCALE, PROTOS_ZP)),
+        shape: vec![1, 160, 160, 32],
+        dshape: vec![],
+    };
+    DecoderBuilder::default()
+        .with_score_threshold(score_threshold)
+        .with_iou_threshold(IOU_THRESHOLD)
+        .with_nms(nms)
+        .with_pre_nms_top_k(pre_nms_top_k)
+        .with_max_det(max_det)
+        .add_output(ConfigOutput::Detection(detection))
+        .add_output(ConfigOutput::Protos(protos))
+        .build()
+        .expect("yolov8-seg bench decoder must build")
+}
+
+// Match the decoder's internal default top-K (kept in sync with
+// `crates/decoder/src/yolo.rs::MAX_NMS_CANDIDATES`). Used as the upper bound
+// when measuring "no top-K cap" decode cost.
+const MAX_NMS_CANDIDATES: usize = 30_000;
 
 /// Run NMS decode to get ProtoData + DetectBox from raw fixtures.
 fn decode_from_fixtures() -> (Vec<DetectBox>, ProtoData) {
-    let boxes = load_boxes_i8();
-    let protos = load_protos_i8();
-    let mut output_boxes = Vec::with_capacity(100);
-    let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-        (boxes.view(), QUANT_BOXES),
-        (protos.view(), QUANT_PROTOS),
+    let decoder = build_decoder(
         SCORE_THRESHOLD,
-        IOU_THRESHOLD,
-        Some(Nms::ClassAgnostic),
-        edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+        MAX_NMS_CANDIDATES,
         300,
-        None,
-        None,
-        &mut output_boxes,
+        Some(Nms::ClassAgnostic),
     );
+    let boxes = load_boxes_tensor();
+    let protos = load_protos_tensor();
+    let inputs: Vec<&TensorDyn> = vec![&boxes, &protos];
+    let mut output_boxes = Vec::with_capacity(100);
+    let proto_data = decoder
+        .decode_proto(&inputs, &mut output_boxes)
+        .expect("decode_proto must succeed on bench fixture")
+        .expect("yolov8-seg config produces ProtoData");
     (output_boxes, proto_data)
 }
 
@@ -151,8 +195,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
 
     // Use the well-known quantization constants (stored in safetensors
     // metadata for documentation, but constants are authoritative).
-    let quant =
-        edgefirst_tensor::Quantization::per_tensor(QUANT_PROTOS.scale, QUANT_PROTOS.zero_point);
+    let quant = edgefirst_tensor::Quantization::per_tensor(PROTOS_SCALE, PROTOS_ZP);
     let protos_tensor = protos_tensor
         .with_quantization(quant)
         .map_err(|e| format!("set quant: {e}"))?;
@@ -170,8 +213,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
         let coeff_i8: Vec<i8> = coeff_bytes.iter().map(|b| *b as i8).collect();
         let t = Tensor::<i8>::from_slice(&coeff_i8, &coeff_shape)
             .map_err(|e| format!("coeff tensor: {e}"))?;
-        let q =
-            edgefirst_tensor::Quantization::per_tensor(QUANT_BOXES.scale, QUANT_BOXES.zero_point);
+        let q = edgefirst_tensor::Quantization::per_tensor(BOXES_SCALE, BOXES_ZP);
         let t = t
             .with_quantization(q)
             .map_err(|e| format!("coeff quant: {e}"))?;
@@ -322,11 +364,8 @@ fn save_to_safetensors(
 
     // Metadata with quantization info.
     let mut metadata = HashMap::new();
-    metadata.insert("proto_scale".to_string(), QUANT_PROTOS.scale.to_string());
-    metadata.insert(
-        "proto_zero_point".to_string(),
-        QUANT_PROTOS.zero_point.to_string(),
-    );
+    metadata.insert("proto_scale".to_string(), PROTOS_SCALE.to_string());
+    metadata.insert("proto_zero_point".to_string(), PROTOS_ZP.to_string());
     metadata.insert("proto_height".to_string(), proto_shape[0].to_string());
     metadata.insert("proto_width".to_string(), proto_shape[1].to_string());
     metadata.insert("num_protos".to_string(), num_protos.to_string());
@@ -571,130 +610,69 @@ fn bench_phase_breakdown(suite: &mut BenchSuite) {
 fn bench_nms_decode(suite: &mut BenchSuite) {
     println!("\n== nms_decode: score filter + NMS + proto extraction ==\n");
 
-    let boxes = load_boxes_i8();
-    let protos = load_protos_i8();
-    let n_proposals = boxes.dim().1;
-    let n_classes = boxes.dim().0 - 4 - 32; // 80
+    let boxes_t = load_boxes_tensor();
+    let protos_t = load_protos_tensor();
+    let inputs: Vec<&TensorDyn> = vec![&boxes_t, &protos_t];
 
-    println!(
-        "  Tensor: [{}, {n_proposals}] I8 ({n_classes} classes + 4 box + 32 mask)",
-        boxes.dim().0
-    );
-    println!(
-        "  Protos: [{}, {}, {}] I8",
-        protos.dim().0,
-        protos.dim().1,
-        protos.dim().2
-    );
+    println!("  Tensor: [1, 116, 8400] I8 (80 classes + 4 box + 32 mask)");
+    println!("  Protos: [1, 160, 160, 32] I8");
     println!("  score_threshold={SCORE_THRESHOLD}, iou_threshold={IOU_THRESHOLD}");
     println!();
 
-    // Full decode (argmax + NMS + proto extraction)
-    let name = "nms_decode/full_0.001";
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let mut output_boxes = Vec::with_capacity(300);
-        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), QUANT_BOXES),
-            (protos.view(), QUANT_PROTOS),
+    // Helper to time one decode_proto config.
+    let bench_one = |name: &str, decoder: Decoder, suite: &mut BenchSuite| -> Vec<DetectBox> {
+        let mut survivors: Vec<DetectBox> = Vec::new();
+        let result = run_bench(name, WARMUP, ITERATIONS, || {
+            let mut output_boxes = Vec::with_capacity(300);
+            let proto_data = decoder.decode_proto(&inputs, &mut output_boxes).unwrap();
+            std::hint::black_box((&output_boxes, &proto_data));
+            survivors = output_boxes;
+        });
+        result.print_summary();
+        suite.record(&result);
+        survivors
+    };
+
+    // Full decode (argmax + NMS + proto extraction) at COCO-eval threshold.
+    let survivors = bench_one(
+        "nms_decode/full_0.001",
+        build_decoder(
             SCORE_THRESHOLD,
-            IOU_THRESHOLD,
-            Some(Nms::ClassAgnostic),
-            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
+            MAX_NMS_CANDIDATES,
             300,
-            None,
-            None,
-            &mut output_boxes,
-        );
-        std::hint::black_box((&output_boxes, &proto_data));
-    });
-    let (detect, _) = decode_from_fixtures();
-    println!("  Survivors after NMS: {} detections", detect.len());
-    result.print_summary();
-    suite.record(&result);
+            Some(Nms::ClassAgnostic),
+        ),
+        suite,
+    );
+    println!("  Survivors after NMS: {} detections", survivors.len());
 
     // With typical inference threshold (0.25)
-    let name = "nms_decode/full_0.25";
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let mut output_boxes = Vec::with_capacity(300);
-        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), QUANT_BOXES),
-            (protos.view(), QUANT_PROTOS),
-            0.25,
-            IOU_THRESHOLD,
-            Some(Nms::ClassAgnostic),
-            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
-            300,
-            None,
-            None,
-            &mut output_boxes,
-        );
-        std::hint::black_box((&output_boxes, &proto_data));
-    });
-    result.print_summary();
-    suite.record(&result);
+    bench_one(
+        "nms_decode/full_0.25",
+        build_decoder(0.25, MAX_NMS_CANDIDATES, 300, Some(Nms::ClassAgnostic)),
+        suite,
+    );
 
     // Pre-NMS top-K=3000 (the key optimization: reduces NMS from O(8400²) to O(3000²))
-    let name = "nms_decode/topk_3000";
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let mut output_boxes = Vec::with_capacity(300);
-        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), QUANT_BOXES),
-            (protos.view(), QUANT_PROTOS),
-            SCORE_THRESHOLD,
-            IOU_THRESHOLD,
-            Some(Nms::ClassAgnostic),
-            3000,
-            300,
-            None,
-            None,
-            &mut output_boxes,
-        );
-        std::hint::black_box((&output_boxes, &proto_data));
-    });
-    result.print_summary();
-    suite.record(&result);
+    bench_one(
+        "nms_decode/topk_3000",
+        build_decoder(SCORE_THRESHOLD, 3000, 300, Some(Nms::ClassAgnostic)),
+        suite,
+    );
 
     // Pre-NMS top-K=300 (default — matches Ultralytics max_det=300)
-    let name = "nms_decode/topk_300";
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let mut output_boxes = Vec::with_capacity(300);
-        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), QUANT_BOXES),
-            (protos.view(), QUANT_PROTOS),
-            SCORE_THRESHOLD,
-            IOU_THRESHOLD,
-            Some(Nms::ClassAgnostic),
-            300,
-            300,
-            None,
-            None,
-            &mut output_boxes,
-        );
-        std::hint::black_box((&output_boxes, &proto_data));
-    });
-    result.print_summary();
-    suite.record(&result);
+    bench_one(
+        "nms_decode/topk_300",
+        build_decoder(SCORE_THRESHOLD, 300, 300, Some(Nms::ClassAgnostic)),
+        suite,
+    );
 
     // Isolate: just score filtering + box decode (no NMS)
-    let name = "nms_decode/score_filter_only";
-    let result = run_bench(name, WARMUP, ITERATIONS, || {
-        let mut output_boxes = Vec::with_capacity(300);
-        let proto_data = impl_yolo_segdet_quant_proto::<XYWH, _, _>(
-            (boxes.view(), QUANT_BOXES),
-            (protos.view(), QUANT_PROTOS),
-            SCORE_THRESHOLD,
-            IOU_THRESHOLD,
-            None, // bypass NMS
-            edgefirst_decoder::yolo::MAX_NMS_CANDIDATES,
-            300,
-            None,
-            None,
-            &mut output_boxes,
-        );
-        std::hint::black_box((&output_boxes, &proto_data));
-    });
-    result.print_summary();
-    suite.record(&result);
+    bench_one(
+        "nms_decode/score_filter_only",
+        build_decoder(SCORE_THRESHOLD, MAX_NMS_CANDIDATES, 300, None),
+        suite,
+    );
 }
 
 fn main() {
