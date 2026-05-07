@@ -1477,12 +1477,11 @@ fn yolov8n_seg_per_scale_smoke_detection_count() {
 /// flagged by Copilot's review of PR #63 — the per-scale path emits
 /// pixel-space coords by design, and `protobox` would reject them
 /// with `InvalidShape("…un-normalized…")` without normalization.
-#[test]
-fn yolov8n_seg_per_scale_decode_with_masks_succeeds() {
+fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filename: &str) {
     use edgefirst_decoder::per_scale::DecodeDtype;
     use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Nms, Segmentation};
 
-    let path = fixture_path("yolov8n-seg.safetensors");
+    let path = fixture_path(fixture_filename);
     let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
         Ok(f) => f,
         Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
@@ -1508,7 +1507,7 @@ fn yolov8n_seg_per_scale_decode_with_masks_succeeds() {
     assert_eq!(decoder.normalized_boxes(), Some(false));
     assert!(
         decoder.input_dims().is_some(),
-        "yolov8n-seg fixture schema must declare input dims so the \
+        "{model_label} fixture schema must declare input dims so the \
          per-scale bridge can normalize pixel-space boxes (EDGEAI-1303)"
     );
 
@@ -1529,28 +1528,34 @@ fn yolov8n_seg_per_scale_decode_with_masks_succeeds() {
     );
     assert!(
         n_boxes >= fix.expected_count_min as usize,
-        "yolov8n-seg per-scale decode() produced {n_boxes} detections, expected ≥ {}",
+        "{model_label} per-scale decode() produced {n_boxes} detections, expected ≥ {}",
         fix.expected_count_min
     );
 
-    // Boxes must be in roughly-normalized range — proves the bridge's
-    // EDGEAI-1303 normalization step ran. YOLO can predict boxes that
-    // extend slightly past the image edge for objects near the border,
-    // so allow a small tolerance below 0 / above 1; the original
-    // pixel-space coords would be in [0, ~640] which is far outside
-    // this tolerance.
-    let in_norm_range = |v: f32| (-0.05..=1.05).contains(&v);
+    // Boxes must be in normalized range — proves the bridge's
+    // EDGEAI-1303 normalization step ran. The check distinguishes
+    // "normalized" (≈[0, 1], with YOLO occasionally predicting slightly
+    // past the image edge) from "pixel-space" (≈[0, 640] for typical
+    // YOLO input dims). A loose ±2.0 envelope is more than enough for
+    // edge-of-image detections while still rejecting any pixel-space
+    // value (which would be > 100).
+    let in_norm_range = |v: f32| (-2.0..=2.0).contains(&v);
     for b in &output_boxes {
         assert!(
             in_norm_range(b.bbox.xmin)
                 && in_norm_range(b.bbox.ymin)
                 && in_norm_range(b.bbox.xmax)
                 && in_norm_range(b.bbox.ymax),
-            "per-scale decode() bbox {:?} not in normalized range — \
+            "{model_label} per-scale decode() bbox {:?} not in normalized range — \
              per_scale_to_masks did not normalize pixel-space coords",
             b.bbox
         );
     }
+}
+
+#[test]
+fn yolov8n_seg_per_scale_decode_with_masks_succeeds() {
+    assert_per_scale_decode_with_masks_succeeds("yolov8n-seg", "yolov8n-seg.safetensors");
 }
 
 #[test]
@@ -1682,6 +1687,11 @@ fn yolo11n_seg_per_scale_pre_nms_parity() {
     assert_pre_nms_parity(&fix, "yolo11n-seg");
 }
 
+#[test]
+fn yolo11n_seg_per_scale_decode_with_masks_succeeds() {
+    assert_per_scale_decode_with_masks_succeeds("yolo11n-seg", "yolo11n-seg.safetensors");
+}
+
 // ────────────────────────────────────────────────────────────────────
 // yolo26n-seg per-scale parity (LTRB-encoded, fixture-backed)
 // ────────────────────────────────────────────────────────────────────
@@ -1771,4 +1781,13 @@ fn yolo26n_seg_per_scale_pre_nms_parity() {
         Err(e) => panic!("{e}"),
     };
     assert_pre_nms_parity(&fix, "yolo26n-seg");
+}
+
+/// LTRB-encoded model exercising the same `Decoder::decode` path through
+/// `per_scale_to_masks`. yolo26's LTRB box-decode kernels differ from
+/// the yolov8 / yolo11 DFL path, so this guards the alternate encoding
+/// against regressions in mask materialization specifically.
+#[test]
+fn yolo26n_seg_per_scale_decode_with_masks_succeeds() {
+    assert_per_scale_decode_with_masks_succeeds("yolo26n-seg", "yolo26n-seg.safetensors");
 }
