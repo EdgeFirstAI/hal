@@ -15,9 +15,15 @@ use crate::DecoderError;
 ///
 /// Prefers named dims (`DimName::Width` / `DimName::Height`) when the
 /// `dshape` is populated, falling back to the NHWC convention
-/// (`shape[1] = H, shape[2] = W`) for 4-element shapes. Returns `None`
-/// for any other shape arity — the decoder treats that as "input dims
-/// unknown" and skips the EDGEAI-1303 normalization path.
+/// (`shape[1] = H, shape[2] = W`) for 4-element shapes whenever either
+/// named dim is missing. Returns `None` for any other shape arity — the
+/// decoder treats that as "input dims unknown" and skips the EDGEAI-1303
+/// normalization path.
+///
+/// The fallback fires when **either** `Height` or `Width` is missing from
+/// the dshape (not only when both are absent), so a partially-named
+/// dshape (e.g. only `Width`) still resolves both dims via positional
+/// inference instead of silently disabling normalization.
 fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usize)> {
     use crate::configs::DimName;
     let mut h = None;
@@ -29,11 +35,13 @@ fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usiz
             _ => {}
         }
     }
-    if h.is_none() && w.is_none() && input.shape.len() == 4 {
+    if (h.is_none() || w.is_none()) && input.shape.len() == 4 {
         // NHWC default: [N, H, W, C]. Mirrors the per-scale `extract_hw`
         // fallback (`crates/decoder/src/per_scale/plan.rs::extract_hw`).
-        h = Some(input.shape[1]);
-        w = Some(input.shape[2]);
+        // Only fill the missing axis so a partial named dshape still
+        // resolves both dims.
+        h = h.or(Some(input.shape[1]));
+        w = w.or(Some(input.shape[2]));
     }
     match (w, h) {
         (Some(w), Some(h)) => Some((w, h)),

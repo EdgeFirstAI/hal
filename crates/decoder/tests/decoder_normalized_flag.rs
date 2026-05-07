@@ -181,3 +181,143 @@ fn pixel_space_input_with_normalized_true_still_rejects() {
         "expected protobox un-normalized rejection; got: {msg}",
     );
 }
+
+/// JSON v2 schema for a SplitSegDet (Boxes + Scores + MaskCoefficients
+/// + Protos) decoder declaring its boxes as pixel-space at imgsz=640.
+///
+/// This is the schema flavour vanilla Ultralytics ONNX `--export-split`
+/// produces and exercises the second (postprocess.rs:511) wiring point
+/// for EDGEAI-1303 — distinct from the combined-Detection path above.
+fn split_schema_json(normalized: bool) -> String {
+    format!(
+        r#"{{
+            "schema_version": 2,
+            "nms": "class_agnostic",
+            "input": {{
+                "shape": [1, {IMG}, {IMG}, 3],
+                "dshape": [
+                    {{"batch": 1}},
+                    {{"height": {IMG}}},
+                    {{"width": {IMG}}},
+                    {{"num_features": 3}}
+                ],
+                "cameraadaptor": "rgb"
+            }},
+            "outputs": [
+                {{
+                    "name": "boxes", "type": "boxes",
+                    "shape": [1, 4, {N}],
+                    "dshape": [
+                        {{"batch": 1}},
+                        {{"box_coords": 4}},
+                        {{"num_boxes": {N}}}
+                    ],
+                    "decoder": "ultralytics",
+                    "encoding": "direct",
+                    "normalized": {normalized}
+                }},
+                {{
+                    "name": "scores", "type": "scores",
+                    "shape": [1, {NC}, {N}],
+                    "dshape": [
+                        {{"batch": 1}},
+                        {{"num_classes": {NC}}},
+                        {{"num_boxes": {N}}}
+                    ],
+                    "decoder": "ultralytics",
+                    "score_format": "per_class"
+                }},
+                {{
+                    "name": "mask_coeff", "type": "mask_coefs",
+                    "shape": [1, {NM}, {N}],
+                    "dshape": [
+                        {{"batch": 1}},
+                        {{"num_protos": {NM}}},
+                        {{"num_boxes": {N}}}
+                    ]
+                }},
+                {{
+                    "name": "protos", "type": "protos",
+                    "shape": [1, {NM}, {PH}, {PW}],
+                    "dshape": [
+                        {{"batch": 1}},
+                        {{"num_protos": {NM}}},
+                        {{"height": {PH}}},
+                        {{"width": {PW}}}
+                    ]
+                }}
+            ]
+        }}"#,
+    )
+}
+
+/// Build the synthetic split tensors (boxes [1,4,N], scores [1,NC,N],
+/// mask_coeff [1,NM,N], protos [1,NM,PH,PW]) with pixel-space boxes
+/// planted at the same anchors as `build_inputs`.
+fn build_split_inputs() -> Vec<TensorDyn> {
+    let n_targets = 5usize;
+    let target_start = 10usize;
+    let mut box_data = vec![0.0f32; 4 * N];
+    let mut score_data = vec![0.0f32; NC * N];
+    let mask_data = vec![0.0f32; NM * N];
+    let set = |d: &mut [f32], r: usize, c: usize, stride: usize, v: f32| d[r * stride + c] = v;
+    for t in 0..n_targets {
+        let anchor = target_start + t;
+        let xc = 80.0 + 80.0 * t as f32;
+        set(&mut box_data, 0, anchor, N, xc);
+        set(&mut box_data, 1, anchor, N, IMG as f32 * 0.5);
+        set(&mut box_data, 2, anchor, N, 25.6);
+        set(&mut box_data, 3, anchor, N, 192.0);
+        set(&mut score_data, 0, anchor, N, 0.9);
+    }
+    let to_dyn = |data: Vec<f32>, shape: &[usize]| -> TensorDyn {
+        let t = Tensor::<f32>::new(shape, Some(TensorMemory::Mem), None).unwrap();
+        {
+            let mut m = t.map().unwrap();
+            m.as_mut_slice().copy_from_slice(&data);
+        }
+        TensorDyn::F32(t)
+    };
+    vec![
+        to_dyn(box_data, &[1, 4, N]),
+        to_dyn(score_data, &[1, NC, N]),
+        to_dyn(mask_data, &[1, NM, N]),
+        to_dyn(vec![0.0f32; NM * PH * PW], &[1, NM, PH, PW]),
+    ]
+}
+
+#[test]
+fn split_schema_pixel_space_with_normalized_false_decodes() {
+    let schema: SchemaV2 = serde_json::from_str(&split_schema_json(false)).unwrap();
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.5)
+        .with_iou_threshold(0.99)
+        .with_schema(schema)
+        .build()
+        .expect("split schema must build");
+
+    assert_eq!(decoder.normalized_boxes(), Some(false));
+    assert_eq!(decoder.input_dims(), Some((IMG, IMG)));
+
+    let owned = build_split_inputs();
+    let inputs: Vec<&TensorDyn> = owned.iter().collect();
+
+    let mut boxes: Vec<DetectBox> = Vec::with_capacity(50);
+    let mut masks: Vec<edgefirst_decoder::Segmentation> = Vec::with_capacity(50);
+    decoder
+        .decode(&inputs, &mut boxes, &mut masks)
+        .expect("split-schema pixel-space decode must succeed (EDGEAI-1303)");
+
+    assert!(!boxes.is_empty(), "expected detections to survive NMS");
+    for b in &boxes {
+        assert!(
+            (0.0..=1.0).contains(&b.bbox.xmin)
+                && (0.0..=1.0).contains(&b.bbox.ymin)
+                && (0.0..=1.0).contains(&b.bbox.xmax)
+                && (0.0..=1.0).contains(&b.bbox.ymax),
+            "split-schema bbox {:?} not in [0, 1]; EDGEAI-1303 normalization \
+             did not run on the SplitSegDet path",
+            b.bbox,
+        );
+    }
+}

@@ -24,15 +24,17 @@ pub struct Decoder {
     /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
     /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
     /// to NMS.  Default: 300.  Ignored when `nms` is `None`.
-    ///
-    /// Applies to segmentation decode paths only. Detection-only models use
-    /// `output_boxes.capacity()` as their implicit output limit.
     pub pre_nms_top_k: usize,
     /// Maximum number of detections returned after NMS. Matches the
     /// Ultralytics `max_det` parameter.  Default: 300.
     ///
-    /// Applies to segmentation decode paths only. Detection-only models are
-    /// bounded by `output_boxes.capacity()`.
+    /// This bound applies uniformly across all segmentation and detection
+    /// decode paths reached via [`Decoder::decode`] / [`Decoder::decode_proto`].
+    /// The output `Vec`'s capacity is only an allocation hint; the post-NMS
+    /// detection count is bounded solely by `max_det` (EDGEAI-1302). The
+    /// `pub fn decode_yolo_*` free convenience wrappers use a separate
+    /// constant ([`crate::yolo::DEFAULT_MAX_DETECTIONS`], also 300) and are
+    /// not affected by this field.
     pub max_det: usize,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range
@@ -282,9 +284,41 @@ impl Decoder {
     /// Model input dimensions `(width, height)` captured from the
     /// schema's `input.shape` / `input.dshape`, or `None` when the
     /// schema did not declare an input spec (e.g. flat YAML configs
-    /// built by hand). Used by the decoder to convert pixel-space box
-    /// coordinates (`normalized: false`) into the canonical `[0, 1]`
-    /// range before NMS and proto cropping. See EDGEAI-1303.
+    /// or `DecoderBuilder::add_output(...)` programmatic builds).
+    ///
+    /// Used together with [`normalized_boxes`](Self::normalized_boxes):
+    /// when the decoder reports `normalized_boxes() == Some(false)` and
+    /// `input_dims()` is `Some((w, h))`, the decoder divides post-NMS
+    /// bbox coordinates by `(w, h)` so they enter the canonical `[0, 1]`
+    /// range before mask cropping (EDGEAI-1303). When `input_dims()` is
+    /// `None`, the decoder cannot perform the division and the existing
+    /// `protobox` `> 2.0` reject acts as a safety net.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    ///     let json = r#"{
+    ///         "schema_version": 2,
+    ///         "nms": "class_agnostic",
+    ///         "input": {
+    ///             "shape": [1, 640, 640, 3],
+    ///             "dshape": [{"batch": 1}, {"height": 640}, {"width": 640}, {"num_features": 3}]
+    ///         },
+    ///         "outputs": [{
+    ///             "name": "out", "type": "detection",
+    ///             "shape": [1, 38, 256],
+    ///             "dshape": [{"batch": 1}, {"num_features": 38}, {"num_boxes": 256}],
+    ///             "decoder": "ultralytics", "encoding": "direct", "normalized": false
+    ///         }]
+    ///     }"#;
+    ///     let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+    ///     let decoder = DecoderBuilder::default().with_schema(schema).build()?;
+    ///     assert_eq!(decoder.input_dims(), Some((640, 640)));
+    /// #   Ok(())
+    /// # }
+    /// ```
     pub fn input_dims(&self) -> Option<(usize, usize)> {
         self.input_dims
     }

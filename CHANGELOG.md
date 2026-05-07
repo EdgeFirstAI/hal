@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.20.0] - 2026-05-06
 
+### Breaking Changes
+
+- Public free functions `crate::yolo::impl_yolo_segdet_quant_proto` and
+  `crate::yolo::impl_yolo_segdet_float_proto` gained four parameters:
+  `pre_nms_top_k: usize`, `max_det: usize`, `normalized: Option<bool>`,
+  and `input_dims: Option<(usize, usize)>` (the latter two are
+  EDGEAI-1303 plumbing). Direct downstream callers must update their
+  call sites; pass `crate::yolo::MAX_NMS_CANDIDATES`,
+  `crate::yolo::DEFAULT_MAX_DETECTIONS`, `None`, `None` to preserve
+  the prior 0.19.0 behaviour (no normalization, capacity-bounded cap
+  superseded by an explicit detection cap).
+- `crate::yolo::decode_segdet_f32` and `crate::yolo::decode_segdet_quant`
+  (`pub(crate)` helpers consumed by the segmentation decode pipeline)
+  changed return type from `Vec<(DetectBox, Array3<u8>)>` to
+  `Vec<(DetectBox, BoundingBox, Array3<u8>)>`. The new middle element
+  is the proto-grid-aligned roi reported back so `Segmentation`
+  bounds can describe the cropped tensor independently of the bbox
+  (EDGEAI-1304 follow-up).
+- Behavioural change for callers that exploited the pre-EDGEAI-1302
+  `output_boxes.capacity()` cap as a per-call detection limit:
+  `Decoder::decode()` and `Decoder::decode_proto()` now ignore
+  capacity entirely and bound the output by `Decoder::max_det` (set
+  via `DecoderBuilder::with_max_det`, default 300). Migrate by setting
+  the cap on the builder; the previous workaround silently dropped
+  detections to zero when `Vec::new()` was passed.
+- Behavioural change for callers that worked around EDGEAI-1303 by
+  patching pixel-space boxes to `[0, 1]` in-graph (e.g. a final
+  `Mul([1/W, 1/W, 1/W, 1/W])` node): if the schema also declares
+  `Detection::normalized = false` and the input spec carries known
+  W/H, the decoder will now divide a second time, producing
+  `[0, 1/W²]`-scale boxes that fail to decode. Migrate by removing
+  the in-graph workaround OR setting `normalized: true` in the
+  schema.
+
 ### Added
 
 - New `per_scale` decoder subsystem for schema-v2 per-scale models.
@@ -103,11 +137,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-scale TFLite schemas no longer require validator NumPy-NMS
   fallback; the HAL handles them natively.
 - `Decoder::decode()` and `Decoder::decode_proto()` no longer treat
-  `output_boxes.capacity()` as a `max_det` cap. The post-NMS detection
-  count is now bounded only by `Decoder::max_det` (default 300, set via
-  `DecoderBuilder::with_max_det`); capacity is purely an allocation
-  hint. Previously, callers passing `Vec::new()` (capacity 0) silently
-  received zero detections (EDGEAI-1302).
+  `output_boxes.capacity()` as a `max_det` cap on **any** of the
+  legacy YOLO paths (`YoloSegDet` combined-output, `YoloSplitSegDet`
+  three-output, `YoloSegDet2Way` split-detection). The post-NMS
+  detection count is now bounded only by `Decoder::max_det` (default
+  300, set via `DecoderBuilder::with_max_det`); capacity is purely an
+  allocation hint. Previously, callers passing `Vec::new()` (capacity
+  0) silently received zero detections, and callers passing
+  `Vec::with_capacity(N)` got an implicit per-call cap of `N`
+  (EDGEAI-1302). See **Breaking Changes** above for the workaround-migration
+  note.
 - `Decoder::decode()` no longer overwrites post-NMS bbox coordinates
   with the proto-grid-quantized roi from `protobox`. Returned bboxes
   are now bit-identical to those `Decoder::decode_proto()` produces
@@ -118,15 +157,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   describe the proto-grid-aligned crop region of the returned mask
   tensor, so the bbox and the mask region are independently
   consistent with their respective data.
-- HAL decoder now honours `Detection::normalized: false`. When the
+- HAL decoder now honours `Detection::normalized: false` across the
+  combined-`Detection` path **and** the three-output split path
+  (`Boxes` + `Scores` + `MaskCoefficients` + `Protos`) used by
+  vanilla Ultralytics ONNX `--export-split` exports. When the
   schema declares pixel-space boxes and the model input dimensions
-  are known (extracted from `inputs[0]` in v2 schemas), the decoder
-  divides bbox channels by `(W, H)` before NMS so `protobox` and
-  IoU semantics see normalized coords. Vanilla Ultralytics ONNX
-  exports no longer require an in-graph `Mul([1/W, ...])` workaround
-  (EDGEAI-1303). The `protobox` rejection message has been updated
-  to point users at `Detection::normalized = false` as the fix when
-  the schema lacks the model input spec.
+  are known (extracted from `input.shape` / `input.dshape` in v2
+  schemas), the decoder divides bbox channels by `(W, H)` before
+  NMS so `protobox` and IoU semantics see normalized coords. The
+  fallback handles partially-named dshapes (e.g. only `Width`
+  declared) by NHWC-positional inference of the missing axis instead
+  of silently disabling normalization (EDGEAI-1303). The `protobox`
+  rejection message now distinguishes "schema missing input spec"
+  from "schema declares normalized incorrectly" so the recommended
+  fix is actionable. See **Breaking Changes** above for the
+  in-graph-workaround migration note.
 
 ## [0.19.0] - 2026-05-05
 

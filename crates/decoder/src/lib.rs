@@ -447,17 +447,31 @@ impl DetectBox {
     }
 }
 
-/// A segmentation result with a segmentation mask, and a normalized bounding
-/// box representing the area that the segmentation mask covers
+/// A segmentation result paired with the normalized bounding box that
+/// describes the spatial extent of `segmentation`.
+///
+/// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the **mask region** —
+/// the proto-grid-aligned crop the [`segmentation`] tensor was sliced
+/// from. They are quantized to the proto grid step (`1/proto_height` and
+/// `1/proto_width`, typically `1/160`), so the region's origin floors and
+/// its extent ceils relative to the companion [`DetectBox`]'s `bbox`. The
+/// detection bbox itself stays un-snapped (see EDGEAI-1304); use
+/// `Segmentation` bounds for rendering masks, and `DetectBox.bbox` for
+/// IoU evaluation, drawing detection rectangles, etc. The mask region
+/// always encloses the detection bbox.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Segmentation {
-    /// left-most normalized coordinate of the segmentation box
+    /// Left-most normalized coordinate of the mask region (proto-grid
+    /// floor of the companion `DetectBox.bbox.xmin`).
     pub xmin: f32,
-    /// top-most normalized coordinate of the segmentation box
+    /// Top-most normalized coordinate of the mask region (proto-grid
+    /// floor of the companion `DetectBox.bbox.ymin`).
     pub ymin: f32,
-    /// right-most normalized coordinate of the segmentation box
+    /// Right-most normalized coordinate of the mask region (proto-grid
+    /// ceil of the companion `DetectBox.bbox.xmax`).
     pub xmax: f32,
-    /// bottom-most normalized coordinate of the segmentation box
+    /// Bottom-most normalized coordinate of the mask region (proto-grid
+    /// ceil of the companion `DetectBox.bbox.ymax`).
     pub ymax: f32,
     /// 3D segmentation array of shape `(H, W, C)`.
     ///
