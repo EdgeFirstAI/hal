@@ -38,6 +38,7 @@ env_logger = { workspace = true }
 image = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+safetensors = "0.7"
 
 [[bench]]
 name = "decoder_benchmark"

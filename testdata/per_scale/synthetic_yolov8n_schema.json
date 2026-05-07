@@ -1,0 +1,144 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "nms": "class_agnostic",
+  "input": {
+    "shape": [1, 640, 640, 3],
+    "dshape": [{"batch": 1}, {"height": 640}, {"width": 640}, {"num_features": 3}],
+    "cameraadaptor": "rgb"
+  },
+  "outputs": [
+    {
+      "name": "boxes",
+      "type": "boxes",
+      "shape": [1, 4, 8400],
+      "dshape": [{"batch": 1}, {"box_coords": 4}, {"num_boxes": 8400}],
+      "encoding": "dfl",
+      "decoder": "ultralytics",
+      "normalized": true,
+      "outputs": [
+        {
+          "name": "boxes_0",
+          "type": "boxes",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 64],
+          "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_features": 64}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.157, "zero_point": -42, "dtype": "int8"}
+        },
+        {
+          "name": "boxes_1",
+          "type": "boxes",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 64],
+          "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_features": 64}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.183, "zero_point": -38, "dtype": "int8"}
+        },
+        {
+          "name": "boxes_2",
+          "type": "boxes",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 64],
+          "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_features": 64}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.221, "zero_point": -33, "dtype": "int8"}
+        }
+      ]
+    },
+    {
+      "name": "scores",
+      "type": "scores",
+      "shape": [1, 80, 8400],
+      "dshape": [{"batch": 1}, {"num_classes": 80}, {"num_boxes": 8400}],
+      "decoder": "ultralytics",
+      "score_format": "per_class",
+      "outputs": [
+        {
+          "name": "scores_0",
+          "type": "scores",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 80],
+          "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_classes": 80}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+          "activation_required": "sigmoid"
+        },
+        {
+          "name": "scores_1",
+          "type": "scores",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 80],
+          "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_classes": 80}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+          "activation_required": "sigmoid"
+        },
+        {
+          "name": "scores_2",
+          "type": "scores",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 80],
+          "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_classes": 80}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+          "activation_required": "sigmoid"
+        }
+      ]
+    },
+    {
+      "name": "mask_coefs",
+      "type": "mask_coefs",
+      "shape": [1, 32, 8400],
+      "dshape": [{"batch": 1}, {"num_features": 32}, {"num_boxes": 8400}],
+      "decoder": "ultralytics",
+      "outputs": [
+        {
+          "name": "mask_coefs_0",
+          "type": "mask_coefs",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [1, 80, 80, 32],
+          "dshape": [{"batch": 1}, {"height": 80}, {"width": 80}, {"num_features": 32}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.0312, "zero_point": 4, "dtype": "int8"}
+        },
+        {
+          "name": "mask_coefs_1",
+          "type": "mask_coefs",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [1, 40, 40, 32],
+          "dshape": [{"batch": 1}, {"height": 40}, {"width": 40}, {"num_features": 32}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.0344, "zero_point": 6, "dtype": "int8"}
+        },
+        {
+          "name": "mask_coefs_2",
+          "type": "mask_coefs",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [1, 20, 20, 32],
+          "dshape": [{"batch": 1}, {"height": 20}, {"width": 20}, {"num_features": 32}],
+          "dtype": "int8",
+          "quantization": {"scale": 0.0379, "zero_point": 9, "dtype": "int8"}
+        }
+      ]
+    },
+    {
+      "name": "protos",
+      "type": "protos",
+      "shape": [1, 160, 160, 32],
+      "dshape": [{"batch": 1}, {"height": 160}, {"width": 160}, {"num_protos": 32}],
+      "stride": 4,
+      "dtype": "int8",
+      "quantization": {"scale": 0.0203, "zero_point": -83, "dtype": "int8"}
+    }
+  ]
+}

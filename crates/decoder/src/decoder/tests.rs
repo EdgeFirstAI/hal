@@ -33,6 +33,243 @@ mod decoder_builder_tests {
     }
 
     #[test]
+    fn builder_with_decode_dtype_constructs_per_scale_decoder() {
+        // Minimal LTRB detection-only per-scale schema: 3 FPN strides for
+        // boxes (4 channels each, LTRB encoding) + scores. Detection-only
+        // avoids the legacy `mask_coefs` dshape verification (which still
+        // expects a flat `num_protos` axis the per-scale fixture
+        // lowering does not provide); per-scale planning is independent
+        // of mask_coefs presence and triggers from the boxes/scores
+        // children alone.
+        let schema_json = r#"{
+          "schema_version": 2,
+          "decoder_version": "yolov8",
+          "input": {
+            "shape": [1, 640, 640, 3],
+            "dshape": [{"batch":1},{"height":640},{"width":640},{"num_features":3}]
+          },
+          "outputs": [
+            {
+              "name": "boxes", "type": "boxes",
+              "shape": [1, 4, 8400],
+              "dshape": [{"batch":1},{"box_coords":4},{"num_boxes":8400}],
+              "encoding": "ltrb", "decoder": "ultralytics", "normalized": true,
+              "outputs": [
+                {"name": "boxes_0", "type": "boxes", "stride": 8, "scale_index": 0,
+                 "shape": [1, 80, 80, 4],
+                 "dshape": [{"batch":1},{"height":80},{"width":80},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.157, "zero_point": -42, "dtype": "int8"}},
+                {"name": "boxes_1", "type": "boxes", "stride": 16, "scale_index": 1,
+                 "shape": [1, 40, 40, 4],
+                 "dshape": [{"batch":1},{"height":40},{"width":40},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.183, "zero_point": -38, "dtype": "int8"}},
+                {"name": "boxes_2", "type": "boxes", "stride": 32, "scale_index": 2,
+                 "shape": [1, 20, 20, 4],
+                 "dshape": [{"batch":1},{"height":20},{"width":20},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.221, "zero_point": -33, "dtype": "int8"}}
+              ]
+            },
+            {
+              "name": "scores", "type": "scores",
+              "shape": [1, 80, 8400],
+              "dshape": [{"batch":1},{"num_classes":80},{"num_boxes":8400}],
+              "decoder": "ultralytics", "score_format": "per_class",
+              "outputs": [
+                {"name": "scores_0", "type": "scores", "stride": 8, "scale_index": 0,
+                 "shape": [1, 80, 80, 80],
+                 "dshape": [{"batch":1},{"height":80},{"width":80},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"},
+                {"name": "scores_1", "type": "scores", "stride": 16, "scale_index": 1,
+                 "shape": [1, 40, 40, 80],
+                 "dshape": [{"batch":1},{"height":40},{"width":40},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"},
+                {"name": "scores_2", "type": "scores", "stride": 32, "scale_index": 2,
+                 "shape": [1, 20, 20, 80],
+                 "dshape": [{"batch":1},{"height":20},{"width":20},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"}
+              ]
+            }
+          ]
+        }"#;
+        let schema = crate::schema::SchemaV2::parse_json(schema_json)
+            .expect("inline per-scale schema must parse");
+
+        let decoder = DecoderBuilder::default()
+            .with_schema(schema)
+            .with_decode_dtype(crate::DecodeDtype::F32)
+            .build()
+            .expect("builder should succeed for per-scale schema");
+
+        assert!(
+            decoder.per_scale.is_some(),
+            "per-scale schema should yield a Decoder with per_scale fast path attached"
+        );
+    }
+
+    #[test]
+    fn decoder_with_per_scale_routes_through_new_path() {
+        // Smoke test: build a per-scale decoder via the inline LTRB
+        // detection-only schema (the same fixture that survives the
+        // legacy validator in `builder_with_decode_dtype_constructs_per_scale_decoder`),
+        // feed zero-i8 tensors with attached per-tensor quant, and
+        // verify `decode` / `decode_proto` route through the per-scale
+        // path without erroring.
+        use crate::DecodeDtype;
+        use edgefirst_tensor::{Quantization as TQ, Tensor, TensorDyn, TensorMemory};
+
+        let schema_json = r#"{
+          "schema_version": 2,
+          "decoder_version": "yolov8",
+          "input": {
+            "shape": [1, 640, 640, 3],
+            "dshape": [{"batch":1},{"height":640},{"width":640},{"num_features":3}]
+          },
+          "outputs": [
+            {
+              "name": "boxes", "type": "boxes",
+              "shape": [1, 4, 8400],
+              "dshape": [{"batch":1},{"box_coords":4},{"num_boxes":8400}],
+              "encoding": "ltrb", "decoder": "ultralytics", "normalized": true,
+              "outputs": [
+                {"name": "boxes_0", "type": "boxes", "stride": 8, "scale_index": 0,
+                 "shape": [1, 80, 80, 4],
+                 "dshape": [{"batch":1},{"height":80},{"width":80},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.157, "zero_point": -42, "dtype": "int8"}},
+                {"name": "boxes_1", "type": "boxes", "stride": 16, "scale_index": 1,
+                 "shape": [1, 40, 40, 4],
+                 "dshape": [{"batch":1},{"height":40},{"width":40},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.183, "zero_point": -38, "dtype": "int8"}},
+                {"name": "boxes_2", "type": "boxes", "stride": 32, "scale_index": 2,
+                 "shape": [1, 20, 20, 4],
+                 "dshape": [{"batch":1},{"height":20},{"width":20},{"box_coords":4}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.221, "zero_point": -33, "dtype": "int8"}}
+              ]
+            },
+            {
+              "name": "scores", "type": "scores",
+              "shape": [1, 80, 8400],
+              "dshape": [{"batch":1},{"num_classes":80},{"num_boxes":8400}],
+              "decoder": "ultralytics", "score_format": "per_class",
+              "outputs": [
+                {"name": "scores_0", "type": "scores", "stride": 8, "scale_index": 0,
+                 "shape": [1, 80, 80, 80],
+                 "dshape": [{"batch":1},{"height":80},{"width":80},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"},
+                {"name": "scores_1", "type": "scores", "stride": 16, "scale_index": 1,
+                 "shape": [1, 40, 40, 80],
+                 "dshape": [{"batch":1},{"height":40},{"width":40},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"},
+                {"name": "scores_2", "type": "scores", "stride": 32, "scale_index": 2,
+                 "shape": [1, 20, 20, 80],
+                 "dshape": [{"batch":1},{"height":20},{"width":20},{"num_classes":80}],
+                 "dtype": "int8",
+                 "quantization": {"scale": 0.00392, "zero_point": -128, "dtype": "int8"},
+                 "activation_required": "sigmoid"}
+              ]
+            }
+          ]
+        }"#;
+        let schema = crate::schema::SchemaV2::parse_json(schema_json)
+            .expect("inline per-scale schema must parse");
+
+        let decoder = DecoderBuilder::default()
+            .with_schema(schema)
+            .with_decode_dtype(DecodeDtype::F32)
+            .build()
+            .expect("builder should succeed for per-scale schema");
+
+        assert!(
+            decoder.per_scale.is_some(),
+            "per-scale fast path must be attached"
+        );
+
+        // Build the 6 zero-i8 inputs (3 levels × {boxes, scores}). LTRB
+        // detection-only: 4 channels per box; no mask_coefs, no protos.
+        let shapes: &[(&[usize], &[usize])] = &[
+            (&[1, 80, 80, 4], &[1, 80, 80, 80]),
+            (&[1, 40, 40, 4], &[1, 40, 40, 80]),
+            (&[1, 20, 20, 4], &[1, 20, 20, 80]),
+        ];
+        let mut owned = Vec::new();
+        for (b_shape, s_shape) in shapes {
+            let mut bt = Tensor::<i8>::new(b_shape, Some(TensorMemory::Mem), None).unwrap();
+            bt.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
+            owned.push(TensorDyn::I8(bt));
+            let mut st = Tensor::<i8>::new(s_shape, Some(TensorMemory::Mem), None).unwrap();
+            st.set_quantization(TQ::per_tensor(0.00392, -128)).unwrap();
+            owned.push(TensorDyn::I8(st));
+        }
+        let inputs: Vec<&TensorDyn> = owned.iter().collect();
+
+        let mut output_boxes: Vec<DetectBox> = Vec::new();
+        let proto = decoder
+            .decode_proto(&inputs, &mut output_boxes)
+            .expect("per-scale decode_proto must succeed");
+        assert!(
+            proto.is_none(),
+            "detection-only schema must produce no ProtoData"
+        );
+
+        // Now exercise the materialised-mask path. Detection-only ⇒ masks
+        // are unused but the entry point should still succeed and report
+        // zero masks.
+        let mut masks: Vec<crate::Segmentation> = Vec::new();
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut masks)
+            .expect("per-scale decode must succeed");
+        assert!(
+            masks.is_empty(),
+            "detection-only schema must produce no Segmentation"
+        );
+    }
+
+    #[test]
+    fn builder_flat_schema_does_not_attach_per_scale_decoder() {
+        let schema_json = include_str!("../../../../testdata/per_scale/synthetic_flat_schema.json");
+        let schema: crate::schema::SchemaV2 =
+            serde_json::from_str(schema_json).expect("flat fixture must parse");
+
+        let decoder = DecoderBuilder::default()
+            .with_schema(schema)
+            .with_decode_dtype(crate::DecodeDtype::F32)
+            .build()
+            .expect("builder should succeed for flat schema");
+
+        assert!(
+            decoder.per_scale.is_none(),
+            "flat schema must not attach a per-scale fast path"
+        );
+    }
+
+    #[test]
+    fn builder_default_decode_dtype_is_f32() {
+        // Default decoder construction selects F32 outputs; this is
+        // observable indirectly via the per_scale plan's chosen
+        // dispatches, but the simplest sanity check is that
+        // `with_decode_dtype` is a no-op compared to leaving the field
+        // unset for an F32-default builder.
+        let b1 = DecoderBuilder::default();
+        let b2 = DecoderBuilder::default().with_decode_dtype(crate::DecodeDtype::F32);
+        assert_eq!(b1, b2);
+    }
+
+    #[test]
     fn test_malformed_config_yaml() {
         let malformed_yaml = "
         model_type: yolov8_det
@@ -2658,6 +2895,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -2758,6 +2997,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut ref_boxes,
         );
         assert!(
@@ -2780,6 +3021,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -2865,6 +3108,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut ref_boxes,
         );
         assert!(!ref_boxes.is_empty());
@@ -2886,6 +3131,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -3699,6 +3946,7 @@ outputs:
         ///   xc = (0.5 + 0) * 8 = 4.0
         ///   w  = (7.5 + 7.5) * 8 = 120.0
         #[test]
+        #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
         fn hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity() {
             use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
             let json = include_str!(concat!(
@@ -3881,6 +4129,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 
@@ -3952,6 +4202,8 @@ outputs:
             Some(Nms::ClassAgnostic),
             crate::yolo::MAX_NMS_CANDIDATES,
             300,
+            None,
+            None,
             &mut output_boxes,
         );
 

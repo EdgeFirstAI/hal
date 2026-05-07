@@ -73,6 +73,7 @@ pub mod byte;
 pub mod error;
 pub mod float;
 pub mod modelpack;
+pub mod per_scale;
 pub mod schema;
 pub mod yolo;
 
@@ -81,6 +82,7 @@ pub use decoder::*;
 
 pub use configs::{DecoderVersion, Nms};
 pub use error::{DecoderError, DecoderResult};
+pub use per_scale::DecodeDtype;
 
 use crate::{
     decoder::configs::QuantTuple, modelpack::modelpack_segmentation_to_mask,
@@ -238,6 +240,24 @@ impl Quantization {
     /// ```
     pub fn new(scale: f32, zero_point: i32) -> Self {
         Self { scale, zero_point }
+    }
+
+    /// Returns a quantization that's a no-op: scale=1.0, zero_point=0.
+    ///
+    /// Used by the per-scale pipeline as a sentinel for float-to-float
+    /// passthrough cells where no affine transform is required.
+    /// # Examples
+    /// ```
+    /// # use edgefirst_decoder::Quantization;
+    /// let quant = Quantization::identity();
+    /// assert_eq!(quant.scale, 1.0);
+    /// assert_eq!(quant.zero_point, 0);
+    /// ```
+    pub fn identity() -> Self {
+        Self {
+            scale: 1.0,
+            zero_point: 0,
+        }
     }
 }
 
@@ -427,17 +447,31 @@ impl DetectBox {
     }
 }
 
-/// A segmentation result with a segmentation mask, and a normalized bounding
-/// box representing the area that the segmentation mask covers
+/// A segmentation result paired with the normalized bounding box that
+/// describes the spatial extent of `segmentation`.
+///
+/// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the **mask region** —
+/// the proto-grid-aligned crop the [`segmentation`] tensor was sliced
+/// from. They are quantized to the proto grid step (`1/proto_height` and
+/// `1/proto_width`, typically `1/160`), so the region's origin floors and
+/// its extent ceils relative to the companion [`DetectBox`]'s `bbox`. The
+/// detection bbox itself stays un-snapped (see EDGEAI-1304); use
+/// `Segmentation` bounds for rendering masks, and `DetectBox.bbox` for
+/// IoU evaluation, drawing detection rectangles, etc. The mask region
+/// always encloses the detection bbox.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Segmentation {
-    /// left-most normalized coordinate of the segmentation box
+    /// Left-most normalized coordinate of the mask region (proto-grid
+    /// floor of the companion `DetectBox.bbox.xmin`).
     pub xmin: f32,
-    /// top-most normalized coordinate of the segmentation box
+    /// Top-most normalized coordinate of the mask region (proto-grid
+    /// floor of the companion `DetectBox.bbox.ymin`).
     pub ymin: f32,
-    /// right-most normalized coordinate of the segmentation box
+    /// Right-most normalized coordinate of the mask region (proto-grid
+    /// ceil of the companion `DetectBox.bbox.xmax`).
     pub xmax: f32,
-    /// bottom-most normalized coordinate of the segmentation box
+    /// Bottom-most normalized coordinate of the mask region (proto-grid
+    /// ceil of the companion `DetectBox.bbox.ymax`).
     pub ymax: f32,
     /// 3D segmentation array of shape `(H, W, C)`.
     ///
@@ -1781,10 +1815,12 @@ mod decoder_tests {
         assert_eq!(output_boxes.len(), output_masks.len());
 
         for (b, m) in output_boxes.iter().zip(&output_masks) {
+            // Mask region is the proto-grid-aligned crop (floor for min,
+            // ceil for max), so it encloses the post-NMS bbox (EDGEAI-1304).
             assert!(b.bbox.xmin >= m.xmin);
             assert!(b.bbox.ymin >= m.ymin);
-            assert!(b.bbox.xmax >= m.xmax);
-            assert!(b.bbox.ymax >= m.ymax);
+            assert!(b.bbox.xmax <= m.xmax);
+            assert!(b.bbox.ymax <= m.ymax);
         }
         assert!(output_boxes[0].equal_within_delta(
             &DetectBox {
