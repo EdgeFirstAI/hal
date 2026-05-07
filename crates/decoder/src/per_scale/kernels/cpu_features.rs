@@ -101,6 +101,39 @@ impl CpuFeatures {
 mod tests {
     use super::*;
 
+    /// RAII guard that overrides an env var for the lifetime of the
+    /// guard, capturing the prior value on construction and restoring it
+    /// on drop. Restores even on panic, and treats "unset" as a distinct
+    /// state from "set to empty string" so we don't accidentally leave a
+    /// stray empty value behind.
+    ///
+    /// The repo runs tests with `--test-threads=1`, so the per-test
+    /// mutation is serialized with respect to other tests in this
+    /// process. The guard ensures we also don't leak state to test
+    /// invocations that follow this one (or to a developer's shell when
+    /// the env var was set externally before `cargo test`).
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn probe_does_not_panic() {
         let _ = CpuFeatures::probe();
@@ -117,22 +150,18 @@ mod tests {
 
     #[test]
     fn from_env_with_scalar_clears_all_simd() {
-        // SAFETY: tests in this module use serial_test or std::env::set_var (single-threaded).
-        // The repo runs tests with --test-threads=1 so racey env access is safe.
-        std::env::set_var("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
+        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "scalar");
         let f = CpuFeatures::from_env_or_probe().unwrap();
         assert!(!f.neon_baseline);
         assert!(!f.neon_fp16);
         assert!(!f.neon_dotprod);
         assert!(!f.avx2);
-        std::env::remove_var("EDGEFIRST_DECODER_FORCE_KERNEL");
     }
 
     #[test]
     fn from_env_with_unknown_tier_errors() {
-        std::env::set_var("EDGEFIRST_DECODER_FORCE_KERNEL", "wibble");
+        let _g = EnvGuard::set("EDGEFIRST_DECODER_FORCE_KERNEL", "wibble");
         let r = CpuFeatures::from_env_or_probe();
-        std::env::remove_var("EDGEFIRST_DECODER_FORCE_KERNEL");
         assert!(r.is_err());
     }
 }
