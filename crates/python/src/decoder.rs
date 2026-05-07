@@ -729,12 +729,13 @@ impl PyDecoder {
     /// Args:
     ///     model_output: List of output :class:`Tensor` from model inference.
     ///     max_boxes: Per-call **post-truncate cap** layered on top of the
-    ///         decoder's own :attr:`max_det` (default 300, set via the
-    ///         constructor's ``max_boxes`` analogue, the builder, or by
-    ///         assigning :attr:`max_det` directly). The smaller of the two
-    ///         wins. Also pre-allocates the underlying buffer; the Rust
-    ///         decoder does not use buffer capacity as a semantic cap
-    ///         (EDGEAI-1302). Default ``100``.
+    ///         decoder's own :attr:`max_det` (default 300; set by assigning
+    ///         to :attr:`max_det` on this instance). The smaller of the two
+    ///         wins. ``max_boxes`` also pre-allocates the underlying box /
+    ///         mask buffers; the Rust decoder does not use buffer capacity
+    ///         as a semantic cap (EDGEAI-1302). Default ``100``. Also see
+    ///         :attr:`max_det` for the decoder-side cap and
+    ///         :attr:`pre_nms_top_k` for the pre-NMS candidate cap.
     ///
     /// Returns:
     ///     Tuple ``(boxes, scores, classes, masks)`` where ``boxes`` is a

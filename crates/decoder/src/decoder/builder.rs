@@ -28,10 +28,15 @@ fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usiz
     use crate::configs::DimName;
     let mut h = None;
     let mut w = None;
+    // `SchemaV2::validate()` doesn't currently enforce
+    // `dshape.len() <= shape.len()`, so a malformed schema can trip an
+    // out-of-bounds index here. Use `shape.get(i)` to silently skip
+    // dshape entries that overflow the shape — the caller treats
+    // missing dims as "unknown" and disables EDGEAI-1303 normalization.
     for (i, (name, _)) in input.dshape.iter().enumerate() {
         match name {
-            DimName::Height => h = Some(input.shape[i]),
-            DimName::Width => w = Some(input.shape[i]),
+            DimName::Height => h = input.shape.get(i).copied(),
+            DimName::Width => w = input.shape.get(i).copied(),
             _ => {}
         }
     }
@@ -46,6 +51,75 @@ fn input_dims_from_spec(input: &crate::schema::InputSpec) -> Option<(usize, usiz
     match (w, h) {
         (Some(w), Some(h)) => Some((w, h)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod input_dims_from_spec_tests {
+    use super::input_dims_from_spec;
+    use crate::configs::DimName;
+    use crate::schema::InputSpec;
+
+    #[test]
+    fn named_dshape_resolves_dims() {
+        let spec = InputSpec {
+            shape: vec![1, 480, 640, 3],
+            dshape: vec![
+                (DimName::Batch, 1),
+                (DimName::Height, 480),
+                (DimName::Width, 640),
+                (DimName::NumFeatures, 3),
+            ],
+            cameraadaptor: None,
+        };
+        assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
+    }
+
+    #[test]
+    fn empty_dshape_falls_back_to_nhwc_for_4d() {
+        let spec = InputSpec {
+            shape: vec![1, 480, 640, 3],
+            dshape: vec![],
+            cameraadaptor: None,
+        };
+        assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
+    }
+
+    #[test]
+    fn malformed_dshape_longer_than_shape_does_not_panic() {
+        // Regression for Copilot review on PR #63: indexing
+        // `input.shape[i]` while iterating dshape can OOB-panic when
+        // `dshape.len() > shape.len()`. The fix uses `shape.get(i)`
+        // and silently treats overflow as "dim missing".
+        let spec = InputSpec {
+            shape: vec![640, 480], // 2-D shape
+            dshape: vec![
+                (DimName::Width, 640),
+                (DimName::Height, 480),
+                (DimName::NumFeatures, 3), // overflow — index 2 ≥ shape.len()
+            ],
+            cameraadaptor: None,
+        };
+        // First two dshape entries resolve via `shape.get()`; the third
+        // is a no-op. Width/Height both resolved, so we expect Some.
+        assert_eq!(input_dims_from_spec(&spec), Some((640, 480)));
+    }
+
+    #[test]
+    fn malformed_dshape_only_overflow_returns_none() {
+        // All dshape entries are past the shape boundary — width and
+        // height stay None and the 4-D NHWC fallback doesn't fire
+        // (shape.len() == 1), so we get None instead of a panic.
+        let spec = InputSpec {
+            shape: vec![1],
+            dshape: vec![
+                (DimName::NumFeatures, 3),
+                (DimName::Height, 480),
+                (DimName::Width, 640),
+            ],
+            cameraadaptor: None,
+        };
+        assert_eq!(input_dims_from_spec(&spec), None);
     }
 }
 
