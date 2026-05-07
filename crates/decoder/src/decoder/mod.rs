@@ -31,10 +31,7 @@ pub struct Decoder {
     /// This bound applies uniformly across all segmentation and detection
     /// decode paths reached via [`Decoder::decode`] / [`Decoder::decode_proto`].
     /// The output `Vec`'s capacity is only an allocation hint; the post-NMS
-    /// detection count is bounded solely by `max_det` (EDGEAI-1302). The
-    /// `pub fn decode_yolo_*` free convenience wrappers use a separate
-    /// constant ([`crate::yolo::DEFAULT_MAX_DETECTIONS`], also 300) and are
-    /// not affected by this field.
+    /// detection count is bounded solely by `max_det` (EDGEAI-1302).
     pub max_det: usize,
     /// Whether decoded boxes are in normalized [0,1] coordinates.
     /// - `Some(true)`: Coordinates in [0,1] range
@@ -230,6 +227,21 @@ pub use builder::DecoderBuilder;
 pub use config::{ConfigOutput, ConfigOutputRef, ConfigOutputs};
 
 impl Decoder {
+    /// Static label identifying which dispatch path `decode` / `decode_proto`
+    /// will take, used as a tracing-span attribute. Lets profiling tools
+    /// distinguish `per_scale` (the fast path), `decode_program` (schema-v2
+    /// merge), and `legacy` (config-driven) without requiring callers to
+    /// inspect the model.
+    fn decode_path_label(&self) -> &'static str {
+        if self.per_scale.is_some() {
+            "per_scale"
+        } else if self.decode_program.is_some() {
+            "decode_program"
+        } else {
+            "legacy"
+        }
+    }
+
     /// This function returns the parsed model type of the decoder.
     ///
     /// # Examples
@@ -867,6 +879,9 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
+        let path = self.decode_path_label();
+        let _span = tracing::trace_span!("Decoder::decode", path = path, n_outputs = outputs.len())
+            .entered();
         // Per-scale fast path — selected at builder time when the schema
         // declares per-scale children with DFL or LTRB encoding.
         if let Some(per_scale_mutex) = &self.per_scale {
@@ -947,6 +962,13 @@ impl Decoder {
         outputs: &[&edgefirst_tensor::TensorDyn],
         output_boxes: &mut Vec<DetectBox>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        let path = self.decode_path_label();
+        let _span = tracing::trace_span!(
+            "Decoder::decode_proto",
+            path = path,
+            n_outputs = outputs.len()
+        )
+        .entered();
         // Per-scale fast path — selected at builder time when the schema
         // declares per-scale children with DFL or LTRB encoding.
         if let Some(per_scale_mutex) = &self.per_scale {
