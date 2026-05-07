@@ -48,12 +48,21 @@ fn attach_per_tensor_quant_by_shape(
     expected_shape: &[usize],
     schema_q: &crate::schema::Quantization,
 ) -> DecoderResult<()> {
+    // Reject empty scale up-front so a malformed schema fails fast at
+    // attach time instead of silently looking "per-channel" here and
+    // surfacing as `QuantMissing` later at decode time.
+    if schema_q.scale.is_empty() {
+        return Err(DecoderError::InvalidShape(format!(
+            "apply_schema_quant: schema declares quantization for shape \
+             {expected_shape:?} but `scale` is empty"
+        )));
+    }
     if !schema_q.is_per_tensor() {
         // Per-channel — skip silently. The per-scale planner errors
         // separately when it actually needs to use a per-channel quant.
         return Ok(());
     }
-    let scale = *schema_q.scale.first().unwrap_or(&0.0);
+    let scale = schema_q.scale[0];
     let zp = schema_q.zero_point_at(0);
 
     for t in tensors.iter_mut() {
@@ -143,6 +152,32 @@ mod tests {
                     "tensor missing quant after apply"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn empty_scale_errors_instead_of_silently_skipping() {
+        // Regression for Copilot review on PR #63: an empty `scale`
+        // vector used to slip past `is_per_tensor()` and return Ok,
+        // masking a malformed schema until decode time.
+        use crate::schema::{DType, Quantization};
+        let bad_q = Quantization {
+            scale: vec![],
+            zero_point: None,
+            axis: None,
+            dtype: Some(DType::Int8),
+        };
+        let mut td =
+            TensorDyn::I8(Tensor::<i8>::new(&[1, 2, 3], Some(TensorMemory::Mem), None).unwrap());
+        let mut refs: Vec<&mut TensorDyn> = vec![&mut td];
+
+        let err = attach_per_tensor_quant_by_shape(&mut refs, &[1, 2, 3], &bad_q)
+            .expect_err("empty scale must be rejected");
+        match err {
+            DecoderError::InvalidShape(msg) => {
+                assert!(msg.contains("`scale` is empty"), "msg = {msg}")
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 
