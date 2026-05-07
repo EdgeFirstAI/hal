@@ -177,8 +177,10 @@ pub(crate) fn impl_modelpack_quant<
             quant_boxes,
         )
     };
-    let boxes = nms_int(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    let cap = output_boxes.capacity();
+    let cap_arg = (cap > 0).then_some(cap);
+    let boxes = nms_int(iou_threshold, cap_arg, boxes);
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(dequant_detect_box(&b, quant_scores));
@@ -208,8 +210,10 @@ pub(crate) fn impl_modelpack_float<
 {
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = nms_float(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    let cap = output_boxes.capacity();
+    let cap_arg = (cap > 0).then_some(cap);
+    let boxes = nms_float(iou_threshold, cap_arg, boxes);
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -237,8 +241,10 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         boxes_tensor.view(),
         scores_tensor.view(),
     );
-    let boxes = nms_float(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    let cap = output_boxes.capacity();
+    let cap_arg = (cap > 0).then_some(cap);
+    let boxes = nms_float(iou_threshold, cap_arg, boxes);
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -267,8 +273,10 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         boxes_tensor.view(),
         scores_tensor.view(),
     );
-    let boxes = nms_float(iou_threshold, boxes);
-    let len = output_boxes.capacity().min(boxes.len());
+    let cap = output_boxes.capacity();
+    let cap_arg = (cap > 0).then_some(cap);
+    let boxes = nms_float(iou_threshold, cap_arg, boxes);
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);

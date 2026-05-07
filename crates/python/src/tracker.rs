@@ -12,7 +12,7 @@ use numpy::{PyArrayLike1, PyArrayLike2};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use uuid::Uuid;
 
-#[pyclass(name = "TrackInfo", str, eq)]
+#[pyclass(name = "TrackInfo", str, eq, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PyTrackInfo {
     pub track: TrackInfo,
@@ -80,7 +80,7 @@ impl PyTrackInfo {
     }
 }
 
-#[pyclass(name = "ActiveTrackInfo", str, eq)]
+#[pyclass(name = "ActiveTrackInfo", str, eq, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PyActiveTrackInfo {
     pub track: ActiveTrackInfo<DetectBox>,
@@ -135,7 +135,7 @@ impl PyActiveTrackInfo {
     }
 }
 
-#[pyclass(name = "ByteTrack")]
+#[pyclass(name = "ByteTrack", from_py_object)]
 #[derive(Clone)]
 pub struct PyByteTrack {
     pub(crate) tracker: Arc<Mutex<ByteTrack<DetectBox>>>,

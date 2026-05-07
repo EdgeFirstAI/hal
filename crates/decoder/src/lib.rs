@@ -2641,7 +2641,7 @@ mod decoder_tests {
 
         // Class-aware NMS should keep both boxes (different classes, IoU ~0.47 >
         // threshold 0.3)
-        let result = nms_class_aware_float(0.3, boxes.clone());
+        let result = nms_class_aware_float(0.3, None, boxes.clone());
         assert_eq!(
             result.len(),
             2,
@@ -2672,7 +2672,7 @@ mod decoder_tests {
             },
         ];
 
-        let result = nms_class_aware_float(0.3, same_class_boxes);
+        let result = nms_class_aware_float(0.3, None, same_class_boxes);
         assert_eq!(
             result.len(),
             1,
@@ -2711,7 +2711,7 @@ mod decoder_tests {
         ];
 
         // Class-agnostic should suppress one (IoU ~0.47 > threshold 0.3)
-        let agnostic_result = nms_float(0.3, boxes.clone());
+        let agnostic_result = nms_float(0.3, None, boxes.clone());
         assert_eq!(
             agnostic_result.len(),
             1,
@@ -2719,7 +2719,7 @@ mod decoder_tests {
         );
 
         // Class-aware should keep both (different classes)
-        let aware_result = nms_class_aware_float(0.3, boxes);
+        let aware_result = nms_class_aware_float(0.3, None, boxes);
         assert_eq!(
             aware_result.len(),
             2,
@@ -2756,7 +2756,7 @@ mod decoder_tests {
         ];
 
         // Should keep both (different classes)
-        let result = nms_class_aware_int(0.5, boxes);
+        let result = nms_class_aware_int(0.5, None, boxes);
         assert_eq!(
             result.len(),
             2,

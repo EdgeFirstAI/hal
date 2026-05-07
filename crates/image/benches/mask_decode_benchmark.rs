@@ -375,7 +375,7 @@ fn save_to_safetensors(
         "YOLOv8n-seg post-NMS test data for mask decode benchmark".to_string(),
     );
 
-    let serialized = safetensors::tensor::serialize(tensors, &Some(metadata))
+    let serialized = safetensors::tensor::serialize(tensors, Some(metadata))
         .map_err(|e| format!("serialize: {e}"))?;
 
     std::fs::write(path, &serialized).map_err(|e| format!("write: {e}"))?;

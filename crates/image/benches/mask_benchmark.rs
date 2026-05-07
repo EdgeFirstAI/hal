@@ -154,6 +154,21 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
                 .map(|i| slice[i * num_protos..(i + 1) * num_protos].to_vec())
                 .collect()
         }
+        TensorDyn::I8(t) => {
+            let q = t.quantization().expect("i8 mask coefficients must carry quant");
+            let scale = q.scale()[0];
+            let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+            let m = t.map().unwrap();
+            let slice = m.as_slice();
+            (0..detect.len())
+                .map(|i| {
+                    slice[i * num_protos..(i + 1) * num_protos]
+                        .iter()
+                        .map(|v| (*v as f32 - zp) * scale)
+                        .collect()
+                })
+                .collect()
+        }
         other => panic!(
             "unsupported mask_coeff dtype for benchmark: {:?}",
             other.dtype()
@@ -256,6 +271,16 @@ fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (Proto
         TensorDyn::F16(t) => {
             let m = t.map().unwrap();
             m.as_slice().iter().map(|v: &f16| v.to_f32()).collect()
+        }
+        TensorDyn::I8(t) => {
+            let q = t.quantization().expect("i8 mask coefficients must carry quant");
+            let scale = q.scale()[0];
+            let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+            let m = t.map().unwrap();
+            m.as_slice()
+                .iter()
+                .map(|v| (*v as f32 - zp) * scale)
+                .collect()
         }
         _ => panic!("unexpected coefficient dtype"),
     };

@@ -85,8 +85,17 @@ pub fn postprocess_boxes_index_float<
 
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
+///
+/// If `max_det` is `Some(n)`, the greedy loop stops as soon as `n` survivors
+/// have been confirmed. Because the input is sorted descending, the first `n`
+/// survivors are the highest-scoring `n`, so the post-NMS top-`n` is preserved
+/// without iterating the full O(N²) suppression loop.
 #[must_use]
-pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+pub fn nms_float(
+    iou: f32,
+    max_det: Option<usize>,
+    mut boxes: Vec<DetectBox>,
+) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -94,8 +103,17 @@ pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
+
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -115,9 +133,18 @@ pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
                 boxes[j].score = -1.0;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    // Filter out suppressed boxes.
-    boxes.into_iter().filter(|b| b.score >= 0.0).collect()
+    // Filter out suppressed boxes; cap at `max_det` because boxes after the
+    // break may still hold positive scores but score lower than every survivor.
+    boxes
+        .into_iter()
+        .filter(|b| b.score >= 0.0)
+        .take(cap)
+        .collect()
 }
 
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
@@ -128,6 +155,7 @@ pub fn nms_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
 #[must_use]
 pub fn nms_extra_float<E: Send + Sync>(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     // Boxes get sorted by score in descending order so we know based on the
@@ -137,8 +165,17 @@ pub fn nms_extra_float<E: Send + Sync>(
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
+
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
 
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
@@ -158,10 +195,19 @@ pub fn nms_extra_float<E: Send + Sync>(
                 boxes[j].0.score = -1.0;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
 
-    // Filter out suppressed boxes.
-    boxes.into_iter().filter(|b| b.0.score >= 0.0).collect()
+    // Filter out suppressed boxes; cap at `max_det` for the same reason as
+    // `nms_float`.
+    boxes
+        .into_iter()
+        .filter(|b| b.0.score >= 0.0)
+        .take(cap)
+        .collect()
 }
 
 /// Class-aware NMS: only suppress boxes with the same label.
@@ -186,16 +232,29 @@ pub fn nms_extra_float<E: Send + Sync>(
 ///     }, // different class
 /// ];
 /// // Both boxes survive because they have different labels
-/// let result = nms_class_aware_float(0.3, boxes);
+/// let result = nms_class_aware_float(0.3, None, boxes);
 /// assert_eq!(result.len(), 2);
 /// ```
 #[must_use]
-pub fn nms_class_aware_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+pub fn nms_class_aware_float(
+    iou: f32,
+    max_det: Option<usize>,
+    mut boxes: Vec<DetectBox>,
+) -> Vec<DetectBox> {
     boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
 
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
+
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
 
     for i in 0..boxes.len() {
         if boxes[i].score < 0.0 {
@@ -210,8 +269,16 @@ pub fn nms_class_aware_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectB
                 boxes[j].score = -1.0;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    boxes.into_iter().filter(|b| b.score >= 0.0).collect()
+    boxes
+        .into_iter()
+        .filter(|b| b.score >= 0.0)
+        .take(cap)
+        .collect()
 }
 
 /// Class-aware NMS with extra data: only suppress boxes with the same label.
@@ -221,6 +288,7 @@ pub fn nms_class_aware_float(iou: f32, mut boxes: Vec<DetectBox>) -> Vec<DetectB
 #[must_use]
 pub fn nms_extra_class_aware_float<E: Send + Sync>(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     boxes.par_sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
@@ -228,8 +296,17 @@ pub fn nms_extra_class_aware_float<E: Send + Sync>(
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
+
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
 
     for i in 0..boxes.len() {
         if boxes[i].0.score < 0.0 {
@@ -246,8 +323,16 @@ pub fn nms_extra_class_aware_float<E: Send + Sync>(
                 boxes[j].0.score = -1.0;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    boxes.into_iter().filter(|b| b.0.score >= 0.0).collect()
+    boxes
+        .into_iter()
+        .filter(|b| b.0.score >= 0.0)
+        .take(cap)
+        .collect()
 }
 
 /// Returns true if the IOU of the given bounding boxes is greater than the iou
