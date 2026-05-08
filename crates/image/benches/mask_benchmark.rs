@@ -155,7 +155,9 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
                 .collect()
         }
         TensorDyn::I8(t) => {
-            let q = t.quantization().expect("i8 mask coefficients must carry quant");
+            let q = t
+                .quantization()
+                .expect("i8 mask coefficients must carry quant");
             let scale = q.scale()[0];
             let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
             let m = t.map().unwrap();
@@ -273,7 +275,9 @@ fn build_proto_dtypes(detect: &[DetectBox], proto_data_i8: &ProtoData) -> (Proto
             m.as_slice().iter().map(|v: &f16| v.to_f32()).collect()
         }
         TensorDyn::I8(t) => {
-            let q = t.quantization().expect("i8 mask coefficients must carry quant");
+            let q = t
+                .quantization()
+                .expect("i8 mask coefficients must carry quant");
             let scale = q.scale()[0];
             let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
             let m = t.map().unwrap();
