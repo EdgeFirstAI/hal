@@ -39,11 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ndarray-stats` 0.6.0 → 0.7.0 (tracks ndarray 0.17).
   - `pyo3` / `pyo3-build-config` 0.26 → 0.28.3, `numpy` 0.26 → 0.28.0,
     `pythonize` 0.26 → 0.28.0. Forced by ndarray bump (numpy 0.28 is
-    the first release supporting ndarray 0.17). Build emits 21
-    deprecation warnings for downstream cleanup
-    (`#[pyclass(from_py_object)]` opt-in, `Bound::cast` over
-    `downcast`, `Bound::from_owned_ptr_or_err` over
-    `Py::from_owned_ptr_or_err`); none affect runtime behaviour.
+    the first release supporting ndarray 0.17). All PyO3 0.27/0.28
+    migration items addressed: `#[pyclass(from_py_object)]` opt-in
+    added for `Clone` types, `Bound::from_owned_ptr_or_err` replaces
+    `Py::from_owned_ptr_or_err`, `.cast()` replaces `.downcast()`.
+    No deprecation warnings remain.
   - `nalgebra` 0.32.6 → 0.34.2. `Allocator<R, U8, U8>` /
     `Allocator<R, U8>` trait bounds in `tracker::kalman` migrated
     to the 2-generic form (`Allocator<U8, U8>` / `Allocator<U8>`)

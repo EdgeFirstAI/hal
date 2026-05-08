@@ -39,6 +39,7 @@ image = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 safetensors = { workspace = true }
+zip = { workspace = true }
 
 [[bench]]
 name = "decoder_benchmark"
