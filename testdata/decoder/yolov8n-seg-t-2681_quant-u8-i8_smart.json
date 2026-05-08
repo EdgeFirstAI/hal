@@ -1,0 +1,538 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "name": "yolov8n-seg",
+  "description": "",
+  "author": "AuZone Technologies Inc",
+  "host": {
+    "studio_server": "test.edgefirst.studio",
+    "project_id": "",
+    "session": "t-2681",
+    "username": "sebastien"
+  },
+  "dataset": {
+    "name": "",
+    "id": "ds-2bcd",
+    "classes": [
+      "person",
+      "bicycle",
+      "car",
+      "motorcycle",
+      "airplane",
+      "bus",
+      "train",
+      "truck",
+      "boat",
+      "traffic light",
+      "fire hydrant",
+      "stop sign",
+      "parking meter",
+      "bench",
+      "bird",
+      "cat",
+      "dog",
+      "horse",
+      "sheep",
+      "cow",
+      "elephant",
+      "bear",
+      "zebra",
+      "giraffe",
+      "backpack",
+      "umbrella",
+      "handbag",
+      "tie",
+      "suitcase",
+      "frisbee",
+      "skis",
+      "snowboard",
+      "sports ball",
+      "kite",
+      "baseball bat",
+      "baseball glove",
+      "skateboard",
+      "surfboard",
+      "tennis racket",
+      "bottle",
+      "wine glass",
+      "cup",
+      "fork",
+      "knife",
+      "spoon",
+      "bowl",
+      "banana",
+      "apple",
+      "sandwich",
+      "orange",
+      "broccoli",
+      "carrot",
+      "hot dog",
+      "pizza",
+      "donut",
+      "cake",
+      "chair",
+      "couch",
+      "potted plant",
+      "bed",
+      "dining table",
+      "toilet",
+      "tv",
+      "laptop",
+      "mouse",
+      "remote",
+      "keyboard",
+      "cell phone",
+      "microwave",
+      "oven",
+      "toaster",
+      "sink",
+      "refrigerator",
+      "book",
+      "clock",
+      "vase",
+      "scissors",
+      "teddy bear",
+      "hair drier",
+      "toothbrush"
+    ]
+  },
+  "input": {
+    "shape": [
+      1,
+      640,
+      640,
+      3
+    ],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "name": "yolov8n-seg-t-2681",
+    "version": "8.4.9+edgefirst-1.7.0",
+    "task": "segmentation",
+    "size": "nano",
+    "detection": false,
+    "segmentation": true,
+    "anchors": null,
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.7,
+    "score": 0.001,
+    "nms": "numpy",
+    "preprocessing": "letterbox",
+    "normalization": "unsigned"
+  },
+  "nms": "class_agnostic",
+  "calibration": "calibration-ds-2bcd-546a1b7e.safetensors",
+  "outputs": [
+    {
+      "name": "boxes",
+      "type": "boxes",
+      "decoder": "ultralytics",
+      "normalized": true,
+      "encoding": "dfl",
+      "shape": [
+        1,
+        4,
+        8400
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "box_coords": 4
+        },
+        {
+          "num_boxes": 8400
+        }
+      ],
+      "outputs": [
+        {
+          "name": "boxes_0",
+          "type": "boxes",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [
+            1,
+            80,
+            80,
+            64
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.15675102174282074,
+            "zero_point": -42,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 80
+            },
+            {
+              "width": 80
+            },
+            {
+              "num_features": 64
+            }
+          ]
+        },
+        {
+          "name": "boxes_1",
+          "type": "boxes",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [
+            1,
+            40,
+            40,
+            64
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.10665248334407806,
+            "zero_point": -36,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 40
+            },
+            {
+              "width": 40
+            },
+            {
+              "num_features": 64
+            }
+          ]
+        },
+        {
+          "name": "boxes_2",
+          "type": "boxes",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [
+            1,
+            20,
+            20,
+            64
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.09433665871620178,
+            "zero_point": -30,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 20
+            },
+            {
+              "width": 20
+            },
+            {
+              "num_features": 64
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "scores",
+      "type": "scores",
+      "decoder": "ultralytics",
+      "score_format": "per_class",
+      "activation_required": "sigmoid",
+      "shape": [
+        1,
+        80,
+        8400
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_classes": 80
+        },
+        {
+          "num_boxes": 8400
+        }
+      ],
+      "outputs": [
+        {
+          "name": "scores_0",
+          "type": "scores",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [
+            1,
+            80,
+            80,
+            80
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.17828580737113953,
+            "zero_point": 108,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 80
+            },
+            {
+              "width": 80
+            },
+            {
+              "num_features": 80
+            }
+          ]
+        },
+        {
+          "name": "scores_1",
+          "type": "scores",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [
+            1,
+            40,
+            40,
+            80
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.20310944318771362,
+            "zero_point": 112,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 40
+            },
+            {
+              "width": 40
+            },
+            {
+              "num_features": 80
+            }
+          ]
+        },
+        {
+          "name": "scores_2",
+          "type": "scores",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [
+            1,
+            20,
+            20,
+            80
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.23862163722515106,
+            "zero_point": 112,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 20
+            },
+            {
+              "width": 20
+            },
+            {
+              "num_features": 80
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mask_coefs",
+      "type": "mask_coefs",
+      "decoder": "ultralytics",
+      "shape": [
+        1,
+        32,
+        8400
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_protos": 32
+        },
+        {
+          "num_boxes": 8400
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask_coefs_0",
+          "type": "mask_coefs",
+          "stride": 8,
+          "scale_index": 0,
+          "shape": [
+            1,
+            80,
+            80,
+            32
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.025366559624671936,
+            "zero_point": 31,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 80
+            },
+            {
+              "width": 80
+            },
+            {
+              "num_features": 32
+            }
+          ]
+        },
+        {
+          "name": "mask_coefs_1",
+          "type": "mask_coefs",
+          "stride": 16,
+          "scale_index": 1,
+          "shape": [
+            1,
+            40,
+            40,
+            32
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.02405855432152748,
+            "zero_point": 32,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 40
+            },
+            {
+              "width": 40
+            },
+            {
+              "num_features": 32
+            }
+          ]
+        },
+        {
+          "name": "mask_coefs_2",
+          "type": "mask_coefs",
+          "stride": 32,
+          "scale_index": 2,
+          "shape": [
+            1,
+            20,
+            20,
+            32
+          ],
+          "dtype": "int8",
+          "quantization": {
+            "scale": 0.024424202740192413,
+            "zero_point": 35,
+            "dtype": "int8"
+          },
+          "dshape": [
+            {
+              "batch": 1
+            },
+            {
+              "height": 20
+            },
+            {
+              "width": 20
+            },
+            {
+              "num_features": 32
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "output_1",
+      "type": "protos",
+      "shape": [
+        1,
+        160,
+        160,
+        32
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "height": 160
+        },
+        {
+          "width": 160
+        },
+        {
+          "num_protos": 32
+        }
+      ],
+      "dtype": "int8",
+      "decoder": "ultralytics",
+      "stride": 4,
+      "quantization": {
+        "scale": 0.03072291798889637,
+        "zero_point": -119,
+        "dtype": "int8"
+      }
+    }
+  ],
+  "tflite_quantizer": {
+    "version": "0.4.2",
+    "timestamp": "2026-05-07T01:38:03.041229+00:00",
+    "task": "bt-449c",
+    "tensorflow_version": "2.21.0",
+    "splits_applied": [
+      "quantization_split"
+    ],
+    "input_dtype": "uint8",
+    "output_dtype": "int8",
+    "calibration": "calibration-ds-2bcd-546a1b7e.safetensors",
+    "calibration_samples": 500,
+    "quantizer": "mlir"
+  }
+}
