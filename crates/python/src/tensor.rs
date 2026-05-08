@@ -72,7 +72,7 @@ impl From<Error> for PyErr {
     }
 }
 
-#[pyclass(name = "TensorMemory", eq, eq_int)]
+#[pyclass(name = "TensorMemory", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum PyTensorMemory {
@@ -364,7 +364,7 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
     ) -> Result<()> {
         let py = src.py();
         let arr = src
-            .downcast::<numpy::PyArrayDyn<T>>()
+            .cast::<numpy::PyArrayDyn<T>>()
             .map_err(|_| Error::Format("numpy dtype does not match tensor dtype".to_string()))?;
 
         let readonly = arr.readonly();
@@ -583,7 +583,7 @@ fn copy_numpy_to_tensor_dyn(src: &Bound<'_, pyo3::types::PyAny>, tensor: &Tensor
                 let contig_obj = np
                     .call_method1("ascontiguousarray", (src,))
                     .map_err(|e| Error::Format(format!("np.ascontiguousarray failed: {e}")))?;
-                let contig_arr = contig_obj.downcast::<numpy::PyArrayDyn<T>>().map_err(|_| {
+                let contig_arr = contig_obj.cast::<numpy::PyArrayDyn<T>>().map_err(|_| {
                     Error::Format("np.ascontiguousarray returned the wrong dtype".to_string())
                 })?;
                 let contig_readonly = contig_arr.readonly();
@@ -930,7 +930,7 @@ impl PyTensor {
 /// per-channel asymmetric. Construct via the ``per_tensor`` /
 /// ``per_tensor_symmetric`` / ``per_channel`` / ``per_channel_symmetric``
 /// static methods.
-#[pyclass(name = "Quantization", str)]
+#[pyclass(name = "Quantization", str, from_py_object)]
 #[derive(Clone)]
 pub struct PyQuantization(pub(crate) edgefirst_hal::tensor::Quantization);
 
@@ -1175,6 +1175,6 @@ impl PyTensorMap {
             )
         };
 
-        unsafe { Py::<PyAny>::from_owned_ptr_or_err(py, mem) }
+        unsafe { Bound::<PyAny>::from_owned_ptr_or_err(py, mem) }.map(Bound::unbind)
     }
 }

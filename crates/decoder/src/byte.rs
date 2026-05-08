@@ -491,6 +491,7 @@ fn postprocess_boxes_index_quant_column_major<
 #[must_use]
 pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     // Boxes get sorted by score in descending order so we know based on the
@@ -501,10 +502,18 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
 
     let min_val = SCORE::min_value();
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].score <= min_val {
@@ -524,9 +533,18 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
                 boxes[j].score = min_val;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    // Filter out boxes that were suppressed.
-    boxes.into_iter().filter(|b| b.score > min_val).collect()
+    // Filter out boxes that were suppressed; cap because boxes after the
+    // break may still hold positive scores but are all lower than survivors.
+    boxes
+        .into_iter()
+        .filter(|b| b.score > min_val)
+        .take(cap)
+        .collect()
 }
 
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
@@ -538,6 +556,7 @@ pub fn nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 #[must_use]
 pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     // Boxes get sorted by score in descending order so we know based on the
@@ -547,10 +566,18 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
 
     let min_val = SCORE::min_value();
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
     // Outer loop over all boxes.
     for i in 0..boxes.len() {
         if boxes[i].0.score <= min_val {
@@ -569,10 +596,18 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
                 boxes[j].0.score = min_val;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
 
-    // Filter out boxes that were suppressed.
-    boxes.into_iter().filter(|b| b.0.score > min_val).collect()
+    // Filter out boxes that were suppressed; cap at `max_det`.
+    boxes
+        .into_iter()
+        .filter(|b| b.0.score > min_val)
+        .take(cap)
+        .collect()
 }
 
 /// Class-aware NMS for quantized boxes: only suppress boxes with the same
@@ -585,6 +620,7 @@ pub fn nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + 
 #[must_use]
 pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     boxes.par_sort_by(|a, b| b.score.cmp(&a.score));
@@ -592,10 +628,18 @@ pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
 
     let min_val = SCORE::min_value();
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
     for i in 0..boxes.len() {
         if boxes[i].score <= min_val {
             continue;
@@ -609,8 +653,16 @@ pub fn nms_class_aware_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
                 boxes[j].score = min_val;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    boxes.into_iter().filter(|b| b.score > min_val).collect()
+    boxes
+        .into_iter()
+        .filter(|b| b.score > min_val)
+        .take(cap)
+        .collect()
 }
 
 /// Class-aware NMS for quantized boxes with extra data: only suppress boxes
@@ -625,6 +677,7 @@ pub fn nms_extra_class_aware_int<
     E: Send + Sync,
 >(
     iou: f32,
+    max_det: Option<usize>,
     mut boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     boxes.par_sort_by(|a, b| b.0.score.cmp(&a.0.score));
@@ -632,10 +685,18 @@ pub fn nms_extra_class_aware_int<
     // When the iou is 1.0 or larger, no boxes will be filtered so we just return
     // immediately
     if iou >= 1.0 {
-        return boxes;
+        return match max_det {
+            Some(n) => {
+                boxes.truncate(n);
+                boxes
+            }
+            None => boxes,
+        };
     }
 
     let min_val = SCORE::min_value();
+    let cap = max_det.unwrap_or(usize::MAX);
+    let mut survivors: usize = 0;
     for i in 0..boxes.len() {
         if boxes[i].0.score <= min_val {
             continue;
@@ -651,8 +712,16 @@ pub fn nms_extra_class_aware_int<
                 boxes[j].0.score = min_val;
             }
         }
+        survivors += 1;
+        if survivors >= cap {
+            break;
+        }
     }
-    boxes.into_iter().filter(|b| b.0.score > min_val).collect()
+    boxes
+        .into_iter()
+        .filter(|b| b.0.score > min_val)
+        .take(cap)
+        .collect()
 }
 
 /// Quantizes a score from f32 to the given integer type, using the following
@@ -803,5 +872,56 @@ mod tests {
             assert_eq!(row.0.score, col.0.score, "i8 candidate {i}: score mismatch");
             assert_eq!(row.1, col.1, "i8 candidate {i}: index mismatch");
         }
+    }
+
+    /// Helper: create `n` non-overlapping boxes with descending u8 scores.
+    fn make_nms_boxes_int(n: usize) -> Vec<DetectBoxQuantized<u8>> {
+        (0..n)
+            .map(|i| DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: i as f32 * 100.0,
+                    ymin: 0.0,
+                    xmax: i as f32 * 100.0 + 10.0,
+                    ymax: 10.0,
+                },
+                label: 0,
+                score: (200 - i as u32).min(255) as u8,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nms_int_max_det_matches_full_truncated() {
+        let boxes = make_nms_boxes_int(20);
+        let n = 5;
+        let full = nms_int(0.5, None, boxes.clone());
+        let capped = nms_int(0.5, Some(n), boxes);
+        assert_eq!(capped.len(), n);
+        assert_eq!(&full[..n], &capped[..]);
+    }
+
+    #[test]
+    fn nms_int_max_det_zero_returns_empty() {
+        let boxes = make_nms_boxes_int(10);
+        let result = nms_int(0.5, Some(0), boxes);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn nms_int_max_det_iou_ge_1_returns_sorted_truncated() {
+        let boxes = make_nms_boxes_int(10);
+        let result = nms_int(1.0, Some(3), boxes);
+        assert_eq!(result.len(), 3);
+        // Scores should be in descending order (sorted).
+        assert!(result[0].score >= result[1].score);
+        assert!(result[1].score >= result[2].score);
+    }
+
+    #[test]
+    fn nms_int_max_det_larger_than_input() {
+        let boxes = make_nms_boxes_int(5);
+        let full = nms_int(0.5, None, boxes.clone());
+        let capped = nms_int(0.5, Some(100), boxes);
+        assert_eq!(full.len(), capped.len());
     }
 }

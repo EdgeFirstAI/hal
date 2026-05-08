@@ -125,7 +125,7 @@ pub enum ImageDest3<'py> {
 /// Pixel format for image tensors.
 ///
 /// Each variant maps directly to an `edgefirst_tensor::PixelFormat` value.
-#[pyclass(name = "PixelFormat", eq, eq_int)]
+#[pyclass(name = "PixelFormat", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyPixelFormat {
     Rgb = 1,
@@ -205,7 +205,7 @@ impl TryFrom<PixelFormat> for PyPixelFormat {
     }
 }
 
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum Normalization {
@@ -803,7 +803,7 @@ fn normalize_to_float_64<'py>(
 }
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
-#[pyclass(name = "EglDisplayKind", eq, eq_int)]
+#[pyclass(name = "EglDisplayKind", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyEglDisplayKind {
     Gbm,
@@ -1339,7 +1339,7 @@ impl PyImageProcessor {
     }
 }
 
-#[pyclass(name = "Rotation", eq, eq_int)]
+#[pyclass(name = "Rotation", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyRotation {
     Rotate0 = 0,
@@ -1373,7 +1373,7 @@ impl From<PyRotation> for Rotation {
     }
 }
 
-#[pyclass(name = "Flip", eq, eq_int)]
+#[pyclass(name = "Flip", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyFlip {
     NoFlip = 0,
@@ -1391,7 +1391,7 @@ impl From<PyFlip> for Flip {
     }
 }
 
-#[pyclass(name = "Rect", eq)]
+#[pyclass(name = "Rect", eq, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PyRect {
     #[pyo3(get, set)]
@@ -1435,7 +1435,7 @@ impl From<PyRect> for Rect {
 /// - ``Instance`` — color is chosen by detection index (each detected object
 ///   gets a unique color regardless of class)
 /// - ``Track`` — color is chosen by track ID (use with object tracking)
-#[pyclass(name = "ColorMode", eq, eq_int)]
+#[pyclass(name = "ColorMode", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyColorMode {
     Class = 0,
@@ -1468,7 +1468,7 @@ impl From<PyColorMode> for image::ColorMode {
 ///   is also passed to ``materialize_masks``, ``(width, height)`` are
 ///   interpreted as original-content pixel dims and the inverse letterbox
 ///   transform is applied during the upsample.
-#[pyclass(name = "MaskResolution")]
+#[pyclass(name = "MaskResolution", from_py_object)]
 #[derive(Debug, Clone, Copy)]
 pub struct PyMaskResolution(pub(crate) MaskResolution);
 

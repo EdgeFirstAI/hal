@@ -10,8 +10,8 @@ use nalgebra::{
 pub struct ConstantVelocityXYAHModel2<R>
 where
     R: RealField,
-    DefaultAllocator: Allocator<R, U8, U8>,
-    DefaultAllocator: Allocator<R, U8>,
+    DefaultAllocator: Allocator<U8, U8>,
+    DefaultAllocator: Allocator<U8>,
 {
     pub mean: SVector<R, 8>,
     pub std_weight_position: R,
