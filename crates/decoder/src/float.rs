@@ -358,3 +358,62 @@ pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
 
     intersection > iou * union
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BoundingBox;
+
+    /// Helper: create `n` non-overlapping boxes with descending f32 scores.
+    fn make_nms_boxes_float(n: usize) -> Vec<DetectBox> {
+        (0..n)
+            .map(|i| DetectBox {
+                bbox: BoundingBox {
+                    xmin: i as f32 * 100.0,
+                    ymin: 0.0,
+                    xmax: i as f32 * 100.0 + 10.0,
+                    ymax: 10.0,
+                },
+                label: 0,
+                score: 1.0 - i as f32 * 0.01,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nms_float_max_det_matches_full_truncated() {
+        let boxes = make_nms_boxes_float(20);
+        let n = 5;
+        let full = nms_float(0.5, None, boxes.clone());
+        let capped = nms_float(0.5, Some(n), boxes);
+        assert_eq!(capped.len(), n);
+        for (f, c) in full[..n].iter().zip(capped.iter()) {
+            assert_eq!(f.bbox, c.bbox);
+            assert_eq!(f.score, c.score);
+        }
+    }
+
+    #[test]
+    fn nms_float_max_det_zero_returns_empty() {
+        let boxes = make_nms_boxes_float(10);
+        let result = nms_float(0.5, Some(0), boxes);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn nms_float_max_det_iou_ge_1_returns_sorted_truncated() {
+        let boxes = make_nms_boxes_float(10);
+        let result = nms_float(1.0, Some(3), boxes);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].score >= result[1].score);
+        assert!(result[1].score >= result[2].score);
+    }
+
+    #[test]
+    fn nms_float_max_det_larger_than_input() {
+        let boxes = make_nms_boxes_float(5);
+        let full = nms_float(0.5, None, boxes.clone());
+        let capped = nms_float(0.5, Some(100), boxes);
+        assert_eq!(full.len(), capped.len());
+    }
+}

@@ -8,7 +8,6 @@ use edgefirst_decoder::{
     byte::{nms_int, postprocess_boxes_quant},
     configs, dequant_detect_box, dequantize_cpu, dequantize_cpu_chunked, dequantize_ndarray,
     float::{nms_float, postprocess_boxes_float},
-    modelpack::{decode_modelpack_det, decode_modelpack_split_quant, ModelPackDetectionConfig},
     per_scale::DecodeDtype,
     schema::SchemaV2,
     ConfigOutput, DecoderBuilder, Nms, Quantization, XYWH,
@@ -294,30 +293,53 @@ fn bench_modelpack_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
     let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
-    let boxes = ndarray::Array2::from_shape_vec((1935, 4), boxes.to_vec()).unwrap();
+    let boxes_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(boxes, &[1, 1935, 1, 4]).unwrap());
 
     let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
-    let scores = ndarray::Array2::from_shape_vec((1935, 1), scores.to_vec()).unwrap();
+    let scores_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(scores, &[1, 1935, 1]).unwrap());
 
-    let quant_boxes = Quantization {
-        scale: 0.004656755365431309,
-        zero_point: 21,
-    };
+    let quant_boxes: configs::QuantTuple = (0.004656755365431309, 21).into();
+    let quant_scores: configs::QuantTuple = (0.0019603664986789227, 0).into();
 
-    let quant_scores = Quantization {
-        scale: 0.0019603664986789227,
-        zero_point: 0,
-    };
-
-    let mut output_boxes: Vec<_> = Vec::with_capacity(50);
-    let result = run_bench("decoder/modelpack/u8", WARMUP, ITERATIONS, || {
-        decode_modelpack_det(
-            (boxes.view(), quant_boxes),
-            (scores.view(), quant_scores),
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
+    let decoder = DecoderBuilder::default()
+        .with_config_modelpack_det(
+            configs::Boxes {
+                decoder: configs::DecoderType::ModelPack,
+                quantization: Some(quant_boxes),
+                shape: vec![1, 1935, 1, 4],
+                dshape: vec![
+                    (configs::DimName::Batch, 1),
+                    (configs::DimName::NumBoxes, 1935),
+                    (configs::DimName::Padding, 1),
+                    (configs::DimName::BoxCoords, 4),
+                ],
+                normalized: Some(true),
+            },
+            configs::Scores {
+                decoder: configs::DecoderType::ModelPack,
+                quantization: Some(quant_scores),
+                shape: vec![1, 1935, 1],
+                dshape: vec![
+                    (configs::DimName::Batch, 1),
+                    (configs::DimName::NumBoxes, 1935),
+                    (configs::DimName::NumClasses, 1),
+                ],
+            },
         )
+        .with_score_threshold(score_threshold)
+        .with_iou_threshold(iou_threshold)
+        .build()
+        .expect("modelpack u8 decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&boxes_tensor, &scores_tensor];
+    let result = run_bench("decoder/modelpack/u8", WARMUP, ITERATIONS, || {
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut output_masks)
+            .unwrap();
+        std::hint::black_box(output_boxes);
+        std::hint::black_box(output_masks);
     });
     result.print_summary();
     suite.record(&result);
@@ -326,45 +348,66 @@ fn bench_modelpack_u8(suite: &mut BenchSuite) {
 fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
+
     let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
-    let detect0 = ndarray::Array3::from_shape_vec((9, 15, 18), detect0.to_vec()).unwrap();
-    let config0 = ModelPackDetectionConfig {
-        anchors: vec![
+    let detect0_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(detect0, &[1, 9, 15, 18]).unwrap());
+
+    let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+    let detect1_tensor =
+        TensorDyn::U8(Tensor::<u8>::from_slice(detect1, &[1, 17, 30, 18]).unwrap());
+
+    let detect_config0 = configs::Detection {
+        decoder: configs::DecoderType::ModelPack,
+        shape: vec![1, 9, 15, 18],
+        anchors: Some(vec![
             [0.36666667461395264, 0.31481480598449707],
             [0.38749998807907104, 0.4740740656852722],
             [0.5333333611488342, 0.644444465637207],
+        ]),
+        quantization: Some((0.08547406643629074, 174).into()),
+        dshape: vec![
+            (configs::DimName::Batch, 1),
+            (configs::DimName::Height, 9),
+            (configs::DimName::Width, 15),
+            (configs::DimName::NumAnchorsXFeatures, 18),
         ],
-        quantization: Some(Quantization {
-            scale: 0.08547406643629074,
-            zero_point: 174,
-        }),
+        normalized: Some(true),
     };
 
-    let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
-    let detect1 = ndarray::Array3::from_shape_vec((17, 30, 18), detect1.to_vec()).unwrap();
-    let config1 = ModelPackDetectionConfig {
-        anchors: vec![
+    let detect_config1 = configs::Detection {
+        decoder: configs::DecoderType::ModelPack,
+        shape: vec![1, 17, 30, 18],
+        anchors: Some(vec![
             [0.13750000298023224, 0.2074074000120163],
             [0.2541666626930237, 0.21481481194496155],
             [0.23125000298023224, 0.35185185074806213],
+        ]),
+        quantization: Some((0.09929127991199493, 183).into()),
+        dshape: vec![
+            (configs::DimName::Batch, 1),
+            (configs::DimName::Height, 17),
+            (configs::DimName::Width, 30),
+            (configs::DimName::NumAnchorsXFeatures, 18),
         ],
-        quantization: Some(Quantization {
-            scale: 0.09929127991199493,
-            zero_point: 183,
-        }),
+        normalized: Some(true),
     };
-    let outputs = [detect0.view(), detect1.view()];
-    let configs = [config0, config1];
-    let mut output_boxes: Vec<_> = Vec::with_capacity(2);
 
+    let decoder = DecoderBuilder::default()
+        .with_config_modelpack_det_split(vec![detect_config1, detect_config0])
+        .with_score_threshold(score_threshold)
+        .with_iou_threshold(iou_threshold)
+        .build()
+        .expect("modelpack split u8 decoder must build");
+
+    let inputs: Vec<&TensorDyn> = vec![&detect0_tensor, &detect1_tensor];
     let result = run_bench("decoder/modelpack/split_u8", WARMUP, ITERATIONS, || {
-        decode_modelpack_split_quant(
-            &outputs,
-            &configs,
-            score_threshold,
-            iou_threshold,
-            &mut output_boxes,
-        )
+        let mut output_boxes = Vec::with_capacity(50);
+        let mut output_masks = Vec::with_capacity(50);
+        decoder
+            .decode(&inputs, &mut output_boxes, &mut output_masks)
+            .unwrap();
+        std::hint::black_box(output_boxes);
+        std::hint::black_box(output_masks);
     });
     result.print_summary();
     suite.record(&result);

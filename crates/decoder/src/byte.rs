@@ -873,4 +873,55 @@ mod tests {
             assert_eq!(row.1, col.1, "i8 candidate {i}: index mismatch");
         }
     }
+
+    /// Helper: create `n` non-overlapping boxes with descending u8 scores.
+    fn make_nms_boxes_int(n: usize) -> Vec<DetectBoxQuantized<u8>> {
+        (0..n)
+            .map(|i| DetectBoxQuantized {
+                bbox: BoundingBox {
+                    xmin: i as f32 * 100.0,
+                    ymin: 0.0,
+                    xmax: i as f32 * 100.0 + 10.0,
+                    ymax: 10.0,
+                },
+                label: 0,
+                score: (200 - i as u32).min(255) as u8,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nms_int_max_det_matches_full_truncated() {
+        let boxes = make_nms_boxes_int(20);
+        let n = 5;
+        let full = nms_int(0.5, None, boxes.clone());
+        let capped = nms_int(0.5, Some(n), boxes);
+        assert_eq!(capped.len(), n);
+        assert_eq!(&full[..n], &capped[..]);
+    }
+
+    #[test]
+    fn nms_int_max_det_zero_returns_empty() {
+        let boxes = make_nms_boxes_int(10);
+        let result = nms_int(0.5, Some(0), boxes);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn nms_int_max_det_iou_ge_1_returns_sorted_truncated() {
+        let boxes = make_nms_boxes_int(10);
+        let result = nms_int(1.0, Some(3), boxes);
+        assert_eq!(result.len(), 3);
+        // Scores should be in descending order (sorted).
+        assert!(result[0].score >= result[1].score);
+        assert!(result[1].score >= result[2].score);
+    }
+
+    #[test]
+    fn nms_int_max_det_larger_than_input() {
+        let boxes = make_nms_boxes_int(5);
+        let full = nms_int(0.5, None, boxes.clone());
+        let capped = nms_int(0.5, Some(100), boxes);
+        assert_eq!(full.len(), capped.len());
+    }
 }

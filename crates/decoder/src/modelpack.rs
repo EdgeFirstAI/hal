@@ -15,9 +15,9 @@ use crate::{
 /// Configuration for ModelPack split detection decoder. The quantization is
 /// ignored when decoding float models.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ModelPackDetectionConfig {
-    pub anchors: Vec<[f32; 2]>,
-    pub quantization: Option<Quantization>,
+pub(crate) struct ModelPackDetectionConfig {
+    pub(crate) anchors: Vec<[f32; 2]>,
+    pub(crate) quantization: Option<Quantization>,
 }
 
 impl TryFrom<&Detection> for ModelPackDetectionConfig {
@@ -43,7 +43,7 @@ impl TryFrom<&Detection> for ModelPackDetectionConfig {
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_modelpack_det<
+pub(crate) fn decode_modelpack_det<
     BOX: PrimInt + AsPrimitive<f32> + Send + Sync,
     SCORE: PrimInt + AsPrimitive<f32> + Send + Sync,
 >(
@@ -51,6 +51,7 @@ pub fn decode_modelpack_det<
     scores_tensor: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -60,6 +61,7 @@ pub fn decode_modelpack_det<
         scores_tensor,
         score_threshold,
         iou_threshold,
+        max_det,
         output_boxes,
     )
 }
@@ -73,7 +75,7 @@ pub fn decode_modelpack_det<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_modelpack_float<
+pub(crate) fn decode_modelpack_float<
     BOX: Float + AsPrimitive<f32> + Send + Sync,
     SCORE: Float + AsPrimitive<f32> + Send + Sync,
 >(
@@ -81,6 +83,7 @@ pub fn decode_modelpack_float<
     scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -90,6 +93,7 @@ pub fn decode_modelpack_float<
         scores_tensor,
         score_threshold,
         iou_threshold,
+        max_det,
         output_boxes,
     )
 }
@@ -104,11 +108,13 @@ pub fn decode_modelpack_float<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
+#[cfg(test)]
+pub(crate) fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) {
     impl_modelpack_split_quant::<XYWH, D>(
@@ -116,6 +122,7 @@ pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
         configs,
         score_threshold,
         iou_threshold,
+        max_det,
         output_boxes,
     )
 }
@@ -130,11 +137,12 @@ pub fn decode_modelpack_split_quant<D: AsPrimitive<f32>>(
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
-pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
+pub(crate) fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) {
     impl_modelpack_split_float::<XYWH, D>(
@@ -142,6 +150,7 @@ pub fn decode_modelpack_split_float<D: AsPrimitive<f32>>(
         configs,
         score_threshold,
         iou_threshold,
+        max_det,
         output_boxes,
     );
 }
@@ -162,6 +171,7 @@ pub(crate) fn impl_modelpack_quant<
     scores: (ArrayView2<SCORE>, Quantization),
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
@@ -177,12 +187,9 @@ pub(crate) fn impl_modelpack_quant<
             quant_boxes,
         )
     };
-    let cap = output_boxes.capacity();
-    let cap_arg = (cap > 0).then_some(cap);
-    let boxes = nms_int(iou_threshold, cap_arg, boxes);
-    let len = cap.min(boxes.len());
+    let boxes = nms_int(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
+    for b in boxes.into_iter().take(max_det) {
         output_boxes.push(dequant_detect_box(&b, quant_scores));
     }
 }
@@ -204,18 +211,16 @@ pub(crate) fn impl_modelpack_float<
     scores_tensor: ArrayView2<SCORE>,
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) where
     f32: AsPrimitive<SCORE>,
 {
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let cap = output_boxes.capacity();
-    let cap_arg = (cap > 0).then_some(cap);
-    let boxes = nms_float(iou_threshold, cap_arg, boxes);
-    let len = cap.min(boxes.len());
+    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
+    for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
 }
@@ -228,11 +233,13 @@ pub(crate) fn impl_modelpack_float<
 ///
 /// # Panics
 /// Panics if shapes don't match the expected dimensions.
+#[cfg(test)]
 pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     outputs: &[ArrayView3<D>],
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_quant(outputs, configs);
@@ -241,12 +248,9 @@ pub(crate) fn impl_modelpack_split_quant<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         boxes_tensor.view(),
         scores_tensor.view(),
     );
-    let cap = output_boxes.capacity();
-    let cap_arg = (cap > 0).then_some(cap);
-    let boxes = nms_float(iou_threshold, cap_arg, boxes);
-    let len = cap.min(boxes.len());
+    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
+    for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
 }
@@ -265,6 +269,7 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
     configs: &[ModelPackDetectionConfig],
     score_threshold: f32,
     iou_threshold: f32,
+    max_det: usize,
     output_boxes: &mut Vec<DetectBox>,
 ) {
     let (boxes_tensor, scores_tensor) = postprocess_modelpack_split_float(outputs, configs);
@@ -273,12 +278,9 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
         boxes_tensor.view(),
         scores_tensor.view(),
     );
-    let cap = output_boxes.capacity();
-    let cap_arg = (cap > 0).then_some(cap);
-    let boxes = nms_float(iou_threshold, cap_arg, boxes);
-    let len = cap.min(boxes.len());
+    let boxes = nms_float(iou_threshold, Some(max_det), boxes);
     output_boxes.clear();
-    for b in boxes.into_iter().take(len) {
+    for b in boxes.into_iter().take(max_det) {
         output_boxes.push(b);
     }
 }
@@ -286,6 +288,7 @@ pub(crate) fn impl_modelpack_split_float<B: BBoxTypeTrait, D: AsPrimitive<f32>>(
 /// Post processes ModelPack split detection into detection boxes,
 /// filtering out any boxes below the score threshold. Returns the boxes and
 /// scores tensors. Boxes are in XYWH format.
+#[cfg(test)]
 pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
     outputs: &[ArrayView3<T>],
     config: &[ModelPackDetectionConfig],
@@ -488,7 +491,7 @@ fn fast_sigmoid_impl(f: f32) -> f32 {
 ///
 /// # Panics
 /// Panics if the input tensor does not have more than one channel.
-pub fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
+pub(crate) fn modelpack_segmentation_to_mask(segmentation: ArrayView3<u8>) -> Array2<u8> {
     use argminmax::ArgMinMax;
     assert!(
         segmentation.shape()[2] > 1,

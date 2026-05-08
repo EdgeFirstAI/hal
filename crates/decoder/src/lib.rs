@@ -958,6 +958,7 @@ mod decoder_tests {
             (scores.slice(s![0, .., ..]), quant_scores),
             score_threshold,
             iou_threshold,
+            300,
             &mut output_boxes,
         );
         assert!(output_boxes[0].equal_within_delta(
@@ -1085,6 +1086,7 @@ mod decoder_tests {
             &[config0, config1],
             score_threshold,
             iou_threshold,
+            300,
             &mut output_boxes,
         );
         assert!(output_boxes[0].equal_within_delta(
