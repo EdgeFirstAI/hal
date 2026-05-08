@@ -91,11 +91,7 @@ pub fn postprocess_boxes_index_float<
 /// survivors are the highest-scoring `n`, so the post-NMS top-`n` is preserved
 /// without iterating the full O(N²) suppression loop.
 #[must_use]
-pub fn nms_float(
-    iou: f32,
-    max_det: Option<usize>,
-    mut boxes: Vec<DetectBox>,
-) -> Vec<DetectBox> {
+pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) -> Vec<DetectBox> {
     // Boxes get sorted by score in descending order so we know based on the
     // index the scoring of the boxes and can skip parts of the loop.
     boxes.par_sort_by(|a, b| b.score.total_cmp(&a.score));
