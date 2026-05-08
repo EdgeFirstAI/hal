@@ -16,7 +16,7 @@ use edgefirst_hal::decoder::{
 ///
 /// Pass `None` to bypass NMS entirely (for end-to-end models with embedded
 /// NMS).
-#[pyo3::pyclass(name = "Nms", eq, eq_int)]
+#[pyo3::pyclass(name = "Nms", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyNms {
     /// Suppress overlapping boxes regardless of class label (default)
@@ -44,7 +44,7 @@ impl From<Nms> for PyNms {
 }
 
 /// Decoder type — selects the post-processing algorithm family.
-#[pyo3::pyclass(name = "DecoderType", eq, eq_int)]
+#[pyo3::pyclass(name = "DecoderType", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyDecoderType {
     /// Ultralytics YOLO models (YOLOv5, YOLOv8, YOLO11, YOLO26)
@@ -77,7 +77,7 @@ impl From<configs::DecoderType> for PyDecoderType {
 /// strategy:
 /// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external NMS
 /// - `Yolo26`: End-to-end models with NMS embedded in the model architecture
-#[pyo3::pyclass(name = "DecoderVersion", eq, eq_int)]
+#[pyo3::pyclass(name = "DecoderVersion", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyDecoderVersion {
     /// YOLOv5 - anchor-based decoder, requires external NMS
@@ -116,7 +116,7 @@ impl From<configs::DecoderVersion> for PyDecoderVersion {
 ///
 /// Used with `dshape` to give semantic meaning to each dimension,
 /// enabling the decoder to validate and interpret the tensor layout.
-#[pyo3::pyclass(name = "DimName", eq, eq_int)]
+#[pyo3::pyclass(name = "DimName", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PyDimName {
     /// Batch dimension (typically 1)
@@ -186,7 +186,7 @@ impl From<configs::DimName> for PyDimName {
 ///
 /// Provide one or the other, not both. If `dshape` is provided, `shape` is
 /// derived automatically.
-#[pyclass(name = "Output")]
+#[pyclass(name = "Output", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyOutput {
     inner: ConfigOutput,

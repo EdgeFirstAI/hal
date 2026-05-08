@@ -39,3 +39,6 @@ env.sh
 
 # C API build artifacts
 crates/capi/build/
+
+# TFLite models (large binaries); testdata/ has its own .gitignore
+*.tflite

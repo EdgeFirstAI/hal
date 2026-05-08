@@ -84,10 +84,20 @@ fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync,
 }
 
 /// Dispatches to the appropriate NMS function based on mode for float boxes.
-fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<DetectBox> {
+///
+/// `max_det` is the post-NMS detection cap; when present it lets the greedy
+/// inner loop break as soon as that many survivors are confirmed (the survivors
+/// are guaranteed to be the top-`max_det` by score because the input is sorted
+/// descending). Pass `None` to run the full O(N²) suppression.
+fn dispatch_nms_float(
+    nms: Option<Nms>,
+    iou: f32,
+    max_det: Option<usize>,
+    boxes: Vec<DetectBox>,
+) -> Vec<DetectBox> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_float(iou, boxes),
-        Some(Nms::ClassAware) => nms_class_aware_float(iou, boxes),
+        Some(Nms::ClassAgnostic) => nms_float(iou, max_det, boxes),
+        Some(Nms::ClassAware) => nms_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -97,11 +107,12 @@ fn dispatch_nms_float(nms: Option<Nms>, iou: f32, boxes: Vec<DetectBox>) -> Vec<
 pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
+    max_det: Option<usize>,
     boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_float(iou, boxes),
-        Some(Nms::ClassAware) => nms_extra_class_aware_float(iou, boxes),
+        Some(Nms::ClassAgnostic) => nms_extra_float(iou, max_det, boxes),
+        Some(Nms::ClassAware) => nms_extra_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -111,11 +122,12 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
 fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
+    max_det: Option<usize>,
     boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_int(iou, boxes),
-        Some(Nms::ClassAware) => nms_class_aware_int(iou, boxes),
+        Some(Nms::ClassAgnostic) => nms_int(iou, max_det, boxes),
+        Some(Nms::ClassAware) => nms_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -125,11 +137,12 @@ fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
 fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send + Sync>(
     nms: Option<Nms>,
     iou: f32,
+    max_det: Option<usize>,
     boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_int(iou, boxes),
-        Some(Nms::ClassAware) => nms_extra_class_aware_int(iou, boxes),
+        Some(Nms::ClassAgnostic) => nms_extra_int(iou, max_det, boxes),
+        Some(Nms::ClassAware) => nms_extra_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
 }
@@ -738,9 +751,11 @@ pub(crate) fn impl_yolo_quant<B: BBoxTypeTrait, T: PrimInt + AsPrimitive<f32> + 
         )
     };
 
-    let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    // Detection cap convention (see `cap_or_default`).
-    let len = cap_or_default(output_boxes).min(boxes.len());
+    let cap = cap_or_default(output_boxes);
+    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
+    // Detection cap convention (see `cap_or_default`). NMS already capped to
+    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_boxes));
@@ -764,9 +779,11 @@ pub(crate) fn impl_yolo_float<B: BBoxTypeTrait, T: Float + AsPrimitive<f32> + Se
     let (boxes_tensor, scores_tensor) = postprocess_yolo(&output);
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    // Detection cap convention (see `cap_or_default`).
-    let len = cap_or_default(output_boxes).min(boxes.len());
+    let cap = cap_or_default(output_boxes);
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
+    // Detection cap convention (see `cap_or_default`). NMS already capped to
+    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -813,9 +830,11 @@ pub(crate) fn impl_yolo_split_quant<
         )
     };
 
-    let boxes = dispatch_nms_int(nms, iou_threshold, boxes);
-    // Detection cap convention (see `cap_or_default`).
-    let len = cap_or_default(output_boxes).min(boxes.len());
+    let cap = cap_or_default(output_boxes);
+    let boxes = dispatch_nms_int(nms, iou_threshold, Some(cap), boxes);
+    // Detection cap convention (see `cap_or_default`). NMS already capped to
+    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.iter().take(len) {
         output_boxes.push(dequant_detect_box(b, quant_scores));
@@ -849,9 +868,11 @@ pub(crate) fn impl_yolo_split_float<
     let scores_tensor = scores_tensor.reversed_axes();
     let boxes =
         postprocess_boxes_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor);
-    let boxes = dispatch_nms_float(nms, iou_threshold, boxes);
-    // Detection cap convention (see `cap_or_default`).
-    let len = cap_or_default(output_boxes).min(boxes.len());
+    let cap = cap_or_default(output_boxes);
+    let boxes = dispatch_nms_float(nms, iou_threshold, Some(cap), boxes);
+    // Detection cap convention (see `cap_or_default`). NMS already capped to
+    // `cap`; the `min` here is a redundant guard for non-NMS bypass mode.
+    let len = cap.min(boxes.len());
     output_boxes.clear();
     for b in boxes.into_iter().take(len) {
         output_boxes.push(b);
@@ -1028,10 +1049,12 @@ where
 
     let mut boxes = {
         let _s = tracing::trace_span!("nms").entered();
-        dispatch_nms_extra_float(nms, iou_threshold, boxes)
+        dispatch_nms_extra_float(nms, iou_threshold, Some(max_det), boxes)
     };
     span.record("n_after_nms", boxes.len());
 
+    // NMS already capped to `max_det`; the trailing sort+truncate is a
+    // redundant guard for the bypass-NMS path (`nms = None`).
     boxes.sort_unstable_by(|a, b| b.0.score.total_cmp(&a.0.score));
     boxes.truncate(max_det);
     span.record("n_detections", boxes.len());
@@ -1142,11 +1165,12 @@ where
 
     let mut boxes = {
         let _s = tracing::trace_span!("nms").entered();
-        dispatch_nms_extra_int(nms, iou_threshold, boxes)
+        dispatch_nms_extra_int(nms, iou_threshold, Some(max_det), boxes)
     };
     span.record("n_after_nms", boxes.len());
 
-    // Sort by score descending before truncation to keep top-scoring detections.
+    // NMS already capped to `max_det`; the trailing sort+truncate is a
+    // redundant guard for the bypass-NMS path (`nms = None`).
     boxes.sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
     boxes.truncate(max_det);
     let result: Vec<_> = {
