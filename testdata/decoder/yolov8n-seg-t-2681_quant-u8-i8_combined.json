@@ -1,0 +1,205 @@
+{
+  "schema_version": 2,
+  "decoder_version": "yolov8",
+  "name": "yolov8n-seg",
+  "description": "",
+  "author": "AuZone Technologies Inc",
+  "host": {
+    "studio_server": "test.edgefirst.studio",
+    "project_id": "",
+    "session": "t-2681",
+    "username": "sebastien"
+  },
+  "dataset": {
+    "name": "",
+    "id": "ds-2bcd",
+    "classes": [
+      "person",
+      "bicycle",
+      "car",
+      "motorcycle",
+      "airplane",
+      "bus",
+      "train",
+      "truck",
+      "boat",
+      "traffic light",
+      "fire hydrant",
+      "stop sign",
+      "parking meter",
+      "bench",
+      "bird",
+      "cat",
+      "dog",
+      "horse",
+      "sheep",
+      "cow",
+      "elephant",
+      "bear",
+      "zebra",
+      "giraffe",
+      "backpack",
+      "umbrella",
+      "handbag",
+      "tie",
+      "suitcase",
+      "frisbee",
+      "skis",
+      "snowboard",
+      "sports ball",
+      "kite",
+      "baseball bat",
+      "baseball glove",
+      "skateboard",
+      "surfboard",
+      "tennis racket",
+      "bottle",
+      "wine glass",
+      "cup",
+      "fork",
+      "knife",
+      "spoon",
+      "bowl",
+      "banana",
+      "apple",
+      "sandwich",
+      "orange",
+      "broccoli",
+      "carrot",
+      "hot dog",
+      "pizza",
+      "donut",
+      "cake",
+      "chair",
+      "couch",
+      "potted plant",
+      "bed",
+      "dining table",
+      "toilet",
+      "tv",
+      "laptop",
+      "mouse",
+      "remote",
+      "keyboard",
+      "cell phone",
+      "microwave",
+      "oven",
+      "toaster",
+      "sink",
+      "refrigerator",
+      "book",
+      "clock",
+      "vase",
+      "scissors",
+      "teddy bear",
+      "hair drier",
+      "toothbrush"
+    ]
+  },
+  "input": {
+    "shape": [
+      1,
+      640,
+      640,
+      3
+    ],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "name": "yolov8n-seg-t-2681",
+    "version": "8.4.9+edgefirst-1.7.0",
+    "task": "segmentation",
+    "size": "nano",
+    "detection": false,
+    "segmentation": true,
+    "anchors": null,
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.7,
+    "score": 0.001,
+    "nms": "numpy",
+    "preprocessing": "letterbox",
+    "normalization": "unsigned"
+  },
+  "nms": "class_agnostic",
+  "calibration": "calibration-ds-2bcd-546a1b7e.safetensors",
+  "outputs": [
+    {
+      "name": "output_1",
+      "type": "protos",
+      "shape": [
+        1,
+        160,
+        160,
+        32
+      ],
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "height": 160
+        },
+        {
+          "width": 160
+        },
+        {
+          "num_protos": 32
+        }
+      ],
+      "dtype": "int8",
+      "decoder": "ultralytics",
+      "stride": 4,
+      "quantization": {
+        "scale": 0.03072291798889637,
+        "zero_point": -119,
+        "dtype": "int8"
+      }
+    },
+    {
+      "name": "output_0",
+      "type": "detection",
+      "shape": [
+        1,
+        116,
+        8400
+      ],
+      "dtype": "int8",
+      "decoder": "ultralytics",
+      "normalized": true,
+      "encoding": "dfl",
+      "score_format": "per_class",
+      "quantization": {
+        "scale": 0.025366559624671936,
+        "zero_point": 31,
+        "dtype": "int8"
+      },
+      "dshape": [
+        {
+          "batch": 1
+        },
+        {
+          "num_features": 116
+        },
+        {
+          "num_boxes": 8400
+        }
+      ]
+    }
+  ],
+  "tflite_quantizer": {
+    "version": "0.4.3",
+    "timestamp": "2026-05-08T13:19:01.319875+00:00",
+    "task": "bt-44a4",
+    "tensorflow_version": "2.21.0",
+    "splits_applied": [],
+    "input_dtype": "uint8",
+    "output_dtype": "int8",
+    "calibration": "calibration-ds-2bcd-546a1b7e.safetensors",
+    "calibration_samples": 500,
+    "quantizer": "mlir"
+  }
+}
