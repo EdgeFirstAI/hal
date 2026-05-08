@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the post-NMS cap through automatically; the breaking change only
   affects callers that import these functions directly.
 
+- The four ModelPack decode functions in `crate::modelpack`
+  (`decode_modelpack_det`, `decode_modelpack_float`,
+  `decode_modelpack_split_quant`, `decode_modelpack_split_float`) and the
+  `ModelPackDetectionConfig` struct are now `pub(crate)`. Use the
+  `Decoder` struct API instead. Previously these functions also used
+  `output_boxes.capacity()` as a post-NMS detection cap, which caused
+  `Vec::new()` callers to silently receive zero detections.
+  `Decoder::decode` now threads `Decoder::max_det` (default 300) into
+  all ModelPack paths, consistent with the YOLO decode paths.
+
 ### Changed
 
 - `Decoder::decode` / `decode_proto` / `decode_yolo_*` now skip the

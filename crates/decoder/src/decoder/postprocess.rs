@@ -82,6 +82,7 @@ impl Decoder {
                     (scores_tensor, quant_scores),
                     self.score_threshold,
                     self.iou_threshold,
+                    self.max_det,
                     output_boxes,
                 );
             });
@@ -186,6 +187,7 @@ impl Decoder {
             &new_detection,
             self.score_threshold,
             self.iou_threshold,
+            self.max_det,
             output_boxes,
         );
         Ok(())
@@ -559,6 +561,7 @@ impl Decoder {
             &new_detection,
             self.score_threshold,
             self.iou_threshold,
+            self.max_det,
             output_boxes,
         );
         Ok(())
@@ -617,6 +620,7 @@ impl Decoder {
             scores_tensor,
             self.score_threshold,
             self.iou_threshold,
+            self.max_det,
             output_boxes,
         );
         Ok(())
