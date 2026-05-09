@@ -2861,6 +2861,82 @@ outputs:
     // ── Proto Extraction Tests ───────────────────────────────────────
 
     #[test]
+    fn test_extract_proto_data_quant_preserves_i16_coefficients() {
+        use crate::yolo::extract_proto_data_quant;
+        use crate::{DetectBox, ProtoLayout, Quantization};
+        use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
+
+        let det_indices = vec![
+            (
+                DetectBox {
+                    bbox: crate::BoundingBox {
+                        xmin: 0.1,
+                        ymin: 0.1,
+                        xmax: 0.4,
+                        ymax: 0.4,
+                    },
+                    score: 0.9,
+                    label: 1,
+                },
+                0usize,
+            ),
+            (
+                DetectBox {
+                    bbox: crate::BoundingBox {
+                        xmin: 0.5,
+                        ymin: 0.5,
+                        xmax: 0.9,
+                        ymax: 0.9,
+                    },
+                    score: 0.8,
+                    label: 2,
+                },
+                2usize,
+            ),
+        ];
+        let mask_tensor = ndarray::Array2::from_shape_vec(
+            (3, 4),
+            vec![
+                300_i16, -400, 200, -150, 1, 2, 3, 4, -12_345, 23_456, 3_000, -4_096,
+            ],
+        )
+        .unwrap();
+        let protos = ndarray::Array3::from_shape_vec(
+            (2, 2, 4),
+            vec![
+                1_i8, 2, 3, 4, -5, -6, -7, -8, 9, 10, 11, 12, -13, -14, -15, -16,
+            ],
+        )
+        .unwrap();
+        let mut output_boxes = Vec::new();
+
+        let proto_data = extract_proto_data_quant(
+            det_indices,
+            mask_tensor.view(),
+            Quantization::new(0.25, -7),
+            protos.view(),
+            Quantization::new(0.5, 3),
+            &mut output_boxes,
+        );
+
+        assert_eq!(output_boxes.len(), 2);
+        assert_eq!(proto_data.layout, ProtoLayout::Nhwc);
+        assert_eq!(proto_data.protos.dtype(), DType::I8);
+        assert_eq!(proto_data.mask_coefficients.dtype(), DType::I16);
+        let coeff_t = proto_data
+            .mask_coefficients
+            .as_i16()
+            .expect("I16 coefficients");
+        let coeff_quant = coeff_t.quantization().expect("I16 coeff quantization");
+        assert!(coeff_quant.is_per_tensor());
+        let coeff_map = coeff_t.map().expect("map I16 coefficients");
+        assert_eq!(
+            coeff_map.as_slice(),
+            &[300_i16, -400, 200, -150, -12_345, 23_456, 3_000, -4_096]
+        );
+    }
+
+    #[test]
     fn test_extract_proto_data_quant_with_cached_model() {
         use crate::yolo::impl_yolo_segdet_quant_proto;
         use crate::{Nms, ProtoData, Quantization, XYWH};
