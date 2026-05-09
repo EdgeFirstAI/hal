@@ -334,15 +334,57 @@ impl CPUProcessor {
             }
         }
 
+        // Fast i16×i8 integer path: i16 coefficients × i8 protos → i32 dot.
+        if proto_data.mask_coefficients.dtype() == DType::I16
+            && proto_data.protos.dtype() == DType::I8
+        {
+            let coeff_t = proto_data
+                .mask_coefficients
+                .as_i16()
+                .expect("I16 coefficients");
+            let coeff_m = coeff_t.map()?;
+            let coeff_quant = coeff_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape(
+                    "I16 mask_coefficients require quantization metadata".into(),
+                )
+            })?;
+            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+            let proto_m = proto_t.map()?;
+            let proto_quant = proto_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+            })?;
+            match proto_segmentations_i16_i8(
+                detect,
+                coeff_m.as_slice(),
+                coeff_quant,
+                proto_m.as_slice(),
+                proto_quant,
+                proto_h,
+                proto_w,
+                num_protos,
+                lx0,
+                inv_lw,
+                ly0,
+                inv_lh,
+                proto_data.layout,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {
+                    // Fall through to the general f32 dequant path.
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         // Coefficients may be F32 (from f32 models), F16 (from fp16 models),
-        // or I8 (from quantized models — kept raw with quantization). For the
-        // mask kernel we always need an f32 view (the multiply-accumulate is
-        // done in f32 for precision). Map once and widen once outside the loop.
-        // NCHW layout is only supported in the i8×i8 integer fast path above
-        // with per-tensor quantization. Reject here for all other combinations.
-        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+        // I8 (from quantized models — kept raw with quantization), or I16.
+        // For the mask kernel we always need an f32 view (the multiply-accumulate
+        // is done in f32 for precision). Map once and widen once outside the loop.
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw
+            && proto_data.protos.dtype() != DType::I8
+        {
             return Err(crate::Error::NotSupported(
-                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                "NCHW proto layout with non-I8 protos is not supported in the f32 fallback path"
                     .into(),
             ));
         }
@@ -392,9 +434,35 @@ impl CPUProcessor {
                 };
                 &coeff_f32_storage[..]
             }
+            DType::I16 => {
+                let t = proto_data
+                    .mask_coefficients
+                    .as_i16()
+                    .expect("dtype matched I16");
+                let m = t.map()?;
+                coeff_f32_storage = if let Some(q) = t.quantization() {
+                    use edgefirst_tensor::QuantMode;
+                    let (scale, zp) = match q.mode() {
+                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                        other => {
+                            return Err(crate::Error::NotSupported(format!(
+                                "I16 mask_coefficients quantization mode {other:?} not supported"
+                            )));
+                        }
+                    };
+                    m.as_slice()
+                        .iter()
+                        .map(|&v| (v as f32 - zp) * scale)
+                        .collect()
+                } else {
+                    m.as_slice().iter().map(|&v| v as f32).collect()
+                };
+                &coeff_f32_storage[..]
+            }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
-                    "mask_coefficients dtype {other:?} not supported; expected F32, F16, or I8"
+                    "mask_coefficients dtype {other:?} not supported; expected F32, F16, I8, or I16"
                 )));
             }
         };
@@ -411,7 +479,22 @@ impl CPUProcessor {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
                 let m = t.map()?;
-                let protos_slice = m.as_slice();
+                let src_slice = m.as_slice();
+                let transposed_storage =
+                    if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+                        let hw = proto_h * proto_w;
+                        let mut nhwc = vec![0i8; hw * num_protos];
+                        for c in 0..num_protos {
+                            let plane = &src_slice[c * hw..(c + 1) * hw];
+                            for px in 0..hw {
+                                nhwc[px * num_protos + c] = plane[px];
+                            }
+                        }
+                        Some(nhwc)
+                    } else {
+                        None
+                    };
+                let protos_slice = transposed_storage.as_deref().unwrap_or(src_slice);
                 detect
                     .par_iter()
                     .enumerate()
@@ -617,12 +700,51 @@ impl CPUProcessor {
             }
         }
 
+        // Fast i16×i8 integer path: i16 coefficients × i8 protos.
+        if proto_data.mask_coefficients.dtype() == DType::I16
+            && proto_data.protos.dtype() == DType::I8
+        {
+            let coeff_t = proto_data
+                .mask_coefficients
+                .as_i16()
+                .expect("I16 coefficients");
+            let coeff_m = coeff_t.map()?;
+            let coeff_quant = coeff_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape(
+                    "I16 mask_coefficients require quantization metadata".into(),
+                )
+            })?;
+            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+            let proto_m = proto_t.map()?;
+            let proto_quant = proto_t.quantization().ok_or_else(|| {
+                crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+            })?;
+            match scaled_segmentations_i16_i8(
+                detect,
+                coeff_m.as_slice(),
+                coeff_quant,
+                proto_m.as_slice(),
+                proto_quant,
+                proto_h,
+                proto_w,
+                num_protos,
+                letterbox,
+                width,
+                height,
+                proto_data.layout,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(crate::Error::NotSupported(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
         // Fallback: widen coefficients to f32 for the float-path kernels.
-        // NCHW layout is only supported in the i8×i8 integer fast path above
-        // with per-tensor quantization. Reject here for all other combinations.
-        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+        if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw
+            && proto_data.protos.dtype() != DType::I8
+        {
             return Err(crate::Error::NotSupported(
-                "NCHW proto layout requires I8 protos and coefficients with per-tensor quantization"
+                "NCHW proto layout with non-I8 protos is not supported in the f32 fallback path"
                     .into(),
             ));
         }
@@ -654,6 +776,29 @@ impl CPUProcessor {
                         return Err(crate::Error::NotSupported(
                             "per-channel mask_coefficients not supported".into(),
                         ))
+                    }
+                };
+                m.as_slice()
+                    .iter()
+                    .map(|&v| (v as f32 - zp) * scale)
+                    .collect()
+            }
+            DType::I16 => {
+                let t = proto_data.mask_coefficients.as_i16().expect("I16");
+                let m = t.map()?;
+                let q = t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape(
+                        "I16 mask_coefficients require quantization metadata".into(),
+                    )
+                })?;
+                use edgefirst_tensor::QuantMode;
+                let (scale, zp) = match q.mode() {
+                    QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                    QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                    other => {
+                        return Err(crate::Error::NotSupported(format!(
+                            "I16 mask_coefficients quantization mode {other:?} not supported"
+                        )))
                     }
                 };
                 m.as_slice()
@@ -705,10 +850,26 @@ impl CPUProcessor {
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
+                let src_slice = m.as_slice();
+                let transposed_storage =
+                    if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
+                        let hw = proto_h * proto_w;
+                        let mut nhwc = vec![0i8; hw * num_protos];
+                        for c in 0..num_protos {
+                            let plane = &src_slice[c * hw..(c + 1) * hw];
+                            for px in 0..hw {
+                                nhwc[px * num_protos + c] = plane[px];
+                            }
+                        }
+                        Some(nhwc)
+                    } else {
+                        None
+                    };
+                let protos_slice = transposed_storage.as_deref().unwrap_or(src_slice);
                 scaled_segmentations_i8_slice(
                     detect,
                     &coeff_f32,
-                    m.as_slice(),
+                    protos_slice,
                     proto_h,
                     proto_w,
                     num_protos,
@@ -1023,6 +1184,190 @@ fn proto_segmentations_i8_i8(
 }
 
 // =============================================================================
+#[allow(clippy::too_many_arguments)]
+fn proto_segmentations_i16_i8(
+    detect: &[crate::DetectBox],
+    coeff_all: &[i16],
+    coeff_quant: &edgefirst_tensor::Quantization,
+    protos: &[i8],
+    proto_quant: &edgefirst_tensor::Quantization,
+    proto_h: usize,
+    proto_w: usize,
+    num_protos: usize,
+    lx0: f32,
+    inv_lw: f32,
+    ly0: f32,
+    inv_lh: f32,
+    layout: edgefirst_decoder::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    use edgefirst_tensor::QuantMode;
+
+    let _span = tracing::trace_span!(
+        "mask_i16_i8_fastpath",
+        n = detect.len(),
+        proto_h,
+        proto_w,
+        num_protos,
+        ?layout,
+    )
+    .entered();
+
+    let zp_c: i32 = match coeff_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel coeff quantization not supported on proto-res i16 path".into(),
+            ))
+        }
+    };
+    let zp_p: i32 = match proto_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel proto quantization not supported on proto-res i8 path".into(),
+            ))
+        }
+    };
+
+    let hw = proto_h * proto_w;
+
+    // Precompute per-pixel proto sums for zero-point correction.
+    let proto_sums: Vec<i32> = if zp_c != 0 {
+        match layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+                .map(|px_idx| {
+                    let base = px_idx * num_protos;
+                    protos[base..base + num_protos]
+                        .iter()
+                        .map(|&v| v as i32)
+                        .sum()
+                })
+                .collect(),
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                let mut sums = vec![0i32; hw];
+                for c in 0..num_protos {
+                    let plane = &protos[c * hw..];
+                    for (px, s) in sums.iter_mut().enumerate() {
+                        *s += plane[px] as i32;
+                    }
+                }
+                sums
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    detect
+        .par_iter()
+        .enumerate()
+        .map(|(i, det)| {
+            let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
+            let (x0, y0, x1, y1, roi_w, roi_h) = bbox_to_proto_roi(det, proto_w, proto_h);
+
+            // Per-detection bias: zp_p·Σc_raw - N·zp_c·zp_p
+            let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
+            let bias = zp_p * coeff_sum - (num_protos as i32) * zp_c * zp_p;
+
+            let mut mask_buf = vec![0u8; roi_h * roi_w];
+
+            match layout {
+                edgefirst_decoder::ProtoLayout::Nhwc => {
+                    let stride_y = proto_w * num_protos;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        for ly in 0..roi_h {
+                            let py = y0 + ly;
+                            let row_base = py * stride_y + x0 * num_protos;
+                            for lx in 0..roi_w {
+                                let pix_base = row_base + lx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = unsafe {
+                                    dot_i16_i8_neon(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
+                                };
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + x0 + lx]
+                                } else {
+                                    0
+                                };
+                                let logit = raw_dot - correction - bias;
+                                if logit > 0 {
+                                    mask_buf[ly * roi_w + lx] = 255;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for ly in 0..roi_h {
+                            let py = y0 + ly;
+                            let row_base = py * stride_y + x0 * num_protos;
+                            for lx in 0..roi_w {
+                                let pix_base = row_base + lx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = dot_i16_i8_scalar(coeff, proto_px, num_protos);
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + x0 + lx]
+                                } else {
+                                    0
+                                };
+                                let logit = raw_dot - correction - bias;
+                                if logit > 0 {
+                                    mask_buf[ly * roi_w + lx] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+                edgefirst_decoder::ProtoLayout::Nchw => {
+                    // Channel-major accumulation: for each channel, accumulate
+                    // coeff[c] * proto[c, py, px] across the ROI. Each channel
+                    // plane is contiguous, giving excellent sequential read access.
+                    let mut accum = vec![0i32; roi_h * roi_w];
+                    for c in 0..num_protos {
+                        let plane = &protos[c * hw..];
+                        let coeff_c = coeff[c] as i32;
+                        for ly in 0..roi_h {
+                            let py = y0 + ly;
+                            let row_start = py * proto_w + x0;
+                            let out_row_start = ly * roi_w;
+                            for lx in 0..roi_w {
+                                accum[out_row_start + lx] += coeff_c * plane[row_start + lx] as i32;
+                            }
+                        }
+                    }
+                    // Apply zero-point correction and threshold.
+                    for ly in 0..roi_h {
+                        let py = y0 + ly;
+                        for lx in 0..roi_w {
+                            let idx = ly * roi_w + lx;
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + x0 + lx]
+                            } else {
+                                0
+                            };
+                            let logit = accum[idx] - correction - bias;
+                            if logit > 0 {
+                                mask_buf[idx] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mask = ndarray::Array3::from_shape_vec((roi_h, roi_w, 1), mask_buf)
+                .expect("mask_buf length matches roi_h * roi_w");
+            Ok(seg_from_roi(
+                mask, x0, y0, x1, y1, proto_w, proto_h, lx0, inv_lw, ly0, inv_lh,
+            ))
+        })
+        .collect()
+}
+
+// =============================================================================
+
 // Sign-threshold proto-resolution kernels (f32/f16/i8 protos with f32 coeffs).
 //
 // These replace the sigmoid-computing kernels for the non-i8×i8 fallback paths.
@@ -1543,6 +1888,52 @@ unsafe fn dot_i8_neon_dotprod(coeff: *const i8, proto: *const i8, n: usize) -> i
     scalar_acc
 }
 
+/// Compute i16×i8 dot product → i32. Platform-agnostic scalar fallback.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn dot_i16_i8_scalar(coeff: &[i16], proto: &[i8], n: usize) -> i32 {
+    let mut acc: i32 = 0;
+    let chunks = n / 4;
+    let mut k = 0;
+    for _ in 0..chunks {
+        acc += coeff[k] as i32 * proto[k] as i32
+            + coeff[k + 1] as i32 * proto[k + 1] as i32
+            + coeff[k + 2] as i32 * proto[k + 2] as i32
+            + coeff[k + 3] as i32 * proto[k + 3] as i32;
+        k += 4;
+    }
+    while k < n {
+        acc += coeff[k] as i32 * proto[k] as i32;
+        k += 1;
+    }
+    acc
+}
+
+/// NEON i16×i8→i32 dot product using widening multiply-accumulate.
+/// Processes 8 elements per iteration (vs 16 for i8×i8 dotprod).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_i16_i8_neon(coeff: *const i16, proto: *const i8, n: usize) -> i32 {
+    use std::arch::aarch64::*;
+    let mut acc = vdupq_n_s32(0);
+    let full_chunks = n / 8;
+    let mut offset = 0usize;
+    for _ in 0..full_chunks {
+        let c = vld1q_s16(coeff.add(offset));
+        let p_raw = vld1_s8(proto.add(offset));
+        let p = vmovl_s8(p_raw);
+        acc = vmlal_s16(acc, vget_low_s16(c), vget_low_s16(p));
+        acc = vmlal_high_s16(acc, c, p);
+        offset += 8;
+    }
+    let mut scalar_acc = vaddvq_s32(acc);
+    while offset < n {
+        scalar_acc += *coeff.add(offset) as i32 * *proto.add(offset) as i32;
+        offset += 1;
+    }
+    scalar_acc
+}
+
 /// Compute the logit grid using the dotprod (sdot) path.
 /// Separated into its own function so the compiler inlines the sdot asm fully.
 #[cfg(target_arch = "aarch64")]
@@ -1808,6 +2199,289 @@ fn scaled_segmentations_i8_i8(
                                 let pix_base = row_base + lx_idx * num_protos;
                                 let proto_px = &protos[pix_base..pix_base + num_protos];
                                 let raw_dot = dot_i8_scalar(coeff, proto_px, num_protos);
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+                                } else {
+                                    0
+                                };
+                                logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+                            }
+                        }
+                    }
+                }
+                edgefirst_decoder::ProtoLayout::Nchw => {
+                    // Channel-major accumulation: contiguous reads per channel plane.
+                    for c in 0..num_protos {
+                        let plane = &protos[c * hw..];
+                        let coeff_c = coeff[c] as i32;
+                        for ly_idx in 0..roi_h {
+                            let py = proto_y0 + ly_idx;
+                            let row_start = py * proto_w + proto_x0;
+                            let out_row_start = ly_idx * roi_w;
+                            for lx_idx in 0..roi_w {
+                                logits[out_row_start + lx_idx] +=
+                                    coeff_c * plane[row_start + lx_idx] as i32;
+                            }
+                        }
+                    }
+                    // Apply zero-point correction and per-detection bias.
+                    for ly_idx in 0..roi_h {
+                        let py = proto_y0 + ly_idx;
+                        for lx_idx in 0..roi_w {
+                            let idx = ly_idx * roi_w + lx_idx;
+                            let correction = if zp_c != 0 {
+                                zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+                            } else {
+                                0
+                            };
+                            logits[idx] -= correction + bias;
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Bilinear upsample i32 logits → binary mask with
+            // sign-shortcut (skip interpolation when all 4 neighbors agree).
+            let roi_last_x = roi_w.saturating_sub(1);
+            let roi_last_y = roi_h.saturating_sub(1);
+
+            // X-coordinate LUT with fixed-point fraction (scale 1024).
+            const FRAC_BITS: i32 = 10;
+            const FRAC_SCALE: i32 = 1 << FRAC_BITS; // 1024
+            let x_coords: Vec<(usize, usize, i32)> = (0..bbox_w)
+                .map(|xi| {
+                    let sample_x = sample_x_at((px0 + xi) as f32) - proto_x0 as f32;
+                    let x_floor = sample_x.floor();
+                    let x_lo = (x_floor as isize).max(0).min(roi_last_x as isize) as usize;
+                    let x_hi = (x_lo + 1).min(roi_w - 1);
+                    let x_frac = ((sample_x - x_floor).clamp(0.0, 1.0) * FRAC_SCALE as f32) as i32;
+                    (x_lo, x_hi, x_frac)
+                })
+                .collect();
+
+            let mut tile_buf = vec![0u8; bbox_h * bbox_w];
+            for yi in 0..bbox_h {
+                let sample_y = sample_y_at((py0 + yi) as f32) - proto_y0 as f32;
+                let y_floor = sample_y.floor();
+                let y_lo = (y_floor as isize).max(0).min(roi_last_y as isize) as usize;
+                let y_hi = (y_lo + 1).min(roi_h - 1);
+                let y_frac = ((sample_y - y_floor).clamp(0.0, 1.0) * FRAC_SCALE as f32) as i32;
+                let y_frac_inv = FRAC_SCALE - y_frac;
+                let row_lo = &logits[y_lo * roi_w..y_lo * roi_w + roi_w];
+                let row_hi = &logits[y_hi * roi_w..y_hi * roi_w + roi_w];
+                let out_row = &mut tile_buf[yi * bbox_w..(yi + 1) * bbox_w];
+
+                for (xi, &(x_lo, x_hi, x_frac)) in x_coords.iter().enumerate() {
+                    let tl = row_lo[x_lo];
+                    let tr = row_lo[x_hi];
+                    let bl = row_hi[x_lo];
+                    let br = row_hi[x_hi];
+
+                    // Sign-shortcut: if all 4 corners have the same sign,
+                    // the bilinear interpolation (positive-weight combination)
+                    // preserves that sign. Skip arithmetic for ~80% of pixels.
+                    if (tl & tr & bl & br) < 0 {
+                        // All negative → output 0 (already zero).
+                        continue;
+                    }
+                    if tl > 0 && tr > 0 && bl > 0 && br > 0 {
+                        // All strictly positive → output 255.
+                        out_row[xi] = 255;
+                        continue;
+                    }
+
+                    // Boundary pixel: fixed-point bilinear in i64.
+                    let x_frac_inv = FRAC_SCALE - x_frac;
+                    let l0 = tl as i64 * x_frac_inv as i64 + tr as i64 * x_frac as i64;
+                    let l1 = bl as i64 * x_frac_inv as i64 + br as i64 * x_frac as i64;
+                    let logit = l0 * y_frac_inv as i64 + l1 * y_frac as i64;
+                    out_row[xi] = if logit > 0 { 255 } else { 0 };
+                }
+            }
+
+            let tile = ndarray::Array3::from_shape_vec((bbox_h, bbox_w, 1), tile_buf)
+                .expect("tile_buf length matches bbox_h * bbox_w");
+            Ok(edgefirst_decoder::Segmentation {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                segmentation: tile,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scaled_segmentations_i16_i8(
+    detect: &[crate::DetectBox],
+    coeff_all: &[i16],
+    coeff_quant: &edgefirst_tensor::Quantization,
+    protos: &[i8],
+    proto_quant: &edgefirst_tensor::Quantization,
+    proto_h: usize,
+    proto_w: usize,
+    num_protos: usize,
+    letterbox: Option<[f32; 4]>,
+    width: u32,
+    height: u32,
+    layout: edgefirst_decoder::ProtoLayout,
+) -> crate::Result<Vec<edgefirst_decoder::Segmentation>> {
+    use edgefirst_tensor::QuantMode;
+
+    let _span = tracing::trace_span!(
+        "mask_i16_i8_fastpath",
+        n = detect.len(),
+        proto_h,
+        proto_w,
+        num_protos,
+        width,
+        height,
+        ?layout,
+    )
+    .entered();
+
+    let zp_c: i32 = match coeff_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel coeff quantization not supported".into(),
+            ))
+        }
+    };
+    let zp_p: i32 = match proto_quant.mode() {
+        QuantMode::PerTensor { zero_point, .. } => zero_point,
+        QuantMode::PerTensorSymmetric { .. } => 0,
+        _ => {
+            return Err(crate::Error::NotSupported(
+                "per-channel proto quantization not supported".into(),
+            ))
+        }
+    };
+
+    let (lx0, lw, ly0, lh) = match letterbox {
+        Some([lx0, ly0, lx1, ly1]) => {
+            let lw = (lx1 - lx0).max(f32::EPSILON);
+            let lh = (ly1 - ly0).max(f32::EPSILON);
+            (lx0, lw, ly0, lh)
+        }
+        None => (0.0_f32, 1.0_f32, 0.0_f32, 1.0_f32),
+    };
+    let out_w = width as usize;
+    let out_h = height as usize;
+    let hw = proto_h * proto_w;
+
+    // Precompute proto_sum for the entire proto tensor (zero-point correction).
+    let proto_sums: Vec<i32> = if zp_c != 0 {
+        match layout {
+            edgefirst_decoder::ProtoLayout::Nhwc => (0..hw)
+                .map(|px_idx| {
+                    let base = px_idx * num_protos;
+                    let mut s: i32 = 0;
+                    for k in 0..num_protos {
+                        s += protos[base + k] as i32;
+                    }
+                    s
+                })
+                .collect(),
+            edgefirst_decoder::ProtoLayout::Nchw => {
+                let mut sums = vec![0i32; hw];
+                for c in 0..num_protos {
+                    let plane = &protos[c * hw..];
+                    for (px, s) in sums.iter_mut().enumerate() {
+                        *s += plane[px] as i32;
+                    }
+                }
+                sums
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Detect dotprod support once, outside the hot loop.
+    // For NHWC layout, stride for row navigation.
+    let stride_y = proto_w * num_protos;
+
+    detect
+        .par_iter()
+        .enumerate()
+        .map(|(i, det)| {
+            let coeff = &coeff_all[i * num_protos..(i + 1) * num_protos];
+            let bbox = det.bbox.to_canonical();
+            let xmin = ((bbox.xmin - lx0) / lw).clamp(0.0, 1.0);
+            let ymin = ((bbox.ymin - ly0) / lh).clamp(0.0, 1.0);
+            let xmax = ((bbox.xmax - lx0) / lw).clamp(0.0, 1.0);
+            let ymax = ((bbox.ymax - ly0) / lh).clamp(0.0, 1.0);
+            let px0 = (xmin * out_w as f32).round() as usize;
+            let py0 = (ymin * out_h as f32).round() as usize;
+            let px1 = ((xmax * out_w as f32).round() as usize).min(out_w);
+            let py1 = ((ymax * out_h as f32).round() as usize).min(out_h);
+            let bbox_w = px1.saturating_sub(px0).max(1);
+            let bbox_h = py1.saturating_sub(py0).max(1);
+
+            // Map output bbox → proto ROI.
+            let sample_x_at = |px: f32| -> f32 {
+                let model_x_norm = lx0 + (px + 0.5) / out_w as f32 * lw;
+                model_x_norm * proto_w as f32 - 0.5
+            };
+            let sample_y_at = |py: f32| -> f32 {
+                let model_y_norm = ly0 + (py + 0.5) / out_h as f32 * lh;
+                model_y_norm * proto_h as f32 - 0.5
+            };
+            let s_x_min = sample_x_at(px0 as f32);
+            let s_x_max = sample_x_at((px1 as f32) - 1.0);
+            let s_y_min = sample_y_at(py0 as f32);
+            let s_y_max = sample_y_at((py1 as f32) - 1.0);
+            let proto_x0 = (s_x_min.floor() as isize)
+                .max(0)
+                .min(proto_w.saturating_sub(1) as isize) as usize;
+            let proto_x1 = ((s_x_max.ceil() as isize) + 1).max(0).min(proto_w as isize) as usize;
+            let proto_y0 = (s_y_min.floor() as isize)
+                .max(0)
+                .min(proto_h.saturating_sub(1) as isize) as usize;
+            let proto_y1 = ((s_y_max.ceil() as isize) + 1).max(0).min(proto_h as isize) as usize;
+            let roi_w = proto_x1.saturating_sub(proto_x0).max(1);
+            let roi_h = proto_y1.saturating_sub(proto_y0).max(1);
+
+            // Per-detection bias.
+            let coeff_sum: i32 = coeff.iter().map(|&c| c as i32).sum();
+            let bias = zp_p * coeff_sum - (num_protos as i32) * zp_c * zp_p;
+
+            // Step 2: Compute i32 logits at each proto-ROI pixel.
+            let mut logits = vec![0_i32; roi_h * roi_w];
+            match layout {
+                edgefirst_decoder::ProtoLayout::Nhwc => {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        for ly_idx in 0..roi_h {
+                            let py = proto_y0 + ly_idx;
+                            let row_base = py * stride_y + proto_x0 * num_protos;
+                            for lx_idx in 0..roi_w {
+                                let pix_base = row_base + lx_idx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = unsafe {
+                                    dot_i16_i8_neon(coeff.as_ptr(), proto_px.as_ptr(), num_protos)
+                                };
+                                let correction = if zp_c != 0 {
+                                    zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
+                                } else {
+                                    0
+                                };
+                                logits[ly_idx * roi_w + lx_idx] = raw_dot - correction - bias;
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for ly_idx in 0..roi_h {
+                            let py = proto_y0 + ly_idx;
+                            let row_base = py * stride_y + proto_x0 * num_protos;
+                            for lx_idx in 0..roi_w {
+                                let pix_base = row_base + lx_idx * num_protos;
+                                let proto_px = &protos[pix_base..pix_base + num_protos];
+                                let raw_dot = dot_i16_i8_scalar(coeff, proto_px, num_protos);
                                 let correction = if zp_c != 0 {
                                     zp_c * proto_sums[py * proto_w + proto_x0 + lx_idx]
                                 } else {

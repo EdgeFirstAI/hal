@@ -4412,6 +4412,30 @@ impl GLProcessorST {
                 };
                 &coeff_widen_i8[..]
             }
+            DType::I16 => {
+                let t = proto_data.mask_coefficients.as_i16().expect("I16");
+                let mc_map_i16 = t.map()?;
+                coeff_widen_i8 = if let Some(q) = t.quantization() {
+                    use edgefirst_tensor::QuantMode;
+                    let (scale, zp) = match q.mode() {
+                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                        other => {
+                            return Err(crate::Error::NotSupported(format!(
+                                "I16 mask_coefficients quantization mode {other:?} not supported on GL seg path"
+                            )));
+                        }
+                    };
+                    mc_map_i16
+                        .as_slice()
+                        .iter()
+                        .map(|&v| (v as f32 - zp) * scale)
+                        .collect()
+                } else {
+                    mc_map_i16.as_slice().iter().map(|&v| v as f32).collect()
+                };
+                &coeff_widen_i8[..]
+            }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
                     "mask_coefficients dtype {other:?} not supported on GL seg path"
