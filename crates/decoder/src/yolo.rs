@@ -62,7 +62,8 @@ pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
 /// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
-/// to avoid full O(N log N) sort. No-op when input length ≤ `top_k`.
+/// to avoid full O(N log N) sort. No-op when `top_k` is 0 (unbounded) or
+/// when the input length ≤ `top_k`.
 fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: usize) {
     if top_k > 0 && boxes.len() > top_k {
         boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.total_cmp(&a.0.score));
@@ -73,6 +74,7 @@ fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: u
 /// Quantized counterpart of [`truncate_to_top_k_by_score`]. Sorts on
 /// the raw quantized score (which preserves order under monotonic
 /// dequantization). Uses partial sort (O(N)) via `select_nth_unstable_by`.
+/// No-op when `top_k` is 0 (unbounded) or when the input length ≤ `top_k`.
 fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send>(
     boxes: &mut Vec<(DetectBoxQuantized<S>, E)>,
     top_k: usize,

@@ -128,9 +128,12 @@ pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
-    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
-    /// models)
-    nms: Option<configs::Nms>,
+    /// NMS mode override. `None` means the user has not explicitly set
+    /// NMS — at build time the config's NMS setting (or the fallback
+    /// default of `ClassAgnostic`) will be used.  `Some(x)` means the
+    /// user explicitly called `with_nms(x)` and it overrides whatever
+    /// the config declares.
+    nms: Option<Option<configs::Nms>>,
     /// Output dtype for the per-scale fast path. Has no effect on
     /// schemas without per-scale children (which use the legacy decode
     /// path).
@@ -181,7 +184,7 @@ impl Default for DecoderBuilder {
             config_src: None,
             iou_threshold: 0.5,
             score_threshold: 0.5,
-            nms: Some(configs::Nms::ClassAgnostic),
+            nms: None,
             decode_dtype: DecodeDtype::F32,
             pre_nms_top_k: 300,
             max_det: 300,
@@ -893,8 +896,9 @@ impl DecoderBuilder {
 
     /// Sets the NMS mode for the decoder.
     ///
-    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress
-    ///   overlapping boxes regardless of class label
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default when no
+    ///   config or user override): suppress overlapping boxes regardless of
+    ///   class label
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
     ///   share the same class label AND overlap above the IoU threshold
     /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
@@ -913,7 +917,7 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn with_nms(mut self, nms: Option<configs::Nms>) -> Self {
-        self.nms = nms;
+        self.nms = Some(nms);
         self
     }
 
@@ -1092,8 +1096,12 @@ impl DecoderBuilder {
             Self::get_normalized(&config.outputs)
         };
 
-        // Use NMS from config if present, otherwise use builder's NMS setting
-        let nms = config.nms.or(self.nms);
+        // NMS precedence: explicit user override > config > fallback default.
+        // `self.nms` is `Some(x)` when the user called `with_nms(x)`,
+        // `None` when they did not (use config or fallback).
+        let nms = self
+            .nms
+            .unwrap_or_else(|| config.nms.or(Some(configs::Nms::ClassAgnostic)));
         // When the per-scale path is active, the per_scale subsystem owns
         // model decoding entirely — `decode` / `decode_proto` short-circuit
         // on `per_scale.is_some()` before reading `model_type`. Skip the

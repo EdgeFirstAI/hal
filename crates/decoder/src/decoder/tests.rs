@@ -1913,14 +1913,22 @@ nms: class_aware
             .unwrap();
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
 
-        // Test that config NMS overrides builder NMS
+        // Test that explicit with_nms() overrides config NMS
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_class_aware.to_string())
-            .with_nms(Some(configs::Nms::ClassAgnostic)) // Builder sets agnostic
+            .with_nms(Some(configs::Nms::ClassAgnostic)) // User explicitly overrides
             .build()
             .unwrap();
-        // Config should override builder
-        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+        // Explicit user override takes precedence over config
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+
+        // Test that explicit with_nms(None) disables NMS even when config declares one
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_aware.to_string())
+            .with_nms(None) // User explicitly disables NMS
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, None);
     }
 
     #[test]
@@ -1959,7 +1967,7 @@ outputs:
             .with_config_yaml_str(yaml_no_nms.to_string())
             .build()
             .unwrap();
-        // Default builder NMS is ClassAgnostic
+        // Default fallback NMS is ClassAgnostic
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
 
         // Test with explicit builder NMS
