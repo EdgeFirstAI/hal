@@ -92,6 +92,47 @@ static void test_decoder_new_with_thresholds(void) {
     TEST_PASS();
 }
 
+static void test_decoder_new_with_pre_nms_top_k(void) {
+    TEST("decoder_new_with_pre_nms_top_k");
+
+    struct hal_decoder_params* params = hal_decoder_params_new();
+    ASSERT_NOT_NULL(params);
+
+    hal_decoder_params_set_config_json(params, YOLO_JSON_CONFIG, 0);
+    hal_decoder_params_set_score_threshold(params, 0.001f);
+    hal_decoder_params_set_pre_nms_top_k(params, 8400);
+    hal_decoder_params_set_max_det(params, 300);
+
+    struct hal_decoder* decoder = hal_decoder_new(params);
+    ASSERT_NOT_NULL(decoder);
+
+    hal_decoder_free(decoder);
+    hal_decoder_params_free(params);
+    TEST_PASS();
+}
+
+static void test_decoder_pre_nms_top_k_null_params(void) {
+    TEST("decoder_pre_nms_top_k_null_params");
+
+    errno = 0;
+    int rc = hal_decoder_params_set_pre_nms_top_k(NULL, 8400);
+    ASSERT_EQ(rc, -1);
+    ASSERT_ERRNO(EINVAL);
+
+    TEST_PASS();
+}
+
+static void test_decoder_max_det_null_params(void) {
+    TEST("decoder_max_det_null_params");
+
+    errno = 0;
+    int rc = hal_decoder_params_set_max_det(NULL, 100);
+    ASSERT_EQ(rc, -1);
+    ASSERT_ERRNO(EINVAL);
+
+    TEST_PASS();
+}
+
 static void test_decoder_new_null_params(void) {
     TEST("decoder_new_null_params");
 
@@ -813,6 +854,9 @@ void run_decoder_tests(void) {
     test_decoder_new_with_json();
     test_decoder_new_with_yaml();
     test_decoder_new_with_thresholds();
+    test_decoder_new_with_pre_nms_top_k();
+    test_decoder_pre_nms_top_k_null_params();
+    test_decoder_max_det_null_params();
     test_decoder_new_null_params();
     test_decoder_new_no_config();
     test_decoder_params_null_handling();

@@ -288,6 +288,12 @@ pub struct HalDecoderParams {
     iou_threshold: f32,
     nms: Option<configs::Nms>,
     decoder_version: Option<configs::DecoderVersion>,
+    /// Maximum number of candidate boxes fed into NMS after score filtering.
+    /// Default: 300. Set via `hal_decoder_params_set_pre_nms_top_k`.
+    pre_nms_top_k: usize,
+    /// Maximum number of detections returned after NMS.
+    /// Default: 300. Set via `hal_decoder_params_set_max_det`.
+    max_det: usize,
     /// Optional model input dims `(width, height)` consumed by the
     /// EDGEAI-1303 normalization path. Set via
     /// `hal_decoder_params_set_input_dims`. Overrides any dims
@@ -366,6 +372,8 @@ pub extern "C" fn hal_decoder_params_new() -> *mut HalDecoderParams {
         iou_threshold: 0.5,
         nms: Some(configs::Nms::ClassAgnostic),
         decoder_version: None,
+        pre_nms_top_k: 300,
+        max_det: 300,
         input_dims: None,
     }))
 }
@@ -800,6 +808,50 @@ pub unsafe extern "C" fn hal_decoder_params_set_decoder_version(
     0
 }
 
+/// Set the maximum number of candidate boxes fed into NMS after score
+/// filtering.  Uses O(N) partial sort to reduce O(N²) NMS cost.
+///
+/// Default: 300 — appropriate for deployment (`score_threshold >= 0.25`).
+///
+/// **WARNING**: For COCO mAP evaluation (`score_threshold ~ 0.001`), set
+/// this to the total anchor count (8400 for 640×640 YOLO models). The
+/// default of 300 discards ~74% of valid candidates before NMS, causing
+/// ~9 pp box mAP loss.
+///
+/// @param params      Params handle (must not be NULL)
+/// @param pre_nms_top_k  Maximum candidates for NMS (0 = no limit)
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_set_score_threshold, hal_decoder_params_set_max_det
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_pre_nms_top_k(
+    params: *mut HalDecoderParams,
+    pre_nms_top_k: size_t,
+) -> c_int {
+    check_null!(params);
+    (*params).pre_nms_top_k = pre_nms_top_k;
+    0
+}
+
+/// Set the maximum number of detections returned after NMS.
+///
+/// Matches the Ultralytics `max_det` parameter.  Default: 300.
+///
+/// @param params   Params handle (must not be NULL)
+/// @param max_det  Maximum detections post-NMS
+/// @return 0 on success, -1 on error (errno = EINVAL)
+///
+/// @see hal_decoder_params_set_pre_nms_top_k
+#[no_mangle]
+pub unsafe extern "C" fn hal_decoder_params_set_max_det(
+    params: *mut HalDecoderParams,
+    max_det: size_t,
+) -> c_int {
+    check_null!(params);
+    (*params).max_det = max_det;
+    0
+}
+
 /// Set the model input dimensions used by the EDGEAI-1303 normalization path.
 ///
 /// When the underlying model emits pixel-space box coordinates and its
@@ -902,7 +954,9 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
     let mut builder = DecoderBuilder::new()
         .with_score_threshold(p.score_threshold)
         .with_iou_threshold(p.iou_threshold)
-        .with_nms(p.nms);
+        .with_nms(p.nms)
+        .with_pre_nms_top_k(p.pre_nms_top_k)
+        .with_max_det(p.max_det);
     if let Some((w, h)) = p.input_dims {
         builder = builder.with_input_dims(w, h);
     }
@@ -1799,6 +1853,61 @@ nms: class_aware
             assert!(!decoder.is_null());
             hal_decoder_params_free(params);
             hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decoder_new_with_pre_nms_top_k() {
+        unsafe {
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
+            hal_decoder_params_set_score_threshold(params, 0.001);
+            assert_eq!(hal_decoder_params_set_pre_nms_top_k(params, 8400), 0);
+            assert_eq!(hal_decoder_params_set_max_det(params, 300), 0);
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            assert_eq!((*decoder).inner.pre_nms_top_k, 8400);
+            assert_eq!((*decoder).inner.max_det, 300);
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decoder_pre_nms_top_k_zero_means_unbounded() {
+        unsafe {
+            let config = CString::new(YOLO_JSON_CONFIG).unwrap();
+            let params = hal_decoder_params_new();
+            hal_decoder_params_set_config_json(params, config.as_ptr(), 0);
+            assert_eq!(hal_decoder_params_set_pre_nms_top_k(params, 0), 0);
+
+            let decoder = hal_decoder_new(params);
+            assert!(!decoder.is_null());
+            assert_eq!((*decoder).inner.pre_nms_top_k, 0);
+            hal_decoder_params_free(params);
+            hal_decoder_free(decoder);
+        }
+    }
+
+    #[test]
+    fn test_decoder_pre_nms_top_k_null_params() {
+        unsafe {
+            assert_eq!(
+                hal_decoder_params_set_pre_nms_top_k(std::ptr::null_mut(), 8400),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn test_decoder_max_det_null_params() {
+        unsafe {
+            assert_eq!(
+                hal_decoder_params_set_max_det(std::ptr::null_mut(), 100),
+                -1
+            );
         }
     }
 

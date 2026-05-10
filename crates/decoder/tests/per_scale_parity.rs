@@ -1600,6 +1600,119 @@ fn yolov8n_seg_per_scale_pre_nms_parity() {
     assert_pre_nms_parity(&fix, "yolov8n-seg");
 }
 
+/// Verify that `pre_nms_top_k` settings don't silently destroy
+/// detection quality.  The default of 300 was introduced for O(N²)
+/// NMS performance (PR #59/#60), but with low score thresholds
+/// (0.001) used for mAP validation it truncates valid candidates and
+/// depresses recall.
+///
+/// This test decodes the fixture with several `pre_nms_top_k` values
+/// and asserts that the detection count doesn't collapse at settings
+/// that should be "safe" (≥ 1000).  The unbounded baseline (100 000)
+/// is the ground truth; anything ≥ 1000 should keep ≥ 90% of those
+/// detections.
+#[test]
+fn yolov8n_seg_pre_nms_top_k_sensitivity() {
+    use edgefirst_decoder::per_scale::DecodeDtype;
+    use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox, Nms};
+
+    let path = fixture_path("yolov8n-seg.safetensors");
+    let fix = match common::per_scale_fixture::PerScaleFixture::load(&path) {
+        Ok(f) => f,
+        Err(common::per_scale_fixture::FixtureError::NotPresent(_)) => {
+            eprintln!("skip: fixture not present");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
+
+    let schema_str = fix.schema_json();
+    let nms_config = fix.nms_config();
+
+    let decode_with_top_k = |top_k: usize| -> usize {
+        let schema: SchemaV2 =
+            serde_json::from_str(schema_str).expect("fixture schema_json must parse");
+        let decoder = DecoderBuilder::default()
+            .with_schema(schema)
+            .with_decode_dtype(DecodeDtype::F32)
+            .with_iou_threshold(nms_config.iou_threshold)
+            .with_score_threshold(nms_config.score_threshold)
+            .with_nms(Some(Nms::ClassAgnostic))
+            .with_pre_nms_top_k(top_k)
+            .with_max_det(100_000) // uncapped so we measure pre_nms_top_k, not max_det
+            .build()
+            .unwrap_or_else(|e| panic!("build decoder (top_k={top_k}): {e}"));
+        let owned_tensors = fix.build_tensors_with_quant().expect("build tensors");
+        let inputs: Vec<&edgefirst_tensor::TensorDyn> = owned_tensors.iter().collect();
+        let mut boxes: Vec<DetectBox> = Vec::with_capacity(300);
+        decoder
+            .decode_proto(&inputs, &mut boxes)
+            .expect("decode_proto");
+        boxes.len()
+    };
+
+    let n_unbounded = decode_with_top_k(100_000);
+    let n_zero = decode_with_top_k(0);
+    let n_8400 = decode_with_top_k(8400);
+    let n_3000 = decode_with_top_k(3000);
+    let n_1000 = decode_with_top_k(1000);
+    let n_300 = decode_with_top_k(300);
+
+    eprintln!(
+        "pre_nms_top_k sensitivity (yolov8n-seg):\n  \
+         unbounded={n_unbounded}, zero={n_zero}, 8400={n_8400}, 3000={n_3000}, \
+         1000={n_1000}, 300={n_300}"
+    );
+
+    // Unbounded must produce meaningful detections.
+    assert!(
+        n_unbounded >= fix.expected_count_min as usize,
+        "unbounded pre_nms_top_k produced only {n_unbounded} detections"
+    );
+
+    // pre_nms_top_k=0 means no limit and must match unbounded.
+    assert_eq!(
+        n_zero, n_unbounded,
+        "pre_nms_top_k=0 (no limit) should match unbounded ({n_unbounded}), got {n_zero}"
+    );
+
+    // 8400 (all anchors) should match unbounded exactly.
+    assert_eq!(
+        n_8400, n_unbounded,
+        "pre_nms_top_k=8400 should match unbounded ({n_unbounded}), got {n_8400}"
+    );
+
+    // Moderate values (≥3000) should retain nearly all detections.
+    // At 1000 some loss is expected since the score filter at 0.001 passes
+    // more candidates than 1000 on this fixture.
+    let ratio_3000 = n_3000 as f32 / n_unbounded as f32;
+    let ratio_1000 = n_1000 as f32 / n_unbounded as f32;
+    assert!(
+        ratio_3000 >= 0.99,
+        "pre_nms_top_k=3000 retained only {:.0}% of unbounded detections ({n_3000}/{n_unbounded})",
+        ratio_3000 * 100.0
+    );
+    assert!(
+        ratio_1000 >= 0.80,
+        "pre_nms_top_k=1000 retained only {:.0}% of unbounded detections ({n_1000}/{n_unbounded})",
+        ratio_1000 * 100.0
+    );
+
+    // The default 300 loses significant detections (the known issue).
+    let ratio_300 = n_300 as f32 / n_unbounded as f32;
+    assert!(
+        ratio_300 < 0.50,
+        "pre_nms_top_k=300 should retain <50% of unbounded detections, got {:.0}%",
+        ratio_300 * 100.0
+    );
+    eprintln!(
+        "  detection retention: 3000→{:.0}%, 1000→{:.0}%, 300→{:.0}%",
+        ratio_3000 * 100.0,
+        ratio_1000 * 100.0,
+        ratio_300 * 100.0
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────
 // yolo11n-seg per-scale parity (fixture-backed)
 // ────────────────────────────────────────────────────────────────────
