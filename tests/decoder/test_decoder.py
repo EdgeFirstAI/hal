@@ -348,6 +348,11 @@ def test_nms():
         config = f.read()
 
     decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.0, 1.0)
+    # Raise max_det so the iou=1.0 fast-path returns ALL anchors, not just
+    # the top 300.  Without this the reference set is truncated and HAL NMS
+    # (which processes the full set) can produce survivors that TF NMS never
+    # sees, causing false-positive mismatches.
+    decoder.max_det = 100_000
     boxes, scores, classes, masks = decoder.decode([output0, output1], 100000)
 
     for iou in range(0, 100):

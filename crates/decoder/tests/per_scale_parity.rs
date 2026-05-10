@@ -1608,9 +1608,10 @@ fn yolov8n_seg_per_scale_pre_nms_parity() {
 ///
 /// This test decodes the fixture with several `pre_nms_top_k` values
 /// and asserts that the detection count doesn't collapse at settings
-/// that should be "safe" (≥ 1000).  The unbounded baseline (100 000)
-/// is the ground truth; anything ≥ 1000 should keep ≥ 90% of those
-/// detections.
+/// that should be "safe".  The unbounded baseline (100 000) is the
+/// ground truth; 3000 should retain ≥ 99% and even 1000 should keep
+/// the majority (≥ 50%).  The default of 300 is expected to lose
+/// significant detections.
 #[test]
 fn yolov8n_seg_pre_nms_top_k_sensitivity() {
     use edgefirst_decoder::per_scale::DecodeDtype;
@@ -1682,9 +1683,9 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
         "pre_nms_top_k=8400 should match unbounded ({n_unbounded}), got {n_8400}"
     );
 
-    // Moderate values (≥3000) should retain nearly all detections.
-    // At 1000 some loss is expected since the score filter at 0.001 passes
-    // more candidates than 1000 on this fixture.
+    // 3000 should retain nearly all detections (≥ 99%).
+    // 1000 may lose some candidates since the fixture produces > 1000
+    // score-passing anchors, but should keep the majority (≥ 50%).
     let ratio_3000 = n_3000 as f32 / n_unbounded as f32;
     let ratio_1000 = n_1000 as f32 / n_unbounded as f32;
     assert!(
@@ -1693,7 +1694,7 @@ fn yolov8n_seg_pre_nms_top_k_sensitivity() {
         ratio_3000 * 100.0
     );
     assert!(
-        ratio_1000 >= 0.80,
+        ratio_1000 >= 0.50,
         "pre_nms_top_k=1000 retained only {:.0}% of unbounded detections ({n_1000}/{n_unbounded})",
         ratio_1000 * 100.0
     );

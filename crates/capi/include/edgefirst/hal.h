@@ -871,7 +871,9 @@ typedef struct hal_camera_adaptor_format_info {
  * |---------|---------|
  * | score_threshold | 0.5 |
  * | iou_threshold | 0.5 |
- * | nms | HAL_NMS_CLASS_AGNOSTIC |
+ * | nms | from config, or HAL_NMS_CLASS_AGNOSTIC |
+ * | pre_nms_top_k | 300 |
+ * | max_det | 300 |
  *
  * The caller must configure outputs (via `hal_decoder_params_add_output()`,
  * `hal_decoder_params_set_config_file()`, `hal_decoder_params_set_config_json()`,
@@ -1242,16 +1244,11 @@ struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
  *
  * All output tensors must be the same general category (all float or all integer).
  *
- * The C API does not expose any caller-side detection-count cap — the decoder
- * allocates and populates the returned `HalDetectBoxList` internally and
- * truncates after NMS using its own `max_det` setting (default 300, fixed
- * at the current C ABI; tunable from Rust via `DecoderBuilder::with_max_det`).
+ * The decoder truncates results after NMS using its `max_det` setting
+ * (default 300, configurable via `hal_decoder_params_set_max_det()`).
  * The output list returned through `out_boxes` therefore contains 0 to
  * `max_det` detections, and callers should always check `hal_decoder_box_list_len()`
- * to find out how many actually survived. See EDGEAI-1302 for the bug this
- * supersedes (a previous Rust-side bug treated the Vec capacity as the cap
- * and silently returned zero detections; the C ABI was never affected, but
- * the underlying Rust call now matches the C ABI's expectations).
+ * to find out how many actually survived.
  *
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers
@@ -1285,9 +1282,9 @@ int hal_decoder_decode(const struct hal_decoder *decoder,
  *       `hal_image_processor_draw_masks()` which is 1.6–27× faster on tested platforms.
  *
  * As with `hal_decoder_decode()`, the number of detections returned is bounded
- * by the decoder's internal `max_det` setting (default 300; not currently
- * exposed via the C ABI). Use `hal_decoder_box_list_len()` to read the actual
- * count from the returned `out_boxes`. See EDGEAI-1302.
+ * by the decoder's `max_det` setting (default 300, configurable via
+ * `hal_decoder_params_set_max_det()`). Use `hal_decoder_box_list_len()`
+ * to read the actual count from the returned `out_boxes`.
  *
  * @param decoder Decoder handle
  * @param outputs Array of output tensor pointers
