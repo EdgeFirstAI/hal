@@ -1125,6 +1125,38 @@ int hal_decoder_params_set_decoder_version(struct hal_decoder_params *params,
                                            enum HalDecoderVersion version);
 
 /**
+ * Set the maximum number of candidate boxes fed into NMS after score
+ * filtering.  Uses O(N) partial sort to reduce O(N²) NMS cost.
+ *
+ * Default: 300 — appropriate for deployment (`score_threshold >= 0.25`).
+ *
+ * **WARNING**: For COCO mAP evaluation (`score_threshold ~ 0.001`), set
+ * this to the total anchor count (8400 for 640×640 YOLO models). The
+ * default of 300 discards ~74% of valid candidates before NMS, causing
+ * ~9 pp box mAP loss.
+ *
+ * @param params      Params handle (must not be NULL)
+ * @param pre_nms_top_k  Maximum candidates for NMS (0 = no limit)
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_set_score_threshold, hal_decoder_params_set_max_det
+ */
+int hal_decoder_params_set_pre_nms_top_k(struct hal_decoder_params *params, size_t pre_nms_top_k);
+
+/**
+ * Set the maximum number of detections returned after NMS.
+ *
+ * Matches the Ultralytics `max_det` parameter.  Default: 300.
+ *
+ * @param params   Params handle (must not be NULL)
+ * @param max_det  Maximum detections post-NMS
+ * @return 0 on success, -1 on error (errno = EINVAL)
+ *
+ * @see hal_decoder_params_set_pre_nms_top_k
+ */
+int hal_decoder_params_set_max_det(struct hal_decoder_params *params, size_t max_det);
+
+/**
  * Set the model input dimensions used by the EDGEAI-1303 normalization path.
  *
  * When the underlying model emits pixel-space box coordinates and its

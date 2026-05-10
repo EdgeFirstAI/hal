@@ -922,18 +922,53 @@ impl DecoderBuilder {
     /// dramatically reducing the O(N²) NMS cost when many low-confidence
     /// proposals pass the threshold (common with mAP eval at 0.001).
     ///
-    /// Default: 300 (matches Ultralytics `max_det`).
+    /// Default: 300.
+    ///
+    /// # ⚠️ Validation vs Deployment
+    ///
+    /// The default is appropriate for **deployment** where
+    /// `score_threshold ≥ 0.25` means few anchors survive filtering and
+    /// top-K is effectively a no-op.
+    ///
+    /// For **COCO mAP evaluation** (`score_threshold ≈ 0.001`), set this to
+    /// the total anchor count (8 400 for standard 640 × 640 YOLO models) or
+    /// to `0` (no limit) so that all score-passing candidates reach NMS.
+    /// Failing to do so causes **~9 pp box mAP loss** — the decoder math is
+    /// correct but the evaluation protocol requires full recall across the
+    /// confidence range.
+    ///
+    /// Post-processing latency scales with candidate count. At deployment
+    /// thresholds the cost difference is negligible; at validation thresholds
+    /// it is measurable but necessary for correct results.
     ///
     /// # Examples
+    ///
+    /// Deployment (default top-K, high score threshold):
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
     /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
-    ///     .with_pre_nms_top_k(1000)
+    ///     .with_score_threshold(0.25)
+    ///     // pre_nms_top_k defaults to 300 — appropriate here
     ///     .build()?;
-    /// assert_eq!(decoder.pre_nms_top_k, 1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// COCO mAP evaluation (pass all anchors to NMS):
+    /// ```rust
+    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
+    /// # fn main() -> DecoderResult<()> {
+    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// let decoder = DecoderBuilder::new()
+    ///     .with_config_json_str(config_json)
+    ///     .with_score_threshold(0.001)
+    ///     .with_pre_nms_top_k(8400)  // all YOLO anchors
+    ///     .with_max_det(300)
+    ///     .build()?;
+    /// assert_eq!(decoder.pre_nms_top_k, 8400);
     /// # Ok(())
     /// # }
     /// ```
