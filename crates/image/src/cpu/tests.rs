@@ -2434,6 +2434,40 @@ mod cpu_tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn make_proto_data_i16_i8(
+        proto_h: usize,
+        proto_w: usize,
+        num_protos: usize,
+        proto_values: Vec<i8>,
+        proto_quant: (f32, i32),
+        coeff_values: Vec<i16>,
+        coeff_quant: (f32, i32),
+        num_detections: usize,
+    ) -> crate::ProtoData {
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
+        assert_eq!(coeff_values.len(), num_detections * num_protos);
+
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(proto_quant.0, proto_quant.1))
+            .unwrap();
+
+        let mut coeff_t =
+            Tensor::<i16>::from_slice(&coeff_values, &[num_detections, num_protos]).unwrap();
+        coeff_t
+            .set_quantization(Quantization::per_tensor(coeff_quant.0, coeff_quant.1))
+            .unwrap();
+
+        crate::ProtoData {
+            mask_coefficients: TensorDyn::I16(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+        }
+    }
+
     #[test]
     fn test_materialize_scaled_i8_i8_basic() {
         // Uniform positive protos + positive coefficients → all-255 mask.
@@ -2643,6 +2677,164 @@ mod cpu_tests {
             f32_mask, i8_mask,
             "i8×i8 integer path must produce identical binarized mask as f32 path (symmetric quant)"
         );
+    }
+
+    #[test]
+    fn test_materialize_i16_i8_parity_with_float() {
+        let proto_h = 8;
+        let proto_w = 8;
+        let num_protos = 4;
+
+        let mut proto_i8 = Vec::with_capacity(proto_h * proto_w * num_protos);
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                for k in 0..num_protos {
+                    let v = ((y as i32 * 7 + x as i32 * 13 + k as i32 * 3) % 127) as i8 - 60;
+                    proto_i8.push(v);
+                }
+            }
+        }
+
+        let coeff_i16 = vec![300_i16, -250, 180, -130];
+        let proto_f32: Vec<f32> = proto_i8.iter().map(|&v| v as f32).collect();
+        let coeff_f32: Vec<f32> = coeff_i16.iter().map(|&v| v as f32).collect();
+
+        let proto_data_f32 =
+            make_proto_data_with_values(proto_h, proto_w, num_protos, proto_f32, vec![coeff_f32]);
+        let proto_data_i16 = make_proto_data_i16_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_i8,
+            (1.0, 0),
+            coeff_i16,
+            (1.0, 0),
+            1,
+        );
+
+        let det = [make_detect_box(0.05, 0.05, 0.95, 0.95)];
+        let cpu = CPUProcessor::new();
+
+        let segs_f32 = cpu
+            .materialize_segmentations(&det, &proto_data_f32, None)
+            .expect("f32 path");
+        let segs_i16 = cpu
+            .materialize_segmentations(&det, &proto_data_i16, None)
+            .expect("i16 path");
+
+        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
+        let i16_mask: Vec<u8> = segs_i16[0].segmentation.iter().copied().collect();
+        assert_eq!(
+            f32_mask, i16_mask,
+            "i16×i8 proto path should match f32 fallback"
+        );
+    }
+
+    #[test]
+    fn test_materialize_scaled_i16_i8_parity_with_float() {
+        let proto_h = 8;
+        let proto_w = 8;
+        let num_protos = 4;
+
+        let mut proto_i8 = Vec::with_capacity(proto_h * proto_w * num_protos);
+        for y in 0..proto_h {
+            for x in 0..proto_w {
+                for k in 0..num_protos {
+                    let v = ((y as i32 * 11 + x as i32 * 5 + k as i32 * 17) % 127) as i8 - 60;
+                    proto_i8.push(v);
+                }
+            }
+        }
+
+        let coeff_i16 = vec![220_i16, -180, 150, -90];
+        let proto_f32: Vec<f32> = proto_i8.iter().map(|&v| v as f32).collect();
+        let coeff_f32: Vec<f32> = coeff_i16.iter().map(|&v| v as f32).collect();
+
+        let proto_data_f32 =
+            make_proto_data_with_values(proto_h, proto_w, num_protos, proto_f32, vec![coeff_f32]);
+        let proto_data_i16 = make_proto_data_i16_i8(
+            proto_h,
+            proto_w,
+            num_protos,
+            proto_i8,
+            (1.0, 0),
+            coeff_i16,
+            (1.0, 0),
+            1,
+        );
+
+        let det = [make_detect_box(0.05, 0.05, 0.95, 0.95)];
+        let cpu = CPUProcessor::new();
+
+        let segs_f32 = cpu
+            .materialize_scaled_segmentations(&det, &proto_data_f32, None, 32, 32)
+            .expect("f32 path");
+        let segs_i16 = cpu
+            .materialize_scaled_segmentations(&det, &proto_data_i16, None, 32, 32)
+            .expect("i16 path");
+
+        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
+        let i16_mask: Vec<u8> = segs_i16[0].segmentation.iter().copied().collect();
+        assert_eq!(
+            f32_mask, i16_mask,
+            "scaled i16×i8 path should match f32 fallback"
+        );
+    }
+
+    #[test]
+    fn test_materialize_nchw_i8_f32_coefficients_use_fallback() {
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 10;
+            proto_values[proto_h * proto_w + i] = -10;
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap();
+        let coeff_t = Tensor::<f32>::from_slice(&[1.0_f32, 0.0], &[1, num_protos]).unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::F32(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_segmentations(&det, &proto_data, None)
+            .expect("NCHW i8 protos should transpose in f32 fallback");
+        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
+    }
+
+    #[test]
+    fn test_materialize_scaled_nchw_i8_f32_coefficients_use_fallback() {
+        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        let cpu = CPUProcessor::new();
+        let (proto_h, proto_w, num_protos) = (4, 4, 2);
+        let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
+        for i in 0..proto_h * proto_w {
+            proto_values[i] = 10;
+            proto_values[proto_h * proto_w + i] = -10;
+        }
+        let mut protos_t =
+            Tensor::<i8>::from_slice(&proto_values, &[num_protos, proto_h, proto_w]).unwrap();
+        protos_t
+            .set_quantization(Quantization::per_tensor(0.1, 0))
+            .unwrap();
+        let coeff_t = Tensor::<f32>::from_slice(&[1.0_f32, 0.0], &[1, num_protos]).unwrap();
+        let proto_data = crate::ProtoData {
+            mask_coefficients: TensorDyn::F32(coeff_t),
+            protos: TensorDyn::I8(protos_t),
+            layout: edgefirst_decoder::ProtoLayout::Nchw,
+        };
+        let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
+        let segs = cpu
+            .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
+            .expect("NCHW i8 protos should transpose in scaled f32 fallback");
+        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
     }
 
     #[test]
