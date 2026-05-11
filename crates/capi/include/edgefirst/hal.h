@@ -200,6 +200,7 @@ typedef enum HalDimName {
  * | HAL_NMS_CLASS_AGNOSTIC | 0 | Suppress overlapping boxes regardless of class |
  * | HAL_NMS_CLASS_AWARE | 1 | Only suppress boxes with the same class label |
  * | HAL_NMS_NONE | 2 | Disable NMS (for end-to-end models with embedded NMS) |
+ * | HAL_NMS_AUTO | 3 | Use config NMS mode, fallback to CLASS_AGNOSTIC (default) |
  *
  * Most YOLO models use HAL_NMS_CLASS_AGNOSTIC. Use HAL_NMS_NONE for
  * end-to-end models (e.g. `decoder_version: yolo26` in EdgeFirst metadata)
@@ -221,6 +222,12 @@ typedef enum hal_nms {
    * Use for end-to-end models that include NMS in the model graph.
    */
   HAL_NMS_NONE = 2,
+  /**
+   * Automatic: use the NMS mode from the model config (e.g. edgefirst.json),
+   * falling back to ClassAgnostic when no config specifies one.
+   * This is the default when `hal_decoder_params_set_nms()` is not called.
+   */
+  HAL_NMS_AUTO = 3,
 } hal_nms;
 
 /**
@@ -871,7 +878,7 @@ typedef struct hal_camera_adaptor_format_info {
  * |---------|---------|
  * | score_threshold | 0.5 |
  * | iou_threshold | 0.5 |
- * | nms | from config, or HAL_NMS_CLASS_AGNOSTIC |
+ * | nms | HAL_NMS_AUTO (config, or HAL_NMS_CLASS_AGNOSTIC) |
  * | pre_nms_top_k | 300 |
  * | max_det | 300 |
  *

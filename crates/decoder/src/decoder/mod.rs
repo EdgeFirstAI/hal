@@ -16,8 +16,11 @@ pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
-    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
-    /// models)
+    /// NMS mode (always a concrete variant after build — `Nms::Auto` is
+    /// resolved during `DecoderBuilder::build()` and never stored here):
+    /// - `Some(ClassAgnostic)` — class-agnostic NMS
+    /// - `Some(ClassAware)` — class-aware NMS
+    /// - `None` — NMS bypassed (end-to-end models)
     pub nms: Option<configs::Nms>,
     /// Maximum number of candidate boxes fed into NMS after score filtering.
     /// Reduces O(N²) NMS cost when many low-confidence proposals pass the

@@ -128,12 +128,14 @@ pub struct DecoderBuilder {
     config_src: Option<ConfigSource>,
     iou_threshold: f32,
     score_threshold: f32,
-    /// NMS mode override. `None` means the user has not explicitly set
-    /// NMS — at build time the config's NMS setting (or the fallback
-    /// default of `ClassAgnostic`) will be used.  `Some(x)` means the
-    /// user explicitly called `with_nms(x)` and it overrides whatever
-    /// the config declares.
-    nms: Option<Option<configs::Nms>>,
+    /// NMS mode.
+    ///
+    /// - `Some(Nms::Auto)` — resolve from config or fallback to
+    ///   `ClassAgnostic` (builder default)
+    /// - `Some(Nms::ClassAgnostic)` — explicit class-agnostic override
+    /// - `Some(Nms::ClassAware)` — explicit class-aware override
+    /// - `None` — bypass NMS entirely
+    nms: Option<configs::Nms>,
     /// Output dtype for the per-scale fast path. Has no effect on
     /// schemas without per-scale children (which use the legacy decode
     /// path).
@@ -184,7 +186,7 @@ impl Default for DecoderBuilder {
             config_src: None,
             iou_threshold: 0.5,
             score_threshold: 0.5,
-            nms: None,
+            nms: Some(configs::Nms::Auto),
             decode_dtype: DecodeDtype::F32,
             pre_nms_top_k: 300,
             max_det: 300,
@@ -896,9 +898,10 @@ impl DecoderBuilder {
 
     /// Sets the NMS mode for the decoder.
     ///
-    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default when no
-    ///   config or user override): suppress overlapping boxes regardless of
-    ///   class label
+    /// - `Some(Nms::Auto)` — resolve from model config (e.g. `edgefirst.json`)
+    ///   or fall back to `ClassAgnostic` (this is the builder default)
+    /// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
+    ///   boxes regardless of class label
     /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
     ///   share the same class label AND overlap above the IoU threshold
     /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
@@ -917,7 +920,7 @@ impl DecoderBuilder {
     /// # }
     /// ```
     pub fn with_nms(mut self, nms: Option<configs::Nms>) -> Self {
-        self.nms = Some(nms);
+        self.nms = nms;
         self
     }
 
@@ -1096,12 +1099,22 @@ impl DecoderBuilder {
             Self::get_normalized(&config.outputs)
         };
 
-        // NMS precedence: explicit user override > config > fallback default.
-        // `self.nms` is `Some(x)` when the user called `with_nms(x)`,
-        // `None` when they did not (use config or fallback).
-        let nms = self
-            .nms
-            .unwrap_or_else(|| config.nms.or(Some(configs::Nms::ClassAgnostic)));
+        // NMS precedence:
+        //   Some(ClassAgnostic|ClassAware) → explicit user override
+        //   Some(Auto) → resolve from config, fallback to ClassAgnostic
+        //   None → NMS disabled (explicit)
+        //
+        // `Auto` is always resolved to a concrete mode here — it never
+        // persists into the built `Decoder`, even if the config itself
+        // contains `Auto`.
+        let resolve_auto = |nms: Option<configs::Nms>| match nms {
+            Some(configs::Nms::Auto) | None => Some(configs::Nms::ClassAgnostic),
+            concrete => concrete,
+        };
+        let nms = match self.nms {
+            Some(configs::Nms::Auto) => resolve_auto(config.nms),
+            other => other,
+        };
         // When the per-scale path is active, the per_scale subsystem owns
         // model decoding entirely — `decode` / `decode_proto` short-circuit
         // on `per_scale.is_some()` before reading `model_type`. Skip the
@@ -1121,6 +1134,11 @@ impl DecoderBuilder {
 
         let per_scale = per_scale_plan
             .map(|plan| std::sync::Mutex::new(crate::per_scale::PerScaleDecoder::new(plan)));
+
+        debug_assert!(
+            !matches!(nms, Some(configs::Nms::Auto)),
+            "Nms::Auto must be resolved to a concrete mode before building Decoder"
+        );
 
         Ok(Decoder {
             model_type,

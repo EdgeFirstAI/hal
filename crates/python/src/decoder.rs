@@ -23,6 +23,9 @@ pub enum PyNms {
     ClassAgnostic = 0,
     /// Only suppress boxes with the same class label that overlap
     ClassAware = 1,
+    /// Use the model config (e.g. ``edgefirst.json``) to decide NMS mode,
+    /// falling back to :attr:`ClassAgnostic` when no config specifies one.
+    Auto = 2,
 }
 
 impl From<PyNms> for Nms {
@@ -30,6 +33,7 @@ impl From<PyNms> for Nms {
         match py {
             PyNms::ClassAgnostic => Nms::ClassAgnostic,
             PyNms::ClassAware => Nms::ClassAware,
+            PyNms::Auto => Nms::Auto,
         }
     }
 }
@@ -39,6 +43,7 @@ impl From<Nms> for PyNms {
         match nms {
             Nms::ClassAgnostic => PyNms::ClassAgnostic,
             Nms::ClassAware => PyNms::ClassAware,
+            Nms::Auto => PyNms::Auto,
         }
     }
 }
@@ -552,7 +557,8 @@ impl PyDecoder {
     ///     score_threshold: Score threshold for filtering detections (default
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
-    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
+    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override
     ///         consumed by the EDGEAI-1303 normalization path. When set,
@@ -560,7 +566,7 @@ impl PyDecoder {
     ///         from a config that does not declare an input shape but the
     ///         model emits pixel-space boxes (``Detection.normalized = False``).
     #[new]
-    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
+    #[pyo3(signature = (config, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
     pub fn new(
         config: Bound<PyAny>,
         score_threshold: f32,
@@ -625,7 +631,7 @@ impl PyDecoder {
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::ClassAgnostic, decoder_version=None, input_dims=None))]
+    #[pyo3(signature = (outputs, score_threshold=0.25, iou_threshold=0.45, nms=PyNms::Auto, decoder_version=None, input_dims=None))]
     pub fn new_from_outputs(
         outputs: Vec<PyRef<PyOutput>>,
         score_threshold: f32,
@@ -661,12 +667,13 @@ impl PyDecoder {
     ///     score_threshold: Score threshold for filtering detections (default
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
-    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
+    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
+    #[pyo3(signature = (json_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
     pub fn new_from_json_str(
         json_str: &str,
         score_threshold: f32,
@@ -696,12 +703,13 @@ impl PyDecoder {
     ///     score_threshold: Score threshold for filtering detections (default
     ///         ``0.1``).
     ///     iou_threshold: IoU threshold for NMS (default ``0.7``).
-    ///     nms: NMS mode - ``Nms.ClassAgnostic`` (default), ``Nms.ClassAware``,
+    ///     nms: NMS mode - ``Nms.Auto`` (default, uses config or
+    ///         ``ClassAgnostic``), ``Nms.ClassAgnostic``, ``Nms.ClassAware``,
     ///         or ``None`` to bypass NMS.
     ///     input_dims: Optional ``(width, height)`` model input override.
     ///         See :meth:`__init__` for semantics.
     #[staticmethod]
-    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::ClassAgnostic, input_dims=None))]
+    #[pyo3(signature = (yaml_str, score_threshold=0.1, iou_threshold=0.7, nms=PyNms::Auto, input_dims=None))]
     pub fn new_from_yaml_str(
         yaml_str: &str,
         score_threshold: f32,
