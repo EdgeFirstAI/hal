@@ -343,36 +343,35 @@ impl CPUProcessor {
                 .as_i16()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map()?;
-            let coeff_quant = coeff_t.quantization().ok_or_else(|| {
-                crate::Error::InvalidShape(
-                    "I16 mask_coefficients require quantization metadata".into(),
-                )
-            })?;
-            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
-            let proto_m = proto_t.map()?;
-            let proto_quant = proto_t.quantization().ok_or_else(|| {
-                crate::Error::InvalidShape("I8 protos require quantization metadata".into())
-            })?;
-            match proto_segmentations_i16_i8(
-                detect,
-                coeff_m.as_slice(),
-                coeff_quant,
-                proto_m.as_slice(),
-                proto_quant,
-                proto_h,
-                proto_w,
-                num_protos,
-                lx0,
-                inv_lw,
-                ly0,
-                inv_lh,
-                proto_data.layout,
-            ) {
-                Ok(result) => return Ok(result),
-                Err(crate::Error::NotSupported(_)) => {
-                    // Fall through to the general f32 dequant path.
+            // Skip the integer fast path when coefficient quantization is
+            // absent — the f32 fallback below handles raw i16 by widening.
+            if let Some(coeff_quant) = coeff_t.quantization() {
+                let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+                let proto_m = proto_t.map()?;
+                let proto_quant = proto_t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+                })?;
+                match proto_segmentations_i16_i8(
+                    detect,
+                    coeff_m.as_slice(),
+                    coeff_quant,
+                    proto_m.as_slice(),
+                    proto_quant,
+                    proto_h,
+                    proto_w,
+                    num_protos,
+                    lx0,
+                    inv_lw,
+                    ly0,
+                    inv_lh,
+                    proto_data.layout,
+                ) {
+                    Ok(result) => return Ok(result),
+                    Err(crate::Error::NotSupported(_)) => {
+                        // Fall through to the general f32 dequant path.
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
 
@@ -709,33 +708,32 @@ impl CPUProcessor {
                 .as_i16()
                 .expect("I16 coefficients");
             let coeff_m = coeff_t.map()?;
-            let coeff_quant = coeff_t.quantization().ok_or_else(|| {
-                crate::Error::InvalidShape(
-                    "I16 mask_coefficients require quantization metadata".into(),
-                )
-            })?;
-            let proto_t = proto_data.protos.as_i8().expect("I8 protos");
-            let proto_m = proto_t.map()?;
-            let proto_quant = proto_t.quantization().ok_or_else(|| {
-                crate::Error::InvalidShape("I8 protos require quantization metadata".into())
-            })?;
-            match scaled_segmentations_i16_i8(
-                detect,
-                coeff_m.as_slice(),
-                coeff_quant,
-                proto_m.as_slice(),
-                proto_quant,
-                proto_h,
-                proto_w,
-                num_protos,
-                letterbox,
-                width,
-                height,
-                proto_data.layout,
-            ) {
-                Ok(result) => return Ok(result),
-                Err(crate::Error::NotSupported(_)) => {}
-                Err(e) => return Err(e),
+            // Skip the integer fast path when coefficient quantization is
+            // absent — the f32 fallback below handles raw i16 by widening.
+            if let Some(coeff_quant) = coeff_t.quantization() {
+                let proto_t = proto_data.protos.as_i8().expect("I8 protos");
+                let proto_m = proto_t.map()?;
+                let proto_quant = proto_t.quantization().ok_or_else(|| {
+                    crate::Error::InvalidShape("I8 protos require quantization metadata".into())
+                })?;
+                match scaled_segmentations_i16_i8(
+                    detect,
+                    coeff_m.as_slice(),
+                    coeff_quant,
+                    proto_m.as_slice(),
+                    proto_quant,
+                    proto_h,
+                    proto_w,
+                    num_protos,
+                    letterbox,
+                    width,
+                    height,
+                    proto_data.layout,
+                ) {
+                    Ok(result) => return Ok(result),
+                    Err(crate::Error::NotSupported(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
 
@@ -786,25 +784,24 @@ impl CPUProcessor {
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
                 let m = t.map()?;
-                let q = t.quantization().ok_or_else(|| {
-                    crate::Error::InvalidShape(
-                        "I16 mask_coefficients require quantization metadata".into(),
-                    )
-                })?;
-                use edgefirst_tensor::QuantMode;
-                let (scale, zp) = match q.mode() {
-                    QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
-                    QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                    other => {
-                        return Err(crate::Error::NotSupported(format!(
-                            "I16 mask_coefficients quantization mode {other:?} not supported"
-                        )))
-                    }
-                };
-                m.as_slice()
-                    .iter()
-                    .map(|&v| (v as f32 - zp) * scale)
-                    .collect()
+                if let Some(q) = t.quantization() {
+                    use edgefirst_tensor::QuantMode;
+                    let (scale, zp) = match q.mode() {
+                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
+                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
+                        other => {
+                            return Err(crate::Error::NotSupported(format!(
+                                "I16 mask_coefficients quantization mode {other:?} not supported"
+                            )))
+                        }
+                    };
+                    m.as_slice()
+                        .iter()
+                        .map(|&v| (v as f32 - zp) * scale)
+                        .collect()
+                } else {
+                    m.as_slice().iter().map(|&v| v as f32).collect()
+                }
             }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
@@ -2784,4 +2781,409 @@ fn scaled_run<P: Copy + Sync>(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CPUProcessor;
+    use edgefirst_decoder::{BoundingBox, DetectBox, ProtoData, ProtoLayout};
+    use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+
+    const PROTO_H: usize = 4;
+    const PROTO_W: usize = 4;
+    const NUM_PROTOS: usize = 8;
+
+    fn det(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> DetectBox {
+        DetectBox {
+            bbox: BoundingBox {
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+            },
+            score: 0.9,
+            label: 0,
+        }
+    }
+
+    fn make_i8_quant(shape: &[usize], data: &[i8], scale: f32, zp: i32) -> TensorDyn {
+        let t = Tensor::<i8>::from_slice(data, shape).unwrap();
+        let t = t
+            .with_quantization(Quantization::per_tensor(scale, zp))
+            .unwrap();
+        TensorDyn::I8(t)
+    }
+
+    fn make_i16_quant(shape: &[usize], data: &[i16], scale: f32, zp: i32) -> TensorDyn {
+        let t = Tensor::<i16>::from_slice(data, shape).unwrap();
+        let t = t
+            .with_quantization(Quantization::per_tensor(scale, zp))
+            .unwrap();
+        TensorDyn::I16(t)
+    }
+
+    fn make_i16_raw(shape: &[usize], data: &[i16]) -> TensorDyn {
+        let t = Tensor::<i16>::from_slice(data, shape).unwrap();
+        TensorDyn::I16(t)
+    }
+
+    fn make_f32(shape: &[usize], data: &[f32]) -> TensorDyn {
+        let t = Tensor::<f32>::from_slice(data, shape).unwrap();
+        TensorDyn::F32(t)
+    }
+
+    fn gen_protos_i8(h: usize, w: usize, k: usize) -> Vec<i8> {
+        (0..h * w * k).map(|i| (i % 127) as i8).collect()
+    }
+
+    fn gen_coeffs_i16(n: usize, k: usize) -> Vec<i16> {
+        (0..n * k)
+            .map(|i| ((i as i32 % 201) - 100) as i16)
+            .collect()
+    }
+
+    fn gen_coeffs_i8(n: usize, k: usize) -> Vec<i8> {
+        (0..n * k).map(|i| ((i as i32 % 201) - 100) as i8).collect()
+    }
+
+    // ── Proto-resolution: i16×i8 fast path (quantized) ─────────────
+
+    #[test]
+    fn materialize_proto_i16_i8_quant_produces_masks() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i16_quant(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS), 0.01, 0);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_segmentations(&detect, &proto_data, None);
+        assert!(result.is_ok(), "materialize failed: {:?}", result.err());
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+        assert!(seg.segmentation.shape()[0] > 0);
+        assert!(seg.segmentation.shape()[1] > 0);
+    }
+
+    // ── Proto-resolution: i16 missing quant → f32 fallback ─────────
+
+    #[test]
+    fn materialize_proto_i16_no_quant_falls_back_to_f32() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.2, 0.2, 0.8, 0.8)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        // I16 coefficients WITHOUT quantization — fast path should be
+        // skipped, f32 fallback should widen raw i16 values.
+        let coeffs = make_i16_raw(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS));
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_segmentations(&detect, &proto_data, None);
+        assert!(
+            result.is_ok(),
+            "missing coeff quant should fall back to f32 path, got: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ── Scaled: i16×i8 fast path (quantized) ───────────────────────
+
+    #[test]
+    fn materialize_scaled_i16_i8_quant_produces_masks() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i16_quant(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS), 0.01, 0);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_scaled_segmentations(&detect, &proto_data, None, 64, 64);
+        assert!(
+            result.is_ok(),
+            "materialize_scaled failed: {:?}",
+            result.err()
+        );
+        let segs = result.unwrap();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+        assert!(seg.segmentation.shape()[0] > 0);
+        assert!(seg.segmentation.shape()[1] > 0);
+    }
+
+    // ── Scaled: i16 missing quant → f32 fallback ───────────────────
+
+    #[test]
+    fn materialize_scaled_i16_no_quant_falls_back_to_f32() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.2, 0.2, 0.8, 0.8)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i16_raw(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS));
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_scaled_segmentations(&detect, &proto_data, None, 64, 64);
+        assert!(
+            result.is_ok(),
+            "missing coeff quant should fall back to f32 path, got: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ── i16×i8 parity with f32 reference ───────────────────────────
+
+    #[test]
+    fn materialize_proto_i16_i8_matches_f32_reference() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9), det(0.3, 0.3, 0.7, 0.7)];
+        let n_det = detect.len();
+        let scale_c = 0.01_f32;
+        let scale_p = 0.02_f32;
+        let raw_protos = gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS);
+        let raw_coeffs = gen_coeffs_i16(n_det, NUM_PROTOS);
+
+        // Build f32 reference (dequantized manually).
+        let protos_f32: Vec<f32> = raw_protos.iter().map(|&v| v as f32 * scale_p).collect();
+        let coeffs_f32: Vec<f32> = raw_coeffs.iter().map(|&v| v as f32 * scale_c).collect();
+        let proto_data_f32 = ProtoData {
+            mask_coefficients: make_f32(&[n_det, NUM_PROTOS], &coeffs_f32),
+            protos: make_f32(&[PROTO_H, PROTO_W, NUM_PROTOS], &protos_f32),
+            layout: ProtoLayout::Nhwc,
+        };
+
+        let proto_data_int = ProtoData {
+            mask_coefficients: make_i16_quant(&[n_det, NUM_PROTOS], &raw_coeffs, scale_c, 0),
+            protos: make_i8_quant(&[PROTO_H, PROTO_W, NUM_PROTOS], &raw_protos, scale_p, 0),
+            layout: ProtoLayout::Nhwc,
+        };
+
+        let segs_f32 = cpu
+            .materialize_segmentations(&detect, &proto_data_f32, None)
+            .unwrap();
+        let segs_int = cpu
+            .materialize_segmentations(&detect, &proto_data_int, None)
+            .unwrap();
+
+        assert_eq!(segs_f32.len(), segs_int.len());
+        for (sf, si) in segs_f32.iter().zip(segs_int.iter()) {
+            assert_eq!(sf.segmentation.shape(), si.segmentation.shape());
+            let total = sf.segmentation.len();
+            let mismatches = sf
+                .segmentation
+                .iter()
+                .zip(si.segmentation.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            let pct = mismatches as f64 / total as f64 * 100.0;
+            assert!(
+                pct < 5.0,
+                "mask mismatch {mismatches}/{total} ({pct:.1}%) exceeds 5% threshold"
+            );
+        }
+    }
+
+    // ── Multiple detections ────────────────────────────────────────
+
+    #[test]
+    fn materialize_proto_i16_multiple_detections() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![
+            det(0.0, 0.0, 0.5, 0.5),
+            det(0.5, 0.5, 1.0, 1.0),
+            det(0.1, 0.1, 0.3, 0.3),
+        ];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i16_quant(&[3, NUM_PROTOS], &gen_coeffs_i16(3, NUM_PROTOS), 0.01, 0);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let segs = cpu
+            .materialize_segmentations(&detect, &proto_data, None)
+            .unwrap();
+        assert_eq!(segs.len(), 3);
+    }
+
+    // ── Empty detections ───────────────────────────────────────────
+
+    #[test]
+    fn materialize_proto_i16_empty_detections() {
+        let cpu = CPUProcessor::new();
+        let detect: Vec<DetectBox> = vec![];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i16_quant(&[0, NUM_PROTOS], &[], 0.01, 0);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let segs = cpu
+            .materialize_segmentations(&detect, &proto_data, None)
+            .unwrap();
+        assert!(segs.is_empty());
+    }
+
+    // ── Scaled parity ──────────────────────────────────────────────
+
+    #[test]
+    fn materialize_scaled_i16_i8_matches_f32_reference() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let scale_c = 0.01_f32;
+        let scale_p = 0.02_f32;
+        let raw_protos = gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS);
+        let raw_coeffs = gen_coeffs_i16(1, NUM_PROTOS);
+
+        let protos_f32: Vec<f32> = raw_protos.iter().map(|&v| v as f32 * scale_p).collect();
+        let coeffs_f32: Vec<f32> = raw_coeffs.iter().map(|&v| v as f32 * scale_c).collect();
+        let proto_data_f32 = ProtoData {
+            mask_coefficients: make_f32(&[1, NUM_PROTOS], &coeffs_f32),
+            protos: make_f32(&[PROTO_H, PROTO_W, NUM_PROTOS], &protos_f32),
+            layout: ProtoLayout::Nhwc,
+        };
+        let proto_data_int = ProtoData {
+            mask_coefficients: make_i16_quant(&[1, NUM_PROTOS], &raw_coeffs, scale_c, 0),
+            protos: make_i8_quant(&[PROTO_H, PROTO_W, NUM_PROTOS], &raw_protos, scale_p, 0),
+            layout: ProtoLayout::Nhwc,
+        };
+
+        let (w, h) = (64_u32, 64_u32);
+        let segs_f32 = cpu
+            .materialize_scaled_segmentations(&detect, &proto_data_f32, None, w, h)
+            .unwrap();
+        let segs_int = cpu
+            .materialize_scaled_segmentations(&detect, &proto_data_int, None, w, h)
+            .unwrap();
+
+        assert_eq!(segs_f32.len(), segs_int.len());
+        for (sf, si) in segs_f32.iter().zip(segs_int.iter()) {
+            assert_eq!(sf.segmentation.shape(), si.segmentation.shape());
+            let total = sf.segmentation.len();
+            let mismatches = sf
+                .segmentation
+                .iter()
+                .zip(si.segmentation.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            let pct = mismatches as f64 / total as f64 * 100.0;
+            assert!(
+                pct < 5.0,
+                "scaled mask mismatch {mismatches}/{total} ({pct:.1}%) exceeds 5% threshold"
+            );
+        }
+    }
+
+    // ── i8×i8 existing path still works (regression) ───────────────
+
+    #[test]
+    fn materialize_proto_i8_i8_regression() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            0,
+        );
+        let coeffs = make_i8_quant(&[1, NUM_PROTOS], &gen_coeffs_i8(1, NUM_PROTOS), 0.01, 0);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_segmentations(&detect, &proto_data, None);
+        assert!(result.is_ok(), "i8×i8 regression: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ── Non-zero zero_point ────────────────────────────────────────
+
+    #[test]
+    fn materialize_proto_i16_nonzero_zp() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            -10,
+        );
+        let coeffs = make_i16_quant(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS), 0.01, 5);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_segmentations(&detect, &proto_data, None);
+        assert!(result.is_ok(), "nonzero zp failed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    // ── Scaled: non-zero zero_point ────────────────────────────────
+
+    #[test]
+    fn materialize_scaled_i16_nonzero_zp() {
+        let cpu = CPUProcessor::new();
+        let detect = vec![det(0.1, 0.1, 0.9, 0.9)];
+        let protos = make_i8_quant(
+            &[PROTO_H, PROTO_W, NUM_PROTOS],
+            &gen_protos_i8(PROTO_H, PROTO_W, NUM_PROTOS),
+            0.02,
+            -10,
+        );
+        let coeffs = make_i16_quant(&[1, NUM_PROTOS], &gen_coeffs_i16(1, NUM_PROTOS), 0.01, 5);
+        let proto_data = ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: ProtoLayout::Nhwc,
+        };
+        let result = cpu.materialize_scaled_segmentations(&detect, &proto_data, None, 64, 64);
+        assert!(
+            result.is_ok(),
+            "scaled nonzero zp failed: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().len(), 1);
+    }
 }
