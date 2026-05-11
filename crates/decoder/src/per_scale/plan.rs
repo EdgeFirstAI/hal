@@ -206,11 +206,11 @@ impl PerScalePlan {
         let num_classes = scores
             .outputs
             .first()
-            .and_then(|s| last_feature_axis(s))
+            .and_then(last_feature_axis)
             .unwrap_or(0);
         let num_mask_coefs = mc
             .and_then(|m| m.outputs.first())
-            .and_then(|c| last_feature_axis(c))
+            .and_then(last_feature_axis)
             .unwrap_or(0);
 
         // Activation declaration site, in priority order:

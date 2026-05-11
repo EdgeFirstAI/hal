@@ -1173,7 +1173,7 @@ where
 
     // NMS already capped to `max_det`; the trailing sort+truncate is a
     // redundant guard for the bypass-NMS path (`nms = None`).
-    boxes.sort_unstable_by(|a, b| b.0.score.cmp(&a.0.score));
+    boxes.sort_unstable_by_key(|b| std::cmp::Reverse(b.0.score));
     boxes.truncate(max_det);
     let result: Vec<_> = {
         let _s = tracing::trace_span!("box_dequant", n = boxes.len()).entered();
