@@ -4375,7 +4375,7 @@ impl GLProcessorST {
         let mc_map_f16;
         let mc_map_i8;
         let coeff_widen_f16: Vec<f32>;
-        let coeff_widen_i8: Vec<f32>;
+        let coeff_dequant: Vec<f32>;
         let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
@@ -4391,7 +4391,7 @@ impl GLProcessorST {
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
                 mc_map_i8 = t.map()?;
-                coeff_widen_i8 = if let Some(q) = t.quantization() {
+                coeff_dequant = if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
                         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
@@ -4410,12 +4410,12 @@ impl GLProcessorST {
                 } else {
                     mc_map_i8.as_slice().iter().map(|&v| v as f32).collect()
                 };
-                &coeff_widen_i8[..]
+                &coeff_dequant[..]
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
                 let mc_map_i16 = t.map()?;
-                coeff_widen_i8 = if let Some(q) = t.quantization() {
+                coeff_dequant = if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
                         QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
@@ -4434,7 +4434,7 @@ impl GLProcessorST {
                 } else {
                     mc_map_i16.as_slice().iter().map(|&v| v as f32).collect()
                 };
-                &coeff_widen_i8[..]
+                &coeff_dequant[..]
             }
             other => {
                 return Err(crate::Error::InvalidShape(format!(
