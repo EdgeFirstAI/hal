@@ -267,19 +267,26 @@ impl DecoderVersion {
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
 /// This enum is used with `Option<Nms>`:
-/// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS (default): suppress
-///   overlapping boxes regardless of class label
+/// - `Some(Nms::Auto)` — resolve from config or fall back to `ClassAgnostic`
+/// - `Some(Nms::ClassAgnostic)` — class-agnostic NMS: suppress overlapping
+///   boxes regardless of class label
 /// - `Some(Nms::ClassAware)` — class-aware NMS: only suppress boxes that
 ///   share the same class label AND overlap above the IoU threshold
 /// - `None` — bypass NMS entirely (for end-to-end models with embedded NMS)
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Nms {
-    /// Suppress overlapping boxes regardless of class label (default HAL
-    /// behavior)
+    /// Let the builder resolve NMS mode from the model config (e.g.
+    /// `edgefirst.json`).  Falls back to [`Nms::ClassAgnostic`] when no
+    /// config specifies a mode.  This is the builder default — callers
+    /// should only use an explicit variant when they need to override
+    /// the config.
+    Auto,
+    /// Suppress overlapping boxes regardless of class label (default
+    /// concrete behavior).
     #[default]
     ClassAgnostic,
-    /// Only suppress boxes with the same class label that overlap
+    /// Only suppress boxes with the same class label that overlap.
     ClassAware,
 }
 

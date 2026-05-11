@@ -98,7 +98,7 @@ fn dispatch_nms_float(
     boxes: Vec<DetectBox>,
 ) -> Vec<DetectBox> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_float(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -113,7 +113,7 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
     boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_extra_float(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_extra_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -128,7 +128,7 @@ fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_int(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -143,7 +143,7 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
     boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_extra_int(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_extra_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }

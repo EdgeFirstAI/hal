@@ -76,6 +76,7 @@ impl From<&DetectBox> for HalDetectBox {
 /// | HAL_NMS_CLASS_AGNOSTIC | 0 | Suppress overlapping boxes regardless of class |
 /// | HAL_NMS_CLASS_AWARE | 1 | Only suppress boxes with the same class label |
 /// | HAL_NMS_NONE | 2 | Disable NMS (for end-to-end models with embedded NMS) |
+/// | HAL_NMS_AUTO | 3 | Use config NMS mode, fallback to CLASS_AGNOSTIC (default) |
 ///
 /// Most YOLO models use HAL_NMS_CLASS_AGNOSTIC. Use HAL_NMS_NONE for
 /// end-to-end models (e.g. `decoder_version: yolo26` in EdgeFirst metadata)
@@ -92,6 +93,10 @@ pub enum HalNms {
     /// No NMS: skip post-processing suppression entirely.
     /// Use for end-to-end models that include NMS in the model graph.
     None = 2,
+    /// Automatic: use the NMS mode from the model config (e.g. edgefirst.json),
+    /// falling back to ClassAgnostic when no config specifies one.
+    /// This is the default when `hal_decoder_params_set_nms()` is not called.
+    Auto = 3,
 }
 
 impl From<HalNms> for Option<Nms> {
@@ -100,6 +105,7 @@ impl From<HalNms> for Option<Nms> {
             HalNms::ClassAgnostic => Some(Nms::ClassAgnostic),
             HalNms::ClassAware => Some(Nms::ClassAware),
             HalNms::None => None,
+            HalNms::Auto => Some(Nms::Auto),
         }
     }
 }
@@ -286,11 +292,9 @@ pub struct HalDecoderParams {
     config_file: Option<String>,
     score_threshold: f32,
     iou_threshold: f32,
-    /// NMS mode. `None` means the user has not explicitly called
-    /// `hal_decoder_params_set_nms()` — the builder will fall back to the
-    /// config's NMS setting (or `ClassAgnostic`).  `Some(x)` is an
-    /// explicit user override that takes precedence over the config.
-    nms: Option<Option<configs::Nms>>,
+    /// NMS mode. Default: `Some(Nms::Auto)` — resolve from config or
+    /// fallback to `ClassAgnostic`.  Set via `hal_decoder_params_set_nms()`.
+    nms: Option<configs::Nms>,
     decoder_version: Option<configs::DecoderVersion>,
     /// Maximum number of candidate boxes fed into NMS after score filtering.
     /// Default: 300. Set via `hal_decoder_params_set_pre_nms_top_k`.
@@ -346,7 +350,7 @@ pub struct HalProtoData {
 /// |---------|---------|
 /// | score_threshold | 0.5 |
 /// | iou_threshold | 0.5 |
-/// | nms | from config, or HAL_NMS_CLASS_AGNOSTIC |
+/// | nms | HAL_NMS_AUTO (config, or HAL_NMS_CLASS_AGNOSTIC) |
 /// | pre_nms_top_k | 300 |
 /// | max_det | 300 |
 ///
@@ -376,7 +380,7 @@ pub extern "C" fn hal_decoder_params_new() -> *mut HalDecoderParams {
         config_file: None,
         score_threshold: 0.5,
         iou_threshold: 0.5,
-        nms: None,
+        nms: Some(configs::Nms::Auto),
         decoder_version: None,
         pre_nms_top_k: 300,
         max_det: 300,
@@ -791,7 +795,7 @@ pub unsafe extern "C" fn hal_decoder_params_set_nms(
     nms: HalNms,
 ) -> c_int {
     check_null!(params);
-    (*params).nms = Some(nms.into());
+    (*params).nms = nms.into();
     0
 }
 
@@ -961,13 +965,8 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
         .with_score_threshold(p.score_threshold)
         .with_iou_threshold(p.iou_threshold)
         .with_pre_nms_top_k(p.pre_nms_top_k)
-        .with_max_det(p.max_det);
-    // Only call with_nms() when the user explicitly set it via
-    // hal_decoder_params_set_nms(); otherwise let the config (or the
-    // builder's ClassAgnostic fallback) decide.
-    if let Some(nms) = p.nms {
-        builder = builder.with_nms(nms);
-    }
+        .with_max_det(p.max_det)
+        .with_nms(p.nms);
     if let Some((w, h)) = p.input_dims {
         builder = builder.with_input_dims(w, h);
     }
