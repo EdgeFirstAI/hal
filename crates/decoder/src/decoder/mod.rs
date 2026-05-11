@@ -16,14 +16,40 @@ pub struct Decoder {
     model_type: ModelType,
     pub iou_threshold: f32,
     pub score_threshold: f32,
-    /// NMS mode: Some(mode) applies NMS, None bypasses NMS (for end-to-end
-    /// models)
+    /// NMS mode (always a concrete variant after build — `Nms::Auto` is
+    /// resolved during `DecoderBuilder::build()` and never stored here):
+    /// - `Some(ClassAgnostic)` — class-agnostic NMS
+    /// - `Some(ClassAware)` — class-aware NMS
+    /// - `None` — NMS bypassed (end-to-end models)
     pub nms: Option<configs::Nms>,
     /// Maximum number of candidate boxes fed into NMS after score filtering.
     /// Reduces O(N²) NMS cost when many low-confidence proposals pass the
     /// threshold (common during COCO mAP evaluation with threshold ≈ 0.001).
     /// Candidates are ranked by score; only the top `pre_nms_top_k` proceed
     /// to NMS.  Default: 300.  Ignored when `nms` is `None`.
+    ///
+    /// # ⚠️ Validation vs Deployment
+    ///
+    /// The default of 300 is tuned for **deployment** (score threshold ≥ 0.25)
+    /// where few anchors pass the score filter, making top-K a no-op in
+    /// practice while bounding worst-case NMS cost.
+    ///
+    /// For **mAP evaluation** (score threshold ≈ 0.001), most of the 8 400
+    /// YOLO anchors pass the score filter. At `pre_nms_top_k = 300`, roughly
+    /// 74 % of candidates that would survive NMS are discarded *before* NMS
+    /// runs, causing **~9 pp box mAP loss** — a measurement artifact, not a
+    /// model quality issue.
+    ///
+    /// | Use case | `pre_nms_top_k` | `score_threshold` |
+    /// |----------|----------------:|------------------:|
+    /// | Deployment | 300 (default) | ≥ 0.25 |
+    /// | COCO mAP evaluation | 8 400 (all anchors) | 0.001 |
+    /// | Unbounded | 0 (no limit) | any |
+    ///
+    /// Post-processing latency scales with the number of candidates entering
+    /// NMS. At deployment thresholds the candidate count is already small, so
+    /// raising `pre_nms_top_k` has negligible cost. At validation thresholds
+    /// the increase is measurable but necessary for correct recall.
     pub pre_nms_top_k: usize,
     /// Maximum number of detections returned after NMS. Matches the
     /// Ultralytics `max_det` parameter.  Default: 300.

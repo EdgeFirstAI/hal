@@ -1913,14 +1913,22 @@ nms: class_aware
             .unwrap();
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
 
-        // Test that config NMS overrides builder NMS
+        // Test that explicit with_nms() overrides config NMS
         let decoder = DecoderBuilder::new()
             .with_config_yaml_str(yaml_class_aware.to_string())
-            .with_nms(Some(configs::Nms::ClassAgnostic)) // Builder sets agnostic
+            .with_nms(Some(configs::Nms::ClassAgnostic)) // User explicitly overrides
             .build()
             .unwrap();
-        // Config should override builder
-        assert_eq!(decoder.nms, Some(configs::Nms::ClassAware));
+        // Explicit user override takes precedence over config
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+
+        // Test that explicit with_nms(None) disables NMS even when config declares one
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_aware.to_string())
+            .with_nms(None) // User explicitly disables NMS
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, None);
     }
 
     #[test]
@@ -1959,7 +1967,7 @@ outputs:
             .with_config_yaml_str(yaml_no_nms.to_string())
             .build()
             .unwrap();
-        // Default builder NMS is ClassAgnostic
+        // Default fallback NMS is ClassAgnostic
         assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
 
         // Test with explicit builder NMS
@@ -1969,6 +1977,76 @@ outputs:
             .build()
             .unwrap();
         assert_eq!(decoder.nms, None);
+    }
+
+    #[test]
+    fn test_nms_auto_never_persists_in_built_decoder() {
+        // Nms::Auto must always be resolved to a concrete mode during build.
+        let yaml_no_nms = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+"#;
+        // Default builder uses Auto → resolves to ClassAgnostic (no config nms)
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_no_nms.to_string())
+            .build()
+            .unwrap();
+        assert_eq!(decoder.nms, Some(configs::Nms::ClassAgnostic));
+        assert_ne!(decoder.nms, Some(configs::Nms::Auto));
+
+        // Explicit Auto → resolves from config (class_aware) rather than default
+        let yaml_class_aware = r#"
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 84, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 84]
+      - [num_boxes, 8400]
+nms: class_aware
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml_class_aware.to_string())
+            .with_nms(Some(configs::Nms::Auto)) // Explicitly request Auto
+            .build()
+            .unwrap();
+        assert_eq!(
+            decoder.nms,
+            Some(configs::Nms::ClassAware),
+            "Auto should resolve to config nms (class_aware)"
+        );
+
+        // ConfigOutputs with nms=Auto directly — resolves to ClassAgnostic
+        let config = ConfigOutputs {
+            outputs: vec![ConfigOutput::Detection(configs::Detection {
+                decoder: configs::DecoderType::Ultralytics,
+                quantization: None,
+                shape: vec![1, 84, 8400],
+                dshape: vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumFeatures, 84),
+                    (DimName::NumBoxes, 8400),
+                ],
+                anchors: None,
+                normalized: None,
+            })],
+            nms: Some(configs::Nms::Auto),
+            decoder_version: None,
+        };
+        let decoder = DecoderBuilder::new().with_config(config).build().unwrap();
+        assert_eq!(
+            decoder.nms,
+            Some(configs::Nms::ClassAgnostic),
+            "Auto in config should resolve to ClassAgnostic fallback"
+        );
+        assert_ne!(decoder.nms, Some(configs::Nms::Auto));
     }
 
     #[test]
