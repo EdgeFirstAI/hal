@@ -62,9 +62,10 @@ pub(crate) const DEFAULT_MAX_DETECTIONS: usize = 300;
 
 /// Truncate `boxes` to the highest-scoring `top_k` entries in-place when the
 /// input exceeds the cap. Uses partial sort (O(N)) via `select_nth_unstable_by`
-/// to avoid full O(N log N) sort. No-op when input length ≤ `top_k`.
+/// to avoid full O(N log N) sort. No-op when `top_k` is 0 (unbounded) or
+/// when the input length ≤ `top_k`.
 fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: usize) {
-    if boxes.len() > top_k {
+    if top_k > 0 && boxes.len() > top_k {
         boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.total_cmp(&a.0.score));
         boxes.truncate(top_k);
     }
@@ -73,11 +74,12 @@ fn truncate_to_top_k_by_score<E: Send>(boxes: &mut Vec<(DetectBox, E)>, top_k: u
 /// Quantized counterpart of [`truncate_to_top_k_by_score`]. Sorts on
 /// the raw quantized score (which preserves order under monotonic
 /// dequantization). Uses partial sort (O(N)) via `select_nth_unstable_by`.
+/// No-op when `top_k` is 0 (unbounded) or when the input length ≤ `top_k`.
 fn truncate_to_top_k_by_score_quant<S: PrimInt + AsPrimitive<f32> + Send + Sync, E: Send>(
     boxes: &mut Vec<(DetectBoxQuantized<S>, E)>,
     top_k: usize,
 ) {
-    if boxes.len() > top_k {
+    if top_k > 0 && boxes.len() > top_k {
         boxes.select_nth_unstable_by(top_k, |a, b| b.0.score.cmp(&a.0.score));
         boxes.truncate(top_k);
     }
@@ -96,7 +98,7 @@ fn dispatch_nms_float(
     boxes: Vec<DetectBox>,
 ) -> Vec<DetectBox> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_float(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -111,7 +113,7 @@ pub(super) fn dispatch_nms_extra_float<E: Send + Sync>(
     boxes: Vec<(DetectBox, E)>,
 ) -> Vec<(DetectBox, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_float(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_extra_float(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_extra_class_aware_float(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -126,7 +128,7 @@ fn dispatch_nms_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync>(
     boxes: Vec<DetectBoxQuantized<SCORE>>,
 ) -> Vec<DetectBoxQuantized<SCORE>> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_int(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -141,7 +143,7 @@ fn dispatch_nms_extra_int<SCORE: PrimInt + AsPrimitive<f32> + Send + Sync, E: Se
     boxes: Vec<(DetectBoxQuantized<SCORE>, E)>,
 ) -> Vec<(DetectBoxQuantized<SCORE>, E)> {
     match nms {
-        Some(Nms::ClassAgnostic) => nms_extra_int(iou, max_det, boxes),
+        Some(Nms::ClassAgnostic | Nms::Auto) => nms_extra_int(iou, max_det, boxes),
         Some(Nms::ClassAware) => nms_extra_class_aware_int(iou, max_det, boxes),
         None => boxes, // bypass NMS
     }
@@ -2923,5 +2925,114 @@ mod tests {
                 panic!("unexpected detection centre {cx:.2}");
             }
         }
+    }
+
+    // ========================================================================
+    // Tests for truncate_to_top_k_by_score / truncate_to_top_k_by_score_quant
+    // ========================================================================
+
+    /// Helper: build a Vec of (DetectBox, ()) with the given scores.
+    fn make_float_boxes(scores: &[f32]) -> Vec<(DetectBox, ())> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                (
+                    DetectBox {
+                        bbox: BoundingBox {
+                            xmin: 0.0,
+                            ymin: 0.0,
+                            xmax: 1.0,
+                            ymax: 1.0,
+                        },
+                        score: s,
+                        label: i,
+                    },
+                    (),
+                )
+            })
+            .collect()
+    }
+
+    /// Helper: build a Vec of (DetectBoxQuantized<i8>, ()) with the given scores.
+    fn make_quant_boxes(scores: &[i8]) -> Vec<(DetectBoxQuantized<i8>, ())> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                (
+                    DetectBoxQuantized {
+                        bbox: BoundingBox {
+                            xmin: 0.0,
+                            ymin: 0.0,
+                            xmax: 1.0,
+                            ymax: 1.0,
+                        },
+                        score: s,
+                        label: i,
+                    },
+                    (),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn truncate_float_top_k_zero_is_unbounded() {
+        let mut boxes = make_float_boxes(&[0.9, 0.1, 0.5, 0.3, 0.7]);
+        let original_len = boxes.len();
+        truncate_to_top_k_by_score(&mut boxes, 0);
+        assert_eq!(
+            boxes.len(),
+            original_len,
+            "top_k=0 should keep all candidates (no-limit semantics)"
+        );
+    }
+
+    #[test]
+    fn truncate_float_top_k_normal() {
+        let mut boxes = make_float_boxes(&[0.9, 0.1, 0.5, 0.3, 0.7]);
+        truncate_to_top_k_by_score(&mut boxes, 3);
+        assert_eq!(boxes.len(), 3);
+        // The top-3 scores should be 0.9, 0.7, 0.5 (order within top-K is unspecified)
+        let mut retained: Vec<f32> = boxes.iter().map(|(b, _)| b.score).collect();
+        retained.sort_by(|a, b| b.total_cmp(a));
+        assert_eq!(retained, vec![0.9, 0.7, 0.5]);
+    }
+
+    #[test]
+    fn truncate_float_top_k_noop_when_under_cap() {
+        let mut boxes = make_float_boxes(&[0.9, 0.5]);
+        truncate_to_top_k_by_score(&mut boxes, 10);
+        assert_eq!(boxes.len(), 2, "should be no-op when len <= top_k");
+    }
+
+    #[test]
+    fn truncate_quant_top_k_zero_is_unbounded() {
+        let mut boxes = make_quant_boxes(&[120, -50, 30, -10, 80]);
+        let original_len = boxes.len();
+        truncate_to_top_k_by_score_quant(&mut boxes, 0);
+        assert_eq!(
+            boxes.len(),
+            original_len,
+            "top_k=0 should keep all candidates (no-limit semantics)"
+        );
+    }
+
+    #[test]
+    fn truncate_quant_top_k_normal() {
+        let mut boxes = make_quant_boxes(&[120, -50, 30, -10, 80]);
+        truncate_to_top_k_by_score_quant(&mut boxes, 3);
+        assert_eq!(boxes.len(), 3);
+        let mut retained: Vec<i8> = boxes.iter().map(|(b, _)| b.score).collect();
+        retained.sort_by(|a, b| b.cmp(a));
+        assert_eq!(retained, vec![120, 80, 30]);
+    }
+
+    #[test]
+    fn truncate_quant_top_k_noop_when_under_cap() {
+        let mut boxes = make_quant_boxes(&[120, 80]);
+        truncate_to_top_k_by_score_quant(&mut boxes, 10);
+        assert_eq!(boxes.len(), 2, "should be no-op when len <= top_k");
     }
 }

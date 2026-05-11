@@ -1169,7 +1169,7 @@ impl NmsMode {
     /// Convert a legacy v1 [`configs::Nms`] to a v2 [`NmsMode`].
     pub fn from_v1(v: &configs::Nms) -> Self {
         match v {
-            configs::Nms::ClassAgnostic => NmsMode::ClassAgnostic,
+            configs::Nms::Auto | configs::Nms::ClassAgnostic => NmsMode::ClassAgnostic,
             configs::Nms::ClassAware => NmsMode::ClassAware,
         }
     }
