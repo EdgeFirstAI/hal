@@ -144,7 +144,7 @@ pub(crate) fn resolve_bindings<'a>(
     Ok(FrameBindings { levels, protos })
 }
 
-use crate::per_scale::kernels::dispatch::InputView;
+use crate::per_scale::kernels::dispatch::{DstSliceMut, InputView};
 use crate::per_scale::kernels::transpose::nchw_to_nhwc;
 use crate::per_scale::outputs::{
     boxes_level_slice_of, mask_coefs_level_slice_of, scores_level_slice_of, Buffer, BufferRef,
@@ -191,15 +191,48 @@ pub(crate) fn run<'a>(
     }
 
     // Protos — single tensor, no per-level structure. Always sequential.
+    // When the schema declares NCHW protos, we transpose into the NHWC
+    // scratch before dequant, matching the per-level NCHW strategy.
     if let (Some(proto_input), Some(proto_dispatch)) = (bind.protos, plan.proto_dispatch) {
         let _s = tracing::trace_span!("protos").entered();
         let q = quant_from_tensor(proto_input, "protos", 0)?;
-        let dst = buffers.protos_dst().ok_or_else(|| {
+        let proto_layout = plan.proto_layout.unwrap_or(Layout::Nhwc);
+        // Destructure to get disjoint borrows on `protos` and
+        // `layout_scratch`, same pattern used by run_levels_sequential.
+        let DecodedOutputBuffers {
+            protos: ref mut proto_buf,
+            layout_scratch,
+            ..
+        } = buffers;
+        let dst = match proto_buf.as_mut() {
+            Some(ProtoStorage::F32(a)) => a.as_slice_mut().map(DstSliceMut::F32),
+            Some(ProtoStorage::F16(a)) => a.as_slice_mut().map(DstSliceMut::F16),
+            None => None,
+        }
+        .ok_or_else(|| {
             DecoderError::Internal("protos buffer absent but plan declared proto_dispatch".into())
         })?;
-        with_mapped_input(proto_input, "protos", 0, |input| {
-            proto_dispatch.run(input, q, dst)
-        })?;
+        if proto_layout == Layout::Nchw {
+            let nhwc = plan.proto_nhwc_shape.as_ref().ok_or_else(|| {
+                DecoderError::Internal("NCHW protos but proto_nhwc_shape is None".into())
+            })?;
+            let (h, w, c) = (nhwc[1], nhwc[2], nhwc[3]);
+            with_mapped_or_transposed_input(
+                proto_input,
+                "protos",
+                0,
+                proto_layout,
+                h,
+                w,
+                c,
+                layout_scratch,
+                |input| proto_dispatch.run(input, q, dst),
+            )?;
+        } else {
+            with_mapped_input(proto_input, "protos", 0, |input| {
+                proto_dispatch.run(input, q, dst)
+            })?;
+        }
     }
 
     Ok(make_outputs_ref(buffers, plan))
