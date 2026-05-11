@@ -37,7 +37,8 @@ FIXTURE LAYOUT
 - ``__metadata__["model_input_shape"]`` — JSON-encoded
   ``[N, H, W, C]``.
 - ``__metadata__["output_quant.<name>"]`` — JSON-encoded
-  ``{"scale": float, "zero_point": int, "dtype": str}`` per output.
+  ``{"scale": float, "zero_point": int, "dtype": str, "shape": list}``
+  per output.
 - ``__metadata__["timestamp_utc"]`` — ISO 8601 generation time.
 
 USAGE
