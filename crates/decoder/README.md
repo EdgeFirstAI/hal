@@ -88,6 +88,52 @@ Decoders can be configured via JSON/YAML matching the model's output specificati
 - `ClassAware` - Only suppress boxes with the same class label
 - `None` - Bypass NMS (for models with built-in NMS)
 
+## Pre-NMS Top-K: Validation vs Deployment
+
+The decoder's `pre_nms_top_k` parameter caps how many score-passing candidates
+enter NMS, bounding its O(N²) cost via an O(N) partial sort. The default of
+**300** is tuned for deployment — but it **must** be raised (or set to `0` for
+no limit) for mAP evaluation.
+
+### Why it matters
+
+| Scenario | `score_threshold` | Anchors passing filter | Effect of `pre_nms_top_k = 300` |
+|----------|------------------:|-----------------------:|--------------------------------|
+| Deployment | ≥ 0.25 | Tens | No effect — fewer candidates than the cap |
+| COCO mAP eval | 0.001 | Thousands | **Discards ~74 % of valid candidates before NMS** |
+
+With COCO's low threshold, most of the 8 400 YOLO anchors pass the score
+filter. The default top-K of 300 silently truncates the candidate pool,
+causing **~9 pp box mAP loss** — a measurement artifact, not a model quality
+issue. The decoder math is correct in both cases.
+
+### Recommended settings
+
+```rust,ignore
+// Deployment (real-time inference)
+let decoder = DecoderBuilder::new()
+    .with_config_json_str(config)
+    .with_score_threshold(0.25)
+    // pre_nms_top_k = 300 (default) — appropriate
+    .build()?;
+
+// COCO mAP evaluation
+let decoder = DecoderBuilder::new()
+    .with_config_json_str(config)
+    .with_score_threshold(0.001)
+    .with_pre_nms_top_k(8400)   // pass all anchors to NMS (or 0 = no limit)
+    .with_max_det(300)           // COCO detection cap applied post-NMS
+    .build()?;
+```
+
+### Performance trade-off
+
+Post-processing latency scales with the number of candidates entering NMS.
+At deployment thresholds (`≥ 0.25`), the candidate count is already small
+regardless of the top-K setting, so raising it has negligible cost. At
+validation thresholds (`0.001`), the increase is measurable — but necessary
+for correct recall across the full precision-recall curve.
+
 ## End-to-End Models (YOLO26)
 
 YOLO26 models embed NMS directly in the model architecture (one-to-one matching heads), eliminating the need for external NMS post-processing.
