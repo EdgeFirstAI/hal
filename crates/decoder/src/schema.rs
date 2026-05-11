@@ -936,7 +936,7 @@ fn validate_logical(logical: &LogicalOutput) -> DecoderResult<()> {
 
 /// Resolve the channel / feature count from a physical child's dshape
 /// when present, otherwise from the last dimension of its shape.
-fn last_feature_axis(child: &PhysicalOutput) -> Option<usize> {
+pub(crate) fn last_feature_axis(child: &PhysicalOutput) -> Option<usize> {
     // Prefer explicit named dimensions: NumFeatures, NumClasses,
     // NumProtos, BoxCoords, NumAnchorsXFeatures.
     for (name, size) in &child.dshape {

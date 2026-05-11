@@ -70,7 +70,7 @@ impl PerScaleDecoder {
             plan.total_anchors,
             plan.num_classes,
             plan.num_mask_coefs,
-            plan.proto_shape.as_deref(),
+            plan.proto_nhwc_shape.as_deref(),
         );
         Self { plan, buffers }
     }

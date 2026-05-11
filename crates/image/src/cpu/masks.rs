@@ -2400,7 +2400,6 @@ fn scaled_segmentations_i16_i8(
         Vec::new()
     };
 
-    // Detect dotprod support once, outside the hot loop.
     // For NHWC layout, stride for row navigation.
     let stride_y = proto_w * num_protos;
 

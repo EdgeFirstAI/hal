@@ -14,7 +14,7 @@ use super::kernels::CpuFeatures;
 use super::{Activation, DecodeDtype};
 use crate::configs::DimName;
 use crate::schema::BoxEncoding;
-use crate::schema::{LogicalOutput, LogicalType, PhysicalOutput, SchemaV2};
+use crate::schema::{last_feature_axis, LogicalOutput, LogicalType, PhysicalOutput, SchemaV2};
 use crate::{DecoderError, DecoderResult};
 
 /// Memory layout of a per-scale child tensor, derived from its dshape.
@@ -84,7 +84,24 @@ pub(crate) struct PerScalePlan {
     /// expected shape is retained — for binding by shape match. The
     /// dtype is captured implicitly in the proto dispatch's variant
     /// (added Task 15); quant comes live from the bound tensor.
+    ///
+    /// **Important**: this stores the *runtime binding* shape (the raw
+    /// schema shape used to match tensors), not the buffer layout.
+    /// When the model produces NCHW protos, the buffer is allocated in
+    /// NHWC order (`proto_nhwc_shape`) and the pipeline transposes at
+    /// decode time.
     pub(crate) proto_shape: Option<Box<[usize]>>,
+
+    /// NHWC-normalised proto shape for buffer allocation. Identical to
+    /// `proto_shape` when the schema is already NHWC; transposed from
+    /// `[N,C,H,W]` to `[N,H,W,C]` when the schema declares NCHW.
+    /// The bridge and mask materializer assume NHWC.
+    pub(crate) proto_nhwc_shape: Option<Box<[usize]>>,
+
+    /// Memory layout of the proto tensor, detected from the schema's
+    /// dshape. Used by the pipeline to decide whether to transpose the
+    /// raw proto data before writing it into the NHWC buffer.
+    pub(crate) proto_layout: Option<Layout>,
 }
 
 #[derive(Debug)]
@@ -189,13 +206,11 @@ impl PerScalePlan {
         let num_classes = scores
             .outputs
             .first()
-            .and_then(|s| s.shape.last())
-            .copied()
+            .and_then(|s| last_feature_axis(s))
             .unwrap_or(0);
         let num_mask_coefs = mc
             .and_then(|m| m.outputs.first())
-            .and_then(|c| c.shape.last())
-            .copied()
+            .and_then(|c| last_feature_axis(c))
             .unwrap_or(0);
 
         // Activation declaration site, in priority order:
@@ -225,6 +240,27 @@ impl PerScalePlan {
                 p.outputs[0].shape.clone().into_boxed_slice()
             }
         });
+
+        // Proto layout: detect NCHW vs NHWC from the dshape, then compute
+        // an NHWC-normalised shape for buffer allocation. The bridge and
+        // mask materializer assume NHWC data, so when the model produces
+        // NCHW protos, the pipeline transposes at decode time (same
+        // mechanism used for per-level NCHW tensors).
+        let proto_layout = protos.map(|p| {
+            let dshape = if p.outputs.is_empty() {
+                &p.dshape
+            } else {
+                &p.outputs[0].dshape
+            };
+            detect_layout_from_dshape(dshape, proto_shape.as_ref().map_or(0, |s| s.len()))
+        });
+        let proto_nhwc_shape = match (&proto_shape, proto_layout) {
+            (Some(s), Some(Layout::Nchw)) if s.len() == 4 => {
+                // [N, C, H, W] → [N, H, W, C]
+                Some(vec![s[0], s[2], s[3], s[1]].into_boxed_slice())
+            }
+            _ => proto_shape.clone(),
+        };
 
         let cpu_features = CpuFeatures::from_env_or_probe()?;
 
@@ -325,6 +361,8 @@ impl PerScalePlan {
             mc_dispatch,
             proto_dispatch,
             proto_shape,
+            proto_nhwc_shape,
+            proto_layout,
         }))
     }
 }
@@ -456,6 +494,23 @@ fn build_levels(
         anchor_offset += h * w;
     }
     Ok(levels)
+}
+
+/// Determine memory layout from a dshape slice and tensor rank.
+///
+/// Shared logic for both physical output children and logical outputs
+/// (e.g. protos, which may be the tensor directly rather than a child).
+fn detect_layout_from_dshape(dshape: &[(DimName, usize)], rank: usize) -> Layout {
+    use DimName::*;
+    let channel_pos = dshape
+        .iter()
+        .position(|(name, _)| matches!(name, BoxCoords | NumClasses | NumFeatures | NumProtos));
+    match channel_pos {
+        Some(idx) if idx == rank - 1 => Layout::Nhwc,
+        Some(idx) if idx == 1 && rank >= 4 => Layout::Nchw,
+        Some(idx) if idx == 1 && rank == 3 => Layout::Nhwc,
+        _ => Layout::Nhwc, // default fallback
+    }
 }
 
 /// Determine the memory layout of a per-scale child from its dshape by
@@ -669,5 +724,46 @@ mod tests {
             _ => false,
         };
         assert!(ok, "unexpected dispatch: {:?}", plan.box_dispatch);
+    }
+
+    #[test]
+    fn nhwc_protos_layout_detected_correctly() {
+        let schema = fixture_yolov8n_schema();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        // Fixture protos: [1, 160, 160, 32] NHWC
+        assert_eq!(plan.proto_layout, Some(Layout::Nhwc));
+        assert_eq!(plan.proto_shape.as_deref(), Some(&[1, 160, 160, 32][..]));
+        // NHWC: nhwc_shape == proto_shape (no transpose needed)
+        assert_eq!(plan.proto_nhwc_shape, plan.proto_shape);
+    }
+
+    #[test]
+    fn nchw_protos_layout_normalize_and_transpose() {
+        // Build NCHW protos by mutating the NHWC fixture
+        let mut schema = fixture_yolo26n_schema();
+        for out in &mut schema.outputs {
+            if out.type_ == Some(LogicalType::Protos) {
+                out.shape = vec![1, 32, 160, 160];
+                out.dshape = vec![
+                    (DimName::Batch, 1),
+                    (DimName::NumProtos, 32),
+                    (DimName::Height, 160),
+                    (DimName::Width, 160),
+                ];
+            }
+        }
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.proto_layout, Some(Layout::Nchw));
+        // Binding shape stays as-is for tensor shape-match
+        assert_eq!(plan.proto_shape.as_deref(), Some(&[1, 32, 160, 160][..]));
+        // Buffer shape normalized to NHWC
+        assert_eq!(
+            plan.proto_nhwc_shape.as_deref(),
+            Some(&[1, 160, 160, 32][..])
+        );
     }
 }
