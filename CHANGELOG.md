@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-05-11
+
+### Breaking Changes
+
+- `DecoderBuilder` default NMS mode changed from `Nms::ClassAgnostic` to
+  `Nms::Auto`. `Nms::Auto` resolves from the model config (e.g.
+  `edgefirst.json`) and falls back to `ClassAgnostic` when no config
+  specifies a mode. Runtime behaviour is identical for callers that did
+  not previously set NMS via config — but downstream code with exhaustive
+  matches on `Nms` must add the new `Auto` variant.
+
+- Python `Decoder` constructors (`__init__`, `from_outputs`,
+  `from_json_str`, `from_yaml_str`) now default the `nms` parameter to
+  `Nms.Auto` instead of `Nms.ClassAgnostic`.
+
+### Added
+
+- **`Nms::Auto` variant** for the NMS configuration enum. Lets the
+  decoder resolve NMS mode from the model config at build time, falling
+  back to `ClassAgnostic`. Exposed across all bindings:
+  - Rust: `configs::Nms::Auto`
+  - Python: `Nms.Auto`
+  - C: `HAL_NMS_AUTO`
+
+- **`hal_decoder_params_set_pre_nms_top_k()`** and
+  **`hal_decoder_params_set_max_det()`** — new C API functions to
+  configure the pre-NMS top-K and post-NMS detection cap. Previously
+  only accessible from Rust/Python.
+
+- **Native i16 mask coefficient support** with optimized i16×i8 integer
+  dot-product kernel. Avoids f32 widening for models that emit 16-bit
+  quantized mask coefficients (e.g. INT16-calibrated segmentation heads).
+
+- **NCHW proto layout** in the mask decode f32-fallback path for i8
+  protos. Previously only the integer fast-path handled NCHW protos.
+
+- Layout-coverage decoder test fixtures (`testdata/decoder/`) and
+  improved `parse_edgefirst` example with NCHW/logical/smart schema
+  variants.
+
+- Extended `pre_nms_top_k` documentation across Rust, Python, and C
+  bindings explaining deployment vs COCO mAP evaluation trade-offs.
+
+### Fixed
+
+- `DecoderBuilder::with_nms()` now properly overrides the config-derived
+  NMS default. Previously an explicit `with_nms(ClassAware)` could be
+  silently replaced by the config's NMS setting.
+
+- i16 quantization fallback in mask decode: when i16 coefficients lack
+  quantization metadata, the decoder now correctly falls through to the
+  f32 dequant path instead of panicking.
+
 ## [0.21.0] - 2026-05-08
 
 ### Breaking Changes
