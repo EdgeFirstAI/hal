@@ -1255,8 +1255,12 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
     // Squeeze explicit `padding` dims before handing to the legacy
     // dispatch: the v1 decoder's `verify_yolo_*` helpers require rank-3
     // shapes, but v2 metadata often carries an explicit `padding: 1`
-    // axis (ARA-2).
-    let (shape, dshape) = squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone());
+    // axis (ARA-2). ModelPack boxes are validated as 4D, so keep
+    // padding dims for ModelPack outputs.
+    let (shape, dshape) = match logical.decoder {
+        Some(DecoderKind::ModelPack) => (logical.shape.clone(), logical.dshape.clone()),
+        _ => squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone()),
+    };
 
     let ty = logical.type_.ok_or_else(|| {
         // Defense-in-depth: `to_legacy_config_outputs` already filters
