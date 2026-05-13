@@ -129,6 +129,11 @@ pub fn nms_float(iou: f32, max_det: Option<usize>, mut boxes: Vec<DetectBox>) ->
                 boxes[j].score = -1.0;
             }
         }
+
+        // NOTE: jaccard_batch4_neon is available for callers that can
+        // batch unsuppressed candidates externally. It is not used
+        // inline here because score=-1 marking creates sparse gaps
+        // that prevent contiguous 4-box batching.
         survivors += 1;
         if survivors >= cap {
             break;
@@ -359,6 +364,109 @@ pub fn jaccard(a: &BoundingBox, b: &BoundingBox, iou: f32) -> bool {
     intersection > iou * union
 }
 
+/// Batch IoU check: test one reference box `a` against 4 candidate boxes.
+///
+/// Returns a 4-element array of booleans: `result[i]` is true if
+/// `jaccard(a, boxes[i], iou)` would return true.
+///
+/// On aarch64, uses NEON `vmaxq_f32`/`vminq_f32` for vectorized
+/// intersection computation. On other architectures falls back to
+/// 4 scalar `jaccard` calls.
+#[inline]
+pub fn jaccard_batch4(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64.
+        unsafe { jaccard_batch4_neon(a, boxes, iou) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        [
+            jaccard(a, &boxes[0], iou),
+            jaccard(a, &boxes[1], iou),
+            jaccard(a, &boxes[2], iou),
+            jaccard(a, &boxes[3], iou),
+        ]
+    }
+}
+
+/// NEON-vectorized batch IoU for 4 candidate boxes against one reference.
+///
+/// Loads xmin/ymin/xmax/ymax of the 4 candidates into separate NEON
+/// registers (AoS→SoA transpose), then computes intersection, union,
+/// and the `intersection > iou * union` test in 4-wide SIMD.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn jaccard_batch4_neon(a: &BoundingBox, boxes: &[BoundingBox; 4], iou: f32) -> [bool; 4] {
+    use std::arch::aarch64::*;
+
+    let zero = vdupq_n_f32(0.0);
+    let iou_v = vdupq_n_f32(iou);
+
+    // Reference box broadcast.
+    let a_xmin = vdupq_n_f32(a.xmin);
+    let a_ymin = vdupq_n_f32(a.ymin);
+    let a_xmax = vdupq_n_f32(a.xmax);
+    let a_ymax = vdupq_n_f32(a.ymax);
+    let area_a = vmulq_f32(vsubq_f32(a_xmax, a_xmin), vsubq_f32(a_ymax, a_ymin));
+
+    // Load 4 boxes (each BoundingBox is [xmin, ymin, xmax, ymax]).
+    let b0 = vld1q_f32(&boxes[0].xmin as *const f32);
+    let b1 = vld1q_f32(&boxes[1].xmin as *const f32);
+    let b2 = vld1q_f32(&boxes[2].xmin as *const f32);
+    let b3 = vld1q_f32(&boxes[3].xmin as *const f32);
+
+    // AoS → SoA transpose (4×4).
+    let t01_lo = vtrn1q_f32(b0, b1); // xmin0,xmin1,xmax0,xmax1
+    let t01_hi = vtrn2q_f32(b0, b1); // ymin0,ymin1,ymax0,ymax1
+    let t23_lo = vtrn1q_f32(b2, b3);
+    let t23_hi = vtrn2q_f32(b2, b3);
+
+    let b_xmin = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(t01_lo),
+        vreinterpretq_f64_f32(t23_lo),
+    ));
+    let b_ymin = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(t01_hi),
+        vreinterpretq_f64_f32(t23_hi),
+    ));
+    let b_xmax = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(t01_lo),
+        vreinterpretq_f64_f32(t23_lo),
+    ));
+    let b_ymax = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(t01_hi),
+        vreinterpretq_f64_f32(t23_hi),
+    ));
+
+    // Intersection.
+    let left = vmaxq_f32(a_xmin, b_xmin);
+    let top = vmaxq_f32(a_ymin, b_ymin);
+    let right = vminq_f32(a_xmax, b_xmax);
+    let bottom = vminq_f32(a_ymax, b_ymax);
+    let w = vmaxq_f32(vsubq_f32(right, left), zero);
+    let h = vmaxq_f32(vsubq_f32(bottom, top), zero);
+    let intersection = vmulq_f32(w, h);
+
+    // Area B.
+    let area_b = vmulq_f32(vsubq_f32(b_xmax, b_xmin), vsubq_f32(b_ymax, b_ymin));
+
+    // Union = area_a + area_b - intersection.
+    let union = vsubq_f32(vaddq_f32(area_a, area_b), intersection);
+
+    // Test: intersection > iou * union (equivalent to IoU > threshold).
+    let iou_union = vmulq_f32(iou_v, union);
+    let mask = vcgtq_f32(intersection, iou_union);
+
+    // Extract per-lane results.
+    [
+        vgetq_lane_u32(mask, 0) != 0,
+        vgetq_lane_u32(mask, 1) != 0,
+        vgetq_lane_u32(mask, 2) != 0,
+        vgetq_lane_u32(mask, 3) != 0,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +523,26 @@ mod tests {
         let full = nms_float(0.5, None, boxes.clone());
         let capped = nms_float(0.5, Some(100), boxes);
         assert_eq!(full.len(), capped.len());
+    }
+
+    #[test]
+    fn jaccard_batch4_matches_scalar() {
+        let a = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let boxes = [
+            BoundingBox::new(5.0, 5.0, 15.0, 15.0),   // overlap
+            BoundingBox::new(20.0, 20.0, 30.0, 30.0), // no overlap
+            BoundingBox::new(0.0, 0.0, 10.0, 10.0),   // identical
+            BoundingBox::new(8.0, 8.0, 18.0, 18.0),   // small overlap
+        ];
+        let iou_threshold = 0.1;
+        let batch = jaccard_batch4(&a, &boxes, iou_threshold);
+        for (i, b) in boxes.iter().enumerate() {
+            let scalar = jaccard(&a, b, iou_threshold);
+            assert_eq!(
+                batch[i], scalar,
+                "batch4 mismatch at {i}: batch={} scalar={}",
+                batch[i], scalar
+            );
+        }
     }
 }

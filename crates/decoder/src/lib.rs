@@ -330,6 +330,7 @@ pub struct DetectBox {
 
 /// A bounding box with f32 coordinates in XYXY format
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
 pub struct BoundingBox {
     /// left-most normalized coordinate of the bounding box
     pub xmin: f32,
@@ -340,6 +341,10 @@ pub struct BoundingBox {
     /// bottom-most normalized coordinate of the bounding box
     pub ymax: f32,
 }
+
+// Guarantee that BoundingBox is 4 contiguous f32 fields for NEON vld1q_f32 loads.
+const _: () = assert!(std::mem::size_of::<BoundingBox>() == 4 * std::mem::size_of::<f32>());
+const _: () = assert!(std::mem::align_of::<BoundingBox>() == std::mem::align_of::<f32>());
 
 impl BoundingBox {
     /// Creates a new BoundingBox from the given coordinates
