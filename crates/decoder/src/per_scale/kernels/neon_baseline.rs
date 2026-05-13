@@ -22,8 +22,7 @@
 //! to roughly the L2 cache bandwidth on Cortex-A53, which scalar code
 //! can't approach.
 //!
-//! Phase 2-A (this module) covers Tier-1 NEON. Tier-2 FP16 and Tier-3
-//! DotProd live in sibling `neon_fp16.rs` / `neon_dotprod.rs` modules.
+//! Phase 2-A (this module) covers Tier-1 NEON baseline and Tier-2 FP16.
 
 #![cfg(target_arch = "aarch64")]
 #![allow(dead_code)] // Wired into dispatch in subsequent N-* tasks.
@@ -889,6 +888,829 @@ pub(crate) unsafe fn softmax_inplace_f32_neon_fp16(buf: &mut [f32]) {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// NEON weighted-sum for DFL (#3)
+//
+// Vectorizes `weighted_sum_4sides_f32` by processing 4 probability-bin
+// products per cycle via `vfmaq_n_f32`. For reg_max = 16 (the common
+// case) each side is exactly 4 NEON iterations, totalling 16 FMAs.
+// On Cortex-A53 (single-issue, 1 FMA/cycle) this replaces 16 scalar
+// multiply-add pairs with 4 NEON FMAs — a ~4× per-side speedup.
+// ────────────────────────────────────────────────────────────────────────
+
+/// NEON weighted-sum for 4 DFL sides.
+///
+/// `probs.len() == 4 * reg_max`, side-major layout. Returns `[d_left,
+/// d_top, d_right, d_bottom]` — same contract as the scalar version.
+///
+/// # Safety
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn weighted_sum_4sides_f32_neon(probs: &[f32], reg_max: usize) -> [f32; 4] {
+    debug_assert_eq!(probs.len(), 4 * reg_max);
+    let mut d = [0.0_f32; 4];
+    let chunks_4 = reg_max / 4;
+    let ptr = probs.as_ptr();
+
+    for (side, slot) in d.iter_mut().enumerate() {
+        let base = side * reg_max;
+        let mut acc = vdupq_n_f32(0.0);
+        let mut bin_idx = 0usize;
+
+        for _ in 0..chunks_4 {
+            let p = vld1q_f32(ptr.add(base + bin_idx));
+            // Bin indices as f32: [bin_idx, bin_idx+1, bin_idx+2, bin_idx+3]
+            let bins = [
+                bin_idx as f32,
+                (bin_idx + 1) as f32,
+                (bin_idx + 2) as f32,
+                (bin_idx + 3) as f32,
+            ];
+            let bins_v = vld1q_f32(bins.as_ptr());
+            acc = vfmaq_f32(acc, p, bins_v);
+            bin_idx += 4;
+        }
+
+        // Horizontal sum of acc.
+        *slot = vaddvq_f32(acc);
+
+        // Scalar tail for reg_max not divisible by 4.
+        while bin_idx < reg_max {
+            *slot += *ptr.add(base + bin_idx) * (bin_idx as f32);
+            bin_idx += 1;
+        }
+    }
+    d
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// NEON fused softmax + weighted_sum
+//
+// Online-softmax-inspired fusion: computes the DFL weighted sum directly
+// from the dequantized logits WITHOUT materializing the intermediate
+// probability vector. For each side:
+//
+//   result = Σ(exp(x[i] - max) × i) / Σ(exp(x[i] - max))
+//
+// This is algebraically identical to softmax(x) · [0,1,...,reg_max-1],
+// but eliminates all intermediate memory traffic:
+//   - 16 stores (softmax writes exp values)
+//   - 16 loads  (softmax reads for normalize pass)
+//   - 16 stores (softmax writes normalized probs)
+//   - 16 loads  (weighted_sum reads probs)
+// = 64 memory ops eliminated per side × 4 sides = 256 per anchor.
+//
+// The kernel is 2-pass over the data instead of 5-pass:
+//   Pass 1: find max (NEON vmaxq_f32 reduction)
+//   Pass 2: exp(x-max) accumulated into sum + weighted_sum in-register
+//
+// For reg_max=16 (the common case), pass 2 processes 4 NEON vectors
+// with precomputed bin-index constants [0..3], [4..7], [8..11], [12..15].
+// Everything stays in registers — no store/reload between exp and the
+// final scalar divide.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Fused softmax + weighted_sum for 4 DFL sides, NEON f32.
+///
+/// `logits` is a dequantized buffer with layout `[side0..side3]`, each
+/// side containing `reg_max` contiguous f32 values. Returns `[d_left,
+/// d_top, d_right, d_bottom]` — same contract as calling
+/// `softmax_inplace` then `weighted_sum_4sides_f32_neon` but faster.
+///
+/// # Safety
+/// Caller must ensure NEON is available (always true on aarch64).
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn softmax_weighted_sum_4sides_f32_neon(
+    logits: &[f32],
+    reg_max: usize,
+) -> [f32; 4] {
+    debug_assert_eq!(logits.len(), 4 * reg_max);
+    let mut d = [0.0_f32; 4];
+    let chunks_4 = reg_max / 4;
+    let ptr = logits.as_ptr();
+
+    for (side, slot) in d.iter_mut().enumerate() {
+        let base = side * reg_max;
+
+        // ── Pass 1: find max ──
+        let mut m = f32::NEG_INFINITY;
+        if chunks_4 > 0 {
+            let mut max_v = vld1q_f32(ptr.add(base));
+            for c in 1..chunks_4 {
+                let v = vld1q_f32(ptr.add(base + c * 4));
+                max_v = vmaxq_f32(max_v, v);
+            }
+            m = vmaxvq_f32(max_v);
+        }
+        // Scalar tail for non-multiple-of-4 reg_max.
+        let tail_start = chunks_4 * 4;
+        for i in tail_start..reg_max {
+            let v = *ptr.add(base + i);
+            if v > m {
+                m = v;
+            }
+        }
+
+        // ── Pass 2: fused exp + sum + weighted_sum ──
+        let m_v = vdupq_n_f32(m);
+        let mut sum_v = vdupq_n_f32(0.0);
+        let mut ws_v = vdupq_n_f32(0.0);
+        let mut bin_idx = 0usize;
+
+        for _ in 0..chunks_4 {
+            let v = vld1q_f32(ptr.add(base + bin_idx));
+            let e = expf_neon_f32x4(vsubq_f32(v, m_v));
+            sum_v = vaddq_f32(sum_v, e);
+            // Bin indices [bin_idx, bin_idx+1, bin_idx+2, bin_idx+3]
+            let bins = [
+                bin_idx as f32,
+                (bin_idx + 1) as f32,
+                (bin_idx + 2) as f32,
+                (bin_idx + 3) as f32,
+            ];
+            let bins_v = vld1q_f32(bins.as_ptr());
+            ws_v = vfmaq_f32(ws_v, e, bins_v);
+            bin_idx += 4;
+        }
+
+        let mut sum = vaddvq_f32(sum_v);
+        let mut ws = vaddvq_f32(ws_v);
+
+        // Scalar tail.
+        while bin_idx < reg_max {
+            let e = (*ptr.add(base + bin_idx) - m).exp();
+            sum += e;
+            ws += e * (bin_idx as f32);
+            bin_idx += 1;
+        }
+
+        // Single divide instead of per-element normalize.
+        *slot = if sum > 0.0 { ws / sum } else { 0.0 };
+    }
+    d
+}
+
+/// Fused softmax + weighted_sum for 4 DFL sides, FP16 exp path.
+///
+/// Same semantics as `softmax_weighted_sum_4sides_f32_neon` but uses the
+/// 8-lane FP16 exp approximation for ~2× exp throughput on Cortex-A55+.
+/// Max-finding and accumulation remain in f32 for precision.
+///
+/// # Safety
+/// Caller must ensure FP16 NEON is available (Cortex-A55+).
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn softmax_weighted_sum_4sides_f32_neon_fp16(
+    logits: &[f32],
+    reg_max: usize,
+) -> [f32; 4] {
+    debug_assert_eq!(logits.len(), 4 * reg_max);
+    let mut d = [0.0_f32; 4];
+    let chunks_8 = reg_max / 8;
+    let chunks_4 = reg_max / 4;
+    let ptr = logits.as_ptr();
+
+    for (side, slot) in d.iter_mut().enumerate() {
+        let base = side * reg_max;
+
+        // ── Pass 1: find max (f32 for precision) ──
+        let mut m = f32::NEG_INFINITY;
+        if chunks_4 > 0 {
+            let mut max_v = vld1q_f32(ptr.add(base));
+            for c in 1..chunks_4 {
+                let v = vld1q_f32(ptr.add(base + c * 4));
+                max_v = vmaxq_f32(max_v, v);
+            }
+            m = vmaxvq_f32(max_v);
+        }
+        let tail_start_4 = chunks_4 * 4;
+        for i in tail_start_4..reg_max {
+            let v = *ptr.add(base + i);
+            if v > m {
+                m = v;
+            }
+        }
+
+        // ── Pass 2: fused exp(fp16) + sum + weighted_sum ──
+        let m_v = vdupq_n_f32(m);
+        let mut sum_v = vdupq_n_f32(0.0);
+        let mut ws_v = vdupq_n_f32(0.0);
+        let mut bin_idx = 0usize;
+
+        // Process 8 elements at a time via FP16 exp.
+        for _ in 0..chunks_8 {
+            let lo = vld1q_f32(ptr.add(base + bin_idx));
+            let hi = vld1q_f32(ptr.add(base + bin_idx + 4));
+            let s_lo = vsubq_f32(lo, m_v);
+            let s_hi = vsubq_f32(hi, m_v);
+            let (e_lo, e_hi) = expf_neon_f32x8_via_f16(s_lo, s_hi);
+
+            sum_v = vaddq_f32(sum_v, e_lo);
+            sum_v = vaddq_f32(sum_v, e_hi);
+
+            let bins_lo = [
+                bin_idx as f32,
+                (bin_idx + 1) as f32,
+                (bin_idx + 2) as f32,
+                (bin_idx + 3) as f32,
+            ];
+            let bins_hi = [
+                (bin_idx + 4) as f32,
+                (bin_idx + 5) as f32,
+                (bin_idx + 6) as f32,
+                (bin_idx + 7) as f32,
+            ];
+            ws_v = vfmaq_f32(ws_v, e_lo, vld1q_f32(bins_lo.as_ptr()));
+            ws_v = vfmaq_f32(ws_v, e_hi, vld1q_f32(bins_hi.as_ptr()));
+            bin_idx += 8;
+        }
+
+        // Handle 4-element remainder (reg_max % 8 >= 4).
+        if bin_idx + 4 <= reg_max {
+            let v = vld1q_f32(ptr.add(base + bin_idx));
+            let e = expf_neon_f32x4(vsubq_f32(v, m_v));
+            sum_v = vaddq_f32(sum_v, e);
+            let bins = [
+                bin_idx as f32,
+                (bin_idx + 1) as f32,
+                (bin_idx + 2) as f32,
+                (bin_idx + 3) as f32,
+            ];
+            ws_v = vfmaq_f32(ws_v, e, vld1q_f32(bins.as_ptr()));
+            bin_idx += 4;
+        }
+
+        let mut sum = vaddvq_f32(sum_v);
+        let mut ws = vaddvq_f32(ws_v);
+
+        // Scalar tail.
+        while bin_idx < reg_max {
+            let e = (*ptr.add(base + bin_idx) - m).exp();
+            sum += e;
+            ws += e * (bin_idx as f32);
+            bin_idx += 1;
+        }
+
+        *slot = if sum > 0.0 { ws / sum } else { 0.0 };
+    }
+    d
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// NEON dist2bbox — batch 4 anchors (#4)
+//
+// Processes 4 anchors simultaneously by loading their LTRB distances,
+// grid centres, and stride into float32x4_t lanes. Each lane computes
+// one anchor's xc/yc/w/h independently. For an 80×80 FPN level (6400
+// anchors), this reduces 6400 scalar iterations to 1600 NEON batches.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Batch dist2bbox for 4 anchors. `ltrb` is `[l0,t0,r0,b0, l1,t1,r1,b1,
+/// ...]` (anchor-major). `gx`/`gy` are 4 grid centres. Output is
+/// `[xc0,yc0,w0,h0, xc1,...,h3]` written to `dst`.
+///
+/// # Safety
+/// Caller must ensure `ltrb.len() >= 16`, `gx.len() >= 4`,
+/// `gy.len() >= 4`, `dst.len() >= 16`, and NEON is available.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dist2bbox_4anchors_f32_neon(
+    ltrb: &[f32],
+    gx: &[f32],
+    gy: &[f32],
+    stride: f32,
+    dst: &mut [f32],
+) {
+    debug_assert!(ltrb.len() >= 16);
+    debug_assert!(gx.len() >= 4 && gy.len() >= 4);
+    debug_assert!(dst.len() >= 16);
+
+    let half = vdupq_n_f32(0.5);
+    let stride_v = vdupq_n_f32(stride);
+
+    // Load LTRB for 4 anchors (each has 4 values, total 16 floats).
+    // Memory layout: [l0,t0,r0,b0, l1,t1,r1,b1, l2,t2,r2,b2, l3,t3,r3,b3]
+    // We need to transpose to get [l0,l1,l2,l3], [t0,...], [r0,...], [b0,...].
+    let a0 = vld1q_f32(ltrb.as_ptr()); // l0,t0,r0,b0
+    let a1 = vld1q_f32(ltrb.as_ptr().add(4)); // l1,t1,r1,b1
+    let a2 = vld1q_f32(ltrb.as_ptr().add(8)); // l2,t2,r2,b2
+    let a3 = vld1q_f32(ltrb.as_ptr().add(12)); // l3,t3,r3,b3
+
+    // 4×4 transpose using TRN + ZIP.
+    let t01_lo = vtrn1q_f32(a0, a1); // l0,l1,r0,r1
+    let t01_hi = vtrn2q_f32(a0, a1); // t0,t1,b0,b1
+    let t23_lo = vtrn1q_f32(a2, a3); // l2,l3,r2,r3
+    let t23_hi = vtrn2q_f32(a2, a3); // t2,t3,b2,b3
+
+    // Interleave 64-bit halves to finish the transpose.
+    let d_left = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(t01_lo),
+        vreinterpretq_f64_f32(t23_lo),
+    )); // l0,l1,l2,l3
+    let d_top = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(t01_hi),
+        vreinterpretq_f64_f32(t23_hi),
+    )); // t0,t1,t2,t3
+    let d_right = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(t01_lo),
+        vreinterpretq_f64_f32(t23_lo),
+    )); // r0,r1,r2,r3
+    let d_bottom = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(t01_hi),
+        vreinterpretq_f64_f32(t23_hi),
+    )); // b0,b1,b2,b3
+
+    let gx_v = vld1q_f32(gx.as_ptr());
+    let gy_v = vld1q_f32(gy.as_ptr());
+
+    // xc = (gx + (right - left) * 0.5) * stride
+    let xc = vmulq_f32(vfmaq_f32(gx_v, vsubq_f32(d_right, d_left), half), stride_v);
+    // yc = (gy + (bottom - top) * 0.5) * stride
+    let yc = vmulq_f32(vfmaq_f32(gy_v, vsubq_f32(d_bottom, d_top), half), stride_v);
+    // w = (left + right) * stride
+    let w = vmulq_f32(vaddq_f32(d_left, d_right), stride_v);
+    // h = (top + bottom) * stride
+    let h = vmulq_f32(vaddq_f32(d_top, d_bottom), stride_v);
+
+    // Transpose back: [xc0,yc0,w0,h0, xc1,...] — reverse the 4×4 transpose.
+    let r01_lo = vtrn1q_f32(xc, yc); // xc0,yc0,xc2,yc2
+    let r01_hi = vtrn2q_f32(xc, yc); // xc1,yc1,xc3,yc3
+    let r23_lo = vtrn1q_f32(w, h); // w0,h0,w2,h2
+    let r23_hi = vtrn2q_f32(w, h); // w1,h1,w3,h3
+
+    let out0 = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(r01_lo),
+        vreinterpretq_f64_f32(r23_lo),
+    )); // xc0,yc0,w0,h0
+    let out1 = vreinterpretq_f32_f64(vtrn1q_f64(
+        vreinterpretq_f64_f32(r01_hi),
+        vreinterpretq_f64_f32(r23_hi),
+    )); // xc1,yc1,w1,h1
+    let out2 = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(r01_lo),
+        vreinterpretq_f64_f32(r23_lo),
+    )); // xc2,yc2,w2,h2
+    let out3 = vreinterpretq_f32_f64(vtrn2q_f64(
+        vreinterpretq_f64_f32(r01_hi),
+        vreinterpretq_f64_f32(r23_hi),
+    )); // xc3,yc3,w3,h3
+
+    vst1q_f32(dst.as_mut_ptr(), out0);
+    vst1q_f32(dst.as_mut_ptr().add(4), out1);
+    vst1q_f32(dst.as_mut_ptr().add(8), out2);
+    vst1q_f32(dst.as_mut_ptr().add(12), out3);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Fused dequant+sigmoid (#5)
+//
+// The score-level pipeline currently runs two passes: dequant → sigmoid.
+// Each pass reads and writes the full score tensor (~80×80×80 = 512 KB
+// at level 0). Fusing into a single pass eliminates the intermediate
+// store→reload — saving ~10% decode time on bandwidth-bound Cortex-A53
+// where the L2→register round-trip dominates.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Fused NEON i8 dequant + sigmoid. Output is sigmoid((in - zp) * scale).
+///
+/// # Safety
+/// See `dequant_i8_to_f32_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_sigmoid_i8_to_f32_neon(
+    input: &[i8],
+    q: Quantization,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let n = input.len();
+    let chunks_16 = n / 16;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_16 {
+        let v_i8 = vld1q_s8(in_ptr.add(i));
+        let lo_i16 = vmovl_s8(vget_low_s8(v_i8));
+        let hi_i16 = vmovl_high_s8(v_i8);
+        let q0 = vmovl_s16(vget_low_s16(lo_i16));
+        let q1 = vmovl_high_s16(lo_i16);
+        let q2 = vmovl_s16(vget_low_s16(hi_i16));
+        let q3 = vmovl_high_s16(hi_i16);
+
+        // Dequant: bias + scale * in
+        let x0 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q0), scale);
+        let x1 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q1), scale);
+        let x2 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q2), scale);
+        let x3 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q3), scale);
+
+        // Inline sigmoid for each quad.
+        macro_rules! sigmoid4 {
+            ($x:expr) => {{
+                let mask = vcgeq_f32($x, zero);
+                let neg_x = vnegq_f32($x);
+                let exp_in = vbslq_f32(mask, neg_x, $x);
+                let e = expf_neon_f32x4(exp_in);
+                let one_plus_e = vaddq_f32(one, e);
+                let recip = vdivq_f32(one, one_plus_e);
+                let neg_branch = vmulq_f32(e, recip);
+                vbslq_f32(mask, recip, neg_branch)
+            }};
+        }
+
+        vst1q_f32(out_ptr.add(i), sigmoid4!(x0));
+        vst1q_f32(out_ptr.add(i + 4), sigmoid4!(x1));
+        vst1q_f32(out_ptr.add(i + 8), sigmoid4!(x2));
+        vst1q_f32(out_ptr.add(i + 12), sigmoid4!(x3));
+        i += 16;
+    }
+
+    // Scalar tail.
+    let zp = q.zero_point as f32;
+    while i < n {
+        let x = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = if x >= 0.0 {
+            let e = (-x).exp();
+            1.0 / (1.0 + e)
+        } else {
+            let e = x.exp();
+            e / (1.0 + e)
+        };
+        i += 1;
+    }
+}
+
+/// Fused NEON u8 dequant + sigmoid.
+///
+/// # Safety
+/// See `dequant_i8_to_f32_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_sigmoid_u8_to_f32_neon(
+    input: &[u8],
+    q: Quantization,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let n = input.len();
+    let chunks_16 = n / 16;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_16 {
+        let v_u8 = vld1q_u8(in_ptr.add(i));
+        let lo_u16 = vmovl_u8(vget_low_u8(v_u8));
+        let hi_u16 = vmovl_high_u8(v_u8);
+        let q0 = vmovl_u16(vget_low_u16(lo_u16));
+        let q1 = vmovl_high_u16(lo_u16);
+        let q2 = vmovl_u16(vget_low_u16(hi_u16));
+        let q3 = vmovl_high_u16(hi_u16);
+
+        let x0 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q0), scale);
+        let x1 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q1), scale);
+        let x2 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q2), scale);
+        let x3 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q3), scale);
+
+        macro_rules! sigmoid4 {
+            ($x:expr) => {{
+                let mask = vcgeq_f32($x, zero);
+                let neg_x = vnegq_f32($x);
+                let exp_in = vbslq_f32(mask, neg_x, $x);
+                let e = expf_neon_f32x4(exp_in);
+                let one_plus_e = vaddq_f32(one, e);
+                let recip = vdivq_f32(one, one_plus_e);
+                let neg_branch = vmulq_f32(e, recip);
+                vbslq_f32(mask, recip, neg_branch)
+            }};
+        }
+
+        vst1q_f32(out_ptr.add(i), sigmoid4!(x0));
+        vst1q_f32(out_ptr.add(i + 4), sigmoid4!(x1));
+        vst1q_f32(out_ptr.add(i + 8), sigmoid4!(x2));
+        vst1q_f32(out_ptr.add(i + 12), sigmoid4!(x3));
+        i += 16;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let x = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = if x >= 0.0 {
+            let e = (-x).exp();
+            1.0 / (1.0 + e)
+        } else {
+            let e = x.exp();
+            e / (1.0 + e)
+        };
+        i += 1;
+    }
+}
+
+/// Fused NEON i16 dequant + sigmoid.
+///
+/// # Safety
+/// See `dequant_i8_to_f32_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_sigmoid_i16_to_f32_neon(
+    input: &[i16],
+    q: Quantization,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let n = input.len();
+    let chunks_8 = n / 8;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_8 {
+        let v_i16 = vld1q_s16(in_ptr.add(i));
+        let lo_i32 = vmovl_s16(vget_low_s16(v_i16));
+        let hi_i32 = vmovl_high_s16(v_i16);
+        let x0 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(lo_i32), scale);
+        let x1 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(hi_i32), scale);
+
+        macro_rules! sigmoid4 {
+            ($x:expr) => {{
+                let mask = vcgeq_f32($x, zero);
+                let neg_x = vnegq_f32($x);
+                let exp_in = vbslq_f32(mask, neg_x, $x);
+                let e = expf_neon_f32x4(exp_in);
+                let one_plus_e = vaddq_f32(one, e);
+                let recip = vdivq_f32(one, one_plus_e);
+                let neg_branch = vmulq_f32(e, recip);
+                vbslq_f32(mask, recip, neg_branch)
+            }};
+        }
+
+        vst1q_f32(out_ptr.add(i), sigmoid4!(x0));
+        vst1q_f32(out_ptr.add(i + 4), sigmoid4!(x1));
+        i += 8;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let x = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = if x >= 0.0 {
+            let e = (-x).exp();
+            1.0 / (1.0 + e)
+        } else {
+            let e = x.exp();
+            e / (1.0 + e)
+        };
+        i += 1;
+    }
+}
+
+/// Fused NEON u16 dequant + sigmoid.
+///
+/// # Safety
+/// See `dequant_i8_to_f32_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_sigmoid_u16_to_f32_neon(
+    input: &[u16],
+    q: Quantization,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let zero = vdupq_n_f32(0.0);
+    let one = vdupq_n_f32(1.0);
+    let n = input.len();
+    let chunks_8 = n / 8;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_8 {
+        let v_u16 = vld1q_u16(in_ptr.add(i));
+        let lo_u32 = vmovl_u16(vget_low_u16(v_u16));
+        let hi_u32 = vmovl_high_u16(v_u16);
+        let x0 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(lo_u32), scale);
+        let x1 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(hi_u32), scale);
+
+        macro_rules! sigmoid4 {
+            ($x:expr) => {{
+                let mask = vcgeq_f32($x, zero);
+                let neg_x = vnegq_f32($x);
+                let exp_in = vbslq_f32(mask, neg_x, $x);
+                let e = expf_neon_f32x4(exp_in);
+                let one_plus_e = vaddq_f32(one, e);
+                let recip = vdivq_f32(one, one_plus_e);
+                let neg_branch = vmulq_f32(e, recip);
+                vbslq_f32(mask, recip, neg_branch)
+            }};
+        }
+
+        vst1q_f32(out_ptr.add(i), sigmoid4!(x0));
+        vst1q_f32(out_ptr.add(i + 4), sigmoid4!(x1));
+        i += 8;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let x = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = if x >= 0.0 {
+            let e = (-x).exp();
+            1.0 / (1.0 + e)
+        } else {
+            let e = x.exp();
+            e / (1.0 + e)
+        };
+        i += 1;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Half-precision dequant output (#6)
+//
+// NEON dequant kernels that output f16 directly via `fcvtn`, halving
+// write bandwidth. The dequant math runs in f32 (preserving precision),
+// then narrows to f16 on the store path. Uses inline asm `.arch_extension
+// fp16` for the `fcvtn`/`fcvtn2` instructions since stable Rust doesn't
+// expose f16 intrinsics.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Convert 4 f32 lanes to 4 f16 lanes (lower half of a uint16x8_t).
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn fcvtn_f16x4_from_f32x4(x: float32x4_t) -> uint16x4_t {
+    let result: uint16x4_t;
+    core::arch::asm!(
+        ".arch_extension fp16",
+        "fcvtn {r:v}.4h, {x:v}.4s",
+        r = out(vreg) result,
+        x = in(vreg) x,
+        options(pure, nomem, nostack),
+    );
+    result
+}
+
+/// NEON i8 → f16 dequant. Dequantizes in f32, narrows to f16 on store.
+///
+/// # Safety
+/// See `dequant_i8_to_f32_neon`. Additionally requires FP16 for `fcvtn`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_i8_to_f16_neon(input: &[i8], q: Quantization, output: &mut [u16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let n = input.len();
+    let chunks_16 = n / 16;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_16 {
+        let v_i8 = vld1q_s8(in_ptr.add(i));
+        let lo_i16 = vmovl_s8(vget_low_s8(v_i8));
+        let hi_i16 = vmovl_high_s8(v_i8);
+        let q0 = vmovl_s16(vget_low_s16(lo_i16));
+        let q1 = vmovl_high_s16(lo_i16);
+        let q2 = vmovl_s16(vget_low_s16(hi_i16));
+        let q3 = vmovl_high_s16(hi_i16);
+        let f0 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q0), scale);
+        let f1 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q1), scale);
+        let f2 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q2), scale);
+        let f3 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(q3), scale);
+        // Narrow to f16 and store.
+        vst1_u16(out_ptr.add(i), fcvtn_f16x4_from_f32x4(f0));
+        vst1_u16(out_ptr.add(i + 4), fcvtn_f16x4_from_f32x4(f1));
+        vst1_u16(out_ptr.add(i + 8), fcvtn_f16x4_from_f32x4(f2));
+        vst1_u16(out_ptr.add(i + 12), fcvtn_f16x4_from_f32x4(f3));
+        i += 16;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let val = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = half::f16::from_f32(val).to_bits();
+        i += 1;
+    }
+}
+
+/// NEON u8 → f16 dequant.
+///
+/// # Safety
+/// See `dequant_i8_to_f16_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_u8_to_f16_neon(input: &[u8], q: Quantization, output: &mut [u16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let n = input.len();
+    let chunks_16 = n / 16;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_16 {
+        let v_u8 = vld1q_u8(in_ptr.add(i));
+        let lo_u16 = vmovl_u8(vget_low_u8(v_u8));
+        let hi_u16 = vmovl_high_u8(v_u8);
+        let q0 = vmovl_u16(vget_low_u16(lo_u16));
+        let q1 = vmovl_high_u16(lo_u16);
+        let q2 = vmovl_u16(vget_low_u16(hi_u16));
+        let q3 = vmovl_high_u16(hi_u16);
+        let f0 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q0), scale);
+        let f1 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q1), scale);
+        let f2 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q2), scale);
+        let f3 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(q3), scale);
+        vst1_u16(out_ptr.add(i), fcvtn_f16x4_from_f32x4(f0));
+        vst1_u16(out_ptr.add(i + 4), fcvtn_f16x4_from_f32x4(f1));
+        vst1_u16(out_ptr.add(i + 8), fcvtn_f16x4_from_f32x4(f2));
+        vst1_u16(out_ptr.add(i + 12), fcvtn_f16x4_from_f32x4(f3));
+        i += 16;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let val = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = half::f16::from_f32(val).to_bits();
+        i += 1;
+    }
+}
+
+/// NEON i16 → f16 dequant.
+///
+/// # Safety
+/// See `dequant_i8_to_f16_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_i16_to_f16_neon(input: &[i16], q: Quantization, output: &mut [u16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let n = input.len();
+    let chunks_8 = n / 8;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_8 {
+        let v_i16 = vld1q_s16(in_ptr.add(i));
+        let lo_i32 = vmovl_s16(vget_low_s16(v_i16));
+        let hi_i32 = vmovl_high_s16(v_i16);
+        let f0 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(lo_i32), scale);
+        let f1 = vfmaq_n_f32(bias_v, vcvtq_f32_s32(hi_i32), scale);
+        vst1_u16(out_ptr.add(i), fcvtn_f16x4_from_f32x4(f0));
+        vst1_u16(out_ptr.add(i + 4), fcvtn_f16x4_from_f32x4(f1));
+        i += 8;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let val = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = half::f16::from_f32(val).to_bits();
+        i += 1;
+    }
+}
+
+/// NEON u16 → f16 dequant.
+///
+/// # Safety
+/// See `dequant_i8_to_f16_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn dequant_u16_to_f16_neon(input: &[u16], q: Quantization, output: &mut [u16]) {
+    debug_assert_eq!(input.len(), output.len());
+    let scale = q.scale;
+    let bias_v = vdupq_n_f32(affine_bias(q));
+    let n = input.len();
+    let chunks_8 = n / 8;
+    let mut i = 0usize;
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+
+    for _ in 0..chunks_8 {
+        let v_u16 = vld1q_u16(in_ptr.add(i));
+        let lo_u32 = vmovl_u16(vget_low_u16(v_u16));
+        let hi_u32 = vmovl_high_u16(v_u16);
+        let f0 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(lo_u32), scale);
+        let f1 = vfmaq_n_f32(bias_v, vcvtq_f32_u32(hi_u32), scale);
+        vst1_u16(out_ptr.add(i), fcvtn_f16x4_from_f32x4(f0));
+        vst1_u16(out_ptr.add(i + 4), fcvtn_f16x4_from_f32x4(f1));
+        i += 8;
+    }
+
+    let zp = q.zero_point as f32;
+    while i < n {
+        let val = (*in_ptr.add(i) as f32 - zp) * scale;
+        *out_ptr.add(i) = half::f16::from_f32(val).to_bits();
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,5 +2129,239 @@ mod tests {
         }
         let sum: f32 = neon_buf.iter().sum();
         assert!((sum - 1.0).abs() < 1e-3, "fp16 softmax sum drift: {sum}");
+    }
+
+    // ── Tests for #3: NEON weighted sum ──────────────────────────────
+    use crate::per_scale::kernels::box_primitives::weighted_sum_4sides_f32;
+
+    #[test]
+    fn weighted_sum_neon_matches_scalar_uniform() {
+        let probs = [0.25_f32; 64]; // 4 sides × 16 bins, uniform
+        let scalar = weighted_sum_4sides_f32(&probs, 16);
+        let neon = unsafe { weighted_sum_4sides_f32_neon(&probs, 16) };
+        for (i, (&s, &n)) in scalar.iter().zip(neon.iter()).enumerate() {
+            assert!(
+                (s - n).abs() < 1e-4,
+                "weighted_sum uniform mismatch side {i}: scalar={s} neon={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_sum_neon_matches_scalar_one_hot() {
+        let mut probs = [0.0_f32; 64];
+        for side in 0..4 {
+            probs[side * 16 + 5] = 1.0;
+        }
+        let scalar = weighted_sum_4sides_f32(&probs, 16);
+        let neon = unsafe { weighted_sum_4sides_f32_neon(&probs, 16) };
+        for (i, (&s, &n)) in scalar.iter().zip(neon.iter()).enumerate() {
+            assert!(
+                (s - n).abs() < 1e-5,
+                "weighted_sum one-hot mismatch side {i}: scalar={s} neon={n}"
+            );
+        }
+    }
+
+    // ── Tests for #4: NEON dist2bbox ─────────────────────────────────
+    use crate::per_scale::kernels::box_primitives::dist2bbox_anchor_f32;
+
+    #[test]
+    fn dist2bbox_4anchors_matches_scalar() {
+        // 4 anchors with distinct LTRB values.
+        let ltrb = [
+            2.0_f32, 2.0, 2.0, 2.0, // anchor 0: symmetric
+            1.0, 0.0, 3.0, 0.0, // anchor 1: l/r only
+            0.0, 1.0, 0.0, 3.0, // anchor 2: t/b only
+            5.0, 3.0, 7.0, 1.0, // anchor 3: asymmetric
+        ];
+        let gx = [0.5_f32, 0.5, 0.5, 0.5];
+        let gy = [0.5_f32, 0.5, 0.5, 0.5];
+        let stride = 8.0;
+        let mut neon_out = [0.0_f32; 16];
+        unsafe {
+            dist2bbox_4anchors_f32_neon(&ltrb, &gx, &gy, stride, &mut neon_out);
+        }
+        for a in 0..4 {
+            let ltrb_a = [
+                ltrb[a * 4],
+                ltrb[a * 4 + 1],
+                ltrb[a * 4 + 2],
+                ltrb[a * 4 + 3],
+            ];
+            let scalar = dist2bbox_anchor_f32(ltrb_a, gx[a], gy[a], stride);
+            for c in 0..4 {
+                assert!(
+                    (scalar[c] - neon_out[a * 4 + c]).abs() < 1e-4,
+                    "dist2bbox mismatch anchor={a} coord={c}: scalar={} neon={}",
+                    scalar[c],
+                    neon_out[a * 4 + c]
+                );
+            }
+        }
+    }
+
+    // ── Tests for #5: fused dequant+sigmoid ──────────────────────────
+
+    #[test]
+    fn fused_dequant_sigmoid_i8_matches_two_pass() {
+        let q = Quantization::new(0.1, 0);
+        let input: Vec<i8> = (-64..64).collect();
+        let mut two_pass = vec![0.0_f32; input.len()];
+        let mut fused = vec![0.0_f32; input.len()];
+
+        dequant_i8_to_f32(&input, q, &mut two_pass);
+        sigmoid_slice_f32(&mut two_pass);
+
+        unsafe {
+            dequant_sigmoid_i8_to_f32_neon(&input, q, &mut fused);
+        }
+
+        for (i, (&t, &f)) in two_pass.iter().zip(fused.iter()).enumerate() {
+            assert!(
+                close_within_ulp(t, f, 8),
+                "fused i8 mismatch at {i}: two_pass={t} fused={f}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_dequant_sigmoid_u8_matches_two_pass() {
+        let q = Quantization::new(0.05, 128);
+        let input: Vec<u8> = (0..=255).collect();
+        let mut two_pass = vec![0.0_f32; input.len()];
+        let mut fused = vec![0.0_f32; input.len()];
+
+        dequant_u8_to_f32(&input, q, &mut two_pass);
+        sigmoid_slice_f32(&mut two_pass);
+
+        unsafe {
+            dequant_sigmoid_u8_to_f32_neon(&input, q, &mut fused);
+        }
+
+        for (i, (&t, &f)) in two_pass.iter().zip(fused.iter()).enumerate() {
+            assert!(
+                close_within_ulp(t, f, 8),
+                "fused u8 mismatch at {i}: two_pass={t} fused={f}"
+            );
+        }
+    }
+
+    // ── Tests for #6: half-precision dequant output ──────────────────
+
+    #[test]
+    fn dequant_i8_to_f16_neon_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("fp16") {
+            return; // FP16 instructions not available (e.g. Cortex-A53).
+        }
+        let q = Quantization::new(0.1, -10);
+        let input: Vec<i8> = (-20..20).collect();
+        let mut neon_out = vec![0u16; input.len()];
+        let mut scalar_f32 = vec![0.0_f32; input.len()];
+        dequant_i8_to_f32(&input, q, &mut scalar_f32);
+
+        unsafe {
+            dequant_i8_to_f16_neon(&input, q, &mut neon_out);
+        }
+
+        for (i, (&neon_bits, &sf)) in neon_out.iter().zip(scalar_f32.iter()).enumerate() {
+            let neon_f = half::f16::from_bits(neon_bits).to_f32();
+            let scalar_f16 = half::f16::from_f32(sf).to_f32();
+            assert!(
+                (neon_f - scalar_f16).abs() < 1e-2,
+                "i8→f16 mismatch at {i}: neon={neon_f} scalar_f16={scalar_f16}"
+            );
+        }
+    }
+
+    #[test]
+    fn dequant_u8_to_f16_neon_matches_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("fp16") {
+            return; // FP16 instructions not available (e.g. Cortex-A53).
+        }
+        let q = Quantization::new(0.5, 0);
+        let input: Vec<u8> = (0..48).collect();
+        let mut neon_out = vec![0u16; input.len()];
+        let mut scalar_f32 = vec![0.0_f32; input.len()];
+        dequant_u8_to_f32(&input, q, &mut scalar_f32);
+
+        unsafe {
+            dequant_u8_to_f16_neon(&input, q, &mut neon_out);
+        }
+
+        for (i, (&neon_bits, &sf)) in neon_out.iter().zip(scalar_f32.iter()).enumerate() {
+            let neon_f = half::f16::from_bits(neon_bits).to_f32();
+            let scalar_f16 = half::f16::from_f32(sf).to_f32();
+            assert!(
+                (neon_f - scalar_f16).abs() < 1e-2,
+                "u8→f16 mismatch at {i}: neon={neon_f} scalar_f16={scalar_f16}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_softmax_weighted_sum_matches_separate() {
+        // Verify that the fused kernel produces the same result as
+        // separate softmax_inplace + weighted_sum for reg_max=16.
+        let reg_max = 16usize;
+        // Simulate 4 sides of dequantized DFL logits (typical range -3..3).
+        let logits: Vec<f32> = (0..(4 * reg_max))
+            .map(|i| ((i as f32) * 0.37 - 2.5).sin() * 3.0)
+            .collect();
+
+        // Reference: separate softmax + weighted_sum (scalar oracle).
+        let mut probs = logits.clone();
+        for side in 0..4 {
+            softmax_inplace_f32(&mut probs[side * reg_max..(side + 1) * reg_max]);
+        }
+        let mut ref_ws = [0.0_f32; 4];
+        for (side, ws) in ref_ws.iter_mut().enumerate() {
+            let base = side * reg_max;
+            for bin in 0..reg_max {
+                *ws += probs[base + bin] * (bin as f32);
+            }
+        }
+
+        // Fused NEON kernel.
+        let fused_ws = unsafe { softmax_weighted_sum_4sides_f32_neon(&logits, reg_max) };
+
+        for (side, (&fused, &reference)) in fused_ws.iter().zip(ref_ws.iter()).enumerate() {
+            let diff = (fused - reference).abs();
+            assert!(
+                diff < 1e-4,
+                "fused softmax+ws mismatch on side {side}: fused={fused} ref={reference} diff={diff}",
+            );
+        }
+    }
+
+    #[test]
+    fn fused_softmax_weighted_sum_reg_max_32() {
+        // Test with reg_max=32 to exercise multi-chunk path.
+        let reg_max = 32usize;
+        let logits: Vec<f32> = (0..(4 * reg_max))
+            .map(|i| ((i as f32) * 0.23 - 1.8).cos() * 2.5)
+            .collect();
+
+        let mut probs = logits.clone();
+        for side in 0..4 {
+            softmax_inplace_f32(&mut probs[side * reg_max..(side + 1) * reg_max]);
+        }
+        let mut ref_ws = [0.0_f32; 4];
+        for (side, ws) in ref_ws.iter_mut().enumerate() {
+            let base = side * reg_max;
+            for bin in 0..reg_max {
+                *ws += probs[base + bin] * (bin as f32);
+            }
+        }
+
+        let fused_ws = unsafe { softmax_weighted_sum_4sides_f32_neon(&logits, reg_max) };
+
+        for (side, (&fused, &reference)) in fused_ws.iter().zip(ref_ws.iter()).enumerate() {
+            let diff = (fused - reference).abs();
+            assert!(
+                diff < 1e-4,
+                "fused softmax+ws (reg_max=32) mismatch on side {side}: fused={fused} ref={reference} diff={diff}",
+            );
+        }
     }
 }
