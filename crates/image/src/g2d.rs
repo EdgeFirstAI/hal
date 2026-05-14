@@ -488,11 +488,7 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 1280;
         let dst_height = 720;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
@@ -502,15 +498,12 @@ mod g2d_tests {
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
-            let nv12_bytes = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.nv12"
-            ));
+            let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_u8()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
-                .copy_from_slice(nv12_bytes);
+                .copy_from_slice(&nv12_bytes);
         } else {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
@@ -615,11 +608,7 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
@@ -644,15 +633,12 @@ mod g2d_tests {
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
-            let nv12_bytes = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.nv12"
-            ));
+            let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_u8()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
-                .copy_from_slice(nv12_bytes);
+                .copy_from_slice(&nv12_bytes);
         } else {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
@@ -715,11 +701,7 @@ mod g2d_tests {
             }),
             dst_color: None,
         };
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
@@ -745,15 +727,12 @@ mod g2d_tests {
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
-            let nv12_bytes = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.nv12"
-            ));
+            let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_u8()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
-                .copy_from_slice(nv12_bytes);
+                .copy_from_slice(&nv12_bytes);
         } else {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
@@ -909,10 +888,7 @@ mod g2d_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
         // Load PixelFormat::Rgba reference (ffmpeg-generated)
@@ -921,10 +897,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )?;
 
         // Convert using G2D
@@ -977,10 +950,7 @@ mod g2d_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
         )?;
 
         // Load PixelFormat::Rgb reference (ffmpeg-generated)
@@ -989,10 +959,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgb,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgb"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgb"),
         )?;
 
         // Convert using G2D
@@ -1045,10 +1012,7 @@ mod g2d_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
         // Load PixelFormat::Rgba reference (ffmpeg-generated)
@@ -1057,10 +1021,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )?;
 
         // Convert using G2D
@@ -1113,10 +1074,7 @@ mod g2d_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )?;
 
         // Load PixelFormat::Rgb reference (ffmpeg-generated)
@@ -1125,10 +1083,7 @@ mod g2d_tests {
             720,
             PixelFormat::Rgb,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgb"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgb"),
         )?;
 
         // Convert using G2D
@@ -1187,11 +1142,7 @@ mod g2d_tests {
     }
 
     fn test_g2d_bgra_no_resize_(g2d_in_fmt: PixelFormat) -> Result<(), crate::Error> {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
@@ -1199,15 +1150,12 @@ mod g2d_tests {
         let mut cpu_converter = CPUProcessor::new();
 
         if g2d_in_fmt == PixelFormat::Nv12 {
-            let nv12_bytes = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.nv12"
-            ));
+            let nv12_bytes = edgefirst_bench::testdata::read("zidane.nv12");
             src2.as_u8()
                 .unwrap()
                 .map()?
                 .as_mut_slice()
-                .copy_from_slice(nv12_bytes);
+                .copy_from_slice(&nv12_bytes);
         } else {
             cpu_converter.convert(&src, &mut src2, Rotation::None, Flip::None, Crop::no_crop())?;
         }
