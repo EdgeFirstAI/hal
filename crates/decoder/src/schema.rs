@@ -1255,8 +1255,12 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
     // Squeeze explicit `padding` dims before handing to the legacy
     // dispatch: the v1 decoder's `verify_yolo_*` helpers require rank-3
     // shapes, but v2 metadata often carries an explicit `padding: 1`
-    // axis (ARA-2).
-    let (shape, dshape) = squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone());
+    // axis (ARA-2). ModelPack boxes are validated as 4D, so keep
+    // padding dims for ModelPack outputs.
+    let (shape, dshape) = match logical.decoder {
+        Some(DecoderKind::ModelPack) => (logical.shape.clone(), logical.dshape.clone()),
+        _ => squeeze_padding_dims(logical.shape.clone(), logical.dshape.clone()),
+    };
 
     let ty = logical.type_.ok_or_else(|| {
         // Defense-in-depth: `to_legacy_config_outputs` already filters
@@ -2393,6 +2397,41 @@ outputs:
         let (shape, dshape) = squeeze_padding_dims(vec![1, 4, 8400], vec![]);
         assert_eq!(shape, vec![1, 4, 8400]);
         assert!(dshape.is_empty());
+    }
+
+    #[test]
+    fn to_legacy_modelpack_boxes_preserves_padding_dim() {
+        // Regression: ModelPack boxes with shape [1, N, 1, 4] (padding dim
+        // present in dshape) were incorrectly squeezed to [1, N, 4] by
+        // `logical_to_legacy_config_output`, triggering "Invalid ModelPack
+        // Boxes shape [1, 1935, 4]". The ModelPack path must skip squeezing.
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [
+            {"name":"boxes","type":"boxes",
+             "shape":[1,1935,1,4],
+             "dshape":[{"batch":1},{"num_boxes":1935},{"padding":1},{"box_coords":4}],
+             "decoder":"modelpack"}
+          ]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        let legacy = schema.to_legacy_config_outputs().expect("lowers cleanly");
+        let boxes = match &legacy.outputs[0] {
+            crate::ConfigOutput::Boxes(b) => b,
+            other => panic!("expected Boxes, got {other:?}"),
+        };
+        // Must preserve the rank-4 shape — the padding dim must NOT be
+        // squeezed for ModelPack outputs.
+        assert_eq!(boxes.shape, vec![1, 1935, 1, 4]);
+        assert_eq!(
+            boxes.dshape,
+            vec![
+                (DimName::Batch, 1),
+                (DimName::NumBoxes, 1935),
+                (DimName::Padding, 1),
+                (DimName::BoxCoords, 4),
+            ]
+        );
     }
 
     #[test]
