@@ -215,7 +215,13 @@ macro_rules! impl_dfl_level_f32_neon {
                         );
                     }
                 }
-                let ltrb = weighted_sum_4sides_f32(&deq[..4 * reg_max], reg_max);
+                // NEON vectorized weighted-sum + scalar dist2bbox.
+                let ltrb = unsafe {
+                    crate::per_scale::kernels::neon_baseline::weighted_sum_4sides_f32_neon(
+                        &deq[..4 * reg_max],
+                        reg_max,
+                    )
+                };
                 let gx = level.grid_x[anchor];
                 let gy = level.grid_y[anchor];
                 let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
@@ -296,19 +302,45 @@ macro_rules! impl_ltrb_level_f32_neon {
             debug_assert_eq!(input.len(), h * w * 4);
             debug_assert_eq!(dst.len(), 4 * h * w);
 
-            // Batch-dequant: NEON shines on the whole tensor (h*w*4 = up
-            // to 25600 elements at level 0); per-anchor 4 elements alone
-            // wouldn't fill a single NEON chunk. Heap scratch is small
-            // and Phase 2-B can move this to a reusable per-frame buffer
-            // (alongside the layout transpose scratch).
             let n = h * w * 4;
             let mut deq: Vec<f32> = vec![0.0_f32; n];
             // SAFETY: NEON mandatory on aarch64; dispatch contract.
             unsafe {
                 crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, &mut deq);
             }
-            // Per-anchor dist2bbox over the dequantized tensor.
-            for anchor in 0..(h * w) {
+
+            // Batch-4 NEON dist2bbox for the bulk of anchors.
+            let n_anchors = h * w;
+            let batch4 = n_anchors / 4;
+            for b in 0..batch4 {
+                let a0 = b * 4;
+                let ltrb_base = a0 * 4;
+                let gx_batch = [
+                    level.grid_x[a0],
+                    level.grid_x[a0 + 1],
+                    level.grid_x[a0 + 2],
+                    level.grid_x[a0 + 3],
+                ];
+                let gy_batch = [
+                    level.grid_y[a0],
+                    level.grid_y[a0 + 1],
+                    level.grid_y[a0 + 2],
+                    level.grid_y[a0 + 3],
+                ];
+                // SAFETY: NEON mandatory on aarch64. deq is contiguous
+                // [l0,t0,r0,b0, l1,t1,r1,b1, ...] — 16 floats per batch.
+                unsafe {
+                    crate::per_scale::kernels::neon_baseline::dist2bbox_4anchors_f32_neon(
+                        &deq[ltrb_base..ltrb_base + 16],
+                        &gx_batch,
+                        &gy_batch,
+                        level.stride,
+                        &mut dst[ltrb_base..ltrb_base + 16],
+                    );
+                }
+            }
+            // Scalar tail for remaining anchors.
+            for anchor in (batch4 * 4)..n_anchors {
                 let base = anchor * 4;
                 let dq = [deq[base], deq[base + 1], deq[base + 2], deq[base + 3]];
                 let gx = level.grid_x[anchor];
@@ -343,6 +375,119 @@ impl_ltrb_level_f32_neon!(
     decode_box_level_ltrb_u16_to_f32_neon,
     u16,
     dequant_u16_to_f32_neon
+);
+
+// ────────────────────────────────────────────────────────────────────────
+// Fused DFL box level kernels (online-softmax inspired)
+//
+// Replaces the separate softmax + weighted_sum calls with a single
+// fused kernel that computes Σ(exp(x-m)×i)/Σ(exp(x-m)) in-register.
+// Eliminates 256 memory ops per anchor (64 per side × 4 sides):
+//   - No intermediate probability store/reload
+//   - No normalize pass
+//   - Single scalar divide at the end
+//
+// Used as the default NEON DFL path (replaces the separate-pass version).
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! impl_dfl_level_f32_neon_fused {
+    ($name:ident, $i:ty, $dequant_neon:ident, $fused_ws:ident) => {
+        #[allow(dead_code)]
+        pub(crate) fn $name(input: &[$i], q: Quantization, level: &LevelPlan, dst: &mut [f32]) {
+            let h = level.h;
+            let w = level.w;
+            let reg_max = level.reg_max;
+            debug_assert_eq!(input.len(), h * w * 4 * reg_max);
+            debug_assert_eq!(dst.len(), 4 * h * w);
+            debug_assert!(reg_max <= MAX_REG_MAX);
+
+            let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
+            for anchor in 0..(h * w) {
+                let in_base = anchor * 4 * reg_max;
+                // SAFETY: NEON mandatory on aarch64; dispatch contract.
+                unsafe {
+                    crate::per_scale::kernels::neon_baseline::$dequant_neon(
+                        &input[in_base..in_base + 4 * reg_max],
+                        q,
+                        &mut deq[..4 * reg_max],
+                    );
+                }
+                // Fused softmax+weighted_sum — no intermediate store.
+                let ltrb = unsafe {
+                    crate::per_scale::kernels::neon_baseline::$fused_ws(
+                        &deq[..4 * reg_max],
+                        reg_max,
+                    )
+                };
+                let gx = level.grid_x[anchor];
+                let gy = level.grid_y[anchor];
+                let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
+                let out_base = anchor * 4;
+                dst[out_base..out_base + 4].copy_from_slice(&xywh);
+            }
+        }
+    };
+}
+
+// Fused f32 variants (Tier-1 NEON baseline).
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_i8_to_f32_neon_fused,
+    i8,
+    dequant_i8_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_u8_to_f32_neon_fused,
+    u8,
+    dequant_u8_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_i16_to_f32_neon_fused,
+    i16,
+    dequant_i16_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_u16_to_f32_neon_fused,
+    u16,
+    dequant_u16_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon
+);
+
+// Fused FP16 variants (Tier-2 FP16 exp path).
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_i8_to_f32_neon_fused_fp16,
+    i8,
+    dequant_i8_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_u8_to_f32_neon_fused_fp16,
+    u8,
+    dequant_u8_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_i16_to_f32_neon_fused_fp16,
+    i16,
+    dequant_i16_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon_fp16
+);
+#[cfg(target_arch = "aarch64")]
+impl_dfl_level_f32_neon_fused!(
+    decode_box_level_dfl_u16_to_f32_neon_fused_fp16,
+    u16,
+    dequant_u16_to_f32_neon,
+    softmax_weighted_sum_4sides_f32_neon_fp16
 );
 
 #[cfg(test)]

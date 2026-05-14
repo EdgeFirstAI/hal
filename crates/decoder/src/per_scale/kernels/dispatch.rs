@@ -18,7 +18,11 @@ use edgefirst_tensor::DType;
 /// `Dfl*` variants run dequant → softmax → weighted-sum → dist2bbox.
 /// `Ltrb*` variants run dequant → dist2bbox.
 ///
-/// Phase 1 only emits `*Scalar` variants. Phase 2 adds NEON tiers.
+/// DFL NEON tiers: NeonBase (f32 exp) and NeonFp16 (fp16 exp via fused
+/// softmax+weighted_sum). DotProd/I8MM are not needed for DFL because
+/// the fused kernel computes weighted_sum as part of the exp loop
+/// using simple FMAs, which is faster than the quantize→integer_dot→
+/// dequantize roundtrip that DotProd/I8MM would provide.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // Wired by Task 15.
 #[allow(clippy::enum_variant_names)] // tier suffix is meaningful (Phase 2 adds Neon variants)
@@ -94,9 +98,10 @@ impl BoxLevelDispatch {
     ) -> DecoderResult<Self> {
         use BoxLevelDispatch::*;
 
+        // Tier 2: FP16 (DFL only — LTRB has no softmax, fused kernel
+        // with fp16 exp is the best DFL path on cores with fp16).
         #[cfg(target_arch = "aarch64")]
         if features.neon_fp16 {
-            // FP16 tier wins for DFL only — LTRB has no softmax.
             match (encoding, input, output) {
                 (BoxEncoding::Dfl, DType::I8, DecodeDtype::F32) => return Ok(DflI8ToF32NeonFp16),
                 (BoxEncoding::Dfl, DType::U8, DecodeDtype::F32) => return Ok(DflU8ToF32NeonFp16),
@@ -206,6 +211,17 @@ pub(crate) enum ScoreLevelDispatch {
     I16ToF32NeonFp16,
     #[cfg(target_arch = "aarch64")]
     U16ToF32NeonFp16,
+
+    // Tier 1-fused: NEON fused dequant+sigmoid in one pass (no intermediate
+    // store/reload). Same CpuFeatures gate as NeonBase.
+    #[cfg(target_arch = "aarch64")]
+    I8ToF32NeonFused,
+    #[cfg(target_arch = "aarch64")]
+    U8ToF32NeonFused,
+    #[cfg(target_arch = "aarch64")]
+    I16ToF32NeonFused,
+    #[cfg(target_arch = "aarch64")]
+    U16ToF32NeonFused,
 }
 
 impl ScoreLevelDispatch {
@@ -214,36 +230,62 @@ impl ScoreLevelDispatch {
         output: DecodeDtype,
         features: &CpuFeatures,
     ) -> DecoderResult<Self> {
-        use ScoreLevelDispatch::*;
-        // Tier-1 NEON-base wins when the probe says it's available AND a
-        // NEON variant exists for this cell. Otherwise the scalar arm
-        // below is the fallback. This is the dispatch contract: a
-        // *NeonBase variant existing in the returned value means the
-        // CpuFeatures probe saw the corresponding hardware feature, so
-        // calls into the unsafe `target_feature` kernel are sound.
         #[cfg(target_arch = "aarch64")]
-        if features.neon_fp16 {
-            match (input, output) {
-                (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonFp16),
-                (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonFp16),
-                (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonFp16),
-                (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonFp16),
-                _ => {} // fall through to NeonBase
+        {
+            use ScoreLevelDispatch::*;
+            if features.neon_fp16 {
+                match (input, output) {
+                    (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonFp16),
+                    (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonFp16),
+                    (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonFp16),
+                    (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonFp16),
+                    _ => {} // fall through to NeonBase
+                }
+            }
+            if features.neon_baseline {
+                match (input, output) {
+                    // Fused dequant+sigmoid: preferred for score tensors.
+                    // MaskCoef/Proto callers use select_dequant_only() instead.
+                    (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonFused),
+                    (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonFused),
+                    (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonFused),
+                    (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonFused),
+                    _ => {} // fall through to scalar
+                }
             }
         }
-        #[cfg(target_arch = "aarch64")]
-        if features.neon_baseline {
-            match (input, output) {
-                (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonBase),
-                (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonBase),
-                (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonBase),
-                (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonBase),
-                _ => {} // fall through to scalar
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = features;
+        Self::select_scalar(input, output, features)
+    }
 
+    /// Dequant-only selector: picks NeonBase (no fused sigmoid) for
+    /// mc/proto paths that have no activation step.
+    pub(crate) fn select_dequant_only(
+        input: DType,
+        output: DecodeDtype,
+        features: &CpuFeatures,
+    ) -> DecoderResult<Self> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use ScoreLevelDispatch::*;
+            if features.neon_baseline {
+                match (input, output) {
+                    (DType::I8, DecodeDtype::F32) => return Ok(I8ToF32NeonBase),
+                    (DType::U8, DecodeDtype::F32) => return Ok(U8ToF32NeonBase),
+                    (DType::I16, DecodeDtype::F32) => return Ok(I16ToF32NeonBase),
+                    (DType::U16, DecodeDtype::F32) => return Ok(U16ToF32NeonBase),
+                    _ => {} // fall through to scalar
+                }
+            }
+        }
+        Self::select_scalar(input, output, features)
+    }
+
+    fn select_scalar(
+        input: DType,
+        output: DecodeDtype,
+        _features: &CpuFeatures,
+    ) -> DecoderResult<Self> {
+        use ScoreLevelDispatch::*;
         Ok(match (input, output) {
             (DType::I8, DecodeDtype::F32) => I8ToF32Scalar,
             (DType::U8, DecodeDtype::F32) => U8ToF32Scalar,
@@ -279,15 +321,9 @@ impl MaskCoefDispatch {
         output: DecodeDtype,
         f: &CpuFeatures,
     ) -> DecoderResult<Self> {
-        // FP16 brings no advantage to mc/proto (they're pure dequant —
-        // no exp/sigmoid/softmax) and the fp16 NEON variants don't have
-        // mc/proto kernels wired. Force the score selector to skip the
-        // fp16 tier for these consumers.
-        let f_no_fp16 = CpuFeatures {
-            neon_fp16: false,
-            ..*f
-        };
-        ScoreLevelDispatch::select(input, output, &f_no_fp16).map(Self)
+        // Pure dequant (no activation) — skip FP16 sigmoid and fused
+        // dequant+sigmoid tiers.
+        ScoreLevelDispatch::select_dequant_only(input, output, f).map(Self)
     }
 }
 
@@ -302,11 +338,8 @@ impl ProtoDispatch {
         output: DecodeDtype,
         f: &CpuFeatures,
     ) -> DecoderResult<Self> {
-        let f_no_fp16 = CpuFeatures {
-            neon_fp16: false,
-            ..*f
-        };
-        ScoreLevelDispatch::select(input, output, &f_no_fp16).map(Self)
+        // Pure dequant (no activation) — skip FP16 sigmoid and fused tiers.
+        ScoreLevelDispatch::select_dequant_only(input, output, f).map(Self)
     }
 }
 
@@ -354,10 +387,10 @@ use super::level_box::{
 };
 #[cfg(target_arch = "aarch64")]
 use super::level_box::{
-    decode_box_level_dfl_i16_to_f32_neon, decode_box_level_dfl_i16_to_f32_neon_fp16,
-    decode_box_level_dfl_i8_to_f32_neon, decode_box_level_dfl_i8_to_f32_neon_fp16,
-    decode_box_level_dfl_u16_to_f32_neon, decode_box_level_dfl_u16_to_f32_neon_fp16,
-    decode_box_level_dfl_u8_to_f32_neon, decode_box_level_dfl_u8_to_f32_neon_fp16,
+    decode_box_level_dfl_i16_to_f32_neon_fused, decode_box_level_dfl_i16_to_f32_neon_fused_fp16,
+    decode_box_level_dfl_i8_to_f32_neon_fused, decode_box_level_dfl_i8_to_f32_neon_fused_fp16,
+    decode_box_level_dfl_u16_to_f32_neon_fused, decode_box_level_dfl_u16_to_f32_neon_fused_fp16,
+    decode_box_level_dfl_u8_to_f32_neon_fused, decode_box_level_dfl_u8_to_f32_neon_fused_fp16,
     decode_box_level_ltrb_i16_to_f32_neon, decode_box_level_ltrb_i8_to_f32_neon,
     decode_box_level_ltrb_u16_to_f32_neon, decode_box_level_ltrb_u8_to_f32_neon,
 };
@@ -456,22 +489,22 @@ impl BoxLevelDispatch {
                 decode_box_level_ltrb_f32_to_f16(i, q, level, d)
             }
 
-            // Tier-1 NEON-base arms.
+            // Tier-1 NEON-base arms (fused softmax+weighted_sum).
             #[cfg(target_arch = "aarch64")]
             (DflI8ToF32NeonBase, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i8_to_f32_neon(i, q, level, d)
+                decode_box_level_dfl_i8_to_f32_neon_fused(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflU8ToF32NeonBase, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u8_to_f32_neon(i, q, level, d)
+                decode_box_level_dfl_u8_to_f32_neon_fused(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflI16ToF32NeonBase, InputView::I16(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i16_to_f32_neon(i, q, level, d)
+                decode_box_level_dfl_i16_to_f32_neon_fused(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflU16ToF32NeonBase, InputView::U16(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u16_to_f32_neon(i, q, level, d)
+                decode_box_level_dfl_u16_to_f32_neon_fused(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (LtrbI8ToF32NeonBase, InputView::I8(i), DstSliceMut::F32(d)) => {
@@ -490,22 +523,22 @@ impl BoxLevelDispatch {
                 decode_box_level_ltrb_u16_to_f32_neon(i, q, level, d)
             }
 
-            // Tier-2 NEON FP16 DFL arms.
+            // Tier-2 NEON FP16 DFL arms (fused softmax+weighted_sum, fp16 exp).
             #[cfg(target_arch = "aarch64")]
             (DflI8ToF32NeonFp16, InputView::I8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i8_to_f32_neon_fp16(i, q, level, d)
+                decode_box_level_dfl_i8_to_f32_neon_fused_fp16(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflU8ToF32NeonFp16, InputView::U8(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u8_to_f32_neon_fp16(i, q, level, d)
+                decode_box_level_dfl_u8_to_f32_neon_fused_fp16(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflI16ToF32NeonFp16, InputView::I16(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_i16_to_f32_neon_fp16(i, q, level, d)
+                decode_box_level_dfl_i16_to_f32_neon_fused_fp16(i, q, level, d)
             }
             #[cfg(target_arch = "aarch64")]
             (DflU16ToF32NeonFp16, InputView::U16(i), DstSliceMut::F32(d)) => {
-                decode_box_level_dfl_u16_to_f32_neon_fp16(i, q, level, d)
+                decode_box_level_dfl_u16_to_f32_neon_fused_fp16(i, q, level, d)
             }
 
             (variant, _, _) => {
@@ -529,9 +562,11 @@ use super::level_score::{
 #[cfg(target_arch = "aarch64")]
 use super::level_score::{
     decode_score_level_i16_to_f32_neon, decode_score_level_i16_to_f32_neon_fp16,
-    decode_score_level_i8_to_f32_neon, decode_score_level_i8_to_f32_neon_fp16,
+    decode_score_level_i16_to_f32_neon_fused, decode_score_level_i8_to_f32_neon,
+    decode_score_level_i8_to_f32_neon_fp16, decode_score_level_i8_to_f32_neon_fused,
     decode_score_level_u16_to_f32_neon, decode_score_level_u16_to_f32_neon_fp16,
-    decode_score_level_u8_to_f32_neon, decode_score_level_u8_to_f32_neon_fp16,
+    decode_score_level_u16_to_f32_neon_fused, decode_score_level_u8_to_f32_neon,
+    decode_score_level_u8_to_f32_neon_fp16, decode_score_level_u8_to_f32_neon_fused,
 };
 use crate::per_scale::Activation;
 
@@ -620,6 +655,24 @@ impl ScoreLevelDispatch {
             #[cfg(target_arch = "aarch64")]
             (U16ToF32NeonFp16, InputView::U16(i), DstSliceMut::F32(d)) => {
                 decode_score_level_u16_to_f32_neon_fp16(i, q, num_classes, level, activation, d)
+            }
+
+            // Tier 1-fused: fused dequant+sigmoid NEON arms.
+            #[cfg(target_arch = "aarch64")]
+            (I8ToF32NeonFused, InputView::I8(i), DstSliceMut::F32(d)) => {
+                decode_score_level_i8_to_f32_neon_fused(i, q, num_classes, level, activation, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (U8ToF32NeonFused, InputView::U8(i), DstSliceMut::F32(d)) => {
+                decode_score_level_u8_to_f32_neon_fused(i, q, num_classes, level, activation, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (I16ToF32NeonFused, InputView::I16(i), DstSliceMut::F32(d)) => {
+                decode_score_level_i16_to_f32_neon_fused(i, q, num_classes, level, activation, d)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (U16ToF32NeonFused, InputView::U16(i), DstSliceMut::F32(d)) => {
+                decode_score_level_u16_to_f32_neon_fused(i, q, num_classes, level, activation, d)
             }
             (variant, _, _) => {
                 return Err(DecoderError::KernelDispatchUnreachable(format!(
