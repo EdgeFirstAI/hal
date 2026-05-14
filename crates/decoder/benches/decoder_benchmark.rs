@@ -19,7 +19,7 @@ const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
 fn bench_yolo_quant(suite: &mut BenchSuite) {
-    let raw = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
     let tensor = TensorDyn::I8(Tensor::<i8>::from_slice(raw, &[1, 84, 8400]).unwrap());
 
@@ -53,7 +53,7 @@ fn bench_yolo_quant(suite: &mut BenchSuite) {
 
 fn bench_quant_decode_boxes(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = ndarray::Array2::from_shape_vec((84, 8400), out.to_vec()).unwrap();
     let quant = Quantization {
@@ -79,7 +79,7 @@ fn bench_quant_decode_boxes(suite: &mut BenchSuite) {
 fn bench_quant_nms(suite: &mut BenchSuite) {
     let score_threshold = 0.01;
     let iou_threshold = 0.70;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
     let quant = Quantization {
@@ -112,7 +112,7 @@ fn bench_yolo_f32(suite: &mut BenchSuite) {
     // Pre-dequantize once outside the timed loop. The bench measures
     // the float decode path; mixing dequant cost into each iteration
     // (as the legacy version did) inflated wall-time by the dequant.
-    let raw = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
     let quant = Quantization {
         scale: 0.0040811873,
@@ -152,7 +152,7 @@ fn bench_yolo_f32(suite: &mut BenchSuite) {
 }
 
 fn bench_dequantize_i8(suite: &mut BenchSuite) {
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
     let quant = Quantization {
@@ -172,7 +172,7 @@ fn bench_dequantize_i8(suite: &mut BenchSuite) {
 }
 
 fn bench_dequantize_i8_chunked(suite: &mut BenchSuite) {
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
     let quant = Quantization {
@@ -192,7 +192,7 @@ fn bench_dequantize_i8_chunked(suite: &mut BenchSuite) {
 }
 
 fn bench_dequantize_i16(suite: &mut BenchSuite) {
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
     let quant = Quantization {
@@ -212,7 +212,7 @@ fn bench_dequantize_i16(suite: &mut BenchSuite) {
 }
 
 fn bench_dequantize_i16_chunked(suite: &mut BenchSuite) {
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out: Vec<_> = out.iter().map(|x| *x as i16).collect();
     let quant = Quantization {
@@ -233,7 +233,7 @@ fn bench_dequantize_i16_chunked(suite: &mut BenchSuite) {
 
 fn bench_f32_decode_boxes(suite: &mut BenchSuite) {
     let score_threshold = 0.25;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
     let quant = Quantization {
@@ -259,7 +259,7 @@ fn bench_f32_decode_boxes(suite: &mut BenchSuite) {
 fn bench_f32_nms(suite: &mut BenchSuite) {
     let score_threshold = 0.01;
     let iou_threshold = 0.70;
-    let out = include_bytes!("../../../testdata/yolov8s_80_classes.bin");
+    let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
     let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
     let out = out.to_vec();
     let quant = Quantization {
@@ -292,11 +292,11 @@ fn bench_f32_nms(suite: &mut BenchSuite) {
 fn bench_modelpack_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
-    let boxes = include_bytes!("../../../testdata/modelpack_boxes_1935x1x4.bin");
-    let boxes_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(boxes, &[1, 1935, 1, 4]).unwrap());
+    let boxes = edgefirst_bench::testdata::read("modelpack_boxes_1935x1x4.bin");
+    let boxes_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(&boxes, &[1, 1935, 1, 4]).unwrap());
 
-    let scores = include_bytes!("../../../testdata/modelpack_scores_1935x1.bin");
-    let scores_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(scores, &[1, 1935, 1]).unwrap());
+    let scores = edgefirst_bench::testdata::read("modelpack_scores_1935x1.bin");
+    let scores_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(&scores, &[1, 1935, 1]).unwrap());
 
     let quant_boxes: configs::QuantTuple = (0.004656755365431309, 21).into();
     let quant_scores: configs::QuantTuple = (0.0019603664986789227, 0).into();
@@ -349,12 +349,12 @@ fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
     let score_threshold = 0.45;
     let iou_threshold = 0.45;
 
-    let detect0 = include_bytes!("../../../testdata/modelpack_split_9x15x18.bin");
-    let detect0_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(detect0, &[1, 9, 15, 18]).unwrap());
+    let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
+    let detect0_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(&detect0, &[1, 9, 15, 18]).unwrap());
 
-    let detect1 = include_bytes!("../../../testdata/modelpack_split_17x30x18.bin");
+    let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
     let detect1_tensor =
-        TensorDyn::U8(Tensor::<u8>::from_slice(detect1, &[1, 17, 30, 18]).unwrap());
+        TensorDyn::U8(Tensor::<u8>::from_slice(&detect1, &[1, 17, 30, 18]).unwrap());
 
     let detect_config0 = configs::Detection {
         decoder: configs::DecoderType::ModelPack,
@@ -417,7 +417,7 @@ fn bench_masks_f32(suite: &mut BenchSuite) {
     // Pre-dequantize boxes + protos once outside the timed loop. The bench
     // measures the float seg-det decode + mask materialization; the legacy
     // version dequantized each iteration which masked the actual decode time.
-    let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+    let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
     let boxes_raw =
         unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
     let boxes_arr = ndarray::Array2::from_shape_vec((116, 8400), boxes_raw.to_vec()).unwrap();
@@ -430,7 +430,7 @@ fn bench_masks_f32(suite: &mut BenchSuite) {
         Tensor::<f32>::from_slice(boxes_f32.as_slice().unwrap(), &[1, 116, 8400]).unwrap(),
     );
 
-    let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+    let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
     let protos_raw =
         unsafe { std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len()) };
     let protos_arr = ndarray::Array3::from_shape_vec((160, 160, 32), protos_raw.to_vec()).unwrap();
@@ -481,12 +481,12 @@ fn bench_masks_f32(suite: &mut BenchSuite) {
 }
 
 fn bench_masks_i8(suite: &mut BenchSuite) {
-    let boxes_raw = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
+    let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
     let boxes_raw =
         unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
     let boxes_tensor = TensorDyn::I8(Tensor::<i8>::from_slice(boxes_raw, &[1, 116, 8400]).unwrap());
 
-    let protos_raw = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+    let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
     let protos_raw =
         unsafe { std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len()) };
     let protos_tensor =

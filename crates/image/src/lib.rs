@@ -28,8 +28,8 @@ the appropriate conversion method based on the available hardware.
 # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
 # use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 # fn main() -> Result<(), edgefirst_image::Error> {
-let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
-let src = load_image(image, Some(PixelFormat::Rgba), None)?;
+let image = edgefirst_bench::testdata::read("zidane.jpg");
+let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
 let mut converter = ImageProcessor::new()?;
 let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
 converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
@@ -1015,8 +1015,8 @@ impl ImageProcessor {
     /// # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
     /// # use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// let image = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
-    /// let src = load_image(image, Some(PixelFormat::Rgba), None)?;
+    /// let image = edgefirst_bench::testdata::read("zidane.jpg");
+    /// let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
     /// let mut converter = ImageProcessor::new()?;
     /// let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
     /// converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
@@ -2560,8 +2560,8 @@ fn load_png(
 /// use edgefirst_image::load_image;
 /// use edgefirst_tensor::PixelFormat;
 /// # fn main() -> Result<(), edgefirst_image::Error> {
-/// let jpeg = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/zidane.jpg"));
-/// let img = load_image(jpeg, Some(PixelFormat::Rgb), None)?;
+/// let jpeg = edgefirst_bench::testdata::read("zidane.jpg");
+/// let img = load_image(&jpeg, Some(PixelFormat::Rgb), None)?;
 /// assert_eq!(img.width(), Some(1280));
 /// assert_eq!(img.height(), Some(720));
 /// # Ok(())

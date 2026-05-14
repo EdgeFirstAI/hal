@@ -904,8 +904,10 @@ mod tests {
         // Feeding f32 tensors would hit the dispatch's mismatched-arm path
         // → KernelDispatchUnreachable. End-to-end run() integration is
         // exercised separately via the int8-with-attached-quant test below.
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+        let json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_yolov8n_schema.json",
+        );
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
         let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
             .unwrap()
             .unwrap();
@@ -927,8 +929,10 @@ mod tests {
         use edgefirst_tensor::Quantization as TQ;
         use edgefirst_tensor::{Tensor, TensorMemory};
 
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+        let json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_yolov8n_schema.json",
+        );
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
         let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
             .unwrap()
             .unwrap();

@@ -241,9 +241,11 @@ mod decoder_builder_tests {
 
     #[test]
     fn builder_flat_schema_does_not_attach_per_scale_decoder() {
-        let schema_json = include_str!("../../../../testdata/per_scale/synthetic_flat_schema.json");
+        let schema_json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_flat_schema.json",
+        );
         let schema: crate::schema::SchemaV2 =
-            serde_json::from_str(schema_json).expect("flat fixture must parse");
+            serde_json::from_str(&schema_json).expect("flat fixture must parse");
 
         let decoder = DecoderBuilder::default()
             .with_schema(schema)
