@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `logical_to_legacy_config_output` is squeezing the padding dimension for 
-  MPK "boxes" output shape causing RuntimeError "Invalid ModelPack Boxes 
-  shape [1, 1935, 4]". Added condition to check if the decoder type is 
-  ModelPack, do not squeeze the padding dimension.
+- `logical_to_legacy_config_output` is squeezing the padding dimension for
+  MPK "boxes" output shape, causing RuntimeError "Invalid ModelPack Boxes
+  shape [1, 1935, 4]". Added a condition to check if the decoder type is
+  ModelPack and not squeeze the padding dimension.
 
 
 ## [0.22.0] - 2026-05-11
