@@ -14,8 +14,9 @@
 # TESTING.md for the documented incantations.
 
 # aarch64 Apple Silicon (M-series) is the one safe exception: every
-# M-series chip has ARMv8.2-FP16. Intel Macs build under the separate
-# `x86_64-apple-darwin` triple, so this entry cannot misfire on
-# non-FP16 hardware.
+# M-series chip (M1 through M4) is ARMv8.6-A+ and supports fp16,
+# dotprod (sdot/udot), and i8mm (smmla/ummla/usmmla). Intel Macs
+# build under the separate `x86_64-apple-darwin` triple, so this
+# entry cannot misfire on non-ARM hardware.
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "target-feature=+fp16"]
+rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
