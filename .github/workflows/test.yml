@@ -500,6 +500,56 @@ jobs:
           echo "C API test artifacts:"
           ls -la hardware-capi-tests/
 
+      - name: Prepare stripped binaries for hardware deployment
+        run: |
+          set -euo pipefail
+          # Cross-compiled aarch64 test binaries built with --profile profiling
+          # carry full DWARF debug info AND coverage instrumentation. The
+          # `__llvm_prf_*` ELF sections that drive profraw generation are
+          # independent of DWARF — `strip --strip-debug` removes the debug
+          # info while preserving the instrumentation, shrinking each binary
+          # ~5-10× and proportionally reducing the artifact download on the
+          # on-target runner. The unstripped originals stay in place for:
+          #   - test-arm (in-place coverage processing, uses runner-test-binaries/)
+          #   - process-hardware-coverage (host-side llvm-cov export, uses
+          #     coverage-binaries-aarch64)
+          # so source-line attribution still works for both Rust and Python
+          # profraw files captured on hardware.
+
+          mkdir -p hardware-test-binaries-stripped
+          cp -a hardware-test-binaries/. hardware-test-binaries-stripped/
+          for bin in hardware-test-binaries-stripped/*; do
+            [ -x "$bin" ] && file "$bin" 2>/dev/null | grep -q "ELF" \
+              && strip --strip-debug "$bin"
+          done
+
+          mkdir -p hardware-capi-tests-stripped
+          cp -a hardware-capi-tests/. hardware-capi-tests-stripped/
+          # libedgefirst_hal.a is consumed at link time only; running tests
+          # on the target dynamic-links against the .so. Drop the static
+          # archive from the hardware deployment artifact.
+          rm -f hardware-capi-tests-stripped/libedgefirst_hal.a
+          for bin in hardware-capi-tests-stripped/test_all \
+                     hardware-capi-tests-stripped/libedgefirst_hal.so*; do
+            [ -f "$bin" ] && strip --strip-debug "$bin" 2>/dev/null || true
+          done
+
+          mkdir -p target/wheels-stripped
+          for whl_in in target/wheels/*.whl; do
+            [ -f "$whl_in" ] || continue
+            whl_name=$(basename "$whl_in")
+            tmp=$(mktemp -d)
+            ( cd "$tmp" && unzip -q "$GITHUB_WORKSPACE/$whl_in" )
+            find "$tmp" -name "*.so" -exec strip --strip-debug {} \;
+            ( cd "$tmp" && zip -qrX "$GITHUB_WORKSPACE/target/wheels-stripped/$whl_name" . )
+            rm -rf "$tmp"
+          done
+
+          echo "=== Hardware deployment artifact sizes (stripped vs original) ==="
+          du -sh hardware-test-binaries/ hardware-test-binaries-stripped/
+          du -sh hardware-capi-tests/ hardware-capi-tests-stripped/
+          du -sh target/wheels/ target/wheels-stripped/
+
       - name: Upload runner test artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
@@ -512,14 +562,14 @@ jobs:
             target/release/libedgefirst_hal.so.0
           retention-days: 7
 
-      - name: Upload hardware test artifacts (binaries + wheels only)
+      - name: Upload hardware test artifacts (stripped, fast on-target download)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: hardware-test-binaries
           path: |
-            target/wheels/*.whl
-            hardware-test-binaries/
-            hardware-capi-tests/
+            target/wheels-stripped/*.whl
+            hardware-test-binaries-stripped/
+            hardware-capi-tests-stripped/
           retention-days: 7
 
       - name: Upload coverage instrumented binaries (for profraw processing)
@@ -743,7 +793,9 @@ jobs:
     steps:
       - name: Clean workspace
         run: |
-          rm -rf build/ venv/ target/ rust-tests/ testdata/ 2>/dev/null || true
+          rm -rf build/ venv/ target/ rust-tests/ testdata/ \
+                 hardware-test-binaries-stripped/ \
+                 hardware-capi-tests-stripped/ 2>/dev/null || true
           find . -name "*.gcda" -o -name "*.profraw" -delete 2>/dev/null || true
 
       - name: Checkout code
@@ -769,8 +821,10 @@ jobs:
           echo "${{ github.workspace }}/venv/bin" >> $GITHUB_PATH
           venv/bin/pip install --upgrade pip setuptools wheel
           venv/bin/pip install slipcover pytest pytest-timeout pytest-benchmark numpy pillow psutil safetensors
-          # Install Python bindings from pre-built wheel (built with profiling profile on aarch64)
-          venv/bin/pip install target/wheels/*.whl
+          # Install Python bindings from pre-built wheel (stripped for fast
+          # download; coverage processing on the host uses the unstripped
+          # copy from coverage-binaries-aarch64).
+          venv/bin/pip install target/wheels-stripped/*.whl
 
       - name: Debug environment info
         run: |
@@ -778,7 +832,7 @@ jobs:
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
           echo "=== Downloaded artifacts ===" && find . -name "*.so*" -o -name "profiling" -type d 2>/dev/null || echo "Not found"
-          echo "=== Test binaries ===" && ls -la hardware-test-binaries/ 2>/dev/null || echo "Not found"
+          echo "=== Test binaries ===" && ls -la hardware-test-binaries-stripped/ 2>/dev/null || echo "Not found"
 
       - name: Run Python tests with coverage
         env:
@@ -843,7 +897,7 @@ jobs:
             fi
           }
 
-          for test_bin in hardware-test-binaries/*; do
+          for test_bin in hardware-test-binaries-stripped/*; do
             [[ -x "$test_bin" && -f "$test_bin" ]] || continue
             [[ "$test_bin" == *.so ]] && continue
             test_name=$(basename "$test_bin")
@@ -867,15 +921,15 @@ jobs:
           EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
 
-          if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
+          if [ -d "hardware-capi-tests-stripped" ] && [ -f "hardware-capi-tests-stripped/test_all" ]; then
             echo "=== Running C API tests on hardware ==="
-            chmod +x hardware-capi-tests/test_all
-            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests:$LD_LIBRARY_PATH
+            chmod +x hardware-capi-tests-stripped/test_all
+            export LD_LIBRARY_PATH=$(pwd)/hardware-capi-tests-stripped:$LD_LIBRARY_PATH
             # Same SIGABRT-on-exit issue as Python tests — the Vivante EGL
             # driver may crash during library unload after all tests pass.
             # Use the test summary output as the source of truth.
             EXIT_CODE=0
-            hardware-capi-tests/test_all 2>&1 | tee build/test-metrics-capi-imx8mp.txt || EXIT_CODE=$?
+            hardware-capi-tests-stripped/test_all 2>&1 | tee build/test-metrics-capi-imx8mp.txt || EXIT_CODE=$?
 
             if [ $EXIT_CODE -ne 0 ]; then
               if grep -q 'Failed: 0' build/test-metrics-capi-imx8mp.txt; then
