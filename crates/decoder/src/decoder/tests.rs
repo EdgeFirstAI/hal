@@ -1721,10 +1721,7 @@ mod decoder_builder_tests {
         let score_threshold = 0.25;
         let iou_threshold = 0.7;
         let quant = (0.0040811873, -123);
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
         let out_float: Array3<f32> = dequantize_ndarray(out.view(), quant.into());
@@ -3022,18 +3019,12 @@ outputs:
         use crate::{Nms, ProtoData, Quantization, XYWH};
 
         // Load cached YOLOv8 segmentation model outputs
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -3123,18 +3114,12 @@ outputs:
         use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
         use crate::{Nms, ProtoData, Quantization, XYWH};
 
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -3234,18 +3219,12 @@ outputs:
         use crate::yolo::{impl_yolo_segdet_float_proto, impl_yolo_segdet_quant_proto};
         use crate::{Nms, ProtoData, Quantization, XYWH};
 
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -3575,10 +3554,7 @@ outputs:
 
         // Use the reference yolov8s detection output, but strip mask_coefs
         // (pretend they come from a separate tensor). Detection = [1,84,8400].
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
 
         // Dequantize the reference detection output
@@ -3654,11 +3630,8 @@ outputs:
         fn with_schema_v1_yaml_via_shim_builds() {
             // Legacy v1 testdata parsed through the v2 shim and fed to
             // the new builder should produce a working decoder.
-            let yaml = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8_seg.yaml"
-            ));
-            let schema = SchemaV2::parse_yaml(yaml).unwrap();
+            let yaml = edgefirst_bench::testdata::read_to_string("yolov8_seg.yaml");
+            let schema = SchemaV2::parse_yaml(&yaml).unwrap();
             let decoder = DecoderBuilder::new().with_schema(schema).build().unwrap();
             assert!(decoder.decode_program.is_none());
         }
@@ -3841,11 +3814,8 @@ outputs:
 
         #[test]
         fn with_schema_real_ara2_int8_dvm() {
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/ara2_int8_edgefirst.json"
-            ));
-            let schema = SchemaV2::parse_json(json).unwrap();
+            let json = edgefirst_bench::testdata::read_to_string("ara2_int8_edgefirst.json");
+            let schema = SchemaV2::parse_json(&json).unwrap();
             schema.validate().unwrap();
             let decoder = DecoderBuilder::new()
                 .with_schema(schema)
@@ -3871,11 +3841,8 @@ outputs:
         #[test]
         fn with_schema_real_ara2_int8_dvm_decode_smoke() {
             use edgefirst_tensor::{Tensor, TensorDyn, TensorMemory, TensorTrait};
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/ara2_int8_edgefirst.json"
-            ));
-            let schema = SchemaV2::parse_json(json).unwrap();
+            let json = edgefirst_bench::testdata::read_to_string("ara2_int8_edgefirst.json");
+            let schema = SchemaV2::parse_json(&json).unwrap();
             let decoder = DecoderBuilder::new()
                 .with_schema(schema)
                 .with_score_threshold(0.25)
@@ -3921,11 +3888,8 @@ outputs:
 
         #[test]
         fn with_schema_real_ara2_int16_dvm() {
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/ara2_int16_edgefirst.json"
-            ));
-            let schema = SchemaV2::parse_json(json).unwrap();
+            let json = edgefirst_bench::testdata::read_to_string("ara2_int16_edgefirst.json");
+            let schema = SchemaV2::parse_json(&json).unwrap();
             schema.validate().unwrap();
             let decoder = DecoderBuilder::new()
                 .with_schema(schema)
@@ -3992,10 +3956,7 @@ outputs:
             // produces. This is the validator's target API: pass the raw
             // edgefirst.json string, get a decoder that handles the
             // xy/wh sub-split natively.
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/ara2_int16_edgefirst.json"
-            ));
+            let json = edgefirst_bench::testdata::read_to_string("ara2_int16_edgefirst.json");
             let decoder = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
                 .with_score_threshold(0.25)
@@ -4010,10 +3971,7 @@ outputs:
 
         #[test]
         fn json_str_v2_ara2_int8_builds() {
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/ara2_int8_edgefirst.json"
-            ));
+            let json = edgefirst_bench::testdata::read_to_string("ara2_int8_edgefirst.json");
             let decoder = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
                 .with_score_threshold(0.25)
@@ -4026,10 +3984,7 @@ outputs:
         fn json_str_v1_legacy_still_builds() {
             // Legacy v1 JSON must continue to build via the same path
             // (the auto-detect must not regress v1 callers).
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_split.json"
-            ));
+            let json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
             let decoder = DecoderBuilder::new()
                 .with_config_json_str(json.to_string())
                 .build()
@@ -4066,11 +4021,8 @@ outputs:
             //   * normalized == false (pixel coords per HAILORT spec)
             //   * the DFL reg_max extracted from the program == 16
             //     (= 64 feature channels ÷ 4)
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/hailo_yolov8seg_edgefirst.json"
-            ));
-            let schema = SchemaV2::parse_json(json).unwrap();
+            let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
+            let schema = SchemaV2::parse_json(&json).unwrap();
             schema.validate().unwrap();
             let decoder = DecoderBuilder::new()
                 .with_schema(schema)
@@ -4105,11 +4057,8 @@ outputs:
         #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
         fn hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity() {
             use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
-            let json = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/hailo_yolov8seg_edgefirst.json"
-            ));
-            let schema = SchemaV2::parse_json(json).unwrap();
+            let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
+            let schema = SchemaV2::parse_json(&json).unwrap();
             let decoder = DecoderBuilder::new()
                 .with_schema(schema)
                 .with_score_threshold(0.25)
@@ -4243,20 +4192,14 @@ outputs:
         use crate::yolo::impl_yolo_segdet_quant_proto;
         use crate::{Nms, ProtoLayout, Quantization, XYWH};
 
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
         // Create protos in physical NCHW layout [K, H, W] then view as [H, W, K].
         let (k, h, w) = (32, 160, 160);
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -4324,20 +4267,14 @@ outputs:
 
         // Use a very high score threshold so no detections survive NMS.
         // The proto layout should still be correctly detected as NCHW.
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes = ndarray::Array2::from_shape_vec((116, 8400), boxes_i8.to_vec()).unwrap();
 
         // Create NCHW protos (same as the non-zero-det test).
         let (k, h, w) = (32, 160, 160);
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };

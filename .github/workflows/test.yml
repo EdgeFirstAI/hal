@@ -586,6 +586,10 @@ jobs:
       - name: Run pre-built Rust tests
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
+          # Test binaries were cross-compiled on build-arm; their baked-in
+          # CARGO_MANIFEST_DIR paths don't resolve on this runner. Point
+          # edgefirst_bench::testdata at the downloaded testdata directory.
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
 
           mkdir -p build/profraw build/rust-test-results
@@ -608,6 +612,8 @@ jobs:
           [ $TEST_FAILED -eq 0 ] || exit 1
 
       - name: Run C API tests
+        env:
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
 
           if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then
@@ -622,6 +628,7 @@ jobs:
       - name: Run Python tests with coverage
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/py-%p-%m.profraw
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
 
           mkdir -p build/profraw
@@ -776,6 +783,7 @@ jobs:
       - name: Run Python tests with coverage
         env:
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/%p-%m.profraw
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
           mkdir -p build/profraw
           export LD_LIBRARY_PATH=$(pwd)/target/profiling:$LD_LIBRARY_PATH
@@ -803,6 +811,10 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/profiling:$LD_LIBRARY_PATH
           LLVM_PROFILE_FILE: ${{ github.workspace }}/build/profraw/rust-%p-%m.profraw
+          # Cross-compiled binaries cannot use their compile-time CARGO_MANIFEST_DIR
+          # path on this runner; point edgefirst_bench::testdata at the downloaded
+          # testdata directory.
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
           # Only run tests that exercise hardware (G2D, OpenGL/EGL, DMA).
           # CPU-only tests already run on the ubuntu-22.04-arm-xlarge runner.
@@ -851,6 +863,8 @@ jobs:
           [ $TEST_FAILED -eq 0 ] || exit 1
 
       - name: Run C API tests
+        env:
+          EDGEFIRST_TESTDATA_DIR: ${{ github.workspace }}/testdata
         run: |
 
           if [ -d "hardware-capi-tests" ] && [ -f "hardware-capi-tests/test_all" ]; then

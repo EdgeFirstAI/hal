@@ -275,7 +275,7 @@ impl Decoder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, configs::ModelType};
     /// # fn main() -> DecoderResult<()> {
-    /// #    let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// #    let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     ///     let decoder = DecoderBuilder::default()
     ///         .with_config_yaml_str(config_yaml)
     ///         .build()?;
@@ -306,7 +306,7 @@ impl Decoder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// #    let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// #    let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     ///     let decoder = DecoderBuilder::default()
     ///         .with_config_yaml_str(config_yaml)
     ///         .build()?;

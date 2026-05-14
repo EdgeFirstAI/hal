@@ -171,7 +171,7 @@ impl Default for DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// #  let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// #  let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::default()
     ///     .with_config_yaml_str(config_yaml)
     ///     .build()?;
@@ -205,7 +205,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// #  let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// #  let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
     ///     .build()?;
@@ -227,7 +227,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
     ///     .build()?;
@@ -248,7 +248,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .build()?;
@@ -270,7 +270,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json"));
+    /// let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
     /// let config = serde_json::from_str(config_json)?;
     /// let decoder = DecoderBuilder::new().with_config(config).build()?;
     ///
@@ -861,7 +861,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.654)
@@ -882,7 +882,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_iou_threshold(0.654)
@@ -910,7 +910,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, configs::Nms};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_nms(Some(Nms::ClassAware))
@@ -954,7 +954,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.25)
@@ -968,7 +968,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.001)
@@ -993,7 +993,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_max_det(100)
@@ -1023,7 +1023,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_yaml = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.yaml")).to_string();
+    /// # let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
     ///     .with_input_dims(640, 640)
@@ -1045,7 +1045,7 @@ impl DecoderBuilder {
     /// ```rust
     /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
     /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json")).to_string();
+    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .with_score_threshold(0.654)
