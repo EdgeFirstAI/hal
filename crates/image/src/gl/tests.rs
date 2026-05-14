@@ -27,10 +27,7 @@ mod gl_tests {
         }
 
         let image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -38,10 +35,7 @@ mod gl_tests {
 
         let mut segmentation = Array3::from_shape_vec(
             (2, 160, 160),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_seg_2x160x160.bin"
-            ))
+            edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin")
             .to_vec(),
         )
         .unwrap();
@@ -74,10 +68,7 @@ mod gl_tests {
         }
 
         let image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
@@ -85,10 +76,7 @@ mod gl_tests {
 
         let mut segmentation = Array3::from_shape_vec(
             (2, 160, 160),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_seg_2x160x160.bin"
-            ))
+            edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin")
             .to_vec(),
         )
         .unwrap();
@@ -124,10 +112,7 @@ mod gl_tests {
         // draw_decoded_masks fully writes dst — pass the camera frame as
         // the MaskOverlay background, not as the dst canvas.
         let bg = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -143,10 +128,7 @@ mod gl_tests {
 
         let segmentation = Array3::from_shape_vec(
             (76, 55, 1),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8_seg_crop_76x55.bin"
-            ))
+            edgefirst_bench::testdata::read("yolov8_seg_crop_76x55.bin")
             .to_vec(),
         )
         .unwrap();
@@ -184,10 +166,7 @@ mod gl_tests {
             TensorDyn::from(__t)
         };
         let expected = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/output_render_gl.jpg"
-            )),
+            &edgefirst_bench::testdata::read("output_render_gl.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -208,10 +187,7 @@ mod gl_tests {
         }
 
         let image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -391,10 +367,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -404,10 +377,7 @@ mod gl_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
 
@@ -458,10 +428,7 @@ mod gl_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -471,10 +438,7 @@ mod gl_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
 
@@ -660,10 +624,7 @@ mod gl_tests {
             // Smoke test: do a simple PixelFormat::Rgba → PixelFormat::Rgba conversion to verify the
             // GL context is fully functional.
             let src = crate::load_image(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/zidane.jpg"
-                )),
+                &edgefirst_bench::testdata::read("zidane.jpg"),
                 Some(PixelFormat::Rgba),
                 None,
             )
@@ -733,10 +694,7 @@ mod gl_tests {
 
         let mut gl = GLProcessorThreaded::new(None).expect("auto-detect should succeed");
         let src = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.jpg"
-            )),
+            &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -854,10 +812,7 @@ mod gl_tests {
             1080,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera1080p.yuyv"
-            )),
+            edgefirst_bench::testdata::read("camera1080p.yuyv"),
         )
         .unwrap();
 
@@ -916,10 +871,7 @@ mod gl_tests {
             1080,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera1080p.yuyv"
-            )),
+            edgefirst_bench::testdata::read("camera1080p.yuyv"),
         )
         .unwrap();
 
@@ -990,10 +942,7 @@ mod gl_tests {
             1080,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera1080p.yuyv"
-            )),
+            edgefirst_bench::testdata::read("camera1080p.yuyv"),
         )
         .unwrap();
 
@@ -1061,10 +1010,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -1144,10 +1090,7 @@ mod gl_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -1220,10 +1163,7 @@ mod gl_tests {
             return;
         }
 
-        let seg_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_seg_2x160x160.bin"
-        ))
+        let seg_bytes = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin")
         .to_vec();
 
         // Build segmentation data (shared between both renders)
@@ -1245,10 +1185,7 @@ mod gl_tests {
 
         // Render to PixelFormat::Rgba
         let rgba_img = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -1259,10 +1196,7 @@ mod gl_tests {
 
         // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
         let rgba_src = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -1332,10 +1266,7 @@ mod gl_tests {
 
         // Render boxes to PixelFormat::Rgba
         let rgba_img = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
@@ -1346,10 +1277,7 @@ mod gl_tests {
 
         // Render boxes to PixelFormat::Bgra
         let rgba_src = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
@@ -1483,10 +1411,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
 
         // Contiguous PixelFormat::Nv12 (single DMA-BUF)
         let src_contiguous = load_raw_image(
@@ -1574,10 +1499,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
         let height: usize = 720;
         let stride: usize = width; // NV12 Y plane: 1 byte per pixel
@@ -1690,10 +1612,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
 
         let src_contiguous = load_raw_image(
             1280,
@@ -1763,10 +1682,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
 
         let src_contiguous = load_raw_image(
             1280,
@@ -1847,10 +1763,7 @@ mod gl_tests {
         }
 
         // Load cached YOLOv8 seg model outputs as TensorDyn::I8 inputs.
-        let boxes_raw: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw: &[u8] = &edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes_tensor = TensorDyn::I8(
@@ -1858,10 +1771,7 @@ mod gl_tests {
                 .expect("boxes tensor"),
         );
 
-        let protos_raw: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw: &[u8] = &edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -1967,10 +1877,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2057,10 +1964,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2118,10 +2022,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2212,10 +2113,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2314,10 +2212,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2375,10 +2270,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2479,10 +2371,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2585,10 +2474,7 @@ mod gl_tests {
             720,
             PixelFormat::Nv12,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -2846,10 +2732,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
         let height: usize = 720;
         let stride: usize = width;
@@ -2969,10 +2852,7 @@ mod gl_tests {
             return;
         }
 
-        let nv12_bytes: &[u8] = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes: &[u8] = edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
         let height: usize = 720;
         let stride: usize = width;

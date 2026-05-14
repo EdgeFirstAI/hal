@@ -2943,11 +2943,8 @@ mod image_tests {
 
     #[test]
     fn test_load_resize_save() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ));
-        let img = crate::load_image(file, Some(PixelFormat::Rgba), None).unwrap();
+        let file = edgefirst_bench::testdata::read("zidane.jpg");
+        let img = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         assert_eq!(img.width(), Some(1280));
         assert_eq!(img.height(), Some(720));
 
@@ -2977,10 +2974,7 @@ mod image_tests {
     #[test]
     fn test_from_tensor_planar() -> Result<(), Error> {
         let mut tensor = Tensor::new(&[3, 720, 1280], None, None)?;
-        tensor.map()?.copy_from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.8bps"
-        )));
+        tensor.map()?.copy_from_slice(&edgefirst_bench::testdata::read("camera720p.8bps"));
         let planar = {
             tensor
                 .set_format(PixelFormat::PlanarRgb)
@@ -2993,10 +2987,7 @@ mod image_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )?;
         compare_images_convert_to_rgb(&planar, &rbga, 0.98, function!());
 
@@ -3018,10 +3009,7 @@ mod image_tests {
             720,
             PixelFormat::PlanarRgb,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.8bps"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.8bps"),
         )
         .unwrap();
 
@@ -3037,10 +3025,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -3177,20 +3162,14 @@ mod image_tests {
     #[test]
     fn test_load_grey() {
         let grey_img = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/grey.jpg"
-            )),
+            &edgefirst_bench::testdata::read("grey.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
 
         let grey_but_rgb_img = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/grey-rgb.jpg"
-            )),
+            &edgefirst_bench::testdata::read("grey-rgb.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -3217,10 +3196,7 @@ mod image_tests {
     fn test_new_image_converter() {
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -3275,10 +3251,7 @@ mod image_tests {
         assert_eq!(dst_u8.dtype(), DType::U8);
 
         // Convert into I8 dst should succeed
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let mut dst_i8 = converter
@@ -3344,10 +3317,7 @@ mod image_tests {
               // fallback triggers a GPU driver hang during SHM→texture upload (e.g.,
               // NVIDIA without /dev/dma_heap permissions). Works on embedded targets.
     fn test_crop_skip() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -3420,20 +3390,14 @@ mod image_tests {
 
     #[test]
     fn test_load_jpeg_with_exif() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane_rotated_exif.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane_rotated_exif.jpg")
         .to_vec();
         let loaded = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(1280));
         assert_eq!(loaded.width(), Some(720));
 
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -3458,20 +3422,14 @@ mod image_tests {
 
     #[test]
     fn test_load_png_with_exif() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane_rotated_exif_180.png"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane_rotated_exif_180.png")
         .to_vec();
         let loaded = crate::load_png(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(720));
         assert_eq!(loaded.width(), Some(1280));
 
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -3820,10 +3778,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src =
             crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
@@ -3874,10 +3829,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -3950,10 +3902,7 @@ mod image_tests {
         }
 
         let img = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/grey.jpg"
-            )),
+            &edgefirst_bench::testdata::read("grey.jpg"),
             Some(PixelFormat::Grey),
             None,
         )
@@ -4004,10 +3953,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -4066,10 +4012,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -4123,10 +4066,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let src_dyn = src;
@@ -4206,10 +4146,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let crop = Crop {
@@ -4263,10 +4200,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -4315,10 +4249,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
 
         let mut cpu_converter = CPUProcessor::new();
@@ -4418,10 +4349,7 @@ mod image_tests {
         // This test rotates the image 4 times and checks that the image was returned to
         // be the same Currently doesn't check if rotations actually rotated in
         // right direction
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
 
         let unchanged_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
@@ -4521,10 +4449,7 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), tensor_memory).unwrap();
 
@@ -4598,10 +4523,7 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src =
             crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
@@ -4650,10 +4572,7 @@ mod image_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
 
@@ -4725,10 +4644,7 @@ mod image_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
 
@@ -4804,10 +4720,7 @@ mod image_tests {
             720,
             PixelFormat::Rgba,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
 
@@ -4878,10 +4791,7 @@ mod image_tests {
 
     #[test]
     fn test_yuyv_to_rgba_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.yuyv"
-        ))
+        let file = edgefirst_bench::testdata::read("camera720p.yuyv")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
         src.as_u8()
@@ -4911,20 +4821,14 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_yuyv_to_rgb_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.yuyv"
-        ))
+        let file = edgefirst_bench::testdata::read("camera720p.yuyv")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
         src.as_u8()
@@ -4958,10 +4862,7 @@ mod image_tests {
             .0
             .iter_mut()
             .zip(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/camera720p.rgba"
-                ))
+                edgefirst_bench::testdata::read("camera720p.rgba")
                 .as_chunks::<4>()
                 .0,
             )
@@ -4989,10 +4890,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5023,10 +4921,7 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -5052,10 +4947,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5086,10 +4978,7 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -5113,10 +5002,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5177,10 +5063,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5228,10 +5111,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5258,10 +5138,7 @@ mod image_tests {
             720,
             PixelFormat::Rgba,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.rgba"),
         )
         .unwrap();
         let (result, _src_target, dst_target) = convert_img(
@@ -5298,10 +5175,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5381,10 +5255,7 @@ mod image_tests {
             720,
             PixelFormat::Yuyv,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -5444,10 +5315,7 @@ mod image_tests {
 
     #[test]
     fn test_vyuy_to_rgba_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.vyuy"
-        ))
+        let file = edgefirst_bench::testdata::read("camera720p.vyuy")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
         src.as_u8()
@@ -5477,20 +5345,14 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_vyuy_to_rgb_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.vyuy"
-        ))
+        let file = edgefirst_bench::testdata::read("camera720p.vyuy")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
         src.as_u8()
@@ -5524,10 +5386,7 @@ mod image_tests {
             .0
             .iter_mut()
             .zip(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/camera720p.rgba"
-                ))
+                edgefirst_bench::testdata::read("camera720p.rgba")
                 .as_chunks::<4>()
                 .0,
             )
@@ -5556,10 +5415,7 @@ mod image_tests {
             720,
             PixelFormat::Vyuy,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.vyuy"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.vyuy"),
         )
         .unwrap();
 
@@ -5596,10 +5452,7 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
@@ -5624,10 +5477,7 @@ mod image_tests {
             720,
             PixelFormat::Vyuy,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.vyuy"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.vyuy"),
         )
         .unwrap();
 
@@ -5696,10 +5546,7 @@ mod image_tests {
             720,
             PixelFormat::Vyuy,
             Some(TensorMemory::Dma),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.vyuy"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.vyuy"),
         )
         .unwrap();
 
@@ -5739,20 +5586,14 @@ mod image_tests {
             .map()
             .unwrap()
             .as_mut_slice()
-            .copy_from_slice(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.rgba"
-            )));
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
     fn test_nv12_to_rgba_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.nv12"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.nv12")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
@@ -5772,10 +5613,7 @@ mod image_tests {
         result.unwrap();
 
         let target_image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.jpg"
-            )),
+            &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -5786,10 +5624,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_rgb_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.nv12"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.nv12")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
@@ -5809,10 +5644,7 @@ mod image_tests {
         result.unwrap();
 
         let target_image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.jpg"
-            )),
+            &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgb),
             None,
         )
@@ -5823,10 +5655,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_grey_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.nv12"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.nv12")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
@@ -5846,10 +5675,7 @@ mod image_tests {
         result.unwrap();
 
         let target_image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.jpg"
-            )),
+            &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Grey),
             None,
         )
@@ -5860,10 +5686,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_yuyv_cpu() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.nv12"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.nv12")
         .to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
@@ -5883,10 +5706,7 @@ mod image_tests {
         result.unwrap();
 
         let target_image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/zidane.jpg"
-            )),
+            &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgb),
             None,
         )
@@ -6015,10 +5835,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/test_image.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("test_image.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -6082,10 +5899,7 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_nv16() {
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -6506,10 +6320,7 @@ mod image_tests {
         );
 
         // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
-        let file = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ))
+        let file = edgefirst_bench::testdata::read("zidane.jpg")
         .to_vec();
         let jpeg_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
@@ -7169,11 +6980,8 @@ mod image_tests {
         }
 
         // Load a source image
-        let image = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/zidane.jpg"
-        ));
-        let src = load_image(image, Some(PixelFormat::Rgba), None).unwrap();
+        let image = edgefirst_bench::testdata::read("zidane.jpg");
+        let src = load_image(&image, Some(PixelFormat::Rgba), None).unwrap();
 
         // Create a raw tensor, then attach format — simulating the from_fd workflow
         let mut dst =
