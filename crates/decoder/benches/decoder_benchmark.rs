@@ -350,7 +350,8 @@ fn bench_modelpack_split_u8(suite: &mut BenchSuite) {
     let iou_threshold = 0.45;
 
     let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
-    let detect0_tensor = TensorDyn::U8(Tensor::<u8>::from_slice(&detect0, &[1, 9, 15, 18]).unwrap());
+    let detect0_tensor =
+        TensorDyn::U8(Tensor::<u8>::from_slice(&detect0, &[1, 9, 15, 18]).unwrap());
 
     let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
     let detect1_tensor =

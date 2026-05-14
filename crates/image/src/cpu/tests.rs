@@ -1034,8 +1034,7 @@ mod cpu_tests {
 
         let mut segmentation = Array3::from_shape_vec(
             (2, 160, 160),
-            edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin")
-            .to_vec(),
+            edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin").to_vec(),
         )
         .unwrap();
         segmentation.swap_axes(0, 1);
@@ -1087,8 +1086,7 @@ mod cpu_tests {
 
         let segmentation = Array3::from_shape_vec(
             (76, 55, 1),
-            edgefirst_bench::testdata::read("yolov8_seg_crop_76x55.bin")
-            .to_vec(),
+            edgefirst_bench::testdata::read("yolov8_seg_crop_76x55.bin").to_vec(),
         )
         .unwrap();
 

@@ -86,8 +86,7 @@ pub fn path(rel: impl AsRef<Path>) -> PathBuf {
 /// resolved absolute path to aid debugging.
 pub fn read(rel: impl AsRef<Path>) -> Vec<u8> {
     let p = path(rel.as_ref());
-    std::fs::read(&p)
-        .unwrap_or_else(|e| panic!("read testdata {}: {}", p.display(), e))
+    std::fs::read(&p).unwrap_or_else(|e| panic!("read testdata {}: {}", p.display(), e))
 }
 
 /// Reads the testdata file at `rel` as a UTF-8 string.
@@ -97,8 +96,7 @@ pub fn read(rel: impl AsRef<Path>) -> Vec<u8> {
 /// Panics if the file cannot be read or is not valid UTF-8.
 pub fn read_to_string(rel: impl AsRef<Path>) -> String {
     let p = path(rel.as_ref());
-    std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("read testdata {}: {}", p.display(), e))
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read testdata {}: {}", p.display(), e))
 }
 
 #[cfg(test)]

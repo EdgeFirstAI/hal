@@ -1129,8 +1129,7 @@ mod decoder_tests {
 
         let decoder = DecoderBuilder::default()
             .with_config_yaml_str(
-                edgefirst_bench::testdata::read_to_string("modelpack_split.yaml")
-                .to_string(),
+                edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string(),
             )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
