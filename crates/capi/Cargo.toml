@@ -37,3 +37,6 @@ log = { workspace = true }
 
 [build-dependencies]
 cbindgen = "0.29"
+
+[dev-dependencies]
+edgefirst-bench = { workspace = true }
