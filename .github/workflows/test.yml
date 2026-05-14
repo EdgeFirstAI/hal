@@ -534,14 +534,18 @@ jobs:
             [ -f "$bin" ] && strip --strip-debug "$bin" 2>/dev/null || true
           done
 
+          # Python wheels — use the venv's `wheel` to unpack and repack so the
+          # PEP 376 RECORD manifest (SHA256 hashes of every file) is
+          # regenerated after the embedded .so files are stripped. pip will
+          # warn or fail on RECORD mismatch otherwise.
           mkdir -p target/wheels-stripped
           for whl_in in target/wheels/*.whl; do
             [ -f "$whl_in" ] || continue
-            whl_name=$(basename "$whl_in")
             tmp=$(mktemp -d)
-            ( cd "$tmp" && unzip -q "$GITHUB_WORKSPACE/$whl_in" )
+            venv/bin/wheel unpack --dest "$tmp" "$whl_in"
             find "$tmp" -name "*.so" -exec strip --strip-debug {} \;
-            ( cd "$tmp" && zip -qrX "$GITHUB_WORKSPACE/target/wheels-stripped/$whl_name" . )
+            unpacked_dir=$(ls -d "$tmp"/*/ | head -1)
+            venv/bin/wheel pack --dest-dir target/wheels-stripped "$unpacked_dir"
             rm -rf "$tmp"
           done
 
