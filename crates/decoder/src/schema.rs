@@ -2400,6 +2400,36 @@ outputs:
     }
 
     #[test]
+    fn to_legacy_modelpack_boxes_preserves_padding_dim() {
+        // Regression: ModelPack boxes with shape [1, N, 1, 4] (padding dim
+        // present in dshape) were incorrectly squeezed to [1, N, 4] by
+        // `logical_to_legacy_config_output`, triggering "Invalid ModelPack
+        // Boxes shape [1, 1935, 4]". The ModelPack path must skip squeezing.
+        let j = r#"{
+          "schema_version": 2,
+          "outputs": [{
+            "name": "boxes",
+            "type": "boxes",
+            "shape": [1, 1935, 1, 4],
+            "dshape": [{"batch": 1}, {"num_boxes": 1935}, {"padding": 1}, {"box_coords": 4}],
+            "dtype": "float32",
+            "decoder": "modelpack",
+            "encoding": "anchor"
+          }]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+        let legacy = schema.to_legacy_config_outputs().expect("lowers cleanly");
+        let boxes = match &legacy.outputs[0] {
+            crate::ConfigOutput::Boxes(b) => b,
+            other => panic!("expected Boxes, got {other:?}"),
+        };
+        // Must preserve the rank-4 shape — the padding dim must NOT be
+        // squeezed for ModelPack outputs.
+        assert_eq!(boxes.shape, vec![1, 1935, 1, 4]);
+        assert_eq!(boxes.dshape.len(), 4);
+    }
+
+    #[test]
     fn to_legacy_preserves_shape_for_v2_split_boxes_without_dshape() {
         // Regression: `Decoder({...v2 split boxes, shape:[1,4,8400], no dshape...})`
         // used to fail with `Invalid Yolo Split Boxes shape []` because
