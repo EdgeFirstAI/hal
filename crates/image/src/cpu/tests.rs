@@ -165,11 +165,7 @@ mod cpu_tests {
                 720,
                 $src_fmt,
                 None,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/",
-                    $src_file
-                )),
+                &edgefirst_bench::testdata::read($src_file),
             )?;
 
             // Load destination reference
@@ -178,11 +174,7 @@ mod cpu_tests {
                 720,
                 $dst_fmt,
                 None,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/",
-                    $dst_file
-                )),
+                &edgefirst_bench::testdata::read($dst_file),
             )?;
 
             let mut converter = CPUProcessor::default();
@@ -219,11 +211,7 @@ mod cpu_tests {
                 720,
                 $src_fmt,
                 None,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/",
-                    $src_file
-                )),
+                &edgefirst_bench::testdata::read($src_file),
             )?;
 
             // Load destination reference
@@ -232,11 +220,7 @@ mod cpu_tests {
                 720,
                 $dst_fmt,
                 None,
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/",
-                    $dst_file
-                )),
+                &edgefirst_bench::testdata::read($dst_file),
             )?;
 
             let mut converter = CPUProcessor::default();
@@ -1041,10 +1025,7 @@ mod cpu_tests {
         use ndarray::Array3;
 
         let image = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -1053,10 +1034,7 @@ mod cpu_tests {
 
         let mut segmentation = Array3::from_shape_vec(
             (2, 160, 160),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_seg_2x160x160.bin"
-            ))
+            edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin")
             .to_vec(),
         )
         .unwrap();
@@ -1093,10 +1071,7 @@ mod cpu_tests {
         // draw_decoded_masks fully writes dst: we must pass the camera
         // frame as a background via MaskOverlay, not as the dst canvas.
         let bg = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/giraffe.jpg"
-            )),
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -1112,10 +1087,7 @@ mod cpu_tests {
 
         let segmentation = Array3::from_shape_vec(
             (76, 55, 1),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8_seg_crop_76x55.bin"
-            ))
+            edgefirst_bench::testdata::read("yolov8_seg_crop_76x55.bin")
             .to_vec(),
         )
         .unwrap();
@@ -1153,10 +1125,7 @@ mod cpu_tests {
             TensorDyn::from(__t)
         };
         let expected = crate::load_image(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/output_render_cpu.jpg"
-            )),
+            &edgefirst_bench::testdata::read("output_render_cpu.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
@@ -1558,10 +1527,7 @@ mod cpu_tests {
             720,
             PixelFormat::Nv12,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv12"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
         )
         .unwrap();
 
@@ -1602,10 +1568,7 @@ mod cpu_tests {
             720,
             PixelFormat::Yuyv,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.yuyv"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
         )
         .unwrap();
 
@@ -1645,10 +1608,7 @@ mod cpu_tests {
             720,
             PixelFormat::Vyuy,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.vyuy"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.vyuy"),
         )
         .unwrap();
 
@@ -1688,10 +1648,7 @@ mod cpu_tests {
             720,
             PixelFormat::Nv16,
             None,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/camera720p.nv16"
-            )),
+            &edgefirst_bench::testdata::read("camera720p.nv16"),
         )
         .unwrap();
 
@@ -2272,20 +2229,14 @@ mod cpu_tests {
         use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, DetectBox, Nms, ProtoData};
         use edgefirst_tensor::{Tensor, TensorDyn};
 
-        let boxes_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
         let boxes_tensor = TensorDyn::I8(
             Tensor::<i8>::from_slice(boxes_i8, &[1, 116, 8400]).expect("boxes tensor"),
         );
 
-        let protos_raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
@@ -2952,17 +2903,14 @@ mod cpu_tests {
     #[test]
     fn test_multiplane_nv12_to_rgb_cpu() -> Result<()> {
         // Load PixelFormat::Nv12 test data as contiguous buffer
-        let nv12_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes = edgefirst_bench::testdata::read("camera720p.nv12");
         let width = 1280usize;
         let height = 720usize;
         let y_size = width * height;
         let uv_size = width * (height / 2);
 
         // ── Contiguous path (baseline) ──────────────────────────────
-        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, nv12_bytes)?;
+        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
         let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None)?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
@@ -3015,16 +2963,13 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_nv12_to_rgba_cpu() -> Result<()> {
-        let nv12_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes = edgefirst_bench::testdata::read("camera720p.nv12");
         let width = 1280usize;
         let height = 720usize;
         let y_size = width * height;
         let uv_size = width * (height / 2);
 
-        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, nv12_bytes)?;
+        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
         let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgba, DType::U8, None)?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
@@ -3074,16 +3019,13 @@ mod cpu_tests {
 
     #[test]
     fn test_multiplane_nv12_to_grey_cpu() -> Result<()> {
-        let nv12_bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/camera720p.nv12"
-        ));
+        let nv12_bytes = edgefirst_bench::testdata::read("camera720p.nv12");
         let width = 1280usize;
         let height = 720usize;
         let y_size = width * height;
         let uv_size = width * (height / 2);
 
-        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, nv12_bytes)?;
+        let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
         let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Grey, DType::U8, None)?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
