@@ -178,6 +178,71 @@ impl_score_level_f32_neon!(
     sigmoid_slice_f32_neon_fp16
 );
 
+// ────────────────────────────────────────────────────────────────────────
+// Fused dequant+sigmoid NEON score-level kernels
+//
+// For quantized integer inputs (i8, u8, i16, u16) with Sigmoid activation,
+// these use a single-pass kernel that dequants and applies sigmoid without
+// writing then re-reading the intermediate f32 buffer. When activation is
+// not Sigmoid, falls back to the two-pass NEON dequant path (no sigmoid).
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! impl_score_level_f32_neon_fused {
+    ($name:ident, $i:ty, $fused:ident, $dequant_neon:ident) => {
+        #[allow(dead_code)]
+        pub(crate) fn $name(
+            input: &[$i],
+            q: Quantization,
+            num_classes: usize,
+            level: &LevelPlan,
+            activation: Activation,
+            dst: &mut [f32],
+        ) {
+            let n = level.h * level.w * num_classes;
+            debug_assert_eq!(input.len(), n);
+            debug_assert_eq!(dst.len(), n);
+            // SAFETY: NEON is mandatory on aarch64; dispatch contract.
+            unsafe {
+                if activation == Activation::Sigmoid {
+                    crate::per_scale::kernels::neon_baseline::$fused(input, q, dst);
+                } else {
+                    crate::per_scale::kernels::neon_baseline::$dequant_neon(input, q, dst);
+                }
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+impl_score_level_f32_neon_fused!(
+    decode_score_level_i8_to_f32_neon_fused,
+    i8,
+    dequant_sigmoid_i8_to_f32_neon,
+    dequant_i8_to_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_score_level_f32_neon_fused!(
+    decode_score_level_u8_to_f32_neon_fused,
+    u8,
+    dequant_sigmoid_u8_to_f32_neon,
+    dequant_u8_to_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_score_level_f32_neon_fused!(
+    decode_score_level_i16_to_f32_neon_fused,
+    i16,
+    dequant_sigmoid_i16_to_f32_neon,
+    dequant_i16_to_f32_neon
+);
+#[cfg(target_arch = "aarch64")]
+impl_score_level_f32_neon_fused!(
+    decode_score_level_u16_to_f32_neon_fused,
+    u16,
+    dequant_sigmoid_u16_to_f32_neon,
+    dequant_u16_to_f32_neon
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
