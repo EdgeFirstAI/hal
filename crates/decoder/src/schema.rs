@@ -1352,19 +1352,16 @@ mod tests {
 
     #[test]
     fn fixtures_round_trip_through_serde() {
-        let yolov8 = edgefirst_bench::testdata::read_to_string(
-            "per_scale/synthetic_yolov8n_schema.json",
-        );
+        let yolov8 =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let _: super::SchemaV2 = serde_json::from_str(&yolov8).expect("yolov8n fixture must parse");
 
-        let yolo26 = edgefirst_bench::testdata::read_to_string(
-            "per_scale/synthetic_yolo26n_schema.json",
-        );
+        let yolo26 =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolo26n_schema.json");
         let _: super::SchemaV2 = serde_json::from_str(&yolo26).expect("yolo26n fixture must parse");
 
-        let flat = edgefirst_bench::testdata::read_to_string(
-            "per_scale/synthetic_flat_schema.json",
-        );
+        let flat =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_flat_schema.json");
         let _: super::SchemaV2 = serde_json::from_str(&flat).expect("flat fixture must parse");
     }
 

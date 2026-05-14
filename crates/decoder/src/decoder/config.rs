@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, ConfigOutputs};
 /// # fn main() -> DecoderResult<()> {
 /// let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
-/// let config: ConfigOutputs = serde_json::from_str(config_json)?;
+/// let config: ConfigOutputs = serde_json::from_str(&config_json)?;
 /// let decoder = DecoderBuilder::new().with_config(config).build()?;
 ///
 /// # Ok(())

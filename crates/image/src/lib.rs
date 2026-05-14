@@ -2974,7 +2974,9 @@ mod image_tests {
     #[test]
     fn test_from_tensor_planar() -> Result<(), Error> {
         let mut tensor = Tensor::new(&[3, 720, 1280], None, None)?;
-        tensor.map()?.copy_from_slice(&edgefirst_bench::testdata::read("camera720p.8bps"));
+        tensor
+            .map()?
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.8bps"));
         let planar = {
             tensor
                 .set_format(PixelFormat::PlanarRgb)
@@ -3196,8 +3198,7 @@ mod image_tests {
     fn test_new_image_converter() {
         let dst_width = 640;
         let dst_height = 360;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let mut converter = ImageProcessor::new().unwrap();
@@ -3251,8 +3252,7 @@ mod image_tests {
         assert_eq!(dst_u8.dtype(), DType::U8);
 
         // Convert into I8 dst should succeed
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let mut dst_i8 = converter
             .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
@@ -3317,8 +3317,7 @@ mod image_tests {
               // fallback triggers a GPU driver hang during SHM→texture upload (e.g.,
               // NVIDIA without /dev/dma_heap permissions). Works on embedded targets.
     fn test_crop_skip() {
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let mut converter = ImageProcessor::new().unwrap();
@@ -3390,15 +3389,13 @@ mod image_tests {
 
     #[test]
     fn test_load_jpeg_with_exif() {
-        let file = edgefirst_bench::testdata::read("zidane_rotated_exif.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane_rotated_exif.jpg").to_vec();
         let loaded = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(1280));
         assert_eq!(loaded.width(), Some(720));
 
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let (dst_width, dst_height) = (cpu_src.height().unwrap(), cpu_src.width().unwrap());
@@ -3422,15 +3419,13 @@ mod image_tests {
 
     #[test]
     fn test_load_png_with_exif() {
-        let file = edgefirst_bench::testdata::read("zidane_rotated_exif_180.png")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane_rotated_exif_180.png").to_vec();
         let loaded = crate::load_png(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(720));
         assert_eq!(loaded.width(), Some(1280));
 
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -3778,8 +3773,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src =
             crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
 
@@ -3829,8 +3823,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
@@ -3953,8 +3946,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
@@ -4012,8 +4004,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
@@ -4066,8 +4057,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let src_dyn = src;
 
@@ -4146,8 +4136,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 360;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let crop = Crop {
             src_rect: Some(Rect {
@@ -4200,8 +4189,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
@@ -4249,8 +4237,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -4349,8 +4336,7 @@ mod image_tests {
         // This test rotates the image 4 times and checks that the image was returned to
         // be the same Currently doesn't check if rotations actually rotated in
         // right direction
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
 
         let unchanged_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
@@ -4449,8 +4435,7 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), tensor_memory).unwrap();
 
         let cpu_dst =
@@ -4523,8 +4508,7 @@ mod image_tests {
             Rotation::Clockwise90 | Rotation::CounterClockwise90 => (size.1, size.0),
         };
 
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src =
             crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
 
@@ -4791,8 +4775,7 @@ mod image_tests {
 
     #[test]
     fn test_yuyv_to_rgba_cpu() {
-        let file = edgefirst_bench::testdata::read("camera720p.yuyv")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("camera720p.yuyv").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
         src.as_u8()
             .unwrap()
@@ -4828,8 +4811,7 @@ mod image_tests {
 
     #[test]
     fn test_yuyv_to_rgb_cpu() {
-        let file = edgefirst_bench::testdata::read("camera720p.yuyv")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("camera720p.yuyv").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
         src.as_u8()
             .unwrap()
@@ -4863,8 +4845,8 @@ mod image_tests {
             .iter_mut()
             .zip(
                 edgefirst_bench::testdata::read("camera720p.rgba")
-                .as_chunks::<4>()
-                .0,
+                    .as_chunks::<4>()
+                    .0,
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
@@ -5315,8 +5297,7 @@ mod image_tests {
 
     #[test]
     fn test_vyuy_to_rgba_cpu() {
-        let file = edgefirst_bench::testdata::read("camera720p.vyuy")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("camera720p.vyuy").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
         src.as_u8()
             .unwrap()
@@ -5352,8 +5333,7 @@ mod image_tests {
 
     #[test]
     fn test_vyuy_to_rgb_cpu() {
-        let file = edgefirst_bench::testdata::read("camera720p.vyuy")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("camera720p.vyuy").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
         src.as_u8()
             .unwrap()
@@ -5387,8 +5367,8 @@ mod image_tests {
             .iter_mut()
             .zip(
                 edgefirst_bench::testdata::read("camera720p.rgba")
-                .as_chunks::<4>()
-                .0,
+                    .as_chunks::<4>()
+                    .0,
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
@@ -5593,8 +5573,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_rgba_cpu() {
-        let file = edgefirst_bench::testdata::read("zidane.nv12")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
@@ -5624,8 +5603,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_rgb_cpu() {
-        let file = edgefirst_bench::testdata::read("zidane.nv12")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
@@ -5655,8 +5633,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_grey_cpu() {
-        let file = edgefirst_bench::testdata::read("zidane.nv12")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
@@ -5686,8 +5663,7 @@ mod image_tests {
 
     #[test]
     fn test_nv12_to_yuyv_cpu() {
-        let file = edgefirst_bench::testdata::read("zidane.nv12")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
@@ -5835,8 +5811,7 @@ mod image_tests {
 
         let dst_width = 640;
         let dst_height = 640;
-        let file = edgefirst_bench::testdata::read("test_image.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("test_image.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst = TensorDyn::image(
@@ -5899,8 +5874,7 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_nv16() {
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_nv16_dst = TensorDyn::image(640, 640, PixelFormat::Nv16, DType::U8, None).unwrap();
@@ -6320,8 +6294,7 @@ mod image_tests {
         );
 
         // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
-        let file = edgefirst_bench::testdata::read("zidane.jpg")
-        .to_vec();
+        let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let jpeg_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         // Resize JPEG into a Mem temp of the right size, then copy into PBO
