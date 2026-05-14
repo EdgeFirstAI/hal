@@ -591,18 +591,24 @@ mod tests {
     use super::*;
 
     fn fixture_yolov8n_schema() -> SchemaV2 {
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        serde_json::from_str(json).expect("yolov8n fixture must parse")
+        let json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_yolov8n_schema.json",
+        );
+        serde_json::from_str(&json).expect("yolov8n fixture must parse")
     }
 
     fn fixture_yolo26n_schema() -> SchemaV2 {
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolo26n_schema.json");
-        serde_json::from_str(json).expect("yolo26n fixture must parse")
+        let json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_yolo26n_schema.json",
+        );
+        serde_json::from_str(&json).expect("yolo26n fixture must parse")
     }
 
     fn fixture_flat_schema() -> SchemaV2 {
-        let json = include_str!("../../../../testdata/per_scale/synthetic_flat_schema.json");
-        serde_json::from_str(json).expect("flat fixture must parse")
+        let json = edgefirst_bench::testdata::read_to_string(
+            "per_scale/synthetic_flat_schema.json",
+        );
+        serde_json::from_str(&json).expect("flat fixture must parse")
     }
 
     #[test]

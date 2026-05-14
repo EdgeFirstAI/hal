@@ -41,6 +41,7 @@ use edgefirst_image::CPUProcessor;
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -69,12 +70,14 @@ const LETTERBOX_640X480: [f32; 4] = [0.0, 80.0 / 640.0, 1.0, 560.0 / 640.0];
 
 /// Path to safetensors test data.
 fn safetensors_path() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/mask_decode_scaled.safetensors")
+    edgefirst_bench::testdata::path("mask_decode_scaled.safetensors")
 }
 
-/// Embedded test data: YOLOv8 segmentation model outputs (fallback).
-const BOXES_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
-const PROTOS_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+/// YOLOv8 segmentation model outputs (fallback), loaded from testdata/.
+static BOXES_RAW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin"));
+static PROTOS_RAW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin"));
 
 /// Wrap the embedded int8 boxes fixture as a `[1, 116, 8400]` `TensorDyn::I8`.
 fn load_boxes_tensor() -> TensorDyn {

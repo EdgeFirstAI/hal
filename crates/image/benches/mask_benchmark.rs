@@ -31,6 +31,7 @@ use edgefirst_image::{CPUProcessor, ImageProcessor, ImageProcessorTrait, MaskRes
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 use half::f16;
 use ndarray::s;
+use std::sync::LazyLock;
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -50,9 +51,11 @@ const IOU_THRESHOLD: f32 = 0.45;
 const OUTPUT_W: usize = 640;
 const OUTPUT_H: usize = 640;
 
-/// Embedded test data: YOLOv8 segmentation model outputs.
-const BOXES_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_boxes_116x8400.bin");
-const PROTOS_RAW: &[u8] = include_bytes!("../../../testdata/yolov8_protos_160x160x32.bin");
+/// YOLOv8 segmentation model outputs, loaded from testdata/ at first access.
+static BOXES_RAW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin"));
+static PROTOS_RAW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin"));
 
 /// Wrap the embedded int8 boxes fixture as a `[1, 116, 8400]` `TensorDyn::I8`.
 fn load_boxes_tensor() -> TensorDyn {

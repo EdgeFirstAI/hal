@@ -25,13 +25,16 @@ use edgefirst_bench::BenchSuite;
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
+use std::sync::LazyLock;
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
 
-// Embedded test data — used in convert and hires sections
-const CAMERA_1080P_RGBA: &[u8] = include_bytes!("../../../testdata/camera1080p.rgba");
-const CAMERA_4K_RGBA: &[u8] = include_bytes!("../../../testdata/camera4k.rgba");
+// Test data loaded at first access from testdata/ (see edgefirst_bench::testdata)
+static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.rgba"));
+static CAMERA_4K_RGBA: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.rgba"));
 
 // =============================================================================
 // 1. Load Benchmarks — JPEG loading to different backends and formats
@@ -61,7 +64,8 @@ fn bench_load(suite: &mut BenchSuite) {
     // Load zidane to Shm and DMA backends
     #[cfg(target_os = "linux")]
     {
-        let zidane = include_bytes!("../../../testdata/zidane.jpg");
+        let zidane = edgefirst_bench::testdata::read("zidane.jpg");
+        let zidane = zidane.as_slice();
 
         {
             let name = "load/shm/RGBA/zidane";
@@ -98,7 +102,8 @@ fn bench_load(suite: &mut BenchSuite) {
 
     // Load zidane to different formats (Mem backend)
     println!("\n== Load: JPEG to Different Formats ==\n");
-    let zidane = include_bytes!("../../../testdata/zidane.jpg");
+    let zidane = edgefirst_bench::testdata::read("zidane.jpg");
+    let zidane = zidane.as_slice();
     for (fmt, fmt_name) in &[
         (PixelFormat::Rgba, "RGBA"),
         (PixelFormat::Rgb, "RGB"),
@@ -238,16 +243,36 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             get_test_data(w, h, PixelFormat::Yuyv),
             2,
         ),
-        (PixelFormat::Rgba, PixelFormat::Yuyv, CAMERA_1080P_RGBA, 4),
-        (PixelFormat::Rgba, PixelFormat::Rgb, CAMERA_1080P_RGBA, 4),
-        (PixelFormat::Rgba, PixelFormat::Rgba, CAMERA_1080P_RGBA, 4),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Yuyv,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Rgb,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Rgba,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
         (
             PixelFormat::Rgba,
             PixelFormat::PlanarRgb,
-            CAMERA_1080P_RGBA,
+            CAMERA_1080P_RGBA.as_slice(),
             4,
         ),
-        (PixelFormat::Rgba, PixelFormat::Nv16, CAMERA_1080P_RGBA, 4),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Nv16,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
     ];
 
     for &(in_fmt, out_fmt, data, bpp) in configs {
@@ -290,7 +315,8 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("\n== Rotate: 90/180/270 degree rotations ==\n");
 
-    let zidane = include_bytes!("../../../testdata/zidane.jpg");
+    let zidane = edgefirst_bench::testdata::read("zidane.jpg");
+    let zidane = zidane.as_slice();
     let src = edgefirst_image::load_image(zidane, Some(PixelFormat::Rgba), None)
         .expect("Failed to load zidane.jpg");
     let (w, h) = (src.width().unwrap(), src.height().unwrap());
@@ -432,9 +458,9 @@ fn run_hires_configs(
             return;
         };
         let data: &[u8] = if src_w == 1920 && src_h == 1080 {
-            CAMERA_1080P_RGBA
+            CAMERA_1080P_RGBA.as_slice()
         } else {
-            CAMERA_4K_RGBA
+            CAMERA_4K_RGBA.as_slice()
         };
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
         src
