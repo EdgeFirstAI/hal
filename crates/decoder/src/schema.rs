@@ -2407,15 +2407,12 @@ outputs:
         // Boxes shape [1, 1935, 4]". The ModelPack path must skip squeezing.
         let j = r#"{
           "schema_version": 2,
-          "outputs": [{
-            "name": "boxes",
-            "type": "boxes",
-            "shape": [1, 1935, 1, 4],
-            "dshape": [{"batch": 1}, {"num_boxes": 1935}, {"padding": 1}, {"box_coords": 4}],
-            "dtype": "float32",
-            "decoder": "modelpack",
-            "encoding": "anchor"
-          }]
+          "outputs": [
+            {"name":"boxes","type":"boxes",
+             "shape":[1,1935,1,4],
+             "dshape":[{"batch":1},{"num_boxes":1935},{"padding":1},{"box_coords":4}],
+             "decoder":"modelpack"}
+          ]
         }"#;
         let schema = SchemaV2::parse_json(j).unwrap();
         let legacy = schema.to_legacy_config_outputs().expect("lowers cleanly");
@@ -2426,7 +2423,15 @@ outputs:
         // Must preserve the rank-4 shape — the padding dim must NOT be
         // squeezed for ModelPack outputs.
         assert_eq!(boxes.shape, vec![1, 1935, 1, 4]);
-        assert_eq!(boxes.dshape.len(), 4);
+        assert_eq!(
+            boxes.dshape,
+            vec![
+                (DimName::Batch, 1),
+                (DimName::NumBoxes, 1935),
+                (DimName::Padding, 1),
+                (DimName::BoxCoords, 4),
+            ]
+        );
     }
 
     #[test]
