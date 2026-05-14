@@ -27,7 +27,9 @@
 # - EnricoMi/publish-unit-test-result-action@34d7c956a59aed1bfebf31df77b8de55db9bbaaf (v2.21.0)
 #
 # Runner Notes:
-# - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
+# - ubuntu-22.04: Standard GitHub-hosted runner, 4 vCPU (x86_64, used for I/O-bound
+#   and aggregation jobs: checkout-lfs, sonarcloud)
+# - ubuntu-22.04-xlarge: GitHub-hosted larger runner, 16 vCPU (x86_64 builds & tests)
 # - ubuntu-22.04-arm-xlarge: GitHub ARM64 runner, 16 vCPU (aarch64 builds)
 # - ubuntu-22.04-arm: GitHub ARM64 runner, 4 vCPU (aarch64 tests, coverage)
 # - macos-latest: GitHub macOS runner (Apple Silicon)
@@ -96,7 +98,7 @@ jobs:
   # ===========================================================================
   doc-tests:
     name: Doc Tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-xlarge
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -127,7 +129,7 @@ jobs:
   # ===========================================================================
   build-and-test-x86:
     name: Build & Test (x86_64)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-xlarge
     needs: checkout-lfs
     permissions:
       contents: read
