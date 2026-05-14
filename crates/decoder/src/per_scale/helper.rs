@@ -103,8 +103,9 @@ mod tests {
     #[test]
     fn applies_quant_to_int8_by_shape() {
         // Build a tiny schema with one logical output `boxes` having an int8 child.
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
         // Build a tensor matching one box child's shape.
         // The yolov8n schema's first box child has shape [1, 80, 80, 64].
@@ -120,8 +121,9 @@ mod tests {
 
     #[test]
     fn applies_quant_to_full_yolov8_input_set() {
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
         // Build the full set of input tensors matching every schema child + protos.
         let shapes_int8 = [
@@ -183,8 +185,9 @@ mod tests {
 
     #[test]
     fn skips_float_tensors_silently() {
-        let json = include_str!("../../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let schema: SchemaV2 = serde_json::from_str(json).unwrap();
+        let json =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
 
         // Build float tensors instead of int8.
         let shape = vec![1, 80, 80, 64];
