@@ -1,8 +1,13 @@
-# EdgeFirst HAL C API
+# edgefirst-hal-capi
 
-C language bindings for the EdgeFirst Hardware Abstraction Layer, providing
-zero-copy tensor operations, hardware-accelerated image processing, ML model
-output decoding, and multi-object tracking.
+[![Crates.io](https://img.shields.io/crates/v/edgefirst-hal-capi.svg)](https://crates.io/crates/edgefirst-hal-capi)
+[![Documentation](https://docs.rs/edgefirst-hal-capi/badge.svg)](https://docs.rs/edgefirst-hal-capi)
+[![License](https://img.shields.io/crates/l/edgefirst-hal-capi.svg)](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE)
+
+**EdgeFirst HAL C API** — C language bindings for the EdgeFirst Hardware
+Abstraction Layer, providing zero-copy tensor operations,
+hardware-accelerated image processing, ML model output decoding, and
+multi-object tracking.
 
 ## Role in edgefirst-hal
 

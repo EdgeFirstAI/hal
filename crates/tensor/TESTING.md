@@ -43,14 +43,17 @@ cargo test -p edgefirst-tensor --features ndarray
   DMA tests are skipped at runtime and the suite falls back to heap-only
   coverage; nothing fails outright. Set `EDGEFIRST_TENSOR_FORCE_MEM=1` to
   skip even the probe.
-- **PBO tests** are gated by the `opengl` feature (which is *not* a feature
-  of this crate but of `edgefirst-image`). PBO behavior is exercised
-  end-to-end by the image crate's tests, not here.
-- **No LFS testdata.** All shapes and inputs are synthesized in-test. The
-  `tensor_benchmark` is the only consumer of `edgefirst_bench::testdata` and
-  uses small synthetic blobs.
-- **No feature flags required by default**; `ndarray` is on by default and
-  is required for `view()` / `view_mut()` doc-tests.
+- **PBO tests** live in
+  [`crates/tensor/src/pbo.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/pbo.rs)
+  and exercise `PboTensor` against a mock `PboOps` implementation. They
+  are not gated on any feature — `cargo test -p edgefirst-tensor` runs
+  them on every host. End-to-end PBO behavior (real GL thread, EGL
+  context) is additionally exercised by the image crate's tests.
+- **No LFS testdata.** All shapes and inputs are synthesized in-test.
+  `tensor_benchmark` does not use `edgefirst_bench::testdata`; it
+  generates its inputs in memory.
+- **No feature flags required by default**; `ndarray` is on by default
+  and is required for `view()` / `view_mut()` doc-tests.
 
 ## Benchmarks
 
@@ -58,8 +61,10 @@ cargo test -p edgefirst-tensor --features ndarray
 # Native-host benchmark
 cargo bench -p edgefirst-tensor
 
-# Cross-compile + deploy to a target
-make bench-arm
+# Cross-compile for a target (see the project Makefile / BENCHMARKS.md
+# for the full deploy workflow)
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
+  -p edgefirst-tensor --bench tensor_benchmark
 ```
 
 | Benchmark | Source | What it measures |

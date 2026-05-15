@@ -23,7 +23,7 @@ crates/capi/
 │   ├── test_common.h
 │   └── Makefile
 └── include/edgefirst/
-    └── hal.h           # cbindgen-generated; CI verifies header parity
+    └── hal.h           # cbindgen-generated; committed in-tree (review is the parity gate)
 ```
 
 The Rust side has thin per-function `#[test]` modules and doc-tests on the
@@ -87,19 +87,17 @@ must `cargo build` first.
   `NEUTRON_ENABLE_ZERO_COPY=1`.
 - **No special features required** for the Rust-side tests; default
   features build the full FFI surface.
-- **`opencv` feature** — when enabled, additional comparison test paths
-  are exercised. CI runs both `--features default,opencv` and the default
-  feature set.
 
 ## Coverage Notes
 
 - The Rust side participates in workspace `cargo llvm-cov`; lcov output
   appears under `crates/capi/`.
-- C-side coverage is collected via `gcov` instrumentation when the
-  Makefile is invoked with `make test COV=1`. Combined Rust + C coverage
-  is uploaded to SonarCloud by the
-  [`Process Hardware Coverage`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml)
-  CI job.
+- The Rust llvm-cov coverage is merged with Python slipcover coverage by
+  the [`Process Hardware Coverage`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml)
+  CI job and uploaded to SonarCloud. The C test binaries are not
+  instrumented with `gcov` today; they validate behaviour and provide a
+  compile-time link-check of the cbindgen header, but C-side line
+  coverage is not currently reported.
 - The C tests are the primary correctness gate for the public ABI: any
   signature drift between the Rust source, the cbindgen-generated header,
   and the C call sites is caught here at compile time.
@@ -107,16 +105,18 @@ must `cargo build` first.
 ## Header Parity Check
 
 `crates/capi/build.rs` runs `cbindgen` during `cargo build` and writes
-the result to `include/edgefirst/hal.h`. The committed copy must match
-the generated copy. CI catches drift via the
-[`Generate SBOM & Check License Compliance`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/sbom.yml)
-workflow's `make sbom` step, which fails the build if the header changed
-without being committed. Locally, run:
+the result to `include/edgefirst/hal.h`. The committed copy must stay
+in sync with the generated copy — contributors are expected to commit
+the regenerated header alongside any Rust FFI change. CI does not
+currently enforce this with an explicit `git diff --exit-code` step, so
+review is the gate. Locally:
 
 ```bash
 cargo build -p edgefirst-hal-capi
 git diff -- crates/capi/include/edgefirst/hal.h    # should be empty
 ```
+
+If the diff is non-empty, commit the regenerated header.
 
 ## Cross-References
 

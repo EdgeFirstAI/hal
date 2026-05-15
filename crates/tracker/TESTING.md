@@ -45,18 +45,18 @@ Run benchmarks from the workspace root:
 # Native-host benchmark
 cargo bench -p edgefirst-tracker
 
-# Cross-compile + deploy to a target (see project Makefile)
-make bench-arm
+# Cross-compile for a target (see BENCHMARKS.md for the deploy workflow)
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
+  -p edgefirst-tracker --bench tracker_benchmark
 ```
 
 | Benchmark | Source | What it measures |
 |-----------|--------|------------------|
 | `tracker_benchmark` | [`benches/tracker_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/benches/tracker_benchmark.rs) | `ByteTrack::update` throughput vs. number of simultaneous tracks |
 
-The benchmark uses `edgefirst_bench::testdata` (workspace dev-dependency) for
-its synthetic detection corpus. See
-[`crates/bench/src/testdata.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/bench/src/testdata.rs)
-for the helper API.
+The benchmark synthesizes its detection corpus internally (see
+`generate_detections` in the bench source); it does not load LFS
+testdata.
 
 ## Coverage Notes
 

@@ -154,7 +154,7 @@ class, ...)`.
 For non-end-to-end YOLO26 exports (`end2end=false`), use
 `decoder_version: "yolov8"` with an explicit `nms` configuration.
 
-### Output tensor physical-order contract (EDGEAI-1288)
+### Output tensor physical-order contract
 
 Every output declared to the decoder — whether programmatically via
 `hal_decoder_params_add_output` / `DecoderBuilder`, or through YAML/JSON
@@ -194,6 +194,39 @@ Common physical layouts by framework:
 | Ara-2 DVM | `[1, N, 1, 4]` anchor-first | `shape=[1,N,1,4]`, `dshape=[batch,num_boxes,padding,box_coords]` |
 | Ultralytics flat | already canonical | `shape=[1,C,N]`, `dshape` may be omitted |
 
+### Quantization on output tensors
+
+The per-scale decode path reads quantization parameters **from the
+output `Tensor`** (`tensor.quantization()`), not from the schema
+metadata. The integrator is responsible for propagating each output
+tensor's `(scale, zero_point)` onto the HAL `Tensor` before calling
+`decode_*` / `decode_*_proto`:
+
+```rust
+if dtype != DType::F32 {
+    let q = edgefirst_decoder::Quantization::from((scale, zero_point));
+    tensor.set_quantization(q)?;
+}
+```
+
+Failure modes when this step is skipped on quantized outputs:
+
+- **Per-scale path:** returns `DecoderError::QuantMissing` for split
+  tensors that have no per-scale quantization in the schema, or
+  silently identity-dequantizes (scale = 1.0, zero = 0) for the flat
+  variants — scores stay in raw int8 / uint8 units and never cross
+  thresholds, producing zero detections.
+- **Flat-detection path:** reads quantization from the schema if
+  present and falls back to identity otherwise; same silent-zero
+  failure mode for models whose quantization is only carried on the
+  runtime tensor.
+
+A producer that allocates the HAL output tensors should attach
+quantization at allocation time. A producer that receives output
+tensors from another layer (e.g. a TFLite delegate's output binding)
+must read the runtime's quantization metadata and call
+`set_quantization` before the first decode of that tensor.
+
 ### Per-scale split-tensor framework
 
 The [`per_scale`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/)
@@ -207,9 +240,11 @@ per-scale tensors (e.g. 80×80, 40×40, 20×20). The pipeline:
 
 The per-scale path achieved 17–45× mask-materialize speedup on i.MX 8M Plus
 in the v0.18 → v0.20 cycle through batched GEMM, NEON FP16 fused-multiply,
-and tile-transpose layout changes. See the historical plans in
-[`.claude/plans/`](https://github.com/EdgeFirstAI/hal/tree/main/.claude/plans)
-(local-only, not part of the published crate) for full design notes.
+and tile-transpose layout changes. See
+[`BENCHMARKS.md`](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md)
+for the empirical numbers and
+[`CHANGELOG.md`](https://github.com/EdgeFirstAI/hal/blob/main/CHANGELOG.md)
+for the release-by-release history.
 
 ### Mask rendering APIs
 

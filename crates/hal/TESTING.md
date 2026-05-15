@@ -38,6 +38,18 @@ the example code compiles against the public API.
   feature matrix in
   [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
 
+## Benchmarks
+
+The umbrella crate ships no benchmarks of its own — every measurable
+hot path is owned by a sub-crate. Use the sub-crate benchmarks
+(`tensor_benchmark`, `image_benchmark`, `decoder_benchmark`,
+`tracker_benchmark`) for per-component numbers, and combine them with
+the `trace` module to capture end-to-end Chrome JSON traces. See the
+[Benchmarking](https://github.com/EdgeFirstAI/hal/blob/main/README.md#benchmarking)
+and
+[Performance Tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)
+sections of the project README.
+
 ## Coverage Notes
 
 Coverage for the umbrella is collected through the workspace `cargo

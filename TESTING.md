@@ -320,6 +320,41 @@ environment variable from the table below and re-run with
 | `EDGEFIRST_FORCE_TRANSFER=sync` | Memcpy upload/readback via `glTexImage2D` / `glReadnPixels` | Non-zero-copy baseline; useful for measuring fast-path cost |
 | `EDGEFIRST_TENSOR_FORCE_MEM=1` | Forces heap tensors; disables DMA / SHM | Pure-CPU regression baseline |
 
+### Warm up before measuring
+
+The first few frames through a pipeline pay one-time costs that do not
+recur in steady state: the EGL image cache populates from cold, GPU
+shaders are JIT-compiled and cached by the driver, and any DMA-BUF
+import that succeeds at the API level still pays its first
+`eglCreateImageKHR` round trip. If a benchmark starts timing on frame
+0, the first measurement is biased upward by these one-time costs and
+the distribution's tail is dominated by them.
+
+The canonical pattern is to run a small warm-up loop on the same
+fixtures used by the measurement loop, with the **same tensors**, the
+**same decoder**, and the **same `ImageProcessor`** that the measurement
+will use:
+
+```rust
+// Warm-up — same objects, results discarded
+for path in fixture_paths.iter().take(WARMUP_FRAMES) {
+    backend.process_one_image(path)?;
+}
+
+// Measurement — caches are now warm, GL shaders JIT-cached
+for path in fixture_paths {
+    let t0 = Instant::now();
+    backend.process_one_image(path)?;
+    record_latency(t0.elapsed());
+}
+```
+
+A typical warm-up depth is 3–5 frames for the cache itself plus enough
+frames to span one full buffer-pool rotation (e.g. 9 for the i.MX 8M
+Plus VPU's 1080p pool). Allocate any new tensor objects **before** the
+warm-up phase, not between warm-up and measurement, or the measurement
+will see a fresh `BufferIdentity` and miss its own warmed cache.
+
 ### Regression testing for tensor reuse
 
 To catch regressions where a caller starts allocating a tensor per
@@ -404,6 +439,8 @@ not the default `Proto`. Downstream validators should pin this with a
 small assertion at the materialize call site:
 
 ```python
+import edgefirst_hal as hal
+
 masks = proc.materialize_masks(
     boxes, scores, classes, proto_data,
     letterbox=letterbox_norm,
@@ -481,10 +518,11 @@ because the gate is an explicit probe, not a `#[ignore]` attribute.
 
 The x86_64 build steps moved to `ubuntu-22.04-xlarge` (16 vCPU) in the
 v0.22 → v0.23 cycle, cutting build time roughly 30 min → ~12 min.
-Hardware-test binaries are stripped on the build host before upload
-(`hardware-test-binaries-stripped` artifact); unstripped originals are
-preserved as `coverage-binaries-aarch64` so source-line attribution
-still works during the post-target coverage merge.
+Hardware-test binaries are stripped on the build host into a
+`hardware-test-binaries-stripped/` directory and uploaded under the
+artifact name `hardware-test-binaries`; unstripped originals are
+preserved as the `coverage-binaries-aarch64` artifact so source-line
+attribution still works during the post-target coverage merge.
 
 ---
 

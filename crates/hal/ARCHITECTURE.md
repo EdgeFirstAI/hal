@@ -60,6 +60,19 @@ Only one trace capture session is supported per process lifetime — this is a
 limitation of Rust's global subscriber model and is acceptable for profiling
 workflows where a single trace per run is the norm.
 
+## Performance Considerations
+
+The umbrella crate has no hot paths of its own; runtime cost is identical
+to depending on each sub-crate directly. The only umbrella-owned code is
+the optional `trace` module, whose span sites in the sub-crates compile
+to a single relaxed atomic load when no subscriber is installed. See
+[`crates/decoder/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md),
+[`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md),
+and
+[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md)
+for the per-crate performance notes that the umbrella's tracing layer
+exposes.
+
 ## Inter-Crate Interfaces
 
 The umbrella has no inter-crate interfaces beyond the re-exports listed in the

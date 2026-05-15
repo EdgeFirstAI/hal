@@ -68,16 +68,31 @@ All `hal_*_free` functions accept `NULL` safely (no-op).
 `hal_error_message(errno_value)` returns a static string description for
 logging.
 
+### errno lifecycle
+
+The HAL only sets `errno` on failure paths; success paths leave it
+untouched. Some functions touch `errno` internally even when they
+succeed (e.g. probing whether an optional kernel device exists), so the
+value may be non-zero after a successful call. Integrators that surface
+`errno` to a higher logging layer should snapshot it **immediately**
+after the HAL call they care about, and clear it (`errno = 0;`) before
+the next call whose errno they intend to inspect. Never rely on `errno`
+to indicate success — always check the return value (`-1` / `NULL` /
+`0`) first and only then inspect `errno`.
+
 ## cbindgen Pipeline
 
 `crates/capi/build.rs` runs `cbindgen` against
 [`crates/capi/cbindgen.toml`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/cbindgen.toml)
 during a normal `cargo build`. The header is emitted to
 [`crates/capi/include/edgefirst/hal.h`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h)
-and is committed to the repository so downstream consumers can read the ABI
-without compiling Rust. CI verifies the committed header matches the
-freshly generated one (via the SBOM workflow's `make sbom` step) — drift
-between the two breaks the build.
+and is committed to the repository so downstream consumers can read the
+ABI without compiling Rust. The committed header is regenerated whenever
+the Rust source changes; contributors are expected to re-run
+`cargo build -p edgefirst-hal-capi` and commit the updated header along
+with their FFI change. CI does not currently run an explicit
+`git diff --exit-code` parity check on the header, so review is the
+gate against drift.
 
 The header preamble defines `HAL_DTYPE_*`, `HAL_PIXEL_FORMAT_*`,
 `HAL_TENSOR_MEMORY_*`, `HAL_ROTATION_*`, `HAL_FLIP_*`, and the
@@ -165,7 +180,7 @@ struct hal_tensor *mid = hal_image_processor_create_image(
 
 // Destination: PlanarRgb for model input, also processor-allocated.
 struct hal_tensor *dst = hal_image_processor_create_image(
-    proc, model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+    proc, model_w, model_h, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_U8);
 ```
 
 When the external buffer has row padding (`stride > width * bytes_per_pixel`),
@@ -275,6 +290,31 @@ if (pool_tensors[buf_index] == NULL) {
 | `hal_plane_descriptor_new()` | Dups eagerly — caller retains original | Never |
 | `hal_import_image()` | Consumes both descriptors (success or fail) | Never (descriptors already duped the fd) |
 | `hal_tensor_from_fd()` | Dups internally — caller retains original | Never |
+
+### Tensor ownership: cached imports vs. fresh allocations
+
+Once you adopt an inode-keyed cache, the `struct hal_tensor *` you hand
+to `hal_image_processor_convert()` will be one of two kinds:
+
+| Kind | Source | Caller must `hal_tensor_free`? | Notes |
+|------|--------|--------------------------------|-------|
+| **Cached** | returned from your `(inode, offset)` cache lookup; created **once** at the first cache miss via `hal_import_image()` / `hal_tensor_from_fd()` | **No** — the cache owns it for the lifetime of the pipeline | Freeing mid-pipeline drops the EGL image cache entry, churns `BufferIdentity`, and turns every subsequent frame into an import miss |
+| **Fresh** | allocated for this call (system-memory fallback when the source has no DMA-BUF, intermediate `create_image()` for chained `convert()`) | **Yes** — exactly once, after the last `convert()` that uses it | Forgetting leaks the underlying memory backend (DMA-BUF fd, PBO, or heap) |
+
+A robust pattern tracks the distinction with a small flag alongside the
+tensor pointer, e.g. an output parameter from the helper that produces
+the source tensor:
+
+```c
+struct hal_tensor *src = lookup_or_import(cache, fd, &src_owned);
+hal_image_processor_convert(proc, src, dst, /* ... */);
+if (src_owned) hal_tensor_free(src);   // only when not cached
+```
+
+The same distinction applies to destination tensors when chaining
+multiple `convert()` calls: the intermediate `create_image()` allocation
+is owned by the chain orchestrator and must be freed once at the end
+(not after each `convert()`).
 
 ### Anti-patterns
 
@@ -604,12 +644,6 @@ Delegate functions are not required to be thread-safe for concurrent
 calls on the same delegate instance. Callers must serialize access per
 delegate. Different delegate instances may be used concurrently from
 different threads.
-
-### Tracking
-
-- Epic: [EDGEAI-1185](https://au-zone.atlassian.net/browse/EDGEAI-1185) — NXP Neutron DMABUF Zero-Copy Support
-- Type definitions: [EDGEAI-1189](https://au-zone.atlassian.net/browse/EDGEAI-1189) — formalize `hal_dmabuf_*` interface
-- Implementation: [EDGEAI-1190](https://au-zone.atlassian.net/browse/EDGEAI-1190) — edgefirst-tflite probing for `hal_dmabuf_*` symbols
 
 ## Logging API
 

@@ -18,7 +18,8 @@ neighbours:
 - Depends on [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `decoder`, default-on) for `DetectBox`, `Segmentation`, and the proto-mask data feeding `draw_proto_masks`.
 - Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `draw_masks_tracked`.
 - Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::image`.
-- Bridged to C/Python via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/).
+- Bridged to C via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) (cbindgen-generated C ABI).
+- Bridged to Python via [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) (PyO3 binding over the Rust umbrella crate; does not go through the C ABI).
 
 ## Features
 
@@ -177,7 +178,7 @@ Control quantized proto interpolation quality:
 processor.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
 ```
 
-See [BENCHMARKS.md](../../BENCHMARKS.md) for per-platform performance numbers.
+See [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) for per-platform performance numbers.
 
 ## Zero-Copy Model Input
 

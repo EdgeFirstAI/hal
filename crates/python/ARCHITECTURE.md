@@ -64,13 +64,16 @@ shapes track the Rust source automatically.
 
 ### Stable ABI / abi3
 
-The wheels are built with `--features pyo3/abi3-py38`, producing a single
-binary that runs on Python 3.8 through the latest 3.x. The trade-off is
-that Python 3.11+ buffer-protocol features fall back to the 3.8-compatible
-path; users on 3.11+ still get full functionality, just without the
-zero-overhead 3.11-specific shortcuts. The CI matrix builds both stable-ABI
-wheels and per-version wheels where measurement showed the abi3 fallback
-materially slower; pip resolves the best wheel per host.
+The release pipeline
+([`.github/workflows/release.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/release.yml))
+builds **two stable-ABI wheels per platform**: one with
+`--features abi3-py311` and one with `--features abi3-py38`. Each
+single binary runs on its abi3 floor and every later 3.x release. The
+`abi3-py38` variant is the broadest-compatibility fallback; the
+`abi3-py311` variant is built because some 3.11+ buffer-protocol
+features benefit from a fresher abi3 floor. There are no per-version
+(non-abi3) wheels; pip selects the appropriate abi3 wheel from the
+two published per platform.
 
 ### NumPy → Tensor copy strategy
 
@@ -104,8 +107,14 @@ performs an `glMapBufferRange` round-trip via the message channel. The
 numpy array.
 
 For DMA-backed tensors, `Tensor.dmabuf_clone()` returns the `int` fd
-suitable for handing to a TFLite delegate. Non-DMA tensors raise
-`NotImplementedError` on this call (matches the C API's `ENOTSUP`).
+suitable for handing to a TFLite delegate. Tensor-side errors
+(non-DMA backend, fd duplication failure, etc.) surface as
+`RuntimeError` — the binding's `From<Error> for PyErr` implementation
+in
+[`crates/python/src/tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs)
+maps every tensor error to `pyo3::exceptions::PyRuntimeError`. The
+C API surfaces the same condition as `errno = ENOTSUP`, but the
+Python exception type is `RuntimeError`, not `NotImplementedError`.
 
 ### Process-shutdown safety with Python finalization
 
@@ -158,8 +167,8 @@ maturin develop -m crates/python/Cargo.toml --release
 # Build a wheel for the current platform
 maturin build -m crates/python/Cargo.toml --release
 
-# Cross-compile a manylinux2014 + abi3-py38 wheel
-make wheel-arm    # uses zig + cross
+# Cross-compile a manylinux2014 wheel for an alternate target (zig + maturin)
+make TARGET=aarch64-unknown-linux-gnu PYABI=py38 wheel
 ```
 
 The release pipeline ([`.github/workflows/release.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/release.yml))

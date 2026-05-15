@@ -41,33 +41,24 @@ cargo test -p edgefirst-image --lib gl::tests -- --test-threads=1
 cargo test -p edgefirst-image --doc
 ```
 
-## Single-Threaded Execution Is Required
-
-All `edgefirst-image` tests must run with `--test-threads=1`. Three
-independent constraints each require it:
-
-1. **EGL display sharing** — concurrent `eglTerminate` from multiple test
-   threads can tear down a display while other threads still reference it.
-2. **G2D driver state** — Vivante `galcore` maintains per-process state that
-   is unsafe to access from concurrent threads creating/destroying G2D
-   contexts.
-3. **DMA-heap CMA pool exhaustion** — concurrent DMA-heap allocations from
-   multiple test threads can exhaust the CMA pool on memory-constrained
-   targets, masking the real failures.
-
-`cargo nextest` provides per-test process isolation, but `-j 1` is still
-required to prevent DMA/GPU contention across processes. The project
-[`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile)
-enforces this automatically.
-
-See [`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)
-for the full technical rationale and the GL_MUTEX implementation.
-
 ## Special Requirements
+
+### Single-threaded execution is mandatory
+
+All `edgefirst-image` tests must run with `--test-threads=1`. The image
+crate is the load-bearing reason for the
+[project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)
+— concurrent EGL, G2D, and DMA-heap operations crash on Vivante
+hardware and risk CMA pool exhaustion on memory-constrained targets.
+The
+[`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile)
+enforces `-j 1` automatically. See
+[`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)
+for the `GL_MUTEX` implementation that makes this rule load-bearing.
 
 ### GL hardware-gated tests
 
-OpenGL and G2D tests in
+OpenGL tests in
 [`crates/image/src/gl/tests.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/tests.rs)
 use `OnceLock<bool>` to probe hardware availability once and skip if absent:
 
@@ -87,6 +78,17 @@ The Neutron-scenario tests gate on `/dev/neutron0` as a platform
 discriminator for i.MX 95 with Mali GPU. This device node indicates that
 large-offset DMA-BUF EGLImage imports are supported — these fail with
 `EGL(BadAccess)` on Vivante (i.MX 8M Plus) even without the NPU driver.
+
+G2D tests live in
+[`crates/image/src/g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs)
+behind the `g2d_test_formats` Cargo feature and use their own DMA / G2D
+availability checks (probing `/dev/galcore` and the DMA-heap nodes). They
+are run by CI on the i.MX 8M Plus hardware runner. To exercise them
+locally on i.MX hardware:
+
+```bash
+cargo test -p edgefirst-image --features g2d_test_formats -- --test-threads=1
+```
 
 ### Device-node gates
 
@@ -145,10 +147,13 @@ Run on host:
 cargo bench -p edgefirst-image --bench mask_benchmark
 ```
 
-Cross-compile + deploy to target:
+Cross-compile for a target (see
+[`BENCHMARKS.md`](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md)
+for the full deploy workflow):
 
 ```bash
-make bench-arm
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
+  -p edgefirst-image --features opengl --bench mask_benchmark
 ```
 
 ### Native fp16 / AVX2 build overrides for local benchmarking
@@ -190,10 +195,11 @@ soft-float `__extendhfsf2` helper) via
   which is why per-target coverage numbers vary between developer
   workstations and CI hardware runners. The hardware-test job on i.MX 8M
   Plus is the source of truth for backend-coverage parity.
-- `EDGEFIRST_DISABLE_GL=1` runs are added to the matrix in
-  [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml)
-  to keep the CPU-fallback paths covered even on machines where GL would
-  succeed.
+- To exercise the CPU-fallback paths on a host that would otherwise
+  pick OpenGL, set `EDGEFIRST_DISABLE_GL=1` locally before invoking
+  `cargo test`. CI does not currently include this configuration in the
+  matrix; downstream contributors covering specific fallback regressions
+  may want to enable it on a per-PR basis.
 
 ## Cross-References
 

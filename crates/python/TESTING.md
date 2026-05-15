@@ -47,9 +47,10 @@ Rust lcov coverage.
 
 ## Special Requirements
 
-- **venv is mandatory.** Per the global CLAUDE.md rule, never `pip install`
-  into the system Python. The `venv/` directory at the workspace root is
-  the canonical environment.
+- **Use a Python virtual environment.** Never `pip install` into the
+  system Python; activate the `venv/` directory at the workspace root
+  before running the Python tooling. The Makefile targets assume `venv/`
+  is the active environment.
 - **`maturin develop` rebuilds the Rust shared object** when the Rust
   source changes. Run it after any change under `crates/` or after pulling
   new commits before running tests.
@@ -65,10 +66,13 @@ Rust lcov coverage.
   required device nodes (mirroring the Rust-side `OnceLock` probes). On
   the i.MX 8M Plus and i.MX 95 hardware runners the full hardware path is
   exercised.
-- **`abi3-py38` wheels** — when running tests against a release wheel
-  rather than `maturin develop`, install the wheel into a clean venv and
-  point `pytest` at the install location. CI does this for the
-  `Hardware Test (imx8mp)` job.
+- **abi3 wheels** — `.github/workflows/test.yml` builds the Python
+  binding with `--features abi3-py311` for the CI test legs (including
+  the `Hardware Test (imx8mp)` job that downloads the wheel into a
+  fresh venv). The release pipeline additionally builds an
+  `abi3-py38` variant for broader compatibility. When testing against
+  a release wheel locally, install it into a clean venv and point
+  `pytest` at that environment.
 
 ## Benchmarks
 

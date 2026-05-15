@@ -108,29 +108,46 @@ managed by the GL thread inside `edgefirst-image`. The tensor crate provides
 the `PboTensor` wrapper and the `PboOps` trait that the GL backend implements
 to perform map / unmap / delete operations.
 
-`PboTensor` holds a `WeakSender` (not a `Sender`) for the channel that talks
-to the GL thread. This is a deliberate design choice: if `PboTensor` held a
-strong `Sender`, any surviving PBO tensor would keep the channel alive,
-preventing `GLProcessorThreaded::drop()` from joining the GL thread at
-shutdown. The `WeakSender` pattern lets the GL thread exit cleanly when
-the `ImageProcessor` is dropped, even if PBO tensors still exist; subsequent
-PBO operations on orphaned tensors return `PboDisconnected`.
+`PboTensor` holds an `Arc<dyn PboOps>` — a trait object the GL backend
+implements to perform map / unmap / delete on the tensor's behalf. The
+image crate's `GlPboOps` is the concrete implementation; it owns a
+`WeakSender` to the GL thread's message channel. The weak-sender
+ownership lives **inside the trait impl**, not in `PboTensor` itself,
+so the tensor crate has no compile-time dependency on the image
+crate's channel implementation. The `WeakSender` is the mechanism
+that lets the GL thread exit cleanly when `ImageProcessor` is
+dropped, even while PBO tensors are still alive; subsequent PBO
+operations on orphaned tensors return `PboDisconnected`.
 
 ### BufferIdentity and EGL image caching
 
-Every tensor allocation or import creates a fresh `BufferIdentity` carrying:
+Every tensor allocation or import creates a fresh `BufferIdentity`
+carrying:
 
-- `id() -> u64` — monotonically increasing integer. Suitable as a HashMap or
-  EGL image cache key; changes every time the underlying buffer changes.
-- `weak() -> Weak<()>` — goes dead when the owning tensor (and all clones)
-  are dropped, allowing caches to detect stale entries without holding a
-  strong reference.
+- `id() -> u64` — monotonically increasing integer. Used by the image
+  crate's EGL image cache as the lookup key.
+- `weak() -> Weak<()>` — goes dead when the owning tensor (and all
+  clones) are dropped, allowing caches to detect stale entries without
+  holding a strong reference.
 
-The image processing backends use `BufferIdentity::id()` to key an EGL image
-cache so that re-importing the same camera buffer across frames does not
-re-create a GPU texture. See
+The image processing backends key their EGL image cache on
+`BufferIdentity.id()` so that the **same tensor object** reused across
+frames hits the cache. The cache does **not** rescue a pipeline that
+re-imports the same DMA-BUF every frame: each `hal_import_image` /
+`hal_tensor_from_fd` call mints a new `BufferIdentity` with a fresh
+ID, so re-imports always miss. The contract is:
+
+- Downstream caches (V4L2 / GStreamer adaptors) cache external
+  DMA-BUFs by stable `(inode, plane_offset)` and hold each
+  `hal_tensor *` alive across frames.
+- That keeps `BufferIdentity.id()` constant for the same physical
+  buffer, which in turn keeps the in-HAL EGL image cache hitting.
+
+See
 [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
-for the cache implementation.
+for the EGL image cache implementation and
+[the project ARCHITECTURE Appendix C](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
+for the full cross-cutting story.
 
 ## Performance Considerations
 
@@ -176,13 +193,16 @@ Each plane keeps its own DMA-BUF fd and per-plane stride / offset.
 The C API exposes this through
 [`hal_import_image(proc, y_pd, uv_pd, ...)`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h)
 which takes two `PlaneDescriptor`s and combines them via `from_planes`. The
-GStreamer integration element `edgefirstcameraadaptor` detects multi-plane
-buffers (`gst_buffer_n_memory() > 1`) and extracts per-plane fds via
-`gst_dmabuf_memory_get_fd()`.
+A downstream GStreamer source/transform element that wants to feed
+multi-plane buffers into the HAL detects them via
+`gst_buffer_n_memory() > 1` and extracts per-plane fds with
+`gst_dmabuf_memory_get_fd()` on each `GstMemory` block, then passes
+each fd into a separate `hal_plane_descriptor`.
 
-This work was implemented under **EDGEAI-1107**. See
-[`../image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
-for the OpenGL-side multi-plane path (`create_image_from_dma2`).
+See
+[`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
+for the OpenGL-side multi-plane import path that consumes per-plane fds
+via EGL attributes.
 
 ## Inter-Crate Interfaces
 
@@ -196,12 +216,18 @@ on it:
 | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | `pub use edgefirst_tensor as tensor` | Re-export |
 | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | `from_fd`, `clone_fd`, `from_planes` | Tensor lifetime across the FFI boundary |
 
-The `BufferIdentity` API is the inter-crate cache contract: image-side EGL
-caches and downstream consumers (e.g. `edgefirstcameraadaptor`) all key on
-`buffer_identity().id()` to detect when a logical buffer's contents have
-changed. See
+`BufferIdentity` is the in-HAL cache contract: the image crate's EGL
+image cache keys on `buffer_identity().id()`, which is stable for the
+lifetime of a tensor object. **Downstream import caches** (V4L2 /
+libcamera / GStreamer adaptors) must not key on
+`buffer_identity().id()` —
+that id is regenerated on every HAL import. Downstream caches key on
+the stable kernel `(inode, plane_offset)` of the external DMA-BUF and
+then keep the resulting `hal_tensor *` alive across frames, which
+keeps `buffer_identity().id()` stable and so keeps the image-side
+cache hitting. See
 [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
-in the project ARCHITECTURE.md for the cross-crate story.
+in the project ARCHITECTURE.md for the full two-layer story.
 
 ## Platform-Specific Notes
 
