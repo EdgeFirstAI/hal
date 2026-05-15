@@ -13,15 +13,19 @@ itself are:
 
 ## Running Tests
 
+All `cargo test` invocations below pass `-- --test-threads=1` per the
+workspace single-threaded rule
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+
 ```bash
 # Default features (ndarray, opengl, tracing)
-cargo test -p edgefirst-hal
+cargo test -p edgefirst-hal -- --test-threads=1
 
 # All features
-cargo test -p edgefirst-hal --all-features
+cargo test -p edgefirst-hal --all-features -- --test-threads=1
 
 # No default features (verifies the lib compiles minimally)
-cargo test -p edgefirst-hal --no-default-features
+cargo test -p edgefirst-hal --no-default-features -- --test-threads=1
 ```
 
 The doc-tests for `trace::*` are marked `no_run` because installing a global
@@ -34,8 +38,9 @@ the example code compiles against the public API.
   CI builds with `--features tracing` so doc-tests for the trace module
   participate in coverage.
 - The `tracker` feature pulls in `edgefirst-tracker` and enables the
-  `edgefirst_hal::tracker` re-export. CI exercises this via the workspace
-  feature matrix in
+  `edgefirst_hal::tracker` re-export. CI exercises this through the
+  workspace doc-test job (`cargo test --doc --workspace --all-features`)
+  and the per-platform `cargo nextest run` jobs in
   [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
 
 ## Benchmarks

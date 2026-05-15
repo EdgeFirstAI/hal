@@ -82,8 +82,10 @@ mod tests {
 }
 ```
 
-Every crate under `crates/` carries its own tests: `tensor`, `image`,
-`decoder`, `tracker`, `hal`, `capi`, `gpu-probe`. The `edgefirst_hal`
+Most crates under `crates/` carry their own Rust tests: `tensor`, `image`,
+`decoder`, `tracker`, `hal`, `capi`, and `bench`. The `gpu-probe` crate
+ships no `#[test]` modules — it is a runtime probe binary and is exercised
+indirectly through the tensor/image suites it informs. The `edgefirst_hal`
 Python crate is excluded from most workspace runs because it requires a
 live Python interpreter — see
 [`crates/python/TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md).

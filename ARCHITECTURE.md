@@ -58,11 +58,19 @@ Common operations cross backend boundaries via traits:
 
 ### 2. Enum dispatch
 
-Hot dispatch points use [`enum_dispatch`](https://docs.rs/enum_dispatch)
-to avoid dynamic dispatch overhead. The match-style code reads like
-trait-object dispatch but compiles to a direct call; the `TensorDyn`
-type-erased tensor and the tracker's per-detection dispatch both rely on
-this pattern.
+The hot `ImageProcessor` dispatch point uses the
+[`enum_dispatch`](https://docs.rs/enum_dispatch) crate
+(`#[enum_dispatch(ImageProcessor)]` in
+[`crates/image/src/lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/lib.rs))
+to avoid dynamic dispatch overhead on `convert()` and the `draw_*`
+APIs — the match-style code reads like trait-object dispatch but compiles
+to a direct call.
+
+`TensorDyn` is a hand-written `match` over a `DType` discriminant rather
+than an `enum_dispatch` macro, and the tracker is monomorphic over
+`DetectionBox`, so neither uses the `enum_dispatch` crate itself; the
+pattern (hot dispatch via an enum + compile-time fan-out) is shared, but
+the mechanism differs.
 
 ### 3. Builder pattern
 
@@ -83,13 +91,20 @@ Used pervasively to avoid per-frame allocations:
 
 ### 5. Hardware fallback chain
 
-`ImageProcessor::new()` probes the GPU once (DMA-BUF round-trip,
-GLES 3.1, PBO availability) and selects the active backend. All
-subsequent calls reuse the same backend; per-call dispatch never re-runs
-the probe. The `Tensor::new()` allocator chains DMA → SHM → Mem with
-the same one-time-probe philosophy. Both chains are defeatable via the
-`EDGEFIRST_DISABLE_*` and `EDGEFIRST_FORCE_*` environment variables for
-testing and benchmarking.
+`ImageProcessor::new()` runs the GPU probe once (DMA-BUF round-trip,
+GLES 3.1, PBO availability) and initializes every viable backend
+(`gl`, `g2d`, `cpu`). The probe never re-runs after construction. Each
+`convert()` / `draw_*()` call still walks the **OpenGL → G2D → CPU**
+chain at dispatch time, falling through when a backend cannot service
+the specific (src/dst format, memory type, operation) tuple — for
+example, GL declines NV12 → PlanarRgb on the GC7000UL two-pass cliff,
+and G2D declines anything that requires GPU compute. Use
+`EDGEFIRST_FORCE_BACKEND=...` to pin a single backend (still falls back
+to CPU only if the forced backend is missing). The `Tensor::new()`
+allocator chains DMA → SHM → Mem with the same probe-once philosophy
+but always uses the first viable backend per call. Both chains are
+defeatable via the `EDGEFIRST_DISABLE_*` and `EDGEFIRST_FORCE_*`
+environment variables for testing and benchmarking.
 
 ### 6. Type-safe foreign interfaces
 
@@ -120,10 +135,12 @@ The `Send + Sync` story across the workspace:
 ### 9. Error handling
 
 Each crate defines its own `Error` / `Result` pair (`DecoderError`,
-`edgefirst_image::Error`, `edgefirst_tensor::Error`). The `image` crate's
-`Error` implements `From<std::io::Error>` so `?` propagates cleanly from
-file I/O in user code; the others do not (rationale: those crates do not
-own file I/O).
+`edgefirst_image::Error`, `edgefirst_tensor::Error`). Both
+`edgefirst_image::Error` and `edgefirst_tensor::Error` implement
+`From<std::io::Error>` so `?` propagates cleanly from file I/O and from
+DMA-BUF / SHM syscalls. `DecoderError` does not, because the decoder
+crate never opens files or fds — its inputs are already-loaded tensors
+and JSON/YAML configuration strings.
 
 The C API translates all errors into POSIX `errno` codes; see
 [`crates/capi/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#error-convention).

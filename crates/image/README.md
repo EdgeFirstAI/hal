@@ -15,7 +15,7 @@ the GPU/G2D/CPU dispatch and segmentation-mask rendering. Its dependency
 neighbours:
 
 - Depends on [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) for `TensorDyn`, `BufferIdentity`, and the `PboOps` trait it implements for the GL backend.
-- Depends on [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `decoder`, default-on) for `DetectBox`, `Segmentation`, and the proto-mask data feeding `draw_proto_masks`.
+- Depends unconditionally on [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) for `DetectBox`, `Segmentation`, and the proto-mask data feeding `draw_proto_masks` (there is no opt-out feature flag).
 - Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `draw_masks_tracked`.
 - Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::image`.
 - Bridged to C via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) (cbindgen-generated C ABI).

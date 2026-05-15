@@ -85,8 +85,12 @@ Variables](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/README.md#e
 The image-side type system reuses [`edgefirst_tensor::TensorDyn`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.TensorDyn.html)
 as the dtype-erased image carrier. `TensorDyn` wraps a `Tensor<T>` and a
 `PixelFormat`; the format describes the spatial layout, the `DType` describes
-element storage. Width / height / channels / stride are **not stored** — they
-are computed from shape + format on every access:
+element storage. Width / height / channels are **not stored** — they
+are computed from shape + format on every access. Row stride is **optional
+metadata** (`Tensor::row_stride()` / `set_row_stride()` /
+`effective_row_stride()`); it is left unset for tightly packed buffers and
+is required for padded DMA-BUF imports where the producer's stride differs
+from `width * bytes_per_pixel`.
 
 | Format | Tensor shape | Notes |
 |--------|--------------|-------|
@@ -155,10 +159,13 @@ required because EGL contexts are thread-local — every GL call must happen
 on the thread that created the context.
 
 The [`PboOps`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/trait.PboOps.html)
-trait bridges the tensor crate and the GL thread: `PboTensor` holds a
-`WeakSender` to the GL thread channel. When the tensor needs to map / unmap
-/ delete the PBO, it sends a message through this channel. The weak sender
-ensures PBO tensors don't prevent GL thread shutdown — see
+trait bridges the tensor crate and the GL thread. `PboTensor` (defined in
+the tensor crate) holds an `Arc<dyn PboOps>`; the image crate's
+`GlPboOps` implementation of that trait is what owns the `WeakSender` to
+the GL-thread channel. When the tensor needs to map / unmap / delete the
+PBO, it calls into the `PboOps` impl, which sends a message through the
+channel. The weak sender ensures PBO tensors don't prevent GL thread
+shutdown — see
 [`crates/tensor/ARCHITECTURE.md#pbo-tensors-and-the-weaksender-pattern`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#pbo-tensors-and-the-weaksender-pattern).
 
 ### GLES 3.1 context and the optional compute path
@@ -275,6 +282,11 @@ mask APIs:
 pub struct MaskOverlay<'a> {
     pub background: Option<&'a TensorDyn>, // blit before drawing masks
     pub opacity: f32,                       // 0.0 invisible, 1.0 opaque
+    pub letterbox: Option<[f32; 4]>,       // [xmin, ymin, xmax, ymax] in
+                                            // model-input normalized space;
+                                            // maps decoder output back to
+                                            // original image coords when set
+    pub color_mode: ColorMode,             // Class | Instance | TrackId
 }
 ```
 
@@ -548,10 +560,11 @@ in the project README for the user-facing rules and validation patterns.
 | Direction | Crate | Interface |
 |-----------|-------|-----------|
 | Depends on | [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | `TensorDyn`, `Tensor<T>`, `BufferIdentity`, `PboOps` impl |
-| Depends on (feature `decoder`) | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `DetectBox`, `Segmentation`, proto data for `draw_*` |
+| Depends on (unconditional) | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `DetectBox`, `Segmentation`, proto data for `draw_*` |
 | Depends on (feature `tracker`) | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | `Tracker<DetectBox>` for `draw_masks_tracked` |
 | Consumed by | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | re-export as `edgefirst_hal::image` |
-| Consumed by | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | C/Python bindings for `ImageProcessor` and rendering APIs |
+| Consumed by | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | C bindings for `ImageProcessor` and rendering APIs (does **not** bridge to Python) |
+| Consumed by | [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) | PyO3 binding over the Rust umbrella crate (does not go through the C API) |
 
 ## Platform-Specific Notes
 

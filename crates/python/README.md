@@ -44,6 +44,23 @@ import numpy as np
 pixels = np.frombuffer(dst.map(), dtype=np.uint8).reshape(dst.shape())
 ```
 
+## Role in edgefirst-hal
+
+The `edgefirst-hal` package on PyPI is the Python face of the EdgeFirst
+HAL Rust workspace:
+
+- Built from [`crates/python`](https://github.com/EdgeFirstAI/hal/tree/main/crates/python),
+  which is a PyO3 binding over the `edgefirst-hal` Rust umbrella crate.
+- Does **not** consume the C API ([`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/));
+  the binding goes directly through Rust.
+- Exposes the same `Tensor`, `ImageProcessor`, `Decoder`, and `Tracker`
+  surfaces as the Rust crate, with numpy-friendly conversions and the
+  buffer protocol for zero-copy interop.
+- Wheels are distributed as two stable-ABI variants per platform —
+  `abi3-py311` (preferred, supports buffer protocol features added in
+  3.11) and `abi3-py38` (compatibility fallback for 3.8–3.10).
+  Pip selects the best wheel automatically.
+
 ## Key Features
 
 - **Zero-copy tensors** — DMA-BUF, POSIX shared memory, and PBO-backed

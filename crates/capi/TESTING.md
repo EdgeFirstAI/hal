@@ -34,9 +34,13 @@ suite under [`crates/capi/tests/`](https://github.com/EdgeFirstAI/hal/tree/main/
 
 ### Rust side
 
+`cargo test` runs with `-- --test-threads=1` per the workspace
+single-threaded rule
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+
 ```bash
 # Rust unit + doc-tests
-cargo test -p edgefirst-hal-capi
+cargo test -p edgefirst-hal-capi -- --test-threads=1
 ```
 
 ### C side
