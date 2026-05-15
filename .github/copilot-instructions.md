@@ -2,8 +2,8 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.3
-**Last Updated:** March 2026
+**Version:** 1.4
+**Last Updated:** May 2026
 
 ---
 
@@ -526,8 +526,10 @@ When adding features:
 
 ### GPU and Hardware Resource Cleanup
 
-**EGL/OpenGL cleanup** uses a defense-in-depth strategy (see ARCHITECTURE.md for
-full details). Key rules:
+**EGL/OpenGL cleanup** uses a defense-in-depth strategy (see
+[`ARCHITECTURE.md`](../ARCHITECTURE.md) and
+[`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) for full
+details). Key rules:
 
 1. **Always call `eglTerminate`** in `GlContext::drop` — EGL display connections
    are ref-counted. Omitting `eglTerminate` causes display connection exhaustion.
@@ -559,8 +561,9 @@ and `-j 1` for `cargo nextest`. This prevents:
 - G2D driver contention (galcore is not thread-safe for context creation)
 - DMA-heap CMA pool exhaustion on memory-constrained embedded targets
 
-This applies to CI, the Makefile, and local development. See ARCHITECTURE.md
-section "Testing with GPU Resources" for details.
+This applies to CI, the Makefile, and local development. See
+[`TESTING.md`](../TESTING.md) and [`ARCHITECTURE.md`](../ARCHITECTURE.md)
+for details.
 
 ### Common Pitfalls
 
@@ -612,6 +615,86 @@ pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
 
 ---
 
+## Architecture & Testing Documentation
+
+### MANDATORY: Read Before Major Changes
+
+This repository maintains detailed architecture and testing documentation at
+both the workspace level and within each sub-crate. **Before making any major
+API change, architectural modification, or design pattern update, you MUST
+read the relevant documents listed below.** After making such changes, you
+MUST update the affected documents to stay in sync with the implementation.
+
+### Document Map
+
+#### Architecture Documents
+
+| Document | Scope |
+|----------|-------|
+| [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Cross-crate** architecture: shared design patterns, performance-tracing infrastructure, DMA-BUF identity, tensor caching, source organization |
+| [`crates/tensor/ARCHITECTURE.md`](../crates/tensor/ARCHITECTURE.md) | Backend dispatch (`Tensor<T>` → DMA/SHM/Mem/PBO), multi-plane DMA-BUF, `BufferIdentity` cache key |
+| [`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) | GL/G2D/CPU backend chain, EGL image cache, `GL_MUTEX`, Vivante workarounds, shutdown safety |
+| [`crates/decoder/ARCHITECTURE.md`](../crates/decoder/ARCHITECTURE.md) | Model-type selection, `dshape` contract, per-scale framework, fused proto path, NMS modes |
+| [`crates/tracker/ARCHITECTURE.md`](../crates/tracker/ARCHITECTURE.md) | ByteTrack two-pass association, Kalman state, `DetectionBox` trait |
+| [`crates/hal/ARCHITECTURE.md`](../crates/hal/ARCHITECTURE.md) | Umbrella re-export layer, tracing subscriber |
+| [`crates/capi/ARCHITECTURE.md`](../crates/capi/ARCHITECTURE.md) | Opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework |
+| [`crates/python/ARCHITECTURE.md`](../crates/python/ARCHITECTURE.md) | PyO3 bindings, numpy 3-path copy strategy, abi3 wheels |
+
+#### Testing Documents
+
+| Document | Scope |
+|----------|-------|
+| [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: single-threaded execution rules, on-target gating, cross-compilation, coverage, CI matrix |
+| [`crates/tensor/TESTING.md`](../crates/tensor/TESTING.md) | Per-backend unit tests, DMA/SHM gating, allocation benchmarks |
+| [`crates/image/TESTING.md`](../crates/image/TESTING.md) | GL gating via OnceLock probe, G2D gating on `/dev/galcore`, fp16 benchmarks |
+| [`crates/decoder/TESTING.md`](../crates/decoder/TESTING.md) | Builder/segmentation/parity tests, per-scale NEON kernel tests, integration suites |
+| [`crates/tracker/TESTING.md`](../crates/tracker/TESTING.md) | ByteTrack association tests, Kalman filter math |
+| [`crates/hal/TESTING.md`](../crates/hal/TESTING.md) | Doc-tests for tracing API, feature-flag coverage |
+| [`crates/capi/TESTING.md`](../crates/capi/TESTING.md) | C-side integration suite, header parity check |
+| [`crates/python/TESTING.md`](../crates/python/TESTING.md) | maturin develop workflow, pytest/slipcover coverage |
+
+### When You MUST Reference These Documents
+
+You must read and consult the relevant architecture and testing documents when:
+
+1. **Adding or modifying public API surfaces** — check the crate's ARCHITECTURE.md for type contracts, invariants, and design rationale before changing signatures
+2. **Changing memory management patterns** — consult `crates/tensor/ARCHITECTURE.md` and the root `ARCHITECTURE.md` for the DMA-BUF identity, fallback chain, and zero-copy contracts
+3. **Modifying GPU/hardware backend code** — consult `crates/image/ARCHITECTURE.md` for EGL lifecycle, `GL_MUTEX` rules, G2D cleanup, and shutdown safety
+4. **Changing decoder logic or model support** — consult `crates/decoder/ARCHITECTURE.md` for the `dshape` physical-memory-order contract, per-scale framework, and NMS pipeline
+5. **Updating the C ABI or delegate framework** — consult `crates/capi/ARCHITECTURE.md` for the opaque-handle ABI contract and DMA-BUF delegate protocol
+6. **Adding or changing tests** — consult the relevant crate's TESTING.md for test gating patterns, fixture conventions, and the single-threaded execution rule
+7. **Cross-crate refactoring** — consult both the root `ARCHITECTURE.md` and all affected crate-level documents
+
+### When You MUST Update These Documents
+
+After making changes, you MUST update the corresponding documentation if:
+
+1. **A public type, trait, or function signature changes** — update the crate's ARCHITECTURE.md module map and key types sections
+2. **A new module or file is added** — add it to the crate's ARCHITECTURE.md module map table
+3. **A design pattern or invariant changes** — update the architectural rationale in the affected document(s)
+4. **A new test pattern or gating mechanism is introduced** — update the crate's TESTING.md test layout and running instructions
+5. **A new benchmark binary is added** — update both the crate's TESTING.md and the Benchmarks section of this file
+6. **Cross-crate contracts change** (e.g., tensor shape conventions, `BufferIdentity`, `PboOps` trait) — update the root `ARCHITECTURE.md` and all affected crate documents
+
+### On-Demand Discrepancy Detection
+
+When asked to review or audit architecture/testing documentation:
+
+1. **Read the relevant ARCHITECTURE.md and TESTING.md documents**
+2. **Cross-reference against the actual source code** — check module maps, type names, trait signatures, and documented invariants against the implementation
+3. **Report any discrepancies** — identify where documentation describes behavior that no longer matches the code, missing modules/types, stale file paths, or outdated design rationale
+4. **Propose specific fixes** — provide concrete edits to bring documentation back in sync with the implementation
+
+Common discrepancy patterns to check for:
+- Module map tables listing files that no longer exist or missing new files
+- Documented type/trait names that have been renamed
+- Described design patterns that have been superseded
+- Test layout sections that don't match the current directory structure
+- Benchmark tables missing new benchmark binaries
+- Stale cross-references between documents
+
+---
+
 ## Working with AI Assistants
 
 ### Best Practices
@@ -620,6 +703,8 @@ pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
 - Run linters after accepting suggestions
 - Ensure meaningful test assertions
 - Follow security best practices
+- **Reference ARCHITECTURE.md and TESTING.md** documents before proposing changes to core design patterns
+- **Update documentation** when implementation changes affect documented contracts
 
 ### Common Pitfalls
 
@@ -628,6 +713,7 @@ pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
 - **Over-engineering:** Prefer simple solutions
 - **Missing edge cases:** Explicitly test boundaries
 - **License violations:** AI may suggest incompatible code
+- **Stale documentation:** Always check if your changes require ARCHITECTURE.md or TESTING.md updates
 
 ---
 
