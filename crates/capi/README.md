@@ -1,8 +1,26 @@
-# EdgeFirst HAL C API
+# edgefirst-hal-capi
 
-C language bindings for the EdgeFirst Hardware Abstraction Layer, providing
-zero-copy tensor operations, hardware-accelerated image processing, ML model
-output decoding, and multi-object tracking.
+[![GitHub release](https://img.shields.io/github/v/release/EdgeFirstAI/hal?label=release)](https://github.com/EdgeFirstAI/hal/releases)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE)
+
+> **Distribution:** the C library is shipped as a GitHub Release tarball,
+> not via crates.io. The `edgefirst-hal-capi` crate is marked
+> `publish = false` because its useful artifact is the static/shared
+> library plus the cbindgen-generated header — not the Rust source.
+
+**EdgeFirst HAL C API** — C language bindings for the EdgeFirst Hardware
+Abstraction Layer, providing zero-copy tensor operations,
+hardware-accelerated image processing, ML model output decoding, and
+multi-object tracking.
+
+## Role in edgefirst-hal
+
+`edgefirst-hal-capi` is the FFI bridge over the EdgeFirst HAL Rust workspace:
+
+- Wraps [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/), [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/), [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/), [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) as opaque-handle C APIs.
+- Builds as both `staticlib` (`libedgefirst_hal.a`) and `cdylib` (`libedgefirst_hal.so` / `.dylib`).
+- Used by GStreamer plugins, OpenCV pipelines, NPU delegates, and any C/C++ consumer that needs the HAL outside Rust.
+- Defines the [Delegate DMA-BUF Framework](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#delegate-dma-buf-framework) ABI that NXP Neutron, VxDelegate, and other TFLite delegates implement to expose their internal DMA-BUF tensors.
 
 ## Features
 
@@ -395,8 +413,15 @@ vendor-specific symbols. Populated by the delegate's
 ## API Reference
 
 The full API is documented with Doxygen comments in
-[`include/edgefirst/hal.h`](include/edgefirst/hal.h).
+[`include/edgefirst/hal.h`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h).
+
+## Documentation
+
+- Architecture overview (incl. performance recommendations and Delegate DMA-BUF framework): [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/TESTING.md)
+- Reference C benchmark / canonical example: [`bench_preproc.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/bench_preproc.c)
+- Project README: [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
 
 ## License
 
-Apache-2.0 - see [LICENSE](../../LICENSE) for details.
+Apache-2.0 - see [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE) for details.
