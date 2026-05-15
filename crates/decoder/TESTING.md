@@ -28,15 +28,21 @@ crates/decoder/
 
 ## Running Tests
 
+All `cargo test` invocations below pass `-- --test-threads=1` per the
+workspace single-threaded rule
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+Decoder tests are CPU-only, but the rule applies workspace-wide so commands
+stay consistent and copy-pasteable across crates.
+
 ```bash
 # Full suite (unit + integration + doc-tests)
-cargo test -p edgefirst-decoder
+cargo test -p edgefirst-decoder -- --test-threads=1
 
 # Just the integration tests
-cargo test -p edgefirst-decoder --tests
+cargo test -p edgefirst-decoder --tests -- --test-threads=1
 
 # Single integration test
-cargo test -p edgefirst-decoder --test per_scale_parity
+cargo test -p edgefirst-decoder --test per_scale_parity -- --test-threads=1
 
 # Doc-tests only
 cargo test -p edgefirst-decoder --doc

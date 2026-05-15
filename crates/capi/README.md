@@ -1,8 +1,12 @@
 # edgefirst-hal-capi
 
-[![Crates.io](https://img.shields.io/crates/v/edgefirst-hal-capi.svg)](https://crates.io/crates/edgefirst-hal-capi)
-[![Documentation](https://docs.rs/edgefirst-hal-capi/badge.svg)](https://docs.rs/edgefirst-hal-capi)
-[![License](https://img.shields.io/crates/l/edgefirst-hal-capi.svg)](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/EdgeFirstAI/hal?label=release)](https://github.com/EdgeFirstAI/hal/releases)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE)
+
+> **Distribution:** the C library is shipped as a GitHub Release tarball,
+> not via crates.io. The `edgefirst-hal-capi` crate is marked
+> `publish = false` because its useful artifact is the static/shared
+> library plus the cbindgen-generated header — not the Rust source.
 
 **EdgeFirst HAL C API** — C language bindings for the EdgeFirst Hardware
 Abstraction Layer, providing zero-copy tensor operations,

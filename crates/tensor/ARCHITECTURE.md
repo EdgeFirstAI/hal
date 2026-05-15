@@ -192,7 +192,7 @@ Each plane keeps its own DMA-BUF fd and per-plane stride / offset.
 
 The C API exposes this through
 [`hal_import_image(proc, y_pd, uv_pd, ...)`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h)
-which takes two `PlaneDescriptor`s and combines them via `from_planes`. The
+which takes two `PlaneDescriptor`s and combines them via `from_planes`.
 A downstream GStreamer source/transform element that wants to feed
 multi-plane buffers into the HAL detects them via
 `gst_buffer_n_memory() > 1` and extracts per-plane fds with

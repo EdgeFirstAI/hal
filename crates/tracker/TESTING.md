@@ -18,15 +18,21 @@ API.
 
 ## Running Tests
 
+All `cargo test` invocations below pass `-- --test-threads=1` per the
+workspace single-threaded rule
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+The tracker is CPU-only, but the rule applies workspace-wide so commands
+stay consistent and copy-pasteable across crates.
+
 ```bash
 # All tracker tests
-cargo test -p edgefirst-tracker
+cargo test -p edgefirst-tracker -- --test-threads=1
 
 # Doc-tests only
 cargo test -p edgefirst-tracker --doc
 
 # Single test
-cargo test -p edgefirst-tracker bytetrack::tests::two_pass_recovery
+cargo test -p edgefirst-tracker bytetrack::tests::two_pass_recovery -- --test-threads=1
 ```
 
 ## Special Requirements

@@ -97,9 +97,10 @@ for the matrix definitions.
 
 ## Performance Considerations
 
-- **No GPU code paths.** ByteTrack is a CPU-only algorithm; the cost matrix
-  uses [`lapjv`](https://docs.rs/lapjv) which is small enough that a single
-  Rayon thread comfortably handles realtime workloads at ≤300 simultaneous
+- **No GPU code paths.** ByteTrack is a CPU-only, single-threaded
+  algorithm — the crate does not depend on Rayon. The cost matrix uses
+  [`lapjv`](https://docs.rs/lapjv) which is small enough that a single
+  thread comfortably handles realtime workloads at ≤300 simultaneous
   tracks.
 - **UUID generation** uses [`uuid`](https://docs.rs/uuid)'s `v4` random
   generator. This is a per-track one-time cost (~hundreds of ns), not a

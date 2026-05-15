@@ -645,6 +645,10 @@ graph TD
 
     Python --> EF
     CAPI --> EF
+    CAPI --> Tensor
+    CAPI --> Image
+    CAPI --> Decoder
+    CAPI --> Tracker
 
     style EF fill:#fff4e1
     style Python fill:#e1f5ff

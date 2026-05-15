@@ -4,8 +4,7 @@
 
 ```
 tests/                          # Project-level Python tests
-├── test_tensor.py
-├── tensor/                     # Tensor-specific tests
+├── test_tensor.py              # Tensor binding coverage (single file)
 ├── image/                      # ImageProcessor tests
 ├── decoder/                    # Decoder tests
 ├── python/                     # PyO3 binding-specific edge cases
@@ -13,6 +12,10 @@ tests/                          # Project-level Python tests
 ├── profile_decode_render.py    # Hot-loop profiling target for `perf record`
 └── example_seg_pipeline.py     # End-to-end pipeline example
 ```
+
+Tensor tests live as a single file (`tests/test_tensor.py`) rather than
+under `tests/tensor/`; the binding surface for `Tensor` is narrow enough
+that a flat file is easier to navigate than a directory.
 
 The Python crate's source under
 [`crates/python/src/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/python/src)

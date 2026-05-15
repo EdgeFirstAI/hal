@@ -21,24 +21,28 @@ files alongside the implementation.
 
 ## Running Tests
 
+All `cargo test` invocations below pass `-- --test-threads=1` per the
+workspace single-threaded rule
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+
 ```bash
 # All tensor tests on the host
-cargo test -p edgefirst-tensor
+cargo test -p edgefirst-tensor -- --test-threads=1
 
 # Heap-only (skips DMA tests when DMA-heap permissions are missing)
-EDGEFIRST_TENSOR_FORCE_MEM=1 cargo test -p edgefirst-tensor
+EDGEFIRST_TENSOR_FORCE_MEM=1 cargo test -p edgefirst-tensor -- --test-threads=1
 
 # Doc-tests only
 cargo test -p edgefirst-tensor --doc
 
 # With ndarray feature exercised explicitly
-cargo test -p edgefirst-tensor --features ndarray
+cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 ```
 
 ## Special Requirements
 
 - **DMA tests** require Linux **and** read+write access to a DMA-heap device
-  (typically `/dev/dma_heap/system` or `/dev/dma_heap/cma`). On a workstation
+  (typically `/dev/dma_heap/linux,cma` or `/dev/dma_heap/system`). On a workstation
   this usually means being in the `video` group. If permissions are missing,
   DMA tests are skipped at runtime and the suite falls back to heap-only
   coverage; nothing fails outright. Set `EDGEFIRST_TENSOR_FORCE_MEM=1` to
