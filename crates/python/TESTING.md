@@ -63,8 +63,10 @@ Rust lcov coverage.
   recommended; the Makefile already disables parallelism.
 - **LFS testdata** — fixtures live under `testdata/`. The Python tests
   resolve paths relative to the workspace root; no env var is needed
-  locally. CI sets `EDGEFIRST_TESTDATA_DIR` for parity with the Rust
-  bench harness.
+  locally. The aarch64 (`test-arm`) and `hardware-test` CI jobs export
+  `EDGEFIRST_TESTDATA_DIR=${{ github.workspace }}/testdata` for parity
+  with the Rust bench harness; the x86_64 Python test job relies on
+  the workspace-relative fallback and does not set the variable.
 - **Hardware gates** — GL/G2D tests skip themselves on hosts without the
   required device nodes (mirroring the Rust-side `OnceLock` probes). On
   the i.MX 8M Plus and i.MX 95 hardware runners the full hardware path is

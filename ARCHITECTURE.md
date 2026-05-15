@@ -103,8 +103,10 @@ GL handles tricky platform cases via in-backend workarounds (for
 example, NV12 → PlanarRgb on Vivante uses an automatic two-pass path
 within the GL backend rather than declining) — only true capability
 gaps cascade down the chain. Use `EDGEFIRST_FORCE_BACKEND=...` to pin
-a single backend (still falls back to CPU only if the forced backend
-is missing). The `Tensor::new()` allocator chains DMA → SHM → Mem with
+a single backend; this disables the fallback chain entirely — if the
+forced backend cannot service the requested operation, the call fails
+with `Error::ForcedBackendUnavailable` rather than dropping down to
+the next backend. The `Tensor::new()` allocator chains DMA → SHM → Mem with
 the same probe-once philosophy but always uses the first viable
 backend per call. Both chains are defeatable via the
 `EDGEFIRST_DISABLE_*` and `EDGEFIRST_FORCE_*` environment variables
@@ -350,7 +352,7 @@ hal/
 │   ├── python/             # edgefirst_hal (PyO3 bindings)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)
 │   └── gpu-probe/          # internal CLI for GPU capability probing
-├── tests/                  # Project-level Python and C integration tests
+├── tests/                  # Project-level Python tests (C integration tests live under crates/capi/tests/)
 ├── testdata/               # Git LFS-tracked fixtures (images, model outputs)
 ├── benchmarks/             # Per-platform benchmark JSON results
 ├── scripts/                # Build / audit / release tooling

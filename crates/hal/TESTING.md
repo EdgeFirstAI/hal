@@ -8,12 +8,18 @@ itself are:
 
 - **Doc-tests** for the `trace::start_tracing` / `stop_tracing` API in
   [`crates/hal/src/trace.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs).
-- **Compile-time feature-flag conditionals** are exercised by the CI
-  jobs that build the crate under three feature configurations:
-  `default`, `--all-features`, and `--no-default-features`. CI does not
-  iterate every pairwise combination of `default` / `tracker` /
-  `tracing`; contributors who need a specific combination should run
-  it locally (see the commands below).
+- **Compile-time feature-flag conditionals** are exercised in CI by:
+  - the workspace doc-test job, which runs with `--all-features`
+    (`cargo test --doc --workspace --all-features`); and
+  - the per-platform `cargo nextest` jobs, which run with
+    `--features default,opencv` on the `--workspace`.
+
+  CI does **not** build the umbrella with `--no-default-features` and
+  does not iterate every combination of `default` / `tracker` /
+  `tracing`. The `tracker` feature on the umbrella is therefore only
+  exercised through the all-features doc-test job; contributors who
+  need a specific combination should run it locally (see the commands
+  below).
 
 ## Running Tests
 
@@ -42,10 +48,14 @@ the example code compiles against the public API.
   CI builds with `--features tracing` so doc-tests for the trace module
   participate in coverage.
 - The `tracker` feature pulls in `edgefirst-tracker` and enables the
-  `edgefirst_hal::tracker` re-export. CI exercises this through the
-  workspace doc-test job (`cargo test --doc --workspace --all-features`)
-  and the per-platform `cargo nextest run` jobs in
-  [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml).
+  `edgefirst_hal::tracker` re-export. CI exercises this only through
+  the workspace doc-test job
+  (`cargo test --doc --workspace --all-features`) — the per-platform
+  `cargo nextest` jobs run with `--features default,opencv`, which
+  does **not** include `tracker` (see
+  [`.github/workflows/test.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/test.yml)).
+  Run `cargo test -p edgefirst-hal --features tracker -- --test-threads=1`
+  locally if you need to exercise the re-export in nextest-style tests.
 
 ## Benchmarks
 
@@ -61,10 +71,14 @@ sections of the project README.
 
 ## Coverage Notes
 
-Coverage for the umbrella is collected through the workspace `cargo
-llvm-cov` run; the small surface of `lib.rs` re-exports and the `trace`
-module's doc-tests show up under `crates/hal/` in the lcov report. The
-substantive coverage numbers come from the sub-crates.
+Coverage for the umbrella is collected through the workspace
+`cargo llvm-cov nextest` run; the small surface of `lib.rs` re-exports
+shows up under `crates/hal/` in the lcov report. Doc-tests are not
+included in the llvm-cov report — the workspace `cargo test --doc`
+job runs separately and is not coverage-instrumented, so the `trace`
+module's doc-tests verify only that the example code compiles and
+runs against the public API. The substantive coverage numbers come
+from the sub-crates.
 
 ## Cross-References
 

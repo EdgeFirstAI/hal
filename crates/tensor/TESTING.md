@@ -33,7 +33,7 @@ cargo test -p edgefirst-tensor -- --test-threads=1
 EDGEFIRST_TENSOR_FORCE_MEM=1 cargo test -p edgefirst-tensor -- --test-threads=1
 
 # Doc-tests only
-cargo test -p edgefirst-tensor --doc
+cargo test -p edgefirst-tensor --doc -- --test-threads=1
 
 # With ndarray feature exercised explicitly
 cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
@@ -81,10 +81,14 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
   appears under `crates/tensor/`.
 - `cfg(target_os = "linux")`-gated code (`dma.rs`, `dmabuf.rs`) is only
   exercised on the Linux host runners and on the i.MX 8M Plus hardware
-  runner. macOS and Windows CI legs cover the heap and SHM paths.
-- The `procfs` dev-dependency on Linux is used to assert that mapped DMA
-  buffers actually appear in `/proc/self/maps` — guards against silent
-  fallback-to-heap regressions.
+  runner. The macOS CI leg covers the heap path. There is no Windows
+  test job today; SHM coverage comes from the Linux runners (where
+  `shm.rs` is `#[cfg(unix)]`-gated and active).
+- The `procfs` dev-dependency on Linux is used to read open-fd counts
+  for the current process via `procfs::process::Process::myself()` —
+  the leak-regression tests assert that fd count returns to its
+  baseline after DMA / SHM tensors are dropped. The check is fd-count
+  based, not a `/proc/self/maps` parse.
 
 ## Cross-References
 

@@ -104,12 +104,23 @@ for the user-facing rule.
 
 ### Tensor buffer protocol
 
-`Tensor.map()` returns a `memoryview` over the tensor's mapped memory. For
-`Mem` and `Dma` backends this is a zero-copy view; for `Pbo` the GL thread
-performs an `glMapBufferRange` round-trip via the message channel. The
-`memoryview` carries the right shape, strides, and dtype so
-`np.frombuffer(t.map(), dtype=...).reshape(t.shape())` produces a zero-copy
-numpy array.
+`Tensor.map()` returns a `TensorMap` — a Python context manager
+(`__enter__` / `__exit__`) that wraps the underlying mapped buffer
+and unmaps it on exit. The actual buffer is exposed via
+`TensorMap.view()`, which returns a `memoryview` over the mapped
+memory. For `Mem` and `Dma` backends the view is zero-copy; for
+`Pbo` the GL thread performs a `glMapBufferRange` round-trip via the
+message channel. The `memoryview` carries the right shape, strides,
+and dtype so the typical pattern is:
+
+```python
+with t.map() as m:
+    arr = np.frombuffer(m.view(), dtype=...).reshape(t.shape())
+```
+
+The context manager is required because `Pbo` and `Dma` mappings
+hold driver state that must be released deterministically — letting
+the `TensorMap` outlive its `with` block keeps the buffer locked.
 
 For DMA-backed tensors, `Tensor.dmabuf_clone()` returns the `int` fd
 suitable for handing to a TFLite delegate. Tensor-side errors

@@ -38,7 +38,7 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
 cargo test -p edgefirst-image --lib gl::tests -- --test-threads=1
 
 # Doc-tests
-cargo test -p edgefirst-image --doc
+cargo test -p edgefirst-image --doc -- --test-threads=1
 ```
 
 ## Special Requirements
@@ -97,7 +97,7 @@ cargo test -p edgefirst-image --features g2d_test_formats -- --test-threads=1
 | `/dev/dma_heap/linux,cma` or `/dev/dma_heap/system` | DMA-BUF tensor allocation |
 | `/dev/galcore` | G2D hardware acceleration |
 | `/dev/neutron0` | Neutron NPU DMA-BUF EGLImage |
-| `/dev/dri/renderD128` | DRM render node; required for DMA-buf backend |
+| `/dev/dri/renderD128` (preferred) or `/dev/dri/card0` / `/dev/dri/card1` | DRM render/card node; the GL context opens the first that exists |
 
 ### Disabling backends for isolation
 
@@ -109,7 +109,7 @@ cargo test -p edgefirst-image --features g2d_test_formats -- --test-threads=1
 | `EDGEFIRST_FORCE_BACKEND=g2d` | G2D-only |
 | `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even if available |
 | `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even if available |
-| `EDGEFIRST_FORCE_TRANSFER=pbo` / `=dmabuf` | Force GL transfer backend |
+| `EDGEFIRST_FORCE_TRANSFER=dmabuf` / `=pbo` / `=sync` | Force GL transfer backend (the `sync` value pins the non-zero-copy `glReadPixels` baseline used for benchmarking) |
 
 Example — run tests without any GPU backend:
 
