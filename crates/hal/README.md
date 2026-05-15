@@ -81,6 +81,13 @@ pip install edgefirst-hal
 See [`edgefirst-hal` on PyPI](https://pypi.org/project/edgefirst-hal/) for
 Python-specific documentation.
 
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/TESTING.md)
+- Full API reference: [docs.rs/edgefirst-hal](https://docs.rs/edgefirst-hal)
+- Project README: [README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE) for details.

@@ -234,6 +234,13 @@ fall back to CPU.
 - **[GitHub](https://github.com/EdgeFirstAI/hal)** — source code,
   architecture docs, benchmarks, and contribution guide
 
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md)
+- Project README (cross-language overview): [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
+- Optimization guide (cross-language user rules): [README.md#optimization-guide](https://github.com/EdgeFirstAI/hal/blob/main/README.md#optimization-guide)
+
 ## License
 
 Apache-2.0 — see [LICENSE](https://github.com/EdgeFirstAI/hal/blob/main/LICENSE).
