@@ -206,8 +206,10 @@ via EGL attributes.
 
 ## Inter-Crate Interfaces
 
-The tensor crate is the foundation; every other `edgefirst-*` crate depends
-on it:
+The tensor crate is the foundation of the data-plane crates — image,
+decoder, capi, and gpu-probe all depend on it. The tracker and bench
+crates are independent of it (tracker operates on `DetectionBox` and
+`nalgebra`; bench is a thin `serde_json` wrapper for benchmark IO):
 
 | Consumer | Interface | Purpose |
 |----------|-----------|---------|
@@ -215,6 +217,7 @@ on it:
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `Tensor<T>`, `TensorMap` | Reading model output tensors |
 | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | `pub use edgefirst_tensor as tensor` | Re-export |
 | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | `from_fd`, `clone_fd`, `from_planes` | Tensor lifetime across the FFI boundary |
+| [`gpu-probe`](https://github.com/EdgeFirstAI/hal/blob/main/crates/gpu-probe/) | `Tensor` allocation | Allocates the DMA-BUF round-trip buffer the probe verifies |
 
 `BufferIdentity` is the in-HAL cache contract: the image crate's EGL
 image cache keys on `buffer_identity().id()`, which is stable for the

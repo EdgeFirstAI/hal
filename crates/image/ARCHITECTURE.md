@@ -427,18 +427,21 @@ The crash arises from a fundamental conflict between four systems:
 │   Catches panics from eglDestroyContext/eglMakeCurrent  │
 │   if function pointers are invalidated                  │
 ├─────────────────────────────────────────────────────────┤
-│ Layer 4: eglTerminate inside catch_unwind               │
-│   Releases ref-counted display; catch_unwind absorbs    │
-│   any driver-side misbehaviour                          │
+│ Layer 4: Skip eglTerminate entirely                     │
+│   Display lives in a process-global OnceLock and is     │
+│   intentionally leaked; eglTerminate is never called    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-`GlContext::drop` performs explicit EGL resource cleanup (destroy context,
-destroy surface, terminate display) inside `catch_unwind`, then
-intentionally skips dropping the `Rc<Egl>` wrapper. The EGL library handle
-is leaked via `Box::leak` at load time so it is never `dlclose`'d.
-`eglTerminate` is ref-counted per the EGL spec — each `eglInitialize`
-increments the count, each `eglTerminate` decrements it.
+`GlContext::drop` calls `eglMakeCurrent(EGL_NO_CONTEXT)` and
+`eglDestroyContext` inside `catch_unwind`, then intentionally skips
+dropping the `Rc<Egl>` wrapper. The EGL library handle is leaked via
+`Box::leak` at load time so it is never `dlclose`'d. The EGL display
+itself lives in the `SHARED_DISPLAY` `OnceLock` (`SharedEglDisplay`) and
+is never terminated — the EGL spec ref-counts `eglTerminate` against
+`eglInitialize`, but calling it from `GlContext::drop` would tear the
+display down for every other live `GlContext` in the process, so the
+HAL leaks it on purpose.
 
 ### Industry precedent
 
@@ -475,21 +478,26 @@ code (where many G2D processors are created/destroyed in one process), the
 avoid repeated `g2d_close` + `dlclose` cycles that exhaust driver
 resources.
 
-### Resource leak prevention policy
+### Resource cleanup policy
 
-- **EGL displays** — `eglTerminate` in `GlContext::drop`. EGL spec
-  ref-counts; only the last terminate tears down state.
-- **EGL contexts** — `eglDestroyContext` before `eglTerminate`. No EGL
-  surfaces are created — the HAL uses surfaceless contexts
-  (`EGL_KHR_surfaceless_context` + `EGL_KHR_no_config_context`) and
-  renders exclusively through FBOs backed by EGLImages.
+- **EGL displays** — never terminated. The process-global
+  `SharedEglDisplay` is created once via `OnceLock` and leaked on
+  process exit. `eglTerminate` is the *EGL way* to release a display
+  but in practice causes driver crashes (see the defense-in-depth
+  section above), so the HAL never calls it.
+- **EGL contexts** — `eglDestroyContext` in `GlContext::drop`, inside
+  `catch_unwind`. No EGL surfaces are created — the HAL uses
+  surfaceless contexts (`EGL_KHR_surfaceless_context` +
+  `EGL_KHR_no_config_context`) and renders exclusively through FBOs
+  backed by EGLImages.
 - **DMA buffers** — fd `close()` in `Drop`.
 - **G2D contexts** — `g2d_close` in `G2DProcessor::drop`.
 
-Intentional leaks are restricted to the EGL library handle (`Box::leak`)
-and the `Rc<Egl>` wrapper (`ManuallyDrop`) — lightweight Rust-side
-objects. Actual GPU/display resources are released by the explicit
-cleanup calls.
+Intentional leaks: the EGL library handle (`Box::leak`), the `Rc<Egl>`
+wrapper (`ManuallyDrop`), and the shared EGL display
+(`SHARED_DISPLAY: OnceLock`). All three are process-lifetime objects;
+the OS reclaims them at exit. GPU contexts, DMA buffers, and G2D
+contexts are released eagerly by their `Drop` impls.
 
 ## GL Command Serialization (GL_MUTEX)
 
@@ -519,8 +527,10 @@ instance. Acquired in three places:
 2. **Message dispatch** — wraps every incoming GL-thread message
    (convert, draw masks, PBO create/download, etc.) so only one GL thread
    executes driver calls at a time.
-3. **Teardown** — wraps `GLProcessorST::drop()` → `GlContext::drop()` so
-   `eglDestroyContext` / `eglTerminate` are serialized.
+3. **Teardown** — wraps `GLProcessorST::drop()` → `GlContext::drop()`
+   so `eglDestroyContext` (and `eglMakeCurrent(EGL_NO_CONTEXT)`) are
+   serialized. The shared display is never terminated, so teardown
+   does not race against display state.
 
 The mutex uses `unwrap_or_else(|e| e.into_inner())` to recover from
 poisoning: if a prior GL operation panicked, subsequent operations on
@@ -549,7 +559,7 @@ approach prioritizes correctness across all targets.
 |--------------|----------------|
 | Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
-| One `ImageProcessor` per pipeline | Each instance owns an EGL display, a GL thread, per-thread caches. Multiple instances serialize on `GL_MUTEX`. |
+| One `ImageProcessor` per pipeline | Each instance owns its OpenGL context, GL thread, and per-thread caches (the EGL display is process-global and shared). Multiple instances still serialize on `GL_MUTEX`, so concurrent use across instances buys nothing. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |
 
 See the [Optimization Guide](https://github.com/EdgeFirstAI/hal/blob/main/README.md#optimization-guide)

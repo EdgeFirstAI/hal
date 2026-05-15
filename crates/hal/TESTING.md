@@ -8,14 +8,18 @@ itself are:
 
 - **Doc-tests** for the `trace::start_tracing` / `stop_tracing` API in
   [`crates/hal/src/trace.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs).
-- **Compile-time feature-flag conditionals** are exercised by building the
-  crate with each combination of `default`, `tracker`, and `tracing` enabled.
+- **Compile-time feature-flag conditionals** are exercised by the CI
+  jobs that build the crate under three feature configurations:
+  `default`, `--all-features`, and `--no-default-features`. CI does not
+  iterate every pairwise combination of `default` / `tracker` /
+  `tracing`; contributors who need a specific combination should run
+  it locally (see the commands below).
 
 ## Running Tests
 
 All `cargo test` invocations below pass `-- --test-threads=1` per the
 workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
 
 ```bash
 # Default features (ndarray, opengl, tracing)

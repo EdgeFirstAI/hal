@@ -96,15 +96,19 @@ GLES 3.1, PBO availability) and initializes every viable backend
 (`gl`, `g2d`, `cpu`). The probe never re-runs after construction. Each
 `convert()` / `draw_*()` call still walks the **OpenGL → G2D → CPU**
 chain at dispatch time, falling through when a backend cannot service
-the specific (src/dst format, memory type, operation) tuple — for
-example, GL declines NV12 → PlanarRgb on the GC7000UL two-pass cliff,
-and G2D declines anything that requires GPU compute. Use
-`EDGEFIRST_FORCE_BACKEND=...` to pin a single backend (still falls back
-to CPU only if the forced backend is missing). The `Tensor::new()`
-allocator chains DMA → SHM → Mem with the same probe-once philosophy
-but always uses the first viable backend per call. Both chains are
-defeatable via the `EDGEFIRST_DISABLE_*` and `EDGEFIRST_FORCE_*`
-environment variables for testing and benchmarking.
+the specific (src/dst format, memory type, operation) tuple — G2D
+declines anything that requires GPU compute (e.g. mask compositing,
+fused proto draws), and the CPU backend acts as the universal floor.
+GL handles tricky platform cases via in-backend workarounds (for
+example, NV12 → PlanarRgb on Vivante uses an automatic two-pass path
+within the GL backend rather than declining) — only true capability
+gaps cascade down the chain. Use `EDGEFIRST_FORCE_BACKEND=...` to pin
+a single backend (still falls back to CPU only if the forced backend
+is missing). The `Tensor::new()` allocator chains DMA → SHM → Mem with
+the same probe-once philosophy but always uses the first viable
+backend per call. Both chains are defeatable via the
+`EDGEFIRST_DISABLE_*` and `EDGEFIRST_FORCE_*` environment variables
+for testing and benchmarking.
 
 ### 6. Type-safe foreign interfaces
 

@@ -45,7 +45,7 @@ struct churn — only the function signatures form the stable contract.
 |--------|-------|-----------|
 | `struct hal_tensor *` | `edgefirst_tensor::TensorDyn` | `hal_tensor_free` |
 | `struct hal_tensor_map *` | `TensorMap<T>` (RAII guard) | `hal_tensor_map_unmap` |
-| `struct hal_plane_descriptor *` | `edgefirst_tensor::PlaneDescriptor` | (consumed by `hal_import_image`, never freed by caller) |
+| `struct hal_plane_descriptor *` | `edgefirst_tensor::PlaneDescriptor` | `hal_plane_descriptor_free` if NOT consumed by `hal_import_image`; the import call takes ownership on success, so the caller must only free descriptors on abort/error paths before calling import |
 | `struct hal_image_processor *` | `edgefirst_image::ImageProcessor` | `hal_image_processor_free` |
 | `struct hal_decoder *` | `edgefirst_decoder::Decoder` | `hal_decoder_free` |
 | `struct hal_decoder_params *` | `edgefirst_decoder::DecoderBuilder` (in-progress) | consumed by `hal_decoder_new` |
