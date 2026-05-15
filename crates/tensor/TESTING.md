@@ -23,7 +23,7 @@ files alongside the implementation.
 
 All `cargo test` invocations below pass `-- --test-threads=1` per the
 workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
 
 ```bash
 # All tensor tests on the host

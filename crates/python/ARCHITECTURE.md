@@ -11,9 +11,14 @@ and `.pyi` stubs for IDE autocompletion. The binding uses
 building.
 
 The crate is published to PyPI as
-[`edgefirst-hal`](https://pypi.org/project/edgefirst-hal/). Pre-built wheels
-ship for Linux x86_64 / aarch64 (manylinux2014 + abi3-py38), macOS Apple
-Silicon, and Windows.
+[`edgefirst-hal`](https://pypi.org/project/edgefirst-hal/). Pre-built
+wheels ship two stable-ABI variants per platform — `abi3-py311`
+(preferred; supports buffer-protocol features added in 3.11) and
+`abi3-py38` (compatibility fallback for 3.8–3.10). Coverage:
+Linux x86_64 / aarch64 (manylinux2014), macOS Apple Silicon, and
+Windows. Pip selects the best wheel automatically. The full wheel
+build matrix lives in
+[`.github/workflows/release.yml`](https://github.com/EdgeFirstAI/hal/blob/main/.github/workflows/release.yml).
 
 ## Module Map
 

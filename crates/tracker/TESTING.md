@@ -20,7 +20,7 @@ API.
 
 All `cargo test` invocations below pass `-- --test-threads=1` per the
 workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
 The tracker is CPU-only, but the rule applies workspace-wide so commands
 stay consistent and copy-pasteable across crates.
 

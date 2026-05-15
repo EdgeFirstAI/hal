@@ -66,9 +66,13 @@ processor.draw_masks(decoder, [output0, output1], output)
 
 **Rust:**
 
+The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
+so a single `edgefirst-hal = "0.22"` dependency is enough — no need to
+list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
+
 ```rust
-use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{PixelFormat, DType};
+use edgefirst_hal::image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_hal::tensor::{PixelFormat, DType};
 
 let bytes = std::fs::read("image.jpg")?;
 let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
@@ -76,6 +80,12 @@ let mut processor = ImageProcessor::new()?;
 let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
 processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
 ```
+
+If you prefer to depend on the sub-crates directly (e.g. to opt out of
+features or to track them at independent versions), add the relevant
+`edgefirst-image`, `edgefirst-tensor`, `edgefirst-decoder`, and
+`edgefirst-tracker` entries to your `Cargo.toml` and use the
+unprefixed `edgefirst_image::*` / `edgefirst_tensor::*` paths above.
 
 **C:**
 
@@ -310,11 +320,14 @@ frame.
 
 ### Rule 5 — One `ImageProcessor` per pipeline
 
-`ImageProcessor` owns its EGL display, OpenGL context, GL thread, and EGL
-image cache. Two instances do not share caches and serialize on a global
-`GL_MUTEX`. Construct one per pipeline (or one per worker thread for
-parallel pipelines) and share it across all `convert()`, `draw_*()`, and
-`create_image()` calls.
+`ImageProcessor` owns its OpenGL context, dedicated GL thread, and EGL
+image cache. The EGL **display** itself is process-global (a shared
+`SharedEglDisplay` initialized once and never terminated), so additional
+processors don't pay the display-creation cost — but each one still
+creates a fresh context and per-instance caches, and all GL operations
+across every processor serialize on a global `GL_MUTEX`. Construct one
+per pipeline (or one per worker thread for parallel pipelines) and share
+it across all `convert()`, `draw_*()`, and `create_image()` calls.
 
 `ImageProcessor` is `Send + Sync`, so it can be moved or shared across
 threads. Concurrent use of a single shared instance still serializes on
@@ -429,7 +442,8 @@ caller code.
 
 | Document | Level | Use it for |
 |----------|-------|------------|
-| [ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#performance-considerations) | Architecture | Why the rules exist: `BufferIdentity`, EGL image cache, GL serialization |
+| [ARCHITECTURE.md § Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | Why the rules exist: `BufferIdentity`, EGL image cache, fd-recycling, downstream cache keying |
+| [image/ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#performance-considerations) | Architecture | GL serialization (`GL_MUTEX`), backend dispatch, per-instance caches |
 | [ARCHITECTURE.md § Appendix C](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | The full v4l2 / GStreamer fd-recycling story and the inode-keyed cache pattern |
 | [TESTING.md § Validating Optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations) | Testing | Confirming your integration follows the rules |
 | [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) | Benchmarks | Empirical cost of breaking each rule, per platform |

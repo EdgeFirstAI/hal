@@ -13,7 +13,12 @@ crates/decoder/
 │   ├── per_scale/
 │   │   ├── pipeline.rs                 # Per-scale pipeline correctness tests
 │   │   ├── plan.rs                     # Schema → Plan validation tests
-│   │   └── helper.rs                   # NEON kernel unit tests
+│   │   ├── helper.rs                   # Per-scale helper math unit tests
+│   │   └── kernels/                    # NEON kernel unit tests
+│   │       ├── neon_baseline.rs        # Scalar reference + NEON parity
+│   │       ├── dequant.rs              # Quant → float dequant kernels
+│   │       ├── sigmoid.rs / softmax.rs # Activation kernels
+│   │       └── level_box.rs / level_score.rs / level_mc.rs
 │   └── schema.rs                       # SchemaV2 round-trip + fixture tests
 ├── tests/                              # Cross-cutting integration suites
 │   ├── decoder_capacity.rs
@@ -30,7 +35,7 @@ crates/decoder/
 
 All `cargo test` invocations below pass `-- --test-threads=1` per the
 workspace single-threaded rule
-([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#why-single-threaded-execution)).
+([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
 Decoder tests are CPU-only, but the rule applies workspace-wide so commands
 stay consistent and copy-pasteable across crates.
 
@@ -58,7 +63,7 @@ cargo test -p edgefirst-decoder --doc
 - **No hardware gates.** All decoder tests run on any host; there is no GPU
   or NPU dependency.
 - **`tracker` feature** — gates the `decode_tracked` test paths. Run
-  `cargo test -p edgefirst-decoder --features tracker` to exercise them.
+  `cargo test -p edgefirst-decoder --features tracker -- --test-threads=1` to exercise them.
 - **Per-scale fixtures** — synthetic schemas under
   [`testdata/per_scale/`](https://github.com/EdgeFirstAI/hal/tree/main/testdata/per_scale)
   validate the per-scale planner against multiple split-tensor topologies

@@ -29,7 +29,7 @@ lives in each sub-crate's `TESTING.md`:
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
 | `make test-capi` | Build the C library and run C API integration tests |
-| `make bench` | Run Rust criterion benchmarks |
+| `make bench` | Run the workspace Rust benchmarks (custom `harness = false` binaries backed by [`crates/bench`](https://github.com/EdgeFirstAI/hal/tree/main/crates/bench); not Criterion) |
 | `make build` | Build with coverage instrumentation (profiling profile) |
 | `make format lint check` | Pre-commit gate — required before every commit |
 
@@ -127,11 +127,19 @@ enforces this automatically via `cargo llvm-cov nextest ... -j 1`.
 
 Three independent constraints each require it:
 
-1. **EGL display sharing** — when multiple tests run in parallel threads
-   within one process, `eglTerminate` on one thread can tear down a
-   shared EGL display while other threads still reference it. This
-   causes intermittent failures that are difficult to reproduce and
-   platform-dependent.
+1. **GL driver concurrency bugs** — the HAL uses a process-global EGL
+   display (`SharedEglDisplay`) that is intentionally never terminated,
+   but the embedded GPU drivers it sits on top of still corrupt
+   driver-internal state under concurrent operations on that shared
+   display. Vivante `galcore` (i.MX 8M Plus) hits SIGSEGV at offset
+   `0x18` in its ioctl path and futex deadlocks when context creation,
+   DMA-BUF import, or draw commands overlap across threads; Broadcom
+   V3D 7.1.10.2 (Raspberry Pi 5) drops affected contexts into
+   `EGL(NotInitialized)` under similar pressure. The HAL's `GL_MUTEX`
+   serializes every GL/EGL call at runtime to keep this safe;
+   `--test-threads=1` extends the same discipline to test harness
+   processes, since `cargo nextest` runs each test in its own process
+   but multiple test processes still share the GPU driver state.
 2. **G2D driver state** — the `galcore` kernel driver maintains
    per-process state that is unsafe to access from concurrent threads
    creating and destroying G2D contexts.
