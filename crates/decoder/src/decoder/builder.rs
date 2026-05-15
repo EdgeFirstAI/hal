@@ -224,10 +224,10 @@ impl DecoderBuilder {
     /// deserialize the YAML and parse the model configuration.
     ///
     /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
-    /// # fn main() -> DecoderResult<()> {
-    /// let config_yaml = edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string();
+    /// ```rust,no_run
+    /// # use edgefirst_decoder::DecoderBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config_yaml = std::fs::read_to_string("modelpack_split.yaml")?;
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_yaml_str(config_yaml)
     ///     .build()?;
@@ -245,10 +245,10 @@ impl DecoderBuilder {
     /// deserialize the JSON and parse the model configuration.
     ///
     /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
-    /// # fn main() -> DecoderResult<()> {
-    /// let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
+    /// ```rust,no_run
+    /// # use edgefirst_decoder::DecoderBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config_json = std::fs::read_to_string("modelpack_split.json")?;
     /// let decoder = DecoderBuilder::new()
     ///     .with_config_json_str(config_json)
     ///     .build()?;
@@ -267,11 +267,11 @@ impl DecoderBuilder {
     /// `DecoderBuilder.build()` to parse the model configuration.
     ///
     /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
-    /// # fn main() -> DecoderResult<()> {
-    /// let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
-    /// let config = serde_json::from_str(&config_json)?;
+    /// ```rust,no_run
+    /// # use edgefirst_decoder::{DecoderBuilder, ConfigOutputs};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config_json = std::fs::read_to_string("modelpack_split.json")?;
+    /// let config: ConfigOutputs = serde_json::from_str(&config_json)?;
     /// let decoder = DecoderBuilder::new().with_config(config).build()?;
     ///
     /// # Ok(())

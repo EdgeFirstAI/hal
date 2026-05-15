@@ -141,7 +141,7 @@ jobs:
           echo "=== DMA heap ===" && ls -la /dev/dma_heap/ 2>/dev/null || echo "Not found"
           echo "=== G2D ===" && ls -la /dev/galcore 2>/dev/null || echo "Not found"
 
-          export EDGEFIRST_TESTDATA=$(pwd)/testdata
+          export EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata
 
           for bench in benchmark-binaries/*; do
             if [ -f "$bench" ] && [ -x "$bench" ]; then
@@ -202,7 +202,7 @@ jobs:
           uname -a
           python3 --version
 
-          export EDGEFIRST_TESTDATA=$(pwd)/testdata
+          export EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata
 
           # Run pytest-benchmark if benchmark files exist
           if find tests/ -name "bench_*.py" -o -name "*_bench.py" | grep -q .; then
