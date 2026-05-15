@@ -106,7 +106,7 @@ nodes are absent.
 | `/dev/dma_heap/linux,cma` or `/dev/dma_heap/system` | DMA-BUF tensor allocation tests |
 | `/dev/galcore` | G2D hardware acceleration tests |
 | `/dev/neutron0` | Neutron NPU DMA-BUF EGLImage tests |
-| `/dev/dri/renderD128` | DRM render node; required for DMA-buf backend |
+| `/dev/dri/renderD128` (preferred) or `/dev/dri/card0` / `/dev/dri/card1` | DRM render/card node; the GL context opens the first that exists, so any one is sufficient |
 
 The hardware-gated test pattern (a single `OnceLock<bool>` probe that
 short-circuits on missing devices) is documented in
@@ -515,7 +515,7 @@ Tests run across multiple runner types:
 |-----|--------|--------------|----------|
 | Build & Test (x86_64) | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
 | Doc Tests | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
-| Build & Test (macOS) | `macos-latest` | x86_64 / arm64 | No GPU |
+| Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | No GPU |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
 | Hardware Test (imx8mp) | `nxp-imx8mp-latest` | aarch64 | G2D, DMA-heap |

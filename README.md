@@ -236,9 +236,11 @@ every destination passed to `convert()`; direct `Tensor::new(memory=...)`
 bypasses the probe.
 
 For DMA-buf access, the process needs `/dev/dma_heap/{linux,cma|system}`
-and `/dev/dri/renderD128`. On embedded Linux, add the user to `video` and
-`render` groups, or set udev rules. If DMA-buf fails, `create_image()`
-transparently falls back to PBO or heap.
+and a DRM render/card node — the GL backend probes
+`/dev/dri/renderD128`, then `/dev/dri/card0`, then `/dev/dri/card1` and
+uses the first one that opens. On embedded Linux, add the user to
+`video` and `render` groups, or set udev rules. If DMA-buf fails,
+`create_image()` transparently falls back to PBO or heap.
 
 ### Rule 3 — Cache imported camera tensors by inode, not by fd
 
@@ -344,9 +346,9 @@ dynamic dispatch, baking them in would SIGILL on older CPUs.
 For local benchmarking on supporting hosts, enable them via `RUSTFLAGS`:
 
 ```bash
-# Orin Nano (Cortex-A78AE)
+# Orin Nano (Cortex-A78AE) — exclude the PyO3 binding (cross-Python toolchain not configured)
 RUSTFLAGS="-C target-cpu=cortex-a78ae" cargo build --release \
-  --target aarch64-unknown-linux-gnu --workspace
+  --target aarch64-unknown-linux-gnu --workspace --exclude edgefirst_hal
 
 # Generic aarch64 with FEAT_FP16 (do NOT use on Cortex-A53 / imx8mp)
 RUSTFLAGS="-C target-feature=+fp16" cargo build --release \
@@ -442,9 +444,8 @@ caller code.
 
 | Document | Level | Use it for |
 |----------|-------|------------|
-| [ARCHITECTURE.md § Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | Why the rules exist: `BufferIdentity`, EGL image cache, fd-recycling, downstream cache keying |
+| [ARCHITECTURE.md § Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | Why the rules exist: `BufferIdentity`, EGL image cache, the v4l2 / GStreamer fd-recycling story, and the inode-keyed downstream cache pattern |
 | [image/ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#performance-considerations) | Architecture | GL serialization (`GL_MUTEX`), backend dispatch, per-instance caches |
-| [ARCHITECTURE.md § Appendix C](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | The full v4l2 / GStreamer fd-recycling story and the inode-keyed cache pattern |
 | [TESTING.md § Validating Optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations) | Testing | Confirming your integration follows the rules |
 | [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) | Benchmarks | Empirical cost of breaking each rule, per platform |
 

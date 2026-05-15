@@ -50,7 +50,7 @@ cargo test -p edgefirst-decoder --tests -- --test-threads=1
 cargo test -p edgefirst-decoder --test per_scale_parity -- --test-threads=1
 
 # Doc-tests only
-cargo test -p edgefirst-decoder --doc
+cargo test -p edgefirst-decoder --doc -- --test-threads=1
 ```
 
 ## Special Requirements

@@ -29,7 +29,7 @@ stay consistent and copy-pasteable across crates.
 cargo test -p edgefirst-tracker -- --test-threads=1
 
 # Doc-tests only
-cargo test -p edgefirst-tracker --doc
+cargo test -p edgefirst-tracker --doc -- --test-threads=1
 
 # Single test
 cargo test -p edgefirst-tracker bytetrack::tests::two_pass_recovery -- --test-threads=1
@@ -39,8 +39,13 @@ cargo test -p edgefirst-tracker bytetrack::tests::two_pass_recovery -- --test-th
 
 - **No hardware gates.** The tracker is pure CPU; tests run identically on
   any host.
-- **No LFS testdata.** Detections are synthesized in-test (random walks
-  through a frame to exercise association and lifecycle paths).
+- **No LFS testdata.** Detections are synthesized in-test as
+  deterministic
+  [`MockDetection`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/lib.rs)
+  sequences (fixed coordinates per frame, hand-tuned to exercise
+  initial track creation, multi-pass association recovery, kill-on-miss
+  lifecycle, and class-aware matching). The benchmark harness uses a
+  similar deterministic grid.
 - **No feature flags.** All tests run under default features.
 
 ## Benchmarks
