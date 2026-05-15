@@ -39,10 +39,34 @@ dst = processor.create_image(640, 640, ef.PixelFormat.Rgb)
 # Convert with letterbox resize (preserves aspect ratio)
 processor.convert(src, dst)
 
-# Access pixel data as a numpy array
+# Access pixel data as a numpy array. Use the context manager + .view()
+# form — this is the portable pattern that works on both wheel variants.
 import numpy as np
-pixels = np.frombuffer(dst.map(), dtype=np.uint8).reshape(dst.shape())
+with dst.map() as m:
+    pixels = np.frombuffer(m.view(), dtype=np.uint8).reshape(dst.shape())
+
+# The shorter `np.frombuffer(dst.map(), ...)` form only works on the
+# abi3-py311 wheel, where `TensorMap` exposes Python's buffer protocol
+# directly. The abi3-py38 compatibility wheel disables `__getbuffer__`,
+# so use `.view()` if your code needs to run on Python 3.8–3.10.
 ```
+
+## Role in edgefirst-hal
+
+The `edgefirst-hal` package on PyPI is the Python face of the EdgeFirst
+HAL Rust workspace:
+
+- Built from [`crates/python`](https://github.com/EdgeFirstAI/hal/tree/main/crates/python),
+  which is a PyO3 binding over the `edgefirst-hal` Rust umbrella crate.
+- Does **not** consume the C API ([`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/));
+  the binding goes directly through Rust.
+- Exposes the same `Tensor`, `ImageProcessor`, `Decoder`, and `Tracker`
+  surfaces as the Rust crate, with numpy-friendly conversions and the
+  buffer protocol for zero-copy interop.
+- Wheels are distributed as two stable-ABI variants per platform —
+  `abi3-py311` (preferred, supports buffer protocol features added in
+  3.11) and `abi3-py38` (compatibility fallback for 3.8–3.10).
+  Pip selects the best wheel automatically.
 
 ## Key Features
 
@@ -233,6 +257,13 @@ fall back to CPU.
   same library directly from Rust or C
 - **[GitHub](https://github.com/EdgeFirstAI/hal)** — source code,
   architecture docs, benchmarks, and contribution guide
+
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/TESTING.md)
+- Project README (cross-language overview): [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
+- Optimization guide (cross-language user rules): [README.md#optimization-guide](https://github.com/EdgeFirstAI/hal/blob/main/README.md#optimization-guide)
 
 ## License
 

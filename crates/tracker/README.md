@@ -8,6 +8,16 @@
 
 This crate provides object tracking algorithms for associating detections across video frames, enabling applications like counting, path analysis, and re-identification.
 
+## Role in edgefirst-hal
+
+`edgefirst-tracker` is an optional component of the EdgeFirst HAL workspace.
+It has no dependency on any other `edgefirst-*` crate; instead, it is consumed
+as a feature by the decoder and image crates:
+
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) calls `Tracker::update` from `decode_tracked()`.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Color stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order coloring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
+- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) re-exports the crate as `edgefirst_hal::tracker`.
+
 ## Algorithms
 
 | Algorithm | Description | Use Case |
@@ -167,6 +177,13 @@ decoder.decode_tracked(
 - `output_boxes` — decoded detection boxes
 - `output_masks` — segmentation masks (empty if the model has no mask head)
 - `output_tracks` — `Vec<TrackInfo>` with one entry per matched detection
+
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md)
+- Full API reference: [docs.rs/edgefirst-tracker](https://docs.rs/edgefirst-tracker)
+- Project README: [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
 
 ## License
 
