@@ -7,6 +7,10 @@
 //! making it safe for GPU hardware that cannot survive `fork()` (EGL, G2D,
 //! Vulkan).
 //!
+//! The [`testdata`] module provides runtime testdata resolution so that
+//! tests and benches can load fixtures from disk instead of embedding them
+//! into binaries with `include_bytes!` / `include_str!`.
+//!
 //! # Usage
 //!
 //! ```rust,no_run
@@ -19,6 +23,8 @@
 //! // or with throughput:
 //! result.print_summary_with_throughput(1920 * 1080 * 4);
 //! ```
+
+pub mod testdata;
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

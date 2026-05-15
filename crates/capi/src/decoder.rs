@@ -2817,10 +2817,7 @@ outputs:
 ";
         unsafe {
             // Load the yolov8s test data (i8 quantized, shape [1, 84, 8400])
-            let raw = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8s_80_classes.bin"
-            ));
+            let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
             let quant_scale: f32 = 0.0040811873;
 
             // Build decoder from YAML config
@@ -2851,7 +2848,7 @@ outputs:
             assert!(!tensor.is_null());
 
             // Copy initial data
-            copy_data_to_tensor(tensor, raw);
+            copy_data_to_tensor(tensor, &raw);
 
             // --- Frame 0: initial decode ---
             let outputs = [tensor as *const HalTensor];
@@ -3577,10 +3574,7 @@ outputs:
 ";
         unsafe {
             // Load the yolov8s test data (i8 quantized, shape [1, 84, 8400])
-            let raw = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/yolov8s_80_classes.bin"
-            ));
+            let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
             let raw = std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len());
             let quant = (0.0040811873, -123);
 
