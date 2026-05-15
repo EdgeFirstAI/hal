@@ -214,21 +214,34 @@ impl BenchConfig {
 }
 
 // =============================================================================
-// Embedded Test Data
+// Test Data (loaded from testdata/ at first access; resolution via
+// EDGEFIRST_TESTDATA_DIR or workspace fallback — see edgefirst_bench::testdata)
 // =============================================================================
 
-pub const CAMERA_720P_YUYV: &[u8] = include_bytes!("../../../testdata/camera720p.yuyv");
-pub const CAMERA_720P_VYUY: &[u8] = include_bytes!("../../../testdata/camera720p.vyuy");
-pub const CAMERA_720P_NV12: &[u8] = include_bytes!("../../../testdata/camera720p.nv12");
-pub const CAMERA_720P_RGB: &[u8] = include_bytes!("../../../testdata/camera720p.rgb");
-pub const CAMERA_1080P_YUYV: &[u8] = include_bytes!("../../../testdata/camera1080p.yuyv");
-pub const CAMERA_1080P_NV12: &[u8] = include_bytes!("../../../testdata/camera1080p.nv12");
-pub const CAMERA_1080P_RGB: &[u8] = include_bytes!("../../../testdata/camera1080p.rgb");
-pub const CAMERA_1080P_VYUY: &[u8] = include_bytes!("../../../testdata/camera1080p.vyuy");
-pub const CAMERA_4K_YUYV: &[u8] = include_bytes!("../../../testdata/camera4k.yuyv");
-pub const CAMERA_4K_VYUY: &[u8] = include_bytes!("../../../testdata/camera4k.vyuy");
-pub const CAMERA_4K_NV12: &[u8] = include_bytes!("../../../testdata/camera4k.nv12");
-pub const CAMERA_4K_RGB: &[u8] = include_bytes!("../../../testdata/camera4k.rgb");
+pub static CAMERA_720P_YUYV: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.yuyv"));
+pub static CAMERA_720P_VYUY: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.vyuy"));
+pub static CAMERA_720P_NV12: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.nv12"));
+pub static CAMERA_720P_RGB: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera720p.rgb"));
+pub static CAMERA_1080P_YUYV: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.yuyv"));
+pub static CAMERA_1080P_NV12: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.nv12"));
+pub static CAMERA_1080P_RGB: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.rgb"));
+pub static CAMERA_1080P_VYUY: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera1080p.vyuy"));
+pub static CAMERA_4K_YUYV: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.yuyv"));
+pub static CAMERA_4K_VYUY: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.vyuy"));
+pub static CAMERA_4K_NV12: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.nv12"));
+pub static CAMERA_4K_RGB: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("camera4k.rgb"));
 
 // NV16 is 4:2:2 semi-planar: Y plane (W*H) + interleaved UV plane (W*H).
 // No real capture file available; synthetic mid-gray data is sufficient for
@@ -243,20 +256,20 @@ static CAMERA_1080P_RGBA: LazyLock<Vec<u8>> = LazyLock::new(|| vec![128u8; 1920 
 /// Get embedded test data for a given resolution and format.
 pub fn get_test_data(width: usize, height: usize, format: PixelFormat) -> &'static [u8] {
     match (width, height, format) {
-        (1280, 720, PixelFormat::Yuyv) => CAMERA_720P_YUYV,
-        (1280, 720, PixelFormat::Vyuy) => CAMERA_720P_VYUY,
-        (1280, 720, PixelFormat::Nv12) => CAMERA_720P_NV12,
-        (1280, 720, PixelFormat::Rgb) => CAMERA_720P_RGB,
-        (1920, 1080, PixelFormat::Yuyv) => CAMERA_1080P_YUYV,
-        (1920, 1080, PixelFormat::Vyuy) => CAMERA_1080P_VYUY,
-        (1920, 1080, PixelFormat::Nv12) => CAMERA_1080P_NV12,
+        (1280, 720, PixelFormat::Yuyv) => &CAMERA_720P_YUYV,
+        (1280, 720, PixelFormat::Vyuy) => &CAMERA_720P_VYUY,
+        (1280, 720, PixelFormat::Nv12) => &CAMERA_720P_NV12,
+        (1280, 720, PixelFormat::Rgb) => &CAMERA_720P_RGB,
+        (1920, 1080, PixelFormat::Yuyv) => &CAMERA_1080P_YUYV,
+        (1920, 1080, PixelFormat::Vyuy) => &CAMERA_1080P_VYUY,
+        (1920, 1080, PixelFormat::Nv12) => &CAMERA_1080P_NV12,
         (1920, 1080, PixelFormat::Nv16) => &CAMERA_1080P_NV16,
-        (1920, 1080, PixelFormat::Rgb) => CAMERA_1080P_RGB,
+        (1920, 1080, PixelFormat::Rgb) => &CAMERA_1080P_RGB,
         (1920, 1080, PixelFormat::Rgba) => &CAMERA_1080P_RGBA,
-        (3840, 2160, PixelFormat::Yuyv) => CAMERA_4K_YUYV,
-        (3840, 2160, PixelFormat::Vyuy) => CAMERA_4K_VYUY,
-        (3840, 2160, PixelFormat::Nv12) => CAMERA_4K_NV12,
-        (3840, 2160, PixelFormat::Rgb) => CAMERA_4K_RGB,
+        (3840, 2160, PixelFormat::Yuyv) => &CAMERA_4K_YUYV,
+        (3840, 2160, PixelFormat::Vyuy) => &CAMERA_4K_VYUY,
+        (3840, 2160, PixelFormat::Nv12) => &CAMERA_4K_NV12,
+        (3840, 2160, PixelFormat::Rgb) => &CAMERA_4K_RGB,
         _ => panic!("No test data for {}x{} {:?}", width, height, format),
     }
 }

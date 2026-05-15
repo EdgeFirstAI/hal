@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 /// Used to represent the outputs in the model configuration.
 /// # Examples
-/// ```rust
-/// # use edgefirst_decoder::{DecoderBuilder, DecoderResult, ConfigOutputs};
-/// # fn main() -> DecoderResult<()> {
-/// let config_json = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/modelpack_split.json"));
-/// let config: ConfigOutputs = serde_json::from_str(config_json)?;
+/// ```rust,no_run
+/// # use edgefirst_decoder::{DecoderBuilder, ConfigOutputs};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config_json = std::fs::read_to_string("modelpack_split.json")?;
+/// let config: ConfigOutputs = serde_json::from_str(&config_json)?;
 /// let decoder = DecoderBuilder::new().with_config(config).build()?;
 ///
 /// # Ok(())

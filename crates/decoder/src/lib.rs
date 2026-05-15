@@ -879,28 +879,19 @@ mod decoder_tests {
     // ─── Shared test data loaders ────────────────────────
 
     fn load_yolov8_boxes() -> Array3<i8> {
-        let raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
         Array3::from_shape_vec((1, 116, 8400), raw.to_vec()).unwrap()
     }
 
     fn load_yolov8_protos() -> Array4<i8> {
-        let raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
         Array4::from_shape_vec((1, 160, 160, 32), raw.to_vec()).unwrap()
     }
 
     fn load_yolov8s_det() -> Array3<i8> {
-        let raw = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
+        let raw = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const i8, raw.len()) };
         Array3::from_shape_vec((1, 84, 8400), raw.to_vec()).unwrap()
     }
@@ -909,16 +900,10 @@ mod decoder_tests {
     fn test_decoder_modelpack() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_boxes_1935x1x4.bin"
-        ));
+        let boxes = edgefirst_bench::testdata::read("modelpack_boxes_1935x1x4.bin");
         let boxes = ndarray::Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
 
-        let scores = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_scores_1935x1.bin"
-        ));
+        let scores = edgefirst_bench::testdata::read("modelpack_scores_1935x1.bin");
         let scores = ndarray::Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
 
         let quant_boxes = (0.004656755365431309, 21).into();
@@ -1016,16 +1001,10 @@ mod decoder_tests {
     fn test_decoder_modelpack_split_u8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let detect0 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_9x15x18.bin"
-        ));
+        let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_17x30x18.bin"
-        ));
+        let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let quant0 = (0.08547406643629074, 174).into();
@@ -1142,25 +1121,15 @@ mod decoder_tests {
     fn test_decoder_parse_config_modelpack_split_u8() {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
-        let detect0 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_9x15x18.bin"
-        ));
+        let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_17x30x18.bin"
-        ));
+        let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let decoder = DecoderBuilder::default()
             .with_config_yaml_str(
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/modelpack_split.yaml"
-                ))
-                .to_string(),
+                edgefirst_bench::testdata::read_to_string("modelpack_split.yaml").to_string(),
             )
             .with_score_threshold(score_threshold)
             .with_iou_threshold(iou_threshold)
@@ -1196,10 +1165,7 @@ mod decoder_tests {
 
     #[test]
     fn test_modelpack_seg() {
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_seg_2x160x160.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin");
         let out = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
         let quant = (1.0 / 255.0, 0).into();
 
@@ -1258,10 +1224,7 @@ mod decoder_tests {
     }
     #[test]
     fn test_modelpack_seg_quant() {
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_seg_2x160x160.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin");
         let out_u8 = ndarray::Array4::from_shape_vec((1, 2, 160, 160), out.to_vec()).unwrap();
         let out_i8 = out_u8.mapv(|x| (x as i16 - 128) as i8);
         let out_u16 = out_u8.mapv(|x| (x as u16) << 8);
@@ -1359,22 +1322,13 @@ mod decoder_tests {
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
 
-        let boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_boxes_1935x1x4.bin"
-        ));
+        let boxes = edgefirst_bench::testdata::read("modelpack_boxes_1935x1x4.bin");
         let boxes = Array4::from_shape_vec((1, 1935, 1, 4), boxes.to_vec()).unwrap();
 
-        let scores = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_scores_1935x1.bin"
-        ));
+        let scores = edgefirst_bench::testdata::read("modelpack_scores_1935x1.bin");
         let scores = Array3::from_shape_vec((1, 1935, 1), scores.to_vec()).unwrap();
 
-        let seg = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_seg_2x160x160.bin"
-        ));
+        let seg = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin");
         let seg = Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
         let quant_boxes = (0.004656755365431309, 21).into();
@@ -1485,22 +1439,13 @@ mod decoder_tests {
         let score_threshold = 0.8;
         let iou_threshold = 0.5;
 
-        let seg = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_seg_2x160x160.bin"
-        ));
+        let seg = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin");
         let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
-        let detect0 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_9x15x18.bin"
-        ));
+        let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
         let detect0 = ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-        let detect1 = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split_17x30x18.bin"
-        ));
+        let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
         let detect1 = ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
         let quant0 = (0.08547406643629074, 174).into();
@@ -1857,10 +1802,7 @@ mod decoder_tests {
             1.0 / 160.0, // wider range because mask will expand the box
         ));
 
-        let full_mask = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_mask_results.bin"
-        ));
+        let full_mask = edgefirst_bench::testdata::read("yolov8_mask_results.bin");
         let full_mask = ndarray::Array2::from_shape_vec((160, 160), full_mask.to_vec()).unwrap();
 
         let cropped_mask = full_mask.slice(ndarray::s![
@@ -2323,10 +2265,7 @@ mod decoder_tests {
     }
 
     fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
+        let config_yaml = edgefirst_bench::testdata::read_to_string("yolov8_seg.yaml");
         DecoderBuilder::default()
             .with_config_yaml_str(config_yaml.to_string())
             .with_score_threshold(score_threshold)
@@ -2470,23 +2409,14 @@ mod decoder_tests {
             let score_threshold = 0.8;
             let iou_threshold = 0.5;
 
-            let seg = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_seg_2x160x160.bin"
-            ));
+            let seg = edgefirst_bench::testdata::read("modelpack_seg_2x160x160.bin");
             let seg = ndarray::Array4::from_shape_vec((1, 2, 160, 160), seg.to_vec()).unwrap();
 
-            let detect0 = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_split_9x15x18.bin"
-            ));
+            let detect0 = edgefirst_bench::testdata::read("modelpack_split_9x15x18.bin");
             let detect0 =
                 ndarray::Array4::from_shape_vec((1, 9, 15, 18), detect0.to_vec()).unwrap();
 
-            let detect1 = include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../testdata/modelpack_split_17x30x18.bin"
-            ));
+            let detect1 = edgefirst_bench::testdata::read("modelpack_split_17x30x18.bin");
             let detect1 =
                 ndarray::Array4::from_shape_vec((1, 17, 30, 18), detect1.to_vec()).unwrap();
 
@@ -2965,20 +2895,14 @@ mod decoder_tests {
                 let quant_boxes = (0.021287762_f32, 31_i32);
                 let quant_protos = (0.02491162_f32, -117_i32);
 
-                let raw_boxes = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_boxes_116x8400.bin"
-                ));
+                let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
                 let raw_boxes = unsafe {
                     std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
                 };
                 let boxes_i8 =
                     ndarray::Array3::from_shape_vec((1, 116, 8400), raw_boxes.to_vec()).unwrap();
 
-                let raw_protos = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_protos_160x160x32.bin"
-                ));
+                let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
                 let raw_protos = unsafe {
                     std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
                 };
@@ -3035,10 +2959,7 @@ mod decoder_tests {
                 let quant_boxes = (0.021287762_f32, 31_i32);
                 let quant_protos = (0.02491162_f32, -117_i32);
 
-                let raw_boxes = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_boxes_116x8400.bin"
-                ));
+                let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
                 let raw_boxes = unsafe {
                     std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
                 };
@@ -3047,10 +2968,7 @@ mod decoder_tests {
                 let boxes_f32: Array3<f32> =
                     dequantize_ndarray(boxes_i8.view(), quant_boxes.into());
 
-                let raw_protos = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_protos_160x160x32.bin"
-                ));
+                let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
                 let raw_protos = unsafe {
                     std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
                 };
@@ -3638,10 +3556,7 @@ outputs:
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
 
-        let raw_boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let raw_boxes =
             unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
         let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
@@ -3652,10 +3567,7 @@ outputs:
             .copy_from_slice(raw_boxes);
         let boxes_i8 = boxes_i8.into();
 
-        let raw_protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let raw_protos = unsafe {
             std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
         };
@@ -3687,10 +3599,7 @@ outputs:
 
         let quant_boxes = (0.021287762_f32, 31_i32);
         let quant_protos = (0.02491162_f32, -117_i32);
-        let raw_boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let raw_boxes =
             unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
         let mut raw_boxes_f32 = vec![0f32; raw_boxes.len()];
@@ -3703,10 +3612,7 @@ outputs:
             .copy_from_slice(&raw_boxes_f32);
         let boxes_f32 = boxes_f32.into();
 
-        let raw_protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let raw_protos = unsafe {
             std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
         };
@@ -3745,10 +3651,7 @@ outputs:
 
         let quant_boxes = (0.021287762_f32, 31_i32);
         let quant_protos = (0.02491162_f32, -117_i32);
-        let raw_boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let raw_boxes =
             unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
         let mut raw_boxes_f64 = vec![0f64; raw_boxes.len()];
@@ -3761,10 +3664,7 @@ outputs:
             .copy_from_slice(&raw_boxes_f64);
         let boxes_f64 = boxes_f64.into();
 
-        let raw_protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let raw_protos = unsafe {
             std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
         };
@@ -3801,10 +3701,7 @@ outputs:
         let score_threshold = 0.45;
         let iou_threshold = 0.45;
 
-        let raw_boxes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_boxes_116x8400.bin"
-        ));
+        let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let raw_boxes =
             unsafe { std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len()) };
         let boxes_i8: Tensor<i8> = Tensor::new(&[1, 116, 8400], None, None).unwrap();
@@ -3815,10 +3712,7 @@ outputs:
             .copy_from_slice(raw_boxes);
         let boxes_i8 = boxes_i8.into();
 
-        let raw_protos = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_protos_160x160x32.bin"
-        ));
+        let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let raw_protos = unsafe {
             std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
         };
@@ -4452,10 +4346,7 @@ mod decoder_tracked_tests {
 
         let score_threshold = 0.25;
         let iou_threshold = 0.1;
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
         let quant = (0.0040811873, -123).into();
@@ -4681,10 +4572,7 @@ mod decoder_tracked_tests {
     }
 
     fn build_yolov8_seg_decoder(score_threshold: f32, iou_threshold: f32) -> crate::Decoder {
-        let config_yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
+        let config_yaml = edgefirst_bench::testdata::read_to_string("yolov8_seg.yaml");
         DecoderBuilder::default()
             .with_config_yaml_str(config_yaml.to_string())
             .with_score_threshold(score_threshold)
@@ -4711,20 +4599,14 @@ mod decoder_tracked_tests {
                 let quant_boxes = (0.021287762_f32, 31_i32);
                 let quant_protos = (0.02491162_f32, -117_i32);
 
-                let raw_boxes = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_boxes_116x8400.bin"
-                ));
+                let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
                 let raw_boxes = unsafe {
                     std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
                 };
                 let boxes_i8 =
                     ndarray::Array3::from_shape_vec((1, 116, 8400), raw_boxes.to_vec()).unwrap();
 
-                let raw_protos = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_protos_160x160x32.bin"
-                ));
+                let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
                 let raw_protos = unsafe {
                     std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
                 };
@@ -4896,10 +4778,7 @@ mod decoder_tracked_tests {
                 let quant_boxes = (0.021287762_f32, 31_i32);
                 let quant_protos = (0.02491162_f32, -117_i32);
 
-                let raw_boxes = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_boxes_116x8400.bin"
-                ));
+                let raw_boxes = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
                 let raw_boxes = unsafe {
                     std::slice::from_raw_parts(raw_boxes.as_ptr() as *const i8, raw_boxes.len())
                 };
@@ -4907,10 +4786,7 @@ mod decoder_tracked_tests {
                     ndarray::Array3::from_shape_vec((1, 116, 8400), raw_boxes.to_vec()).unwrap();
                 let boxes_f32 = dequantize_ndarray(boxes_i8.view(), quant_boxes.into());
 
-                let raw_protos = include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../testdata/yolov8_protos_160x160x32.bin"
-                ));
+                let raw_protos = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
                 let raw_protos = unsafe {
                     std::slice::from_raw_parts(raw_protos.as_ptr() as *const i8, raw_protos.len())
                 };
@@ -6235,10 +6111,7 @@ outputs:
 
         let score_threshold = 0.25;
         let iou_threshold = 0.1;
-        let out = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8s_80_classes.bin"
-        ));
+        let out = edgefirst_bench::testdata::read("yolov8s_80_classes.bin");
         let out = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const i8, out.len()) };
         let mut out = Array3::from_shape_vec((1, 84, 8400), out.to_vec()).unwrap();
         let quant = (0.0040811873, -123).into();

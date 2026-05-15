@@ -633,6 +633,7 @@ name = "edgefirst-hal-capi"
 version = "0.22.0"
 dependencies = [
  "cbindgen",
+ "edgefirst-bench",
  "edgefirst-decoder",
  "edgefirst-hal",
  "edgefirst-image",

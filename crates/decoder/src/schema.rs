@@ -1356,14 +1356,17 @@ mod tests {
 
     #[test]
     fn fixtures_round_trip_through_serde() {
-        let yolov8 = include_str!("../../../testdata/per_scale/synthetic_yolov8n_schema.json");
-        let _: super::SchemaV2 = serde_json::from_str(yolov8).expect("yolov8n fixture must parse");
+        let yolov8 =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(&yolov8).expect("yolov8n fixture must parse");
 
-        let yolo26 = include_str!("../../../testdata/per_scale/synthetic_yolo26n_schema.json");
-        let _: super::SchemaV2 = serde_json::from_str(yolo26).expect("yolo26n fixture must parse");
+        let yolo26 =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolo26n_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(&yolo26).expect("yolo26n fixture must parse");
 
-        let flat = include_str!("../../../testdata/per_scale/synthetic_flat_schema.json");
-        let _: super::SchemaV2 = serde_json::from_str(flat).expect("flat fixture must parse");
+        let flat =
+            edgefirst_bench::testdata::read_to_string("per_scale/synthetic_flat_schema.json");
+        let _: super::SchemaV2 = serde_json::from_str(&flat).expect("flat fixture must parse");
     }
 
     #[test]
@@ -1802,11 +1805,8 @@ mod tests {
 
     #[test]
     fn parse_v1_yaml_yolov8_seg_testdata() {
-        let yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_seg.yaml"
-        ));
-        let schema = SchemaV2::parse_yaml(yaml).expect("parse v1 yaml");
+        let yaml = edgefirst_bench::testdata::read_to_string("yolov8_seg.yaml");
+        let schema = SchemaV2::parse_yaml(&yaml).expect("parse v1 yaml");
         assert_eq!(schema.schema_version, 2);
         assert_eq!(schema.outputs.len(), 2);
         // First output: Detection [1, 116, 8400]
@@ -1827,11 +1827,8 @@ mod tests {
 
     #[test]
     fn parse_v1_json_modelpack_split_testdata() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/modelpack_split.json"
-        ));
-        let schema = SchemaV2::parse_json(json).expect("parse v1 json");
+        let json = edgefirst_bench::testdata::read_to_string("modelpack_split.json");
+        let schema = SchemaV2::parse_json(&json).expect("parse v1 json");
         assert_eq!(schema.schema_version, 2);
         assert_eq!(schema.outputs.len(), 2);
         // Both are ModelPack anchor detection with anchors
@@ -2302,11 +2299,8 @@ mod tests {
 
     #[test]
     fn parse_real_ara2_int8_dvm_metadata() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/ara2_int8_edgefirst.json"
-        ));
-        let schema = SchemaV2::parse_json(json).expect("ARA-2 int8 parse");
+        let json = edgefirst_bench::testdata::read_to_string("ara2_int8_edgefirst.json");
+        let schema = SchemaV2::parse_json(&json).expect("ARA-2 int8 parse");
         assert_eq!(schema.schema_version, 2);
         assert_eq!(schema.decoder_version, Some(DecoderVersion::Yolov8));
         assert_eq!(schema.nms, Some(NmsMode::ClassAgnostic));
@@ -2347,11 +2341,8 @@ mod tests {
 
     #[test]
     fn parse_real_ara2_int16_dvm_metadata() {
-        let json = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/ara2_int16_edgefirst.json"
-        ));
-        let schema = SchemaV2::parse_json(json).expect("ARA-2 int16 parse");
+        let json = edgefirst_bench::testdata::read_to_string("ara2_int16_edgefirst.json");
+        let schema = SchemaV2::parse_json(&json).expect("ARA-2 int16 parse");
         assert_eq!(schema.schema_version, 2);
         assert_eq!(schema.outputs.len(), 4);
         let boxes = &schema.outputs[0];
