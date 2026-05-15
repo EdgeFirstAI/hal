@@ -7,12 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- `logical_to_legacy_config_output` is squeezing the padding dimension for
-  MPK "boxes" output shape, causing RuntimeError "Invalid ModelPack Boxes
-  shape [1, 1935, 4]". Added a condition to check if the decoder type is
-  ModelPack and not squeeze the padding dimension.
+## [0.22.1] - 2026-05-15
 
+### Added
+
+- **NEON SIMD optimizations for decoder post-processing pipeline** (DE-2557):
+  tiered dispatch with runtime CPU feature detection (NeonBase, FP16, DotProd,
+  I8MM). Key kernels:
+  - Fused softmax+weighted_sum: eliminates intermediate memory traffic by
+    computing in-register (2 passes instead of 5, saves 256 memory ops per
+    anchor).
+  - NEON weighted_sum with DotProd (`udot`) and I8MM (`usmmla`) fast paths.
+  - Vectorized dist2bbox (LTRB to XYXY) processing 4 boxes per iteration.
+  - Fused dequant+sigmoid with FP16 narrowing variant for A55+.
+  - NMS `jaccard_batch4`: vectorized IoU for 4 candidates simultaneously.
+  - Benchmark gains vs v0.22.0: **1.60–1.67×** on i.MX 8M Plus (A53),
+    **1.08–1.10×** on i.MX 95 (A55).
+
+- Apple Silicon NEON optimizations enabled for macOS CI (`+dotprod`, `+i8mm`
+  target features for `aarch64-apple-darwin`).
+
+- `BoundingBox` is now `#[repr(C)]` with compile-time size/alignment asserts,
+  guaranteeing 4 contiguous f32 fields for SIMD `vld1q_f32` loads.
+
+### Changed
+
+- Test fixtures migrated from `include_bytes!`/`include_str!` to runtime
+  reads via `edgefirst_bench::testdata` helper. Reduces binary sizes and
+  allows testdata to live outside the compiled artifact.
+
+- CI: upgraded GitHub Actions to latest upstream versions, x86_64 runners
+  to `ubuntu-22.04-xlarge`, and added binary stripping for hardware
+  deployment artifacts.
+
+### Fixed
+
+- `logical_to_legacy_config_output` squeezing the padding dimension for
+  ModelPack "boxes" output shape, causing `RuntimeError "Invalid ModelPack
+  Boxes shape [1, 1935, 4]"`. Added a condition to skip squeeze when the
+  decoder type is ModelPack (DE-2490).
 
 ## [0.22.0] - 2026-05-11
 
