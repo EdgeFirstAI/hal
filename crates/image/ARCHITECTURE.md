@@ -230,8 +230,8 @@ Key implications:
   making it safe to chain calls.
 
 See [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
-in the project ARCHITECTURE.md for the cross-crate cache story (V4L2 fd
-recycling, inode-keyed cache, `edgefirstcameraadaptor` integration).
+in the project ARCHITECTURE.md for the cross-crate cache story (V4L2
+fd recycling, inode-keyed cache, GStreamer adaptor integration).
 
 ### Vivante NV12 → PlanarRgb two-pass workaround
 
@@ -333,6 +333,44 @@ Control quantized proto interpolation via
 > i.MX 8M Plus without EGL), all `draw_*` methods return
 > `NotImplemented`. Use an OpenGL-capable processor (pass an
 > `egl_display`) or fall back to CPU rendering.
+
+#### Vivante shader performance cliff and the eager-materialize workaround
+
+The fused `draw_proto_masks` path is the preferred GPU pipeline on
+Mali / Panfrost (i.MX 95) and on desktop GPUs, where the per-pixel
+sigmoid + dot product runs comfortably under real-time even at large
+detection counts. **On Vivante GC7000UL (i.MX 8M Plus)** the same
+shader can fall off a cliff for models with many detections or large
+proto fields, reaching multi-second per-frame latency. The driver's
+fragment-shader scheduling on this part does not amortise the
+per-quad-per-pixel work the way mainline GPUs do.
+
+The safe pattern on Vivante (and as a defensive choice for any
+deployment that may run on it) is to **materialise masks once on the
+CPU** via `materialize_masks` immediately after decode, free the proto
+data, and then render with the cheap `draw_decoded_masks` blit:
+
+```rust
+// On the decode thread:
+let masks = processor.materialize_masks(
+    &boxes, &scores, &classes, &proto_data,
+    letterbox_norm,
+    MaskResolution::Scaled { width: dst_w, height: dst_h },
+)?;
+drop(proto_data); // free the proto tensor immediately
+
+// On the render thread (or the same thread, just later):
+processor.draw_decoded_masks(&mut frame, &boxes, &masks, overlay)?;
+```
+
+`materialize_masks` runs the same batched-GEMM kernel exercised by
+`mask_benchmark` (see [`TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md#benchmarks)),
+which is well-amortised across detections; `draw_decoded_masks`
+becomes a cheap RGBA blit. The combined CPU + GPU cost on i.MX 8M
+Plus is comfortably real-time at typical COCO detection counts. On
+Mali / desktop GPUs, switching back to the fused `draw_proto_masks`
+is straightforward — the data flow is the same up to the choice of
+render call.
 
 ## Process-Shutdown Resource Cleanup
 

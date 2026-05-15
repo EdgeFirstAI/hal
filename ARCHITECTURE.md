@@ -30,7 +30,7 @@ Each sub-crate has a single responsibility in the inference pipeline:
 
 - [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with four interchangeable backends (DMA / SHM / Mem / PBO), multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked).
-- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations (EDGEAI-1288 contract) at builder time.
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the four functional crates and owns the optional Chrome JSON tracing subscriber.
 - [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) — C ABI layer with cbindgen-generated header. Defines the [Delegate DMA-BUF framework](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#delegate-dma-buf-framework) ABI used by NXP Neutron, VxDelegate, and other TFLite delegates.
@@ -397,10 +397,15 @@ fstat(fd, &st);
 ino_t inode = st.st_ino;
 ```
 
-This is a single cheap syscall on cache miss. For a 16-buffer pool,
-`fstat` is called exactly 16 times over the lifetime of the pipeline
-(once per unique buffer at first import). All subsequent frames are
-cache hits.
+`fstat` is a cheap syscall (microseconds), but it does run on **every
+buffer handoff** because the inode is the lookup key — it must be
+computed before the cache table is consulted. The cache lookup itself
+is a hash-table probe; only the import path (`hal_import_image`) is
+skipped on hits. If the per-frame `fstat` is undesirable on a
+particular pipeline, layer an fd-to-inode memoization above the cache
+(invalidated whenever an fd is closed). For a typical 4–16 buffer
+pool, the steady-state cost is one `fstat` per frame and zero EGL
+re-imports.
 
 Cache key design for multi-plane buffers:
 
@@ -436,23 +441,28 @@ where the pipeline never fully warms up.
 
 ### EGL image cache inside HAL
 
-`hal_import_image()` internally maintains an EGL image cache keyed by
-DMA-BUF fd (more precisely, by the new `BufferIdentity.id` allocated
-on each import). When called with the same fd, it returns the cached
-EGL image without re-creating it.
+The image backend maintains an EGL image cache keyed by the
+**tensor's** `BufferIdentity.id` — not by the DMA-BUF fd. Every call
+to `hal_import_image()` / `hal_tensor_from_fd()` allocates a fresh
+`BufferIdentity`, so calling those functions repeatedly with the same
+fd produces a new key each time and misses the cache on every call.
+The cache only hits when the **same tensor object** is reused across
+frames.
 
-However, this HAL-internal cache **also suffers from fd recycling**:
-if the calling code frees the `hal_tensor *` and later calls
-`hal_import_image` with a different fd that refers to the same
-physical buffer, HAL creates a new EGL image — incurring the full
-import cost again and leaving a "swept dead entry" in the EGL cache
-log.
+This means the cache cannot rescue a pipeline that re-imports its
+camera buffers every frame: each import is a brand-new identity.
+HAL emits a "swept dead entry" log line when a tensor is dropped
+while its EGL image is still in the cache; a steady stream of these
+in a running pipeline is a sign that the calling code is churning
+tensors.
 
-**The fix is at the calling layer** (e.g. `edgefirstcameraadaptor`):
-maintain a cache of `hal_tensor *` objects keyed by `(inode, offset)`,
-and never free them between frames. This ensures `hal_import_image` is
-called exactly once per unique DMA-BUF over the lifetime of the
-pipeline.
+**The fix is at the calling layer** (the GStreamer / V4L2 / libcamera
+adaptor that hands buffers to the HAL): maintain a cache of
+`hal_tensor *` objects keyed by `(inode, offset)`, and never free them
+between frames. Holding the tensor alive keeps its `BufferIdentity`
+stable, which keeps the in-HAL EGL image cache hitting. This ensures
+`hal_import_image` is called exactly once per unique DMA-BUF over the
+lifetime of the pipeline.
 
 For the per-tensor `BufferIdentity` mechanism that the EGL cache uses
 internally, see
@@ -460,10 +470,10 @@ internally, see
 and
 [`crates/image/ARCHITECTURE.md#egl-image-cache`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#egl-image-cache).
 
-### Implementation in edgefirstcameraadaptor
+### Reference implementation pattern (GStreamer adaptor)
 
-`edgefirstcameraadaptor` (the EdgeFirst GStreamer plug-in) implements
-the inode-based cache as follows:
+A representative GStreamer source/transform element that hands camera
+buffers to the HAL implements the inode-based cache as follows:
 
 ```c
 typedef struct { ino_t inode; gsize offset; } InputCacheKey;

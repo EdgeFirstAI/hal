@@ -83,6 +83,9 @@ processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
+/* `src` is loaded from disk or imported from a DMA-BUF fd —
+ * see the C API README for hal_tensor_load_file / hal_import_image. */
+struct hal_tensor *src = /* ... */;
 struct hal_tensor *dst = hal_image_processor_create_image(
     proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
@@ -253,9 +256,12 @@ BufferKey key = { .inode = st.st_ino, .offset = plane_offset };
 struct hal_tensor *tensor = lookup_tensor(cache, &key);
 if (!tensor) {
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
+    if (!pd) { perror("hal_plane_descriptor_new"); continue; }
     tensor = hal_import_image(proc, pd, NULL, w, h,
                               HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-    insert_tensor(cache, &key, tensor);  // pd is consumed
+    // pd is consumed by hal_import_image (success or failure)
+    if (!tensor) { perror("hal_import_image"); continue; }
+    insert_tensor(cache, &key, tensor);
 }
 hal_image_processor_convert(proc, tensor, dst, /* ... */);
 ```
@@ -392,6 +398,8 @@ parameter:
 | `MaskResolution::Scaled { width, height }` | `(roi_h, roi_w, 1)` u8 binary at requested resolution | dot → sigmoid → upsample to `(W, H)` → threshold (`>127`) | All COCO / IoU / mAP evaluation |
 
 ```python
+import edgefirst_hal as hal
+
 # Wrong: threshold then upsample → blocky edges, mAP regression.
 tiles = proc.materialize_masks(boxes, scores, classes, proto_data, letterbox=lb)
 for tile, box in zip(tiles, boxes):
@@ -432,7 +440,7 @@ caller code.
 |---------|--------------|---------------|-------|---------|
 | DMA tensors | Yes | Yes | No | No |
 | PBO tensors (GPU) | Yes | Yes | No | No |
-| Shared memory tensors | Yes | Yes | Yes | Yes |
+| Shared memory tensors | Yes | Yes | Yes | No |
 | Heap tensors | Yes | Yes | Yes | Yes |
 | G2D acceleration | Yes | No | No | No |
 | OpenGL acceleration | Yes (optional) | Yes (optional) | No | No |
@@ -503,7 +511,7 @@ Cross-compile + deploy to a target (SSH hostnames in `~/.ssh/config`:
 `maivin`):
 
 ```bash
-cargo-zigbuild build --target aarch64-unknown-linux-gnu --release \
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
   -p edgefirst-image --features opengl --bench pipeline_benchmark
 
 scp target/aarch64-unknown-linux-gnu/release/deps/pipeline_benchmark-* imx8mp-frdm:/tmp/

@@ -70,17 +70,19 @@ cargo test -p edgefirst-decoder --doc
 # Native-host bench
 cargo bench -p edgefirst-decoder
 
-# Cross-compile + deploy (see project Makefile)
-make bench-arm
+# Cross-compile for a target (see BENCHMARKS.md for the deploy workflow)
+cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
+  -p edgefirst-decoder --bench decoder_benchmark
 ```
 
 | Benchmark | Source | What it measures |
 |-----------|--------|------------------|
 | `decoder_benchmark` | [`benches/decoder_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/benches/decoder_benchmark.rs) | End-to-end decode latency: detection-only, segmentation, proto-data, per-scale split-tensor; both quantized and float paths |
 
-The benchmark uses the project's standard `--bench` flag for host runs and
-the deploy targets in the workspace `Makefile` for cross-compile + on-target
-runs (i.MX 8M Plus, i.MX 95).
+The benchmark uses the project's standard `--bench` flag for host runs.
+The aarch64 cross-compile flow plus `scp` + on-target run procedure is
+documented in
+[`BENCHMARKS.md`](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md).
 
 ## Coverage Notes
 
