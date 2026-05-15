@@ -8,6 +8,18 @@
 
 This crate provides hardware-accelerated image loading, format conversion, resizing, rotation, and cropping operations optimized for ML preprocessing workflows.
 
+## Role in edgefirst-hal
+
+`edgefirst-image` sits at the centre of the EdgeFirst HAL workspace, owning
+the GPU/G2D/CPU dispatch and segmentation-mask rendering. Its dependency
+neighbours:
+
+- Depends on [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) for `TensorDyn`, `BufferIdentity`, and the `PboOps` trait it implements for the GL backend.
+- Depends on [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `decoder`, default-on) for `DetectBox`, `Segmentation`, and the proto-mask data feeding `draw_proto_masks`.
+- Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `draw_masks_tracked`.
+- Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::image`.
+- Bridged to C/Python via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/).
+
 ## Features
 
 - **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
@@ -228,6 +240,13 @@ processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
 ```
 
 The OpenGL backend imports each plane's DMA-BUF fd separately for zero-copy GPU access.
+
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md)
+- Full API reference: [docs.rs/edgefirst-image](https://docs.rs/edgefirst-image)
+- Project README: [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
 
 ## License
 

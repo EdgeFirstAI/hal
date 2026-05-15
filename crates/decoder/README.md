@@ -8,6 +8,17 @@
 
 This crate provides efficient post-processing for YOLO and ModelPack model outputs, supporting both floating-point and quantized inference results.
 
+## Role in edgefirst-hal
+
+`edgefirst-decoder` sits between the inference engine and the image-rendering
+side of the EdgeFirst HAL workspace:
+
+- Depends on [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) for reading model output buffers.
+- Optionally depends on [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) for `decode_tracked()`.
+- Consumed by [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — its `DetectBox`, `Segmentation`, and proto-data outputs feed the `draw_decoded_masks` / `draw_proto_masks` / `draw_masks_tracked` rendering APIs.
+- Re-exported from [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) as `edgefirst_hal::decoder`.
+- Bridged to C/Python via [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/).
+
 ## Supported Models
 
 | Family | Detection | Segmentation | Formats |
@@ -309,6 +320,13 @@ for (det, track) in detections.iter().zip(tracks.iter()) {
 | `last_updated` | `u64` | Timestamp of the most recent update |
 
 The `tracked_location` reflects the Kalman-filter prediction and may differ slightly from `det.bbox`, which is the raw decoded box before smoothing.
+
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md)
+- Full API reference: [docs.rs/edgefirst-decoder](https://docs.rs/edgefirst-decoder)
+- Project README: [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
 
 ## License
 

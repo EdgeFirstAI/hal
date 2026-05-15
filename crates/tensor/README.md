@@ -8,6 +8,18 @@
 
 This crate provides a unified interface for managing multi-dimensional arrays (tensors) with support for different memory backends optimized for ML inference pipelines.
 
+## Role in edgefirst-hal
+
+`edgefirst-tensor` is the foundation of the EdgeFirst HAL workspace. Every
+other `edgefirst-*` crate depends on it:
+
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) consumes `Tensor<u8>` / `TensorDyn` for image processor input/output buffers and provides the `PboOps` trait impl that backs `PboTensor`.
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) reads model output via `Tensor<T>` and `TensorMap`.
+- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) re-exports this crate as `edgefirst_hal::tensor`.
+- [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) crosses the FFI boundary using `from_fd`, `clone_fd`, and `from_planes`.
+
+This crate has **no internal `edgefirst-*` dependencies**.
+
 ## Memory Types
 
 | Type | Description | Use Case |
@@ -146,6 +158,13 @@ let guard = t.buffer_identity().weak();
 
 `BufferIdentity` is used internally by the image processing backends as an EGL
 image cache key to avoid redundant GPU texture imports across frames.
+
+## Documentation
+
+- Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md)
+- Testing guide: [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md)
+- Full API reference: [docs.rs/edgefirst-tensor](https://docs.rs/edgefirst-tensor)
+- Project README: [../../README.md](https://github.com/EdgeFirstAI/hal/blob/main/README.md)
 
 ## License
 
