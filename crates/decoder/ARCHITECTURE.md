@@ -258,11 +258,17 @@ mask_raw[i] = coefficients[i] @ protos       # (proto_h, proto_w)
 
 The decoder exposes three mask APIs that pair with image-side rendering:
 
-| Workflow | Decoder API | Image-side render | Use case |
-|----------|-------------|-------------------|----------|
-| Materialized masks | `decode_quantized` / `decode_float` | `processor.draw_decoded_masks()` | When you need mask matrices on the CPU side |
-| Proto data (preferred for GPU) | `decode_quantized_proto` / `decode_float_proto` | `processor.draw_proto_masks()` | Fused proto→pixel GPU path; never materializes full-res masks on CPU |
-| Tracked + drawn in one call | (consumer of [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/)) | `processor.draw_masks_tracked()` | Single-call decode + track + render |
+| Workflow | Decoder API (public) | Image-side render | Use case |
+|----------|----------------------|-------------------|----------|
+| Materialized masks | [`Decoder::decode()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode) | `processor.draw_decoded_masks()` | When you need mask matrices on the CPU side |
+| Proto data (preferred for GPU) | [`Decoder::decode_proto()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_proto) | `processor.draw_proto_masks()` | Fused proto→pixel GPU path; never materializes full-res masks on CPU |
+| Tracked materialized | [`Decoder::decode_tracked()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_tracked) | `processor.draw_masks_tracked()` | Single-call decode + track + render |
+| Tracked proto | [`Decoder::decode_proto_tracked()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_proto_tracked) | `processor.draw_proto_masks()` (with track-augmented detections) | Tracked GPU-fused path |
+
+`decode()` and `decode_proto()` dispatch internally to crate-private
+`decode_quantized` / `decode_float` / `decode_quantized_proto` /
+`decode_float_proto` based on the model's output dtype; external
+callers never invoke those helpers directly.
 
 The proto-data path is the recommended GPU path. It avoids the CPU cost of
 materializing full-resolution masks; the GPU evaluates `sigmoid(coeffs @

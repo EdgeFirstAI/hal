@@ -31,8 +31,8 @@ cargo test -p edgefirst-tracker -- --test-threads=1
 # Doc-tests only
 cargo test -p edgefirst-tracker --doc -- --test-threads=1
 
-# Single test
-cargo test -p edgefirst-tracker bytetrack::tests::two_pass_recovery -- --test-threads=1
+# Single test (e.g. the multi-frame association test)
+cargo test -p edgefirst-tracker bytetrack::tests::test_two_stage_matching -- --test-threads=1
 ```
 
 ## Special Requirements

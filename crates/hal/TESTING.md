@@ -75,10 +75,12 @@ Coverage for the umbrella is collected through the workspace
 `cargo llvm-cov nextest` run; the small surface of `lib.rs` re-exports
 shows up under `crates/hal/` in the lcov report. Doc-tests are not
 included in the llvm-cov report — the workspace `cargo test --doc`
-job runs separately and is not coverage-instrumented, so the `trace`
-module's doc-tests verify only that the example code compiles and
-runs against the public API. The substantive coverage numbers come
-from the sub-crates.
+job runs separately and is not coverage-instrumented. The `trace`
+module's executable Rust doc-tests are additionally marked `no_run`
+(installing a global tracing subscriber has process-lifetime side
+effects), so they only **compile** against the public API; they are
+not actually executed. The substantive coverage numbers come from
+the sub-crates.
 
 ## Cross-References
 

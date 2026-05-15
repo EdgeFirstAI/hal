@@ -34,7 +34,7 @@ build matrix lives in
 
 | Python class | Wraps | Notes |
 |--------------|-------|-------|
-| `Tensor` | `edgefirst_tensor::TensorDyn` | Implements the numpy buffer protocol — `np.frombuffer(t.map())` is zero-copy when the backend supports it |
+| `Tensor` | `edgefirst_tensor::TensorDyn` | Buffer protocol is exposed by `TensorMap` (returned by `Tensor.map()`), not by `Tensor` itself. The portable zero-copy pattern is `with t.map() as m: np.frombuffer(m.view(), dtype=...).reshape(t.shape())`. The shorter `np.frombuffer(t.map(), ...)` works only on the abi3-py311 wheel (see § Stable ABI). |
 | `ImageProcessor` | `edgefirst_image::ImageProcessor` | One-per-pipeline; owns the GL thread |
 | `Decoder` | `edgefirst_decoder::Decoder` | Built once from a metadata dict or YAML/JSON string |
 | `ByteTrack` | `edgefirst_tracker::ByteTrack<DetectBox>` | Stable per-track UUIDs |
@@ -144,8 +144,17 @@ relies on the Rust-side `Drop` chain.
 
 ## Performance Considerations
 
-- **`Tensor` buffer protocol is zero-copy when the backend allows.** Use
-  `np.frombuffer(t.map(), dtype=...)` instead of `np.array(t.map(), copy=True)`.
+- **Map + view is zero-copy when the backend allows.** Prefer the
+  context-manager form (portable across both wheels):
+
+  ```python
+  with t.map() as m:
+      arr = np.frombuffer(m.view(), dtype=...).reshape(t.shape())
+  ```
+
+  rather than copying with `np.array(t.map(), copy=True)`. The
+  shorter `np.frombuffer(t.map(), ...)` is also zero-copy but
+  requires the abi3-py311 wheel.
 - **Pass numpy arrays directly to `from_numpy` and `decode`** — do not
   pre-call `np.ascontiguousarray()`. The binding handles strided inputs
   internally via the three-path dispatch above; pre-materializing

@@ -117,7 +117,7 @@ The tracker crate has no compile-time dependency on any other `edgefirst-*`
 crate. It is consumed as an optional feature by:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) — exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering color-stable masks per track UUID.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` is the planned per-UUID palette mode, but currently aliases `ColorMode::Instance` (detection-order coloring) until the per-track palette lands.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) — re-exports as `edgefirst_hal::tracker`.
 
 The boundary type is the [`DetectionBox`](https://docs.rs/edgefirst-tracker/latest/edgefirst_tracker/trait.DetectionBox.html)

@@ -15,7 +15,7 @@ It has no dependency on any other `edgefirst-*` crate; instead, it is consumed
 as a feature by the decoder and image crates:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) calls `Tracker::update` from `decode_tracked()`.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) uses track UUIDs for color-stable mask rendering via `draw_masks_tracked()`.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Color stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order coloring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) re-exports the crate as `edgefirst_hal::tracker`.
 
 ## Algorithms

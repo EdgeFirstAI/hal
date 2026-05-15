@@ -162,9 +162,13 @@ The default build does **not** enable `+fp16` (aarch64) or `+f16c`
 (x86_64) — distributed HAL binaries stay on each target triple's baseline
 ISA so they run on older CPUs within the same triple. Benchmarks that need
 to exercise the native f16 mask kernel
-(`fused_dot_sigmoid_f16_slice` in
+(`fused_dot_sign_f16_slice` in
 [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs))
-must set `RUSTFLAGS` explicitly on the host that supports the extension:
+must set `RUSTFLAGS` explicitly on the host that supports the extension.
+The relevant kernel symbol is `fused_dot_sign_f16_slice` (see
+[`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs)
+— search for `fused_dot_sign_*`); the `_f16c` variant is the AVX2
+intrinsic path enabled by `+f16c,+fma`.
 
 ```bash
 # Orin Nano (Cortex-A78AE)
