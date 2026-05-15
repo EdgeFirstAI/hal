@@ -44,9 +44,12 @@ python -m pytest tests/decoder/test_decoder.py
 python -m slipcover --xml --out target/python-coverage.xml -m pytest tests/
 ```
 
-The Makefile target `make test-python` wraps steps 2–4. CI uses the same
-target; coverage from slipcover is uploaded to SonarCloud alongside the
-Rust lcov coverage.
+The Makefile target `make test-python` wraps step 2 (install via
+`pip install -q crates/python/[test]`) and then runs the full pytest
+suite (step 3) under `slipcover --xml` when slipcover is available.
+It does **not** wrap step 4 — single-module invocations have to be
+run by hand. CI uses the same target; the slipcover XML is uploaded
+to SonarCloud alongside the Rust lcov coverage.
 
 ## Special Requirements
 

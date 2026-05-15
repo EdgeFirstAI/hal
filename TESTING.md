@@ -492,13 +492,14 @@ for the full f16 benchmarking workflow.
 | Overall workspace | 70% line coverage |
 | Critical paths (tensor ops, decoder, image processing hot paths) | 90% line coverage |
 
-Coverage is collected using `cargo-llvm-cov` for Rust and `slipcover` for
-Python. Both generate LCOV reports that are merged and reported to
-SonarCloud.
+Coverage is collected using `cargo-llvm-cov` for Rust (LCOV output) and
+`slipcover --xml` for Python (Cobertura XML output). The two formats
+are uploaded to SonarCloud separately; the merge happens on the
+SonarCloud side, not in the workspace.
 
 Coverage reports:
-- Rust: `target/rust-coverage.lcov`
-- Python: `target/python-coverage.xml`
+- Rust: `target/rust-coverage.lcov` (LCOV)
+- Python: `target/python-coverage.xml` (Cobertura XML)
 
 CI enforces coverage gating on pull requests. A failing coverage check
 blocks the merge. See

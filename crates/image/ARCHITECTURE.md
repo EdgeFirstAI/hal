@@ -270,11 +270,12 @@ mask_raw[i] = coefficients[i] @ protos       # (proto_h, proto_w)
 The image crate exposes three rendering pipelines paired with the decoder's
 mask APIs:
 
-| Workflow | Decoder source | Image-side render | Best for |
-|----------|----------------|-------------------|----------|
-| Materialized | `decode_quantized` / `decode_float` | `draw_decoded_masks` | Already have mask matrices |
-| Fused proto path | `decode_quantized_proto` / `decode_float_proto` | `draw_proto_masks` | Real-time GPU overlay (preferred) |
-| Tracked + drawn | (consumes [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/)) | `draw_masks_tracked` | Single-call decode + track + render |
+| Workflow | Decoder source (public API) | Image-side render | Best for |
+|----------|-----------------------------|-------------------|----------|
+| Materialized | [`Decoder::decode()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode) | `draw_decoded_masks` | Already have mask matrices |
+| Fused proto path | [`Decoder::decode_proto()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_proto) | `draw_proto_masks` | Real-time GPU overlay (preferred) |
+| Tracked materialized | [`Decoder::decode_tracked()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_tracked) (via [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/)) | `draw_masks_tracked` | Single-call decode + track + render |
+| Tracked proto | [`Decoder::decode_proto_tracked()`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html#method.decode_proto_tracked) | `draw_proto_masks` (with track-augmented detections) | Tracked GPU-fused path |
 
 ### MaskOverlay
 
@@ -286,7 +287,9 @@ pub struct MaskOverlay<'a> {
                                             // model-input normalized space;
                                             // maps decoder output back to
                                             // original image coords when set
-    pub color_mode: ColorMode,             // Class | Instance | TrackId
+    pub color_mode: ColorMode,             // Class | Instance | Track
+                                            // (Track currently behaves
+                                            //  like Instance — see below)
 }
 ```
 

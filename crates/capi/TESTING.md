@@ -83,9 +83,14 @@ must `cargo build` first.
   backend, they inherit the
   [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution).
   The C test Makefile runs each `test_*` binary serially.
-- **LFS testdata** — image/decoder C tests load fixtures from `testdata/`
-  (LFS-tracked). The Makefile resolves `EDGEFIRST_TESTDATA_DIR` from the
-  environment and falls back to `<workspace>/testdata`.
+- **No LFS testdata for the standard C suite.** The C tests
+  (`test_tensor`, `test_image`, `test_decoder`, `test_tracker`,
+  `bench_preproc`) synthesize all inputs in-process — they do not
+  read from `testdata/` and the Makefile does not resolve
+  `EDGEFIRST_TESTDATA_DIR`. The `test_neutron_dmabuf*` programs do
+  consume external data (a TFLite model and an input frame), but the
+  paths are passed as command-line arguments per the per-binary
+  `--help` output, not via an env var.
 - **Hardware gates** — `test_neutron_dmabuf*` requires a live TFLite
   delegate, model, and the i.MX 95 NPU device tree. Run on target with
   `NEUTRON_ENABLE_ZERO_COPY=1`.

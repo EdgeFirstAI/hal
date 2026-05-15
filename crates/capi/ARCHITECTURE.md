@@ -48,7 +48,7 @@ struct churn — only the function signatures form the stable contract.
 | `struct hal_plane_descriptor *` | `edgefirst_tensor::PlaneDescriptor` | `hal_plane_descriptor_free` ONLY if the descriptor was never passed to `hal_import_image`. The import call consumes both descriptors unconditionally (success and failure paths alike — see `hal_import_image` docs), so calling `_free` after `_import_image` is a double-free. |
 | `struct hal_image_processor *` | `edgefirst_image::ImageProcessor` | `hal_image_processor_free` |
 | `struct hal_decoder *` | `edgefirst_decoder::Decoder` | `hal_decoder_free` |
-| `struct hal_decoder_params *` | `edgefirst_decoder::DecoderBuilder` (in-progress) | consumed by `hal_decoder_new` |
+| `struct hal_decoder_params *` | `edgefirst_decoder::DecoderBuilder` (in-progress) | `hal_decoder_params_free`. The handle is **not** consumed by `hal_decoder_new` — that call takes `const struct hal_decoder_params *` and clones the configuration into the new decoder, so the caller still owns the params and must free them after `hal_decoder_new` returns. |
 | `struct hal_detect_box_list *` | `Vec<DetectBox>` | `hal_detect_box_list_free` |
 | `struct hal_segmentation_list *` | `Vec<Segmentation>` | `hal_segmentation_list_free` |
 | `struct hal_bytetrack *` | `edgefirst_tracker::ByteTrack<DetectBox>` | `hal_bytetrack_free` |
