@@ -330,7 +330,7 @@ EdgeFirst HAL is a Rust-based hardware abstraction layer with Python bindings, p
 ```
 crates/
 ├── tensor/     # Zero-copy tensor abstractions
-├── codec/      # Zero-allocation image decode (JPEG, PNG)
+├── codec/      # Image decode into tensors (JPEG, PNG)
 ├── image/      # Hardware-accelerated image processing
 ├── decoder/    # YOLO and model output decoding
 ├── tracker/    # Object tracking algorithms
@@ -634,7 +634,7 @@ MUST update the affected documents to stay in sync with the implementation.
 |----------|-------|
 | [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Cross-crate** architecture: shared design patterns, performance-tracing infrastructure, DMA-BUF identity, tensor caching, source organization |
 | [`crates/tensor/ARCHITECTURE.md`](../crates/tensor/ARCHITECTURE.md) | Backend dispatch (`Tensor<T>` → DMA/SHM/Mem/PBO), multi-plane DMA-BUF, `BufferIdentity` cache key |
-| [`crates/codec/ARCHITECTURE.md`](../crates/codec/ARCHITECTURE.md) | Zero-allocation image decode pipeline, strided output strategy, `ImageLoad` trait, Phase 2+ roadmap |
+| [`crates/codec/ARCHITECTURE.md`](../crates/codec/ARCHITECTURE.md) | Image decode pipeline, strided output strategy, `ImageLoad` trait, multi-dtype support, allocation profiling |
 | [`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) | GL/G2D/CPU backend chain, EGL image cache, `GL_MUTEX`, Vivante workarounds, shutdown safety |
 | [`crates/decoder/ARCHITECTURE.md`](../crates/decoder/ARCHITECTURE.md) | Model-type selection, `dshape` contract, per-scale framework, fused proto path, NMS modes |
 | [`crates/tracker/ARCHITECTURE.md`](../crates/tracker/ARCHITECTURE.md) | ByteTrack two-pass association, Kalman state, `DetectionBox` trait |
@@ -648,7 +648,7 @@ MUST update the affected documents to stay in sync with the implementation.
 |----------|-------|
 | [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: single-threaded execution rules, on-target gating, cross-compilation, coverage, CI matrix |
 | [`crates/tensor/TESTING.md`](../crates/tensor/TESTING.md) | Per-backend unit tests, DMA/SHM gating, allocation benchmarks |
-| [`crates/codec/TESTING.md`](../crates/codec/TESTING.md) | JPEG/PNG decode tests, strided output validation, hot-loop reuse pattern, benchmark methodology |
+| [`crates/codec/TESTING.md`](../crates/codec/TESTING.md) | JPEG/PNG decode tests, strided output validation, hot-loop reuse pattern, allocation profiling, benchmark methodology |
 | [`crates/image/TESTING.md`](../crates/image/TESTING.md) | GL gating via OnceLock probe, G2D gating on `/dev/galcore`, fp16 benchmarks |
 | [`crates/decoder/TESTING.md`](../crates/decoder/TESTING.md) | Builder/segmentation/parity tests, per-scale NEON kernel tests, integration suites |
 | [`crates/tracker/TESTING.md`](../crates/tracker/TESTING.md) | ByteTrack association tests, Kalman filter math |
@@ -664,7 +664,7 @@ You must read and consult the relevant architecture and testing documents when:
 2. **Changing memory management patterns** — consult `crates/tensor/ARCHITECTURE.md` and the root `ARCHITECTURE.md` for the DMA-BUF identity, fallback chain, and zero-copy contracts
 3. **Modifying GPU/hardware backend code** — consult `crates/image/ARCHITECTURE.md` for EGL lifecycle, `GL_MUTEX` rules, G2D cleanup, and shutdown safety
 4. **Changing decoder logic or model support** — consult `crates/decoder/ARCHITECTURE.md` for the `dshape` physical-memory-order contract, per-scale framework, and NMS pipeline
-5. **Changing image decode or codec APIs** — consult `crates/codec/ARCHITECTURE.md` for the strided decode pipeline, `ImageLoad` trait, and zero-allocation design constraints
+5. **Changing image decode or codec APIs** — consult `crates/codec/ARCHITECTURE.md` for the strided decode pipeline, `ImageLoad` trait, and allocation discipline
 6. **Updating the C ABI or delegate framework** — consult `crates/capi/ARCHITECTURE.md` for the opaque-handle ABI contract and DMA-BUF delegate protocol
 7. **Adding or changing tests** — consult the relevant crate's TESTING.md for test gating patterns, fixture conventions, and the single-threaded execution rule
 8. **Cross-crate refactoring** — consult both the root `ARCHITECTURE.md` and all affected crate-level documents

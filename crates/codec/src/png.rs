@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! PNG decoding into pre-allocated tensors (Phase 1: zune-png shim).
+//! PNG decoding into pre-allocated tensors via zune-png.
 
 use crate::error::CodecError;
 use crate::options::{DecodeOptions, ImageInfo};
