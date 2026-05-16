@@ -46,7 +46,7 @@ g2d-sys = "1.2.0"
 gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }
 gls = "0.1.6"
 half = { version = "2.7.1", features = ["num-traits"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 image-compare = "0.5.0"
 jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 kamadak-exif = "0.6.1"

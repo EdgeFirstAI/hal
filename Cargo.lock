@@ -1266,6 +1266,8 @@ dependencies = [
  "png",
  "ravif",
  "rayon",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
