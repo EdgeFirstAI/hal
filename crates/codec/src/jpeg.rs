@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! JPEG decoding into pre-allocated tensors (Phase 1: zune-jpeg shim).
+//! JPEG decoding into pre-allocated tensors via zune-jpeg.
 
 use crate::error::CodecError;
 use crate::options::{DecodeOptions, ImageInfo};
@@ -133,9 +133,9 @@ pub(crate) fn decode_jpeg_into<T: ImagePixel>(
     let mut zune_opts = DecoderOptions::default().jpeg_set_out_colorspace(colour);
     if opts.scale_denom > 1 {
         // zune-jpeg doesn't expose IDCT scaling, so we ignore scale_denom
-        // for now. Phase 2 custom decoder will support this.
+        // for now. A custom decoder will be needed to support this.
         log::debug!(
-            "JPEG IDCT scaling not supported in Phase 1 shim, ignoring scale_denom={}",
+            "JPEG IDCT scaling not yet supported, ignoring scale_denom={}",
             opts.scale_denom
         );
     }

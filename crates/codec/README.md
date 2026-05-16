@@ -1,7 +1,7 @@
 # EdgeFirst Codec
 
-Zero-allocation image decoding into pre-allocated tensor buffers for
-real-time vision pipelines.
+Zero-allocation image decoding framework for pre-allocated tensor buffers
+in real-time vision pipelines.
 
 ## Overview
 
@@ -21,7 +21,8 @@ let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb,
     Some(TensorMemory::Mem)).unwrap();
 let mut decoder = ImageDecoder::new();
 
-// Decode in the hot loop — zero allocations after warmup
+// Decode in the hot loop — codec layer is allocation-free after warmup
+// (underlying zune-jpeg/zune-png still allocate internal decoder state)
 let jpeg_bytes = std::fs::read("frame.jpg").unwrap();
 let info = tensor.load_image(&mut decoder, &jpeg_bytes,
     &DecodeOptions::default()).unwrap();
@@ -69,10 +70,13 @@ Free-standing tensors work but cannot use PBO and may lack GPU-aligned pitch.
 
 ## Data Types
 
-| Type  | Support | Notes                    |
-|-------|---------|--------------------------|
-| `u8`  | ✓       | Direct copy              |
-| `f32` | ✓       | Normalized to [0.0, 1.0] |
+| Type  | Support | Notes                              |
+|-------|---------|------------------------------------|
+| `u8`  | ✓       | Direct copy (identity)             |
+| `u16` | ✓       | Scaled `* 257` from 8-bit; native from 16-bit PNG |
+| `i8`  | ✓       | XOR 0x80 sign-bit flip             |
+| `i16` | ✓       | XOR 0x8000 sign-bit flip           |
+| `f32` | ✓       | Normalized to [0.0, 1.0]           |
 
 ## API Reference
 

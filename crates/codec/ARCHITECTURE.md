@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `edgefirst-codec` crate provides zero-allocation image decoding into
-pre-allocated tensor buffers. It is designed for real-time vision pipelines
-where the anti-pattern of allocating new memory on every frame must be
+The `edgefirst-codec` crate provides image decoding into pre-allocated
+tensor buffers. It is designed for real-time vision pipelines where the
+anti-pattern of allocating new output buffers on every frame must be
 avoided.
 
 The core principle: **allocate once at init, decode in the hot loop**.
@@ -18,21 +18,21 @@ edgefirst-tensor ← edgefirst-codec ← edgefirst-image (re-export)
 ```
 
 `edgefirst-codec` depends only on `edgefirst-tensor` plus format-specific
-decode libraries (`zune-jpeg`, `zune-png` in Phase 1). It has no dependency
-on `edgefirst-image` or any GPU libraries, keeping the dependency graph clean.
+decode libraries (`zune-jpeg`, `zune-png`). It has no dependency on
+`edgefirst-image` or any GPU libraries, keeping the dependency graph clean.
 
 ## Module Map
 
-| Module       | Purpose                                        |
-|--------------|------------------------------------------------|
-| `lib.rs`     | Crate root, public re-exports                  |
+| Module       | Purpose                                         |
+|--------------|-------------------------------------------------|
+| `lib.rs`     | Crate root, public re-exports                   |
 | `error.rs`   | `CodecError` enum with capacity/dtype/format/IO |
-| `pixel.rs`   | `ImagePixel` trait (u8, f32 support)            |
+| `pixel.rs`   | `ImagePixel` trait (u8, u16, i8, i16, f32)      |
 | `options.rs` | `DecodeOptions` and `ImageInfo` structs         |
 | `decoder.rs` | `ImageDecoder` struct with scratch buffers      |
 | `traits.rs`  | `ImageLoad` extension trait for Tensor/TensorDyn|
 | `jpeg.rs`    | JPEG decode with EXIF orientation handling       |
-| `png.rs`     | PNG decode with format conversion               |
+| `png.rs`     | PNG decode with format conversion and native 16-bit support |
 
 ## Key Design Decisions
 
@@ -117,24 +117,32 @@ processor.convert(&tensor, &mut dst, rot, flip,
 
 ## Decode Pipeline
 
-### JPEG Decode Flow (Phase 1 — Zune Shim)
+### JPEG Decode Flow
 
 1. Parse JPEG headers via `zune-jpeg` → get dimensions, colorspace
 2. Validate tensor capacity ≥ decoded dimensions
 3. Optionally read EXIF orientation tag
-4. Decode into `ImageDecoder.scratch` (contiguous buffer)
+4. Decode into `ImageDecoder.scratch` (contiguous buffer, reused across frames)
 5. Apply EXIF rotation/flip in-place on scratch (if enabled)
-6. Row-copy from scratch → tensor buffer at stride offsets
-7. For `f32` tensors: row-copy with `u8 → f32` conversion (`/ 255.0`)
-8. Return `ImageInfo` with decoded dimensions
+6. Row-copy from scratch → tensor buffer at stride offsets, with pixel type
+   conversion via `ImagePixel::from_u8()` (JPEG is always 8-bit source)
+7. Return `ImageInfo` with decoded dimensions
 
-### PNG Decode Flow (Phase 1 — Zune Shim)
+**Fast paths:** `u8` uses `copy_from_slice`; `i8` uses copy + XOR 0x80 in-place.
+Generic path (u16, i16, f32) converts element-by-element via `from_u8()`.
+
+### PNG Decode Flow
 
 1. Parse PNG headers via `zune-png` → get dimensions, colorspace, bit depth
 2. Validate tensor capacity ≥ decoded dimensions
-3. Decode into `ImageDecoder.scratch`
+3. Choose decode strategy based on target type and source bit depth:
+   - **u8/i8 targets**: Use `decode_into(&mut [u8])` — fast u8 path with
+     optional XOR for i8
+   - **u16/i16/f32 targets**: Use `decode()` → `DecodingResult` which
+     preserves native 16-bit data from 16-bit PNGs
 4. Convert pixel format if needed (e.g., RGBA→RGB, RGB→Grey)
-5. Row-copy from scratch → tensor buffer at stride offsets
+5. Row-copy from decoded data → tensor buffer at stride offsets with pixel
+   type conversion via `from_u8()` or `from_u16()` depending on source depth
 6. Return `ImageInfo` with decoded dimensions
 
 ### Format Auto-Detection
@@ -155,32 +163,53 @@ The decoder inspects magic bytes:
 
 ## Data Type Support
 
-| Type  | Status | Conversion              |
-|-------|--------|-------------------------|
-| `u8`  | ✓      | Direct copy (identity)  |
-| `f32` | ✓      | `value / 255.0`         |
-| `i8`  | ✗      | Returns `UnsupportedDtype` |
-| `f16` | Future | Behind feature gate     |
+| Type  | JPEG               | PNG (8-bit source)   | PNG (16-bit source) |
+|-------|--------------------|----------------------|---------------------|
+| `u8`  | Direct copy        | Direct copy          | `>> 8`              |
+| `u16` | `* 257` scaling    | `* 257` scaling      | Direct copy         |
+| `i8`  | XOR 0x80           | XOR 0x80             | `(>> 8) XOR 0x80`  |
+| `i16` | `* 257` then XOR   | `* 257` then XOR     | XOR 0x8000          |
+| `f32` | `/ 255.0`          | `/ 255.0`            | `/ 65535.0`         |
 
-## Phase 2+ Roadmap
+### XOR Trick for Signed Types
 
-### Phase 2: Custom JPEG Decoder
+Signed integer decoding uses a bit-flip to convert unsigned pixel data into
+the signed range, which is the standard approach for ML quantization:
 
-Replace `zune-jpeg` with a custom Rust JPEG decoder that writes MCU tiles
-directly into strided output buffers. Key optimizations:
+- **i8**: `(u8_value ^ 0x80) as i8` — maps `0→-128`, `128→0`, `255→127`
+- **i16**: `(u16_value ^ 0x8000) as i16` — maps `0→-32768`, `32768→0`, `65535→32767`
 
-- NEON-optimized 8×8 IDCT
-- NEON-optimized YCbCr→RGB color conversion
-- Fused u8→f32 path with `vcvtq_f32_u32`
-- Direct YUV/Grey output (skip chroma upsampling)
+### u16 Scaling from u8
 
-### Phase 3: Custom PNG Decoder
+When JPEG (8-bit) data is decoded into `u16`, each byte is scaled to the full
+16-bit range: `u8_value as u16 * 257`. This maps `0→0`, `128→32896`, `255→65535`
+exactly (257 = 0x0101).
 
-- Streaming inflate into strided row buffer
-- NEON-optimized PNG filter reconstruction
+## Scratch Buffer Strategy
 
-### Phase 4: OpenGL Decode Path
+`ImageDecoder` contains a `Vec<u8>` scratch buffer that grows to the
+high-water mark and is reused. The edgefirst-codec layer itself does not
+perform heap allocations in the decode hot path after warmup — all row-copy
+and pixel conversion logic operates on the pre-allocated scratch and tensor
+buffers.
 
-- Feature-gated `opengl` support
-- Compute shader IDCT + color conversion on GPU
-- Direct decode into PBO/DMA-BUF tensors
+However, the underlying decode libraries (zune-jpeg, zune-png) allocate
+internal state (Huffman tables, filter state) on each call because they
+do not support decoder state reuse. This means the overall decode path
+does involve allocations per call, originating in the format libraries.
+
+**Allocation-free layers (after warmup):**
+- Scratch buffer management (`Vec::resize` is a no-op at high-water mark)
+- Row-copy and stride padding logic
+- Pixel type conversion (u8→u16, u8→i8 XOR, u8→f32)
+- Format conversion (RGB↔RGBA, Grey↔RGB)
+
+**Allocating layers (per call):**
+- `zune-jpeg::JpegDecoder::new()` — internal Huffman/quantization tables
+- `zune-png::PngDecoder::decode()` — returns owned `Vec<u16>` for 16-bit PNGs
+- `exif::Reader::read_raw()` — when EXIF orientation is enabled
+
+For the PNG native-depth path (`u16`/`f32` targets), zune-png's `decode()`
+returns an owned `Vec<u16>` or `Vec<u8>` — this is an additional allocation
+per call beyond the decoder state. The u8/i8 targets use `decode_into()` which
+writes directly into the reusable scratch buffer, avoiding this extra allocation.
