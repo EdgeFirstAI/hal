@@ -177,6 +177,7 @@ cargo nextest run --workspace --exclude edgefirst_hal -j 1
 
 # 5. Tests for a specific crate
 cargo test -p edgefirst-image -- --test-threads=1
+cargo test -p edgefirst-codec -- --test-threads=1
 cargo test -p edgefirst-decoder -- --test-threads=1
 cargo test -p edgefirst-tensor -- --test-threads=1
 ```

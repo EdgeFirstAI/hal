@@ -56,7 +56,7 @@ impl CPUProcessor {
         Ok(yuv::yuv_nv12_to_rgb(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
             yuv::YuvConversionMode::Balanced,
@@ -100,7 +100,7 @@ impl CPUProcessor {
         Ok(yuv::yuv_nv12_to_rgba(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
             yuv::YuvConversionMode::Balanced,
@@ -136,7 +136,7 @@ impl CPUProcessor {
     pub(super) fn convert_yuyv_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.map()?,
             yuy_stride: src_rs as u32,
@@ -157,7 +157,7 @@ impl CPUProcessor {
     pub(super) fn convert_yuyv_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.map()?,
             yuy_stride: src_rs as u32,
@@ -168,7 +168,7 @@ impl CPUProcessor {
         Ok(yuv::yuyv422_to_rgba(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
         )?)
@@ -242,7 +242,7 @@ impl CPUProcessor {
     pub(super) fn convert_vyuy_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.map()?,
             yuy_stride: src_rs as u32,
@@ -263,7 +263,7 @@ impl CPUProcessor {
     pub(super) fn convert_vyuy_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
             yuy: &src.map()?,
             yuy_stride: src_rs as u32,
@@ -274,7 +274,7 @@ impl CPUProcessor {
         Ok(yuv::vyuy422_to_rgba(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
         )?)
@@ -353,7 +353,7 @@ impl CPUProcessor {
     pub(super) fn convert_grey_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvGrayImage::<u8> {
             y_plane: &src.map()?,
             y_stride: src_rs as u32,
@@ -363,7 +363,7 @@ impl CPUProcessor {
         Ok(yuv::yuv400_to_rgb(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt709,
         )?)
@@ -372,7 +372,7 @@ impl CPUProcessor {
     pub(super) fn convert_grey_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
-        let src_rs = super::row_stride_for(src_w, src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvGrayImage::<u8> {
             y_plane: &src.map()?,
             y_stride: src_rs as u32,
@@ -382,7 +382,7 @@ impl CPUProcessor {
         Ok(yuv::yuv400_to_rgba(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt709,
         )?)
@@ -479,8 +479,8 @@ impl CPUProcessor {
     pub(super) fn convert_rgba_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
-        let dst_rs = super::row_stride_for(dst_w, dst.format().unwrap());
-        let src_rs = super::row_stride_for(src.width().unwrap(), src.format().unwrap());
+        let dst_rs = super::tensor_row_stride(dst);
+        let src_rs = super::tensor_row_stride(src);
         let mut dst = yuv::YuvGrayImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map()?),
             y_stride: dst_rs as u32,
@@ -618,7 +618,7 @@ impl CPUProcessor {
         } else {
             dst.shape()[0] / 2
         };
-        let src_rs = super::row_stride_for(src.width().unwrap(), src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let mut dst_map = dst.map()?;
 
         let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
@@ -657,8 +657,8 @@ impl CPUProcessor {
     pub(super) fn convert_rgb_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
-        let dst_rs = super::row_stride_for(dst_w, dst.format().unwrap());
-        let src_rs = super::row_stride_for(src.width().unwrap(), src.format().unwrap());
+        let dst_rs = super::tensor_row_stride(dst);
+        let src_rs = super::tensor_row_stride(src);
         let mut dst = yuv::YuvGrayImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map()?),
             y_stride: dst_rs as u32,
@@ -797,7 +797,7 @@ impl CPUProcessor {
         } else {
             dst.shape()[0] / 2
         };
-        let src_rs = super::row_stride_for(src.width().unwrap(), src.format().unwrap());
+        let src_rs = super::tensor_row_stride(src);
         let mut dst_map = dst.map()?;
 
         let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
@@ -869,7 +869,7 @@ impl CPUProcessor {
         Ok(yuv::yuv_nv16_to_rgb(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
             yuv::YuvConversionMode::Balanced,
@@ -910,7 +910,7 @@ impl CPUProcessor {
         Ok(yuv::yuv_nv16_to_rgba(
             &src,
             dst.map()?.as_mut_slice(),
-            super::row_stride_for(dst.width().unwrap(), dst.format().unwrap()) as u32,
+            super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Limited,
             yuv::YuvStandardMatrix::Bt709,
             yuv::YuvConversionMode::Balanced,

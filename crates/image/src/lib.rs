@@ -25,9 +25,11 @@ the appropriate conversion method based on the available hardware.
 ## Examples
 
 ```rust
+# #[allow(deprecated)]
 # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
 # use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
 # fn main() -> Result<(), edgefirst_image::Error> {
+# #[allow(deprecated)]
 let image = edgefirst_bench::testdata::read("zidane.jpg");
 let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
 let mut converter = ImageProcessor::new()?;
@@ -363,6 +365,7 @@ use zune_jpeg::{
 use zune_png::PngDecoder;
 
 pub use cpu::CPUProcessor;
+pub use edgefirst_codec as codec;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
@@ -1012,9 +1015,11 @@ impl ImageProcessor {
     ///
     /// # Examples
     /// ```rust,no_run
+    /// # #[allow(deprecated)]
     /// # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
     /// # use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// # #[allow(deprecated)]
     /// let image = std::fs::read("zidane.jpg")?;
     /// let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
     /// let mut converter = ImageProcessor::new()?;
@@ -2557,16 +2562,25 @@ fn load_png(
 ///
 /// # Examples
 /// ```rust,no_run
+/// #[allow(deprecated)]
 /// use edgefirst_image::load_image;
 /// use edgefirst_tensor::PixelFormat;
 /// # fn main() -> Result<(), edgefirst_image::Error> {
-/// let jpeg = std::fs::read("zidane.jpg")?;
-/// let img = load_image(&jpeg, Some(PixelFormat::Rgb), None)?;
+/// #[allow(deprecated)]
+/// let img = {
+///     let jpeg = std::fs::read("zidane.jpg")?;
+///     load_image(&jpeg, Some(PixelFormat::Rgb), None)?
+/// };
 /// assert_eq!(img.width(), Some(1280));
 /// assert_eq!(img.height(), Some(720));
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(
+    since = "0.23.0",
+    note = "Use edgefirst_codec::ImageLoad::load_image() to decode into pre-allocated tensors. \
+            This avoids per-frame allocation and supports strided/DMA-backed buffers."
+)]
 pub fn load_image(
     image: &[u8],
     format: Option<PixelFormat>,
@@ -2809,6 +2823,7 @@ mod alignment_tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(deprecated)]
 mod image_tests {
     use super::*;
     use crate::{CPUProcessor, Rotation};

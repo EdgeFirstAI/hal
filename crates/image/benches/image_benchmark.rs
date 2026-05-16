@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(deprecated)]
+
 //! Image processing benchmarks using the edgefirst-bench in-process harness.
 //!
 //! Divan runs each benchmark in a forked subprocess. On i.MX8MP this causes

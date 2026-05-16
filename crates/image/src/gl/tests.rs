@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 #[cfg(feature = "opengl")]
+#[allow(deprecated)]
 mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     use crate::opengl_headless::processor::GLProcessorST;

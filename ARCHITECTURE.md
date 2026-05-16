@@ -29,10 +29,11 @@ this document does not reproduce it.
 Each sub-crate has a single responsibility in the inference pipeline:
 
 - [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with four interchangeable backends (DMA / SHM / Mem / PBO), multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
+- [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — zero-allocation image decoding (JPEG, PNG) into pre-allocated tensor buffers. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked).
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
-- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the four functional crates and owns the optional Chrome JSON tracing subscriber.
+- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the five functional crates and owns the optional Chrome JSON tracing subscriber.
 - [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) — C ABI layer with cbindgen-generated header. Defines the [Delegate DMA-BUF framework](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#delegate-dma-buf-framework) ABI used by NXP Neutron, VxDelegate, and other TFLite delegates.
 - [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) — PyO3 bindings, published as `edgefirst-hal` on PyPI. Contains the three-path numpy copy dispatcher.
 
@@ -344,6 +345,7 @@ for benchmark infrastructure.
 hal/
 ├── crates/
 │   ├── tensor/             # edgefirst-tensor
+│   ├── codec/              # edgefirst-codec (image decode into tensors)
 │   ├── image/              # edgefirst-image
 │   ├── decoder/            # edgefirst-decoder
 │   ├── tracker/            # edgefirst-tracker

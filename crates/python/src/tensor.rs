@@ -72,6 +72,42 @@ impl From<Error> for PyErr {
     }
 }
 
+impl From<edgefirst_hal::codec::CodecError> for Error {
+    fn from(err: edgefirst_hal::codec::CodecError) -> Self {
+        Error::Format(format!("{err}"))
+    }
+}
+
+use std::cell::RefCell;
+thread_local! {
+    static DECODER: RefCell<edgefirst_hal::codec::ImageDecoder> =
+        RefCell::new(edgefirst_hal::codec::ImageDecoder::new());
+}
+
+/// Metadata returned by ``decode_image`` / ``decode_image_file``.
+#[pyclass(name = "ImageInfo", get_all)]
+#[derive(Debug, Clone)]
+pub struct PyImageInfo {
+    /// Decoded image width in pixels.
+    pub width: usize,
+    /// Decoded image height in pixels.
+    pub height: usize,
+    /// Pixel format of the decoded data.
+    pub format: crate::image::PyPixelFormat,
+    /// Row stride in bytes used for writing.
+    pub row_stride: usize,
+}
+
+#[pymethods]
+impl PyImageInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "ImageInfo(width={}, height={}, format={:?}, row_stride={})",
+            self.width, self.height, self.format, self.row_stride
+        )
+    }
+}
+
 #[pyclass(name = "TensorMemory", eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(clippy::upper_case_acronyms)]
@@ -767,6 +803,7 @@ impl PyTensor {
     /// Load an image from a file, decoding JPEG/PNG automatically.
     #[staticmethod]
     #[pyo3(signature = (filename, format = None, mem = None))]
+    #[allow(deprecated)]
     fn load(
         filename: &str,
         format: Option<crate::image::PyPixelFormat>,
@@ -783,6 +820,7 @@ impl PyTensor {
     /// Load an image from raw bytes, decoding JPEG/PNG automatically.
     #[staticmethod]
     #[pyo3(signature = (data, format = None, mem = None))]
+    #[allow(deprecated)]
     fn load_from_bytes(
         data: &[u8],
         format: Option<crate::image::PyPixelFormat>,
@@ -801,6 +839,61 @@ impl PyTensor {
         use edgefirst_hal::image;
         image::save_jpeg(&self.0, filename, quality)?;
         Ok(())
+    }
+
+    /// Decode image bytes (JPEG/PNG) directly into this pre-allocated tensor.
+    ///
+    /// Returns an ``ImageInfo`` dict with ``width``, ``height``, ``format``,
+    /// and ``row_stride`` of the decoded image. The tensor must have
+    /// sufficient capacity (width × height) for the decoded image.
+    ///
+    /// This is the preferred API for real-time pipelines: allocate once via
+    /// ``ImageProcessor.create_image()``, then call ``decode_image()`` in
+    /// the main loop to avoid per-frame allocations.
+    ///
+    /// Args:
+    ///     data: Raw JPEG or PNG bytes.
+    ///     format: Desired output pixel format (default: native format from file).
+    #[pyo3(signature = (data, format = None))]
+    fn decode_image(
+        &mut self,
+        data: &[u8],
+        format: Option<crate::image::PyPixelFormat>,
+    ) -> Result<PyImageInfo> {
+        use edgefirst_hal::codec::{DecodeOptions, ImageDecoder, ImageLoad};
+        let mut opts = DecodeOptions::default().with_exif(false);
+        if let Some(fmt) = format {
+            opts = opts.with_format(fmt.into());
+        }
+        DECODER.with(|cell| {
+            let mut decoder = cell.borrow_mut();
+            let info = self.0.load_image(&mut decoder, data, &opts)?;
+            Ok(PyImageInfo {
+                width: info.width,
+                height: info.height,
+                format: crate::image::PyPixelFormat::try_from(info.format)
+                    .map_err(|e| Error::Format(e.to_string()))?,
+                row_stride: info.row_stride,
+            })
+        })
+    }
+
+    /// Decode an image file (JPEG/PNG) directly into this pre-allocated tensor.
+    ///
+    /// Returns an ``ImageInfo`` dict with ``width``, ``height``, ``format``,
+    /// and ``row_stride`` of the decoded image.
+    ///
+    /// Args:
+    ///     filename: Path to the image file.
+    ///     format: Desired output pixel format (default: native format from file).
+    #[pyo3(signature = (filename, format = None))]
+    fn decode_image_file(
+        &mut self,
+        filename: &str,
+        format: Option<crate::image::PyPixelFormat>,
+    ) -> Result<PyImageInfo> {
+        let data = std::fs::read(filename).map_err(Error::Io)?;
+        self.decode_image(&data, format)
     }
 
     /// Pixel format of this tensor (None if not an image tensor).

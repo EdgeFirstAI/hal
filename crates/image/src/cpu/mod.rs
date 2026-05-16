@@ -88,6 +88,18 @@ fn row_stride_for(width: usize, fmt: PixelFormat) -> usize {
     }
 }
 
+/// Read the effective row stride from a tensor, falling back to the computed
+/// minimum stride if the tensor has no explicit stride set. This correctly
+/// handles tensors with GPU pitch-alignment padding (e.g., from
+/// `ImageProcessor::create_image()` or codec strided decode).
+fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
+    tensor.effective_row_stride().unwrap_or_else(|| {
+        let w = tensor.width().unwrap_or(0);
+        let fmt = tensor.format().unwrap_or(PixelFormat::Rgb);
+        row_stride_for(w, fmt)
+    })
+}
+
 /// Apply XOR 0x80 bias to color channels only, preserving alpha.
 ///
 /// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
@@ -679,7 +691,7 @@ impl CPUProcessor {
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
-        let dst_rs = row_stride_for(dst_w, dst_fmt);
+        let dst_rs = tensor_row_stride(dst);
         let dst_c = dst_fmt.channels();
 
         let mut map = dst.map()?;
@@ -744,7 +756,7 @@ impl CPUProcessor {
 
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
-        let dst_rs = row_stride_for(dst_w, dst_fmt);
+        let dst_rs = tensor_row_stride(dst);
         let channels = dst_fmt.channels();
 
         let mut map = dst.map()?;

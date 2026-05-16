@@ -13,6 +13,7 @@ use crate::{
     check_null, check_null_ret_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList,
 };
 use edgefirst_decoder::{DetectBox, Segmentation};
+#[allow(deprecated)]
 use edgefirst_image::{
     load_image, save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
     ImageProcessorTrait, MaskResolution, Rect, Rotation,
@@ -434,6 +435,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 /// - EBADMSG: Failed to decode image
 /// - ENOMEM: Memory allocation failed
 #[no_mangle]
+#[allow(deprecated)]
 pub unsafe extern "C" fn hal_tensor_load_image(
     data: *const u8,
     len: size_t,
@@ -468,6 +470,7 @@ pub unsafe extern "C" fn hal_tensor_load_image(
 /// - EBADMSG: Failed to decode image
 /// - ENOMEM: Memory allocation failed
 #[no_mangle]
+#[allow(deprecated)]
 pub unsafe extern "C" fn hal_tensor_load_image_file(
     path: *const c_char,
     format: HalPixelFormat,
@@ -512,6 +515,7 @@ pub unsafe extern "C" fn hal_tensor_load_image_file(
 /// - EBADMSG: Failed to decode JPEG
 /// - ENOMEM: Memory allocation failed
 #[no_mangle]
+#[allow(deprecated)]
 pub unsafe extern "C" fn hal_tensor_load_jpeg(
     data: *const u8,
     len: size_t,
@@ -546,6 +550,7 @@ pub unsafe extern "C" fn hal_tensor_load_jpeg(
 /// - EBADMSG: Failed to decode PNG
 /// - ENOMEM: Memory allocation failed
 #[no_mangle]
+#[allow(deprecated)]
 pub unsafe extern "C" fn hal_tensor_load_png(
     data: *const u8,
     len: size_t,
