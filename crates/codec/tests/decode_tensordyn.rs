@@ -78,7 +78,7 @@ fn decode_tensordyn_unsupported_dtype() {
         1280,
         720,
         PixelFormat::Rgb,
-        DType::I8,
+        DType::I32,
         Some(TensorMemory::Mem),
     )
     .unwrap();
@@ -91,6 +91,81 @@ fn decode_tensordyn_unsupported_dtype() {
             .with_exif(false),
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn decode_tensordyn_i8() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor = TensorDyn::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        DType::I8,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+}
+
+#[test]
+fn decode_tensordyn_u16() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor = TensorDyn::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        DType::U16,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+}
+
+#[test]
+fn decode_tensordyn_i16() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor = TensorDyn::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        DType::I16,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
 }
 
 #[test]

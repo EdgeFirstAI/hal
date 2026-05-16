@@ -87,6 +87,9 @@ impl ImageDecoder {
     ) -> crate::Result<ImageInfo> {
         match dst {
             TensorDyn::U8(t) => self.decode_into(data, t, opts),
+            TensorDyn::I8(t) => self.decode_into(data, t, opts),
+            TensorDyn::U16(t) => self.decode_into(data, t, opts),
+            TensorDyn::I16(t) => self.decode_into(data, t, opts),
             TensorDyn::F32(t) => self.decode_into(data, t, opts),
             other => Err(CodecError::UnsupportedDtype(other.dtype())),
         }
