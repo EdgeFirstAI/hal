@@ -674,6 +674,22 @@ class TensorMemory(enum.Enum):
     MEM: TensorMemory
     """Regular system memory allocation"""
 
+class ImageInfo:
+    """Metadata returned by ``Tensor.decode_image()`` / ``Tensor.decode_image_file()``.
+
+    Describes the actual decoded image dimensions and format, which may
+    be smaller than the tensor's allocated capacity.
+    """
+
+    width: int
+    """Decoded image width in pixels."""
+    height: int
+    """Decoded image height in pixels."""
+    format: PixelFormat
+    """Pixel format of the decoded data."""
+    row_stride: int
+    """Row stride in bytes used for writing."""
+
 class Tensor:
     if sys.platform == "linux":
         def __init__(
@@ -936,6 +952,53 @@ class Tensor:
         Args:
             filename: Output file path.
             quality: JPEG quality (1-100, default 80).
+        """
+        ...
+
+    def decode_image(
+        self,
+        data: bytes,
+        format: PixelFormat | None = None,
+    ) -> ImageInfo:
+        """Decode image bytes (JPEG/PNG) directly into this pre-allocated tensor.
+
+        This is the preferred API for real-time pipelines: allocate a tensor
+        once via ``ImageProcessor.create_image()``, then call ``decode_image()``
+        in the main loop to avoid per-frame allocations.
+
+        The tensor must have sufficient capacity (width × height) for the
+        decoded image. Smaller images decode into the top-left region.
+
+        Args:
+            data: Raw JPEG or PNG bytes.
+            format: Desired output pixel format (default: native from file).
+
+        Returns:
+            ImageInfo with decoded width, height, format, and row_stride.
+
+        Raises:
+            RuntimeError: If the tensor is too small or the dtype is unsupported.
+        """
+        ...
+
+    def decode_image_file(
+        self,
+        filename: str,
+        format: PixelFormat | None = None,
+    ) -> ImageInfo:
+        """Decode an image file (JPEG/PNG) directly into this pre-allocated tensor.
+
+        Convenience wrapper around ``decode_image()`` that reads from a file path.
+
+        Args:
+            filename: Path to the image file.
+            format: Desired output pixel format (default: native from file).
+
+        Returns:
+            ImageInfo with decoded width, height, format, and row_stride.
+
+        Raises:
+            RuntimeError: If the tensor is too small or the dtype is unsupported.
         """
         ...
 

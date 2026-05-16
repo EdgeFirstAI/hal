@@ -20,6 +20,7 @@ tracker = ["edgefirst-decoder/tracker", "edgefirst-image/tracker", "edgefirst-tr
 tracing = ["dep:tracing", "dep:tracing-chrome", "dep:tracing-subscriber"]
 
 [dependencies]
+edgefirst-codec = { workspace = true }
 edgefirst-decoder = { workspace = true }
 edgefirst-image = { workspace = true }
 edgefirst-tensor = { workspace = true }

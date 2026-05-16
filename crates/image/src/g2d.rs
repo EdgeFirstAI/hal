@@ -448,6 +448,7 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
 
 #[cfg(feature = "g2d_test_formats")]
 #[cfg(test)]
+#[allow(deprecated)]
 mod g2d_tests {
     use super::*;
     use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation};

@@ -6,7 +6,7 @@ use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use rayon::iter::IndexedParallelIterator;
 
-use super::{row_stride_for, CPUProcessor};
+use super::{tensor_row_stride, CPUProcessor};
 
 impl CPUProcessor {
     /// Core flip/rotate using ndarray, parameterized by dimensions.
@@ -115,7 +115,7 @@ impl CPUProcessor {
         // adjust crop box for rotation/flip
         Self::adjust_dest_rect_for_rotate_flip_dims(&mut dst_rect, dst_w, dst_h, rotation, flip);
 
-        let dst_rs = row_stride_for(dst_w, fmt);
+        let dst_rs = tensor_row_stride(dst);
 
         let needs_resize = src_w != dst_w
             || src_h != dst_h

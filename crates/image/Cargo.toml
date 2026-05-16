@@ -22,6 +22,7 @@ dma_test_formats = []
 
 [dependencies]
 ctor = { workspace = true }
+edgefirst-codec = { workspace = true }
 edgefirst-tensor = { workspace = true }
 enum_dispatch = { workspace = true }
 env_logger = { workspace = true }

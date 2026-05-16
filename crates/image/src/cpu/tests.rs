@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(deprecated)]
 mod cpu_tests {
 
     use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Result, Rotation};

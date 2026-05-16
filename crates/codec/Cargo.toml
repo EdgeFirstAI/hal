@@ -1,0 +1,46 @@
+[package]
+name = "edgefirst-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Image codec for decoding JPEG/PNG into pre-allocated EdgeFirst tensors"
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+keywords = ["jpeg", "png", "image-decoding", "zero-copy", "edge-ai"]
+categories = ["multimedia::images", "embedded"]
+documentation = "https://docs.rs/edgefirst-codec"
+
+[features]
+default = []
+opencv = ["dep:opencv"]
+turbojpeg = ["dep:turbojpeg"]
+
+[dependencies]
+edgefirst-tensor = { workspace = true }
+kamadak-exif = { workspace = true }
+log = { workspace = true }
+num-traits = { workspace = true }
+opencv = { workspace = true, optional = true }
+turbojpeg = { version = "0.5", optional = true }
+zune-jpeg = { workspace = true }
+zune-png = { workspace = true }
+
+[dev-dependencies]
+edgefirst-bench = { workspace = true }
+image = { workspace = true }
+
+# Comparison benchmark libraries (enable with --features)
+[target.'cfg(any())'.dev-dependencies]
+# These are gated by features and only used in benchmarks.
+# We use cfg(any()) as a no-op target filter; the actual gating is via
+# required-features on the bench targets.
+
+
+[[bench]]
+name = "codec_benchmark"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
