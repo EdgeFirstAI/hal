@@ -122,3 +122,111 @@ fn decode_png_capacity_error() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn decode_png_u16() {
+    let png = testdata("zidane.png");
+    let mut tensor =
+        Tensor::<u16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &png,
+            &DecodeOptions::default().with_format(PixelFormat::Rgb),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    // zidane.png is 8-bit RGB, so u16 values should be multiples of 257
+    let map = tensor.map().unwrap();
+    let pixels: &[u16] = &map;
+    let sample_count = info.width * 3;
+    let nonzero = pixels[..sample_count].iter().filter(|&&v| v != 0).count();
+    assert!(
+        nonzero > 100,
+        "expected many non-zero u16 pixels, got {nonzero}"
+    );
+}
+
+#[test]
+fn decode_png_i8() {
+    let png = testdata("zidane.png");
+    let mut tensor =
+        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &png,
+            &DecodeOptions::default().with_format(PixelFormat::Rgb),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    // i8 via XOR: should span negative and positive values
+    let map = tensor.map().unwrap();
+    let pixels: &[i8] = &map;
+    let sample_count = info.width * 3;
+    let min = pixels[..sample_count].iter().copied().min().unwrap();
+    let max = pixels[..sample_count].iter().copied().max().unwrap();
+    assert!(min < 0, "expected negative i8 pixels, min={min}");
+    assert!(max > 0, "expected positive i8 pixels, max={max}");
+}
+
+#[test]
+fn decode_png_i16() {
+    let png = testdata("zidane.png");
+    let mut tensor =
+        Tensor::<i16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &png,
+            &DecodeOptions::default().with_format(PixelFormat::Rgb),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    let map = tensor.map().unwrap();
+    let pixels: &[i16] = &map;
+    let sample_count = info.width * 3;
+    let min = pixels[..sample_count].iter().copied().min().unwrap();
+    let max = pixels[..sample_count].iter().copied().max().unwrap();
+    assert!(min < 0, "expected negative i16 pixels, min={min}");
+    assert!(max > 0, "expected positive i16 pixels, max={max}");
+}
+
+#[test]
+fn decode_png_i8_xor_consistency() {
+    // Verify PNG i8 decode matches manual u8→i8 XOR conversion
+    let png = testdata("zidane.png");
+
+    let mut u8_tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut i8_tensor =
+        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default().with_format(PixelFormat::Rgb);
+
+    u8_tensor.load_image(&mut decoder, &png, &opts).unwrap();
+    i8_tensor.load_image(&mut decoder, &png, &opts).unwrap();
+
+    let u8_map = u8_tensor.map().unwrap();
+    let i8_map = i8_tensor.map().unwrap();
+    let u8_pixels: &[u8] = &u8_map;
+    let i8_pixels: &[i8] = &i8_map;
+
+    for i in 0..1000 {
+        let expected = (u8_pixels[i] ^ 0x80) as i8;
+        assert_eq!(
+            i8_pixels[i], expected,
+            "pixel {i}: u8={}, i8={}, expected={}",
+            u8_pixels[i], i8_pixels[i], expected
+        );
+    }
+}

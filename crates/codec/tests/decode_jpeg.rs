@@ -187,3 +187,127 @@ fn decode_reuse_pattern() {
         assert!(info.width > 0 && info.height > 0, "failed to decode {name}");
     }
 }
+
+#[test]
+fn decode_jpeg_u16() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor =
+        Tensor::<u16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    // u16 pixels should be scaled: u8 0→0, 255→65535
+    let map = tensor.map().unwrap();
+    let pixels: &[u16] = &map;
+    let sample_count = info.width * 3;
+    for &v in &pixels[..sample_count] {
+        // All values should be multiples of 257 (u8 * 257 scaling)
+        assert_eq!(v % 257, 0, "u16 pixel {v} is not a multiple of 257");
+    }
+    // Verify non-trivial content
+    let nonzero = pixels[..sample_count].iter().filter(|&&v| v != 0).count();
+    assert!(
+        nonzero > 100,
+        "expected many non-zero u16 pixels, got {nonzero}"
+    );
+}
+
+#[test]
+fn decode_jpeg_i8() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor =
+        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    // i8 uses XOR trick: u8 0→-128, 128→0, 255→127
+    let map = tensor.map().unwrap();
+    let pixels: &[i8] = &map;
+    let sample_count = info.width * 3;
+    // Should have a range spanning negative and positive
+    let min = pixels[..sample_count].iter().copied().min().unwrap();
+    let max = pixels[..sample_count].iter().copied().max().unwrap();
+    assert!(min < 0, "expected negative i8 pixels, min={min}");
+    assert!(max > 0, "expected positive i8 pixels, max={max}");
+}
+
+#[test]
+fn decode_jpeg_i16() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor =
+        Tensor::<i16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, 1280);
+    assert_eq!(info.height, 720);
+
+    // i16 uses XOR trick: u8 scale to u16 then XOR 0x8000
+    let map = tensor.map().unwrap();
+    let pixels: &[i16] = &map;
+    let sample_count = info.width * 3;
+    let min = pixels[..sample_count].iter().copied().min().unwrap();
+    let max = pixels[..sample_count].iter().copied().max().unwrap();
+    assert!(min < 0, "expected negative i16 pixels, min={min}");
+    assert!(max > 0, "expected positive i16 pixels, max={max}");
+}
+
+#[test]
+fn decode_jpeg_i8_xor_consistency() {
+    // Verify that JPEG i8 decode matches manual u8→i8 XOR conversion
+    let jpeg = testdata("zidane.jpg");
+
+    let mut u8_tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut i8_tensor =
+        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+
+    u8_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+    i8_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+
+    let u8_map = u8_tensor.map().unwrap();
+    let i8_map = i8_tensor.map().unwrap();
+    let u8_pixels: &[u8] = &u8_map;
+    let i8_pixels: &[i8] = &i8_map;
+
+    // Check first 1000 pixels match the XOR trick
+    for i in 0..1000 {
+        let expected = (u8_pixels[i] ^ 0x80) as i8;
+        assert_eq!(
+            i8_pixels[i], expected,
+            "pixel {i}: u8={}, i8={}, expected={}",
+            u8_pixels[i], i8_pixels[i], expected
+        );
+    }
+}

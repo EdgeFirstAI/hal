@@ -9,6 +9,7 @@ use crate::pixel::ImagePixel;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 use zune_png::zune_core::colorspace::ColorSpace;
 use zune_png::zune_core::options::DecoderOptions;
+use zune_png::zune_core::result::DecodingResult;
 use zune_png::PngDecoder;
 
 /// Map zune's [`ColorSpace`] to a [`PixelFormat`] and whether LumaA stripping
@@ -68,11 +69,214 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         });
     }
 
-    // Validate dtype
-    if T::dtype() != edgefirst_tensor::DType::U8 && T::dtype() != edgefirst_tensor::DType::F32 {
-        return Err(CodecError::UnsupportedDtype(T::dtype()));
+    // For types that can benefit from native 16-bit PNG decode (u16, i16, f32),
+    // use decode() → DecodingResult which preserves the full bit depth.
+    // For u8/i8, use decode_into(&mut [u8]) as before.
+    let use_native_u16 = matches!(
+        T::dtype(),
+        edgefirst_tensor::DType::U16 | edgefirst_tensor::DType::I16 | edgefirst_tensor::DType::F32
+    );
+
+    if use_native_u16 {
+        decode_png_via_decoding_result(
+            decoder,
+            dst,
+            opts,
+            dest_fmt,
+            decoded_fmt,
+            strip_luma_alpha,
+            img_w,
+            img_h,
+        )
+    } else {
+        decode_png_via_u8(
+            decoder,
+            dst,
+            opts,
+            scratch,
+            dest_fmt,
+            decoded_fmt,
+            strip_luma_alpha,
+            img_w,
+            img_h,
+        )
+    }
+}
+
+/// Decode PNG using `decode()` → `DecodingResult` to preserve native bit depth.
+/// If the PNG is 16-bit, we get `Vec<u16>` directly from zune-png.
+/// If 8-bit, we get `Vec<u8>` and upscale via `from_u8`.
+#[allow(clippy::too_many_arguments)]
+fn decode_png_via_decoding_result<T: ImagePixel>(
+    mut decoder: PngDecoder<zune_png::zune_core::bytestream::ZCursor<&[u8]>>,
+    dst: &mut Tensor<T>,
+    _opts: &DecodeOptions,
+    dest_fmt: PixelFormat,
+    decoded_fmt: PixelFormat,
+    strip_luma_alpha: bool,
+    img_w: usize,
+    img_h: usize,
+) -> crate::Result<ImageInfo> {
+    let result = decoder.decode()?;
+
+    let final_channels = dest_fmt.channels();
+    let elem_size = std::mem::size_of::<T>();
+    let tensor_w = dst
+        .width()
+        .unwrap_or_else(|| dst.shape().get(1).copied().unwrap_or(0));
+    let dst_stride = dst
+        .effective_row_stride()
+        .unwrap_or(tensor_w * final_channels * elem_size);
+    let dst_stride_elems = dst_stride / elem_size;
+    let src_stride = img_w * final_channels;
+
+    match result {
+        DecodingResult::U16(raw_u16) => {
+            // Native 16-bit PNG: use from_u16 for best precision
+            let decode_channels = if strip_luma_alpha {
+                2
+            } else {
+                decoded_fmt.channels()
+            };
+
+            // Strip LumaA if needed
+            let src_u16: Vec<u16> = if strip_luma_alpha {
+                raw_u16.iter().step_by(2).copied().collect()
+            } else {
+                raw_u16
+            };
+
+            // Format conversion if needed
+            let final_pixels = if decoded_fmt != dest_fmt {
+                convert_pixels_u16(
+                    &src_u16,
+                    if strip_luma_alpha { 1 } else { decode_channels },
+                    final_channels,
+                    img_w * img_h,
+                )
+            } else {
+                src_u16
+            };
+
+            // Write rows into tensor
+            let mut map = dst.map()?;
+            let dst_elems: &mut [T] = &mut map;
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                for x in 0..src_stride {
+                    dst_elems[d + x] = T::from_u16(final_pixels[s + x]);
+                }
+            }
+        }
+        DecodingResult::U8(raw_u8) => {
+            // 8-bit PNG: use from_u8 (same as the u8 path but into wider types)
+            let decode_channels = if strip_luma_alpha {
+                2
+            } else {
+                decoded_fmt.channels()
+            };
+
+            let src_u8: Vec<u8> = if strip_luma_alpha {
+                raw_u8.iter().step_by(2).copied().collect()
+            } else {
+                raw_u8
+            };
+
+            let final_pixels = if decoded_fmt != dest_fmt {
+                convert_pixels(
+                    &src_u8,
+                    if strip_luma_alpha { 1 } else { decode_channels },
+                    final_channels,
+                    img_w * img_h,
+                )
+            } else {
+                src_u8
+            };
+
+            if final_pixels.len() != img_w * img_h * final_channels {
+                return Err(CodecError::UnsupportedFormat(dest_fmt));
+            }
+
+            let mut map = dst.map()?;
+            let dst_elems: &mut [T] = &mut map;
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                for x in 0..src_stride {
+                    dst_elems[d + x] = T::from_u8(final_pixels[s + x]);
+                }
+            }
+        }
+        DecodingResult::F32(raw_f32) => {
+            // F32 PNG (rare but possible)
+            let decode_channels = if strip_luma_alpha {
+                2
+            } else {
+                decoded_fmt.channels()
+            };
+
+            let src_f32: Vec<f32> = if strip_luma_alpha {
+                raw_f32.iter().step_by(2).copied().collect()
+            } else {
+                raw_f32
+            };
+
+            // Convert f32 [0,1] → u16 [0,65535] for the from_u16 path
+            let as_u16: Vec<u16> = src_f32
+                .iter()
+                .map(|&v| (v.clamp(0.0, 1.0) * 65535.0) as u16)
+                .collect();
+
+            let final_pixels = if decoded_fmt != dest_fmt {
+                convert_pixels_u16(
+                    &as_u16,
+                    if strip_luma_alpha { 1 } else { decode_channels },
+                    final_channels,
+                    img_w * img_h,
+                )
+            } else {
+                as_u16
+            };
+
+            let mut map = dst.map()?;
+            let dst_elems: &mut [T] = &mut map;
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                for x in 0..src_stride {
+                    dst_elems[d + x] = T::from_u16(final_pixels[s + x]);
+                }
+            }
+        }
+        _ => {
+            return Err(CodecError::InvalidData(
+                "PNG: unsupported decoded pixel format from zune".into(),
+            ));
+        }
     }
 
+    Ok(ImageInfo {
+        width: img_w,
+        height: img_h,
+        format: dest_fmt,
+        row_stride: dst_stride,
+    })
+}
+
+/// Decode PNG via the `decode_into(&mut [u8])` path for u8/i8 targets.
+#[allow(clippy::too_many_arguments)]
+fn decode_png_via_u8<T: ImagePixel>(
+    mut decoder: PngDecoder<zune_png::zune_core::bytestream::ZCursor<&[u8]>>,
+    dst: &mut Tensor<T>,
+    _opts: &DecodeOptions,
+    scratch: &mut Vec<u8>,
+    dest_fmt: PixelFormat,
+    decoded_fmt: PixelFormat,
+    strip_luma_alpha: bool,
+    img_w: usize,
+    img_h: usize,
+) -> crate::Result<ImageInfo> {
     // Decode into scratch
     let decode_channels = if strip_luma_alpha {
         2
@@ -85,7 +289,6 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
 
     // Strip LumaA → Grey if needed
     let (src_pixels, src_channels) = if strip_luma_alpha {
-        // Compact in-place: take every other byte (luma, skip alpha)
         for (write, i) in (0..decoded_size).step_by(2).enumerate() {
             scratch[write] = scratch[i];
         }
@@ -94,15 +297,10 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         (&scratch[..decoded_size], decoded_fmt.channels())
     };
 
-    // Format conversion if needed (decoded_fmt → dest_fmt)
-    // For Phase 1, we support a subset of conversions:
-    //   Grey → Grey, RGB → RGB, RGBA → RGBA (identity)
-    //   RGB → RGBA (add alpha=255), RGBA → RGB (strip alpha)
-    //   Grey → RGB (broadcast), RGB → Grey (luminance)
+    // Format conversion if needed
     let final_channels = dest_fmt.channels();
     let needs_conversion = decoded_fmt != dest_fmt;
 
-    // Allocate conversion scratch if needed
     let converted: Vec<u8>;
     let final_pixels: &[u8] = if needs_conversion {
         let conv_size = img_w * img_h * final_channels;
@@ -115,9 +313,11 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         src_pixels
     };
 
-    // Write decoded rows into tensor at stride offsets.
-    // The tensor keeps its original shape — ImageInfo reports actual dims.
+    // Write decoded rows into tensor at stride offsets
     let elem_size = std::mem::size_of::<T>();
+    let tensor_w = dst
+        .width()
+        .unwrap_or_else(|| dst.shape().get(1).copied().unwrap_or(0));
     let dst_stride = dst
         .effective_row_stride()
         .unwrap_or(tensor_w * final_channels * elem_size);
@@ -135,6 +335,19 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
                 let s = y * src_stride;
                 let d = y * dst_stride;
                 dst_u8[d..d + src_stride].copy_from_slice(&final_pixels[s..s + src_stride]);
+            }
+        } else if T::dtype() == edgefirst_tensor::DType::I8 {
+            // Fast path: copy + XOR 0x80
+            let dst_u8: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(dst_elems.as_mut_ptr() as *mut u8, dst_elems.len())
+            };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride;
+                dst_u8[d..d + src_stride].copy_from_slice(&final_pixels[s..s + src_stride]);
+                for b in &mut dst_u8[d..d + src_stride] {
+                    *b ^= 0x80;
+                }
             }
         } else {
             let dst_stride_elems = dst_stride / elem_size;
@@ -156,11 +369,10 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
     })
 }
 
-/// Simple pixel format conversion.
+/// Simple pixel format conversion (u8 path).
 fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) -> Vec<u8> {
     let mut out = vec![0u8; pixel_count * dst_ch];
     match (src_ch, dst_ch) {
-        // RGB → RGBA: add alpha=255
         (3, 4) => {
             for i in 0..pixel_count {
                 out[i * 4] = src[i * 3];
@@ -169,7 +381,6 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
                 out[i * 4 + 3] = 255;
             }
         }
-        // RGBA → RGB: strip alpha
         (4, 3) => {
             for i in 0..pixel_count {
                 out[i * 3] = src[i * 4];
@@ -177,7 +388,6 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
                 out[i * 3 + 2] = src[i * 4 + 2];
             }
         }
-        // Grey → RGB: broadcast
         (1, 3) => {
             for i in 0..pixel_count {
                 out[i * 3] = src[i];
@@ -185,7 +395,6 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
                 out[i * 3 + 2] = src[i];
             }
         }
-        // Grey → RGBA: broadcast + alpha
         (1, 4) => {
             for i in 0..pixel_count {
                 out[i * 4] = src[i];
@@ -194,7 +403,6 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
                 out[i * 4 + 3] = 255;
             }
         }
-        // RGB → Grey: BT.601 luminance
         (3, 1) => {
             for i in 0..pixel_count {
                 let r = src[i * 3] as u32;
@@ -203,7 +411,6 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
                 out[i] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
             }
         }
-        // RGBA → Grey: BT.601 luminance (ignore alpha)
         (4, 1) => {
             for i in 0..pixel_count {
                 let r = src[i * 4] as u32;
@@ -213,7 +420,63 @@ fn convert_pixels(src: &[u8], src_ch: usize, dst_ch: usize, pixel_count: usize) 
             }
         }
         _ => {
-            // Unsupported: return empty (caller checks length)
+            return Vec::new();
+        }
+    }
+    out
+}
+
+/// Pixel format conversion for u16 data (16-bit PNG path).
+fn convert_pixels_u16(src: &[u16], src_ch: usize, dst_ch: usize, pixel_count: usize) -> Vec<u16> {
+    let mut out = vec![0u16; pixel_count * dst_ch];
+    match (src_ch, dst_ch) {
+        (3, 4) => {
+            for i in 0..pixel_count {
+                out[i * 4] = src[i * 3];
+                out[i * 4 + 1] = src[i * 3 + 1];
+                out[i * 4 + 2] = src[i * 3 + 2];
+                out[i * 4 + 3] = 65535;
+            }
+        }
+        (4, 3) => {
+            for i in 0..pixel_count {
+                out[i * 3] = src[i * 4];
+                out[i * 3 + 1] = src[i * 4 + 1];
+                out[i * 3 + 2] = src[i * 4 + 2];
+            }
+        }
+        (1, 3) => {
+            for i in 0..pixel_count {
+                out[i * 3] = src[i];
+                out[i * 3 + 1] = src[i];
+                out[i * 3 + 2] = src[i];
+            }
+        }
+        (1, 4) => {
+            for i in 0..pixel_count {
+                out[i * 4] = src[i];
+                out[i * 4 + 1] = src[i];
+                out[i * 4 + 2] = src[i];
+                out[i * 4 + 3] = 65535;
+            }
+        }
+        (3, 1) => {
+            for i in 0..pixel_count {
+                let r = src[i * 3] as u32;
+                let g = src[i * 3 + 1] as u32;
+                let b = src[i * 3 + 2] as u32;
+                out[i] = ((r * 77 + g * 150 + b * 29) >> 8) as u16;
+            }
+        }
+        (4, 1) => {
+            for i in 0..pixel_count {
+                let r = src[i * 4] as u32;
+                let g = src[i * 4 + 1] as u32;
+                let b = src[i * 4 + 2] as u32;
+                out[i] = ((r * 77 + g * 150 + b * 29) >> 8) as u16;
+            }
+        }
+        _ => {
             return Vec::new();
         }
     }
@@ -250,5 +513,19 @@ mod tests {
         let src = [1, 2, 3];
         let out = convert_pixels(&src, 3, 5, 1);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn u16_rgb_to_rgba() {
+        let src: Vec<u16> = vec![1000, 2000, 3000, 4000, 5000, 6000];
+        let out = convert_pixels_u16(&src, 3, 4, 2);
+        assert_eq!(out, [1000, 2000, 3000, 65535, 4000, 5000, 6000, 65535]);
+    }
+
+    #[test]
+    fn u16_grey_to_rgb() {
+        let src: Vec<u16> = vec![10000, 50000];
+        let out = convert_pixels_u16(&src, 1, 3, 2);
+        assert_eq!(out, [10000, 10000, 10000, 50000, 50000, 50000]);
     }
 }

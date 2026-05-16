@@ -190,10 +190,8 @@ pub(crate) fn decode_jpeg_into<T: ImagePixel>(
         });
     }
 
-    // Validate dtype
-    if T::dtype() != edgefirst_tensor::DType::U8 && T::dtype() != edgefirst_tensor::DType::F32 {
-        return Err(CodecError::UnsupportedDtype(T::dtype()));
-    }
+    // Validate that T is a supported pixel type (all ImagePixel types are valid)
+    // No dtype check needed — any ImagePixel impl works via from_u8().
 
     let channels = output_fmt.channels();
 
@@ -246,8 +244,23 @@ pub(crate) fn decode_jpeg_into<T: ImagePixel>(
                 let d = y * dst_stride_bytes;
                 dst_u8[d..d + src_stride].copy_from_slice(&scratch[s..s + src_stride]);
             }
+        } else if T::dtype() == edgefirst_tensor::DType::I8 {
+            // Fast path: u8 → i8, copy + XOR 0x80 per byte
+            // SAFETY: T is i8 (1 byte), layout-identical to u8
+            let dst_u8: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
+            };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride;
+                dst_u8[d..d + src_stride].copy_from_slice(&scratch[s..s + src_stride]);
+                // XOR sign-bit flip in-place
+                for b in &mut dst_u8[d..d + src_stride] {
+                    *b ^= 0x80;
+                }
+            }
         } else {
-            // Conversion path: u8 → T (e.g. f32)
+            // Generic conversion path: u8 → T (u16, i16, f32)
             let dst_stride_elems = dst_stride / elem_size;
             for y in 0..img_h {
                 let s = y * src_stride;
