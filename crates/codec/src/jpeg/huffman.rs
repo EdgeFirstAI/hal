@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Huffman table construction and decoding with 9-bit lookahead LUT.
+//! Huffman table construction and decoding with 11-bit lookahead LUT.
 
 use crate::error::CodecError;
 use crate::jpeg::bitstream::BitStream;
@@ -10,18 +10,20 @@ use crate::jpeg::types::QuantTable;
 /// Maximum Huffman code length in JPEG.
 const MAX_CODE_LEN: usize = 16;
 
-/// 9-bit lookahead table size.
-const FAST_BITS: u8 = 9;
+/// 11-bit lookahead: resolves ~99% of Huffman codes in a single table hit,
+/// reducing branch mispredictions vs the previous 9-bit table. The 4 KB
+/// table (2048 × 2 bytes) fits comfortably in L1 cache.
+const FAST_BITS: u8 = 11;
 const FAST_SIZE: usize = 1 << FAST_BITS;
 
-/// A Huffman lookup table with 9-bit fast path.
+/// A Huffman lookup table with 11-bit fast path.
 ///
-/// For codes ≤ 9 bits, `fast[peek_9_bits]` gives the symbol and code length.
-/// For longer codes, slow linear decode is used (rare — ~5% of AC codes).
+/// For codes ≤ 11 bits, `fast[peek_11_bits]` gives the symbol and code length.
+/// For longer codes (12–16 bits), slow linear decode is used (extremely rare).
 #[derive(Debug, Clone)]
 pub struct HuffmanTable {
     /// Fast lookup: `fast[index] = (symbol, code_length)`.
-    /// `code_length == 0` means this entry is invalid (code > 9 bits).
+    /// `code_length == 0` means this entry is invalid (code > 11 bits).
     fast: Vec<(u8, u8)>,
     /// Code values indexed by increasing code length. Used for slow decode.
     symbols: Vec<u8>,
@@ -62,7 +64,7 @@ impl HuffmanTable {
             code <<= 1;
         }
 
-        // Build 9-bit fast lookup table
+        // Build 11-bit fast lookup table
         let mut fast = vec![(0u8, 0u8); FAST_SIZE];
         code = 0;
         si = 0;
@@ -95,8 +97,8 @@ impl HuffmanTable {
 
     /// Decode one Huffman symbol from the bit stream.
     ///
-    /// Uses the 9-bit fast lookup table for short codes, falls back to
-    /// slow bit-by-bit decode for codes > 9 bits.
+    /// Uses the 11-bit fast lookup table for short codes, falls back to
+    /// slow bit-by-bit decode for codes > 11 bits.
     #[inline]
     pub fn decode_symbol(&self, bs: &mut BitStream<'_>) -> crate::Result<u8> {
         let peek = bs.peek(FAST_BITS) as usize;
@@ -110,9 +112,9 @@ impl HuffmanTable {
         self.decode_slow(bs)
     }
 
-    /// Slow Huffman decode for codes > 9 bits.
+    /// Slow Huffman decode for codes > 11 bits.
     fn decode_slow(&self, bs: &mut BitStream<'_>) -> crate::Result<u8> {
-        // We already peeked 9 bits; start from length 10
+        // We already peeked 11 bits; start from length 12
         let mut code = bs.peek(FAST_BITS) as i32;
         bs.consume(FAST_BITS);
 

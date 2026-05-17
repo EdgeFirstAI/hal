@@ -44,15 +44,18 @@ keeping the dependency graph clean.
 | `types.rs`       | `Component`, `SamplingFactor`, `ImageHeader`, `QuantTable`, `ZIGZAG` |
 | `markers.rs`     | SOF/SOS/DQT/DHT/DRI/APP marker parsing               |
 | `bitstream.rs`   | 64-bit bit buffer with FF/00 byte-stuffing, bulk refill |
-| `huffman.rs`     | 9-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
-| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON/SSE2 selection via function pointers) |
+| `huffman.rs`     | 11-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
+| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON/SSE4.1/SSE2 selection via function pointers) |
 | `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path    |
 | `idct/neon.rs`   | NEON 8×8 IDCT: 4-wide Loeffler butterfly, 4×4 transpose, DC-only fill |
-| `idct/sse2.rs`   | SSE2 8×8 IDCT: 4-wide Loeffler butterfly, comparison-based clamp |
+| `idct/sse2.rs`   | SSE2 8×8 IDCT: 4-wide Loeffler butterfly, emulated mullo_epi32 |
+| `idct/sse41.rs`  | SSE4.1 8×8 IDCT: native mullo_epi32, min/max clamping |
 | `color/mod.rs`   | Color conversion dispatcher                           |
 | `color/scalar.rs`| BT.601 full-range YCbCr→RGB/RGBA/BGRA/Grey           |
 | `color/neon.rs`  | NEON YCbCr→RGB/RGBA/BGRA: 8-pixel SIMD with vst3/vst4 |
-| `color/sse2.rs`  | SSE2 YCbCr→RGB/RGBA/BGRA: 8-pixel SIMD with unpack interleave |
+| `color/sse2.rs`  | SSE2 YCbCr→RGBA/BGRA: 8-pixel SIMD with unpack interleave |
+| `color/ssse3.rs` | SSSE3 YCbCr→RGB: 8-pixel SIMD with shuffle-based 3-channel interleave |
+| `convert.rs`     | Vectorised u8→f32/u16/i16 pixel conversion (NEON + SSE2) |
 | `upsample/mod.rs`| Chroma upsample dispatcher                            |
 | `upsample/scalar.rs` | Bilinear 3:1 blend for horizontal 2× upsampling |
 | `upsample/neon.rs`   | NEON horizontal 2× upsample: widening multiply-accumulate |
@@ -151,7 +154,7 @@ The custom baseline JPEG decoder processes images through these stages:
 2. **Capacity validation**: Verify tensor dimensions ≥ decoded image size
    (accounting for EXIF rotation if enabled).
 3. **MCU decode loop** (`mcu.rs`): For each MCU row:
-   a. **Huffman decode** (`huffman.rs`): 9-bit lookahead LUT decodes DC/AC
+   a. **Huffman decode** (`huffman.rs`): 11-bit lookahead LUT decodes DC/AC
       coefficients with dequantisation fused into the decode step.
    b. **IDCT** (`idct/`): Two-pass Loeffler 8×8 IDCT with DC-only fast
       path converts frequency coefficients → spatial pixel values.
@@ -162,8 +165,9 @@ The custom baseline JPEG decoder processes images through these stages:
    e. **Strided output**: Write converted pixels to tensor buffer at
       `effective_row_stride()` offsets.
 4. **EXIF rotation/flip**: Apply orientation transform in-place (if enabled).
-5. **Type conversion**: For non-u8 targets, convert pixel data via
-   `ImagePixel::from_u8()` with fast paths for i8 (XOR 0x80).
+5. **Type conversion** (`convert.rs`): For non-u8 targets, convert pixel
+   data via SIMD-vectorised paths: NEON/SSE2 for f32 (×1/255), u16 (×257),
+   i16 (×257 XOR 0x8000); byte-level XOR for i8.
 6. **Return** `ImageInfo` with decoded dimensions.
 
 **Key optimisations:**
@@ -176,7 +180,8 @@ The custom baseline JPEG decoder processes images through these stages:
 - DC-only IDCT fast path: when all 63 AC coefficients are zero, the IDCT
   reduces to a constant fill (single multiply + shift).
 - Function pointer dispatch for IDCT/color/upsample: selected once at init
-  based on CPU feature detection (NEON on AArch64, SSE2 on x86-64, scalar fallback).
+  based on CPU feature detection (NEON on AArch64, SSE4.1 > SSE2 on x86-64,
+  scalar fallback).
 
 ### NEON SIMD Kernels (AArch64)
 
@@ -190,27 +195,43 @@ at init time.
 | **Color**    | 7-bit fixed-point YCbCr→RGB/RGBA/BGRA, vmovl widening, vrshrq rounding shift, vqmovun saturation, vst3/vst4 interleaved store | 8 pixels per iteration |
 | **Upsample** | Widening bilinear 3:1 blend via vmulq_n_u16, interleaved output via vst2 | 8→16 samples per iteration |
 
-### SSE2 SIMD Kernels (x86-64)
+### SSE2/SSE4.1/SSSE3 SIMD Kernels (x86-64)
 
-On x86-64, the decoder uses SSE2 intrinsics for the same three kernels.
-SSE2 is guaranteed on all x86-64 CPUs but dispatch still uses
-`is_x86_feature_detected!("sse2")` for pattern consistency.
+On x86-64, the decoder uses a tiered SIMD dispatch: SSE4.1 > SSE2 > scalar
+for IDCT, SSSE3 > SSE2 for RGB color conversion. Each tier is selected at
+init via `is_x86_feature_detected!()`.
 
-| Kernel       | Strategy                                          | Throughput    |
-|--------------|---------------------------------------------------|---------------|
-| **IDCT**     | 4-wide Loeffler butterfly with `__m128i`, emulated `mullo_epi32` (SSE2 lacks native i32 multiply), comparison-based clamp to [0,255] | 4 cols/rows per iteration |
-| **Color**    | 7-bit fixed-point YCbCr→RGB/RGBA/BGRA, `_mm_unpacklo_epi8` widening, `_mm_srai_epi16` shift, `_mm_packus_epi16` saturation, unpack-interleave for RGBA/BGRA, temp-buffer scatter for RGB | 8 pixels per iteration |
-| **Upsample** | 16-bit bilinear 3:1 blend via `_mm_mullo_epi16`, `_mm_packus_epi16` narrow, `_mm_unpacklo_epi8` interleave | 16→32 samples per iteration |
+| Kernel       | Tier    | Strategy                                          | Throughput    |
+|--------------|---------|---------------------------------------------------|---------------|
+| **IDCT**     | SSE4.1  | 4-wide Loeffler with native `_mm_mullo_epi32`, `_mm_min_epi32`/`_mm_max_epi32` clamp | 4 cols/rows per iteration |
+| **IDCT**     | SSE2    | 4-wide Loeffler with emulated `mullo_epi32` (4 instructions), comparison-based clamp | 4 cols/rows per iteration |
+| **Color RGB**| SSSE3   | 7-bit fixed-point YCbCr→RGB, `_mm_shuffle_epi8` for 3-channel interleave | 8 pixels per iteration |
+| **Color RGBA/BGRA** | SSE2 | 7-bit fixed-point, `_mm_unpacklo_epi8` 4-channel interleave | 8 pixels per iteration |
+| **Upsample** | SSE2    | 16-bit bilinear 3:1 blend via `_mm_mullo_epi16`, `_mm_packus_epi16` narrow, `_mm_unpacklo_epi8` interleave | 16→32 samples per iteration |
 
-SSE2 notes:
-- `_mm_mullo_epi32` requires SSE4.1; the IDCT emulates it via two `_mm_mul_epu32` +
-  shuffle/unpack (low 32 bits of unsigned multiply match signed multiply).
-- RGB 3-channel interleave uses a temp buffer + scalar scatter (SSE2 has no byte
-  shuffle like SSSE3's `_mm_shuffle_epi8`); RGBA/BGRA use native `_mm_unpacklo_epi8`
-  interleaving which is actually faster than RGB.
+SSE4.1 IDCT improvements over SSE2:
+- Native `_mm_mullo_epi32` replaces 4-instruction emulation (2× `_mm_mul_epu32` +
+  shuffle + unpack), reducing IDCT instruction count by ~30%.
+- `_mm_min_epi32`/`_mm_max_epi32` replaces 5-instruction comparison-based clamp
+  with a 2-instruction branchless clamp.
 
-All kernels have scalar tails for remainder elements when the width is not
-a multiple of the SIMD width.
+SSSE3 RGB improvements over SSE2:
+- `_mm_shuffle_epi8` with precomputed masks interleaves R/G/B bytes into packed
+  RGB in 2 shuffles + 1 OR per 16 output bytes, replacing the SSE2 temp-buffer
+  scatter (3 stores + 8-iteration scalar loop).
+
+### Vectorised Type Conversion
+
+The u8→T conversion step uses dedicated SIMD kernels (`convert.rs`) instead of
+per-element `ImagePixel::from_u8()` calls. This is the critical optimisation for
+f32 decode performance (reduced from 4× slower to 1.17× slower than u8).
+
+| Target | NEON Strategy                                   | SSE2 Strategy                            |
+|--------|------------------------------------------------|------------------------------------------|
+| **f32**| Load 16 bytes, `vmovl`→u16→u32, `vcvtq_f32_u32`, `vmulq_f32(1/255)` | Load 16 bytes, unpack→u32, `_mm_cvtepi32_ps`, `_mm_mul_ps(1/255)` |
+| **u16**| Load 16 bytes, `vmovl_u8`→u16, `vmulq_u16(257)` | Load 16 bytes, unpack→u16, `_mm_mullo_epi16(257)` |
+| **i16**| Same as u16 + `veorq_u16(0x8000)` XOR         | Same as u16 + `_mm_xor_si128(0x8000)`    |
+| **i8** | `copy_from_slice` + bulk XOR 0x80 (auto-vectorised) | Same                                  |
 
 ### NV12 Output Path
 

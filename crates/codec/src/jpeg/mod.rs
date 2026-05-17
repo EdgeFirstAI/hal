@@ -12,6 +12,7 @@
 
 pub mod bitstream;
 pub mod color;
+pub mod convert;
 pub mod huffman;
 pub mod idct;
 pub mod markers;
@@ -239,7 +240,47 @@ pub fn decode_jpeg_into<T: ImagePixel>(
                     *b ^= 0x80;
                 }
             }
+        } else if T::dtype() == edgefirst_tensor::DType::F32 {
+            // SIMD-vectorized u8 → f32 normalisation
+            let dst_f32: &mut [f32] = unsafe {
+                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut f32, dst_bytes.len())
+            };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_f32(
+                    &state.exif_scratch[s..s + src_stride],
+                    &mut dst_f32[d..d + src_stride],
+                );
+            }
+        } else if T::dtype() == edgefirst_tensor::DType::U16 {
+            // SIMD-vectorized u8 → u16 scaling (×257)
+            let dst_u16: &mut [u16] = unsafe {
+                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u16, dst_bytes.len())
+            };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_u16(
+                    &state.exif_scratch[s..s + src_stride],
+                    &mut dst_u16[d..d + src_stride],
+                );
+            }
+        } else if T::dtype() == edgefirst_tensor::DType::I16 {
+            // SIMD-vectorized u8 → i16 (×257 XOR 0x8000)
+            let dst_i16: &mut [i16] = unsafe {
+                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut i16, dst_bytes.len())
+            };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_i16(
+                    &state.exif_scratch[s..s + src_stride],
+                    &mut dst_i16[d..d + src_stride],
+                );
+            }
         } else {
+            // Fallback for any other type
             for y in 0..img_h {
                 let s = y * src_stride;
                 let d = y * dst_stride_elems;

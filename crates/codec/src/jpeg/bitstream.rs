@@ -35,28 +35,45 @@ impl<'a> BitStream<'a> {
         self.pos
     }
 
-    /// Ensure at least 32 bits are available by reading up to 4 bytes.
+    /// Ensure at least 32 bits are available by reading up to 8 bytes.
     ///
-    /// This is the "bulk refill" fast path. If no 0xFF bytes are present in
-    /// the next 4 bytes, we can do a single 32-bit read. Otherwise we fall
-    /// back to byte-at-a-time with stuffing check.
+    /// Uses a fast path that batches non-FF bytes. When the remaining data
+    /// contains no 0xFF markers (the common case), multiple bytes are loaded
+    /// without per-byte branching.
     #[inline]
     pub fn fill(&mut self) {
+        // Fast path: if we need ≥ 4 bytes and the next 4 have no 0xFF,
+        // bulk-load them without per-byte checks.
+        while self.available <= 32 && self.pos + 3 < self.data.len() {
+            let b0 = self.data[self.pos];
+            let b1 = self.data[self.pos + 1];
+            let b2 = self.data[self.pos + 2];
+            let b3 = self.data[self.pos + 3];
+            if (b0 | b1 | b2 | b3) & 0x80 != 0 {
+                // At least one byte has the high bit set — could be 0xFF.
+                // Fall through to byte-at-a-time.
+                break;
+            }
+            // No byte is ≥ 0x80, so none can be 0xFF. Bulk-load all four.
+            let word = (b0 as u64) << 24 | (b1 as u64) << 16 | (b2 as u64) << 8 | (b3 as u64);
+            self.bits |= word << (32 - self.available);
+            self.available += 32;
+            self.pos += 4;
+        }
+
+        // Byte-at-a-time path for remaining fills (handles 0xFF stuffing)
         while self.available <= 56 && self.pos < self.data.len() {
             let b = self.data[self.pos];
             self.pos += 1;
 
             if b == 0xFF {
-                // Peek at next byte
                 if self.pos < self.data.len() {
                     if self.data[self.pos] == 0x00 {
-                        // Stuffed byte: consume the 0x00, keep the 0xFF
                         self.pos += 1;
                         self.bits |= (0xFF_u64) << (56 - self.available);
                         self.available += 8;
                     } else {
-                        // Marker found — stop reading, don't consume marker
-                        self.pos -= 1; // Un-read the 0xFF
+                        self.pos -= 1;
                         break;
                     }
                 } else {

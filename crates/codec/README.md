@@ -12,9 +12,10 @@ in the hot loop — the primary design goal.
 
 JPEG decoding uses a custom from-scratch baseline decoder with reusable
 state, achieving zero heap allocations after the first decode at each
-resolution. SIMD-optimized kernels (NEON on AArch64, SSE2 on x86-64) are
-selected automatically at init via dynamic dispatch. PNG decoding uses
-`zune-png`.
+resolution. SIMD-optimized kernels (NEON on AArch64, SSE4.1/SSSE3/SSE2 on
+x86-64) are selected automatically at init via dynamic dispatch. Vectorised
+type conversion (NEON/SSE2) accelerates f32, u16, and i16 output paths.
+PNG decoding uses `zune-png`.
 
 ## Quick Start
 
