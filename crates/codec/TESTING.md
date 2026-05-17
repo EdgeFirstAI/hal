@@ -6,13 +6,19 @@
 
 Inline `#[cfg(test)]` modules in each source file:
 
-| Module       | Tests                                               |
-|--------------|-----------------------------------------------------|
-| `jpeg.rs`    | Decode test JPEGs, verify dimensions + pixel data   |
-| `png.rs`     | Format conversion (u8 and u16), correctness checks  |
-| `decoder.rs` | Format detection, capacity validation, error paths  |
-| `pixel.rs`   | `ImagePixel::from_u8`/`from_u16` for all 5 types   |
-| `options.rs` | Builder API, default values                         |
+| Module                | Tests                                               |
+|-----------------------|-----------------------------------------------------|
+| `jpeg/mod.rs`         | EXIF orientation default                            |
+| `jpeg/bitstream.rs`   | Bit read, byte-stuffing, sign extension             |
+| `jpeg/huffman.rs`     | Table build, symbol decode, block decode            |
+| `jpeg/idct/scalar.rs` | DC-only shortcut, known coefficient IDCT            |
+| `jpeg/color/scalar.rs`| YCbCr→RGB accuracy, grey copy, neutral grey         |
+| `jpeg/upsample/scalar.rs` | H2 single/two/uniform upsampling               |
+| `jpeg/markers.rs`     | Minimal JPEG parse, invalid data rejection          |
+| `png.rs`              | Format conversion (u8 and u16), correctness checks  |
+| `decoder.rs`          | Format detection, capacity validation, error paths  |
+| `pixel.rs`            | `ImagePixel::from_u8`/`from_u16` for all 5 types   |
+| `options.rs`          | Builder API, default values                         |
 
 ### Integration Tests
 
@@ -20,7 +26,7 @@ Located in `crates/codec/tests/`:
 
 | File                    | What It Tests                                      |
 |-------------------------|----------------------------------------------------|
-| `decode_jpeg.rs`        | JPEG → Tensor<u8/u16/i8/i16/f32>, reuse patterns  |
+| `decode_jpeg.rs`        | JPEG → Tensor<u8/u16/i8/i16/f32>, pixel accuracy, strided decode, error handling, reuse patterns |
 | `decode_png.rs`         | PNG → Tensor<u8/u16/i8/i16/f32>, format conversion|
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 
@@ -131,11 +137,9 @@ assert!(result.is_err());
 
 ## Allocation Profiling
 
-A key design goal of the codec is to minimise heap allocations in the decode
-hot path. The edgefirst-codec layer (scratch buffer, row-copy, pixel
-conversion) is allocation-free after warmup. However, the underlying format
-libraries (zune-jpeg, zune-png) create internal decoder state on every call
-because they do not support state reuse.
+A key design goal of the codec is zero heap allocations in the JPEG decode
+hot path after warmup. The custom JPEG decoder (`JpegDecoderState`) achieves
+this by reusing all scratch buffers across frames.
 
 ### Profiling Methodology
 
@@ -151,46 +155,50 @@ strace -e brk,mmap -f ./target/release/examples/zero_alloc_check 2>&1 \
 This traces `brk` and `mmap` syscalls (proxies for heap allocations) during
 100 decode iterations of the same JPEG into a pre-allocated `Tensor<u8>`.
 
-### Current Results
+### Expected Results
 
-With zune-jpeg as the decode backend, approximately 3 `brk` syscalls occur
-per JPEG decode iteration, originating from zune-jpeg's internal Huffman table
-and quantization matrix allocation. These are **not** from edgefirst-codec's
-own scratch buffer or row-copy logic.
+With the custom JPEG decoder, the hot loop should show **zero** `brk`/`mmap`
+syscalls after the warmup iteration. All buffers (`McuScratch`, `exif_scratch`,
+tensor buffer) are pre-allocated during warmup and reused.
+
+**Note:** If EXIF orientation is enabled (`apply_exif(true)`, the default),
+`kamadak-exif::Reader::read_raw()` allocates on each call. Use
+`DecodeOptions::with_exif(false)` to eliminate this allocation source in
+latency-critical loops.
 
 ### Allocation Sources by Layer
 
-| Layer                | After Warmup     | Notes                        |
-|----------------------|------------------|------------------------------|
-| `ImageDecoder.scratch` | No allocations | `Vec::resize` is no-op at high-water mark |
-| Row-copy / stride    | No allocations   | Operates on pre-allocated buffers |
-| Pixel conversion     | No allocations   | In-place or element-wise     |
-| Format conversion    | 1 `Vec` if needed | Only when src_fmt ≠ dest_fmt |
-| zune-jpeg decoder    | ~3 `brk` / call  | Internal Huffman/quant tables |
-| zune-png `decode()`  | 1 `Vec` / call   | Returns owned `Vec<u16/u8>`  |
-| zune-png `decode_into()` | ~3 `brk` / call | Internal filter state    |
-| EXIF reader          | 1 `Vec` / call   | `to_vec()` on EXIF data; skip with `apply_exif(false)` |
+| Layer                    | After Warmup     | Notes                        |
+|--------------------------|------------------|------------------------------|
+| JPEG `McuScratch`        | No allocations   | Grows to high-water mark     |
+| JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
+| JPEG IDCT workspace      | No allocations   | Stack-allocated `[i32; 64]`  |
+| Row-copy / stride        | No allocations   | Operates on pre-allocated buffers |
+| Pixel conversion         | No allocations   | In-place or element-wise     |
+| EXIF reader              | 1 `Vec` / call   | Skip with `apply_exif(false)` |
+| zune-png `decode()`      | 1 `Vec` / call   | Returns owned `Vec<u16/u8>`  |
+| zune-png `decode_into()` | ~3 `brk` / call  | Internal filter state        |
 
-### Maintaining Low-Allocation Discipline
+### Maintaining Zero-Allocation Discipline
 
-When modifying the JPEG or PNG decode paths:
+When modifying the JPEG decode path:
 - **Do not** add `Vec::new()`, `vec![]`, `String::new()`, `Box::new()`, or
-  any allocating operation inside the per-frame decode logic in edgefirst-codec
-- **Do** reuse the `ImageDecoder.scratch` buffer (it grows via `resize()`
-  only if the new image is larger than any previously seen)
-- **Do** pre-size any buffers at init time
-- If a new allocation is unavoidable (e.g., a library returns an owned Vec),
-  document it in ARCHITECTURE.md
-- Run the `zero_alloc_check` example under `strace` to verify any changes
-  do not introduce new allocation sources in the codec layer
+  any allocating operation inside the per-frame decode logic
+- **Do** reuse `McuScratch` buffers (they grow via `resize()` only if the
+  new image is larger than any previously seen)
+- **Do** pre-size any new buffers at init time and add them to `McuScratch`
+  or `JpegDecoderState`
+- If a new allocation is unavoidable, document it in ARCHITECTURE.md
+- Run the `zero_alloc_check` example under `strace` to verify changes do
+  not introduce new allocation sources
 
 ## Benchmarks
 
 See `crates/codec/benches/codec_benchmark.rs` for performance benchmarks.
 
 Benchmark comparisons:
-- `edgefirst-codec` vs raw `zune-jpeg`/`zune-png` (overhead of strided copy)
-- `edgefirst-codec` vs `image` crate (allocation-heavy reference)
+- `edgefirst-codec` custom JPEG decoder vs `image` crate
+- `edgefirst-codec` vs raw `zune-png` (PNG overhead of strided copy)
 - Strided vs tight decode (measures stride padding overhead)
 - `u8` vs `f32` decode (measures conversion overhead)
 

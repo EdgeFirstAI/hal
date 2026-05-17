@@ -17,9 +17,11 @@ edgefirst-tensor ← edgefirst-codec ← edgefirst-image (re-export)
                                     ← crates/python (bindings)
 ```
 
-`edgefirst-codec` depends only on `edgefirst-tensor` plus format-specific
-decode libraries (`zune-jpeg`, `zune-png`). It has no dependency on
-`edgefirst-image` or any GPU libraries, keeping the dependency graph clean.
+`edgefirst-codec` depends only on `edgefirst-tensor` plus `zune-png`
+(for PNG decoding) and `kamadak-exif` (for EXIF orientation). JPEG
+decoding uses a custom from-scratch decoder with no external dependencies.
+The crate has no dependency on `edgefirst-image` or any GPU libraries,
+keeping the dependency graph clean.
 
 ## Module Map
 
@@ -29,10 +31,30 @@ decode libraries (`zune-jpeg`, `zune-png`). It has no dependency on
 | `error.rs`   | `CodecError` enum with capacity/dtype/format/IO |
 | `pixel.rs`   | `ImagePixel` trait (u8, u16, i8, i16, f32)      |
 | `options.rs` | `DecodeOptions` and `ImageInfo` structs         |
-| `decoder.rs` | `ImageDecoder` struct with scratch buffers      |
+| `decoder.rs` | `ImageDecoder` struct with `JpegDecoderState`   |
 | `traits.rs`  | `ImageLoad` extension trait for Tensor/TensorDyn|
-| `jpeg.rs`    | JPEG decode with EXIF orientation handling       |
+| `jpeg/`      | Custom baseline JPEG decoder (see below)        |
 | `png.rs`     | PNG decode with format conversion and native 16-bit support |
+
+### JPEG Module Map (`jpeg/`)
+
+| Module           | Purpose                                              |
+|------------------|------------------------------------------------------|
+| `mod.rs`         | `JpegDecoderState`, `decode_jpeg_into<T>()`, EXIF    |
+| `types.rs`       | `Component`, `SamplingFactor`, `ImageHeader`, `QuantTable`, `ZIGZAG` |
+| `markers.rs`     | SOF/SOS/DQT/DHT/DRI/APP marker parsing               |
+| `bitstream.rs`   | 64-bit bit buffer with FF/00 byte-stuffing, bulk refill |
+| `huffman.rs`     | 9-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
+| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON selection via function pointers) |
+| `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path    |
+| `idct/neon.rs`   | NEON IDCT stub (delegates to scalar)                  |
+| `color/mod.rs`   | Color conversion dispatcher                           |
+| `color/scalar.rs`| BT.601 full-range YCbCr→RGB/RGBA/BGRA/Grey           |
+| `color/neon.rs`  | NEON color conversion stub (delegates to scalar)      |
+| `upsample/mod.rs`| Chroma upsample dispatcher                            |
+| `upsample/scalar.rs` | Bilinear 3:1 blend for horizontal 2× upsampling |
+| `upsample/neon.rs`   | NEON upsample stub (delegates to scalar)         |
+| `mcu.rs`         | MCU decode loop, `McuScratch`, strided output         |
 
 ## Key Design Decisions
 
@@ -119,17 +141,66 @@ processor.convert(&tensor, &mut dst, rot, flip,
 
 ### JPEG Decode Flow
 
-1. Parse JPEG headers via `zune-jpeg` → get dimensions, colorspace
-2. Validate tensor capacity ≥ decoded dimensions
-3. Optionally read EXIF orientation tag
-4. Decode into `ImageDecoder.scratch` (contiguous buffer, reused across frames)
-5. Apply EXIF rotation/flip in-place on scratch (if enabled)
-6. Row-copy from scratch → tensor buffer at stride offsets, with pixel type
-   conversion via `ImagePixel::from_u8()` (JPEG is always 8-bit source)
-7. Return `ImageInfo` with decoded dimensions
+The custom baseline JPEG decoder processes images through these stages:
 
-**Fast paths:** `u8` uses `copy_from_slice`; `i8` uses copy + XOR 0x80 in-place.
-Generic path (u16, i16, f32) converts element-by-element via `from_u8()`.
+1. **Marker parsing** (`markers.rs`): Parse SOF0, DQT, DHT, DRI, SOS, APP1
+   segments. Build Huffman tables, quantisation tables, and extract EXIF data.
+2. **Capacity validation**: Verify tensor dimensions ≥ decoded image size
+   (accounting for EXIF rotation if enabled).
+3. **MCU decode loop** (`mcu.rs`): For each MCU row:
+   a. **Huffman decode** (`huffman.rs`): 9-bit lookahead LUT decodes DC/AC
+      coefficients with dequantisation fused into the decode step.
+   b. **IDCT** (`idct/`): Two-pass Loeffler 8×8 IDCT with DC-only fast
+      path converts frequency coefficients → spatial pixel values.
+   c. **Chroma upsample** (`upsample/`): Bilinear 3:1 blend expands
+      subsampled Cb/Cr channels to full resolution.
+   d. **Color conversion** (`color/`): BT.601 full-range YCbCr→RGB/RGBA/
+      BGRA/Grey conversion with clamping.
+   e. **Strided output**: Write converted pixels to tensor buffer at
+      `effective_row_stride()` offsets.
+4. **EXIF rotation/flip**: Apply orientation transform in-place (if enabled).
+5. **Type conversion**: For non-u8 targets, convert pixel data via
+   `ImagePixel::from_u8()` with fast paths for i8 (XOR 0x80).
+6. **Return** `ImageInfo` with decoded dimensions.
+
+**Key optimisations:**
+- `JpegDecoderState` persists across frames — `McuScratch` buffers grow
+  to the high-water mark and are reused. After the first decode at a given
+  resolution, the JPEG decoder performs zero heap allocations.
+- Dequantisation is fused into Huffman decode: `decode_block()` multiplies
+  each coefficient by the quant table entry during decode, not as a
+  separate pass.
+- DC-only IDCT fast path: when all 63 AC coefficients are zero, the IDCT
+  reduces to a constant fill (single multiply + shift).
+- Function pointer dispatch for IDCT/color/upsample: selected once at init
+  based on CPU feature detection (NEON vs scalar).
+
+### JPEG Decoder Architecture
+
+```
+JpegDecoderState
+├── McuScratch (reusable across frames)
+│   ├── component_bufs: Vec<Vec<u8>>   — per-component IDCT output
+│   ├── cb_row / cr_row: Vec<u8>       — upsampled chroma rows
+│   └── output_row: Vec<u8>            — color-converted output row
+└── exif_scratch: Vec<u8>              — EXIF rotation workspace
+```
+
+The MCU loop processes one MCU row at a time:
+1. Decode all blocks (Y, Cb, Cr) into `component_bufs`
+2. For each pixel row in the MCU row:
+   - Upsample chroma into `cb_row`/`cr_row`
+   - Color-convert Y+Cb+Cr → `output_row`
+   - Copy `output_row` → tensor at strided offset
+
+### Chroma Subsampling Support
+
+| Sampling | Description     | H/V Ratios | Upsample Path         |
+|----------|-----------------|------------|------------------------|
+| 4:4:4    | No subsampling  | 1:1 / 1:1  | Direct (no upsample)  |
+| 4:2:2    | Horizontal 2×   | 2:1 / 1:1  | `upsample_h2()`       |
+| 4:2:0    | Horizontal + Vertical 2× | 2:1 / 2:1 | `upsample_h2()` + row duplication |
+| Greyscale| Single component| N/A        | `grey_copy()`          |
 
 ### PNG Decode Flow
 
@@ -187,29 +258,42 @@ exactly (257 = 0x0101).
 
 ## Scratch Buffer Strategy
 
-`ImageDecoder` contains a `Vec<u8>` scratch buffer that grows to the
-high-water mark and is reused. The edgefirst-codec layer itself does not
-perform heap allocations in the decode hot path after warmup — all row-copy
-and pixel conversion logic operates on the pre-allocated scratch and tensor
-buffers.
+### JPEG (`JpegDecoderState`)
 
-However, the underlying decode libraries (zune-jpeg, zune-png) allocate
-internal state (Huffman tables, filter state) on each call because they
-do not support decoder state reuse. This means the overall decode path
-does involve allocations per call, originating in the format libraries.
+The custom JPEG decoder uses `JpegDecoderState` which persists across frames.
+The internal `McuScratch` buffers grow to the high-water mark and are reused.
+After the first decode at a given resolution, subsequent JPEG decodes perform
+**zero heap allocations** in the entire decode path.
 
-**Allocation-free layers (after warmup):**
-- Scratch buffer management (`Vec::resize` is a no-op at high-water mark)
+**Allocation-free after warmup:**
+- `McuScratch` component buffers, chroma rows, output row
+- Huffman table lookups (tables are rebuilt from marker data each frame using
+  pre-allocated `Vec` storage)
+- IDCT workspace (stack-allocated `[i32; 64]`)
+- Bitstream reader (borrows input `&[u8]`)
 - Row-copy and stride padding logic
 - Pixel type conversion (u8→u16, u8→i8 XOR, u8→f32)
-- Format conversion (RGB↔RGBA, Grey↔RGB)
 
-**Allocating layers (per call):**
-- `zune-jpeg::JpegDecoder::new()` — internal Huffman/quantization tables
-- `zune-png::PngDecoder::decode()` — returns owned `Vec<u16>` for 16-bit PNGs
-- `exif::Reader::read_raw()` — when EXIF orientation is enabled
+**EXIF rotation** (`exif_scratch`) uses a reusable `Vec<u8>` that grows to
+the high-water mark. `kamadak-exif::Reader::read_raw()` allocates on each
+call — disable with `DecodeOptions::with_exif(false)` in the hot loop if
+the application handles orientation separately.
 
-For the PNG native-depth path (`u16`/`f32` targets), zune-png's `decode()`
-returns an owned `Vec<u16>` or `Vec<u8>` — this is an additional allocation
-per call beyond the decoder state. The u8/i8 targets use `decode_into()` which
-writes directly into the reusable scratch buffer, avoiding this extra allocation.
+### PNG (`zune-png`)
+
+PNG decoding uses `zune-png` which allocates internal decoder state on each
+call. The edgefirst-codec PNG layer reuses `ImageDecoder.input_buffer` for
+`Read`-based input but the zune-png library itself allocates per-frame.
+
+### Allocation Sources by Layer
+
+| Layer                    | After Warmup     | Notes                        |
+|--------------------------|------------------|------------------------------|
+| JPEG `McuScratch`        | No allocations   | Grows to high-water mark     |
+| JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
+| JPEG IDCT workspace      | No allocations   | Stack-allocated `[i32; 64]`  |
+| Row-copy / stride        | No allocations   | Operates on pre-allocated buffers |
+| Pixel conversion         | No allocations   | In-place or element-wise     |
+| EXIF reader              | 1 `Vec` / call   | `to_vec()` on EXIF data; skip with `apply_exif(false)` |
+| zune-png `decode()`      | 1 `Vec` / call   | Returns owned `Vec<u16/u8>`  |
+| zune-png `decode_into()` | ~3 `brk` / call  | Internal filter state        |
