@@ -131,6 +131,41 @@ impl Default for ImageDecoder {
     }
 }
 
+/// Parse image headers and return image dimensions/format without decoding pixels.
+///
+/// Detects the image format (JPEG or PNG) from magic bytes and returns an
+/// [`ImageInfo`] describing the post-decode layout. For images with an EXIF
+/// 90°/270° orientation tag and `opts.apply_exif == true`, `width` and
+/// `height` reflect the **post-rotation** dimensions — matching exactly what
+/// a subsequent [`ImageDecoder::decode_into`] call would write to the tensor.
+///
+/// This is the recommended entry point for one-shot decode flows that need
+/// to allocate a tensor sized to the image:
+///
+/// ```rust,no_run
+/// use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad, DecodeOptions};
+/// use edgefirst_tensor::{Tensor, TensorMemory, PixelFormat};
+///
+/// let data = std::fs::read("image.jpg").unwrap();
+/// let opts = DecodeOptions::default().with_format(PixelFormat::Rgba);
+/// let info = peek_info(&data, &opts).unwrap();
+/// let mut tensor = Tensor::<u8>::image(info.width, info.height, info.format,
+///                                       Some(TensorMemory::Mem)).unwrap();
+/// let mut decoder = ImageDecoder::new();
+/// tensor.load_image(&mut decoder, &data, &opts).unwrap();
+/// ```
+pub fn peek_info(data: &[u8], opts: &DecodeOptions) -> crate::Result<ImageInfo> {
+    if is_jpeg(data) {
+        crate::jpeg::peek_jpeg_info(data, opts)
+    } else if is_png(data) {
+        crate::png::peek_png_info(data, opts)
+    } else {
+        Err(CodecError::InvalidData(
+            "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
+        ))
+    }
+}
+
 /// Check for JPEG magic bytes (FFD8FF).
 fn is_jpeg(data: &[u8]) -> bool {
     data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF

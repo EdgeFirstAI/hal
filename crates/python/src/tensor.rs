@@ -85,7 +85,7 @@ thread_local! {
 }
 
 /// Metadata returned by ``decode_image`` / ``decode_image_file``.
-#[pyclass(name = "ImageInfo", get_all)]
+#[pyclass(name = "ImageInfo", get_all, skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyImageInfo {
     /// Decoded image width in pixels.
@@ -800,37 +800,44 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
-    /// Load an image from a file, decoding JPEG/PNG automatically.
+    /// Parse the header of a JPEG/PNG byte string and return its dimensions
+    /// and pixel format without decoding pixels. Use this to allocate a
+    /// tensor at the right size before calling ``decode_image``.
+    ///
+    /// EXIF orientation is ignored so the reported dimensions match what
+    /// ``decode_image`` will actually write (decode also ignores EXIF when
+    /// writing into a pre-allocated tensor — see ``decode_image``).
     #[staticmethod]
-    #[pyo3(signature = (filename, format = None, mem = None))]
-    #[allow(deprecated)]
-    fn load(
-        filename: &str,
-        format: Option<crate::image::PyPixelFormat>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        use edgefirst_hal::image;
-        let fmt = format.map(|f| f.into());
-        let data = std::fs::read(filename)?;
-        let memory = mem.map(|x| x.into());
-        let tensor = image::load_image(&data, fmt, memory)?;
-        Ok(PyTensor(tensor))
-    }
-
-    /// Load an image from raw bytes, decoding JPEG/PNG automatically.
-    #[staticmethod]
-    #[pyo3(signature = (data, format = None, mem = None))]
-    #[allow(deprecated)]
-    fn load_from_bytes(
+    #[pyo3(signature = (data, format = None))]
+    fn peek_image_info(
         data: &[u8],
         format: Option<crate::image::PyPixelFormat>,
-        mem: Option<PyTensorMemory>,
-    ) -> Result<Self> {
-        use edgefirst_hal::image;
-        let fmt = format.map(|f| f.into());
-        let memory = mem.map(|x| x.into());
-        let tensor = image::load_image(data, fmt, memory)?;
-        Ok(PyTensor(tensor))
+    ) -> Result<PyImageInfo> {
+        use edgefirst_hal::codec::{peek_info, DecodeOptions};
+        let mut opts = DecodeOptions::default().with_exif(false);
+        if let Some(fmt) = format {
+            opts = opts.with_format(fmt.into());
+        }
+        let info = peek_info(data, &opts)?;
+        Ok(PyImageInfo {
+            width: info.width,
+            height: info.height,
+            format: crate::image::PyPixelFormat::try_from(info.format)
+                .map_err(|e| Error::Format(e.to_string()))?,
+            row_stride: info.row_stride,
+        })
+    }
+
+    /// Parse the header of an image file and return its dimensions and
+    /// pixel format without decoding pixels.
+    #[staticmethod]
+    #[pyo3(signature = (filename, format = None))]
+    fn peek_image_info_file(
+        filename: &str,
+        format: Option<crate::image::PyPixelFormat>,
+    ) -> Result<PyImageInfo> {
+        let data = std::fs::read(filename)?;
+        Self::peek_image_info(&data, format)
     }
 
     /// Save this image tensor as a JPEG file.
@@ -860,7 +867,7 @@ impl PyTensor {
         data: &[u8],
         format: Option<crate::image::PyPixelFormat>,
     ) -> Result<PyImageInfo> {
-        use edgefirst_hal::codec::{DecodeOptions, ImageDecoder, ImageLoad};
+        use edgefirst_hal::codec::{DecodeOptions, ImageLoad};
         let mut opts = DecodeOptions::default().with_exif(false);
         if let Some(fmt) = format {
             opts = opts.with_format(fmt.into());

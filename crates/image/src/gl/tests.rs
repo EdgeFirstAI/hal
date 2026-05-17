@@ -27,7 +27,7 @@ mod gl_tests {
             return;
         }
 
-        let image = crate::load_image(
+        let image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -67,7 +67,7 @@ mod gl_tests {
             return;
         }
 
-        let image = crate::load_image(
+        let image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
@@ -110,7 +110,7 @@ mod gl_tests {
 
         // draw_decoded_masks fully writes dst — pass the camera frame as
         // the MaskOverlay background, not as the dst canvas.
-        let bg = crate::load_image(
+        let bg = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -163,7 +163,7 @@ mod gl_tests {
             __t.set_format(PixelFormat::Rgba).unwrap();
             TensorDyn::from(__t)
         };
-        let expected = crate::load_image(
+        let expected = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("output_render_gl.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -184,7 +184,7 @@ mod gl_tests {
             return;
         }
 
-        let image = crate::load_image(
+        let image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -621,7 +621,7 @@ mod gl_tests {
 
             // Smoke test: do a simple PixelFormat::Rgba → PixelFormat::Rgba conversion to verify the
             // GL context is fully functional.
-            let src = crate::load_image(
+            let src = crate::load_image_test_helper(
                 &edgefirst_bench::testdata::read("zidane.jpg"),
                 Some(PixelFormat::Rgba),
                 None,
@@ -691,7 +691,7 @@ mod gl_tests {
         }
 
         let mut gl = GLProcessorThreaded::new(None).expect("auto-detect should succeed");
-        let src = crate::load_image(
+        let src = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -1181,7 +1181,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Render to PixelFormat::Rgba
-        let rgba_img = crate::load_image(
+        let rgba_img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -1192,7 +1192,7 @@ mod gl_tests {
             .unwrap();
 
         // Render to PixelFormat::Bgra (convert source to PixelFormat::Bgra first)
-        let rgba_src = crate::load_image(
+        let rgba_src = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -1262,7 +1262,7 @@ mod gl_tests {
         gl.set_class_colors(&colors).unwrap();
 
         // Render boxes to PixelFormat::Rgba
-        let rgba_img = crate::load_image(
+        let rgba_img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),
@@ -1273,7 +1273,7 @@ mod gl_tests {
             .unwrap();
 
         // Render boxes to PixelFormat::Bgra
-        let rgba_src = crate::load_image(
+        let rgba_src = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             Some(edgefirst_tensor::TensorMemory::Mem),

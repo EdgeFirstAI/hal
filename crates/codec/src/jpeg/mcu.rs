@@ -204,7 +204,11 @@ pub fn decode_image(
         let mcu_pixel_h = max_v * 8;
         let y_start = mcu_row * mcu_pixel_h;
 
-        if is_greyscale {
+        if is_greyscale || output_format == PixelFormat::Grey {
+            // The Y plane (component_bufs[0]) is stored at native pixel
+            // resolution for both 1-component (greyscale) JPEGs and the
+            // luma channel of multi-component JPEGs, so the same write
+            // path covers both cases — chroma planes are simply skipped.
             let grey_fn = color::select_grey_copy();
             write_greyscale_rows(
                 &scratch.component_bufs[0],

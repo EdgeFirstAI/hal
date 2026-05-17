@@ -42,8 +42,6 @@ rayon = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 yuv = { workspace = true }
-zune-jpeg = { workspace = true }
-zune-png = { workspace = true }
 edgefirst-decoder = { workspace = true }
 edgefirst-tracker = { workspace = true, optional = true }
 ndarray-stats = { workspace = true }

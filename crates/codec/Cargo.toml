@@ -29,12 +29,8 @@ zune-png = { workspace = true }
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
-
-# Comparison benchmark libraries (enable with --features)
-[target.'cfg(any())'.dev-dependencies]
-# These are gated by features and only used in benchmarks.
-# We use cfg(any()) as a no-op target filter; the actual gating is via
-# required-features on the bench targets.
+# zune-jpeg is used only by parity tests and the comparison benchmark.
+zune-jpeg = { workspace = true }
 
 
 [[bench]]

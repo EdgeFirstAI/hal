@@ -9,14 +9,12 @@
 use crate::decoder::{HalDecoder, HalDetectBoxList, HalProtoData, HalSegmentationList};
 use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
-use crate::{
-    check_null, check_null_ret_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList,
-};
+use crate::{check_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList};
 use edgefirst_codec::{CodecError, DecodeOptions, ImageDecoder, ImageLoad};
 use edgefirst_decoder::{DetectBox, Segmentation};
 #[allow(deprecated)]
 use edgefirst_image::{
-    load_image, save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
+    save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
     ImageProcessorTrait, MaskResolution, Rect, Rotation,
 };
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
@@ -444,158 +442,6 @@ pub unsafe extern "C" fn hal_tensor_new_image(
             mem_opt,
         ),
         libc::ENOMEM
-    );
-
-    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
-}
-
-/// Load an image from memory (JPEG or PNG).
-///
-/// Automatically detects format and decodes the image.
-///
-/// @param data Pointer to image data
-/// @param len Length of image data in bytes
-/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
-/// @param memory Memory allocation type
-/// @return New tensor handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL data, zero length)
-/// - EBADMSG: Failed to decode image
-/// - ENOMEM: Memory allocation failed
-#[no_mangle]
-#[allow(deprecated)]
-pub unsafe extern "C" fn hal_tensor_load_image(
-    data: *const u8,
-    len: size_t,
-    format: HalPixelFormat,
-    memory: HalTensorMemory,
-) -> *mut HalTensor {
-    check_null_ret_null!(data);
-    if len == 0 {
-        return set_error_null(libc::EINVAL);
-    }
-
-    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
-    let mem_opt: Option<TensorMemory> = memory.into();
-
-    let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
-        libc::EBADMSG
-    );
-
-    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
-}
-
-/// Load an image from a file (JPEG or PNG).
-///
-/// @param path Path to the image file
-/// @param format Output pixel format
-/// @param memory Memory allocation type
-/// @return New tensor handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL path)
-/// - ENOENT: File not found
-/// - EBADMSG: Failed to decode image
-/// - ENOMEM: Memory allocation failed
-#[no_mangle]
-#[allow(deprecated)]
-pub unsafe extern "C" fn hal_tensor_load_image_file(
-    path: *const c_char,
-    format: HalPixelFormat,
-    memory: HalTensorMemory,
-) -> *mut HalTensor {
-    check_null_ret_null!(path);
-
-    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return set_error_null(libc::EINVAL),
-    };
-
-    let data = match std::fs::read(path_str) {
-        Ok(d) => d,
-        Err(e) => {
-            return set_error_null(if e.kind() == std::io::ErrorKind::NotFound {
-                libc::ENOENT
-            } else {
-                libc::EIO
-            })
-        }
-    };
-
-    let mem_opt: Option<TensorMemory> = memory.into();
-    let dyn_tensor = try_or_null!(
-        load_image(&data, Some(format.to_pixel_format()), mem_opt),
-        libc::EBADMSG
-    );
-
-    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
-}
-
-/// Load a JPEG image from memory.
-///
-/// @param data Pointer to JPEG data
-/// @param len Length of JPEG data in bytes
-/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
-/// @param memory Memory allocation type
-/// @return New tensor handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL data, zero length)
-/// - EBADMSG: Failed to decode JPEG
-/// - ENOMEM: Memory allocation failed
-#[no_mangle]
-#[allow(deprecated)]
-pub unsafe extern "C" fn hal_tensor_load_jpeg(
-    data: *const u8,
-    len: size_t,
-    format: HalPixelFormat,
-    memory: HalTensorMemory,
-) -> *mut HalTensor {
-    check_null_ret_null!(data);
-    if len == 0 {
-        return set_error_null(libc::EINVAL);
-    }
-
-    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
-    let mem_opt: Option<TensorMemory> = memory.into();
-
-    let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
-        libc::EBADMSG
-    );
-
-    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
-}
-
-/// Load a PNG image from memory.
-///
-/// @param data Pointer to PNG data
-/// @param len Length of PNG data in bytes
-/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, or HAL_PIXEL_FORMAT_GREY)
-/// @param memory Memory allocation type
-/// @return New tensor handle on success, NULL on error
-/// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL data, zero length)
-/// - EBADMSG: Failed to decode PNG
-/// - ENOMEM: Memory allocation failed
-#[no_mangle]
-#[allow(deprecated)]
-pub unsafe extern "C" fn hal_tensor_load_png(
-    data: *const u8,
-    len: size_t,
-    format: HalPixelFormat,
-    memory: HalTensorMemory,
-) -> *mut HalTensor {
-    check_null_ret_null!(data);
-    if len == 0 {
-        return set_error_null(libc::EINVAL);
-    }
-
-    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
-    let mem_opt: Option<TensorMemory> = memory.into();
-
-    let dyn_tensor = try_or_null!(
-        load_image(data_slice, Some(format.to_pixel_format()), mem_opt),
-        libc::EBADMSG
     );
 
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
@@ -2221,54 +2067,6 @@ mod tests {
     }
 
     #[test]
-    fn test_image_load_null_data() {
-        unsafe {
-            let image = hal_tensor_load_image(
-                std::ptr::null(),
-                100,
-                HalPixelFormat::Rgb,
-                HalTensorMemory::Mem,
-            );
-            assert!(image.is_null());
-        }
-    }
-
-    #[test]
-    fn test_image_load_zero_length() {
-        unsafe {
-            let data = [0u8; 10];
-            let image =
-                hal_tensor_load_image(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
-            assert!(image.is_null());
-        }
-    }
-
-    #[test]
-    fn test_image_load_file_null_path() {
-        unsafe {
-            let image = hal_tensor_load_image_file(
-                std::ptr::null(),
-                HalPixelFormat::Rgb,
-                HalTensorMemory::Mem,
-            );
-            assert!(image.is_null());
-        }
-    }
-
-    #[test]
-    fn test_image_load_file_nonexistent() {
-        unsafe {
-            let path = CString::new("/nonexistent/path/image.jpg").unwrap();
-            let image = hal_tensor_load_image_file(
-                path.as_ptr(),
-                HalPixelFormat::Rgb,
-                HalTensorMemory::Mem,
-            );
-            assert!(image.is_null());
-        }
-    }
-
-    #[test]
     fn test_image_save_jpeg_null_params() {
         unsafe {
             let image = hal_tensor_new_image(
@@ -2415,43 +2213,6 @@ mod tests {
             assert_eq!(hal_tensor_row_stride(std::ptr::null()), 0);
         }
     }
-
-    #[test]
-    fn test_image_load_jpeg_null() {
-        unsafe {
-            let image = hal_tensor_load_jpeg(
-                std::ptr::null(),
-                100,
-                HalPixelFormat::Rgb,
-                HalTensorMemory::Mem,
-            );
-            assert!(image.is_null());
-
-            let data = [0u8; 10];
-            let image =
-                hal_tensor_load_jpeg(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
-            assert!(image.is_null());
-        }
-    }
-
-    #[test]
-    fn test_image_load_png_null() {
-        unsafe {
-            let image = hal_tensor_load_png(
-                std::ptr::null(),
-                100,
-                HalPixelFormat::Rgb,
-                HalTensorMemory::Mem,
-            );
-            assert!(image.is_null());
-
-            let data = [0u8; 10];
-            let image =
-                hal_tensor_load_png(data.as_ptr(), 0, HalPixelFormat::Rgb, HalTensorMemory::Mem);
-            assert!(image.is_null());
-        }
-    }
-
     #[test]
     fn test_image_processor_draw_decoded_masks_null_params() {
         unsafe {
