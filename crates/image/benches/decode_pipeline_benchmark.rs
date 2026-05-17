@@ -22,7 +22,7 @@ use common::{calculate_letterbox, run_bench, BenchSuite};
 
 use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -106,12 +106,12 @@ fn bench_decode_convert(
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
 
-    let input_mem = Some(TensorMemory::Mem);
+    // Auto-select memory type: DMA if available, else Mem
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, input_mem)
+        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, None)
         .expect("Failed to create input tensor");
     let mut output = proc
-        .create_image(MODEL_W, MODEL_H, output_fmt, DType::U8, input_mem)
+        .create_image(MODEL_W, MODEL_H, output_fmt, DType::U8, None)
         .expect("Failed to create output tensor");
 
     for img in TEST_IMAGES {

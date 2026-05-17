@@ -14,9 +14,29 @@
 //! After warmup, the hot loop performs **zero heap allocations** — all buffers
 //! (decoder scratch, tensor backing, GL resources) were sized during init.
 //!
+//! ## Memory modes
+//!
+//! By default, tensors are allocated with the best available backend:
+//! - **DMA-BUF** (i.MX 8M Plus, i.MX 95, RPi 5): zero-copy EGL image import
+//! - **PBO** (Jetson Orin Nano): use `EDGEFIRST_FORCE_TRANSFER=pbo`
+//! - **Heap** (x86_64 desktop): fallback when no DMA-heap is available
+//!
+//! Override with `PIPELINE_MEM_TYPE=mem|dma|shm`.
+//!
 //! ## Run as demo
 //! ```bash
 //! cargo run --release -p edgefirst-image --example pipeline_demo
+//! ```
+//!
+//! ## Run on embedded target
+//! ```bash
+//! # Cross-compile
+//! cargo-zigbuild zigbuild --release --target aarch64-unknown-linux-gnu \
+//!     -p edgefirst-image --example pipeline_demo
+//! # Deploy and run
+//! scp target/aarch64-unknown-linux-gnu/release/examples/pipeline_demo target:/tmp/
+//! scp testdata/*.jpg target:/tmp/testdata/
+//! ssh target 'EDGEFIRST_TESTDATA_DIR=/tmp/testdata /tmp/pipeline_demo'
 //! ```
 //!
 //! ## Verify zero allocations with strace
@@ -180,36 +200,57 @@ fn main() {
 
     // Create ImageProcessor (probes GPU backends)
     let mut proc = ImageProcessor::new().expect("Failed to create ImageProcessor");
-    eprintln!("  ImageProcessor created");
+
+    // Memory type: auto-select (DMA on embedded, Mem on desktop).
+    // Override with PIPELINE_MEM_TYPE=mem|dma|shm for testing.
+    let mem_type = match std::env::var("PIPELINE_MEM_TYPE")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "mem" => Some(TensorMemory::Mem),
+        "dma" => Some(TensorMemory::Dma),
+        "shm" => Some(TensorMemory::Shm),
+        _ => None, // auto-select: DMA if available, else Mem
+    };
+    let mem_label = mem_type.map_or("auto", |m| match m {
+        TensorMemory::Mem => "Mem",
+        TensorMemory::Dma => "Dma",
+        TensorMemory::Shm => "Shm",
+        _ => "other",
+    });
+    eprintln!("  ImageProcessor created (memory: {mem_label})");
 
     // Allocate input tensor — larger than all test images.
-    // Use Mem (heap) for portability; on embedded Linux this would be Dma.
-    let input_mem = Some(TensorMemory::Mem);
+    // With None (auto), DMA-BUF backed tensors are used on embedded Linux
+    // for zero-copy GPU pipeline (decode → EGL image → convert).
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, input_mem)
+        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, mem_type)
         .expect("Failed to create input tensor");
     let input_stride = input.effective_row_stride().unwrap_or(0);
+    let input_memory = input.memory();
     eprintln!(
-        "  Input tensor: {}×{}×{} ({} bytes, stride={})",
+        "  Input tensor: {}×{}×{} ({} bytes, stride={}, {:?})",
         max_w,
         max_h,
         3,
         input.size(),
-        input_stride
+        input_stride,
+        input_memory
     );
 
     // Allocate output tensors — 640×640 in both packed and planar layouts
     let mut output_packed = proc
-        .create_image(MODEL_W, MODEL_H, PixelFormat::Rgb, DType::U8, input_mem)
+        .create_image(MODEL_W, MODEL_H, PixelFormat::Rgb, DType::U8, mem_type)
         .expect("Failed to create packed output tensor");
     let packed_stride = output_packed.effective_row_stride().unwrap_or(0);
     eprintln!(
-        "  Output packed (HWC): {}×{}×{} ({} bytes, stride={})",
+        "  Output packed (HWC): {}×{}×{} ({} bytes, stride={}, {:?})",
         MODEL_W,
         MODEL_H,
         3,
         output_packed.size(),
-        packed_stride
+        packed_stride,
+        output_packed.memory()
     );
 
     let mut output_planar = proc
@@ -218,15 +259,16 @@ fn main() {
             MODEL_H,
             PixelFormat::PlanarRgb,
             DType::U8,
-            input_mem,
+            mem_type,
         )
         .expect("Failed to create planar output tensor");
     eprintln!(
-        "  Output planar (CHW): {}×{}×{} ({} bytes)",
+        "  Output planar (CHW): {}×{}×{} ({} bytes, {:?})",
         MODEL_W,
         MODEL_H,
         3,
         output_planar.size(),
+        output_planar.memory()
     );
 
     // Create decoder and options
