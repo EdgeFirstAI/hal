@@ -636,7 +636,7 @@ The tracing infrastructure complements the rules in the
 - [ndarray](https://docs.rs/ndarray) — N-dimensional arrays
 - [rayon](https://docs.rs/rayon) — Data parallelism
 - [fast_image_resize](https://docs.rs/fast_image_resize) — CPU image operations
-- [zune-jpeg](https://docs.rs/zune-jpeg) / [zune-png](https://docs.rs/zune-png) — Image decoding
+- [zune-png](https://docs.rs/zune-png) — PNG image decoding (JPEG uses custom decoder)
 - [dma-heap](https://docs.rs/dma-heap) — Linux DMA allocation
 - [nix](https://docs.rs/nix) — Unix system calls
 

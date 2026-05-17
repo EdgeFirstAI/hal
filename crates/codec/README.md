@@ -10,6 +10,10 @@ in real-time vision pipelines.
 (GPU pitch-aligned DMA-BUF, PBO). This eliminates per-frame allocations
 in the hot loop — the primary design goal.
 
+JPEG decoding uses a custom from-scratch baseline decoder with reusable
+state, achieving zero heap allocations after the first decode at each
+resolution. PNG decoding uses `zune-png`.
+
 ## Quick Start
 
 ```rust
@@ -21,8 +25,7 @@ let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb,
     Some(TensorMemory::Mem)).unwrap();
 let mut decoder = ImageDecoder::new();
 
-// Decode in the hot loop — codec layer is allocation-free after warmup
-// (underlying zune-jpeg/zune-png still allocate internal decoder state)
+// Decode in the hot loop — zero allocations after warmup for JPEG
 let jpeg_bytes = std::fs::read("frame.jpg").unwrap();
 let info = tensor.load_image(&mut decoder, &jpeg_bytes,
     &DecodeOptions::default()).unwrap();

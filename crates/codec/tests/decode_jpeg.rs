@@ -3,7 +3,7 @@
 
 //! Integration tests: JPEG decode into Mem tensors with various configurations.
 
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{CodecError, DecodeOptions, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -495,5 +495,367 @@ fn decode_strided_oversized_tensor() {
                 "row {y} should be untouched sentinel"
             );
         }
+    }
+}
+
+#[test]
+fn decode_truncated_jpeg() {
+    let jpeg = testdata("zidane.jpg");
+    let truncated = &jpeg[..100];
+    let mut tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let result = tensor.load_image(
+        &mut decoder,
+        truncated,
+        &DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(false),
+    );
+    assert!(matches!(result, Err(CodecError::InvalidData(_))));
+}
+
+#[test]
+fn decode_not_jpeg() {
+    let mut bogus = testdata("zidane.png");
+    bogus[..4].copy_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]);
+
+    let mut tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let result = tensor.load_image(
+        &mut decoder,
+        &bogus,
+        &DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(false),
+    );
+    assert!(matches!(result, Err(CodecError::InvalidData(_))));
+}
+
+#[test]
+fn decode_empty_data() {
+    let mut tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let result = tensor.load_image(
+        &mut decoder,
+        &[],
+        &DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(false),
+    );
+    assert!(matches!(result, Err(CodecError::InvalidData(_))));
+}
+
+#[test]
+fn decode_corrupt_markers() {
+    let corrupt = [0xFF, 0xD8, 0xFF, 0x00];
+    let mut tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let result = tensor.load_image(
+        &mut decoder,
+        &corrupt,
+        &DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(false),
+    );
+    assert!(matches!(result, Err(CodecError::InvalidData(_))));
+}
+
+#[test]
+fn decode_bgra_format() {
+    let jpeg = testdata("zidane.jpg");
+    let mut rgb =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut bgra =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Bgra, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+
+    let rgb_info = rgb
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    let bgra_info = bgra
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Bgra)
+                .with_exif(false),
+        )
+        .unwrap();
+
+    assert_eq!(bgra_info.width, rgb_info.width);
+    assert_eq!(bgra_info.height, rgb_info.height);
+    assert_eq!(bgra_info.format, PixelFormat::Bgra);
+    assert_eq!(bgra_info.row_stride, bgra_info.width * 4);
+
+    let rgb_map = rgb.map().unwrap();
+    let bgra_map = bgra.map().unwrap();
+    let rgb_pixels: &[u8] = &rgb_map;
+    let bgra_pixels: &[u8] = &bgra_map;
+    let pixel_count = bgra_info.width * bgra_info.height;
+
+    for i in 0..pixel_count {
+        assert_eq!(bgra_pixels[i * 4], rgb_pixels[i * 3 + 2]);
+        assert_eq!(bgra_pixels[i * 4 + 1], rgb_pixels[i * 3 + 1]);
+        assert_eq!(bgra_pixels[i * 4 + 2], rgb_pixels[i * 3]);
+        assert_eq!(bgra_pixels[i * 4 + 3], 255);
+    }
+}
+
+#[test]
+fn decode_exact_size_tensor() {
+    use image::ImageDecoder as _;
+
+    let jpeg = testdata("giraffe.jpg");
+    let header =
+        image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg.as_slice())).unwrap();
+    let (width, height) = header.dimensions();
+
+    let mut tensor = Tensor::<u8>::image(
+        width as usize,
+        height as usize,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+
+    assert_eq!(info.width, width as usize);
+    assert_eq!(info.height, height as usize);
+    assert_eq!(info.format, PixelFormat::Rgb);
+    assert_eq!(info.row_stride, info.width * PixelFormat::Rgb.channels());
+}
+
+#[test]
+fn decode_grey_to_rgb() {
+    let jpeg = testdata("grey.jpg");
+    let mut grey =
+        Tensor::<u8>::image(1024, 681, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut rgb =
+        Tensor::<u8>::image(1024, 681, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+
+    let grey_info = grey
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Grey)
+                .with_exif(false),
+        )
+        .unwrap();
+    let rgb_info = rgb
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+
+    assert_eq!(rgb_info.width, grey_info.width);
+    assert_eq!(rgb_info.height, grey_info.height);
+    assert_eq!(rgb_info.format, PixelFormat::Rgb);
+
+    let grey_map = grey.map().unwrap();
+    let rgb_map = rgb.map().unwrap();
+    let grey_pixels: &[u8] = &grey_map;
+    let rgb_pixels: &[u8] = &rgb_map;
+
+    for y in 0..rgb_info.height {
+        for x in 0..rgb_info.width {
+            let grey_val = grey_pixels[y * grey_info.row_stride + x];
+            let base = y * rgb_info.row_stride + x * 3;
+            assert_eq!(rgb_pixels[base], grey_val);
+            assert_eq!(rgb_pixels[base + 1], grey_val);
+            assert_eq!(rgb_pixels[base + 2], grey_val);
+        }
+    }
+}
+
+#[test]
+fn decode_with_exif_rotation() {
+    use image::ImageDecoder as _;
+
+    let jpeg = testdata("zidane_rotated_exif.jpg");
+    let header =
+        image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(jpeg.as_slice())).unwrap();
+    let (stored_w, stored_h) = header.dimensions();
+    let max_dim = stored_w.max(stored_h) as usize;
+
+    let mut plain =
+        Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut oriented =
+        Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+
+    let plain_info = plain
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+    let oriented_info = oriented
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(true),
+        )
+        .unwrap();
+
+    assert_eq!(plain_info.width, stored_w as usize);
+    assert_eq!(plain_info.height, stored_h as usize);
+    assert!(
+        (oriented_info.width, oriented_info.height) == (plain_info.width, plain_info.height)
+            || (oriented_info.width, oriented_info.height) == (plain_info.height, plain_info.width),
+        "EXIF-applied dimensions should match stored dims or their rotation"
+    );
+
+    let map = oriented.map().unwrap();
+    let pixels: &[u8] = &map;
+    let decoded_bytes = oriented_info.width * oriented_info.height * PixelFormat::Rgb.channels();
+    let nonzero = pixels[..decoded_bytes].iter().filter(|&&v| v != 0).count();
+    assert!(nonzero > 1000, "expected EXIF decode to produce image data");
+}
+
+#[test]
+fn decode_u16_scaling_consistency() {
+    let jpeg = testdata("zidane.jpg");
+    let mut u8_tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut u16_tensor =
+        Tensor::<u16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+
+    let u8_info = u8_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+    let u16_info = u16_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+
+    assert_eq!(u8_info.width, u16_info.width);
+    assert_eq!(u8_info.height, u16_info.height);
+
+    let u8_map = u8_tensor.map().unwrap();
+    let u16_map = u16_tensor.map().unwrap();
+    let u8_pixels: &[u8] = &u8_map;
+    let u16_pixels: &[u16] = &u16_map;
+    let u16_stride = u16_info.row_stride / std::mem::size_of::<u16>();
+
+    for y in 0..u8_info.height {
+        for x in 0..u8_info.width * 3 {
+            let u8_val = u8_pixels[y * u8_info.row_stride + x];
+            let u16_val = u16_pixels[y * u16_stride + x];
+            assert_eq!(u16_val, u16::from(u8_val) * 257);
+        }
+    }
+}
+
+#[test]
+fn decode_f32_scaling_consistency() {
+    let jpeg = testdata("zidane.jpg");
+    let mut u8_tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut f32_tensor =
+        Tensor::<f32>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+
+    let u8_info = u8_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+    let f32_info = f32_tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+
+    assert_eq!(u8_info.width, f32_info.width);
+    assert_eq!(u8_info.height, f32_info.height);
+
+    let u8_map = u8_tensor.map().unwrap();
+    let f32_map = f32_tensor.map().unwrap();
+    let u8_pixels: &[u8] = &u8_map;
+    let f32_pixels: &[f32] = &f32_map;
+    let f32_stride = f32_info.row_stride / std::mem::size_of::<f32>();
+
+    for y in 0..u8_info.height {
+        for x in 0..u8_info.width * 3 {
+            let u8_val = u8_pixels[y * u8_info.row_stride + x];
+            let expected = f32::from(u8_val) / 255.0;
+            let actual = f32_pixels[y * f32_stride + x];
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+}
+
+#[test]
+fn decode_stride_padding_untouched() {
+    let jpeg = testdata("zidane.jpg");
+    let mut tensor =
+        Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+
+    {
+        let mut map = tensor.map().unwrap();
+        let bytes: &mut [u8] = &mut map;
+        bytes.fill(0x5A);
+    }
+
+    let mut decoder = ImageDecoder::new();
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Rgb)
+                .with_exif(false),
+        )
+        .unwrap();
+
+    let decoded_row_bytes = info.width * PixelFormat::Rgb.channels();
+    let map = tensor.map().unwrap();
+    let bytes: &[u8] = &map;
+
+    for y in 0..info.height {
+        let row = &bytes[y * info.row_stride..(y + 1) * info.row_stride];
+        assert!(
+            row[..decoded_row_bytes].iter().any(|&b| b != 0x5A),
+            "decoded portion of row {y} should contain image data"
+        );
+        assert!(
+            row[decoded_row_bytes..].iter().all(|&b| b == 0x5A),
+            "padding after decoded width in row {y} should remain untouched"
+        );
+    }
+
+    for y in info.height..1080 {
+        let row = &bytes[y * info.row_stride..(y + 1) * info.row_stride];
+        assert!(
+            row.iter().all(|&b| b == 0x5A),
+            "rows past decoded height should remain untouched"
+        );
     }
 }
