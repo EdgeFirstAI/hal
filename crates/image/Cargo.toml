@@ -80,6 +80,10 @@ name = "sanity_check"
 harness = false
 
 [[bench]]
+name = "decode_pipeline_benchmark"
+harness = false
+
+[[bench]]
 name = "opencv_benchmark"
 harness = false
 required-features = ["opencv"]

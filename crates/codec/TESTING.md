@@ -192,6 +192,12 @@ When modifying the JPEG decode path:
 - Run the `zero_alloc_check` example under `strace` to verify changes do
   not introduce new allocation sources
 
+For full pipeline validation (JPEG decode → ImageProcessor letterbox
+convert), see the `pipeline_demo` example in `crates/image/examples/`
+and the `decode_pipeline_benchmark` in `crates/image/benches/`. See
+[`TESTING.md`](../../TESTING.md#zero-allocation-pipeline-verification)
+at the workspace root for strace verification instructions.
+
 ## Benchmarks
 
 See `crates/codec/benches/codec_benchmark.rs` for performance benchmarks.
