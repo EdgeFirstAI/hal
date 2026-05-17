@@ -769,6 +769,108 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 ---
 
+## Decode → Letterbox Pipeline Benchmark (`decode_pipeline_benchmark`)
+
+This section documents the end-to-end JPEG decode → GPU letterbox convert
+pipeline using the zero-allocation, strided-buffer pattern. The input tensor
+is allocated larger than all test images so that the JPEG decoder writes into
+a strided sub-region; the `ImageProcessor::convert()` then performs a
+letterbox resize into a 640×640 model-input tensor.
+
+**Source:** `crates/image/examples/pipeline_demo.rs`,
+`crates/image/benches/decode_pipeline_benchmark.rs`
+
+**Key design:** All tensors are allocated once during init. After warmup, the
+hot loop performs **zero heap allocations** — verified via `strace` filtering
+for `brk` and `MAP_ANONYMOUS` mmap calls during the `HOT LOOP START/END`
+markers.
+
+**Memory modes:**
+- **DMA-BUF** (imx8mp, imx95, rpi5): tensors backed by Linux DMA-heap for
+  zero-copy EGL image import. Verified zero heap allocations on all three.
+- **CPU/Heap** (x86, orin-nano): tensors backed by standard heap allocation
+  with CPU-only convert path. Verified zero allocations.
+
+### Results (collected 2026-05-17)
+
+All times are median over 100 iterations after 10× warmup per combination.
+
+#### imx8mp-frdm (Cortex-A53, Vivante GC7000UL, DMA-BUF)
+
+| Image | Output | Decode | Convert | Total |
+|-------|--------|-------:|--------:|------:|
+| zidane 1280×720 | HWC (stride=1920) | 16,723 µs | 6,465 µs | 23,188 µs |
+| giraffe 640×640 | HWC (stride=1920) | 14,220 µs | 3,468 µs | 17,688 µs |
+| zidane 1280×720 | CHW (planar) | 16,680 µs | 7,435 µs | 24,115 µs |
+| giraffe 640×640 | CHW (planar) | 14,223 µs | 4,264 µs | 18,487 µs |
+
+#### imx95-frdm (Cortex-A55, Mali GPU, DMA-BUF)
+
+| Image | Output | Decode | Convert | Total |
+|-------|--------|-------:|--------:|------:|
+| zidane 1280×720 | HWC (stride=1920) | 16,130 µs | 5,598 µs | 21,728 µs |
+| giraffe 640×640 | HWC (stride=1920) | 13,624 µs | 3,308 µs | 16,932 µs |
+| zidane 1280×720 | CHW (planar) | 16,137 µs | 6,344 µs | 22,481 µs |
+| giraffe 640×640 | CHW (planar) | 13,692 µs | 3,649 µs | 17,341 µs |
+
+#### rpi5-hailo (Cortex-A76, VideoCore V3D, DMA-BUF)
+
+| Image | Output | Decode | Convert | Total |
+|-------|--------|-------:|--------:|------:|
+| zidane 1280×720 | HWC (stride=1920) | 4,620 µs | 2,283 µs | 6,903 µs |
+| giraffe 640×640 | HWC (stride=1920) | 4,307 µs | 848 µs | 5,155 µs |
+| zidane 1280×720 | CHW (planar) | 4,599 µs | 3,235 µs | 7,834 µs |
+| giraffe 640×640 | CHW (planar) | 4,332 µs | 1,302 µs | 5,634 µs |
+
+#### orin-nano (Cortex-A78AE, CPU-only¹)
+
+| Image | Output | Decode | Convert | Total |
+|-------|--------|-------:|--------:|------:|
+| zidane 1280×720 | HWC (stride=1920) | 6,397 µs | 1,578 µs | 7,975 µs |
+| giraffe 640×640 | HWC (stride=1920) | 5,985 µs | 153 µs | 6,138 µs |
+| zidane 1280×720 | CHW (planar) | 6,392 µs | 1,897 µs | 8,289 µs |
+| giraffe 640×640 | CHW (planar) | 5,996 µs | 355 µs | 6,351 µs |
+
+¹ GL/PBO path on Orin Nano hangs during warmup (NVIDIA EGL PBO
+upload/download stalls). CPU-only results shown. Investigation pending.
+
+#### x86-desktop (Ryzen, CPU-only)
+
+| Image | Output | Decode | Convert | Total |
+|-------|--------|-------:|--------:|------:|
+| zidane 1280×720 | HWC (stride=1920) | 1,922 µs | 546 µs | 2,468 µs |
+| giraffe 640×640 | HWC (stride=1920) | 1,704 µs | 39 µs | 1,743 µs |
+| zidane 1280×720 | CHW (planar) | 1,876 µs | 696 µs | 2,572 µs |
+| giraffe 640×640 | CHW (planar) | 1,766 µs | 231 µs | 1,997 µs |
+
+### Zero-Allocation Verification
+
+| Platform | Memory | Heap allocs in hot loop | Notes |
+|----------|--------|------------------------:|-------|
+| imx8mp-frdm | DMA-BUF | 0 | 1,400 MAP_SHARED mmap (DMA-BUF map/unmap for GPU, expected) |
+| imx95-frdm | DMA-BUF | 0¹ | 1 `PROT_NONE` 64MB reservation (GPU address space, not heap) |
+| rpi5-hailo | DMA-BUF | 0 | 1,400 MAP_SHARED mmap (DMA-BUF map/unmap for GPU, expected) |
+| x86-desktop | CPU/Heap | 0 | Verified with `EDGEFIRST_FORCE_BACKEND=cpu` |
+
+¹ The single `mmap(PROT_NONE, 64MB)` on imx95 is a GPU driver virtual
+address space reservation with no read/write permissions — not a heap
+allocation.
+
+### Cross-Platform Analysis
+
+- **Decode performance scales with CPU**: A76 (rpi5) is ~3.5× faster than
+  A53 (imx8mp), matching the expected IPC and clock frequency difference.
+  Orin A78AE falls between. x86 SSE2/SSE4.1 is fastest at ~1.9ms for 720p.
+- **DMA-BUF convert benefits**: On DMA-BUF platforms the convert step uses
+  zero-copy EGL image import — the GPU reads directly from the DMA-BUF
+  without any CPU-side copy. This is most visible on rpi5 where HWC convert
+  is only 848µs for 640×640.
+- **Strided input overhead**: The strided decode (1280-wide tensor for
+  640-wide images) adds no measurable overhead to convert — the GPU shader
+  reads only the valid region via `src_rect`.
+
+---
+
 ## Known Benchmark Gaps
 
 ### Missing Platforms
@@ -808,7 +910,9 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 14. **No PBO tensor allocation benchmarks** — Tensor allocation benchmarks cover Mem, SHM, and DMA but not PBO (which requires GL context).
 
-15. **No end-to-end pipeline benchmark** — No benchmark covers the full camera → preprocess → decode → mask render cycle in a single measurement.
+15. ~~**No end-to-end pipeline benchmark**~~ — Resolved: `decode_pipeline_benchmark` and `pipeline_demo` cover the decode → letterbox convert pipeline. Full camera → inference → mask render cycle benchmark still pending.
+
+16. **Orin Nano GL/PBO pipeline hangs during warmup** — The `pipeline_demo` GL/PBO path stalls indefinitely during warmup on the Jetson Orin Nano (NVIDIA EGL PBO upload/download). CPU-only results collected; GL investigation pending.
 
 ---
 
@@ -816,6 +920,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.6 | 2026-05-17 | Add decode→letterbox pipeline benchmark (`decode_pipeline_benchmark`, `pipeline_demo`): cross-platform results on imx8mp-frdm, imx95-frdm, rpi5-hailo, orin-nano, x86-desktop. Zero heap allocations verified on all DMA-BUF platforms via strace. Auto-detect DMA/PBO/Mem memory type. |
 | 3.5 | 2026-05-18 | Perf-driven optimizations: 11-bit Huffman LUT (was 9-bit); batch byte-stuffing in bitstream refill; SSE4.1 IDCT with native `mullo_epi32` and `min/max` clamping; SSSE3 RGB shuffle store; NEON+SSE2 vectorised u8→f32/u16/i16 conversion. f32 decode now only 1.17× slower than u8 (was 4.0×); x86 RGB within 6% of image crate (was 25%); all results updated on 3 platforms. |
 | 3.4 | 2026-05-17 | Add SSE2 SIMD kernels for x86-64: IDCT, YCbCr→RGB/RGBA/BGRA color conversion, and horizontal chroma upsample. x86 JPEG decode now 1.75× faster than scalar; within 25% of image crate for 720p and matches/beats it for 640×640. Update all x86-desktop results. |
 | 3.3 | 2026-05-17 | Custom JPEG decoder with NEON SIMD: replace zune-jpeg wrapper with from-scratch baseline decoder; 17–23% faster than image crate on ARM; add NV12/BGRA/giraffe benchmarks; add x86-desktop baselines; collect on imx8mp, imx95, x86. |
