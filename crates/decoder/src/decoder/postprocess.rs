@@ -439,7 +439,7 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        // Phase 1: Slice combined detection into boxes[0:4] and scores[4:],
+        // Step 1: Slice combined detection into boxes[0:4] and scores[4:],
         // run NMS. Both slices share the detection tensor's quantization.
         let mut boxes = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
@@ -458,7 +458,7 @@ impl Decoder {
         });
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
-        // Phase 2: Process masks with separate mask_coeff tensor.
+        // Step 2: Process masks with separate mask_coeff tensor.
         with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
@@ -1257,7 +1257,7 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        // Phase 1: boxes + scores (2-level nesting, 36 paths).
+        // Step 1: boxes + scores (2-level nesting, 36 paths).
         let det_indices = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
@@ -1280,7 +1280,7 @@ impl Decoder {
             })
         });
 
-        // Phase 2: masks + protos (2-level nesting, 36 paths).
+        // Step 2: masks + protos (2-level nesting, 36 paths).
         let proto = with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
@@ -1393,7 +1393,7 @@ impl Decoder {
         let (protos_tensor, _) =
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
-        // Phase 1: Slice detection into boxes + scores, run NMS.
+        // Step 1: Slice detection into boxes + scores, run NMS.
         let det_indices = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
             let det = det.slice(s![0, .., ..]);
@@ -1410,7 +1410,7 @@ impl Decoder {
             )
         });
 
-        // Phase 2: Extract proto data from separate mask_coeff + protos.
+        // Step 2: Extract proto data from separate mask_coeff + protos.
         let proto = with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Self::swap_axes_if_needed(m, mask_coeff.into());
@@ -1873,9 +1873,9 @@ macro_rules! process_tracked_yolo_segmentation_split {
 /// Tracked decode macro for 2-way split segmentation:
 /// combined detection `[1, nc+4, N]` + separate mask_coeff + protos.
 ///
-/// Phase 1: Slices detection into boxes[..4] and scores[4..], runs NMS.
+/// Step 1: Slices detection into boxes[..4] and scores[4..], runs NMS.
 /// Tracker: Runs between NMS and mask extraction.
-/// Phase 2: Processes separate mask_coeff and protos tensors.
+/// Step 2: Processes separate mask_coeff and protos tensors.
 #[cfg(feature = "tracker")]
 macro_rules! process_tracked_yolo_segmentation_2way {
     (
@@ -1917,7 +1917,7 @@ macro_rules! process_tracked_yolo_segmentation_2way {
         let (protos_tensor, _) =
             Decoder::find_outputs_with_shape_quantized(&$protos.shape, $outputs, &skip)?;
 
-        // Phase 1: Slice combined detection into boxes + scores, run NMS
+        // Step 1: Slice combined detection into boxes + scores, run NMS
         let boxes = with_quantized!(det_tensor, d, {
             let det = Decoder::swap_axes_if_needed(d, $detection.into());
             let det = det.slice(s![0, .., ..]);
@@ -1938,7 +1938,7 @@ macro_rules! process_tracked_yolo_segmentation_2way {
         let (new_boxes, old_boxes) =
             Decoder::update_tracker_yolo_segdet($tracker, $timestamp, boxes, $output_tracks);
 
-        // Phase 2: Process separate mask_coeff + protos
+        // Step 2: Process separate mask_coeff + protos
         let mask_data = with_quantized!(mask_tensor, m, {
             with_quantized!(protos_tensor, p, {
                 let mask_tensor = Decoder::swap_axes_if_needed(m, $mask_coeff.into());

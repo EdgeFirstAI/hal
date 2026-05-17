@@ -163,7 +163,7 @@ pub(crate) fn run<'a>(
 ) -> DecoderResult<DecodedOutputsRef<'a>> {
     // Top-level span. The `n_levels` field gives at-a-glance shape in
     // Perfetto's flame graph; per-level / per-role child spans below
-    // give the per-stage decomposition we need to find Phase 2 hotspots.
+    // give the per-stage decomposition we need to find hotspots.
     let _outer = tracing::trace_span!(
         "per_scale_decode",
         n_levels = plan.levels.len(),
@@ -612,7 +612,7 @@ fn box_channel_count_for_level(lvl: &crate::per_scale::plan::LevelPlan) -> usize
 /// the closure. NHWC inputs pass through unchanged (zero overhead).
 ///
 /// The transpose runs the scalar `nchw_to_nhwc` helper from
-/// `kernels::transpose`; Phase 2 NEON tile-transpose can lift the
+/// `kernels::transpose`; NEON tile-transpose can lift the
 /// `tiled_proto_transpose_nchw_to_nhwc` pattern from `main`'s mask
 /// pipeline as a drop-in replacement.
 #[allow(clippy::too_many_arguments)]

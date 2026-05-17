@@ -244,7 +244,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-scale subsystem now supports both **NHWC and NCHW children** via
   named-axis dshape lookup. NCHW children are transposed to a per-dtype
   scratch buffer (`LayoutScratch`) before the existing NHWC kernel
-  dispatch, keeping kernel coverage uniform for Phase 2 NEON.
+  dispatch, keeping kernel coverage uniform for NEON optimization.
 - **NEON 16x16 byte tile transpose** for the NCHW → NHWC scratch
   step, replacing the scalar walk for `u8` / `i8` inputs when
   `c >= 16` and `h*w >= 16`. Uses the canonical 4-stage TRN1/TRN2
@@ -252,7 +252,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in registers. Targets the Ara-240 NCHW path; NHWC inputs (TFLite,
   the canonical fixtures) skip the transpose entirely and are
   unaffected.
-- **Phase 2-A NEON (Tier 1) kernels** for the per-scale subsystem on
+- **NEON (Tier 1) kernels** for the per-scale subsystem on
   aarch64. Adds `kernels::neon_baseline` with NEON i8/u8/i16/u16 → f32
   dequant primitives (FMA-fused affine), NEON sigmoid f32 (vbslq
   blend), and NEON softmax f32 (3-pass max/exp/normalize). All
@@ -283,14 +283,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when all levels are NHWC (NCHW would need per-level scratch).
   Drops imx8mp 36.9 ms → 30.8 ms (Cortex-A53, 4 cores) and
   imx95 23.5 ms → 20.5 ms (Cortex-A55, 6 cores).
-- **End-to-end Phase 2 speedups** vs original libm scalar `expf`:
+- **End-to-end NEON speedups** vs original libm scalar `expf`:
   imx8mp-evk 74.4 ms → 30.8 ms (2.42×); imx95-evk ~60 ms →
   20.5 ms (~2.93×). coco128 box mAP@[0.5:0.95] holds at 0.417
   across all variants (within rounding of the FP32 reference).
 - **Perfetto / Chrome-trace spans** throughout the per-scale
   subsystem: `per_scale_decode`, `resolve_bindings`, per-level
   `level`, and per-role `box` / `score` / `mc` / `protos`. Drove
-  the Phase 2 hotspot analysis.
+  the hotspot analysis.
 - `DecoderBuilder::with_decode_dtype` for choosing f32 or f16 outputs
   through the per-scale pipeline.
 - `per_scale::apply_schema_quant` helper that walks a schema-v2

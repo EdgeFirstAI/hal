@@ -3,9 +3,8 @@
 
 //! Plan-time selected kernel dispatches.
 //!
-//! Phase 1 only implements scalar variants. Phase 2 adds NEON tier
-//! variants without changing this enum's shape — `select()` adds
-//! higher-tier branches and falls through to scalar.
+//! Scalar and NEON variants are dispatched at plan time. The `select()`
+//! method picks the highest-tier kernel available for the current CPU.
 
 use super::CpuFeatures;
 use crate::per_scale::DecodeDtype;
@@ -25,7 +24,7 @@ use edgefirst_tensor::DType;
 /// dequantize roundtrip that DotProd/I8MM would provide.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // Wired by Task 15.
-#[allow(clippy::enum_variant_names)] // tier suffix is meaningful (Phase 2 adds Neon variants)
+#[allow(clippy::enum_variant_names)] // tier suffix is meaningful
 pub(crate) enum BoxLevelDispatch {
     // ── DFL encoding (yolov8, yolo11) ────────────────────
     DflI8ToF32Scalar,
@@ -57,7 +56,7 @@ pub(crate) enum BoxLevelDispatch {
 
     // Tier 1 NEON-baseline (aarch64 only). Selected when
     // CpuFeatures::neon_baseline is true. f16 outputs and float inputs
-    // fall through to scalar in this milestone; Phase 2-B adds them.
+    // fall through to scalar.
     #[cfg(target_arch = "aarch64")]
     DflI8ToF32NeonBase,
     #[cfg(target_arch = "aarch64")]
@@ -89,7 +88,7 @@ pub(crate) enum BoxLevelDispatch {
 }
 
 impl BoxLevelDispatch {
-    /// Highest available tier wins. Phase 1: always scalar.
+    /// Select the highest-tier kernel available for the given configuration.
     pub(crate) fn select(
         encoding: BoxEncoding,
         input: DType,
@@ -165,7 +164,7 @@ impl BoxLevelDispatch {
             (enc, dt, _) => {
                 return Err(DecoderError::NotSupported(format!(
                     "per-scale BoxLevelDispatch: encoding {enc:?} + input {dt:?} \
-                     not in Phase 1 fast-path matrix"
+                     not in fast-path matrix"
                 )));
             }
         };
@@ -175,7 +174,7 @@ impl BoxLevelDispatch {
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // Wired by Task 15.
-#[allow(clippy::enum_variant_names)] // tier suffix is meaningful (Phase 2 adds Neon variants)
+#[allow(clippy::enum_variant_names)] // tier suffix is meaningful
 pub(crate) enum ScoreLevelDispatch {
     I8ToF32Scalar,
     U8ToF32Scalar,
@@ -191,8 +190,7 @@ pub(crate) enum ScoreLevelDispatch {
     F32ToF16Scalar,
     // Tier 1 NEON-baseline (aarch64 only). Selected when
     // CpuFeatures::neon_baseline is true. Falls through to the scalar
-    // variant for cells that don't have a NEON specialization yet
-    // (currently the f16/f32 input cells; Phase 2-B adds them).
+    // variant for cells that don't have a NEON specialization yet.
     #[cfg(target_arch = "aarch64")]
     I8ToF32NeonBase,
     #[cfg(target_arch = "aarch64")]
@@ -301,7 +299,7 @@ impl ScoreLevelDispatch {
             (DType::F32, DecodeDtype::F16) => F32ToF16Scalar,
             (dt, _) => {
                 return Err(DecoderError::NotSupported(format!(
-                    "per-scale ScoreLevelDispatch: input {dt:?} not in Phase 1 matrix"
+                    "per-scale ScoreLevelDispatch: input {dt:?} not in current matrix"
                 )));
             }
         })

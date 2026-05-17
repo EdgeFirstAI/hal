@@ -25,7 +25,7 @@ that downstream integrators must follow.
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/lib.rs) | local | crate-wide setup, panic-safe FFI helpers, error reporting |
 | [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `hal_plane_descriptor_*` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, convert, draw masks (and tracked variants) |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
 | [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | ~3.2k lines — `hal_decoder_*` create / decode detection / decode segmentation |
 | [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | ~300 lines — `hal_bytetrack_*` create / update / get_active_tracks |
 | [`delegate.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/delegate.rs) | local | ~200 lines — Delegate DMA-BUF ABI types and camera adaptor format info |
@@ -132,7 +132,7 @@ Allocate src/dst tensors       Call convert()                Free processor
 (from fd or create_image)      (EGL cache hits)
 ```
 
-### Phase 1 — Initialization
+### Initialization
 
 Allocate all tensors before entering the processing loop. When the source
 dimensions are not known until the first frame arrives (e.g., V4L2
@@ -193,7 +193,7 @@ struct hal_tensor *src = hal_import_image(
     proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
 ```
 
-### Phase 2 — Main processing loop
+### Main Processing Loop
 
 Reuse the same tensor objects on every frame. The EGL image cache hits on
 the second and all subsequent iterations because `BufferIdentity.id` has
@@ -223,7 +223,7 @@ both sides achieve cache hits after the first frame.
 The `glFinish()` issued at the end of each `convert()` call guarantees
 coherency, making chained calls safe without explicit synchronization.
 
-### Phase 3 — Teardown
+### Teardown
 
 Free tensors only when the pipeline is torn down — typically at program
 exit or when a pipeline is reconfigured (e.g., resolution change):

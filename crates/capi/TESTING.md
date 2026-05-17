@@ -70,7 +70,7 @@ must `cargo build` first.
 | Source file | Coverage |
 |-------------|----------|
 | [`test_tensor.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_tensor.c) | Tensor allocation, DMA-BUF, memory types, fd ownership |
-| [`test_image.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_image.c) | Image loading, format conversion, draw masks |
+| [`test_image.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_image.c) | Image loading, pre-allocated decode, format conversion, draw masks |
 | [`test_decoder.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_decoder.c) | YOLO/ModelPack decoder, post-processing parity |
 | [`test_tracker.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_tracker.c) | ByteTrack create/update/get_active_tracks |
 | [`test_neutron_dmabuf.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_neutron_dmabuf.c) | On-target Neutron NPU DMA-BUF regression |
@@ -83,12 +83,13 @@ must `cargo build` first.
   backend, they inherit the
   [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution).
   The C test Makefile runs each `test_*` binary serially.
-- **No LFS testdata for the standard C suite.** The C tests
-  (`test_tensor`, `test_image`, `test_decoder`, `test_tracker`,
-  `bench_preproc`) synthesize all inputs in-process — they do not
-  read from `testdata/` and the Makefile does not resolve
-  `EDGEFIRST_TESTDATA_DIR`. The `test_neutron_dmabuf*` programs do
-  consume external data (a TFLite model and an input frame), but the
+- **`test_image` uses checked-in fixtures.** The decode cases in
+  `test_image.c` read `testdata/zidane.jpg`. When run via
+  `crates/capi/tests/Makefile`, the helper probes both `testdata/`
+  (repo-root execution) and `../../../testdata/` (Makefile execution
+  from `crates/capi/tests`). Other standard C tests still synthesize
+  their inputs in-process. The `test_neutron_dmabuf*` programs also
+  consume external data (a TFLite model and an input frame), but those
   paths are passed as command-line arguments per the per-binary
   `--help` output, not via an env var.
 - **Hardware gates** — `test_neutron_dmabuf*` requires a live TFLite

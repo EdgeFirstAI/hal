@@ -44,7 +44,7 @@ pub(crate) enum Layout {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by Phase 1 try_from_schema + run() in later tasks.
+#[allow(dead_code)] // Consumed by try_from_schema + run() in later tasks.
 pub(crate) struct PerScalePlan {
     /// Per-FPN-level geometry, pre-computed grids, expected shapes.
     /// Sorted stride-ascending by `try_from_schema`.
@@ -105,7 +105,7 @@ pub(crate) struct PerScalePlan {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Consumed by Phase 1 try_from_schema + level kernels.
+#[allow(dead_code)] // Consumed by try_from_schema + level kernels.
 pub(crate) struct LevelPlan {
     /// FPN spatial stride in pixels (8.0, 16.0, 32.0 typically).
     pub(crate) stride: f32,
@@ -184,7 +184,7 @@ impl PerScalePlan {
         let mc = find_logical_by_type(schema, LogicalType::MaskCoefs);
         let protos = find_logical_by_type(schema, LogicalType::Protos);
 
-        // Encoding sanity (only Dfl + Direct/Ltrb are in scope for Phase 1).
+        // Encoding sanity (only Dfl + Direct/Ltrb are in scope).
         let box_encoding = boxes.encoding.unwrap_or(BoxEncoding::Dfl);
         if !matches!(box_encoding, BoxEncoding::Dfl | BoxEncoding::Direct) {
             return Ok(None); // Anchor-encoded falls through to legacy.
@@ -196,7 +196,7 @@ impl PerScalePlan {
         for lvl in &levels {
             if box_encoding == BoxEncoding::Dfl && lvl.reg_max > 64 {
                 return Err(DecoderError::NotSupported(format!(
-                    "DFL reg_max={} exceeds Phase 1 stack-scratch cap of 64",
+                    "DFL reg_max={} exceeds stack-scratch cap of 64",
                     lvl.reg_max
                 )));
             }
@@ -369,7 +369,7 @@ impl PerScalePlan {
 
 /// Map a schema-level [`crate::schema::DType`] (which uses `Int8`/`Float32`
 /// style names) to the runtime [`edgefirst_tensor::DType`] (which uses
-/// `I8`/`F32` style names). Phase 1 supports the integer + float types
+/// `I8`/`F32` style names). Supports the integer + float types
 /// covered by the dispatch matrix; other variants surface as
 /// `NotSupported`.
 fn schema_dtype_to_tensor_dtype(d: crate::schema::DType) -> DecoderResult<edgefirst_tensor::DType> {

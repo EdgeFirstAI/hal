@@ -8,7 +8,7 @@ use crate::Quantization;
 pub(crate) mod cpu_features;
 pub(crate) mod dequant;
 
-#[allow(unused_imports)] // Consumed by Phase 1 dispatch tables in later tasks.
+#[allow(unused_imports)] // Consumed by dispatch tables in later tasks.
 pub(crate) use cpu_features::CpuFeatures;
 
 /// Per-tensor affine dequantization: `out[i] = (in[i] - zp) * scale`.

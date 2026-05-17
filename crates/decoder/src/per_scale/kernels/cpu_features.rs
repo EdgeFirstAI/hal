@@ -9,7 +9,7 @@ use crate::DecoderError;
 /// `from_env_or_probe()` reads `EDGEFIRST_DECODER_FORCE_KERNEL` for
 /// debugging / benchmarking overrides.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(dead_code)] // Consumed by Phase 1 dispatch tables in later tasks.
+#[allow(dead_code)] // Consumed by dispatch tables in later tasks.
 pub(crate) struct CpuFeatures {
     pub(crate) neon_baseline: bool,
     pub(crate) neon_fp16: bool,

@@ -660,6 +660,7 @@ version = "0.22.1"
 dependencies = [
  "cbindgen",
  "edgefirst-bench",
+ "edgefirst-codec",
  "edgefirst-decoder",
  "edgefirst-hal",
  "edgefirst-image",

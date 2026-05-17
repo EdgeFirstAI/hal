@@ -1709,6 +1709,54 @@ struct hal_tensor *hal_tensor_load_png(const uint8_t *data,
                                        enum hal_tensor_memory memory);
 
 /**
+ * Decode image data (JPEG/PNG) into a pre-allocated tensor.
+ *
+ * The tensor must have sufficient capacity for the decoded image.
+ * Returns 0 on success, -1 on error (errno set).
+ *
+ * @param tensor Pre-allocated tensor to decode into
+ * @param data Pointer to encoded image data (JPEG or PNG)
+ * @param len Length of image data in bytes
+ * @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, HAL_PIXEL_FORMAT_GREY),
+ *               or -1 to use the native format from the file
+ * @param out_width If non-NULL, receives the decoded image width
+ * @param out_height If non-NULL, receives the decoded image height
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL tensor/data, zero length, invalid format)
+ * - EBADMSG: Failed to decode image
+ * - ENOSPC: Tensor capacity insufficient for decoded image
+ */
+int hal_tensor_decode_image(struct hal_tensor *tensor,
+                            const uint8_t *data,
+                            size_t len,
+                            int format,
+                            size_t *out_width,
+                            size_t *out_height);
+
+/**
+ * Decode an image file (JPEG/PNG) into a pre-allocated tensor.
+ *
+ * @param tensor Pre-allocated tensor to decode into
+ * @param path Path to the image file
+ * @param format Output pixel format, or -1 for native format
+ * @param out_width If non-NULL, receives the decoded image width
+ * @param out_height If non-NULL, receives the decoded image height
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8, invalid format)
+ * - ENOENT: File not found
+ * - EIO: Failed to read file
+ * - EBADMSG: Failed to decode image
+ * - ENOSPC: Tensor capacity insufficient
+ */
+int hal_tensor_decode_image_file(struct hal_tensor *tensor,
+                                 const char *path,
+                                 int format,
+                                 size_t *out_width,
+                                 size_t *out_height);
+
+/**
  * Save an image tensor as JPEG.
  *
  * @param tensor Image tensor to save

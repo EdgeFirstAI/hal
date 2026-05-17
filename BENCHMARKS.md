@@ -2,7 +2,7 @@
 
 **Version:** 3.2
 **Last Updated:** May 15, 2026
-**Status:** Add `edgefirst-codec` (image decode) baselines on imx8mp-frdm and imx95-frdm; Phase 1 zune shim ≤9% overhead vs raw decode
+**Status:** Add `edgefirst-codec` (image decode) baselines on imx8mp-frdm and imx95-frdm; zune shim ≤9% overhead vs raw decode
 
 ---
 
@@ -396,7 +396,7 @@ All CPU-only (decoder is not GPU-accelerated).
 
 ### Image Codec Decode (`edgefirst-codec`)
 
-**Data collected:** May 15, 2026 (v0.22.1, Phase 1 zune shim, Mem tensors)
+**Data collected:** May 15, 2026 (v0.22.1, zune shim, Mem tensors)
 
 Compares three decode paths:
 - **edgefirst-codec** — `Tensor::load_image()` strided decode into pre-allocated `Tensor<u8>` (zero-allocation hot path)
@@ -797,7 +797,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 3.2 | 2026-05-15 | Add `edgefirst-codec` image decode baselines on imx8mp-frdm and imx95-frdm: JPEG (720p, 4K, RGBA, f32, strided) and PNG (720p) vs raw zune-jpeg/zune-png and image crate. Phase 1 zune shim adds ≤9% overhead vs raw decode on 720p, matches on 4K. |
+| 3.2 | 2026-05-15 | Add `edgefirst-codec` image decode baselines on imx8mp-frdm and imx95-frdm: JPEG (720p, 4K, RGBA, f32, strided) and PNG (720p) vs raw zune-jpeg/zune-png and image crate. Zune shim adds ≤9% overhead vs raw decode on 720p, matches on 4K. |
 | 3.1 | 2026-04-23 | `materialize_masks` batched-GEMM path: single GEMM at proto resolution + rayon-parallel per-detection finalisation + pooled `MaskScratch` buffers. Scaled 640×640 wins 1.7–45× across N=2–100; Proto wins 1.0–2.7× at N≥32. Cross-platform A/B measured on imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop |
 | 3.0 | 2026-03-30 | v0.15.0 release: add jetson-orin-nano platform; refresh all benchmarks across 5 platforms; per-texture EGL binding optimization eliminates redundant EGLImageTargetTexture2DOES calls; add materialize_masks API with three-stage pipeline benchmarks; hybrid path 1.4–14.2× faster than fused GPU on all platforms |
 | 2.2 | 2026-03-27 | Add collection date stamps to all benchmark result sections; add image_benchmark to benchmark binary table; note pending YoloSegDet2Way benchmark data in decoder section; note pending mask rendering optimization updates |

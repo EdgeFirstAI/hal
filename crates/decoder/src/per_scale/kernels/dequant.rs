@@ -141,7 +141,7 @@ pub(crate) fn dequant_f32_to_f16(input: &[f32], q: Quantization, output: &mut [f
 
 // Trait impls for dispatch — one zero-sized type per cell selector.
 
-#[allow(dead_code)] // Consumed by Phase 1 dispatch tables in later tasks.
+#[allow(dead_code)] // Consumed by dispatch tables in later tasks.
 pub(crate) struct ScalarDequant;
 
 macro_rules! impl_scalar_dequant {

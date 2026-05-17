@@ -452,7 +452,7 @@ fn postprocess_boxes_index_quant_column_major<
 ) -> Vec<(DetectBoxQuantized<Scores>, usize)> {
     let (n_candidates, n_classes) = scores.dim();
 
-    // Phase 1: Column-based argmax — sequential reads over contiguous columns.
+    // Step 1: Column-based argmax — sequential reads over contiguous columns.
     // Use u8 for class indices (max 255 classes) for optimal NEON vectorization.
     // Fall back to row-major path for models with >255 classes.
     if n_classes > 255 {
@@ -518,7 +518,7 @@ fn postprocess_boxes_index_quant_column_major<
         }
     }
 
-    // Phase 2: Copy boxes column-by-column into contiguous heap buffer.
+    // Step 2: Copy boxes column-by-column into contiguous heap buffer.
     // Boxes view is also transposed [N_candidates, 4] with strides [1, N_candidates],
     // so column reads are sequential while row reads are strided.
     let boxes_buf: [Vec<Boxes>; 4] = if boxes.strides()[0] == 1 && boxes.as_slice().is_none() {
@@ -545,7 +545,7 @@ fn postprocess_boxes_index_quant_column_major<
     };
     let boxes_copied = !boxes_buf[0].is_empty();
 
-    // Phase 3: Threshold filter — collect candidates that pass.
+    // Step 3: Threshold filter — collect candidates that pass.
     let mut result = Vec::new();
     for i in 0..n_candidates {
         if max_scores[i] >= threshold {

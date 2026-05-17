@@ -4,6 +4,7 @@
 from edgefirst_hal import (
     ColorMode,
     Decoder,
+    ImageInfo,
     ImageProcessor,
     Flip,
     PixelFormat,
@@ -41,8 +42,22 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0 - rms
 
 
+# Maximum source tensor dimensions — oversized to exercise strided decode.
+# Used by decode-specific tests where pixel comparison goes through
+# normalize_to_numpy at the decoded sub-region size.
+MAX_SRC_W, MAX_SRC_H = 1920, 1080
+
+
+def _image_size(path):
+    """Read image dimensions from file header without decoding pixels."""
+    with Image.open(path) as im:
+        return im.size  # (width, height)
+
+
 def test_flip():
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     dst = converter.create_image(1280, 720, PixelFormat.Rgba)
     converter.convert(src, dst, flip=Flip.Horizontal)
@@ -57,16 +72,20 @@ def test_flip():
 
 
 def test_grey_load():
-    rgba_ = Tensor.load("testdata/grey.jpg", PixelFormat.Rgba)
-    rgba = np.zeros((rgba_.height, rgba_.width, 4), dtype=np.uint8)
+    w, h = _image_size("testdata/grey.jpg")
+    rgba_ = Tensor.image(w, h, format=PixelFormat.Rgba)
+    rgba_.decode_image_file("testdata/grey.jpg", PixelFormat.Rgba)
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba_.normalize_to_numpy(rgba)
 
-    grey_ = Tensor.load("testdata/grey.jpg", PixelFormat.Grey)
-    grey = np.zeros((grey_.height, grey_.width, 1), dtype=np.uint8)
+    grey_ = Tensor.image(w, h, format=PixelFormat.Grey)
+    grey_.decode_image_file("testdata/grey.jpg", PixelFormat.Grey)
+    grey = np.zeros((h, w, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
 
-    default_ = Tensor.load("testdata/grey.jpg", PixelFormat.Rgb)
-    default = np.zeros((default_.height, default_.width, 3), dtype=np.uint8)
+    default_ = Tensor.image(w, h, format=PixelFormat.Rgb)
+    default_.decode_image_file("testdata/grey.jpg", PixelFormat.Rgb)
+    default = np.zeros((h, w, 3), dtype=np.uint8)
     default_.normalize_to_numpy(default)
 
     assert calculate_similarity_rms_u8(rgba[:, :, 0:3], default) > 0.99
@@ -75,7 +94,9 @@ def test_grey_load():
 
 
 def test_normalize():
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     dst = converter.create_image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst)
@@ -90,13 +111,15 @@ def test_normalize():
 
 
 def test_render():
-    bg = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    bg = Tensor.image(w, h, format=PixelFormat.Rgba)
+    bg.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
         (76, 55, 1)
     )
     converter = ImageProcessor()
     converter.set_class_colors([[255, 255, 0, 233], [128, 128, 255, 100]])
-    dst = converter.create_image(bg.width, bg.height, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba)
     converter.draw_decoded_masks(
         dst,
         bbox=np.array([[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
@@ -118,7 +141,9 @@ def test_render():
 
 
 def test_rgb_resize():
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgb)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgb)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
     converter = ImageProcessor()
     dst = converter.create_image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst)
@@ -129,10 +154,12 @@ def test_rgb_resize():
 
 
 def test_rgba_to_rgb():
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
-    dst = converter.create_image(1280, 720, PixelFormat.Rgb)
-    converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, 1280, 720))
+    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, w, h))
 
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 3))
@@ -226,7 +253,9 @@ def test_create_image_dtype_i8():
     assert img.dtype == "int8"
 
     # Convert into i8 destination should succeed
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = converter.create_image(640, 640, PixelFormat.Rgb, dtype="int8")
     converter.convert(src, dst)
 
@@ -236,7 +265,9 @@ def test_create_image_convert():
     converter = ImageProcessor()
 
     # Load a source image normally
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/zidane.jpg")
+    src = Tensor.image(w, h, format=PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
 
     # Create destination via create_image (may use PBO, DMA, or Mem)
     dst = converter.create_image(640, 640, PixelFormat.Rgba)
@@ -343,9 +374,11 @@ def test_import_image_dma_success():
 
 def test_draw_decoded_masks_empty():
     """draw_decoded_masks with zero detections should produce background only."""
-    bg = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    bg = Tensor.image(w, h, format=PixelFormat.Rgba)
+    bg.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
-    dst = converter.create_image(bg.width, bg.height, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba)
     converter.draw_decoded_masks(
         dst,
         bbox=np.zeros((0, 4), dtype=np.float32),
@@ -362,7 +395,9 @@ def test_draw_decoded_masks_empty():
 
 def test_draw_decoded_masks_multiple_boxes():
     """draw_decoded_masks with multiple detections (boxes only, no seg)."""
-    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    dst = Tensor.image(w, h, format=PixelFormat.Rgba)
+    dst.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     converter.draw_decoded_masks(
         dst,
@@ -388,7 +423,9 @@ def test_draw_decoded_masks_multiple_boxes():
 
 def test_draw_decoded_masks_instance_color_mode():
     """draw_decoded_masks with ColorMode.Instance assigns per-detection colors."""
-    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    dst = Tensor.image(w, h, format=PixelFormat.Rgba)
+    dst.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     # Two detections with same class but Instance coloring
     converter.draw_decoded_masks(
@@ -410,8 +447,11 @@ def test_draw_decoded_masks_instance_color_mode():
 
 def test_draw_decoded_masks_with_opacity():
     """draw_decoded_masks with reduced opacity makes overlays more transparent."""
-    dst_full = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
-    dst_half = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    dst_full = Tensor.image(w, h, format=PixelFormat.Rgba)
+    dst_full.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
+    dst_half = Tensor.image(w, h, format=PixelFormat.Rgba)
+    dst_half.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     bbox = np.array([[0.1, 0.1, 0.9, 0.9]], dtype=np.float32)
     scores = np.array([0.9], dtype=np.float32)
@@ -458,7 +498,9 @@ outputs:
         buf = np.frombuffer(m.view(), dtype=np.float32).reshape((1, 10, 6))
         buf[:] = data
 
-    dst = Tensor.load("testdata/giraffe.jpg", PixelFormat.Rgba)
+    w, h = _image_size("testdata/giraffe.jpg")
+    dst = Tensor.image(w, h, format=PixelFormat.Rgba)
+    dst.decode_image_file("testdata/giraffe.jpg", PixelFormat.Rgba)
     converter = ImageProcessor()
     result = converter.draw_masks(decoder, [model_output_tensor], dst)
 
@@ -468,6 +510,142 @@ outputs:
     assert boxes.shape[1] == 4
     assert len(scores) == len(boxes)
     assert len(classes) == len(boxes)
+
+
+def test_decode_image_from_bytes():
+    """Test decode_image with raw bytes into oversized tensor (strided)."""
+    data = open("testdata/zidane.jpg", "rb").read()
+    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Rgb)
+    info: ImageInfo = tensor.decode_image(data, PixelFormat.Rgb)
+    assert info.width == 1280
+    assert info.height == 720
+    assert info.format == PixelFormat.Rgb
+    assert info.row_stride >= MAX_SRC_W * 3
+
+
+def test_decode_image_reuse():
+    """Test decoding multiple different images into the same oversized tensor."""
+    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Rgb)
+
+    # First decode: zidane.jpg (1280x720) — strided into 1920x1080
+    info1 = tensor.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+    assert info1.width == 1280
+    assert info1.height == 720
+
+    # Second decode: grey.jpg (1024x681) — strided into same tensor
+    info2 = tensor.decode_image_file("testdata/grey.jpg", PixelFormat.Rgb)
+    assert info2.width == 1024
+    assert info2.height == 681
+
+
+def test_decode_image_native_format():
+    """Test decode_image without specifying format (uses native)."""
+    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Rgb)
+    info = tensor.decode_image_file("testdata/zidane.jpg")
+    assert info.width == 1280
+    assert info.height == 720
+
+
+def test_decode_image_grey():
+    """Test decoding into Grey format with oversized tensor."""
+    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey)
+    info = tensor.decode_image_file("testdata/grey.jpg", PixelFormat.Grey)
+    assert info.width == 1024
+    assert info.height == 681
+    assert info.format == PixelFormat.Grey
+
+
+def test_decode_image_pipeline():
+    """Test the full recommended pipeline: create_image -> decode -> convert."""
+    converter = ImageProcessor()
+
+    # Allocate via ImageProcessor for optimal memory backend (oversized)
+    src = converter.create_image(MAX_SRC_W, MAX_SRC_H, PixelFormat.Rgba)
+    src.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgba)
+
+    dst = converter.create_image(640, 640, PixelFormat.Rgba)
+    converter.convert(src, dst)
+
+    # Verify result has pixel data
+    n = np.zeros((640, 640, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    assert n.any(), "Destination image is all zeros after pipeline"
+
+
+def test_decode_image_exact_size():
+    """Allocate tensor at exact decoded image size by reading the JPEG header first."""
+    # Use PIL to read just the header (no pixel decode)
+    with Image.open("testdata/zidane.jpg") as im:
+        w, h = im.size
+
+    # Allocate tensor at exact dimensions
+    tensor = Tensor.image(w, h, format=PixelFormat.Rgb)
+    info = tensor.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+    assert info.width == w
+    assert info.height == h
+    # Row stride should equal exactly width * channels (no padding)
+    assert info.row_stride == w * 3
+
+
+def test_decode_image_exact_size_png():
+    """Exact-size decode for PNG format."""
+    with Image.open("testdata/zidane.png") as im:
+        w, h = im.size
+
+    tensor = Tensor.image(w, h, format=PixelFormat.Rgba)
+    info = tensor.decode_image_file("testdata/zidane.png", PixelFormat.Rgba)
+    assert info.width == w
+    assert info.height == h
+    assert info.row_stride == w * 4
+
+
+def test_decode_image_tensor_too_small_width():
+    """Decoding into a tensor narrower than the image should raise an error."""
+    tensor = Tensor.image(320, 720, format=PixelFormat.Rgb)
+    with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Ww]idth|[Ss]tride"):
+        tensor.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+
+
+def test_decode_image_tensor_too_small_height():
+    """Decoding into a tensor shorter than the image should raise an error."""
+    tensor = Tensor.image(1280, 360, format=PixelFormat.Rgb)
+    with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Hh]eight|[Rr]ow"):
+        tensor.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+
+
+def test_decode_image_tensor_too_small_both():
+    """Decoding into a tensor smaller in both dimensions should raise an error."""
+    tensor = Tensor.image(100, 100, format=PixelFormat.Rgb)
+    with pytest.raises(RuntimeError):
+        tensor.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+
+
+def test_decode_image_strided_pixel_correctness():
+    """Verify strided decode produces identical pixels to exact-size decode."""
+    # Exact-size decode (no stride padding)
+    w, h = _image_size("testdata/zidane.jpg")
+    exact = Tensor.image(w, h, format=PixelFormat.Rgb)
+    exact.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+    exact_np = np.zeros((h, w, 3), dtype=np.uint8)
+    exact.normalize_to_numpy(exact_np)
+
+    # Oversized decode (strided — the common real-world path)
+    big = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Rgb)
+    info = big.decode_image_file("testdata/zidane.jpg", PixelFormat.Rgb)
+
+    # Extract the decoded sub-region via map() and row stride
+    with big.map() as m:
+        raw = np.frombuffer(m.view(), dtype=np.uint8)
+        stride = info.row_stride
+        big_np = np.zeros((h, w, 3), dtype=np.uint8)
+        for row in range(h):
+            start = row * stride
+            big_np[row] = raw[start : start + w * 3].reshape(w, 3)
+
+    # Pixels must match exactly — strided decode must not corrupt data
+    assert np.array_equal(exact_np, big_np), (
+        "Strided decode pixels differ from exact-size decode"
+    )
 
 
 @pytest.mark.parametrize(

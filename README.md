@@ -119,16 +119,19 @@ graph TB
         CAPI --> Main
 
         Tensor["edgefirst-tensor<br/>Zero-copy buffers"]
+        Codec["edgefirst-codec<br/>Image decode"]
         Image["edgefirst-image<br/>Format conv + draw"]
         Decoder["edgefirst-decoder<br/>Model output decode"]
         Tracker["edgefirst-tracker<br/>ByteTrack"]
 
         Main --> Tensor
+        Main --> Codec
         Main --> Image
         Main --> Decoder
         Main -.->|tracker feature| Tracker
         CAPI --> Tracker
 
+        Codec --> Tensor
         Image --> Tensor
         Image --> Decoder
         Image -.optional.-> G2D["g2d-sys<br/>NXP i.MX"]
@@ -141,6 +144,7 @@ graph TB
     style CAPI fill:#e1f5ff
     style Main fill:#fff4e1
     style Tensor fill:#e8f5e9
+    style Codec fill:#e8f5e9
     style Image fill:#e8f5e9
     style Decoder fill:#e8f5e9
     style Tracker fill:#e8f5e9
@@ -151,6 +155,7 @@ graph TB
 | Crate | Role | Architecture | Testing |
 |-------|------|--------------|---------|
 | [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | Zero-copy multi-dim buffers (DMA / SHM / Mem / PBO) | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md) |
+| [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) | JPEG/PNG decode into pre-allocated tensors (strided, multi-dtype) | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/TESTING.md) |
 | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | OpenGL / G2D / CPU image processor + mask rendering | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) |
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | YOLO + ModelPack post-processing, NMS, proto-mask APIs | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | ByteTrack multi-object tracking | [ARCH](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) | [TEST](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |

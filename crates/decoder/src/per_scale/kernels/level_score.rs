@@ -84,7 +84,7 @@ impl_score_level_f16!(decode_score_level_f32_to_f16, f32, dequant_f32_to_f16);
 // activation step (`sigmoid_slice_f32_neon` / `sigmoid_slice_f16_neon`,
 // see the `$sigmoid` macro parameter). Both the dequant and the
 // sigmoid are NEON-vectorised at this point; the polynomial NEON
-// `expf` (Phase 2-A `N-13`) backs the sigmoid for the bulk of the
+// `expf` (The NEON `N-13` polynomial) backs the sigmoid for the bulk of the
 // speedup over the original scalar libm path.
 // ────────────────────────────────────────────────────────────────────────
 

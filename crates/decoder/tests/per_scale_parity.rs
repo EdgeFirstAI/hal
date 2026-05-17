@@ -356,7 +356,7 @@ fn synthetic_ltrb_distances_produce_expected_box() {
 // NCHW layout coverage
 // ────────────────────────────────────────────────────────────────────
 //
-// HAL Phase 1 added per-level NCHW support via a transpose-to-scratch
+// HAL added per-level NCHW support via a transpose-to-scratch
 // path (NHWC kernels stay unmodified; the pipeline transposes NCHW
 // children into a per-dtype scratch before dispatching). These tests
 // build paired NHWC and NCHW schemas with the same logical content,
@@ -625,7 +625,7 @@ fn synthetic_ltrb_nchw_and_nhwc_produce_identical_detections() {
 // testdata/per_scale/). The validator team supplies them; tests
 // skip cleanly when absent.
 //
-// NOTE for Phase 1: the HAL doesn't load TFLite models directly. This
+// NOTE: the HAL doesn't load TFLite models directly. This
 // test invokes the Python reference (which DOES load TFLite) for both
 // the inference and the decode steps; the HAL comparison piece is a
 // TODO marker that requires the inference layer to extract raw int8
@@ -661,9 +661,9 @@ fn parity_yolov8n_seg_per_scale_int8() {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     eprintln!("python reference detected {n} boxes on synthetic input");
-    // TODO HAL-Phase2: after the inference layer is integrated, run
+    // TODO: after the inference layer is integrated, run
     // HAL on the same synthetic input and compare detection counts +
-    // per-detection scores within ~2 ulp f32. For Phase 1 we just
+    // per-detection scores within ~2 ulp f32. Currently we just
     // verify the Python side runs cleanly.
 }
 

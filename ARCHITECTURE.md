@@ -450,7 +450,7 @@ plane.
 
 Pool behaviour in practice:
 
-| Phase | Frames | EGL import | Preprocessing time (i.MX 95) |
+| Stage | Frames | EGL import | Preprocessing time (i.MX 95) |
 |-------|--------|------------|------------------------------|
 | Warm-up | 1 – N | Yes | ~5–6 ms (import + GL) |
 | Steady state | N+1 onwards | No | ~5–6 ms (GL only) |
