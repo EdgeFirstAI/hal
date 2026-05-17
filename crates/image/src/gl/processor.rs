@@ -1833,14 +1833,33 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let (width, height) = (dst_w as i32, dst_h as i32);
-        let format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            _ => {
-                return Err(crate::Error::NotSupported(format!(
-                    "PBO renderbuffer not supported for {dst_fmt}",
-                )))
+        let is_planar = dst_fmt.layout() == PixelLayout::Planar;
+
+        let (width, height) = if is_planar {
+            let width = dst_w / 4;
+            let height = match dst_fmt.channels() {
+                4 => dst_h * 4,
+                3 => dst_h * 3,
+                1 => dst_h,
+                _ => unreachable!(),
+            };
+            (width as i32, height as i32)
+        } else {
+            (dst_w as i32, dst_h as i32)
+        };
+
+        let format = if is_planar {
+            gls::gl::RED
+        } else {
+            match dst_fmt {
+                PixelFormat::Rgb => gls::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+                PixelFormat::Grey => gls::gl::RED,
+                _ => {
+                    return Err(crate::Error::NotSupported(format!(
+                        "PBO renderbuffer not supported for {dst_fmt}",
+                    )))
+                }
             }
         };
         self.convert_fbo.bind();
@@ -1925,7 +1944,10 @@ impl GLProcessorST {
             (src_pbo.buffer_id(), dst_pbo.buffer_id())
         };
 
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+        // Use PBO-as-UNPACK to set up the framebuffer render texture.
+        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
+        // PboMap message back to this GL thread — causing a deadlock.
+        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
 
         // For int8 output, swap to int8 shader programs so the GPU applies
         // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
@@ -2317,7 +2339,10 @@ impl GLProcessorST {
         }
         let dst_buffer_id = dst_pbo.buffer_id();
 
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+        // Use PBO-as-UNPACK to set up the framebuffer render texture.
+        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
+        // PboMap message back to this GL thread — causing a deadlock.
+        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
 
         // For int8 non-planar output, swap to int8 shader programs.
         // Planar path handles int8 internally via its own int8 shader.
