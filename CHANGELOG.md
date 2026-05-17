@@ -32,6 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JPEG chroma subsampling sanity check: rejects images whose chroma rate
   exceeds luma (a division-by-zero hazard in the chroma upsampler / NV12
   writer with adversarial input).
+- NV12 output with odd width or odd height is now rejected up front
+  (`CodecError::InvalidData(...)`). The NV12 chroma plane is defined
+  only for even dimensions; the prior path silently truncated the
+  right/bottom chroma column.
+- Scalar↔SIMD parity tests for all 8 JPEG SIMD kernels (IDCT
+  NEON/SSE2/SSE4.1, color NEON/SSE2/SSSE3, chroma upsample NEON/SSE2).
+  26 inline tests with deterministic synthetic inputs and ±1 LSB
+  tolerance, gated on the right `target_arch` + runtime feature
+  detection. Catches arithmetic divergence that end-to-end image tests
+  (which tolerate ±12 LSB) silently masked.
+- Codec integration tests for typed `Unsupported(ProgressiveJpeg)`,
+  odd-width NV12 rejection, and partial-MCU bottom-edge correctness.
+- GL PBO regression tests (`test_gl_convert_any_to_pbo_no_deadlock`,
+  `test_gl_convert_pbo_to_pbo_no_deadlock`) — explicit liveness coverage
+  for the deadlock fixed in commit c494fae.
+- `codec` rows added to the root `ARCHITECTURE.md` and `TESTING.md`
+  per-crate index tables.
+- `crates/codec/README.md` "Decoder Limitations" section with a complete
+  table of unsupported JPEG/PNG features, each mapped to the typed
+  `CodecError::Unsupported(...)` variant that the rejection carries.
+- `crates/codec/ARCHITECTURE.md` "Supported Source Features" section
+  cross-referencing the limitations table and stating the codec's
+  contract ("accept this strict subset; reject everything else with a
+  precise typed error").
 
 ### Changed
 

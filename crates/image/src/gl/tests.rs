@@ -13,8 +13,10 @@ mod gl_tests {
     };
     use edgefirst_decoder::DetectBox;
     #[cfg(feature = "dma_test_formats")]
-    use edgefirst_tensor::{is_dma_available, Tensor, TensorMemory};
-    use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait};
+    use edgefirst_tensor::is_dma_available;
+    use edgefirst_tensor::{
+        DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+    };
     use image::buffer::ConvertBuffer;
     use ndarray::Array3;
 
@@ -1367,6 +1369,126 @@ mod gl_tests {
             Err(e) => {
                 // PBO may not be supported on all GL implementations
                 eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+            }
+        }
+    }
+
+    /// Regression test for the PBO deadlock fix in `convert_any_to_pbo`
+    /// (commit c494fae). Before the fix, the GL thread called
+    /// `tensor.map()` on the PBO destination, which sent a message back to
+    /// the very same GL thread and deadlocked the channel. The fix uses
+    /// `setup_renderbuffer_from_pbo` to bind the PBO via the GL buffer-
+    /// binding path, never reaching back through `map()`.
+    ///
+    /// This test would hang indefinitely (or, with the channel
+    /// instrumentation, panic with "GL converter thread exited") if the
+    /// deadlock returned. A successful return proves the round-trip
+    /// completed.
+    #[test]
+    fn test_gl_convert_any_to_pbo_no_deadlock() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+                return;
+            }
+        };
+        let src = Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
+            .expect("Mem source tensor");
+        // Fill source with a deterministic pattern so a regression that
+        // produces a black/empty PBO would be detectable downstream.
+        {
+            let mut map = src.map().unwrap();
+            let slice: &mut [u8] = &mut map;
+            for (i, b) in slice.iter_mut().enumerate() {
+                *b = (i & 0xFF) as u8;
+            }
+        }
+        let src_dyn = TensorDyn::from(src);
+        let mut dst_dyn = TensorDyn::from(pbo_dst);
+
+        // The convert call is the deadlock site. If it returns at all the
+        // fix is intact. We do not assert pixel-perfect contents here —
+        // that is covered by other GL tests; this is a liveness regression
+        // gate.
+        let res = gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        );
+        match res {
+            Ok(()) => {
+                assert_eq!(dst_dyn.width(), Some(64));
+                assert_eq!(dst_dyn.height(), Some(64));
+            }
+            Err(e) => {
+                // GL convert may legitimately fail on this CI host for
+                // reasons unrelated to the deadlock (e.g. missing
+                // extensions). Only fail the test on the deadlock
+                // signature itself.
+                let msg = format!("{e:?}");
+                assert!(
+                    !msg.contains("GL converter thread exited"),
+                    "PBO destination convert deadlocked: {msg}"
+                );
+                eprintln!("SKIPPED: {} - convert failed unrelated: {msg}", function!());
+            }
+        }
+    }
+
+    /// Regression test for the `convert_pbo_to_pbo` deadlock path. Same
+    /// underlying defect as `convert_any_to_pbo`; both sites were patched
+    /// in commit c494fae and both need explicit coverage.
+    #[test]
+    fn test_gl_convert_pbo_to_pbo_no_deadlock() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let pbo_src = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - PBO not supported: {e:?}", function!());
+                return;
+            }
+        };
+        let pbo_dst = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - PBO dst not supported: {e:?}", function!());
+                return;
+            }
+        };
+        let src_dyn = TensorDyn::from(pbo_src);
+        let mut dst_dyn = TensorDyn::from(pbo_dst);
+        let res = gl.convert(
+            &src_dyn,
+            &mut dst_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        );
+        match res {
+            Ok(()) => {
+                assert_eq!(dst_dyn.width(), Some(64));
+            }
+            Err(e) => {
+                let msg = format!("{e:?}");
+                assert!(
+                    !msg.contains("GL converter thread exited"),
+                    "PBO→PBO convert deadlocked: {msg}"
+                );
+                eprintln!("SKIPPED: {} - convert failed unrelated: {msg}", function!());
             }
         }
     }

@@ -11,6 +11,7 @@ sub-crate's `ARCHITECTURE.md`:
 | Crate | Per-crate architecture |
 |-------|------------------------|
 | `tensor` | [crates/tensor/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) — backend dispatch, multi-plane DMA-BUF, BufferIdentity |
+| `codec` | [crates/codec/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) — custom baseline JPEG decoder, SIMD dispatch (NEON/SSE4.1/SSSE3/SSE2), zero-allocation scratch model, strided/EXIF-rotated output |
 | `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — GL/G2D/CPU, EGL image cache, GL_MUTEX, Vivante workaround, shutdown safety |
 | `decoder` | [crates/decoder/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) — model-type selection, dshape contract, per-scale framework, fused proto path |
 | `tracker` | [crates/tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) — ByteTrack two-pass association, Kalman state |

@@ -19,6 +19,10 @@ Inline `#[cfg(test)]` modules in each source file:
 | `decoder.rs`          | Format detection, capacity validation, error paths  |
 | `pixel.rs`            | `ImagePixel::from_u8`/`from_u16` for all 5 types   |
 | `options.rs`          | Builder API, default values                         |
+| `exif.rs`             | EXIF orientation tag parsing, rotated_dims helper   |
+| `jpeg/idct/{neon,sse2,sse41}.rs` | Scalar↔SIMD parity per kernel                  |
+| `jpeg/color/{neon,sse2,ssse3}.rs` | Scalar↔SIMD parity for YCbCr→{RGB,RGBA,BGRA}  |
+| `jpeg/upsample/{neon,sse2}.rs` | Scalar↔SIMD parity for horizontal upsample      |
 
 ### Integration Tests
 

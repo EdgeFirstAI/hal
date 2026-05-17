@@ -73,3 +73,98 @@ unsafe fn upsample_h2_neon_inner(input: &[u8], output: &mut [u8], width: usize) 
     // Last pixel: duplicate
     output[2 * width - 1] = input[width - 1];
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::scalar::upsample_h2;
+    use super::upsample_h2_neon;
+
+    /// Deterministic synthetic chroma row covering a range of values.
+    fn make_chroma_row() -> [u8; 16] {
+        [
+            0, 16, 32, 64, 80, 100, 128, 150, 170, 200, 220, 235, 255, 128, 64, 0,
+        ]
+    }
+
+    #[test]
+    fn upsample_h2_parity_full() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let input = make_chroma_row();
+        let width = 16usize;
+        let mut scalar_out = vec![0u8; width * 2];
+        let mut simd_out = vec![0u8; width * 2];
+
+        upsample_h2(&input, &mut scalar_out, width);
+        upsample_h2_neon(&input, &mut simd_out, width);
+
+        for i in 0..(width * 2) {
+            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+            assert!(
+                diff <= 1,
+                "parity mismatch at output index {i}: scalar={}, simd={}, diff={}",
+                scalar_out[i],
+                simd_out[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn upsample_h2_parity_partial_chunk() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        // Width 11: one full chunk of 8 interior pairs + 2 scalar tail pairs + boundary
+        let input = make_chroma_row();
+        let width = 11usize;
+        let mut scalar_out = vec![0u8; width * 2];
+        let mut simd_out = vec![0u8; width * 2];
+
+        upsample_h2(&input[..width], &mut scalar_out, width);
+        upsample_h2_neon(&input[..width], &mut simd_out, width);
+
+        for i in 0..(width * 2) {
+            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+            assert!(
+                diff <= 1,
+                "partial parity mismatch at output index {i}: scalar={}, simd={}, diff={}",
+                scalar_out[i],
+                simd_out[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn upsample_h2_parity_uniform() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let input = [128u8; 16];
+        let width = 16usize;
+        let mut scalar_out = vec![0u8; width * 2];
+        let mut simd_out = vec![0u8; width * 2];
+
+        upsample_h2(&input, &mut scalar_out, width);
+        upsample_h2_neon(&input, &mut simd_out, width);
+
+        for i in 0..(width * 2) {
+            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+            assert!(
+                diff <= 1,
+                "uniform parity mismatch at output index {i}: scalar={}, simd={}, diff={}",
+                scalar_out[i],
+                simd_out[i],
+                diff
+            );
+        }
+    }
+}
