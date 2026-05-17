@@ -54,7 +54,11 @@ impl Default for JpegDecoderState {
 /// Map a [`PixelFormat`] to an output format supported by the JPEG decoder.
 fn validate_output_format(fmt: PixelFormat) -> crate::Result<PixelFormat> {
     match fmt {
-        PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Bgra => Ok(fmt),
+        PixelFormat::Rgb
+        | PixelFormat::Rgba
+        | PixelFormat::Grey
+        | PixelFormat::Bgra
+        | PixelFormat::Nv12 => Ok(fmt),
         _ => Err(CodecError::UnsupportedFormat(fmt)),
     }
 }
@@ -103,15 +107,20 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let output_fmt = validate_output_format(dest_fmt)?;
 
     // Handle greyscale JPEGs
-    let output_fmt = if hdr.components.len() == 1 && output_fmt != PixelFormat::Grey {
+    let output_fmt = if hdr.components.len() == 1 && output_fmt == PixelFormat::Nv12 {
+        // Greyscale JPEG cannot produce NV12 with chroma
+        return Err(CodecError::InvalidData(
+            "cannot decode greyscale JPEG to NV12".into(),
+        ));
+    } else if hdr.components.len() == 1 && output_fmt != PixelFormat::Grey {
         // Greyscale JPEG: we can still output RGB/RGBA by expanding
         output_fmt
     } else {
         output_fmt
     };
 
-    // Read EXIF orientation
-    let (rotation_deg, flip_h) = if opts.apply_exif {
+    // Read EXIF orientation (NV12 output does not support EXIF rotation)
+    let (rotation_deg, flip_h) = if opts.apply_exif && output_fmt != PixelFormat::Nv12 {
         headers
             .exif_data
             .as_deref()

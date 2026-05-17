@@ -42,7 +42,13 @@ pub fn select_color_convert(format: PixelFormat) -> Option<ColorConvertFn> {
             }
             Some(scalar::ycbcr_to_rgba)
         }
-        PixelFormat::Bgra => Some(scalar::ycbcr_to_bgra),
+        PixelFormat::Bgra => {
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                return Some(neon::ycbcr_to_bgra_neon);
+            }
+            Some(scalar::ycbcr_to_bgra)
+        }
         _ => None,
     }
 }
