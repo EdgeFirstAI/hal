@@ -170,3 +170,108 @@ unsafe fn ycbcr_to_rgb_ssse3_inner(
         output[j * 3 + 2] = b;
     }
 }
+
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use super::{ycbcr_to_rgb_ssse3, CB_TO_B_7, CB_TO_G_7, CR_TO_G_7, CR_TO_R_7};
+
+    fn make_ycbcr_row() -> ([u8; 16], [u8; 16], [u8; 16]) {
+        let y: [u8; 16] = [
+            16, 40, 64, 80, 100, 120, 128, 140, 160, 180, 200, 210, 220, 230, 235, 200,
+        ];
+        let cb: [u8; 16] = [
+            128, 100, 80, 64, 150, 200, 128, 90, 110, 170, 210, 128, 60, 220, 128, 140,
+        ];
+        let cr: [u8; 16] = [
+            128, 200, 60, 180, 100, 128, 220, 128, 90, 160, 128, 50, 200, 128, 170, 100,
+        ];
+        (y, cb, cr)
+    }
+
+    /// 7-bit fixed-point scalar reference matching SSSE3 arithmetic.
+    fn scalar_rgb_7bit(y: u8, cb: u8, cr: u8) -> (u8, u8, u8) {
+        let y = y as i32;
+        let cb = cb as i32 - 128;
+        let cr = cr as i32 - 128;
+        let r = (y + ((cr * CR_TO_R_7 as i32 + 64) >> 7)).clamp(0, 255) as u8;
+        let g =
+            (y + ((cb * CB_TO_G_7 as i32 + cr * CR_TO_G_7 as i32 + 64) >> 7)).clamp(0, 255) as u8;
+        let b = (y + ((cb * CB_TO_B_7 as i32 + 64) >> 7)).clamp(0, 255) as u8;
+        (r, g, b)
+    }
+
+    #[test]
+    fn ycbcr_to_rgb_parity() {
+        if !is_x86_feature_detected!("ssse3") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let (y, cb, cr) = make_ycbcr_row();
+        let width = 16usize;
+        let mut simd_out = vec![0u8; width * 3];
+        ycbcr_to_rgb_ssse3(&y, &cb, &cr, &mut simd_out, width);
+
+        for i in 0..width {
+            let (sr, sg, sb) = scalar_rgb_7bit(y[i], cb[i], cr[i]);
+            let vr = simd_out[i * 3];
+            let vg = simd_out[i * 3 + 1];
+            let vb = simd_out[i * 3 + 2];
+            let dr = (sr as i32 - vr as i32).abs();
+            let dg = (sg as i32 - vg as i32).abs();
+            let db = (sb as i32 - vb as i32).abs();
+            assert!(
+                dr <= 1,
+                "RGB R parity mismatch at pixel {i}: scalar={sr}, simd={vr}, diff={dr}"
+            );
+            assert!(
+                dg <= 1,
+                "RGB G parity mismatch at pixel {i}: scalar={sg}, simd={vg}, diff={dg}"
+            );
+            assert!(
+                db <= 1,
+                "RGB B parity mismatch at pixel {i}: scalar={sb}, simd={vb}, diff={db}"
+            );
+        }
+    }
+
+    #[test]
+    fn ycbcr_to_rgb_parity_partial_chunk() {
+        if !is_x86_feature_detected!("ssse3") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        // Width of 11: one full chunk of 8 + 3 scalar tail pixels
+        let (y_full, cb_full, cr_full) = make_ycbcr_row();
+        let width = 11usize;
+        let y = &y_full[..width];
+        let cb = &cb_full[..width];
+        let cr = &cr_full[..width];
+        let mut simd_out = vec![0u8; width * 3];
+        ycbcr_to_rgb_ssse3(y, cb, cr, &mut simd_out, width);
+
+        for i in 0..width {
+            let (sr, sg, sb) = scalar_rgb_7bit(y[i], cb[i], cr[i]);
+            let vr = simd_out[i * 3];
+            let vg = simd_out[i * 3 + 1];
+            let vb = simd_out[i * 3 + 2];
+            let dr = (sr as i32 - vr as i32).abs();
+            let dg = (sg as i32 - vg as i32).abs();
+            let db = (sb as i32 - vb as i32).abs();
+            assert!(
+                dr <= 1,
+                "partial RGB R parity mismatch at pixel {i}: scalar={sr}, simd={vr}, diff={dr}"
+            );
+            assert!(
+                dg <= 1,
+                "partial RGB G parity mismatch at pixel {i}: scalar={sg}, simd={vg}, diff={dg}"
+            );
+            assert!(
+                db <= 1,
+                "partial RGB B parity mismatch at pixel {i}: scalar={sb}, simd={vb}, diff={db}"
+            );
+        }
+    }
+}

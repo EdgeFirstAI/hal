@@ -410,11 +410,15 @@ fn write_nv12_rows(
     }
 
     // Write UV plane (interleaved Cb/Cr at half height, half width).
-    // For odd-width images we need `ceil(img_w / 2)` chroma pairs to cover
-    // the right-most luma column — `img_w / 2` truncates and leaves a
-    // chroma-less stripe at the right edge (magenta/green artefact).
+    // NV12 is defined only for even widths — the UV plane stores one pair
+    // per two-luma-column block. With odd img_w the right-most column has
+    // no chroma neighbour and the tensor allocation cannot fit ceil(w/2)
+    // UV pairs into a w-byte row stride. Odd-width NV12 is rejected up
+    // front in `decode_image` (see Unsupported(JpegChromaSubsampling)
+    // for the subsampling validator); here we just use the spec-true
+    // half-width count.
     let chroma_h = num_rows / v_ratio as usize;
-    let chroma_w = img_w.div_ceil(2);
+    let chroma_w = img_w / 2;
 
     for crow in 0..chroma_h {
         let chroma_src_row = crow;

@@ -89,6 +89,11 @@ pub fn peek_jpeg_info(data: &[u8], opts: &DecodeOptions) -> crate::Result<ImageI
             "cannot decode greyscale JPEG to NV12".into(),
         ));
     }
+    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
+        return Err(CodecError::InvalidData(format!(
+            "NV12 requires even dimensions; got {img_w}×{img_h}"
+        )));
+    }
 
     let (rotation_deg, _flip_h) = if opts.apply_exif && output_fmt != PixelFormat::Nv12 {
         headers
@@ -143,6 +148,15 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     } else {
         output_fmt
     };
+
+    // NV12 requires even width/height by definition (chroma plane stores
+    // one Cb/Cr pair per 2×2 luma block). Reject odd dimensions up front
+    // rather than silently truncate or overflow the row stride.
+    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
+        return Err(CodecError::InvalidData(format!(
+            "NV12 requires even dimensions; got {img_w}×{img_h}"
+        )));
+    }
 
     // Read EXIF orientation (NV12 output does not support EXIF rotation)
     let (rotation_deg, flip_h) = if opts.apply_exif && output_fmt != PixelFormat::Nv12 {

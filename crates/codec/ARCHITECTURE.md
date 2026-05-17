@@ -302,6 +302,19 @@ The decoder inspects magic bytes:
 | BGRA          | ✓    | ✓    | B/R channel swap from RGB/RGBA  |
 | NV12          | ✓    | —    | Y plane + interleaved UV (4:2:0)|
 
+## Supported Source Features
+
+The codec implements a **strict subset** of the JPEG and PNG specifications.
+Inputs that fall outside the subset surface a typed
+`CodecError::Unsupported(UnsupportedFeature)`. See the per-feature table in
+[`README.md`](README.md#decoder-limitations) for the full matrix and the
+typed error variant that each rejected case carries.
+
+The codec does **not** transparently fall back to another decoder for
+unsupported inputs and does **not** attempt to transcode them. The
+contract is "accept this strict subset; reject everything else with a
+precise typed error."
+
 ## Data Type Support
 
 | Type  | JPEG               | PNG (8-bit source)   | PNG (16-bit source) |
