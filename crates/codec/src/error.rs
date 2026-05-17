@@ -70,12 +70,6 @@ impl From<edgefirst_tensor::Error> for CodecError {
     }
 }
 
-impl From<zune_jpeg::errors::DecodeErrors> for CodecError {
-    fn from(e: zune_jpeg::errors::DecodeErrors) -> Self {
-        Self::InvalidData(format!("JPEG: {e}"))
-    }
-}
-
 impl From<zune_png::error::PngDecodeErrors> for CodecError {
     fn from(e: zune_png::error::PngDecodeErrors) -> Self {
         Self::InvalidData(format!("PNG: {e}"))

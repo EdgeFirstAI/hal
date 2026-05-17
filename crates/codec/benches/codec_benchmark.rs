@@ -147,44 +147,16 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// 2. Raw zune-jpeg/zune-png — baseline (allocating decoder)
+// 2. Raw zune-png — baseline (allocating decoder)
 // =============================================================================
 
 fn bench_zune_raw(suite: &mut BenchSuite) {
-    println!("\n== zune-jpeg/zune-png: raw decode (allocating) ==\n");
-
-    // zune-jpeg: zidane.jpg → RGB
-    {
-        let r = run_bench("zune/jpeg/rgb/zidane_720p", WARMUP, ITERATIONS, || {
-            use zune_jpeg::zune_core::bytestream::ZCursor;
-            use zune_jpeg::JpegDecoder;
-            let mut decoder = JpegDecoder::new(ZCursor::new(&ZIDANE_JPG[..]));
-            decoder.decode_headers().expect("jpeg header decode failed");
-            let pixels = decoder.decode().expect("jpeg decode failed");
-            std::hint::black_box(pixels);
-        });
-        r.print_summary();
-        suite.record(&r);
-    }
-
-    // zune-jpeg: person.jpg → RGB
-    {
-        let r = run_bench("zune/jpeg/rgb/person_4k", WARMUP, ITERATIONS, || {
-            use zune_jpeg::zune_core::bytestream::ZCursor;
-            use zune_jpeg::JpegDecoder;
-            let mut decoder = JpegDecoder::new(ZCursor::new(&PERSON_JPG[..]));
-            decoder.decode_headers().expect("jpeg header decode failed");
-            let pixels = decoder.decode().expect("jpeg decode failed");
-            std::hint::black_box(pixels);
-        });
-        r.print_summary();
-        suite.record(&r);
-    }
+    println!("\n== zune-png: raw decode (allocating) ==\n");
 
     // zune-png: zidane.png → RGB
     {
         let r = run_bench("zune/png/rgb/zidane_720p", WARMUP, ITERATIONS, || {
-            use zune_jpeg::zune_core::bytestream::ZCursor;
+            use zune_png::zune_core::bytestream::ZCursor;
             use zune_png::PngDecoder;
             let mut decoder = PngDecoder::new(ZCursor::new(&ZIDANE_PNG[..]));
             decoder.decode_headers().expect("png header decode failed");

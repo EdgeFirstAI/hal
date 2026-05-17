@@ -586,7 +586,6 @@ dependencies = [
  "num-traits",
  "opencv",
  "turbojpeg",
- "zune-jpeg",
  "zune-png",
 ]
 

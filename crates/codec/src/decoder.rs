@@ -32,7 +32,9 @@ use std::io::Read;
 /// }
 /// ```
 pub struct ImageDecoder {
-    /// Scratch buffer for the contiguous decode output from zune.
+    /// Reusable JPEG decoder state (Huffman tables, MCU scratch buffers).
+    pub(crate) jpeg_state: crate::jpeg::JpegDecoderState,
+    /// Scratch buffer for PNG decode output.
     pub(crate) scratch: Vec<u8>,
     /// Buffer for `Read` → `&[u8]` conversion.
     pub(crate) input_buffer: Vec<u8>,
@@ -42,6 +44,7 @@ impl ImageDecoder {
     /// Create a new decoder with empty scratch buffers.
     pub fn new() -> Self {
         Self {
+            jpeg_state: crate::jpeg::JpegDecoderState::new(),
             scratch: Vec::new(),
             input_buffer: Vec::new(),
         }
@@ -65,7 +68,7 @@ impl ImageDecoder {
         opts: &DecodeOptions,
     ) -> crate::Result<ImageInfo> {
         if is_jpeg(data) {
-            crate::jpeg::decode_jpeg_into(data, dst, opts, &mut self.scratch)
+            crate::jpeg::decode_jpeg_into(data, dst, opts, &mut self.jpeg_state)
         } else if is_png(data) {
             crate::png::decode_png_into(data, dst, opts, &mut self.scratch)
         } else {
