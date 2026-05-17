@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Codec decode benchmarks comparing `edgefirst-codec` (strided decode into
-//! pre-allocated tensors) against raw `zune-jpeg`/`zune-png` and the `image`
-//! crate.
+//! Codec decode benchmarks comparing `edgefirst-codec` (custom JPEG decoder
+//! with NEON SIMD, strided decode into pre-allocated tensors) against the
+//! `image` crate and raw `zune-png`.
 //!
 //! ## Run benchmarks
 //! ```bash
