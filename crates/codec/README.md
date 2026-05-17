@@ -12,7 +12,9 @@ in the hot loop — the primary design goal.
 
 JPEG decoding uses a custom from-scratch baseline decoder with reusable
 state, achieving zero heap allocations after the first decode at each
-resolution. PNG decoding uses `zune-png`.
+resolution. SIMD-optimized kernels (NEON on AArch64, SSE2 on x86-64) are
+selected automatically at init via dynamic dispatch. PNG decoding uses
+`zune-png`.
 
 ## Quick Start
 

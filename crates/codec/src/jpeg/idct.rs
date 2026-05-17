@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! IDCT dispatcher — selects scalar or NEON implementation.
+//! IDCT dispatcher — selects scalar, NEON, or SSE2 implementation.
 
 pub mod scalar;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
+
+#[cfg(target_arch = "x86_64")]
+pub mod sse2;
 
 /// IDCT function signature: takes 64 dequantised coefficients in natural
 /// order, writes 64 clamped u8 values into `output` at the given stride.
@@ -18,6 +21,12 @@ pub fn select_idct() -> IdctFn {
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             return neon::idct_8x8_neon;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            return sse2::idct_8x8_sse2;
         }
     }
     scalar::idct_8x8_scalar
@@ -32,6 +41,12 @@ pub fn select_idct_dc_only() -> IdctDcOnlyFn {
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             return neon::idct_dc_only_neon;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse2") {
+            return sse2::idct_dc_only_sse2;
         }
     }
     scalar::idct_dc_only_scalar
