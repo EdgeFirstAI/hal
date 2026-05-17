@@ -218,6 +218,18 @@ pub fn decode_image(
                 grey_fn,
                 &mut scratch.output_row,
             );
+        } else if output_format == PixelFormat::Nv12 {
+            write_nv12_rows(
+                hdr,
+                &scratch.component_bufs,
+                mcus_x,
+                dst,
+                dst_stride,
+                y_start,
+                mcu_pixel_h.min(img_h - y_start),
+                img_w,
+                img_h,
+            );
         } else {
             let color_fn = color::select_color_convert(output_format)
                 .ok_or(CodecError::UnsupportedFormat(output_format))?;
@@ -350,5 +362,66 @@ fn write_color_rows(
         let dst_offset = (y_start + row) * dst_stride;
         let row_bytes = img_w * channels;
         dst[dst_offset..dst_offset + row_bytes].copy_from_slice(&output_row[..row_bytes]);
+    }
+}
+
+/// Write NV12 output: Y plane + interleaved UV plane.
+///
+/// NV12 layout in the destination buffer:
+/// - Y plane: `img_h` rows of `img_w` bytes at offset 0
+/// - UV plane: `img_h/2` rows of `img_w` bytes (Cb/Cr interleaved) at offset
+///   `img_h * dst_stride`
+///
+/// For 4:2:0 JPEGs, the Cb/Cr components are already at half resolution,
+/// so we copy them directly (no upsampling needed).
+/// For 4:4:4 JPEGs, we subsample by averaging 2×2 blocks.
+#[allow(clippy::too_many_arguments)]
+fn write_nv12_rows(
+    hdr: &crate::jpeg::types::ImageHeader,
+    comp_bufs: &[Vec<u8>],
+    mcus_x: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    y_start: usize,
+    num_rows: usize,
+    img_w: usize,
+    img_h: usize,
+) {
+    let y_comp = &hdr.components[0];
+    let cb_comp = &hdr.components[1];
+
+    let y_comp_stride = mcus_x * y_comp.sampling.h as usize * 8;
+    let cb_comp_stride = mcus_x * cb_comp.sampling.h as usize * 8;
+
+    let v_ratio = y_comp.sampling.v / cb_comp.sampling.v;
+    let uv_plane_offset = img_h * dst_stride;
+
+    // Copy Y plane rows directly
+    for row in 0..num_rows {
+        let src_offset = row * y_comp_stride;
+        let dst_offset = (y_start + row) * dst_stride;
+        let copy_len = img_w.min(y_comp_stride - (src_offset % y_comp_stride));
+        dst[dst_offset..dst_offset + img_w.min(copy_len)]
+            .copy_from_slice(&comp_bufs[0][src_offset..src_offset + img_w.min(copy_len)]);
+    }
+
+    // Write UV plane (interleaved Cb/Cr at half height, half width)
+    // Only write UV rows for even Y rows (or when v_ratio == 1, subsample)
+    let chroma_h = num_rows / v_ratio as usize;
+    let chroma_w = img_w / 2;
+
+    for crow in 0..chroma_h {
+        let chroma_src_row = crow;
+        let cb_src = &comp_bufs[1][chroma_src_row * cb_comp_stride..];
+        let cr_src = &comp_bufs[2][chroma_src_row * cb_comp_stride..];
+
+        let uv_row_idx = y_start / 2 + crow;
+        let uv_offset = uv_plane_offset + uv_row_idx * dst_stride;
+
+        // Interleave Cb/Cr pairs
+        for x in 0..chroma_w {
+            dst[uv_offset + x * 2] = cb_src[x];
+            dst[uv_offset + x * 2 + 1] = cr_src[x];
+        }
     }
 }

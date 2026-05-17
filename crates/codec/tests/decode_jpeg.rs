@@ -859,3 +859,62 @@ fn decode_stride_padding_untouched() {
         );
     }
 }
+
+#[test]
+fn decode_nv12_output() {
+    let jpeg = testdata("zidane.jpg");
+    // NV12 needs H * W + H/2 * W = 1.5 * H * W bytes.
+    // For 1280×720: Y plane = 921600, UV plane = 460800, total = 1382400
+    let width = 1280usize;
+    let height = 720usize;
+    let nv12_size = width * height * 3 / 2;
+
+    // Create a tensor large enough for NV12 (1 channel, height*1.5 rows)
+    let mut tensor = Tensor::<u8>::image(
+        width,
+        height * 3 / 2,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    let mut decoder = ImageDecoder::new();
+
+    let info = tensor
+        .load_image(
+            &mut decoder,
+            &jpeg,
+            &DecodeOptions::default()
+                .with_format(PixelFormat::Nv12)
+                .with_exif(false),
+        )
+        .unwrap();
+    assert_eq!(info.width, width);
+    assert_eq!(info.height, height);
+    assert_eq!(info.format, PixelFormat::Nv12);
+
+    let map = tensor.map().unwrap();
+    let bytes: &[u8] = &map;
+
+    // Y plane should have non-zero data
+    let y_nonzero = bytes[..width * height].iter().filter(|&&v| v != 0).count();
+    assert!(
+        y_nonzero > 1000,
+        "Y plane should have many non-zero pixels, got {y_nonzero}"
+    );
+
+    // UV plane should have non-128 data (chrominance varies in real images)
+    let uv_start = height * width;
+    let uv_size = width * height / 2;
+    if uv_start + uv_size <= bytes.len() {
+        let uv_non128 = bytes[uv_start..uv_start + uv_size]
+            .iter()
+            .filter(|&&v| v != 128)
+            .count();
+        assert!(
+            uv_non128 > 100,
+            "UV plane should have varied chrominance, non-128 count: {uv_non128}"
+        );
+    }
+
+    let _ = nv12_size;
+}

@@ -26,7 +26,7 @@ Located in `crates/codec/tests/`:
 
 | File                    | What It Tests                                      |
 |-------------------------|----------------------------------------------------|
-| `decode_jpeg.rs`        | JPEG → Tensor<u8/u16/i8/i16/f32>, pixel accuracy, strided decode, error handling, reuse patterns |
+| `decode_jpeg.rs`        | JPEG → Tensor<u8/u16/i8/i16/f32>, pixel accuracy, strided decode, NV12 output, error handling, reuse patterns |
 | `decode_png.rs`         | PNG → Tensor<u8/u16/i8/i16/f32>, format conversion|
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 

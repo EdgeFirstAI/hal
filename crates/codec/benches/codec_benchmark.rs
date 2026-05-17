@@ -26,8 +26,8 @@ const ITERATIONS: usize = 100;
 static ZIDANE_JPG: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("zidane.jpg"));
 
-static PERSON_JPG: LazyLock<Vec<u8>> =
-    LazyLock::new(|| edgefirst_bench::testdata::read("person.jpg"));
+static GIRAFFE_JPG: LazyLock<Vec<u8>> =
+    LazyLock::new(|| edgefirst_bench::testdata::read("giraffe.jpg"));
 
 static ZIDANE_PNG: LazyLock<Vec<u8>> =
     LazyLock::new(|| edgefirst_bench::testdata::read("zidane.png"));
@@ -80,15 +80,19 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
         suite.record(&r);
     }
 
-    // JPEG: person.jpg (4256×2532) — large image
+    // JPEG: giraffe.jpg (640×640) — smaller baseline image
     {
         let mut tensor =
-            Tensor::<u8>::image(4256, 2532, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+            Tensor::<u8>::image(640, 640, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
         let mut decoder = ImageDecoder::new();
-        tensor.load_image(&mut decoder, &PERSON_JPG, &opts).unwrap();
+        tensor
+            .load_image(&mut decoder, &GIRAFFE_JPG, &opts)
+            .unwrap();
 
-        let r = run_bench("codec/jpeg/rgb/person_4k", WARMUP, ITERATIONS, || {
-            tensor.load_image(&mut decoder, &PERSON_JPG, &opts).unwrap();
+        let r = run_bench("codec/jpeg/rgb/giraffe_640", WARMUP, ITERATIONS, || {
+            tensor
+                .load_image(&mut decoder, &GIRAFFE_JPG, &opts)
+                .unwrap();
             std::hint::black_box(&tensor);
         });
         r.print_summary();
@@ -144,6 +148,55 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
         r.print_summary();
         suite.record(&r);
     }
+
+    // JPEG: BGRA decode
+    {
+        let opts_bgra = DecodeOptions::default()
+            .with_format(PixelFormat::Bgra)
+            .with_exif(false);
+        let mut tensor =
+            Tensor::<u8>::image(1280, 720, PixelFormat::Bgra, Some(TensorMemory::Mem)).unwrap();
+        let mut decoder = ImageDecoder::new();
+        tensor
+            .load_image(&mut decoder, &ZIDANE_JPG, &opts_bgra)
+            .unwrap();
+
+        let r = run_bench("codec/jpeg/bgra/zidane_720p", WARMUP, ITERATIONS, || {
+            tensor
+                .load_image(&mut decoder, &ZIDANE_JPG, &opts_bgra)
+                .unwrap();
+            std::hint::black_box(&tensor);
+        });
+        r.print_summary();
+        suite.record(&r);
+    }
+
+    // JPEG: NV12 decode (skip color conversion)
+    {
+        let opts_nv12 = DecodeOptions::default()
+            .with_format(PixelFormat::Nv12)
+            .with_exif(false);
+        let mut tensor = Tensor::<u8>::image(
+            1280,
+            720 * 3 / 2,
+            PixelFormat::Grey,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        let mut decoder = ImageDecoder::new();
+        tensor
+            .load_image(&mut decoder, &ZIDANE_JPG, &opts_nv12)
+            .unwrap();
+
+        let r = run_bench("codec/jpeg/nv12/zidane_720p", WARMUP, ITERATIONS, || {
+            tensor
+                .load_image(&mut decoder, &ZIDANE_JPG, &opts_nv12)
+                .unwrap();
+            std::hint::black_box(&tensor);
+        });
+        r.print_summary();
+        suite.record(&r);
+    }
 }
 
 // =============================================================================
@@ -193,14 +246,20 @@ fn bench_image_crate(suite: &mut BenchSuite) {
         suite.record(&r);
     }
 
-    // image crate: person.jpg → RGB
+    // image crate: giraffe.jpg → RGB
     {
-        let r = run_bench("image_crate/jpeg/rgb/person_4k", WARMUP, ITERATIONS, || {
-            let img = image::load_from_memory_with_format(&PERSON_JPG, image::ImageFormat::Jpeg)
-                .expect("image crate decode failed");
-            let rgb = img.to_rgb8();
-            std::hint::black_box(rgb);
-        });
+        let r = run_bench(
+            "image_crate/jpeg/rgb/giraffe_640",
+            WARMUP,
+            ITERATIONS,
+            || {
+                let img =
+                    image::load_from_memory_with_format(&GIRAFFE_JPG, image::ImageFormat::Jpeg)
+                        .expect("image crate decode failed");
+                let rgb = img.to_rgb8();
+                std::hint::black_box(rgb);
+            },
+        );
         r.print_summary();
         suite.record(&r);
     }

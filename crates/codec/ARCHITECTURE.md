@@ -47,14 +47,14 @@ keeping the dependency graph clean.
 | `huffman.rs`     | 9-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
 | `idct/mod.rs`    | IDCT dispatcher (scalar/NEON selection via function pointers) |
 | `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path    |
-| `idct/neon.rs`   | NEON IDCT stub (delegates to scalar)                  |
+| `idct/neon.rs`   | NEON 8×8 IDCT: 4-wide Loeffler butterfly, 4×4 transpose, DC-only fill |
 | `color/mod.rs`   | Color conversion dispatcher                           |
 | `color/scalar.rs`| BT.601 full-range YCbCr→RGB/RGBA/BGRA/Grey           |
-| `color/neon.rs`  | NEON color conversion stub (delegates to scalar)      |
+| `color/neon.rs`  | NEON YCbCr→RGB/RGBA/BGRA: 8-pixel SIMD with vst3/vst4 |
 | `upsample/mod.rs`| Chroma upsample dispatcher                            |
 | `upsample/scalar.rs` | Bilinear 3:1 blend for horizontal 2× upsampling |
-| `upsample/neon.rs`   | NEON upsample stub (delegates to scalar)         |
-| `mcu.rs`         | MCU decode loop, `McuScratch`, strided output         |
+| `upsample/neon.rs`   | NEON horizontal 2× upsample: widening multiply-accumulate |
+| `mcu.rs`         | MCU decode loop, `McuScratch`, strided output, NV12 path |
 
 ## Key Design Decisions
 
@@ -175,6 +175,32 @@ The custom baseline JPEG decoder processes images through these stages:
 - Function pointer dispatch for IDCT/color/upsample: selected once at init
   based on CPU feature detection (NEON vs scalar).
 
+### NEON SIMD Kernels
+
+On AArch64, the decoder uses NEON intrinsics for the three hot-path kernels.
+Each kernel is selected via `std::arch::is_aarch64_feature_detected!("neon")`
+at init time; on x86_64, the scalar path is used.
+
+| Kernel       | Strategy                                          | Throughput    |
+|--------------|---------------------------------------------------|---------------|
+| **IDCT**     | 4-wide Loeffler butterfly with int32x4_t, 4×4 transpose via vzip, DC-only fills 8 bytes via vdup/vst1 | 4 cols/rows per iteration |
+| **Color**    | 7-bit fixed-point YCbCr→RGB/RGBA/BGRA, vmovl widening, vrshrq rounding shift, vqmovun saturation, vst3/vst4 interleaved store | 8 pixels per iteration |
+| **Upsample** | Widening bilinear 3:1 blend via vmulq_n_u16, interleaved output via vst2 | 8→16 samples per iteration |
+
+All kernels have scalar tails for remainder elements when the width is not
+a multiple of the SIMD width.
+
+### NV12 Output Path
+
+For NV12 output, the decoder skips YCbCr→RGB color conversion entirely:
+- Y plane is copied directly from the IDCT output buffer
+- Cb and Cr planes are interleaved pair-wise into the UV plane
+
+This path is faster than RGB/RGBA because it avoids the fixed-point color
+conversion entirely. It is intended for hardware video encoders and GPU
+pipelines that consume NV12 natively. EXIF rotation is not supported for
+NV12 output.
+
 ### JPEG Decoder Architecture
 
 ```
@@ -231,6 +257,7 @@ The decoder inspects magic bytes:
 | RGBA          | ✓    | ✓    | Alpha = 255 for JPEG            |
 | Grey          | ✓    | ✓    | Luminance only                  |
 | BGRA          | ✓    | ✓    | B/R channel swap from RGB/RGBA  |
+| NV12          | ✓    | —    | Y plane + interleaved UV (4:2:0)|
 
 ## Data Type Support
 
