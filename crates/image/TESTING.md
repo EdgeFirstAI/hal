@@ -19,6 +19,7 @@ crates/image/
     ├── mask_benchmark.rs        # Mask decode + draw paths
     ├── mask_decode_benchmark.rs # Mask materialization vs proto-only
     ├── pipeline_benchmark.rs    # End-to-end pipeline measurements
+    ├── decode_pipeline_benchmark.rs  # JPEG decode → letterbox convert pipeline
     ├── opencv_benchmark.rs      # Comparison vs OpenCV reference (optional)
     ├── sanity_check.rs          # Quick smoke tests for bench harness setup
     └── common.rs                # Shared bench fixture helpers

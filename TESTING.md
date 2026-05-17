@@ -469,6 +469,57 @@ inspect this call first — the most common cause is calling
 and then thresholding the proto-resolution sigmoid in caller code
 before resizing, which produces blocky binary edges.
 
+### Zero-allocation pipeline verification
+
+The JPEG decode → letterbox resize pipeline must perform **zero heap
+allocations** in its hot loop. All buffers (decoder scratch, tensor
+backing, GL resources) are sized during init and reused.
+
+Two examples validate this:
+
+| Example | Scope | Location |
+|---------|-------|----------|
+| `zero_alloc_check` | Codec-only (decode into strided tensor) | `crates/codec/examples/` |
+| `pipeline_demo` | Full pipeline (decode + ImageProcessor convert) | `crates/image/examples/` |
+
+**Verification with strace** (CPU backend — guaranteed zero `brk`/`mmap`):
+
+```bash
+cargo build --release -p edgefirst-image --example pipeline_demo
+EDGEFIRST_FORCE_BACKEND=cpu strace -e brk,mmap -f \
+    ./target/release/examples/pipeline_demo 2>&1 \
+    | grep -A9999 'HOT LOOP START' | grep -B9999 'HOT LOOP END'
+```
+
+Expected: zero `brk` or `mmap` lines between the markers.
+
+With the OpenGL backend, a single GPU driver `mmap` (MAP_SHARED on the
+DRM render device) may appear the first time a new source dimension is
+presented. This is a driver-internal resource import, not a heap
+allocation. On embedded targets with DMA-BUF tensors this does not occur.
+
+**Key implementation details for maintaining zero-allocation:**
+
+1. **Decoder scratch buffers** (`ImageDecoder`) grow to high-water mark
+   on first decode and are reused for subsequent frames.
+2. **`DecodeOptions::with_exif(false)`** must be set — the EXIF parser
+   allocates per call.
+3. **Input tensors** must be pre-allocated large enough for the maximum
+   expected image size. The decoder returns an error if the tensor is
+   too small.
+4. **Timing vectors** and other metadata must be pre-allocated before
+   the hot loop.
+
+**Benchmark:**
+
+```bash
+cargo bench -p edgefirst-image --bench decode_pipeline_benchmark
+```
+
+This measures decode, convert, and full pipeline (decode + convert)
+latency with strided input tensors for both packed RGB (HWC) and
+planar RGB (CHW) output layouts.
+
 ### Quantifying native CPU feature builds
 
 When benchmarking with `RUSTFLAGS="-C target-feature=+fp16"` (or `+f16c`

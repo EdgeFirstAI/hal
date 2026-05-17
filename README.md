@@ -512,6 +512,7 @@ testing detail lives in each crate's `TESTING.md` — links in the
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types |
 | `image_benchmark` | `edgefirst-image` | Crop, flip, rotate, resize, draw |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline + format conversion |
+| `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert (strided, HWC/CHW) |
 | `mask_benchmark` | `edgefirst-image` | `draw_decoded_masks`, `draw_proto_masks`, hybrid path |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequant |
