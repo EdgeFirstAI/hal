@@ -36,6 +36,10 @@ pub struct ImageDecoder {
     pub(crate) jpeg_state: crate::jpeg::JpegDecoderState,
     /// Scratch buffer for PNG decode output.
     pub(crate) scratch: Vec<u8>,
+    /// Reusable PNG EXIF rotation scratch (used by `apply_exif_u8` for the
+    /// 90°/270° paths). Kept across decodes so EXIF-rotated PNG workloads
+    /// don't re-allocate a multi-megabyte buffer per frame.
+    pub(crate) png_rot_scratch: Vec<u8>,
     /// Buffer for `Read` → `&[u8]` conversion.
     pub(crate) input_buffer: Vec<u8>,
 }
@@ -46,6 +50,7 @@ impl ImageDecoder {
         Self {
             jpeg_state: crate::jpeg::JpegDecoderState::new(),
             scratch: Vec::new(),
+            png_rot_scratch: Vec::new(),
             input_buffer: Vec::new(),
         }
     }
@@ -70,7 +75,13 @@ impl ImageDecoder {
         if is_jpeg(data) {
             crate::jpeg::decode_jpeg_into(data, dst, opts, &mut self.jpeg_state)
         } else if is_png(data) {
-            crate::png::decode_png_into(data, dst, opts, &mut self.scratch)
+            crate::png::decode_png_into(
+                data,
+                dst,
+                opts,
+                &mut self.scratch,
+                &mut self.png_rot_scratch,
+            )
         } else {
             Err(CodecError::InvalidData(
                 "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -99,7 +110,8 @@ impl ImageDecoder {
     }
 
     /// Read all bytes from a `Read` source into the internal input buffer,
-    /// then decode.
+    /// then decode. The input buffer is reused across calls — no per-call
+    /// heap copy of the encoded bytes.
     pub fn decode_from_reader<T: ImagePixel, R: Read>(
         &mut self,
         mut reader: R,
@@ -108,7 +120,18 @@ impl ImageDecoder {
     ) -> crate::Result<ImageInfo> {
         self.input_buffer.clear();
         reader.read_to_end(&mut self.input_buffer)?;
-        self.decode_into(&self.input_buffer.clone(), dst, opts)
+        // Split-borrow: decode_into_inner reads `input_buffer` while
+        // separately holding `&mut jpeg_state` and `&mut scratch`, which
+        // `decode_into(&mut self, &self.input_buffer)` cannot do without
+        // cloning the bytes.
+        decode_into_inner(
+            &mut self.jpeg_state,
+            &mut self.scratch,
+            &mut self.png_rot_scratch,
+            &self.input_buffer,
+            dst,
+            opts,
+        )
     }
 
     /// Read all bytes from a `Read` source into the internal input buffer,
@@ -121,7 +144,54 @@ impl ImageDecoder {
     ) -> crate::Result<ImageInfo> {
         self.input_buffer.clear();
         reader.read_to_end(&mut self.input_buffer)?;
-        self.decode_into_dyn(&self.input_buffer.clone(), dst, opts)
+        decode_into_inner_dyn(
+            &mut self.jpeg_state,
+            &mut self.scratch,
+            &mut self.png_rot_scratch,
+            &self.input_buffer,
+            dst,
+            opts,
+        )
+    }
+}
+
+/// Internal decode entry point parameterised over disjoint `&mut` borrows
+/// so callers can read from a `&[u8]` borrowed from one field of
+/// [`ImageDecoder`] while mutably borrowing the others.
+pub(crate) fn decode_into_inner<T: ImagePixel>(
+    jpeg_state: &mut crate::jpeg::JpegDecoderState,
+    scratch: &mut Vec<u8>,
+    png_rot_scratch: &mut Vec<u8>,
+    data: &[u8],
+    dst: &mut Tensor<T>,
+    opts: &DecodeOptions,
+) -> crate::Result<ImageInfo> {
+    if is_jpeg(data) {
+        crate::jpeg::decode_jpeg_into(data, dst, opts, jpeg_state)
+    } else if is_png(data) {
+        crate::png::decode_png_into(data, dst, opts, scratch, png_rot_scratch)
+    } else {
+        Err(CodecError::InvalidData(
+            "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
+        ))
+    }
+}
+
+pub(crate) fn decode_into_inner_dyn(
+    jpeg_state: &mut crate::jpeg::JpegDecoderState,
+    scratch: &mut Vec<u8>,
+    png_rot_scratch: &mut Vec<u8>,
+    data: &[u8],
+    dst: &mut TensorDyn,
+    opts: &DecodeOptions,
+) -> crate::Result<ImageInfo> {
+    match dst {
+        TensorDyn::U8(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        TensorDyn::I8(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        TensorDyn::U16(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        TensorDyn::I16(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        TensorDyn::F32(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        other => Err(CodecError::UnsupportedDtype(other.dtype())),
     }
 }
 

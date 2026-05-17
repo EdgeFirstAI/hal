@@ -100,7 +100,6 @@ frames — scratch buffers amortize after the first decode.
 ### `DecodeOptions`
 
 - `format`: Output pixel format (`None` = native from file)
-- `scale_denom`: JPEG IDCT downscale (1/2/4/8, default 1)
 - `apply_exif`: Apply EXIF orientation (default true)
 
 ### `ImageInfo`

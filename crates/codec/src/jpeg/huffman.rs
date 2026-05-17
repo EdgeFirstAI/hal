@@ -192,6 +192,15 @@ pub fn decode_block(
         }
 
         if size > 0 {
+            // JPEG spec: AC coefficient sizes are 1..=10 bits (the low
+            // nibble of the AC symbol). Reject anything larger so a
+            // crafted Huffman table can't drive `read_bits` / `extend`
+            // past the spec range and produce coefficient overflow.
+            if size > 10 {
+                return Err(CodecError::InvalidData(format!(
+                    "JPEG: AC coefficient size {size} exceeds spec maximum (10)"
+                )));
+            }
             let val = bs.read_bits(size);
             let coeff = BitStream::extend(val, size);
             // Natural order index via the zig-zag table in QuantTable

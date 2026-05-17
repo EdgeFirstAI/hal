@@ -12,10 +12,6 @@ pub struct DecodeOptions {
     /// file (typically RGB for JPEG, RGB/RGBA for PNG).
     pub format: Option<PixelFormat>,
 
-    /// JPEG IDCT downscale denominator (1, 2, 4, or 8). Ignored for PNG.
-    /// A value of 2 decodes at half resolution, 4 at quarter, etc.
-    pub scale_denom: u8,
-
     /// Whether to apply EXIF orientation metadata. Default: `true`.
     ///
     /// Set to `false` when the caller will handle rotation/flip externally
@@ -27,7 +23,6 @@ impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
             format: None,
-            scale_denom: 1,
             apply_exif: true,
         }
     }
@@ -38,13 +33,6 @@ impl DecodeOptions {
     #[must_use]
     pub fn with_format(mut self, format: PixelFormat) -> Self {
         self.format = Some(format);
-        self
-    }
-
-    /// Set the JPEG IDCT downscale denominator.
-    #[must_use]
-    pub fn with_scale(mut self, denom: u8) -> Self {
-        self.scale_denom = denom;
         self
     }
 
