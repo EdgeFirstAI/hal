@@ -1550,7 +1550,7 @@ impl Decoder {
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
         // Per-scale fast path: route via the basic decode then update the
-        // tracker. Phase 1 keeps the tracker integration simple; per-frame
+        // tracker. The current implementation keeps the tracker integration simple; per-frame
         // decoupling between detection and tracking is preserved.
         if self.per_scale.is_some() {
             output_tracks.clear();

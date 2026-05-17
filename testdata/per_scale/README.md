@@ -25,5 +25,5 @@ These are produced by the EdgeFirst tflite-converter with
 current artifacts.
 
 When present, the parity tests in `crates/decoder/tests/per_scale_parity.rs`
-will run them through the Python reference and (Phase 2+) the HAL.
+will run them through the Python reference and the HAL.
 Tests gracefully skip when files are absent.

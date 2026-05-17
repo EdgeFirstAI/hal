@@ -15,7 +15,7 @@
 //! "HOT LOOP END".
 
 use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
-use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory};
 
 fn main() {
     let testdata = std::env::var("EDGEFIRST_TESTDATA_DIR")

@@ -15,7 +15,7 @@
 //! kernel count) the pipeline pays a small per-frame transpose cost
 //! into a scratch buffer and then dispatches the existing NHWC kernel.
 //! Cost on Cortex-A53 scalar: ~6 ms / frame for a yolo at 640x640
-//! (memory-bandwidth-bound). Phase 2 NEON tile-transpose (the same
+//! (memory-bandwidth-bound). NEON tile-transpose (the same
 //! pattern that powers `tiled_proto_transpose_nchw_to_nhwc` on `main`)
 //! drops this to ~1.5 ms.
 //!

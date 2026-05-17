@@ -30,7 +30,7 @@ pub enum DecodeDtype {
 /// `Sigmoid` is wired through the per-scale pipeline; future activations
 /// (e.g. `Softmax` on objectness) extend this enum without ripple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)] // consumed by later per-scale phase 1 tasks
+#[allow(dead_code)] // consumed by per-scale pipeline tasks
 pub(crate) enum Activation {
     #[default]
     None,
@@ -40,7 +40,7 @@ pub(crate) enum Activation {
 impl Activation {
     /// Translate a schema activation to a per_scale Activation.
     /// Returns Activation::None when the schema declares no activation.
-    #[allow(dead_code)] // consumed by later per-scale phase 1 tasks
+    #[allow(dead_code)] // consumed by per-scale pipeline tasks
     pub(crate) fn from_schema(s: Option<crate::schema::Activation>) -> Self {
         match s {
             Some(crate::schema::Activation::Sigmoid) => Self::Sigmoid,

@@ -12,6 +12,7 @@ use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
 use crate::{
     check_null, check_null_ret_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList,
 };
+use edgefirst_codec::{CodecError, DecodeOptions, ImageDecoder, ImageLoad};
 use edgefirst_decoder::{DetectBox, Segmentation};
 #[allow(deprecated)]
 use edgefirst_image::{
@@ -21,7 +22,11 @@ use edgefirst_image::{
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
 use edgefirst_tracker::TrackInfo;
 use libc::{c_char, c_int, size_t};
-use std::ffi::CStr;
+use std::{cell::RefCell, ffi::CStr};
+
+thread_local! {
+    static CODEC_DECODER: RefCell<ImageDecoder> = RefCell::new(ImageDecoder::new());
+}
 
 /// Parse an optional letterbox pointer into `Option<[f32; 4]>`.
 ///
@@ -66,6 +71,13 @@ fn draw_err_to_errno(e: &edgefirst_image::Error) -> libc::c_int {
     match e {
         edgefirst_image::Error::AliasedBuffers(_) => libc::EINVAL,
         _ => libc::EIO,
+    }
+}
+
+fn decode_err_to_errno(err: &CodecError) -> libc::c_int {
+    match err {
+        CodecError::InsufficientCapacity { .. } => libc::ENOSPC,
+        _ => libc::EBADMSG,
     }
 }
 
@@ -114,6 +126,22 @@ impl HalPixelFormat {
             HalPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
             HalPixelFormat::Bgra => PixelFormat::Bgra,
             HalPixelFormat::Vyuy => PixelFormat::Vyuy,
+        }
+    }
+
+    fn from_raw(value: c_int) -> Option<Self> {
+        match value {
+            x if x == Self::Yuyv as c_int => Some(Self::Yuyv),
+            x if x == Self::Nv12 as c_int => Some(Self::Nv12),
+            x if x == Self::Nv16 as c_int => Some(Self::Nv16),
+            x if x == Self::Rgba as c_int => Some(Self::Rgba),
+            x if x == Self::Rgb as c_int => Some(Self::Rgb),
+            x if x == Self::Grey as c_int => Some(Self::Grey),
+            x if x == Self::PlanarRgb as c_int => Some(Self::PlanarRgb),
+            x if x == Self::PlanarRgba as c_int => Some(Self::PlanarRgba),
+            x if x == Self::Bgra as c_int => Some(Self::Bgra),
+            x if x == Self::Vyuy as c_int => Some(Self::Vyuy),
+            _ => None,
         }
     }
 
@@ -571,6 +599,123 @@ pub unsafe extern "C" fn hal_tensor_load_png(
     );
 
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
+}
+
+/// Decode image data (JPEG/PNG) into a pre-allocated tensor.
+///
+/// The tensor must have sufficient capacity for the decoded image.
+/// Returns 0 on success, -1 on error (errno set).
+///
+/// @param tensor Pre-allocated tensor to decode into
+/// @param data Pointer to encoded image data (JPEG or PNG)
+/// @param len Length of image data in bytes
+/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, HAL_PIXEL_FORMAT_GREY),
+///               or -1 to use the native format from the file
+/// @param out_width If non-NULL, receives the decoded image width
+/// @param out_height If non-NULL, receives the decoded image height
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL tensor/data, zero length, invalid format)
+/// - EBADMSG: Failed to decode image
+/// - ENOSPC: Tensor capacity insufficient for decoded image
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_decode_image(
+    tensor: *mut HalTensor,
+    data: *const u8,
+    len: size_t,
+    format: c_int,
+    out_width: *mut size_t,
+    out_height: *mut size_t,
+) -> c_int {
+    check_null!(tensor);
+    check_null!(data);
+    if len == 0 {
+        return set_error(libc::EINVAL);
+    }
+
+    let tensor = unsafe { &mut *tensor };
+    let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
+
+    let mut opts = DecodeOptions::default().with_exif(false);
+    if format != -1 {
+        let hal_fmt = match HalPixelFormat::from_raw(format) {
+            Some(fmt) => fmt,
+            None => return set_error(libc::EINVAL),
+        };
+        opts = opts.with_format(hal_fmt.to_pixel_format());
+    }
+
+    let info = CODEC_DECODER.with(|cell| {
+        let mut decoder = cell.borrow_mut();
+        tensor.inner.load_image(&mut decoder, data_slice, &opts)
+    });
+
+    let info = match info {
+        Ok(info) => info,
+        Err(err) => return set_error(decode_err_to_errno(&err)),
+    };
+
+    if !out_width.is_null() {
+        unsafe { *out_width = info.width };
+    }
+    if !out_height.is_null() {
+        unsafe { *out_height = info.height };
+    }
+
+    0
+}
+
+/// Decode an image file (JPEG/PNG) into a pre-allocated tensor.
+///
+/// @param tensor Pre-allocated tensor to decode into
+/// @param path Path to the image file
+/// @param format Output pixel format, or -1 for native format
+/// @param out_width If non-NULL, receives the decoded image width
+/// @param out_height If non-NULL, receives the decoded image height
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8, invalid format)
+/// - ENOENT: File not found
+/// - EIO: Failed to read file
+/// - EBADMSG: Failed to decode image
+/// - ENOSPC: Tensor capacity insufficient
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_decode_image_file(
+    tensor: *mut HalTensor,
+    path: *const c_char,
+    format: c_int,
+    out_width: *mut size_t,
+    out_height: *mut size_t,
+) -> c_int {
+    check_null!(tensor);
+    check_null!(path);
+
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return set_error(libc::EINVAL),
+    };
+
+    let data = match std::fs::read(path_str) {
+        Ok(d) => d,
+        Err(e) => {
+            return set_error(if e.kind() == std::io::ErrorKind::NotFound {
+                libc::ENOENT
+            } else {
+                libc::EIO
+            });
+        }
+    };
+
+    unsafe {
+        hal_tensor_decode_image(
+            tensor,
+            data.as_ptr(),
+            data.len(),
+            format,
+            out_width,
+            out_height,
+        )
+    }
 }
 
 /// Save an image tensor as JPEG.

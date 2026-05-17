@@ -4053,7 +4053,7 @@ outputs:
         ///   xc = (0.5 + 0) * 8 = 4.0
         ///   w  = (7.5 + 7.5) * 8 = 120.0
         #[test]
-        #[ignore = "TODO HAL-Phase3: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
+        #[ignore = "TODO: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
         fn hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity() {
             use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
             let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");

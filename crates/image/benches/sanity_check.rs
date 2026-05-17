@@ -88,7 +88,7 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
         .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
         .with_dst_color(Some([114, 114, 114, 255]));
 
-    // Phase 1: single iteration
+    // Stage 1: single iteration
     let start = Instant::now();
     if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
         write_result(result_fd, &format!("FAILED:convert:{e}:0:0:0"));
@@ -106,7 +106,7 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
         return;
     }
 
-    // Phase 2: 10 more iterations
+    // Stage 2: 10 more iterations
     let mut times = Vec::with_capacity(10);
     for i in 0..10 {
         let start = Instant::now();

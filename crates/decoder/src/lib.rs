@@ -777,7 +777,7 @@ pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
     }
 
     unsafe {
-        // Phase 1: Find the global max value using NEON horizontal max.
+        // Step 1: Find the global max value using NEON horizontal max.
         let chunks = n / 16;
         let mut vmax = vld1q_s8(scores.as_ptr());
         for i in 1..chunks {
@@ -795,7 +795,7 @@ pub(crate) fn arg_max_i8(scores: &[i8]) -> (i8, usize) {
             }
         }
 
-        // Phase 2: Find the LAST index of `final_max` (preserves tie semantics).
+        // Step 2: Find the LAST index of `final_max` (preserves tie semantics).
         // Scan backwards for the last occurrence.
         let mut idx = 0;
         for i in (0..n).rev() {

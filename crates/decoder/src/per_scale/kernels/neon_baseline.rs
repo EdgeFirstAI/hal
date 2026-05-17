@@ -22,7 +22,7 @@
 //! to roughly the L2 cache bandwidth on Cortex-A53, which scalar code
 //! can't approach.
 //!
-//! Phase 2-A (this module) covers Tier-1 NEON baseline and Tier-2 FP16.
+//! This module covers Tier-1 NEON baseline and Tier-2 FP16.
 
 #![cfg(target_arch = "aarch64")]
 #![allow(dead_code)] // Wired into dispatch in subsequent N-* tasks.

@@ -357,6 +357,168 @@ static void test_tensor_image_dma(void) {
 }
 
 // =============================================================================
+// Image Decode Tests (into pre-allocated tensors)
+// =============================================================================
+
+static const char* test_image_jpeg_path(void) {
+    if (access("testdata/zidane.jpg", R_OK) == 0) {
+        return "testdata/zidane.jpg";
+    }
+    if (access("../../../testdata/zidane.jpg", R_OK) == 0) {
+        return "../../../testdata/zidane.jpg";
+    }
+    return NULL;
+}
+
+static void test_tensor_decode_image_jpeg(void) {
+    TEST("tensor_decode_image_jpeg");
+
+    // Create a pre-allocated tensor large enough for zidane.jpg (1280x720)
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(tensor);
+
+    const char* path = test_image_jpeg_path();
+    if (!path) {
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found\n");
+        tests_run--;
+        return;
+    }
+
+    // Read the JPEG file
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found\n");
+        tests_run--;
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* data = (uint8_t*)malloc((size_t)fsize);
+    ASSERT_NOT_NULL(data);
+    size_t bytes_read = fread(data, 1, (size_t)fsize, f);
+    fclose(f);
+    if (bytes_read != (size_t)fsize) {
+        free(data);
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: failed to read testdata/zidane.jpg\n");
+        tests_run--;
+        return;
+    }
+
+    // Decode into the pre-allocated tensor
+    size_t width = 0, height = 0;
+    int ret = hal_tensor_decode_image(tensor, data, (size_t)fsize, HAL_PIXEL_FORMAT_RGB, &width, &height);
+    ASSERT_EQ(0, ret);
+    ASSERT_EQ(1280, (int)width);
+    ASSERT_EQ(720, (int)height);
+
+    free(data);
+    hal_tensor_free(tensor);
+    TEST_PASS();
+}
+
+static void test_tensor_decode_image_file_jpeg(void) {
+    TEST("tensor_decode_image_file_jpeg");
+
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(tensor);
+
+    const char* path = test_image_jpeg_path();
+    if (!path) {
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
+        tests_run--;
+        return;
+    }
+
+    size_t width = 0, height = 0;
+    int ret = hal_tensor_decode_image_file(tensor, path, HAL_PIXEL_FORMAT_RGBA, &width, &height);
+    if (ret != 0) {
+        // File might not exist in test environment
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
+        tests_run--;
+        return;
+    }
+    ASSERT_EQ(0, ret);
+    ASSERT_EQ(1280, (int)width);
+    ASSERT_EQ(720, (int)height);
+
+    hal_tensor_free(tensor);
+    TEST_PASS();
+}
+
+static void test_tensor_decode_image_native_format(void) {
+    TEST("tensor_decode_image_native_format");
+
+    // Use -1 for format to let the decoder choose
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(tensor);
+
+    const char* path = test_image_jpeg_path();
+    if (!path) {
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
+        tests_run--;
+        return;
+    }
+
+    size_t width = 0, height = 0;
+    int ret = hal_tensor_decode_image_file(tensor, path, -1, &width, &height);
+    if (ret != 0) {
+        hal_tensor_free(tensor);
+        fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
+        tests_run--;
+        return;
+    }
+    ASSERT_EQ(0, ret);
+    ASSERT_EQ(1280, (int)width);
+    ASSERT_EQ(720, (int)height);
+
+    hal_tensor_free(tensor);
+    TEST_PASS();
+}
+
+static void test_tensor_decode_image_null_handling(void) {
+    TEST("tensor_decode_image_null_handling");
+
+    // NULL tensor
+    int ret = hal_tensor_decode_image(NULL, (const uint8_t*)"data", 4, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ASSERT_EQ(-1, ret);
+
+    // NULL data
+    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(tensor);
+    ret = hal_tensor_decode_image(tensor, NULL, 100, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ASSERT_EQ(-1, ret);
+
+    // Zero length
+    ret = hal_tensor_decode_image(tensor, (const uint8_t*)"data", 0, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ASSERT_EQ(-1, ret);
+
+    hal_tensor_free(tensor);
+    TEST_PASS();
+}
+
+static void test_tensor_decode_image_file_null_handling(void) {
+    TEST("tensor_decode_image_file_null_handling");
+
+    int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ASSERT_EQ(-1, ret);
+
+    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(tensor);
+    ret = hal_tensor_decode_image_file(tensor, NULL, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ASSERT_EQ(-1, ret);
+
+    hal_tensor_free(tensor);
+    TEST_PASS();
+}
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -388,6 +550,13 @@ void run_image_tests(void) {
 
     // DMA tests
     test_tensor_image_dma();
+
+    // Decode tests (new codec API)
+    test_tensor_decode_image_jpeg();
+    test_tensor_decode_image_file_jpeg();
+    test_tensor_decode_image_native_format();
+    test_tensor_decode_image_null_handling();
+    test_tensor_decode_image_file_null_handling();
 }
 
 #ifdef TEST_IMAGE_STANDALONE

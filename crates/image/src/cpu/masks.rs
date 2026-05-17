@@ -893,8 +893,7 @@ impl CPUProcessor {
 // at the FMA site via `half::f16::to_f32()`.
 //
 // On ARMv8.2-FP16 this compiles to `fcvt`; on Cortex-A53 and non-F16C x86 it
-// becomes a soft-float helper. Stage 8 adds explicit intrinsic kernels
-// gated by `#[cfg(target_feature = "fp16")]` / `+f16c`.
+// becomes a soft-float helper.
 // =============================================================================
 
 /// Map a detection bbox in normalised letterboxed coords to its ROI in
