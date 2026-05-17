@@ -45,15 +45,18 @@ keeping the dependency graph clean.
 | `markers.rs`     | SOF/SOS/DQT/DHT/DRI/APP marker parsing               |
 | `bitstream.rs`   | 64-bit bit buffer with FF/00 byte-stuffing, bulk refill |
 | `huffman.rs`     | 9-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
-| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON selection via function pointers) |
+| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON/SSE2 selection via function pointers) |
 | `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path    |
 | `idct/neon.rs`   | NEON 8×8 IDCT: 4-wide Loeffler butterfly, 4×4 transpose, DC-only fill |
+| `idct/sse2.rs`   | SSE2 8×8 IDCT: 4-wide Loeffler butterfly, comparison-based clamp |
 | `color/mod.rs`   | Color conversion dispatcher                           |
 | `color/scalar.rs`| BT.601 full-range YCbCr→RGB/RGBA/BGRA/Grey           |
 | `color/neon.rs`  | NEON YCbCr→RGB/RGBA/BGRA: 8-pixel SIMD with vst3/vst4 |
+| `color/sse2.rs`  | SSE2 YCbCr→RGB/RGBA/BGRA: 8-pixel SIMD with unpack interleave |
 | `upsample/mod.rs`| Chroma upsample dispatcher                            |
 | `upsample/scalar.rs` | Bilinear 3:1 blend for horizontal 2× upsampling |
 | `upsample/neon.rs`   | NEON horizontal 2× upsample: widening multiply-accumulate |
+| `upsample/sse2.rs`   | SSE2 horizontal 2× upsample: 16-bit multiply with pack |
 | `mcu.rs`         | MCU decode loop, `McuScratch`, strided output, NV12 path |
 
 ## Key Design Decisions
@@ -173,19 +176,38 @@ The custom baseline JPEG decoder processes images through these stages:
 - DC-only IDCT fast path: when all 63 AC coefficients are zero, the IDCT
   reduces to a constant fill (single multiply + shift).
 - Function pointer dispatch for IDCT/color/upsample: selected once at init
-  based on CPU feature detection (NEON vs scalar).
+  based on CPU feature detection (NEON on AArch64, SSE2 on x86-64, scalar fallback).
 
-### NEON SIMD Kernels
+### NEON SIMD Kernels (AArch64)
 
 On AArch64, the decoder uses NEON intrinsics for the three hot-path kernels.
 Each kernel is selected via `std::arch::is_aarch64_feature_detected!("neon")`
-at init time; on x86_64, the scalar path is used.
+at init time.
 
 | Kernel       | Strategy                                          | Throughput    |
 |--------------|---------------------------------------------------|---------------|
 | **IDCT**     | 4-wide Loeffler butterfly with int32x4_t, 4×4 transpose via vzip, DC-only fills 8 bytes via vdup/vst1 | 4 cols/rows per iteration |
 | **Color**    | 7-bit fixed-point YCbCr→RGB/RGBA/BGRA, vmovl widening, vrshrq rounding shift, vqmovun saturation, vst3/vst4 interleaved store | 8 pixels per iteration |
 | **Upsample** | Widening bilinear 3:1 blend via vmulq_n_u16, interleaved output via vst2 | 8→16 samples per iteration |
+
+### SSE2 SIMD Kernels (x86-64)
+
+On x86-64, the decoder uses SSE2 intrinsics for the same three kernels.
+SSE2 is guaranteed on all x86-64 CPUs but dispatch still uses
+`is_x86_feature_detected!("sse2")` for pattern consistency.
+
+| Kernel       | Strategy                                          | Throughput    |
+|--------------|---------------------------------------------------|---------------|
+| **IDCT**     | 4-wide Loeffler butterfly with `__m128i`, emulated `mullo_epi32` (SSE2 lacks native i32 multiply), comparison-based clamp to [0,255] | 4 cols/rows per iteration |
+| **Color**    | 7-bit fixed-point YCbCr→RGB/RGBA/BGRA, `_mm_unpacklo_epi8` widening, `_mm_srai_epi16` shift, `_mm_packus_epi16` saturation, unpack-interleave for RGBA/BGRA, temp-buffer scatter for RGB | 8 pixels per iteration |
+| **Upsample** | 16-bit bilinear 3:1 blend via `_mm_mullo_epi16`, `_mm_packus_epi16` narrow, `_mm_unpacklo_epi8` interleave | 16→32 samples per iteration |
+
+SSE2 notes:
+- `_mm_mullo_epi32` requires SSE4.1; the IDCT emulates it via two `_mm_mul_epu32` +
+  shuffle/unpack (low 32 bits of unsigned multiply match signed multiply).
+- RGB 3-channel interleave uses a temp buffer + scalar scatter (SSE2 has no byte
+  shuffle like SSSE3's `_mm_shuffle_epi8`); RGBA/BGRA use native `_mm_unpacklo_epi8`
+  interleaving which is actually faster than RGB.
 
 All kernels have scalar tails for remainder elements when the width is not
 a multiple of the SIMD width.

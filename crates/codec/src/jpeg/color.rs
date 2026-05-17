@@ -8,6 +8,9 @@ pub mod scalar;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 
+#[cfg(target_arch = "x86_64")]
+pub mod sse2;
+
 use edgefirst_tensor::PixelFormat;
 
 /// Color conversion function: converts one row of YCbCr component data to
@@ -33,6 +36,10 @@ pub fn select_color_convert(format: PixelFormat) -> Option<ColorConvertFn> {
             if std::arch::is_aarch64_feature_detected!("neon") {
                 return Some(neon::ycbcr_to_rgb_neon);
             }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("sse2") {
+                return Some(sse2::ycbcr_to_rgb_sse2);
+            }
             Some(scalar::ycbcr_to_rgb)
         }
         PixelFormat::Rgba => {
@@ -40,12 +47,20 @@ pub fn select_color_convert(format: PixelFormat) -> Option<ColorConvertFn> {
             if std::arch::is_aarch64_feature_detected!("neon") {
                 return Some(neon::ycbcr_to_rgba_neon);
             }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("sse2") {
+                return Some(sse2::ycbcr_to_rgba_sse2);
+            }
             Some(scalar::ycbcr_to_rgba)
         }
         PixelFormat::Bgra => {
             #[cfg(target_arch = "aarch64")]
             if std::arch::is_aarch64_feature_detected!("neon") {
                 return Some(neon::ycbcr_to_bgra_neon);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("sse2") {
+                return Some(sse2::ycbcr_to_bgra_sse2);
             }
             Some(scalar::ycbcr_to_bgra)
         }

@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.3
+**Version:** 3.4
 **Last Updated:** May 17, 2026
-**Status:** Custom JPEG decoder with NEON SIMD kernels: 17–23% faster than image crate on ARM; NV12 output, BGRA, x86 baselines
+**Status:** Custom JPEG decoder with NEON SIMD (AArch64) and SSE2 SIMD (x86-64): 17–23% faster than image crate on ARM, within 25% on x86
 
 ---
 
@@ -399,8 +399,8 @@ All CPU-only (decoder is not GPU-accelerated).
 **Data collected:** May 17, 2026 (v0.22.1, custom JPEG decoder with NEON kernels, Mem tensors)
 
 Compares decode paths:
-- **edgefirst-codec** — `Tensor::load_image()` strided decode into pre-allocated tensor (zero-allocation hot path; custom baseline JPEG decoder with NEON SIMD on AArch64)
-- **image crate** — `image::load_from_memory_with_format()` + `to_rgb8()` (allocates per call; uses zune-jpeg internally with x86 SIMD)
+- **edgefirst-codec** — `Tensor::load_image()` strided decode into pre-allocated tensor (zero-allocation hot path; custom baseline JPEG decoder with NEON SIMD on AArch64, SSE2 SIMD on x86-64)
+- **image crate** — `image::load_from_memory_with_format()` + `to_rgb8()` (allocates per call; uses zune-jpeg internally with SSE2/AVX2 SIMD)
 - **zune-png** — raw `zune_png::PngDecoder::decode_raw()` (PNG only; allocates per call)
 
 All JPEG measurements use the custom decoder (not zune-jpeg). All measurements are Mem (heap) tensors. DMA-buf and PBO-backed tensors will add map/unmap overhead per the Buffer Infrastructure table above.
@@ -413,8 +413,8 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm (A53) | giraffe 640 (640×640) | 11.4 ms | 13.8 ms | **17% faster** |
 | imx95-frdm (A55) | zidane 720p (1280×720) | 13.3 ms | 16.9 ms | **21% faster** |
 | imx95-frdm (A55) | giraffe 640 (640×640) | 10.9 ms | 12.7 ms | **14% faster** |
-| x86-desktop | zidane 720p (1280×720) | 3.5 ms | 1.7 ms | 2.1× slower (no x86 SIMD) |
-| x86-desktop | giraffe 640 (640×640) | 2.5 ms | 2.0 ms | 1.3× slower (no x86 SIMD) |
+| x86-desktop | zidane 720p (1280×720) | 2.0 ms | 1.6 ms | 25% slower |
+| x86-desktop | giraffe 640 (640×640) | 1.8 ms | 1.9 ms | **5% faster** |
 
 **JPEG Decode — RGBA / BGRA u8:**
 
@@ -424,8 +424,8 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm | BGRA | 14.2 ms | +2.2% | NEON vst4 with swapped R/B |
 | imx95-frdm | RGBA | 13.4 ms | +0.8% | |
 | imx95-frdm | BGRA | 13.4 ms | +0.8% | |
-| x86-desktop | RGBA | 3.4 ms | −1.4% | |
-| x86-desktop | BGRA | 3.5 ms | 0% | |
+| x86-desktop | RGBA | 1.9 ms | −5% | SSE2 unpack interleave |
+| x86-desktop | BGRA | 1.9 ms | −5% | SSE2 unpack with swapped R/B |
 
 **JPEG Decode — NV12 (skip color conversion):**
 
@@ -433,7 +433,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 |----------|-----------------|--------|-------|
 | imx8mp-frdm | 10.6 ms | **−24%** | Direct Y copy + Cb/Cr interleave, no YCbCr→RGB |
 | imx95-frdm | 10.1 ms | **−24%** | |
-| x86-desktop | 1.8 ms | **−49%** | |
+| x86-desktop | 1.5 ms | **−25%** | |
 
 **JPEG Decode — RGB f32:**
 
@@ -441,7 +441,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 |----------|-----------------|-------|-------|
 | imx8mp-frdm | 56.1 ms | 4.0× | u8 decode + per-pixel f32 normalization |
 | imx95-frdm | 53.7 ms | 4.0× | |
-| x86-desktop | 5.1 ms | 1.5× | |
+| x86-desktop | 3.6 ms | 1.8× | |
 
 **JPEG Strided Decode (720p image → 1080p tensor):**
 
@@ -449,7 +449,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 |----------|-----------------|-----------------|-------|
 | imx8mp-frdm | 13.9 ms | 0% | Zero overhead — MCU loop writes directly at stride |
 | imx95-frdm | 13.3 ms | 0% | |
-| x86-desktop | 3.5 ms | 0% | |
+| x86-desktop | 2.0 ms | 0% | |
 
 **PNG Decode — RGB u8:**
 
@@ -461,11 +461,11 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 
 **Key Observations:**
 - On AArch64, the custom JPEG decoder with NEON SIMD is **17–23% faster** than the `image` crate (which uses zune-jpeg internally). The NEON kernels optimize IDCT, YCbCr→RGB color conversion, and chroma upsampling.
-- On x86-64, the custom decoder is 1.3–2.1× slower because it uses scalar fallback while zune-jpeg has SSE2/AVX2 SIMD. This is expected — the primary target is ARM embedded.
-- **NV12 output is 24% faster** than RGB on ARM because it skips color conversion entirely: Y plane is copied directly from IDCT output, Cb/Cr are interleaved without YCbCr→RGB math.
+- On x86-64, SSE2 SIMD brings performance within **25% of the image crate** for 720p and **matches or beats it** for smaller images. The remaining gap is due to zune-jpeg's AVX2 kernels and more mature Huffman decoding. SIMD dispatch selects SSE2 automatically on all x86-64 CPUs.
+- **NV12 output is 24–25% faster** than RGB because it skips color conversion entirely: Y plane is copied directly from IDCT output, Cb/Cr are interleaved without YCbCr→RGB math.
 - **Strided decode has zero overhead** — the MCU decode loop writes directly into the tensor at the tensor's row stride, so decoding a 720p image into a 1080p tensor costs the same as into an exact-size tensor.
-- RGBA/BGRA add <2% overhead vs RGB — the NEON kernel uses `vst4_u8` which writes 4 channels in a single interleaved store.
-- f32 decode is 4× slower than u8 on ARM due to per-pixel `u8→f32` normalization (divide by 255.0). On x86, the overhead is only 1.5× due to faster FPU throughput.
+- RGBA/BGRA add <2% overhead vs RGB on ARM (NEON `vst4_u8`); on x86, RGBA/BGRA is actually **5% faster** than RGB due to SSE2's native 4-channel interleave vs RGB's 3-channel scatter.
+- f32 decode is 4× slower than u8 on ARM due to per-pixel `u8→f32` normalization (divide by 255.0). On x86, the overhead is 1.8× due to faster FPU throughput.
 - PNG decode uses zune-png internally; edgefirst-codec adds 2–6% overhead for strided row-copy into the pre-allocated tensor.
 - imx95-frdm (Cortex-A55 @ 1.8 GHz) is ~4–5% faster than imx8mp-frdm (Cortex-A53 @ 1.6 GHz) across JPEG decode paths.
 
@@ -815,6 +815,7 @@ The binary requires a DMA-heap device (`/dev/dma_heap/linux,cma` or `/dev/dma_he
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.4 | 2026-05-17 | Add SSE2 SIMD kernels for x86-64: IDCT, YCbCr→RGB/RGBA/BGRA color conversion, and horizontal chroma upsample. x86 JPEG decode now 1.75× faster than scalar; within 25% of image crate for 720p and matches/beats it for 640×640. Update all x86-desktop results. |
 | 3.3 | 2026-05-17 | Custom JPEG decoder with NEON SIMD: replace zune-jpeg wrapper with from-scratch baseline decoder; 17–23% faster than image crate on ARM; add NV12/BGRA/giraffe benchmarks; add x86-desktop baselines; collect on imx8mp, imx95, x86. |
 | 3.2 | 2026-05-15 | Add `edgefirst-codec` image decode baselines on imx8mp-frdm and imx95-frdm: JPEG (720p, 4K, RGBA, f32, strided) and PNG (720p) vs image crate. |
 | 3.1 | 2026-04-23 | `materialize_masks` batched-GEMM path: single GEMM at proto resolution + rayon-parallel per-detection finalisation + pooled `MaskScratch` buffers. Scaled 640×640 wins 1.7–45× across N=2–100; Proto wins 1.0–2.7× at N≥32. Cross-platform A/B measured on imx8mp-frdm, imx95-frdm, rpi5-hailo, x86-desktop |
