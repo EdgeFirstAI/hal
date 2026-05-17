@@ -193,6 +193,20 @@ itself and deadlock. The convert path dispatches to specialized methods:
 | PBO → Mem | `convert_pbo_to_mem` (UNPACK + ReadnPixels) |
 | Mem/DMA → Mem/DMA | `convert_dest_non_dma` (texture + memcpy) |
 
+**PBO destination renderbuffer setup:** When the destination is a PBO tensor
+and the shader needs a pre-initialized renderbuffer (e.g., for letterbox
+padding), the code must use `setup_renderbuffer_from_pbo()` — **never**
+`setup_renderbuffer_non_dma()`. The latter calls `dst.map()`, which sends a
+`PboMap` message to the GL thread via the channel. Since we are already
+executing on the GL thread (processing an `ImageConvert` message), this
+deadlocks. `setup_renderbuffer_from_pbo()` avoids this by binding the PBO as
+`GL_PIXEL_UNPACK_BUFFER` and loading data with `glTexImage2D(NULL)`, which
+reads directly from the PBO without any channel round-trip.
+
+`convert_pbo_to_mem()` is not affected because its destination is a Mem
+tensor, so `dst.map()` is a direct memory operation with no GL thread
+message.
+
 ### EGL image cache
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —

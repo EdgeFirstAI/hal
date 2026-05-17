@@ -822,17 +822,18 @@ All times are median over 100 iterations after 10× warmup per combination.
 | zidane 1280×720 | CHW (planar) | 4,599 µs | 3,235 µs | 7,834 µs |
 | giraffe 640×640 | CHW (planar) | 4,332 µs | 1,302 µs | 5,634 µs |
 
-#### orin-nano (Cortex-A78AE, CPU-only¹)
+#### orin-nano (Cortex-A78AE, GL/PBO)
 
 | Image | Output | Decode | Convert | Total |
 |-------|--------|-------:|--------:|------:|
-| zidane 1280×720 | HWC (stride=1920) | 6,397 µs | 1,578 µs | 7,975 µs |
-| giraffe 640×640 | HWC (stride=1920) | 5,985 µs | 153 µs | 6,138 µs |
-| zidane 1280×720 | CHW (planar) | 6,392 µs | 1,897 µs | 8,289 µs |
-| giraffe 640×640 | CHW (planar) | 5,996 µs | 355 µs | 6,351 µs |
+| zidane 1280×720 | HWC (stride=1920) | 6,438 µs | 1,008 µs | 7,446 µs |
+| giraffe 640×640 | HWC (stride=1920) | 6,108 µs | 630 µs | 6,738 µs |
+| zidane 1280×720 | CHW (planar) | 6,478 µs | 1,576 µs | 8,054 µs |
+| giraffe 640×640 | CHW (planar) | 6,112 µs | 447 µs | 6,559 µs |
 
-¹ GL/PBO path on Orin Nano hangs during warmup (NVIDIA EGL PBO
-upload/download stalls). CPU-only results shown. Investigation pending.
+GL/PBO path now works after fixing a PBO deadlock in `setup_renderbuffer_non_dma`
+(the GL thread called `dst.map()` which re-entered the GL thread channel). Convert
+times improved ~36% vs CPU-only (1,008 µs vs 1,578 µs for zidane HWC).
 
 #### x86-desktop (Ryzen, CPU-only)
 
@@ -912,7 +913,7 @@ allocation.
 
 15. ~~**No end-to-end pipeline benchmark**~~ — Resolved: `decode_pipeline_benchmark` and `pipeline_demo` cover the decode → letterbox convert pipeline. Full camera → inference → mask render cycle benchmark still pending.
 
-16. **Orin Nano GL/PBO pipeline hangs during warmup** — The `pipeline_demo` GL/PBO path stalls indefinitely during warmup on the Jetson Orin Nano (NVIDIA EGL PBO upload/download). CPU-only results collected; GL investigation pending.
+16. ~~**Orin Nano GL/PBO pipeline hangs during warmup**~~ — Resolved: PBO deadlock in `setup_renderbuffer_non_dma` fixed by routing PBO destinations through `setup_renderbuffer_from_pbo` which avoids re-entering the GL thread channel. GL/PBO results now collected.
 
 ---
 
