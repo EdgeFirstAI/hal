@@ -283,6 +283,83 @@ fn bench_image_crate(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// 4. EXIF orientation overhead — measure the cost of apply_exif=true on
+//    each of the 8 spec-defined EXIF orientations. Uses fixtures generated
+//    by `scripts/generate_exif_fixtures.py` which carry identical pixel
+//    data and differ only in the EXIF/eXIf orientation tag.
+//
+//    Reported names:
+//      exif/jpeg/orient_<N>/apply_<bool>  — decode time for orientation N
+//      exif/png /orient_<N>/apply_<bool>
+//
+//    Compare:
+//      - apply_false across all 8 → should be constant (sanity check;
+//        all variants share scan/IDAT content).
+//      - apply_true on orient_1   → "decided not to rotate" cost.
+//      - apply_true on orient_3   → in-place 180° (no dim swap, no scratch).
+//      - apply_true on orient_6/8 → 90°/270° rotation with scratch alloc + copy.
+//      - apply_true on orient_5/7 → rotation + horizontal flip.
+//    The 6/8 vs 1 delta is the headline number for "how much does EXIF
+//    rotation cost on this platform".
+// =============================================================================
+
+fn bench_exif_overhead(suite: &mut BenchSuite) {
+    println!("\n== edgefirst-codec: EXIF orientation overhead (JPEG + PNG) ==\n");
+
+    // Source dims are 1280×720; orientations 5/6/7/8 produce 720×1280
+    // output. Allocate at max(w,h) on both axes so a single tensor
+    // serves every variant without reallocating between bench rounds.
+    let max_dim = 1280;
+    let exif_iters = ITERATIONS;
+    let exif_warmup = WARMUP;
+
+    // ---- JPEG ----
+    for apply in [false, true] {
+        let opts = DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(apply);
+        for o in 1..=8u32 {
+            let name = format!("codec/exif/jpeg/orient_{o}/apply_{apply}");
+            let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.jpg"));
+            let mut tensor =
+                Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem))
+                    .unwrap();
+            let mut decoder = ImageDecoder::new();
+            // Warm scratch with one decode before timing.
+            tensor.load_image(&mut decoder, &data, &opts).unwrap();
+            let r = run_bench(&name, exif_warmup, exif_iters, || {
+                tensor.load_image(&mut decoder, &data, &opts).unwrap();
+                std::hint::black_box(&tensor);
+            });
+            r.print_summary();
+            suite.record(&r);
+        }
+    }
+
+    // ---- PNG ----
+    for apply in [false, true] {
+        let opts = DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(apply);
+        for o in 1..=8u32 {
+            let name = format!("codec/exif/png/orient_{o}/apply_{apply}");
+            let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.png"));
+            let mut tensor =
+                Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem))
+                    .unwrap();
+            let mut decoder = ImageDecoder::new();
+            tensor.load_image(&mut decoder, &data, &opts).unwrap();
+            let r = run_bench(&name, exif_warmup, exif_iters, || {
+                tensor.load_image(&mut decoder, &data, &opts).unwrap();
+                std::hint::black_box(&tensor);
+            });
+            r.print_summary();
+            suite.record(&r);
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -292,6 +369,7 @@ fn main() {
     bench_codec_decode(&mut suite);
     bench_zune_raw(&mut suite);
     bench_image_crate(&mut suite);
+    bench_exif_overhead(&mut suite);
 
     suite.finish();
 }
