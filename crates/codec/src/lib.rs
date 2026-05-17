@@ -54,7 +54,7 @@ mod png;
 mod traits;
 
 pub use decoder::{peek_info, ImageDecoder};
-pub use error::CodecError;
+pub use error::{CodecError, UnsupportedFeature};
 pub use options::{DecodeOptions, ImageInfo};
 pub use pixel::ImagePixel;
 pub use traits::ImageLoad;

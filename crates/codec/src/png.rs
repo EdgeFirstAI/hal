@@ -82,6 +82,7 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
     dst: &mut Tensor<T>,
     opts: &DecodeOptions,
     scratch: &mut Vec<u8>,
+    rot_scratch: &mut Vec<u8>,
 ) -> crate::Result<ImageInfo> {
     let dest_fmt = opts.format.unwrap_or(PixelFormat::Rgb);
 
@@ -158,6 +159,7 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
             dst,
             opts,
             scratch,
+            rot_scratch,
             dest_fmt,
             decoded_fmt,
             strip_luma_alpha,
@@ -341,6 +343,7 @@ fn decode_png_via_u8<T: ImagePixel>(
     dst: &mut Tensor<T>,
     _opts: &DecodeOptions,
     scratch: &mut Vec<u8>,
+    rot_scratch: &mut Vec<u8>,
     dest_fmt: PixelFormat,
     decoded_fmt: PixelFormat,
     strip_luma_alpha: bool,
@@ -393,7 +396,6 @@ fn decode_png_via_u8<T: ImagePixel>(
     let mut img_h = img_h;
     let owned_pixels = if let Some(mut buf) = owned_pixels {
         if needs_rotation {
-            let mut rot_scratch: Vec<u8> = Vec::new();
             apply_exif_u8(
                 &mut buf,
                 img_w * final_channels,
@@ -402,7 +404,7 @@ fn decode_png_via_u8<T: ImagePixel>(
                 final_channels,
                 rotation_deg,
                 flip_h,
-                &mut rot_scratch,
+                rot_scratch,
             );
         }
         Some(buf)

@@ -5,9 +5,20 @@
 
 /// JPEG marker byte constants.
 pub mod marker {
-    pub const SOF0: u8 = 0xC0; // Baseline DCT
+    pub const SOF0: u8 = 0xC0; // Baseline DCT (supported)
+    pub const SOF1: u8 = 0xC1; // Extended sequential DCT
     pub const SOF2: u8 = 0xC2; // Progressive DCT
+    pub const SOF3: u8 = 0xC3; // Lossless (sequential)
     pub const DHT: u8 = 0xC4; // Define Huffman Table
+    pub const SOF5: u8 = 0xC5; // Differential sequential DCT
+    pub const SOF6: u8 = 0xC6; // Differential progressive DCT
+    pub const SOF7: u8 = 0xC7; // Differential lossless (sequential)
+    pub const SOF9: u8 = 0xC9; // Extended sequential DCT, arithmetic
+    pub const SOF10: u8 = 0xCA; // Progressive DCT, arithmetic
+    pub const SOF11: u8 = 0xCB; // Lossless, arithmetic
+    pub const SOF13: u8 = 0xCD; // Differential sequential DCT, arithmetic
+    pub const SOF14: u8 = 0xCE; // Differential progressive DCT, arithmetic
+    pub const SOF15: u8 = 0xCF; // Differential lossless, arithmetic
     pub const SOI: u8 = 0xD8; // Start of Image
     pub const EOI: u8 = 0xD9; // End of Image
     pub const SOS: u8 = 0xDA; // Start of Scan

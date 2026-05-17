@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `eXIf` chunk surfaced by zune-png and the shared `apply_exif_u8` helper).
 - `Error::Codec(CodecError)` variant on `edgefirst_image::Error` with a
   `From<CodecError>` conversion.
+- `CodecError::Unsupported(UnsupportedFeature)` variant + `UnsupportedFeature`
+  enum exposing typed variants for features the codec doesn't implement:
+  `ProgressiveJpeg`, `ArithmeticCodedJpeg`, `LosslessJpeg`,
+  `HierarchicalJpeg`, `JpegPrecision { bits }`, `JpegComponentCount`,
+  `JpegChromaSubsampling`. Callers can pattern-match instead of grepping
+  error strings.
+- SOF marker recognition for all JPEG variants (SOF1/3/5/6/7/9/10/11/13/14/15)
+  — previously these fell through to the "unknown marker" path and were
+  silently skipped; now they return a precise `Unsupported(...)` error.
+- JPEG chroma subsampling sanity check: rejects images whose chroma rate
+  exceeds luma (a division-by-zero hazard in the chroma upsampler / NV12
+  writer with adversarial input).
 
 ### Changed
 
@@ -61,12 +73,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed `Error::JpegDecoding(zune_jpeg::errors::DecodeErrors)` and
   `Error::PngDecoding(zune_png::error::PngDecodeErrors)` variants on
   `edgefirst_image::Error`; codec errors now surface via `Error::Codec`.
+- `DecodeOptions::scale_denom` and `DecodeOptions::with_scale()`. The field
+  was declared and documented but never read by any decode path — calling
+  `with_scale(2)` silently produced a full-resolution decode. Removed
+  rather than leave a public-API trap.
 
 ### Fixed
 
 - Codec EXIF orientation parsing now actually fires on real-world JPEGs (it
   was a silent no-op for every JPEG whose APP1 segment carried the standard
   `"Exif\0\0"` prefix).
+- NV12 odd-width truncation: `chroma_w = img_w / 2` truncated the right-most
+  chroma column on odd-width images (magenta/green edge artefact). Now uses
+  `img_w.div_ceil(2)`.
+- AC Huffman coefficient size is bounded to the spec maximum of 10 bits.
+  Crafted Huffman tables can produce symbols up to size 15, which previously
+  fed `read_bits(15)` and `extend` past the spec range, then multiplied by
+  the quant table to overflow i32 silently.
+- JPEG with component count ∉ {1, 3} is rejected up front with
+  `Unsupported(JpegComponentCount { components })`. Previously a 4-component
+  CMYK JPEG would index `hdr.components[0..3]` and silently misinterpret
+  the 4th component as Cr.
+- `ImageDecoder::decode_from_reader{,_dyn}` no longer clones the input
+  buffer on every call (split-borrow via a new private `decode_into_inner`
+  free function). Restores the documented "allocate once, decode many"
+  invariant on the file/`Read` path used by Python/C surfaces.
 
 ## [0.22.1] - 2026-05-15
 

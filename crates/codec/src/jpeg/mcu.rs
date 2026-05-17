@@ -409,10 +409,12 @@ fn write_nv12_rows(
             .copy_from_slice(&comp_bufs[0][src_offset..src_offset + img_w.min(copy_len)]);
     }
 
-    // Write UV plane (interleaved Cb/Cr at half height, half width)
-    // Only write UV rows for even Y rows (or when v_ratio == 1, subsample)
+    // Write UV plane (interleaved Cb/Cr at half height, half width).
+    // For odd-width images we need `ceil(img_w / 2)` chroma pairs to cover
+    // the right-most luma column — `img_w / 2` truncates and leaves a
+    // chroma-less stripe at the right edge (magenta/green artefact).
     let chroma_h = num_rows / v_ratio as usize;
-    let chroma_w = img_w / 2;
+    let chroma_w = img_w.div_ceil(2);
 
     for crow in 0..chroma_h {
         let chroma_src_row = crow;
