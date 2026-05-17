@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(deprecated)]
-
 //! Image processing benchmarks using the edgefirst-bench in-process harness.
 //!
 //! Divan runs each benchmark in a forked subprocess. On i.MX8MP this causes
@@ -24,10 +22,30 @@ mod common;
 
 use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchConfig};
 use edgefirst_bench::BenchSuite;
+use edgefirst_codec::{peek_info, DecodeOptions, ImageDecoder, ImageLoad};
 
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorMemory, TensorTrait};
+use edgefirst_tensor::{
+    DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
+};
 use std::sync::LazyLock;
+
+/// One-shot helper: peek header, allocate sized to image, decode.
+fn load_image_bench(
+    data: &[u8],
+    format: Option<PixelFormat>,
+    memory: Option<TensorMemory>,
+) -> Result<TensorDyn, Box<dyn std::error::Error>> {
+    let opts = match format {
+        Some(f) => DecodeOptions::default().with_format(f),
+        None => DecodeOptions::default(),
+    };
+    let info = peek_info(data, &opts)?;
+    let mut t = Tensor::<u8>::image(info.width, info.height, info.format, memory)?;
+    let mut decoder = ImageDecoder::new();
+    t.load_image(&mut decoder, data, &opts)?;
+    Ok(TensorDyn::from(t))
+}
 
 const WARMUP: usize = 10;
 const ITERATIONS: usize = 100;
@@ -45,18 +63,16 @@ static CAMERA_4K_RGBA: LazyLock<Vec<u8>> =
 fn bench_load(suite: &mut BenchSuite) {
     println!("\n== Load: JPEG to Memory Backends ==\n");
 
-    // Load 3 test images to Mem backend in PixelFormat::Rgba
-    for name in &["jaguar.jpg", "person.jpg", "zidane.jpg"] {
+    // Load baseline JPEG test images to Mem backend in PixelFormat::Rgba.
+    // (person.jpg is progressive JPEG and is intentionally not exercised by
+    // this benchmark — the codec supports baseline only.)
+    for name in &["jaguar.jpg", "giraffe.jpg", "zidane.jpg"] {
         let path = find_testdata_path(name);
         let bench_name = format!("load/mem/RGBA/{}", name.strip_suffix(".jpg").unwrap());
         let file = std::fs::read(&path).unwrap();
         let result = run_bench(&bench_name, WARMUP, ITERATIONS, || {
-            let img = edgefirst_image::load_image(
-                &file,
-                Some(PixelFormat::Rgba),
-                Some(TensorMemory::Mem),
-            )
-            .expect("Failed to load JPEG");
+            let img = load_image_bench(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Mem))
+                .expect("Failed to load JPEG");
             std::hint::black_box(img);
         });
         result.print_summary();
@@ -72,12 +88,9 @@ fn bench_load(suite: &mut BenchSuite) {
         {
             let name = "load/shm/RGBA/zidane";
             let result = run_bench(name, WARMUP, ITERATIONS, || {
-                let img = edgefirst_image::load_image(
-                    zidane,
-                    Some(PixelFormat::Rgba),
-                    Some(TensorMemory::Shm),
-                )
-                .expect("Failed to load JPEG");
+                let img =
+                    load_image_bench(zidane, Some(PixelFormat::Rgba), Some(TensorMemory::Shm))
+                        .expect("Failed to load JPEG");
                 std::hint::black_box(img);
             });
             result.print_summary();
@@ -87,12 +100,9 @@ fn bench_load(suite: &mut BenchSuite) {
         if common::dma_available() {
             let name = "load/dma/RGBA/zidane";
             let result = run_bench(name, WARMUP, ITERATIONS, || {
-                let img = edgefirst_image::load_image(
-                    zidane,
-                    Some(PixelFormat::Rgba),
-                    Some(TensorMemory::Dma),
-                )
-                .expect("Failed to load JPEG");
+                let img =
+                    load_image_bench(zidane, Some(PixelFormat::Rgba), Some(TensorMemory::Dma))
+                        .expect("Failed to load JPEG");
                 std::hint::black_box(img);
             });
             result.print_summary();
@@ -113,7 +123,7 @@ fn bench_load(suite: &mut BenchSuite) {
     ] {
         let bench_name = format!("load/mem/{}/zidane", fmt_name);
         let result = run_bench(&bench_name, WARMUP, ITERATIONS, || {
-            let img = edgefirst_image::load_image(zidane, Some(*fmt), Some(TensorMemory::Mem))
+            let img = load_image_bench(zidane, Some(*fmt), Some(TensorMemory::Mem))
                 .expect("Failed to load JPEG");
             std::hint::black_box(img);
         });
@@ -135,7 +145,7 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 
     // RGBA→RGBA resize
     {
-        let src = edgefirst_image::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = load_image_bench(&file, Some(PixelFormat::Rgba), None).unwrap();
         let (sw, sh) = (src.width().unwrap(), src.height().unwrap());
         let src_dyn = src;
 
@@ -176,7 +186,7 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 
     // RGB→RGB resize
     {
-        let src = edgefirst_image::load_image(&file, Some(PixelFormat::Rgb), None).unwrap();
+        let src = load_image_bench(&file, Some(PixelFormat::Rgb), None).unwrap();
         let (sw, sh) = (src.width().unwrap(), src.height().unwrap());
         let src_dyn = src;
 
@@ -319,8 +329,8 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
 
     let zidane = edgefirst_bench::testdata::read("zidane.jpg");
     let zidane = zidane.as_slice();
-    let src = edgefirst_image::load_image(zidane, Some(PixelFormat::Rgba), None)
-        .expect("Failed to load zidane.jpg");
+    let src =
+        load_image_bench(zidane, Some(PixelFormat::Rgba), None).expect("Failed to load zidane.jpg");
     let (w, h) = (src.width().unwrap(), src.height().unwrap());
     let src_dyn = src;
 

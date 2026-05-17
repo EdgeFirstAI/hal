@@ -913,34 +913,31 @@ class Tensor:
         ...
 
     @staticmethod
-    def load(
-        filename: str,
+    def peek_image_info(
+        data: bytes,
         format: PixelFormat | None = None,
-        mem: TensorMemory | None = None,
-    ) -> Tensor:
-        """Load an image from a file, decoding JPEG/PNG automatically.
+    ) -> ImageInfo:
+        """Parse the header of JPEG/PNG bytes without decoding pixels.
+
+        Returns image dimensions and pixel format. Use this to allocate a
+        tensor at the right size before calling ``decode_image``.
 
         Args:
-            filename: Path to the image file.
-            format: Optional destination pixel format. If None, the format is
-                inferred from the file contents.
-            mem: Optional memory type override.
+            data: Raw JPEG or PNG bytes.
+            format: Desired output pixel format (default: native).
         """
         ...
 
     @staticmethod
-    def load_from_bytes(
-        data: bytes,
+    def peek_image_info_file(
+        filename: str,
         format: PixelFormat | None = None,
-        mem: TensorMemory | None = None,
-    ) -> Tensor:
-        """Load an image from raw bytes, decoding JPEG/PNG automatically.
+    ) -> ImageInfo:
+        """Parse the header of an image file without decoding pixels.
 
         Args:
-            data: Raw image bytes (JPEG or PNG encoded).
-            format: Optional destination pixel format. If None, the format is
-                inferred from the data.
-            mem: Optional memory type override.
+            filename: Path to the image file.
+            format: Desired output pixel format (default: native).
         """
         ...
 

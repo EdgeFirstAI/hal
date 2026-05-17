@@ -4,6 +4,7 @@
 //! PNG decoding into pre-allocated tensors via zune-png.
 
 use crate::error::CodecError;
+use crate::exif::{apply_exif_u8, read_exif_orientation, rotated_dims};
 use crate::options::{DecodeOptions, ImageInfo};
 use crate::pixel::ImagePixel;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
@@ -22,6 +23,57 @@ fn colorspace_to_pixelfmt(cs: ColorSpace) -> Option<(PixelFormat, bool)> {
         ColorSpace::RGBA => Some((PixelFormat::Rgba, false)),
         _ => None,
     }
+}
+
+/// Parse PNG headers and return image dimensions/format without decoding pixels.
+///
+/// The returned `format` matches `opts.format` when set (defaulting to RGB),
+/// regardless of the source colorspace — the decoder converts at decode time.
+/// For `apply_exif=true` and a PNG with a 90°/270° eXIf chunk, the returned
+/// `width` and `height` reflect the post-rotation layout.
+pub fn peek_png_info(data: &[u8], opts: &DecodeOptions) -> crate::Result<ImageInfo> {
+    let zune_opts = DecoderOptions::default()
+        .png_set_add_alpha_channel(false)
+        .png_set_decode_animated(false);
+    let mut decoder = PngDecoder::new_with_options(
+        zune_png::zune_core::bytestream::ZCursor::new(data),
+        zune_opts,
+    );
+    decoder.decode_headers()?;
+
+    let info = decoder
+        .info()
+        .ok_or_else(|| CodecError::InvalidData("PNG: no header info".into()))?;
+    let width = info.width;
+    let height = info.height;
+    let exif_bytes = info.exif.clone();
+
+    let decoder_cs = decoder
+        .colorspace()
+        .ok_or_else(|| CodecError::InvalidData("PNG: no colorspace".into()))?;
+    let _ = colorspace_to_pixelfmt(decoder_cs).ok_or_else(|| {
+        CodecError::InvalidData(format!("PNG: unsupported colorspace {decoder_cs:?}"))
+    })?;
+
+    let dest_fmt = opts.format.unwrap_or(PixelFormat::Rgb);
+
+    let (rotation_deg, _flip_h) = if opts.apply_exif {
+        exif_bytes
+            .as_deref()
+            .map(read_exif_orientation)
+            .unwrap_or((0, false))
+    } else {
+        (0, false)
+    };
+
+    let (final_w, final_h) = rotated_dims(width, height, rotation_deg);
+    let channels = dest_fmt.channels();
+    Ok(ImageInfo {
+        width: final_w,
+        height: final_h,
+        format: dest_fmt,
+        row_stride: final_w * channels,
+    })
 }
 
 /// Decode a PNG image from `data` into the pre-allocated tensor `dst`.
@@ -47,6 +99,7 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         .ok_or_else(|| CodecError::InvalidData("PNG: no header info".into()))?;
     let img_w = info.width;
     let img_h = info.height;
+    let exif_bytes = info.exif.clone();
 
     let decoder_cs = decoder
         .colorspace()
@@ -55,27 +108,38 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
         CodecError::InvalidData(format!("PNG: unsupported colorspace {decoder_cs:?}"))
     })?;
 
-    // Validate tensor capacity
+    // For types that can benefit from native 16-bit PNG decode (u16, i16, f32),
+    // use decode() → DecodingResult which preserves the full bit depth.
+    // For u8/i8, use decode_into(&mut [u8]) as before. EXIF rotation is only
+    // applied on the u8 path; the native-u16 path ignores EXIF orientation.
+    let use_native_u16 = matches!(
+        T::dtype(),
+        edgefirst_tensor::DType::U16 | edgefirst_tensor::DType::I16 | edgefirst_tensor::DType::F32
+    );
+
+    let (rotation_deg, flip_h) = if !use_native_u16 && opts.apply_exif {
+        exif_bytes
+            .as_deref()
+            .map(read_exif_orientation)
+            .unwrap_or((0, false))
+    } else {
+        (0, false)
+    };
+
+    // Validate tensor capacity against POST-rotation dimensions.
+    let (final_w_check, final_h_check) = rotated_dims(img_w, img_h, rotation_deg);
     let tensor_w = dst
         .width()
         .unwrap_or_else(|| dst.shape().get(1).copied().unwrap_or(0));
     let tensor_h = dst
         .height()
         .unwrap_or_else(|| dst.shape().first().copied().unwrap_or(0));
-    if img_w > tensor_w || img_h > tensor_h {
+    if final_w_check > tensor_w || final_h_check > tensor_h {
         return Err(CodecError::InsufficientCapacity {
-            image: (img_w, img_h),
+            image: (final_w_check, final_h_check),
             tensor: (tensor_w, tensor_h),
         });
     }
-
-    // For types that can benefit from native 16-bit PNG decode (u16, i16, f32),
-    // use decode() → DecodingResult which preserves the full bit depth.
-    // For u8/i8, use decode_into(&mut [u8]) as before.
-    let use_native_u16 = matches!(
-        T::dtype(),
-        edgefirst_tensor::DType::U16 | edgefirst_tensor::DType::I16 | edgefirst_tensor::DType::F32
-    );
 
     if use_native_u16 {
         decode_png_via_decoding_result(
@@ -99,6 +163,8 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
             strip_luma_alpha,
             img_w,
             img_h,
+            rotation_deg,
+            flip_h,
         )
     }
 }
@@ -265,6 +331,10 @@ fn decode_png_via_decoding_result<T: ImagePixel>(
 }
 
 /// Decode PNG via the `decode_into(&mut [u8])` path for u8/i8 targets.
+///
+/// `rotation_deg` and `flip_h` come from the eXIf chunk and are applied to
+/// the post-conversion pixel buffer; `img_w`/`img_h` reflect raw decode dims
+/// and become post-rotation dims after `apply_exif_u8`.
 #[allow(clippy::too_many_arguments)]
 fn decode_png_via_u8<T: ImagePixel>(
     mut decoder: PngDecoder<zune_png::zune_core::bytestream::ZCursor<&[u8]>>,
@@ -276,6 +346,8 @@ fn decode_png_via_u8<T: ImagePixel>(
     strip_luma_alpha: bool,
     img_w: usize,
     img_h: usize,
+    rotation_deg: u16,
+    flip_h: bool,
 ) -> crate::Result<ImageInfo> {
     // Decode into scratch
     let decode_channels = if strip_luma_alpha {
@@ -297,21 +369,47 @@ fn decode_png_via_u8<T: ImagePixel>(
         (&scratch[..decoded_size], decoded_fmt.channels())
     };
 
-    // Format conversion if needed
+    // Format conversion if needed. Always materialise an owned buffer when
+    // EXIF rotation is requested so apply_exif_u8 can mutate it in place.
     let final_channels = dest_fmt.channels();
     let needs_conversion = decoded_fmt != dest_fmt;
+    let needs_rotation = flip_h || rotation_deg != 0;
 
-    let converted: Vec<u8>;
-    let final_pixels: &[u8] = if needs_conversion {
+    let owned_pixels: Option<Vec<u8>> = if needs_conversion {
         let conv_size = img_w * img_h * final_channels;
-        converted = convert_pixels(src_pixels, src_channels, final_channels, img_w * img_h);
-        if converted.len() != conv_size {
+        let c = convert_pixels(src_pixels, src_channels, final_channels, img_w * img_h);
+        if c.len() != conv_size {
             return Err(CodecError::UnsupportedFormat(dest_fmt));
         }
-        &converted
+        Some(c)
+    } else if needs_rotation {
+        Some(src_pixels.to_vec())
     } else {
-        src_pixels
+        None
     };
+
+    // Apply EXIF rotation/flip in place on the owned buffer.
+    let mut img_w = img_w;
+    let mut img_h = img_h;
+    let owned_pixels = if let Some(mut buf) = owned_pixels {
+        if needs_rotation {
+            let mut rot_scratch: Vec<u8> = Vec::new();
+            apply_exif_u8(
+                &mut buf,
+                img_w * final_channels,
+                &mut img_w,
+                &mut img_h,
+                final_channels,
+                rotation_deg,
+                flip_h,
+                &mut rot_scratch,
+            );
+        }
+        Some(buf)
+    } else {
+        None
+    };
+    let final_pixels: &[u8] = owned_pixels.as_deref().unwrap_or(src_pixels);
 
     // Write decoded rows into tensor at stride offsets
     let elem_size = std::mem::size_of::<T>();

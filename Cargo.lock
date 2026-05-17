@@ -586,6 +586,7 @@ dependencies = [
  "num-traits",
  "opencv",
  "turbojpeg",
+ "zune-jpeg",
  "zune-png",
 ]
 
@@ -710,8 +711,6 @@ dependencies = [
  "tokio",
  "tracing",
  "yuv",
- "zune-jpeg",
- "zune-png",
 ]
 
 [[package]]

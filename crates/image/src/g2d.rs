@@ -490,7 +490,7 @@ mod g2d_tests {
         let dst_width = 1280;
         let dst_height = 720;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
@@ -610,7 +610,7 @@ mod g2d_tests {
         let dst_width = 600;
         let dst_height = 400;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -703,7 +703,7 @@ mod g2d_tests {
             dst_color: None,
         };
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -1144,7 +1144,7 @@ mod g2d_tests {
 
     fn test_g2d_bgra_no_resize_(g2d_in_fmt: PixelFormat) -> Result<(), crate::Error> {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgb), None)?;
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;

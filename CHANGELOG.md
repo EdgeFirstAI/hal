@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `edgefirst_codec::peek_info()` — parse JPEG/PNG headers and return image
+  dimensions/format without decoding pixels. Used to allocate a tensor sized
+  to the image before calling `decode_into`/`load_image`. Returns
+  post-rotation dimensions when `apply_exif=true` and the image carries a
+  90°/270° orientation tag.
+- Python `Tensor.peek_image_info(data)` and `Tensor.peek_image_info_file(path)`
+  staticmethods, mirroring the Rust `peek_info` API.
+- EXIF orientation handling for PNG images on the u8 decode path (uses the
+  `eXIf` chunk surfaced by zune-png and the shared `apply_exif_u8` helper).
+- `Error::Codec(CodecError)` variant on `edgefirst_image::Error` with a
+  `From<CodecError>` conversion.
+
+### Changed
+
+- **EXIF rotation in the codec u8 fast path is now correct on rotated
+  destination tensors.** Previously the decoder wrote native-dimension rows
+  into a post-rotation-sized tensor with the post-rotation stride, causing
+  silent row overlap. The decode now lands in a native-stride scratch buffer,
+  is rotated in place, then stride-copied into the destination — including
+  pitch-padded DMA tensors.
+- `edgefirst_codec::exif::read_exif_orientation()` now strips the JPEG APP1
+  `"Exif\0\0"` identifier before handing the TIFF block to kamadak-exif. The
+  prior parse silently returned "no rotation" for every real-world JPEG.
+- Color JPEGs can now decode to `PixelFormat::Grey` (Y-plane copy, chroma
+  ignored). Previously the codec returned `UnsupportedFormat(Grey)` for
+  multi-component input.
+- EXIF helpers (`read_exif_orientation`, `apply_exif_u8`) moved from the
+  JPEG submodule into a shared `crate::exif` module so JPEG and PNG paths
+  share one implementation. `apply_exif_u8` parameter renamed `channels` →
+  `bytes_per_pixel` to reflect that the routine is byte-width agnostic.
+
+### Removed
+
+- **Breaking change.** Removed the legacy `edgefirst_image::load_image`,
+  `load_jpeg`, and `load_png` functions, along with the C
+  `hal_tensor_load_image`, `hal_tensor_load_image_file`, `hal_tensor_load_jpeg`,
+  `hal_tensor_load_png` symbols and the Python `Tensor.load`,
+  `Tensor.load_from_bytes` staticmethods. Decode now goes through the
+  `edgefirst_codec` API: `peek_info` → allocate tensor → `decode_into` /
+  `Tensor.decode_image`. This makes per-frame allocations explicit and lets
+  the decoder write directly into pitch-padded DMA tensors.
+- `zune-jpeg` is no longer a runtime dependency of `edgefirst-image`; it is
+  retained only as a `[dev-dependencies]` entry in `edgefirst-codec` for
+  oracle parity tests/benchmarks.
+- `zune-png` is no longer a direct dependency of `edgefirst-image`
+  (`edgefirst-codec` continues to depend on it for PNG decoding).
+- Removed unused `edgefirst-image` internal helpers `rotate_flip_to_dyn`,
+  `copy_packed_to_padded_dma`, and `read_exif_orientation` (their only
+  callers were the now-removed `load_image` family).
+- Removed `Error::JpegDecoding(zune_jpeg::errors::DecodeErrors)` and
+  `Error::PngDecoding(zune_png::error::PngDecodeErrors)` variants on
+  `edgefirst_image::Error`; codec errors now surface via `Error::Codec`.
+
+### Fixed
+
+- Codec EXIF orientation parsing now actually fires on real-world JPEGs (it
+  was a silent no-op for every JPEG whose APP1 segment carried the standard
+  `"Exif\0\0"` prefix).
+
 ## [0.22.1] - 2026-05-15
 
 ### Added
