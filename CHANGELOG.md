@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-05-17
+
 ### Added
 
 - `edgefirst_codec::peek_info()` — parse JPEG/PNG headers and return image
@@ -121,9 +123,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Codec EXIF orientation parsing now actually fires on real-world JPEGs (it
   was a silent no-op for every JPEG whose APP1 segment carried the standard
   `"Exif\0\0"` prefix).
-- NV12 odd-width truncation: `chroma_w = img_w / 2` truncated the right-most
-  chroma column on odd-width images (magenta/green edge artefact). Now uses
-  `img_w.div_ceil(2)`.
+- NV12 odd-dimension safety: NV12 requires even width and height by definition
+  (one Cb/Cr pair per 2×2 luma block). Previously `chroma_w = img_w / 2`
+  silently truncated the right-most chroma column on odd-width images,
+  producing a magenta/green edge artefact. The decoder now rejects odd
+  NV12 dimensions up front with `InvalidData("NV12 requires even dimensions
+  …")` rather than silently mis-decoding.
 - AC Huffman coefficient size is bounded to the spec maximum of 10 bits.
   Crafted Huffman tables can produce symbols up to size 15, which previously
   fed `read_bits(15)` and `extend` past the spec range, then multiplied by
