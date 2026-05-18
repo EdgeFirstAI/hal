@@ -204,7 +204,11 @@ pub fn decode_image(
         let mcu_pixel_h = max_v * 8;
         let y_start = mcu_row * mcu_pixel_h;
 
-        if is_greyscale {
+        if is_greyscale || output_format == PixelFormat::Grey {
+            // The Y plane (component_bufs[0]) is stored at native pixel
+            // resolution for both 1-component (greyscale) JPEGs and the
+            // luma channel of multi-component JPEGs, so the same write
+            // path covers both cases — chroma planes are simply skipped.
             let grey_fn = color::select_grey_copy();
             write_greyscale_rows(
                 &scratch.component_bufs[0],
@@ -405,8 +409,14 @@ fn write_nv12_rows(
             .copy_from_slice(&comp_bufs[0][src_offset..src_offset + img_w.min(copy_len)]);
     }
 
-    // Write UV plane (interleaved Cb/Cr at half height, half width)
-    // Only write UV rows for even Y rows (or when v_ratio == 1, subsample)
+    // Write UV plane (interleaved Cb/Cr at half height, half width).
+    // NV12 is defined only for even widths — the UV plane stores one pair
+    // per two-luma-column block. With odd img_w the right-most column has
+    // no chroma neighbour and the tensor allocation cannot fit ceil(w/2)
+    // UV pairs into a w-byte row stride. Odd-width NV12 is rejected up
+    // front in `decode_image` (see Unsupported(JpegChromaSubsampling)
+    // for the subsampling validator); here we just use the spec-true
+    // half-width count.
     let chroma_h = num_rows / v_ratio as usize;
     let chroma_w = img_w / 2;
 

@@ -274,3 +274,132 @@ pub fn idct_dc_only_sse2(dc_value: i32, output: &mut [u8], stride: usize) {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use super::super::scalar::{idct_8x8_scalar, idct_dc_only_scalar};
+    use super::{idct_8x8_sse2, idct_dc_only_sse2};
+
+    fn make_test_coeffs() -> [i32; 64] {
+        let mut c = [0i32; 64];
+        c[0] = 256;
+        c[1] = 32;
+        c[8] = 16;
+        c[2] = -24;
+        c[16] = 20;
+        c[9] = -12;
+        c[3] = 8;
+        c[24] = -8;
+        c
+    }
+
+    #[test]
+    fn idct_8x8_parity() {
+        if !is_x86_feature_detected!("sse2") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let coeffs = make_test_coeffs();
+        let mut scalar_out = [0u8; 64];
+        let mut simd_out = [0u8; 64];
+
+        idct_8x8_scalar(&coeffs, &mut scalar_out, 8);
+        idct_8x8_sse2(&coeffs, &mut simd_out, 8);
+
+        for i in 0..64 {
+            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+            assert!(
+                diff <= 1,
+                "parity mismatch at index {i}: scalar={}, simd={}, diff={}",
+                scalar_out[i],
+                simd_out[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn idct_8x8_parity_zero_block() {
+        if !is_x86_feature_detected!("sse2") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let coeffs = [0i32; 64];
+        let mut scalar_out = [0u8; 64];
+        let mut simd_out = [0u8; 64];
+
+        idct_8x8_scalar(&coeffs, &mut scalar_out, 8);
+        idct_8x8_sse2(&coeffs, &mut simd_out, 8);
+
+        for i in 0..64 {
+            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+            assert!(
+                diff <= 1,
+                "zero-block parity mismatch at index {i}: scalar={}, simd={}, diff={}",
+                scalar_out[i],
+                simd_out[i],
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn idct_8x8_parity_strided() {
+        if !is_x86_feature_detected!("sse2") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        let coeffs = make_test_coeffs();
+        let stride = 16usize;
+        let mut scalar_out = vec![0u8; stride * 8];
+        let mut simd_out = vec![0u8; stride * 8];
+
+        idct_8x8_scalar(&coeffs, &mut scalar_out, stride);
+        idct_8x8_sse2(&coeffs, &mut simd_out, stride);
+
+        for row in 0..8 {
+            for col in 0..8 {
+                let i = row * stride + col;
+                let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+                assert!(
+                    diff <= 1,
+                    "strided parity mismatch at row={row} col={col}: scalar={}, simd={}, diff={}",
+                    scalar_out[i],
+                    simd_out[i],
+                    diff
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idct_dc_only_parity() {
+        if !is_x86_feature_detected!("sse2") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+
+        for dc in [0i32, 8, 64, 128, -64, 255, -255] {
+            let mut scalar_out = [0u8; 64];
+            let mut simd_out = [0u8; 64];
+
+            idct_dc_only_scalar(dc, &mut scalar_out, 8);
+            idct_dc_only_sse2(dc, &mut simd_out, 8);
+
+            for i in 0..64 {
+                let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+                assert!(
+                    diff <= 1,
+                    "dc_only parity mismatch dc={dc} at index {i}: scalar={}, simd={}, diff={}",
+                    scalar_out[i],
+                    simd_out[i],
+                    diff
+                );
+            }
+        }
+    }
+}

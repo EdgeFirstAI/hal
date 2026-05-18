@@ -3,7 +3,7 @@
 
 //! JPEG marker segment parsing (SOF, SOS, DQT, DHT, DRI, APP/EXIF).
 
-use crate::error::CodecError;
+use crate::error::{CodecError, UnsupportedFeature};
 use crate::jpeg::huffman::HuffmanTable;
 use crate::jpeg::types::{marker, Component, ImageHeader, QuantTable, SamplingFactor, ZIGZAG};
 
@@ -77,6 +77,30 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
             // Restart markers — shouldn't appear in marker segments
             m if (marker::RST0..=marker::RST7).contains(&m) => continue,
 
+            // Unsupported JPEG modes — surface a typed Unsupported error so
+            // callers can pattern-match instead of string-matching.
+            marker::SOF1 => {
+                return Err(CodecError::Unsupported(
+                    UnsupportedFeature::ExtendedSequentialJpeg,
+                ));
+            }
+            marker::SOF3 => return Err(CodecError::Unsupported(UnsupportedFeature::LosslessJpeg)),
+            marker::SOF5 | marker::SOF6 | marker::SOF7 => {
+                return Err(CodecError::Unsupported(
+                    UnsupportedFeature::HierarchicalJpeg,
+                ));
+            }
+            marker::SOF9
+            | marker::SOF10
+            | marker::SOF11
+            | marker::SOF13
+            | marker::SOF14
+            | marker::SOF15 => {
+                return Err(CodecError::Unsupported(
+                    UnsupportedFeature::ArithmeticCodedJpeg,
+                ));
+            }
+
             marker::SOF0 | marker::SOF2 => {
                 let is_progressive = marker_byte == marker::SOF2;
                 if pos + 1 >= data.len() {
@@ -92,14 +116,21 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
                 let num_components = data[pos + 7] as usize;
 
                 if precision != 8 {
-                    return Err(CodecError::InvalidData(format!(
-                        "unsupported precision {precision} (only 8-bit baseline)"
-                    )));
+                    return Err(CodecError::Unsupported(UnsupportedFeature::JpegPrecision {
+                        bits: precision,
+                    }));
                 }
                 if num_components == 0 || num_components > 4 {
                     return Err(CodecError::InvalidData(format!(
                         "invalid component count {num_components}"
                     )));
+                }
+                if num_components != 1 && num_components != 3 {
+                    return Err(CodecError::Unsupported(
+                        UnsupportedFeature::JpegComponentCount {
+                            components: num_components as u8,
+                        },
+                    ));
                 }
                 if seg_len < 8 + num_components * 3 {
                     return Err(CodecError::InvalidData(
@@ -136,6 +167,21 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
                         dc_table_id: 0,
                         ac_table_id: 0,
                     });
+                }
+
+                // Validate that every component sampling factor divides the
+                // luma sampling factor evenly. This prevents division-by-zero
+                // (and other absurd subsampling configs) in the chroma
+                // upsampler / NV12 writer when adversarial input declares a
+                // chroma rate that exceeds luma.
+                for comp in &components {
+                    if !max_h.is_multiple_of(comp.sampling.h)
+                        || !max_v.is_multiple_of(comp.sampling.v)
+                    {
+                        return Err(CodecError::Unsupported(
+                            UnsupportedFeature::JpegChromaSubsampling,
+                        ));
+                    }
                 }
 
                 header = Some(ImageHeader {
@@ -308,9 +354,7 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
     let header = header.ok_or_else(|| CodecError::InvalidData("no SOF marker found".into()))?;
 
     if header.is_progressive {
-        return Err(CodecError::InvalidData(
-            "progressive JPEG not supported (baseline only)".into(),
-        ));
+        return Err(CodecError::Unsupported(UnsupportedFeature::ProgressiveJpeg));
     }
 
     if !scan_found {

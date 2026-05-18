@@ -3,7 +3,9 @@
 
 //! Integration tests: JPEG decode into Mem tensors with various configurations.
 
-use edgefirst_codec::{CodecError, DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{
+    peek_info, CodecError, DecodeOptions, ImageDecoder, ImageLoad, UnsupportedFeature,
+};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -917,4 +919,92 @@ fn decode_nv12_output() {
     }
 
     let _ = nv12_size;
+}
+
+#[test]
+fn unsupported_progressive_jpeg_returns_typed_variant() {
+    // person.jpg is a progressive JPEG — the codec rejects it with a
+    // typed Unsupported(ProgressiveJpeg). Verifies the error model
+    // upgrade from cluster B (callers can pattern-match instead of
+    // string-matching).
+    let jpeg = testdata("person.jpg");
+    let opts = DecodeOptions::default();
+    match peek_info(&jpeg, &opts) {
+        Err(CodecError::Unsupported(UnsupportedFeature::ProgressiveJpeg)) => {}
+        Err(other) => {
+            panic!("expected Unsupported(ProgressiveJpeg), got {other:?}");
+        }
+        Ok(_) => panic!("progressive JPEG should not decode"),
+    }
+}
+
+#[test]
+fn nv12_odd_width_is_rejected() {
+    // NV12 requires even dimensions by definition (chroma plane stores
+    // one UV pair per 2×2 luma block, and the tensor row stride is
+    // sized for img_w not img_w.div_ceil(2)*2). The codec rejects
+    // odd-width NV12 up front rather than silently truncating the
+    // right-most chroma column (which was the prior 0.22.x behaviour
+    // and left a magenta/green edge artefact).
+    //
+    // jaguar.jpg is 789×384 (odd width).
+    let jpeg = testdata("jaguar.jpg");
+    let opts = DecodeOptions::default().with_format(PixelFormat::Nv12);
+
+    match peek_info(&jpeg, &opts) {
+        Err(CodecError::InvalidData(msg)) => {
+            assert!(
+                msg.contains("NV12") && msg.contains("even"),
+                "expected NV12 even-dim rejection, got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected InvalidData for odd-width NV12, got {other:?}"),
+        Ok(_) => panic!("odd-width NV12 should not peek successfully"),
+    }
+}
+
+#[test]
+fn partial_mcu_at_image_edge_decodes_full_width() {
+    // jaguar.jpg is 789×384 — neither dim is a multiple of 16, so the
+    // right-edge and bottom-edge MCUs are partial. A regression in the
+    // MCU clip math would either truncate or write past the tensor end.
+    // This test catches both by allocating exactly the image size and
+    // verifying the last image row contains decoder output.
+    let jpeg = testdata("jaguar.jpg");
+    let info = peek_info(
+        &jpeg,
+        &DecodeOptions::default()
+            .with_format(PixelFormat::Rgb)
+            .with_exif(false),
+    )
+    .unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        info.width,
+        info.height,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+    )
+    .unwrap();
+    {
+        let mut map = tensor.map().unwrap();
+        let slice: &mut [u8] = &mut map;
+        for b in slice.iter_mut() {
+            *b = 0xAA;
+        }
+    }
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+    decoder.decode_into(&jpeg, &mut tensor, &opts).unwrap();
+    let map = tensor.map().unwrap();
+    let bytes: &[u8] = &map;
+    let stride = info.width * 3;
+    let last_row = &bytes[(info.height - 1) * stride..info.height * stride];
+    let sentinel_count = last_row.iter().filter(|&&b| b == 0xAA).count();
+    assert!(
+        sentinel_count < last_row.len() / 4,
+        "bottom-edge MCU appears unwritten ({sentinel_count}/{} sentinel bytes)",
+        last_row.len(),
+    );
 }

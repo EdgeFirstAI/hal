@@ -12,6 +12,7 @@ lives in each sub-crate's `TESTING.md`:
 | Crate | Per-crate testing guide |
 |-------|------------------------|
 | `tensor` | [crates/tensor/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md) |
+| `codec` | [crates/codec/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/TESTING.md) — JPEG/PNG decode correctness, allocation profiling, scalar↔SIMD parity |
 | `image` | [crates/image/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md) — GL gating, fp16 benches |
 | `decoder` | [crates/decoder/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md) |
 | `tracker` | [crates/tracker/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/TESTING.md) |

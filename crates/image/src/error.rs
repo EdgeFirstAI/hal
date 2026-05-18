@@ -9,8 +9,7 @@ pub enum Error {
     NotFound(String),
     Library(libloading::Error),
     JpegEncoding(jpeg_encoder::EncodingError),
-    JpegDecoding(zune_jpeg::errors::DecodeErrors),
-    PngDecoding(zune_png::error::PngDecodeErrors),
+    Codec(edgefirst_codec::CodecError),
     ResizeImageBuffer(fast_image_resize::ImageBufferError),
     Resize(fast_image_resize::ResizeError),
     Yuv(yuv::YuvError),
@@ -63,15 +62,9 @@ impl From<jpeg_encoder::EncodingError> for Error {
     }
 }
 
-impl From<zune_jpeg::errors::DecodeErrors> for Error {
-    fn from(err: zune_jpeg::errors::DecodeErrors) -> Self {
-        Error::JpegDecoding(err)
-    }
-}
-
-impl From<zune_png::error::PngDecodeErrors> for Error {
-    fn from(err: zune_png::error::PngDecodeErrors) -> Self {
-        Error::PngDecoding(err)
+impl From<edgefirst_codec::CodecError> for Error {
+    fn from(err: edgefirst_codec::CodecError) -> Self {
+        Error::Codec(err)
     }
 }
 
