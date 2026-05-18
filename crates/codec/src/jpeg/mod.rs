@@ -21,6 +21,7 @@ pub mod types;
 pub mod upsample;
 
 use crate::error::CodecError;
+use crate::exif::{apply_exif_u8, read_exif_orientation, rotated_dims};
 use crate::options::{DecodeOptions, ImageInfo};
 use crate::pixel::ImagePixel;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
@@ -33,8 +34,12 @@ use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 pub struct JpegDecoderState {
     /// MCU scratch buffers (component buffers, chroma rows, output row).
     mcu_scratch: Option<mcu::McuScratch>,
-    /// EXIF rotation scratch buffer.
+    /// Pre-rotation pixel scratch (also reused as u8 staging for non-u8 outputs).
     exif_scratch: Vec<u8>,
+    /// Post-rotation pixel scratch used by `apply_exif_u8` for 90°/270°.
+    /// Reused across decodes so EXIF-rotated workloads don't re-allocate
+    /// a multi-megabyte buffer per frame.
+    rot_scratch: Vec<u8>,
 }
 
 impl JpegDecoderState {
@@ -42,6 +47,7 @@ impl JpegDecoderState {
         Self {
             mcu_scratch: None,
             exif_scratch: Vec::new(),
+            rot_scratch: Vec::new(),
         }
     }
 }
@@ -64,26 +70,49 @@ fn validate_output_format(fmt: PixelFormat) -> crate::Result<PixelFormat> {
     }
 }
 
-/// Read EXIF orientation tag and return (rotation_degrees, flip_horizontal).
-fn read_exif_orientation(exif_data: &[u8]) -> (u16, bool) {
-    let reader = exif::Reader::new();
-    let Ok(exif) = reader.read_raw(exif_data.to_vec()) else {
-        return (0, false);
-    };
-    let Some(orient) = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) else {
-        return (0, false);
-    };
-    match orient.value.get_uint(0).unwrap_or(1) {
-        1 => (0, false),
-        2 => (0, true),
-        3 => (180, false),
-        4 => (180, true),
-        5 => (270, true),
-        6 => (90, false),
-        7 => (90, true),
-        8 => (270, false),
-        _ => (0, false),
+/// Parse JPEG headers and return image dimensions/format without decoding pixels.
+///
+/// For `apply_exif=true` and a JPEG with a 90°/270° EXIF orientation tag,
+/// the returned `width` and `height` reflect the **post-rotation** layout —
+/// they match exactly what a subsequent `decode_jpeg_into` call would write.
+pub fn peek_jpeg_info(data: &[u8], opts: &DecodeOptions) -> crate::Result<ImageInfo> {
+    let headers = markers::parse_markers(data)?;
+    let hdr = &headers.header;
+    let img_w = hdr.width as usize;
+    let img_h = hdr.height as usize;
+
+    let dest_fmt = opts.format.unwrap_or(PixelFormat::Rgb);
+    let output_fmt = validate_output_format(dest_fmt)?;
+
+    if hdr.components.len() == 1 && output_fmt == PixelFormat::Nv12 {
+        return Err(CodecError::InvalidData(
+            "cannot decode greyscale JPEG to NV12".into(),
+        ));
     }
+    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
+        return Err(CodecError::InvalidData(format!(
+            "NV12 requires even dimensions; got {img_w}×{img_h}"
+        )));
+    }
+
+    let (rotation_deg, _flip_h) = if opts.apply_exif && output_fmt != PixelFormat::Nv12 {
+        headers
+            .exif_data
+            .as_deref()
+            .map(read_exif_orientation)
+            .unwrap_or((0, false))
+    } else {
+        (0, false)
+    };
+
+    let (final_w, final_h) = rotated_dims(img_w, img_h, rotation_deg);
+    let channels = output_fmt.channels();
+    Ok(ImageInfo {
+        width: final_w,
+        height: final_h,
+        format: output_fmt,
+        row_stride: final_w * channels,
+    })
 }
 
 /// Decode a JPEG image from `data` into the pre-allocated tensor `dst`.
@@ -120,6 +149,15 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         output_fmt
     };
 
+    // NV12 requires even width/height by definition (chroma plane stores
+    // one Cb/Cr pair per 2×2 luma block). Reject odd dimensions up front
+    // rather than silently truncate or overflow the row stride.
+    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
+        return Err(CodecError::InvalidData(format!(
+            "NV12 requires even dimensions; got {img_w}×{img_h}"
+        )));
+    }
+
     // Read EXIF orientation (NV12 output does not support EXIF rotation)
     let (rotation_deg, flip_h) = if opts.apply_exif && output_fmt != PixelFormat::Nv12 {
         headers
@@ -132,10 +170,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     };
 
     // After rotation, dimensions may swap
-    let (final_w, final_h) = match rotation_deg {
-        90 | 270 => (img_h, img_w),
-        _ => (img_w, img_h),
-    };
+    let (final_w, final_h) = rotated_dims(img_w, img_h, rotation_deg);
 
     // Validate tensor capacity
     let tensor_w = dst
@@ -178,20 +213,44 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
         };
 
-        mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
-
-        // Apply EXIF transformations
         if flip_h || rotation_deg != 0 {
+            // EXIF rotation/flip path: decode at native (pre-rotation) stride
+            // into the codec's scratch buffer, rotate in-place there, then
+            // stride-copy into the (possibly pitch-padded) destination. We
+            // cannot decode directly into `dst_u8` when rotation swaps dims
+            // because native rows would overflow the rotated tensor stride.
+            let native_stride = img_w * channels;
+            state.exif_scratch.resize(native_stride * img_h, 0);
+            mcu::decode_image(
+                data,
+                &headers,
+                mcu_scratch,
+                &mut state.exif_scratch,
+                native_stride,
+                output_fmt,
+            )?;
             apply_exif_u8(
-                dst_u8,
-                dst_stride,
+                &mut state.exif_scratch,
+                native_stride,
                 &mut img_w,
                 &mut img_h,
                 channels,
                 rotation_deg,
                 flip_h,
-                &mut state.exif_scratch,
+                &mut state.rot_scratch,
             );
+            // exif_scratch now holds post-rotation pixels at stride
+            // `img_w * channels`. Copy into the tensor at `dst_stride`,
+            // which honors any pitch padding.
+            let final_native_stride = img_w * channels;
+            for y in 0..img_h {
+                let src_off = y * final_native_stride;
+                let dst_off = y * dst_stride;
+                dst_u8[dst_off..dst_off + final_native_stride]
+                    .copy_from_slice(&state.exif_scratch[src_off..src_off + final_native_stride]);
+            }
+        } else {
+            mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
         }
     } else {
         // Generic path: decode into temporary u8 buffer, then convert
@@ -210,7 +269,6 @@ pub fn decode_jpeg_into<T: ImagePixel>(
 
         // Apply EXIF transformations on the temp buffer
         if flip_h || rotation_deg != 0 {
-            let mut extra_scratch = Vec::new();
             apply_exif_u8(
                 &mut state.exif_scratch,
                 temp_stride,
@@ -219,7 +277,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
                 channels,
                 rotation_deg,
                 flip_h,
-                &mut extra_scratch,
+                &mut state.rot_scratch,
             );
         }
 
@@ -297,101 +355,4 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         format: output_fmt,
         row_stride: dst_stride,
     })
-}
-
-/// Apply EXIF rotation/flip to a contiguous u8 pixel buffer.
-#[allow(clippy::too_many_arguments)]
-fn apply_exif_u8(
-    data: &mut [u8],
-    stride: usize,
-    w: &mut usize,
-    h: &mut usize,
-    channels: usize,
-    rotation_deg: u16,
-    flip_h: bool,
-    scratch: &mut Vec<u8>,
-) {
-    let img_w = *w;
-    let img_h = *h;
-
-    if flip_h {
-        for y in 0..img_h {
-            let row_start = y * stride;
-            for x in 0..img_w / 2 {
-                let left = row_start + x * channels;
-                let right = row_start + (img_w - 1 - x) * channels;
-                for c in 0..channels {
-                    data.swap(left + c, right + c);
-                }
-            }
-        }
-    }
-
-    match rotation_deg {
-        90 => {
-            let src_stride = img_w * channels;
-            let new_w = img_h;
-            let new_h = img_w;
-            scratch.resize(new_w * new_h * channels, 0);
-            for y in 0..img_h {
-                for x in 0..img_w {
-                    let src_off = y * src_stride + x * channels;
-                    let dst_x = img_h - 1 - y;
-                    let dst_y = x;
-                    let dst_off = dst_y * new_w * channels + dst_x * channels;
-                    scratch[dst_off..dst_off + channels]
-                        .copy_from_slice(&data[src_off..src_off + channels]);
-                }
-            }
-            data[..scratch.len()].copy_from_slice(scratch);
-            *w = new_w;
-            *h = new_h;
-        }
-        180 => {
-            let src_stride = img_w * channels;
-            let total = img_w * img_h;
-            for i in 0..total / 2 {
-                let j = total - 1 - i;
-                let a_y = i / img_w;
-                let a_x = i % img_w;
-                let b_y = j / img_w;
-                let b_x = j % img_w;
-                let a = a_y * src_stride + a_x * channels;
-                let b = b_y * src_stride + b_x * channels;
-                for c in 0..channels {
-                    data.swap(a + c, b + c);
-                }
-            }
-        }
-        270 => {
-            let src_stride = img_w * channels;
-            let new_w = img_h;
-            let new_h = img_w;
-            scratch.resize(new_w * new_h * channels, 0);
-            for y in 0..img_h {
-                for x in 0..img_w {
-                    let src_off = y * src_stride + x * channels;
-                    let dst_x = y;
-                    let dst_y = img_w - 1 - x;
-                    let dst_off = dst_y * new_w * channels + dst_x * channels;
-                    scratch[dst_off..dst_off + channels]
-                        .copy_from_slice(&data[src_off..src_off + channels]);
-                }
-            }
-            data[..scratch.len()].copy_from_slice(scratch);
-            *w = new_w;
-            *h = new_h;
-        }
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exif_orientation_default() {
-        assert_eq!(read_exif_orientation(&[]), (0, false));
-    }
 }

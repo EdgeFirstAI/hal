@@ -69,10 +69,52 @@ Free-standing tensors work but cannot use PBO and may lack GPU-aligned pitch.
 
 ## Supported Formats
 
-| Format | Input  | Output Formats           |
-|--------|--------|--------------------------|
-| JPEG   | `&[u8]`| RGB, RGBA, Grey, BGRA    |
-| PNG    | `&[u8]`| RGB, RGBA, Grey, BGRA    |
+| Format | Input  | Output Formats                 |
+|--------|--------|--------------------------------|
+| JPEG   | `&[u8]`| RGB, RGBA, Grey, BGRA, NV12    |
+| PNG    | `&[u8]`| RGB, RGBA, Grey, BGRA          |
+
+## Decoder Limitations
+
+The codec decodes a strict subset of the JPEG / PNG specs. Inputs that fall
+outside the supported subset surface a typed `CodecError::Unsupported(...)`
+variant so callers can pattern-match programmatically (no string parsing
+required).
+
+### JPEG
+
+| JPEG feature                                     | Status        |
+|--------------------------------------------------|---------------|
+| Baseline DCT (SOF0)                              | Supported     |
+| 8-bit sample precision                           | Supported     |
+| 1 component (greyscale) or 3 components (YCbCr)  | Supported     |
+| Chroma subsampling 4:4:4 / 4:2:2 / 4:2:0 / 4:4:0 | Supported     |
+| EXIF orientation (apply_exif)                    | Supported     |
+| Progressive DCT (SOF2)                           | **Unsupported** — `Unsupported(ProgressiveJpeg)` |
+| Extended sequential DCT (SOF1)                   | **Unsupported** |
+| Lossless predictive (SOF3)                       | **Unsupported** — `Unsupported(LosslessJpeg)` |
+| Hierarchical (SOF5/6/7)                          | **Unsupported** — `Unsupported(HierarchicalJpeg)` |
+| Arithmetic coding (SOF9/10/11/13/14/15)          | **Unsupported** — `Unsupported(ArithmeticCodedJpeg)` |
+| Sample precision other than 8-bit                | **Unsupported** — `Unsupported(JpegPrecision { bits })` |
+| CMYK / YCCK / >3 components                      | **Unsupported** — `Unsupported(JpegComponentCount { components })` |
+| Chroma sampling that exceeds luma                | **Unsupported** — `Unsupported(JpegChromaSubsampling)` |
+| Thumbnails (JFIF / APP markers)                  | Ignored       |
+| EXIF rotation with planar NV12 output            | Not applied (apply_exif silently ignored for NV12) |
+
+### PNG
+
+PNG decoding goes through `zune-png`; the codec applies its own
+post-processing (format conversion, EXIF rotation, stride-aware writes).
+
+| PNG feature                                      | Status        |
+|--------------------------------------------------|---------------|
+| 8-bit colorspace: Luma / LumaA / RGB / RGBA      | Supported     |
+| 16-bit colorspace: RGB / RGBA / Luma → `u16` / `i16` / `f32` tensors | Supported |
+| `eXIf` chunk orientation, u8 output              | Supported     |
+| Palette (indexed-color) PNG                      | Per zune-png (expanded to RGB/RGBA by the decoder) |
+| `eXIf` chunk orientation, 16-bit output paths    | Not applied (apply_exif ignored on `u16`/`i16`/`f32`) |
+| APNG (animated)                                  | Not exercised (decoder set to `png_set_decode_animated(false)`) |
+| Interlaced (Adam7)                               | Per zune-png |
 
 ## Data Types
 
@@ -100,7 +142,6 @@ frames — scratch buffers amortize after the first decode.
 ### `DecodeOptions`
 
 - `format`: Output pixel format (`None` = native from file)
-- `scale_denom`: JPEG IDCT downscale (1/2/4/8, default 1)
 - `apply_exif`: Apply EXIF orientation (default true)
 
 ### `ImageInfo`

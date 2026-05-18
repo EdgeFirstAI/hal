@@ -35,6 +35,28 @@ def load_bytes_to_image(bytes, format, size, resize=None, rotate=None):
     return np.array(im)
 
 
+def _tensor_from_file(path, fmt):
+    """Test helper that replaces the removed Tensor.load() convenience.
+
+    Peeks the file header, allocates a tensor sized to the image, then decodes.
+    Production code should follow the same pattern explicitly.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    info = Tensor.peek_image_info(data, fmt)
+    t = Tensor.image(info.width, info.height, fmt)
+    t.decode_image(data, fmt)
+    return t
+
+
+def _tensor_from_bytes(data, fmt):
+    """Test helper that replaces the removed Tensor.load_from_bytes() convenience."""
+    info = Tensor.peek_image_info(data, fmt)
+    t = Tensor.image(info.width, info.height, fmt)
+    t.decode_image(data, fmt)
+    return t
+
+
 def calculate_similarity_rms_u8(imageA, imageB) -> float:
     imgA = np.asarray(imageA)
     imgB = np.asarray(imageB)
@@ -78,7 +100,7 @@ finally:
 def test_resize_cpu_rgba_to_rgba(benchmark):
     """Benchmark CPU RGBA to RGBA resize."""
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgba)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -96,7 +118,7 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
     """Benchmark CV2 RGBA to RGBA resize."""
     cv2 = pytest.importorskip("cv2")
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgba)
 
@@ -128,7 +150,7 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgba", warmup_iterations=3)
 def test_resize_gl_rgba_to_rgba(benchmark):
     """Benchmark GL RGBA to RGBA resize."""
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgba)
 
     try:
@@ -150,7 +172,7 @@ def test_resize_gl_rgba_to_rgba(benchmark):
 def test_resize_g2d_rgba_to_rgba(benchmark):
     """Benchmark G2D RGBA to RGBA resize."""
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgba)
 
     try:
@@ -172,7 +194,7 @@ def test_resize_g2d_rgba_to_rgba(benchmark):
 def test_resize_cpu_rgba_to_rgb(benchmark):
     """Benchmark CPU RGBA to RGB resize."""
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgb)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -189,7 +211,7 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
     """Benchmark CV2 RGBA to RGB resize."""
     cv2 = pytest.importorskip("cv2")
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb)
     dst = Tensor.image(*dst_size, PixelFormat.Rgb)
 
@@ -224,7 +246,7 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
 @pytest.mark.benchmark(group="rgba_to_rgb", warmup_iterations=3)
 def test_resize_g2d_rgba_to_rgb(benchmark):
     """Benchmark G2D RGBA to RGB resize."""
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(*dst_size, PixelFormat.Rgb)
 
     try:
@@ -469,19 +491,23 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
         assert calculate_similarity_rms_u8(arr_dst, expected) > 0.98
 
 
+@pytest.mark.skip(
+    reason="person.jpg is progressive JPEG; the codec supports baseline JPEG only "
+    "(unsupported feature, no fallback). Use jaguar.jpg / giraffe.jpg / zidane.jpg "
+    "for baseline-JPEG benchmarks."
+)
 def test_load_jpeg_person(benchmark):
-    """Benchmark JPEG loading for person.jpg."""
+    """Benchmark JPEG loading for person.jpg (progressive — unsupported)."""
     with open("testdata/person.jpg", "rb") as f:
         data = f.read()
-
-    benchmark(Tensor.load_from_bytes, data, PixelFormat.Rgba)
+    benchmark(_tensor_from_bytes, data, PixelFormat.Rgba)
 
 
 def test_load_jpeg_zidane(benchmark):
     """Benchmark JPEG loading for zidane.jpg."""
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
-    benchmark(Tensor.load_from_bytes, data, PixelFormat.Rgba)
+    benchmark(_tensor_from_bytes, data, PixelFormat.Rgba)
 
 
 @pytest.mark.benchmark(group="rotate_90", warmup_iterations=3)
@@ -490,7 +516,7 @@ def test_cpu_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = Tensor.load_from_bytes(data, PixelFormat.Rgba)
+    src = _tensor_from_bytes(data, PixelFormat.Rgba)
     dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
@@ -512,7 +538,7 @@ def test_cv2_rotate_90(benchmark):
     """Benchmark OpenCV 90 degree rotation."""
     cv2 = pytest.importorskip("cv2")
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
 
     with src.map() as m, dst.map() as d:
@@ -547,7 +573,7 @@ def test_gl_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = Tensor.load_from_bytes(data, PixelFormat.Rgba)
+    src = _tensor_from_bytes(data, PixelFormat.Rgba)
     dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
 
     try:
@@ -575,7 +601,7 @@ def test_g2d_rotate_90(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = Tensor.load_from_bytes(data, PixelFormat.Rgba)
+    src = _tensor_from_bytes(data, PixelFormat.Rgba)
     dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
 
     try:
@@ -603,7 +629,7 @@ def test_cpu_rotate_180(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = Tensor.load_from_bytes(data, PixelFormat.Rgba)
+    src = _tensor_from_bytes(data, PixelFormat.Rgba)
     dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
@@ -626,7 +652,7 @@ def test_cv2_rotate_180(benchmark):
     """Benchmark OpenCV 180 degree rotation."""
     cv2 = pytest.importorskip("cv2")
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
 
     with src.map() as m, dst.map() as d:
@@ -661,7 +687,7 @@ def test_gl_rotate_180(benchmark):
     with open("testdata/zidane.jpg", "rb") as f:
         data = f.read()
 
-    src = Tensor.load_from_bytes(data, PixelFormat.Rgba)
+    src = _tensor_from_bytes(data, PixelFormat.Rgba)
     dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
 
     try:
@@ -687,7 +713,7 @@ def test_gl_rotate_180(benchmark):
 def test_g2d_rotate_180(benchmark):
     """Benchmark G2D 180 degree rotation."""
 
-    src = Tensor.load("testdata/zidane.jpg", PixelFormat.Rgba)
+    src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
     dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
 
     try:

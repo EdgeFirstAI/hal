@@ -25,16 +25,20 @@ the appropriate conversion method based on the available hardware.
 ## Examples
 
 ```rust
-# #[allow(deprecated)]
-# use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
-# use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
+# use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait};
+# use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad, DecodeOptions};
+# use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorMemory};
 # fn main() -> Result<(), edgefirst_image::Error> {
-# #[allow(deprecated)]
 let image = edgefirst_bench::testdata::read("zidane.jpg");
-let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
+let opts = DecodeOptions::default().with_format(PixelFormat::Rgba);
+let info = peek_info(&image, &opts).expect("peek");
+let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
+                                   Some(TensorMemory::Mem))?;
+let mut decoder = ImageDecoder::new();
+src.load_image(&mut decoder, &image, &opts).expect("decode");
 let mut converter = ImageProcessor::new()?;
 let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
-converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+converter.convert(&src.into(), &mut dst, Rotation::None, Flip::None, Crop::default())?;
 # Ok(())
 # }
 ```
@@ -241,10 +245,12 @@ pub fn primary_plane_bpp(format: PixelFormat, elem: usize) -> Option<usize> {
 ///
 /// Mali G310 (i.MX 95) rejects `eglCreateImage` from DMA-BUFs whose
 /// `PLANE0_PITCH_EXT` is not a multiple of 64 bytes, surfacing as
-/// `EGL_BAD_ALLOC`. Decoders like [`load_jpeg`]/[`load_png`] use this
-/// helper to decide whether to route through the two-buffer padded
-/// decode path.
-#[cfg(target_os = "linux")]
+/// `EGL_BAD_ALLOC`. The `load_image_test_helper` test-only helper
+/// in this crate uses this to decide whether to allocate a tensor
+/// with padded row stride before invoking the decode path; production
+/// callers do the equivalent peek → allocate → decode dance themselves
+/// (see crate-level docs).
+#[cfg(all(target_os = "linux", test))]
 pub(crate) fn padded_dma_pitch_for(
     fmt: PixelFormat,
     width: usize,
@@ -280,92 +286,18 @@ pub(crate) fn padded_dma_pitch_for(
     }
 }
 
-/// Row-copy a tightly-packed `src` tensor into a `dst` tensor that has a
-/// larger row stride (typically a DMA-BUF allocated with GPU-aligned pitch).
-///
-/// Both tensors must share the same width, height and pixel format. The
-/// bytes between the end of each source row and the next destination row
-/// are left untouched — EGL import doesn't read past the row's valid
-/// width, so the padding can remain whatever the allocator produced.
-#[cfg(target_os = "linux")]
-pub(crate) fn copy_packed_to_padded_dma(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-    let width = dst.width().ok_or(Error::NotAnImage)?;
-    let height = dst.height().ok_or(Error::NotAnImage)?;
-    let fmt = dst.format().ok_or(Error::NotAnImage)?;
-    let src_width = src.width().ok_or(Error::NotAnImage)?;
-    let src_height = src.height().ok_or(Error::NotAnImage)?;
-    let src_fmt = src.format().ok_or(Error::NotAnImage)?;
-    if src_width != width || src_height != height || src_fmt != fmt {
-        return Err(Error::Internal(format!(
-            "copy_packed_to_padded_dma: src and dst image metadata must match \
-             (src: {src_width}x{src_height} {src_fmt:?}, dst: {width}x{height} {fmt:?})"
-        )));
-    }
-    let bpp = primary_plane_bpp(fmt, 1).ok_or_else(|| {
-        Error::NotSupported(format!(
-            "copy_packed_to_padded_dma: unknown bpp for {fmt:?}"
-        ))
-    })?;
-    let natural = width.checked_mul(bpp).ok_or_else(|| {
-        Error::Internal(format!(
-            "copy_packed_to_padded_dma: width {width} × bpp {bpp} overflows"
-        ))
-    })?;
-    let dst_stride = dst.effective_row_stride().ok_or_else(|| {
-        Error::Internal("copy_packed_to_padded_dma: dst has no effective row stride".into())
-    })?;
-
-    // `TensorMap` derefs to `[T]`, which gives us the slice without
-    // needing to import the `TensorMapTrait` at this call site.
-    let src_map = src.map()?;
-    let src_bytes: &[u8] = &src_map;
-    let mut dst_map = dst.map()?;
-    let dst_bytes: &mut [u8] = &mut dst_map;
-
-    if src_bytes.len() < natural.saturating_mul(height) {
-        return Err(Error::Internal(format!(
-            "copy_packed_to_padded_dma: src has {} bytes, need {} ({}x{} @ {} bpp)",
-            src_bytes.len(),
-            natural.saturating_mul(height),
-            width,
-            height,
-            bpp,
-        )));
-    }
-    if dst_bytes.len() < dst_stride.saturating_mul(height) {
-        return Err(Error::Internal(format!(
-            "copy_packed_to_padded_dma: dst has {} bytes, need {} ({} stride × {} rows)",
-            dst_bytes.len(),
-            dst_stride.saturating_mul(height),
-            dst_stride,
-            height,
-        )));
-    }
-
-    for row in 0..height {
-        let s = row * natural;
-        let d = row * dst_stride;
-        dst_bytes[d..d + natural].copy_from_slice(&src_bytes[s..s + natural]);
-    }
-    Ok(())
-}
+pub use cpu::CPUProcessor;
+pub use edgefirst_codec as codec;
 
 #[cfg(test)]
 use edgefirst_decoder::ProtoLayout;
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
+#[cfg(any(test, all(target_os = "linux", feature = "opengl")))]
+use edgefirst_tensor::Tensor;
 use edgefirst_tensor::{
-    DType, PixelFormat, PixelLayout, Tensor, TensorDyn, TensorMemory, TensorTrait as _,
+    DType, PixelFormat, PixelLayout, TensorDyn, TensorMemory, TensorTrait as _,
 };
 use enum_dispatch::enum_dispatch;
-use std::{fmt::Display, time::Instant};
-use zune_jpeg::{
-    zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions},
-    JpegDecoder,
-};
-use zune_png::PngDecoder;
-
-pub use cpu::CPUProcessor;
-pub use edgefirst_codec as codec;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
@@ -378,6 +310,7 @@ pub use opengl_headless::Int8InterpolationMode;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
+use std::{fmt::Display, time::Instant};
 
 mod cpu;
 mod error;
@@ -387,72 +320,6 @@ mod opengl_headless;
 
 // Use `edgefirst_tensor::PixelFormat` variants (Rgb, Rgba, Grey, etc.) and
 // `TensorDyn` / `Tensor<u8>` with `.format()` metadata instead.
-
-/// Flips the image data, then rotates it. Returns a new `TensorDyn`.
-fn rotate_flip_to_dyn(
-    src: &Tensor<u8>,
-    src_fmt: PixelFormat,
-    rotation: Rotation,
-    flip: Flip,
-    memory: Option<TensorMemory>,
-) -> Result<TensorDyn, Error> {
-    let src_w = src.width().unwrap();
-    let src_h = src.height().unwrap();
-    let channels = src_fmt.channels();
-
-    let (dst_w, dst_h) = match rotation {
-        Rotation::None | Rotation::Rotate180 => (src_w, src_h),
-        Rotation::Clockwise90 | Rotation::CounterClockwise90 => (src_h, src_w),
-    };
-
-    // Rotate/flip into Mem staging then row-copy into padded DMA when the
-    // caller wants DMA and the destination width would produce an
-    // unaligned pitch (see [`padded_dma_pitch_for`]).
-    #[cfg(target_os = "linux")]
-    if let Some(aligned_pitch) = padded_dma_pitch_for(src_fmt, dst_w, &memory) {
-        let tmp = Tensor::<u8>::image(dst_w, dst_h, src_fmt, Some(TensorMemory::Mem))?;
-        let src_map = src.map()?;
-        let mut tmp_map = tmp.map()?;
-        CPUProcessor::flip_rotate_ndarray_pf(
-            &src_map,
-            &mut tmp_map,
-            dst_w,
-            dst_h,
-            channels,
-            rotation,
-            flip,
-        )?;
-        drop(tmp_map);
-        drop(src_map);
-        let mut dma = Tensor::<u8>::image_with_stride(
-            dst_w,
-            dst_h,
-            src_fmt,
-            aligned_pitch,
-            Some(TensorMemory::Dma),
-        )?;
-        copy_packed_to_padded_dma(&tmp, &mut dma)?;
-        return Ok(TensorDyn::from(dma));
-    }
-
-    let dst = Tensor::<u8>::image(dst_w, dst_h, src_fmt, memory)?;
-    let src_map = src.map()?;
-    let mut dst_map = dst.map()?;
-
-    CPUProcessor::flip_rotate_ndarray_pf(
-        &src_map,
-        &mut dst_map,
-        dst_w,
-        dst_h,
-        channels,
-        rotation,
-        flip,
-    )?;
-    drop(dst_map);
-    drop(src_map);
-
-    Ok(TensorDyn::from(dst))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
@@ -1015,16 +882,20 @@ impl ImageProcessor {
     ///
     /// # Examples
     /// ```rust,no_run
-    /// # #[allow(deprecated)]
-    /// # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait, load_image};
-    /// # use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
+    /// # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait};
+    /// # use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad, DecodeOptions};
+    /// # use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorMemory};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
-    /// # #[allow(deprecated)]
     /// let image = std::fs::read("zidane.jpg")?;
-    /// let src = load_image(&image, Some(PixelFormat::Rgba), None)?;
+    /// let opts = DecodeOptions::default().with_format(PixelFormat::Rgba);
+    /// let info = peek_info(&image, &opts).expect("peek");
+    /// let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
+    ///                                    Some(TensorMemory::Mem))?;
+    /// let mut decoder = ImageDecoder::new();
+    /// src.load_image(&mut decoder, &image, &opts).expect("decode");
     /// let mut converter = ImageProcessor::new()?;
     /// let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
-    /// converter.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+    /// converter.convert(&src.into(), &mut dst, Rotation::None, Flip::None, Crop::default())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -2271,330 +2142,46 @@ impl ImageProcessorTrait for ImageProcessor {
 // Image loading / saving helpers
 // ---------------------------------------------------------------------------
 
-/// Read EXIF orientation from raw EXIF bytes and return (Rotation, Flip).
-fn read_exif_orientation(exif_bytes: &[u8]) -> (Rotation, Flip) {
-    let exifreader = exif::Reader::new();
-    let Ok(exif_) = exifreader.read_raw(exif_bytes.to_vec()) else {
-        return (Rotation::None, Flip::None);
-    };
-    let Some(orientation) = exif_.get_field(exif::Tag::Orientation, exif::In::PRIMARY) else {
-        return (Rotation::None, Flip::None);
-    };
-    match orientation.value.get_uint(0) {
-        Some(1) => (Rotation::None, Flip::None),
-        Some(2) => (Rotation::None, Flip::Horizontal),
-        Some(3) => (Rotation::Rotate180, Flip::None),
-        Some(4) => (Rotation::Rotate180, Flip::Horizontal),
-        Some(5) => (Rotation::Clockwise90, Flip::Horizontal),
-        Some(6) => (Rotation::Clockwise90, Flip::None),
-        Some(7) => (Rotation::CounterClockwise90, Flip::Horizontal),
-        Some(8) => (Rotation::CounterClockwise90, Flip::None),
-        Some(v) => {
-            log::warn!("broken orientation EXIF value: {v}");
-            (Rotation::None, Flip::None)
-        }
-        None => (Rotation::None, Flip::None),
-    }
-}
-
-/// Map a [`PixelFormat`] to the zune-jpeg `ColorSpace` for decoding.
-/// Returns `None` for formats that the JPEG decoder cannot output directly.
-fn pixelfmt_to_colorspace(fmt: PixelFormat) -> Option<ColorSpace> {
-    match fmt {
-        PixelFormat::Rgb => Some(ColorSpace::RGB),
-        PixelFormat::Rgba => Some(ColorSpace::RGBA),
-        PixelFormat::Grey => Some(ColorSpace::Luma),
-        _ => None,
-    }
-}
-
-/// Map a zune-jpeg `ColorSpace` to a [`PixelFormat`].
-fn colorspace_to_pixelfmt(cs: ColorSpace) -> Option<PixelFormat> {
-    match cs {
-        ColorSpace::RGB => Some(PixelFormat::Rgb),
-        ColorSpace::RGBA => Some(PixelFormat::Rgba),
-        ColorSpace::Luma => Some(PixelFormat::Grey),
-        _ => None,
-    }
-}
-
-/// Load a JPEG image from raw bytes and return a [`TensorDyn`].
-// TODO: evaluate replacing zune-jpeg with libjpeg-turbo (via `turbojpeg`
-// crate). `tjDecompress2` accepts an explicit `pitch` parameter, which
-// would let us decode directly into a pitch-padded DMA-BUF and drop the
-// Mem-staging + row-copy introduced below for Mali G310 pitch alignment.
-// Dropping zune-jpeg also gets us a 2-4× faster SIMD decode on AArch64.
-// Blockers: adds a C dep (mozjpeg-sys / libturbojpeg) to the build;
-// cross-compilation story needs validating with zigbuild.
-fn load_jpeg(
+/// Test-only convenience helper that peeks the image header, allocates a
+/// tensor sized to the image (honoring DMA pitch padding on Linux when
+/// requested), and decodes via [`edgefirst_codec`]. Mirrors the semantics of
+/// the removed public `load_image` API for test sites; production callers
+/// should use the explicit peek → allocate → decode pattern directly.
+#[cfg(test)]
+pub(crate) fn load_image_test_helper(
     image: &[u8],
     format: Option<PixelFormat>,
     memory: Option<TensorMemory>,
 ) -> Result<TensorDyn> {
-    let colour = match format {
-        Some(f) => pixelfmt_to_colorspace(f)
-            .ok_or_else(|| Error::NotSupported(format!("Unsupported image format {f:?}")))?,
-        None => ColorSpace::RGB,
+    use edgefirst_codec::{peek_info, DecodeOptions, ImageDecoder, ImageLoad};
+
+    let opts = match format {
+        Some(f) => DecodeOptions::default().with_format(f),
+        None => DecodeOptions::default(),
     };
-    let options = DecoderOptions::default().jpeg_set_out_colorspace(colour);
-    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(image), options);
-    decoder.decode_headers()?;
+    let info = peek_info(image, &opts)?;
+    let dest_fmt = info.format;
+    let w = info.width;
+    let h = info.height;
 
-    let image_info = decoder.info().ok_or(Error::Internal(
-        "JPEG did not return decoded image info".to_string(),
-    ))?;
+    let mut decoder = ImageDecoder::new();
 
-    let converted_cs = decoder
-        .output_colorspace()
-        .ok_or(Error::Internal("No output colorspace".to_string()))?;
-
-    let converted_fmt = colorspace_to_pixelfmt(converted_cs).ok_or(Error::NotSupported(
-        "Unsupported JPEG decoder output".to_string(),
-    ))?;
-
-    let dest_fmt = format.unwrap_or(converted_fmt);
-
-    let (rotation, flip) = decoder
-        .exif()
-        .map(|x| read_exif_orientation(x))
-        .unwrap_or((Rotation::None, Flip::None));
-
-    let w = image_info.width as usize;
-    let h = image_info.height as usize;
-
-    if (rotation, flip) == (Rotation::None, Flip::None) {
-        // When caller wants DMA and the natural pitch would be rejected by
-        // the GPU's DMA-BUF import (Mali G310 needs 64-byte pitch), decode
-        // into a tightly-packed Mem staging buffer and row-copy into a
-        // pitch-padded DMA tensor. zune-jpeg has no stride-aware decode,
-        // so the Mem intermediate is unavoidable until we swap decoders
-        // (see TODO below).
-        #[cfg(target_os = "linux")]
-        if let Some(aligned_pitch) = padded_dma_pitch_for(dest_fmt, w, &memory) {
-            let staging = Tensor::<u8>::image(w, h, converted_fmt, Some(TensorMemory::Mem))?;
-            decoder.decode_into(&mut staging.map()?)?;
-            let packed = if converted_fmt != dest_fmt {
-                let mut tmp = Tensor::<u8>::image(w, h, dest_fmt, Some(TensorMemory::Mem))?;
-                CPUProcessor::convert_format_pf(&staging, &mut tmp, converted_fmt, dest_fmt)?;
-                tmp
-            } else {
-                staging
-            };
-            let mut dma = Tensor::<u8>::image_with_stride(
-                w,
-                h,
-                dest_fmt,
-                aligned_pitch,
-                Some(TensorMemory::Dma),
-            )?;
-            copy_packed_to_padded_dma(&packed, &mut dma)?;
-            return Ok(TensorDyn::from(dma));
-        }
-
-        let mut img = Tensor::<u8>::image(w, h, dest_fmt, memory)?;
-
-        if converted_fmt != dest_fmt {
-            let tmp = Tensor::<u8>::image(w, h, converted_fmt, Some(TensorMemory::Mem))?;
-            decoder.decode_into(&mut tmp.map()?)?;
-            CPUProcessor::convert_format_pf(&tmp, &mut img, converted_fmt, dest_fmt)?;
-            return Ok(TensorDyn::from(img));
-        }
-        decoder.decode_into(&mut img.map()?)?;
-        return Ok(TensorDyn::from(img));
-    }
-
-    let mut tmp = Tensor::<u8>::image(w, h, dest_fmt, Some(TensorMemory::Mem))?;
-
-    if converted_fmt != dest_fmt {
-        let tmp2 = Tensor::<u8>::image(w, h, converted_fmt, Some(TensorMemory::Mem))?;
-        decoder.decode_into(&mut tmp2.map()?)?;
-        CPUProcessor::convert_format_pf(&tmp2, &mut tmp, converted_fmt, dest_fmt)?;
-    } else {
-        decoder.decode_into(&mut tmp.map()?)?;
-    }
-
-    rotate_flip_to_dyn(&tmp, dest_fmt, rotation, flip, memory)
-}
-
-/// Load a PNG image from raw bytes and return a [`TensorDyn`].
-///
-/// Supports the same destination formats as the CPU backend's format
-/// converter (`Rgb`, `Rgba`, `Bgra`, `Grey`, etc.). Earlier revisions only
-/// accepted `Rgb`/`Rgba`; greyscale PNGs decoded to `Grey` now work through
-/// the same pitch-aware DMA path as JPEG. LumaA PNGs are normalised to
-/// `Grey` inline (alpha stripped) before going through the shared CPU
-/// converter.
-fn load_png(
-    image: &[u8],
-    format: Option<PixelFormat>,
-    memory: Option<TensorMemory>,
-) -> Result<TensorDyn> {
-    let dest_fmt = format.unwrap_or(PixelFormat::Rgb);
-
-    // Decode with add_alpha=false — any alpha upgrade/strip happens via
-    // the CPU converter downstream so we share one code path with
-    // load_jpeg instead of duplicating promotion logic here.
-    let options = DecoderOptions::default()
-        .png_set_add_alpha_channel(false)
-        .png_set_decode_animated(false);
-    let mut decoder = PngDecoder::new_with_options(ZCursor::new(image), options);
-    decoder.decode_headers()?;
-
-    let (width, height, rotation, flip) = {
-        let info = decoder
-            .info()
-            .ok_or_else(|| Error::Internal("PNG did not return decoded image info".to_string()))?;
-        let (rot, flip) = info
-            .exif
-            .as_ref()
-            .map(|x| read_exif_orientation(x))
-            .unwrap_or((Rotation::None, Flip::None));
-        (info.width, info.height, rot, flip)
-    };
-
-    // Map the decoder's native colorspace onto a PixelFormat that the CPU
-    // converter understands. LumaA has no direct PixelFormat variant so we
-    // decode as LumaA and then strip alpha inline to get Grey.
-    let decoder_cs = decoder
-        .colorspace()
-        .ok_or_else(|| Error::Internal("PNG decoder did not return colorspace".to_string()))?;
-    let (decoded_fmt, strip_luma_alpha) = match decoder_cs {
-        ColorSpace::Luma => (PixelFormat::Grey, false),
-        ColorSpace::LumaA => (PixelFormat::Grey, true),
-        ColorSpace::RGB => (PixelFormat::Rgb, false),
-        ColorSpace::RGBA => (PixelFormat::Rgba, false),
-        other => {
-            return Err(Error::NotSupported(format!(
-                "PNG decoder produced unsupported colorspace {other:?}"
-            )));
-        }
-    };
-
-    // Reject destinations the CPU converter can't reach from the decoder's
-    // output so callers get a precise error rather than a downstream map
-    // failure. (`Grey → Grey` / `Rgb → Rgb` / etc. are identity pairs and
-    // are always valid.)
-    if decoded_fmt != dest_fmt
-        && !crate::cpu::CPUProcessor::support_conversion_pf(decoded_fmt, dest_fmt)
-    {
-        return Err(Error::NotSupported(format!(
-            "load_png: cannot convert decoder output {decoded_fmt:?} to {dest_fmt:?}"
-        )));
-    }
-
-    // Decode into a Mem staging buffer in the decoder's native format. For
-    // LumaA we allocate an extra byte-pair-per-pixel buffer since our Tensor
-    // API only knows 1-channel (Grey); after decode we compact to Grey.
-    let staging = if strip_luma_alpha {
-        // LumaA is 2 bytes per pixel in the raw decode; allocate a flat
-        // Tensor large enough to hold it, then compact to Grey in place.
-        let raw = Tensor::<u8>::new(&[height, width, 2], Some(TensorMemory::Mem), None)?;
-        decoder.decode_into(&mut raw.map()?)?;
-        let grey = Tensor::<u8>::image(width, height, PixelFormat::Grey, Some(TensorMemory::Mem))?;
-        {
-            let raw_map = raw.map()?;
-            let mut grey_map = grey.map()?;
-            let raw_bytes: &[u8] = &raw_map;
-            let grey_bytes: &mut [u8] = &mut grey_map;
-            for (pair, out) in raw_bytes.chunks_exact(2).zip(grey_bytes.iter_mut()) {
-                *out = pair[0];
-            }
-        }
-        grey
-    } else {
-        let staging = Tensor::<u8>::image(width, height, decoded_fmt, Some(TensorMemory::Mem))?;
-        decoder.decode_into(&mut staging.map()?)?;
-        staging
-    };
-
-    // Optional CPU format conversion before the final memory placement.
-    let packed = if decoded_fmt != dest_fmt {
-        let mut tmp = Tensor::<u8>::image(width, height, dest_fmt, Some(TensorMemory::Mem))?;
-        CPUProcessor::convert_format_pf(&staging, &mut tmp, decoded_fmt, dest_fmt)?;
-        tmp
-    } else {
-        staging
-    };
-
-    if (rotation, flip) != (Rotation::None, Flip::None) {
-        return rotate_flip_to_dyn(&packed, dest_fmt, rotation, flip, memory);
-    }
-
-    // Final placement. When the caller wants DMA and the natural pitch
-    // would be rejected by the GPU's DMA-BUF import (see
-    // `padded_dma_pitch_for`), allocate a pitch-padded DMA tensor and
-    // row-copy. Otherwise allocate in the requested memory domain and
-    // linear-copy — or, when the caller asked for Mem, just return the
-    // staging tensor directly.
     #[cfg(target_os = "linux")]
-    if let Some(aligned_pitch) = padded_dma_pitch_for(dest_fmt, width, &memory) {
+    if let Some(aligned_pitch) = padded_dma_pitch_for(dest_fmt, w, &memory) {
         let mut dma = Tensor::<u8>::image_with_stride(
-            width,
-            height,
+            w,
+            h,
             dest_fmt,
             aligned_pitch,
             Some(TensorMemory::Dma),
         )?;
-        copy_packed_to_padded_dma(&packed, &mut dma)?;
+        dma.load_image(&mut decoder, image, &opts)?;
         return Ok(TensorDyn::from(dma));
     }
 
-    if matches!(memory, Some(TensorMemory::Mem)) {
-        return Ok(TensorDyn::from(packed));
-    }
-    // DMA (default on Linux) or Shm with naturally-aligned pitch.
-    let out = Tensor::<u8>::image(width, height, dest_fmt, memory)?;
-    {
-        let src_map = packed.map()?;
-        let mut dst_map = out.map()?;
-        let src_bytes: &[u8] = &src_map;
-        let dst_bytes: &mut [u8] = &mut dst_map;
-        dst_bytes.copy_from_slice(src_bytes);
-    }
-    Ok(TensorDyn::from(out))
-}
-
-/// Load an image from raw bytes (JPEG or PNG) and return a [`TensorDyn`].
-///
-/// The optional `format` specifies the desired output pixel format (e.g.,
-/// [`PixelFormat::Rgb`], [`PixelFormat::Rgba`]); if `None`, the native
-/// format of the file is used (typically RGB for JPEG).
-///
-/// # Examples
-/// ```rust,no_run
-/// #[allow(deprecated)]
-/// use edgefirst_image::load_image;
-/// use edgefirst_tensor::PixelFormat;
-/// # fn main() -> Result<(), edgefirst_image::Error> {
-/// #[allow(deprecated)]
-/// let img = {
-///     let jpeg = std::fs::read("zidane.jpg")?;
-///     load_image(&jpeg, Some(PixelFormat::Rgb), None)?
-/// };
-/// assert_eq!(img.width(), Some(1280));
-/// assert_eq!(img.height(), Some(720));
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.23.0",
-    note = "Use edgefirst_codec::ImageLoad::load_image() to decode into pre-allocated tensors. \
-            This avoids per-frame allocation and supports strided/DMA-backed buffers."
-)]
-pub fn load_image(
-    image: &[u8],
-    format: Option<PixelFormat>,
-    memory: Option<TensorMemory>,
-) -> Result<TensorDyn> {
-    if let Ok(i) = load_jpeg(image, format, memory) {
-        return Ok(i);
-    }
-    if let Ok(i) = load_png(image, format, memory) {
-        return Ok(i);
-    }
-    Err(Error::NotSupported(
-        "Could not decode as jpeg or png".to_string(),
-    ))
+    let mut img = Tensor::<u8>::image(w, h, dest_fmt, memory)?;
+    img.load_image(&mut decoder, image, &opts)?;
+    Ok(TensorDyn::from(img))
 }
 
 /// Save a [`TensorDyn`] image as a JPEG file.
@@ -2938,28 +2525,30 @@ mod image_tests {
 
     #[test]
     fn test_invalid_image_file() -> Result<(), Error> {
-        let result = crate::load_image(&[123; 5000], None, None);
-        assert!(matches!(
-            result,
-            Err(Error::NotSupported(e)) if e == "Could not decode as jpeg or png"));
-
+        let result = crate::load_image_test_helper(&[123; 5000], None, None);
+        assert!(
+            matches!(result, Err(Error::Codec(_))),
+            "unrecognised bytes should surface as Error::Codec, got {result:?}"
+        );
         Ok(())
     }
 
     #[test]
     fn test_invalid_jpeg_format() -> Result<(), Error> {
-        let result = crate::load_image(&[123; 5000], Some(PixelFormat::Yuyv), None);
-        assert!(matches!(
-            result,
-            Err(Error::NotSupported(e)) if e == "Could not decode as jpeg or png"));
-
+        let result = crate::load_image_test_helper(&[123; 5000], Some(PixelFormat::Yuyv), None);
+        // YUYV is not a valid decode target; peek_info fails before the magic-
+        // bytes check, so the precise variant depends on which error fires first.
+        assert!(
+            matches!(result, Err(Error::Codec(_))),
+            "Yuyv target with garbage bytes should surface as Error::Codec, got {result:?}"
+        );
         Ok(())
     }
 
     #[test]
     fn test_load_resize_save() {
         let file = edgefirst_bench::testdata::read("zidane.jpg");
-        let img = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let img = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         assert_eq!(img.width(), Some(1280));
         assert_eq!(img.height(), Some(720));
 
@@ -2980,7 +2569,7 @@ mod image_tests {
         crate::save_jpeg(&dst, "zidane_resized.jpg", 80).unwrap();
 
         let file = std::fs::read("zidane_resized.jpg").unwrap();
-        let img = crate::load_image(&file, None, None).unwrap();
+        let img = crate::load_image_test_helper(&file, None, None).unwrap();
         assert_eq!(img.width(), Some(640));
         assert_eq!(img.height(), Some(360));
         assert_eq!(img.format().unwrap(), PixelFormat::Rgb);
@@ -3178,14 +2767,14 @@ mod image_tests {
 
     #[test]
     fn test_load_grey() {
-        let grey_img = crate::load_image(
+        let grey_img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey.jpg"),
             Some(PixelFormat::Rgba),
             None,
         )
         .unwrap();
 
-        let grey_but_rgb_img = crate::load_image(
+        let grey_but_rgb_img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey-rgb.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -3214,7 +2803,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let mut converter = ImageProcessor::new().unwrap();
         let converter_dst = converter
@@ -3268,7 +2857,7 @@ mod image_tests {
 
         // Convert into I8 dst should succeed
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let mut dst_i8 = converter
             .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
@@ -3333,7 +2922,7 @@ mod image_tests {
               // NVIDIA without /dev/dma_heap permissions). Works on embedded targets.
     fn test_crop_skip() {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let mut converter = ImageProcessor::new().unwrap();
         let converter_dst = converter
@@ -3405,13 +2994,13 @@ mod image_tests {
     #[test]
     fn test_load_jpeg_with_exif() {
         let file = edgefirst_bench::testdata::read("zidane_rotated_exif.jpg").to_vec();
-        let loaded = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let loaded = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(1280));
         assert_eq!(loaded.width(), Some(720));
 
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let cpu_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let (dst_width, dst_height) = (cpu_src.height().unwrap(), cpu_src.width().unwrap());
 
@@ -3435,13 +3024,13 @@ mod image_tests {
     #[test]
     fn test_load_png_with_exif() {
         let file = edgefirst_bench::testdata::read("zidane_rotated_exif_180.png").to_vec();
-        let loaded = crate::load_png(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let loaded = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         assert_eq!(loaded.height(), Some(720));
         assert_eq!(loaded.width(), Some(1280));
 
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let cpu_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let cpu_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         let mut cpu_converter = CPUProcessor::new();
@@ -3510,7 +3099,7 @@ mod image_tests {
         // 375 * 4 = 1500 bytes/row, pitch-padded to 1536. Width%4 = 3,
         // so the old pre-check rejected it; new code accepts it.
         let jpeg = make_rgb_jpeg(375, 333);
-        let src_gl = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
+        let src_gl = crate::load_image_test_helper(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
         assert_eq!(src_gl.width(), Some(375));
         // Row stride must still be pitch-padded (separate concern from width).
         let stride = src_gl.row_stride().unwrap();
@@ -3536,7 +3125,8 @@ mod image_tests {
         // CPU-only processor regardless of which backends the host has
         // available.
         let src_cpu =
-            crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem)).unwrap();
+            crate::load_image_test_helper(&jpeg, Some(PixelFormat::Rgba), Some(TensorMemory::Mem))
+                .unwrap();
         let mut cpu_proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
             ..Default::default()
@@ -3587,7 +3177,8 @@ mod image_tests {
         // The pitch-padding fix is what makes these importable at all.
         for &w in &[500u32, 612, 428] {
             let jpeg = make_rgb_jpeg(w, 333);
-            let loaded = crate::load_jpeg(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
+            let loaded =
+                crate::load_image_test_helper(&jpeg, Some(PixelFormat::Rgba), None).unwrap();
             let natural = (w as usize) * 4;
             let aligned = crate::align_pitch_bytes_to_gpu_alignment(natural).unwrap();
             assert!(
@@ -3701,7 +3292,7 @@ mod image_tests {
             return;
         }
         let png = make_grey_png(612, 388);
-        let loaded = crate::load_png(&png, Some(PixelFormat::Grey), None).unwrap();
+        let loaded = crate::load_image_test_helper(&png, Some(PixelFormat::Grey), None).unwrap();
         assert_eq!(loaded.width(), Some(612));
         assert_eq!(loaded.height(), Some(388));
         assert_eq!(loaded.format(), Some(PixelFormat::Grey));
@@ -3732,7 +3323,8 @@ mod image_tests {
         use edgefirst_tensor::TensorMemory;
         let png = make_grey_png(612, 100);
         let loaded =
-            crate::load_png(&png, Some(PixelFormat::Grey), Some(TensorMemory::Mem)).unwrap();
+            crate::load_image_test_helper(&png, Some(PixelFormat::Grey), Some(TensorMemory::Mem))
+                .unwrap();
         assert_eq!(loaded.width(), Some(612));
         assert_eq!(loaded.height(), Some(100));
         assert_eq!(loaded.format(), Some(PixelFormat::Grey));
@@ -3755,7 +3347,8 @@ mod image_tests {
         use edgefirst_tensor::TensorMemory;
         let png = make_grey_png(620, 240);
         let loaded =
-            crate::load_png(&png, Some(PixelFormat::Rgb), Some(TensorMemory::Mem)).unwrap();
+            crate::load_image_test_helper(&png, Some(PixelFormat::Rgb), Some(TensorMemory::Mem))
+                .unwrap();
         assert_eq!(loaded.width(), Some(620));
         assert_eq!(loaded.height(), Some(240));
         assert_eq!(loaded.format(), Some(PixelFormat::Rgb));
@@ -3790,7 +3383,8 @@ mod image_tests {
         let dst_height = 360;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src =
-            crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
+            crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma))
+                .unwrap();
 
         let g2d_dst = TensorDyn::image(
             dst_width,
@@ -3839,7 +3433,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -3909,7 +3503,7 @@ mod image_tests {
             return;
         }
 
-        let img = crate::load_image(
+        let img = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey.jpg"),
             Some(PixelFormat::Grey),
             None,
@@ -3962,7 +3556,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -4020,7 +3614,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -4073,7 +3667,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let src_dyn = src;
 
         let mut cpu_dst =
@@ -4152,7 +3746,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 360;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let crop = Crop {
             src_rect: Some(Rect {
                 left: 320,
@@ -4205,7 +3799,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -4268,7 +3862,7 @@ mod image_tests {
             dst_color: None,
         };
         for m in mem {
-            let src = crate::load_image(&file, Some(PixelFormat::Rgba), m).unwrap();
+            let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), m).unwrap();
             let src_dyn = src;
 
             for rot in [
@@ -4353,8 +3947,9 @@ mod image_tests {
         // right direction
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
 
-        let unchanged_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let unchanged_src =
+            crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let (dst_width, dst_height) = match rot {
             Rotation::None | Rotation::Rotate180 => (src.width().unwrap(), src.height().unwrap()),
@@ -4451,7 +4046,8 @@ mod image_tests {
         };
 
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), tensor_memory).unwrap();
+        let src =
+            crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), tensor_memory).unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -4525,7 +4121,8 @@ mod image_tests {
 
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src =
-            crate::load_image(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma)).unwrap();
+            crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma))
+                .unwrap();
 
         let cpu_dst =
             TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5606,7 +5203,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = crate::load_image(
+        let target_image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -5636,7 +5233,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = crate::load_image(
+        let target_image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgb),
             None,
@@ -5666,7 +5263,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = crate::load_image(
+        let target_image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Grey),
             None,
@@ -5696,7 +5293,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = crate::load_image(
+        let target_image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("zidane.jpg"),
             Some(PixelFormat::Rgb),
             None,
@@ -5827,7 +5424,7 @@ mod image_tests {
         let dst_width = 640;
         let dst_height = 640;
         let file = edgefirst_bench::testdata::read("test_image.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_dst = TensorDyn::image(
             dst_width,
@@ -5890,7 +5487,7 @@ mod image_tests {
     #[test]
     fn test_cpu_resize_nv16() {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let cpu_nv16_dst = TensorDyn::image(640, 640, PixelFormat::Nv16, DType::U8, None).unwrap();
         let cpu_rgb_dst = TensorDyn::image(640, 640, PixelFormat::Rgb, DType::U8, None).unwrap();
@@ -6310,7 +5907,7 @@ mod image_tests {
 
         // Fill source PBO with test pattern: load JPEG then convert Mem→PBO
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
-        let jpeg_src = crate::load_image(&file, Some(PixelFormat::Rgba), None).unwrap();
+        let jpeg_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         // Resize JPEG into a Mem temp of the right size, then copy into PBO
         let mem_src = TensorDyn::image(
@@ -6969,7 +6566,7 @@ mod image_tests {
 
         // Load a source image
         let image = edgefirst_bench::testdata::read("zidane.jpg");
-        let src = load_image(&image, Some(PixelFormat::Rgba), None).unwrap();
+        let src = load_image_test_helper(&image, Some(PixelFormat::Rgba), None).unwrap();
 
         // Create a raw tensor, then attach format — simulating the from_fd workflow
         let mut dst =

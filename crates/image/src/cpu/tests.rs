@@ -1025,7 +1025,7 @@ mod cpu_tests {
         use edgefirst_decoder::Segmentation;
         use ndarray::Array3;
 
-        let image = crate::load_image(
+        let image = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -1070,7 +1070,7 @@ mod cpu_tests {
 
         // draw_decoded_masks fully writes dst: we must pass the camera
         // frame as a background via MaskOverlay, not as the dst canvas.
-        let bg = crate::load_image(
+        let bg = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("giraffe.jpg"),
             Some(PixelFormat::Rgba),
             None,
@@ -1123,7 +1123,7 @@ mod cpu_tests {
             __t.set_format(PixelFormat::Rgba).unwrap();
             TensorDyn::from(__t)
         };
-        let expected = crate::load_image(
+        let expected = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("output_render_cpu.jpg"),
             Some(PixelFormat::Rgba),
             None,

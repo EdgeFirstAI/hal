@@ -470,6 +470,100 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 - PNG decode uses zune-png internally; edgefirst-codec adds 2–5% overhead for strided row-copy into the pre-allocated tensor.
 - imx95-frdm (Cortex-A55 @ 1.8 GHz) is ~4–5% faster than imx8mp-frdm (Cortex-A53 @ 1.6 GHz) across JPEG decode paths.
 
+### EXIF Orientation Overhead
+
+**Data collected:** 2026-05-17 (codec at b77df09..4e04dc4 + EXIF coverage). Each
+fixture in `testdata/zidane_exif_<N>.{jpg,png}` carries identical pixel data
+for `zidane.jpg` (1280×720) with only the EXIF orientation tag varying
+(N = 1..=8, per the EXIF/TIFF spec). Apply-false rows verify the fixtures
+share scan/IDAT content; apply-true rows measure the cost of the in-place
+byte rearrangement performed by `codec/src/exif.rs::apply_exif_u8`.
+
+Orientation reference: **1**=identity, **2**=mirror-H, **3**=180°, **4**=mirror-V,
+**5**=90° CW + mirror-H, **6**=90° CW, **7**=90° CCW + mirror-H, **8**=90° CCW.
+
+#### JPEG decode (`zidane.jpg` 1280×720 → RGB u8, median over n=100)
+
+| Platform | apply | o=1 | o=2 (flip-H) | o=3 (180°) | o=4 (mirror-V) | o=5 (rot+flip) | o=6 (90°) | o=7 (rot+flip) | o=8 (270°) |
+|----------|-------|------|------|------|------|------|------|------|------|
+| PC (x86_64, host) | false | 1.6 ms | 1.6 ms | 1.6 ms | 1.6 ms | 1.6 ms | 1.6 ms | 1.7 ms | 1.6 ms |
+| PC (x86_64, host) | true  | 1.7 ms | 3.4 ms | 3.6 ms | 5.3 ms | 5.4 ms | 3.4 ms | 5.3 ms | 3.6 ms |
+| imx95-frdm (A55) | false | 13.8 ms | 13.8 ms | 13.8 ms | 13.8 ms | 13.8 ms | 13.8 ms | 13.9 ms | 13.8 ms |
+| imx95-frdm (A55) | true  | 13.9 ms | 31.1 ms | 31.5 ms | 48.2 ms | 47.1 ms | 30.5 ms | 47.1 ms | 30.5 ms |
+| imx8mp-frdm (A53) | false | 14.4 ms | 14.3 ms | 14.3 ms | 14.4 ms | 14.4 ms | 14.4 ms | 14.3 ms | 14.3 ms |
+| imx8mp-frdm (A53) | true  | 14.3 ms | 30.0 ms | 35.5 ms | 49.7 ms | 55.7 ms | 41.3 ms | 55.6 ms | 41.3 ms |
+| orin-nano (A78AE) | false | 6.4 ms | 6.4 ms | 6.4 ms | 6.4 ms | 6.4 ms | 6.4 ms | 6.4 ms | 6.4 ms |
+| orin-nano (A78AE) | true  | 6.4 ms | 12.0 ms | 13.8 ms | 19.1 ms | 17.5 ms | 12.2 ms | 17.5 ms | 12.3 ms |
+| rpi5-hailo (A76) | false | 4.1 ms | 4.1 ms | 4.2 ms | 4.1 ms | 4.2 ms | 4.1 ms | 4.2 ms | 4.2 ms |
+| rpi5-hailo (A76) | true  | 4.2 ms | 8.7 ms | 10.3 ms | 14.4 ms | 15.6 ms | 11.4 ms | 15.6 ms | 11.4 ms |
+
+#### PNG decode (`zidane_exif_<N>.png` 1280×720 → RGB u8, median over n=100)
+
+| Platform | apply | o=1 | o=2 | o=3 | o=4 | o=5 | o=6 | o=7 | o=8 |
+|----------|-------|------|------|------|------|------|------|------|------|
+| PC (x86_64, host) | false | 5.6 ms | 5.6 ms | 5.6 ms | 5.5 ms | 5.6 ms | 5.6 ms | 5.6 ms | 5.6 ms |
+| PC (x86_64, host) | true  | 5.6 ms | 8.1 ms | 7.6 ms | 9.9 ms | 9.9 ms | 7.4 ms | 9.7 ms | 7.5 ms |
+| imx95-frdm (A55) | false | 38.1 ms | 38.1 ms | 38.1 ms | 38.0 ms | 38.0 ms | 38.0 ms | 38.0 ms | 38.1 ms |
+| imx95-frdm (A55) | true  | 38.1 ms | 55.4 ms | 55.8 ms | 72.3 ms | 71.1 ms | 54.5 ms | 71.1 ms | 54.4 ms |
+| imx8mp-frdm (A53) | false | 41.5 ms | 41.6 ms | 41.6 ms | 41.6 ms | 41.5 ms | 41.5 ms | 41.6 ms | 41.6 ms |
+| imx8mp-frdm (A53) | true  | 41.6 ms | 56.8 ms | 62.4 ms | 76.6 ms | 82.8 ms | 68.4 ms | 82.6 ms | 68.3 ms |
+| orin-nano (A78AE) | false | 19.4 ms | 19.4 ms | 19.4 ms | 19.4 ms | 19.4 ms | 19.4 ms | 19.4 ms | 19.4 ms |
+| orin-nano (A78AE) | true  | 19.4 ms | 25.1 ms | 26.8 ms | 32.2 ms | 30.6 ms | 25.2 ms | 30.6 ms | 25.2 ms |
+| rpi5-hailo (A76) | false | 14.5 ms | 14.5 ms | 14.5 ms | 14.5 ms | 14.5 ms | 14.5 ms | 14.5 ms | 14.5 ms |
+| rpi5-hailo (A76) | true  | 14.5 ms | 19.2 ms | 20.7 ms | 24.8 ms | 25.9 ms | 21.8 ms | 25.9 ms | 21.8 ms |
+
+**Key Observations:**
+- **`apply_false` is flat across all 8 orientations on every platform** — the
+  fixtures truly share scan/IDAT content, and the codec doesn't waste cycles
+  on the EXIF tag in the no-rotation path.
+- **Orientation 1 with `apply_true` matches `apply_false` exactly** — the codec
+  reads the EXIF tag, sees identity, and skips `apply_exif_u8` entirely. No
+  hidden overhead for callers that pass `apply_exif=true` defensively.
+- **In-place transforms (o=3 = 180°) cost roughly +1 byte-rearrangement per
+  pixel.** On the imx8mp Cortex-A53 the delta is +21 ms for JPEG (+147% over
+  the baseline 14.4 ms) which approximates the DDR write-bandwidth-limited
+  cost of touching 2.7 MB (1280×720×3 RGB bytes) once.
+- **90°/270° rotations (o=6, o=8) cost the same as 180°** despite needing a
+  scratch buffer — the allocation is negligible vs the byte-rearrangement
+  itself, and the codec reuses the rotation scratch across calls (see
+  `state.exif_scratch` in `crates/codec/src/jpeg/mod.rs`).
+- **Combined rotate+flip (o=4, o=5, o=7) costs ~2× the rotation alone** —
+  the codec applies flip-H as a separate pass after rotation, so each
+  transform is paid for in full DDR bandwidth.
+- **Cortex-A55 (imx95-frdm) is faster than A53 (imx8mp-frdm) on the
+  combined-transform paths** despite the A55 being only marginally faster on
+  the JPEG decode itself (~14 ms vs 14.4 ms baseline). The A55's wider
+  load/store pipeline accelerates the byte rearrangement (apply_exif_u8 is
+  pure memcpy-shaped work).
+- **A76 (rpi5-hailo) and A78AE (orin-nano) are the fastest by a wide margin**
+  — A76 decode at 4.2 ms vs A55 at 14 ms, and EXIF rotation overhead scales
+  proportionally. EXIF on these platforms is essentially free at frame
+  cadences ≥ 30 Hz.
+- **PNG EXIF overhead is roughly the same absolute cost as JPEG EXIF** — the
+  transform operates on the post-decode pixel buffer, not on the source
+  bytes. The PNG baseline is just higher because zune-png decode itself is
+  slower than the custom JPEG decoder.
+
+**Reproduce:**
+```bash
+# Host
+source venv/bin/activate
+python scripts/generate_exif_fixtures.py        # one-shot; commit fixtures
+EDGEFIRST_TESTDATA_DIR=$(pwd)/testdata cargo bench -p edgefirst-codec --bench codec_benchmark
+
+# Cross-compile and deploy to embedded target
+cargo zigbuild -p edgefirst-codec --bench codec_benchmark --release --target aarch64-unknown-linux-gnu
+BIN=$(ls -t target/aarch64-unknown-linux-gnu/release/deps/codec_benchmark-* | grep -v "\.d$" | head -1)
+for host in imx8mp-frdm imx95-frdm rpi5-hailo orin-nano; do
+    ssh "$host" "mkdir -p ~/bench/testdata"
+    scp "$BIN" "$host:~/bench/codec_benchmark"
+    scp testdata/zidane*.jpg testdata/zidane*.png "$host:~/bench/testdata/"
+    ssh "$host" "chmod +x ~/bench/codec_benchmark"
+    ssh "$host" "EDGEFIRST_TESTDATA_DIR=~/bench/testdata ~/bench/codec_benchmark" \
+        | tee /tmp/exif_bench_$host.log
+done
+```
+
 ### Mask Rendering
 
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**

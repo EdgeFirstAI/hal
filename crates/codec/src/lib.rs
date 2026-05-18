@@ -46,14 +46,15 @@
 
 mod decoder;
 mod error;
+mod exif;
 mod jpeg;
 mod options;
 mod pixel;
 mod png;
 mod traits;
 
-pub use decoder::ImageDecoder;
-pub use error::CodecError;
+pub use decoder::{peek_info, ImageDecoder};
+pub use error::{CodecError, UnsupportedFeature};
 pub use options::{DecodeOptions, ImageInfo};
 pub use pixel::ImagePixel;
 pub use traits::ImageLoad;
