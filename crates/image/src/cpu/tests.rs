@@ -3071,4 +3071,148 @@ mod cpu_tests {
         );
         Ok(())
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // src_rect clamping tests — verify that cropping from a larger buffer
+    // never samples padding pixels during bilinear resize.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Create a synthetic RGB tensor where the left half is pure red and the
+    /// right half is pure blue.
+    fn make_red_blue_src(width: usize, height: usize) -> TensorDyn {
+        let mut t = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None).unwrap();
+        {
+            let tensor_u8 = t.as_u8_mut().unwrap();
+            let mut map = tensor_u8.map().unwrap();
+            let data = map.as_mut_slice();
+            let half = width / 2;
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) * 3;
+                    if x < half {
+                        data[idx] = 255;
+                        data[idx + 1] = 0;
+                        data[idx + 2] = 0;
+                    } else {
+                        data[idx] = 0;
+                        data[idx + 1] = 0;
+                        data[idx + 2] = 255;
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// Crop the blue (right) half of a red|blue image and resize to a smaller
+    /// destination. Verify no red pixels bleed into the interior output.
+    /// Edge pixels (first/last column) may have filter-radius bleed from the
+    /// resize library; we skip those and validate the interior is pure blue.
+    #[test]
+    fn test_src_rect_crop_no_bleed_cpu() -> Result<()> {
+        let src_w = 128;
+        let src_h = 64;
+        let dst_w = 32;
+        let dst_h = 32;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+
+        let mut cpu = CPUProcessor::default();
+
+        // Crop only the right (blue) half
+        let crop = Crop::new().with_src_rect(Some(Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+
+        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+
+        // Skip the leftmost 2 columns (resize filter radius at crop boundary)
+        let map = dst.as_u8().unwrap().map()?;
+        let data = map.as_slice();
+        for y in 0..dst_h {
+            for x in 2..dst_w {
+                let i = y * dst_w + x;
+                let r = data[i * 3];
+                let g = data[i * 3 + 1];
+                let b = data[i * 3 + 2];
+                assert!(
+                    r <= 2 && g <= 2 && b >= 253,
+                    "CPU pixel ({x},{y}) has red bleed: RGB=({r},{g},{b}), expected pure blue"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Crop the red (left) half and verify no blue bleeds into the interior.
+    #[test]
+    fn test_src_rect_crop_left_half_no_bleed_cpu() -> Result<()> {
+        let src_w = 128;
+        let src_h = 64;
+        let dst_w = 32;
+        let dst_h = 32;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+
+        let mut cpu = CPUProcessor::default();
+
+        // Crop only the left (red) half
+        let crop = Crop::new().with_src_rect(Some(Rect::new(0, 0, src_w / 2, src_h)));
+
+        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+
+        // Skip the rightmost 2 columns (resize filter radius at crop boundary)
+        let map = dst.as_u8().unwrap().map()?;
+        let data = map.as_slice();
+        for y in 0..dst_h {
+            for x in 0..(dst_w - 2) {
+                let i = y * dst_w + x;
+                let r = data[i * 3];
+                let g = data[i * 3 + 1];
+                let b = data[i * 3 + 2];
+                assert!(
+                    r >= 253 && g <= 2 && b <= 2,
+                    "CPU pixel ({x},{y}) has blue bleed: RGB=({r},{g},{b}), expected pure red"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Crop at the exact red→blue boundary and resize. Interior pixels
+    /// (away from the crop edge) must be pure blue.
+    #[test]
+    fn test_src_rect_boundary_crop_no_bleed_cpu() -> Result<()> {
+        let src_w = 256;
+        let src_h = 64;
+        let dst_w = 64;
+        let dst_h = 64;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+
+        let mut cpu = CPUProcessor::default();
+
+        // Crop the right half — boundary is exactly at the colour transition
+        let crop = Crop::new().with_src_rect(Some(Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+
+        cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
+
+        // Skip the leftmost 2 columns (filter radius near crop boundary)
+        let map = dst.as_u8().unwrap().map()?;
+        let data = map.as_slice();
+        for y in 0..dst_h {
+            for x in 2..dst_w {
+                let i = y * dst_w + x;
+                let r = data[i * 3];
+                let g = data[i * 3 + 1];
+                let b = data[i * 3 + 2];
+                assert!(
+                    r <= 2 && g <= 2 && b >= 253,
+                    "CPU pixel ({x},{y}) contamination at boundary: RGB=({r},{g},{b})"
+                );
+            }
+        }
+        Ok(())
+    }
 }
