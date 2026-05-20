@@ -94,6 +94,11 @@ impl CPUProcessor {
         let mut src_map = src.map()?;
         let mut dst_map = dst.map()?;
 
+        // FIXME: fast_image_resize does not clamp its filter kernel at crop
+        // boundaries — bilinear/bicubic taps can sample 1-2 pixels beyond the
+        // specified crop rect, causing colour bleed from adjacent regions.
+        // A proper fix would inset the crop by the filter radius or use a
+        // library that supports boundary clamping.
         let options = if let Some(crop) = crop.src_rect {
             self.options.crop(
                 crop.left as f64,

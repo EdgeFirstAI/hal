@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-05-19
+
+### Fixed
+
+- GL texture sampling now applies a half-texel inset to `src_rect` texture
+  coordinates, preventing `GL_LINEAR` bilinear interpolation from bleeding
+  into padding pixels when decoding into reused strided buffers via
+  `load_image`. All non-DMA upload paths (`draw_src_texture`,
+  `draw_src_texture_from_pbo`) and the EGLImage path now also set
+  `GL_CLAMP_TO_EDGE` as secondary defense.
+
 ## [0.23.0] - 2026-05-17
 
 ### Added
