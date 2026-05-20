@@ -2102,12 +2102,7 @@ impl GLProcessorST {
             .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest {
-                left: crop.left as f32 / src_w as f32,
-                top: (crop.top + crop.height) as f32 / src_h as f32,
-                right: (crop.left + crop.width) as f32 / src_w as f32,
-                bottom: crop.top as f32 / src_h as f32,
-            }
+            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -2166,6 +2161,16 @@ impl GLProcessorST {
                 texture_target,
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_S,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_T,
+                gls::gl::CLAMP_TO_EDGE as i32,
             );
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
@@ -2565,12 +2570,7 @@ impl GLProcessorST {
         }
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest {
-                left: crop.left as f32 / src_w as f32,
-                top: (crop.top + crop.height) as f32 / src_h as f32,
-                right: (crop.left + crop.width) as f32 / src_w as f32,
-                bottom: crop.top as f32 / src_h as f32,
-            }
+            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -2691,12 +2691,7 @@ impl GLProcessorST {
         );
 
         let src_roi = if let Some(crop) = crop.src_rect {
-            RegionOfInterest {
-                left: crop.left as f32 / src_w as f32,
-                top: (crop.top + crop.height) as f32 / src_h as f32,
-                right: (crop.left + crop.width) as f32 / src_w as f32,
-                bottom: crop.top as f32 / src_h as f32,
-            }
+            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
         } else {
             RegionOfInterest {
                 left: 0.,
@@ -3468,6 +3463,16 @@ impl GLProcessorST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_S,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_T,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
@@ -3570,7 +3575,7 @@ impl GLProcessorST {
     fn draw_camera_texture_eglimage(
         &mut self,
         src: &Tensor<u8>,
-        src_fmt: PixelFormat,
+        _src_fmt: PixelFormat,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
@@ -3596,24 +3601,22 @@ impl GLProcessorST {
                 gls::gl::TEXTURE_MAG_FILTER,
                 gls::gl::LINEAR as i32,
             );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_S,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
+            gls::gl::TexParameteri(
+                texture_target,
+                gls::gl::TEXTURE_WRAP_T,
+                gls::gl::CLAMP_TO_EDGE as i32,
+            );
 
-            if src_fmt == PixelFormat::Grey {
-                for swizzle in [
-                    gls::gl::TEXTURE_SWIZZLE_R,
-                    gls::gl::TEXTURE_SWIZZLE_G,
-                    gls::gl::TEXTURE_SWIZZLE_B,
-                ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
-                }
-            } else {
-                for (swizzle, src_comp) in [
-                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
-                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
-                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
-                ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_comp as i32);
-                }
-            }
+            // Note: GL_TEXTURE_SWIZZLE_* is not supported for
+            // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
+            // handled by the driver when sampling from an external texture,
+            // and greyscale EGLImages replicate luma to all channels
+            // automatically via the YUV shader.
 
             if self
                 .camera_eglimage_texture

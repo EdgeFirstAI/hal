@@ -3101,4 +3101,171 @@ mod gl_tests {
             width * bpp
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // src_rect clamping tests — verify that cropping from a larger buffer
+    // never samples padding pixels, even with GL_LINEAR bilinear filtering.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Create a synthetic RGB tensor where the left half is pure red and the
+    /// right half is pure blue. Simulates a larger reused buffer where only a
+    /// sub-region contains the desired content.
+    fn make_red_blue_src(width: usize, height: usize) -> TensorDyn {
+        let mut t = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None).unwrap();
+        {
+            let tensor_u8 = t.as_u8_mut().unwrap();
+            let mut map = tensor_u8.map().unwrap();
+            let data = map.as_mut_slice();
+            let half = width / 2;
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = (y * width + x) * 3;
+                    if x < half {
+                        // Red
+                        data[idx] = 255;
+                        data[idx + 1] = 0;
+                        data[idx + 2] = 0;
+                    } else {
+                        // Blue
+                        data[idx] = 0;
+                        data[idx + 1] = 0;
+                        data[idx + 2] = 255;
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    /// Crop the blue (right) half of a red|blue image and resize to a smaller
+    /// destination. Verify no red pixels bleed into the output.
+    #[test]
+    fn test_src_rect_crop_no_bleed_gl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_src_rect_crop_no_bleed_gl - OpenGL not available");
+            return;
+        }
+
+        let src_w = 128;
+        let src_h = 64;
+        let dst_w = 32;
+        let dst_h = 32;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None).unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Crop only the right (blue) half
+        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(
+            src_w / 2, // left = start of blue region
+            0,
+            src_w / 2, // width = blue half
+            src_h,
+        )));
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        // Verify: every pixel in the output should be blue (R=0, G=0, B=255)
+        // with a small tolerance for GPU rounding.
+        let map = dst.as_u8().unwrap().map().unwrap();
+        let data = map.as_slice();
+        let pixel_count = dst_w * dst_h;
+        let mut max_red: u8 = 0;
+        for i in 0..pixel_count {
+            let r = data[i * 3];
+            let g = data[i * 3 + 1];
+            let b = data[i * 3 + 2];
+            max_red = max_red.max(r);
+            // Allow tiny rounding (≤2) on blue channel but no red contamination
+            assert!(
+                r <= 2 && g <= 2 && b >= 253,
+                "Pixel {i} has red bleed: RGB=({r},{g},{b}), expected pure blue"
+            );
+        }
+        assert!(
+            max_red <= 2,
+            "Max red channel value in output = {max_red}, expected 0 (no bleed from padding)"
+        );
+    }
+
+    /// Same test but with the crop at an exact colour boundary: crop starts
+    /// precisely at the red→blue transition. This is the worst case for
+    /// bilinear bleed since the leftmost sampled texel is adjacent to red.
+    #[test]
+    fn test_src_rect_boundary_crop_no_bleed_gl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_src_rect_boundary_crop_no_bleed_gl - OpenGL not available");
+            return;
+        }
+
+        // Use a power-of-two size to avoid any sub-pixel alignment issues
+        let src_w = 256;
+        let src_h = 64;
+        let dst_w = 64;
+        let dst_h = 64;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None).unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Crop the right half — the left boundary is exactly at the red→blue edge
+        let crop =
+            Crop::new().with_src_rect(Some(crate::Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let map = dst.as_u8().unwrap().map().unwrap();
+        let data = map.as_slice();
+        for i in 0..(dst_w * dst_h) {
+            let r = data[i * 3];
+            let g = data[i * 3 + 1];
+            let b = data[i * 3 + 2];
+            assert!(
+                r <= 2 && g <= 2 && b >= 253,
+                "Pixel {i} has contamination at boundary: RGB=({r},{g},{b})"
+            );
+        }
+    }
+
+    /// Crop the red (left) half and verify no blue bleeds in from the right.
+    /// Tests the opposite edge.
+    #[test]
+    fn test_src_rect_crop_left_half_no_bleed_gl() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: test_src_rect_crop_left_half_no_bleed_gl - OpenGL not available");
+            return;
+        }
+
+        let src_w = 128;
+        let src_h = 64;
+        let dst_w = 32;
+        let dst_h = 32;
+
+        let src = make_red_blue_src(src_w, src_h);
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None).unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Crop only the left (red) half
+        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(0, 0, src_w / 2, src_h)));
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let map = dst.as_u8().unwrap().map().unwrap();
+        let data = map.as_slice();
+        for i in 0..(dst_w * dst_h) {
+            let r = data[i * 3];
+            let g = data[i * 3 + 1];
+            let b = data[i * 3 + 2];
+            assert!(
+                r >= 253 && g <= 2 && b <= 2,
+                "Pixel {i} has blue bleed: RGB=({r},{g},{b}), expected pure red"
+            );
+        }
+    }
 }

@@ -139,3 +139,27 @@ pub(super) struct RegionOfInterest {
     pub(super) right: f32,
     pub(super) bottom: f32,
 }
+
+impl RegionOfInterest {
+    /// Build a source ROI from a pixel-space crop rectangle with a half-texel
+    /// inset. The inset ensures that `GL_LINEAR` filtering never samples
+    /// outside the crop boundary — at the extreme texture coordinates the
+    /// bilinear kernel is centred on the boundary texel and cannot reach
+    /// adjacent padding pixels.
+    ///
+    /// The result is clamped to [0, 1] so an out-of-bounds crop rectangle
+    /// cannot produce invalid texture coordinates.
+    ///
+    /// `crop`: pixel-space rectangle (left, top, width, height).
+    /// `tex_w`, `tex_h`: full texture dimensions in pixels.
+    pub(super) fn from_crop_clamped(crop: &crate::Rect, tex_w: usize, tex_h: usize) -> Self {
+        let half_x = 0.5 / tex_w as f32;
+        let half_y = 0.5 / tex_h as f32;
+        RegionOfInterest {
+            left: (crop.left as f32 / tex_w as f32 + half_x).clamp(0.0, 1.0),
+            top: ((crop.top + crop.height) as f32 / tex_h as f32 - half_y).clamp(0.0, 1.0),
+            right: ((crop.left + crop.width) as f32 / tex_w as f32 - half_x).clamp(0.0, 1.0),
+            bottom: (crop.top as f32 / tex_h as f32 + half_y).clamp(0.0, 1.0),
+        }
+    }
+}
