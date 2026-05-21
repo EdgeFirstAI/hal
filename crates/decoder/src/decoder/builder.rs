@@ -1259,15 +1259,23 @@ impl DecoderBuilder {
         // 1. decoder_version is explicitly set to Yolo26 (definitive), OR
         //    decoder_version is not set but the dshapes are (batch, num_boxes,
         //    num_features)
+        //
+        // Exception: model.end2end = false explicitly opts out of the
+        // end-to-end path even when decoder_version is yolo26 (e.g. a YOLO26
+        // model exported without embedded NMS).
         let is_end_to_end_dshape = boxes.as_ref().is_some_and(|b| {
             let dims = b.dshape.iter().map(|(d, _)| *d).collect::<Vec<_>>();
             dims == vec![DimName::Batch, DimName::NumBoxes, DimName::NumFeatures]
         });
 
-        let is_end_to_end = configs
-            .decoder_version
-            .map(|v| v.is_end_to_end())
-            .unwrap_or(is_end_to_end_dshape);
+        let is_end_to_end = if configs.end2end == Some(false) {
+            false
+        } else {
+            configs
+                .decoder_version
+                .map(|v| v.is_end_to_end())
+                .unwrap_or(is_end_to_end_dshape)
+        };
 
         if is_end_to_end {
             if let Some(boxes) = boxes {

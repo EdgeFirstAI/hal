@@ -146,13 +146,21 @@ The feature dimension is the smaller of the two non-batch dimensions
 
 #### YOLOv26 end-to-end selection
 
-`decoder_version: "yolo26"` triggers `DecoderVersion::is_end_to_end() == true`
-and selects one of the `YoloEndToEnd*` variants. NMS is bypassed entirely;
-the model emits post-NMS `[B, N, 6+]` rows of `(x1, y1, x2, y2, conf,
-class, ...)`.
+The routing priority is:
 
-For non-end-to-end YOLO26 exports (`end2end=false`), use
-`decoder_version: "yolov8"` with an explicit `nms` configuration.
+1. **`model.end2end: false`** — explicit opt-out. Regardless of
+   `decoder_version`, HAL applies its own NMS and routes to the
+   standard `YoloSegDet` / `YoloDet` path. Use this for YOLO26 models
+   exported without embedded NMS (Ultralytics `end2end=False`).
+
+2. **`decoder_version: "yolo26"`** (and `model.end2end` absent or `true`)
+   — selects one of the `YoloEndToEnd*` variants. NMS is bypassed; the
+   model emits post-NMS `[B, N, 6+]` rows of
+   `(x1, y1, x2, y2, conf, class, ...)`.
+
+3. **No `decoder_version`** — falls back to a dshape heuristic: if the
+   detection output dshape is `[batch, num_boxes, num_features]` (boxes
+   before features), HAL treats the model as end-to-end.
 
 ### Output tensor physical-order contract
 

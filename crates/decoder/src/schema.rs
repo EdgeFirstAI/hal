@@ -82,9 +82,27 @@ pub struct SchemaV2 {
     /// YOLO architecture version for Ultralytics decoders.
     ///
     /// Values: `yolov5`, `yolov8`, `yolo11`, `yolo26`. `yolo26` is
-    /// end-to-end (embedded NMS).
+    /// end-to-end (embedded NMS) unless `model.end2end` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<DecoderVersion>,
+
+    /// Model-level properties from the EdgeFirst Studio metadata.
+    ///
+    /// Only the fields relevant to decoding are read; all other fields in
+    /// the `model` object are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSpec>,
+}
+
+/// Model-level properties that affect decoding behaviour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ModelSpec {
+    /// When `false`, the model was exported *without* embedded NMS even
+    /// though `decoder_version` may be `yolo26`.  HAL will apply its own
+    /// NMS in that case.  `None` (field absent) defers to the architecture
+    /// default inferred from `decoder_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end2end: Option<bool>,
 }
 
 impl Default for SchemaV2 {
@@ -95,6 +113,7 @@ impl Default for SchemaV2 {
             outputs: Vec::new(),
             nms: None,
             decoder_version: None,
+            model: None,
         }
     }
 }
@@ -745,6 +764,7 @@ impl SchemaV2 {
             outputs,
             nms: v1.nms.as_ref().map(NmsMode::from_v1),
             decoder_version: v1.decoder_version.as_ref().map(DecoderVersion::from_v1),
+            model: v1.end2end.map(|e| ModelSpec { end2end: Some(e) }),
         })
     }
 }
@@ -825,6 +845,7 @@ impl SchemaV2 {
             outputs,
             nms: self.nms.map(NmsMode::to_v1),
             decoder_version: self.decoder_version.map(|v| v.to_v1()),
+            end2end: self.model.as_ref().and_then(|m| m.end2end),
         })
     }
 
@@ -1795,6 +1816,7 @@ mod tests {
             }],
             nms: Some(NmsMode::ClassAgnostic),
             decoder_version: Some(DecoderVersion::Yolov8),
+            model: None,
         };
         let j = serde_json::to_string(&original).unwrap();
         let parsed: SchemaV2 = serde_json::from_str(&j).unwrap();
@@ -1904,6 +1926,7 @@ mod tests {
             })],
             nms: Some(crate::configs::Nms::ClassAware),
             decoder_version: Some(crate::configs::DecoderVersion::Yolo11),
+            end2end: None,
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();
         assert_eq!(v2.nms, Some(NmsMode::ClassAware));
@@ -2004,6 +2027,7 @@ mod tests {
             ],
             nms: None,
             decoder_version: None,
+            model: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
         assert_eq!(
@@ -2045,6 +2069,7 @@ mod tests {
             }],
             nms: None,
             decoder_version: None,
+            model: None,
         };
         let legacy = schema.to_legacy_config_outputs().unwrap();
         assert!(legacy.outputs.is_empty());
@@ -2089,6 +2114,7 @@ mod tests {
             outputs: vec![lo],
             nms: None,
             decoder_version: None,
+            model: None,
         };
         schema.validate().expect(
             "typed + typeless children with equal shape must not trigger \
@@ -2126,6 +2152,7 @@ mod tests {
             })],
             nms: None,
             decoder_version: None,
+            end2end: None,
         };
         let v2 = SchemaV2::from_v1(&v1).unwrap();
         assert_eq!(v2.outputs[0].encoding, Some(BoxEncoding::Anchor));

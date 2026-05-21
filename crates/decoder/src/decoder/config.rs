@@ -36,6 +36,14 @@ pub struct ConfigOutputs {
     /// - `None` — infer from other settings (legacy behavior)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder_version: Option<configs::DecoderVersion>,
+    /// Whether the model has NMS embedded (end-to-end export).
+    ///
+    /// When `Some(false)`, the model was exported without embedded NMS even
+    /// if `decoder_version` is `yolo26`; HAL will apply its own NMS.
+    /// `None` defers to the architecture default inferred from
+    /// `decoder_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end2end: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]

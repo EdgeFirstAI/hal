@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ModelSpec` struct in `SchemaV2` with an `end2end: Option<bool>` field that
+  propagates from the `model.end2end` key in EdgeFirst Studio 
+  metadata JSON/YAML (DE-2576).
+- `end2end: Option<bool>` field on `ConfigOutputs` so the decoder builder can
+  read the flag after schema-to-config conversion (DE-2576).
+- V1↔V2 schema round-trip support for `end2end`: `SchemaV2::from_v1` maps the
+  flat `end2end` field into `ModelSpec`; `to_legacy_config_outputs` round-trips
+  it back (DE-2576).
+
+### Fixed
+
+- YOLO26 models exported *without* embedded NMS (`end2end: false` in metadata)
+  are now correctly routed to the standard `YoloDet`/`YoloSegDet` decoder paths
+  instead of the end-to-end path. Previously `decoder_version: yolo26` always
+  forced the end-to-end branch regardless of the `end2end` flag (DE-2576).
+
+### Tests
+
+- Added `test_yolo26_standard_layout_dshape_overrides_end_to_end` covering
+  single-class (37-feature) and multi-class (116-feature) segmentation configs
+  with `decoder_version: yolo26` + `end2end: false` (DE-2576).
+
 ## [0.23.1] - 2026-05-19
 
 ### Fixed

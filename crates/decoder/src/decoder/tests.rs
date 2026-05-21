@@ -2037,6 +2037,7 @@ nms: class_aware
             })],
             nms: Some(configs::Nms::Auto),
             decoder_version: None,
+            end2end: None,
         };
         let decoder = DecoderBuilder::new().with_config(config).build().unwrap();
         assert_eq!(
@@ -2314,7 +2315,6 @@ outputs:
       - [batch, 1]
       - [num_features, 38]
       - [num_boxes, 300]
-
   - decoder: ultralytics
     type: protos
     shape: [1, 160, 160, 32]
@@ -2330,6 +2330,91 @@ outputs:
             .unwrap();
         // 38 features (4+2+32) with protos -> traditional YOLO segmentation detection
         assert!(matches!(decoder.model_type, ModelType::YoloSegDet { .. }));
+    }
+
+    /// YOLO26 architecture exported *without* embedded NMS (end2end=False).
+    /// The `end2end: false` field must override the decoder_version hint and
+    /// route to the standard YoloSegDet / YoloDet paths rather than the
+    /// end-to-end variants.
+    #[test]
+    fn test_yolo26_standard_layout_dshape_overrides_end_to_end() {
+        // Single-class segmentation: shape [1, 37, 8400] = 4 boxes + 1 class + 32 mask_coefs
+        let yaml = r#"
+decoder_version: yolo26
+end2end: false
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 37, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 37]
+      - [num_boxes, 8400]
+    normalized: true
+  - decoder: ultralytics
+    type: protos
+    shape: [1, 32, 160, 160]
+    dshape:
+      - [batch, 1]
+      - [num_protos, 32]
+      - [height, 160]
+      - [width, 160]
+"#;
+        // end2end=false must override decoder_version=yolo26 and route to the
+        // standard (non-end-to-end) segmentation path.
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloSegDet { .. }));
+
+        // 80-class segmentation: shape [1, 116, 8400] = 4 + 80 + 32
+        let yaml = r#"
+decoder_version: yolo26
+end2end: false
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 116, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 116]
+      - [num_boxes, 8400]
+    normalized: true
+  - decoder: ultralytics
+    type: protos
+    shape: [1, 32, 160, 160]
+    dshape:
+      - [batch, 1]
+      - [num_protos, 32]
+      - [height, 160]
+      - [width, 160]
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloSegDet { .. }));
+
+        // Detection-only: shape [1, 5, 8400] = 4 boxes + 1 class, no protos
+        let yaml = r#"
+decoder_version: yolo26
+end2end: false
+outputs:
+  - decoder: ultralytics
+    type: detection
+    shape: [1, 5, 8400]
+    dshape:
+      - [batch, 1]
+      - [num_features, 5]
+      - [num_boxes, 8400]
+    normalized: true
+"#;
+        let decoder = DecoderBuilder::new()
+            .with_config_yaml_str(yaml.to_string())
+            .build()
+            .unwrap();
+        assert!(matches!(decoder.model_type, ModelType::YoloDet { .. }));
     }
 
     #[test]
