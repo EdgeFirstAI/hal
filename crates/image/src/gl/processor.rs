@@ -686,7 +686,7 @@ impl GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         let _span = tracing::trace_span!(
-            "gl_convert",
+            "image.convert.gl",
             ?src_fmt,
             ?dst_fmt,
             is_int8,
@@ -2805,7 +2805,8 @@ impl GLProcessorST {
         );
 
         // --- Pass 1: Render source → intermediate RGBA texture ---
-        let _pass1 = tracing::trace_span!("gl_pass1_to_rgba", dst_w, dst_h).entered();
+        let _pass1 =
+            tracing::trace_span!("image.convert.gl.pack_rgb.pass1_rgba", dst_w, dst_h).entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
@@ -2826,7 +2827,9 @@ impl GLProcessorST {
         drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
-        let _pass2 = tracing::trace_span!("gl_pass2_pack_rgb", render_w, render_h).entered();
+        let _pass2 =
+            tracing::trace_span!("image.convert.gl.pack_rgb.pass2_pack", render_w, render_h)
+                .entered();
         self.convert_fbo.bind();
         let dest_egl = self.get_or_create_egl_image_rgb(
             dst,
@@ -2952,7 +2955,9 @@ impl GLProcessorST {
 
         // --- Pass 1: NV12→RGBA into intermediate texture ---
         // No int8 bias here — bias is applied in pass 2's planar shader.
-        let _pass1 = tracing::trace_span!("gl_pass1_to_rgba", dst_w, dst_h).entered();
+        let _pass1 =
+            tracing::trace_span!("image.convert.gl.nv12_to_planar.pass1_rgba", dst_w, dst_h)
+                .entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
@@ -2977,7 +2982,12 @@ impl GLProcessorST {
         // setup_renderbuffer_dma rebinds convert_fbo with the DMA destination EGLImage,
         // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
         // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
-        let _pass2 = tracing::trace_span!("gl_pass2_to_planar", dst_w, dst_h).entered();
+        let _pass2 = tracing::trace_span!(
+            "image.convert.gl.nv12_to_planar.pass2_deinterleave",
+            dst_w,
+            dst_h
+        )
+        .entered();
         self.setup_renderbuffer_dma(dst, dst_fmt)?;
 
         // Bias letterbox clear color for int8 — glClear bypasses the shader.

@@ -125,8 +125,17 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     opts: &DecodeOptions,
     state: &mut JpegDecoderState,
 ) -> crate::Result<ImageInfo> {
+    let _span = tracing::trace_span!(
+        "codec.decode_jpeg",
+        dtype = std::any::type_name::<T>(),
+        n_bytes = data.len(),
+    )
+    .entered();
     // Parse all marker segments
-    let headers = markers::parse_markers(data)?;
+    let headers = {
+        let _s = tracing::trace_span!("codec.decode_jpeg.parse_markers").entered();
+        markers::parse_markers(data)?
+    };
 
     let hdr = &headers.header;
     let mut img_w = hdr.width as usize;
@@ -203,150 +212,45 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let mut map = dst.map()?;
     let dst_bytes: &mut [T] = &mut map;
 
-    // We need to decode into u8 first, then convert to the target type.
-    // For u8 targets, we can decode directly. For other types, use a
-    // temporary u8 buffer then convert row-by-row.
+    // Dispatch to the u8-direct path when T == u8 (lets the MCU loop write
+    // directly into the tensor); otherwise stage in `exif_scratch` and convert.
     if T::dtype() == edgefirst_tensor::DType::U8 {
-        // Fast path: decode directly into tensor buffer
-        // SAFETY: T is u8, layout-identical
+        // SAFETY: T is u8 — layout-identical reinterpret of the tensor slice.
         let dst_u8: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
         };
-
-        if flip_h || rotation_deg != 0 {
-            // EXIF rotation/flip path: decode at native (pre-rotation) stride
-            // into the codec's scratch buffer, rotate in-place there, then
-            // stride-copy into the (possibly pitch-padded) destination. We
-            // cannot decode directly into `dst_u8` when rotation swaps dims
-            // because native rows would overflow the rotated tensor stride.
-            let native_stride = img_w * channels;
-            state.exif_scratch.resize(native_stride * img_h, 0);
-            mcu::decode_image(
-                data,
-                &headers,
-                mcu_scratch,
-                &mut state.exif_scratch,
-                native_stride,
-                output_fmt,
-            )?;
-            apply_exif_u8(
-                &mut state.exif_scratch,
-                native_stride,
-                &mut img_w,
-                &mut img_h,
-                channels,
-                rotation_deg,
-                flip_h,
-                &mut state.rot_scratch,
-            );
-            // exif_scratch now holds post-rotation pixels at stride
-            // `img_w * channels`. Copy into the tensor at `dst_stride`,
-            // which honors any pitch padding.
-            let final_native_stride = img_w * channels;
-            for y in 0..img_h {
-                let src_off = y * final_native_stride;
-                let dst_off = y * dst_stride;
-                dst_u8[dst_off..dst_off + final_native_stride]
-                    .copy_from_slice(&state.exif_scratch[src_off..src_off + final_native_stride]);
-            }
-        } else {
-            mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
-        }
-    } else {
-        // Generic path: decode into temporary u8 buffer, then convert
-        let temp_stride = img_w * channels;
-        let temp_size = temp_stride * img_h;
-        state.exif_scratch.resize(temp_size, 0);
-
-        mcu::decode_image(
+        decode_u8_path(
             data,
             &headers,
             mcu_scratch,
             &mut state.exif_scratch,
-            temp_stride,
+            &mut state.rot_scratch,
+            dst_u8,
             output_fmt,
+            &mut img_w,
+            &mut img_h,
+            channels,
+            dst_stride,
+            rotation_deg,
+            flip_h,
         )?;
-
-        // Apply EXIF transformations on the temp buffer
-        if flip_h || rotation_deg != 0 {
-            apply_exif_u8(
-                &mut state.exif_scratch,
-                temp_stride,
-                &mut img_w,
-                &mut img_h,
-                channels,
-                rotation_deg,
-                flip_h,
-                &mut state.rot_scratch,
-            );
-        }
-
-        // Convert u8 → T and write to tensor at stride offsets
-        let src_stride = img_w * channels;
-        let dst_stride_elems = dst_stride / elem_size;
-
-        if T::dtype() == edgefirst_tensor::DType::I8 {
-            // Fast path: copy + XOR 0x80
-            let dst_u8: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
-            };
-            for y in 0..img_h {
-                let s = y * src_stride;
-                let d = y * dst_stride;
-                dst_u8[d..d + src_stride].copy_from_slice(&state.exif_scratch[s..s + src_stride]);
-                for b in &mut dst_u8[d..d + src_stride] {
-                    *b ^= 0x80;
-                }
-            }
-        } else if T::dtype() == edgefirst_tensor::DType::F32 {
-            // SIMD-vectorized u8 → f32 normalisation
-            let dst_f32: &mut [f32] = unsafe {
-                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut f32, dst_bytes.len())
-            };
-            for y in 0..img_h {
-                let s = y * src_stride;
-                let d = y * dst_stride_elems;
-                convert::convert_u8_to_f32(
-                    &state.exif_scratch[s..s + src_stride],
-                    &mut dst_f32[d..d + src_stride],
-                );
-            }
-        } else if T::dtype() == edgefirst_tensor::DType::U16 {
-            // SIMD-vectorized u8 → u16 scaling (×257)
-            let dst_u16: &mut [u16] = unsafe {
-                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u16, dst_bytes.len())
-            };
-            for y in 0..img_h {
-                let s = y * src_stride;
-                let d = y * dst_stride_elems;
-                convert::convert_u8_to_u16(
-                    &state.exif_scratch[s..s + src_stride],
-                    &mut dst_u16[d..d + src_stride],
-                );
-            }
-        } else if T::dtype() == edgefirst_tensor::DType::I16 {
-            // SIMD-vectorized u8 → i16 (×257 XOR 0x8000)
-            let dst_i16: &mut [i16] = unsafe {
-                std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut i16, dst_bytes.len())
-            };
-            for y in 0..img_h {
-                let s = y * src_stride;
-                let d = y * dst_stride_elems;
-                convert::convert_u8_to_i16(
-                    &state.exif_scratch[s..s + src_stride],
-                    &mut dst_i16[d..d + src_stride],
-                );
-            }
-        } else {
-            // Fallback for any other type
-            for y in 0..img_h {
-                let s = y * src_stride;
-                let d = y * dst_stride_elems;
-                for x in 0..src_stride {
-                    dst_bytes[d + x] = T::from_u8(state.exif_scratch[s + x]);
-                }
-            }
-        }
+    } else {
+        decode_typed_path::<T>(
+            data,
+            &headers,
+            mcu_scratch,
+            &mut state.exif_scratch,
+            &mut state.rot_scratch,
+            dst_bytes,
+            output_fmt,
+            &mut img_w,
+            &mut img_h,
+            channels,
+            elem_size,
+            dst_stride,
+            rotation_deg,
+            flip_h,
+        )?;
     }
 
     Ok(ImageInfo {
@@ -355,4 +259,246 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         format: output_fmt,
         row_stride: dst_stride,
     })
+}
+
+/// u8 decode path: MCU writes into the tensor directly when no EXIF transform
+/// applies; otherwise stages into `exif_scratch`, rotates in place, then
+/// stride-copies into the (possibly pitch-padded) destination.
+#[allow(clippy::too_many_arguments)]
+fn decode_u8_path(
+    data: &[u8],
+    headers: &markers::JpegHeaders,
+    mcu_scratch: &mut mcu::McuScratch,
+    exif_scratch: &mut Vec<u8>,
+    rot_scratch: &mut Vec<u8>,
+    dst_u8: &mut [u8],
+    output_fmt: PixelFormat,
+    img_w: &mut usize,
+    img_h: &mut usize,
+    channels: usize,
+    dst_stride: usize,
+    rotation_deg: u16,
+    flip_h: bool,
+) -> crate::Result<()> {
+    if !flip_h && rotation_deg == 0 {
+        let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
+        return mcu::decode_image(data, headers, mcu_scratch, dst_u8, dst_stride, output_fmt);
+    }
+
+    // EXIF rotation/flip path: cannot decode directly into `dst_u8` when
+    // rotation swaps dims, because native rows would overflow the rotated
+    // tensor stride. Decode into scratch at native stride, rotate, copy out.
+    let native_stride = *img_w * channels;
+    exif_scratch.resize(native_stride * *img_h, 0);
+    decode_mcu_into(
+        data,
+        headers,
+        mcu_scratch,
+        exif_scratch,
+        native_stride,
+        output_fmt,
+    )?;
+    run_apply_exif(
+        exif_scratch,
+        native_stride,
+        img_w,
+        img_h,
+        channels,
+        rotation_deg,
+        flip_h,
+        rot_scratch,
+    );
+    // exif_scratch now holds post-rotation pixels at `img_w * channels`
+    // stride. Copy into the tensor at `dst_stride`, honouring pitch padding.
+    let final_native_stride = *img_w * channels;
+    for y in 0..*img_h {
+        let src_off = y * final_native_stride;
+        let dst_off = y * dst_stride;
+        dst_u8[dst_off..dst_off + final_native_stride]
+            .copy_from_slice(&exif_scratch[src_off..src_off + final_native_stride]);
+    }
+    Ok(())
+}
+
+/// Non-u8 decode path: MCU writes u8 into `exif_scratch`, EXIF (if needed)
+/// rotates in place, then `convert_rows_to_target` does the typed conversion.
+#[allow(clippy::too_many_arguments)]
+fn decode_typed_path<T: ImagePixel>(
+    data: &[u8],
+    headers: &markers::JpegHeaders,
+    mcu_scratch: &mut mcu::McuScratch,
+    exif_scratch: &mut Vec<u8>,
+    rot_scratch: &mut Vec<u8>,
+    dst_bytes: &mut [T],
+    output_fmt: PixelFormat,
+    img_w: &mut usize,
+    img_h: &mut usize,
+    channels: usize,
+    elem_size: usize,
+    dst_stride: usize,
+    rotation_deg: u16,
+    flip_h: bool,
+) -> crate::Result<()> {
+    let temp_stride = *img_w * channels;
+    exif_scratch.resize(temp_stride * *img_h, 0);
+    decode_mcu_into(
+        data,
+        headers,
+        mcu_scratch,
+        exif_scratch,
+        temp_stride,
+        output_fmt,
+    )?;
+
+    if flip_h || rotation_deg != 0 {
+        run_apply_exif(
+            exif_scratch,
+            temp_stride,
+            img_w,
+            img_h,
+            channels,
+            rotation_deg,
+            flip_h,
+            rot_scratch,
+        );
+    }
+
+    convert_rows_to_target::<T>(
+        exif_scratch,
+        dst_bytes,
+        *img_w,
+        *img_h,
+        channels,
+        dst_stride,
+        elem_size,
+    );
+    Ok(())
+}
+
+/// MCU decode wrapped in its own span so the cost is attributable in traces
+/// regardless of which decode path called it.
+#[inline]
+fn decode_mcu_into(
+    data: &[u8],
+    headers: &markers::JpegHeaders,
+    mcu_scratch: &mut mcu::McuScratch,
+    dst: &mut [u8],
+    dst_stride: usize,
+    output_fmt: PixelFormat,
+) -> crate::Result<()> {
+    let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
+    mcu::decode_image(data, headers, mcu_scratch, dst, dst_stride, output_fmt)
+}
+
+/// EXIF rotation wrapped in its own span. `img_w` / `img_h` may swap on
+/// 90°/270° rotations — that's why the caller passes them through `&mut`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn run_apply_exif(
+    data: &mut [u8],
+    stride: usize,
+    img_w: &mut usize,
+    img_h: &mut usize,
+    channels: usize,
+    rotation_deg: u16,
+    flip_h: bool,
+    rot_scratch: &mut Vec<u8>,
+) {
+    let _s = tracing::trace_span!("codec.decode_jpeg.apply_exif", rotation_deg, flip_h).entered();
+    apply_exif_u8(
+        data,
+        stride,
+        img_w,
+        img_h,
+        channels,
+        rotation_deg,
+        flip_h,
+        rot_scratch,
+    );
+}
+
+/// Per-row u8 → T conversion dispatch. Pulled out of `decode_jpeg_into` so
+/// the dtype if/else chain doesn't inflate the top-level function's
+/// cognitive complexity.
+fn convert_rows_to_target<T: ImagePixel>(
+    src: &[u8],
+    dst: &mut [T],
+    img_w: usize,
+    img_h: usize,
+    channels: usize,
+    dst_stride: usize,
+    elem_size: usize,
+) {
+    let _s = tracing::trace_span!(
+        "codec.decode_jpeg.type_convert",
+        dtype = std::any::type_name::<T>(),
+    )
+    .entered();
+    let src_stride = img_w * channels;
+    let dst_stride_elems = dst_stride / elem_size;
+
+    match T::dtype() {
+        edgefirst_tensor::DType::I8 => {
+            // SAFETY: T is i8 — layout-identical reinterpret of the dst slice.
+            let dst_u8: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len()) };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride;
+                dst_u8[d..d + src_stride].copy_from_slice(&src[s..s + src_stride]);
+                for b in &mut dst_u8[d..d + src_stride] {
+                    *b ^= 0x80;
+                }
+            }
+        }
+        edgefirst_tensor::DType::F32 => {
+            // SAFETY: T is f32 — layout-identical reinterpret of the dst slice.
+            let dst_f32: &mut [f32] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, dst.len()) };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_f32(
+                    &src[s..s + src_stride],
+                    &mut dst_f32[d..d + src_stride],
+                );
+            }
+        }
+        edgefirst_tensor::DType::U16 => {
+            // SAFETY: T is u16 — layout-identical reinterpret of the dst slice.
+            let dst_u16: &mut [u16] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u16, dst.len()) };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_u16(
+                    &src[s..s + src_stride],
+                    &mut dst_u16[d..d + src_stride],
+                );
+            }
+        }
+        edgefirst_tensor::DType::I16 => {
+            // SAFETY: T is i16 — layout-identical reinterpret of the dst slice.
+            let dst_i16: &mut [i16] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut i16, dst.len()) };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                convert::convert_u8_to_i16(
+                    &src[s..s + src_stride],
+                    &mut dst_i16[d..d + src_stride],
+                );
+            }
+        }
+        _ => {
+            // Fallback for any other type — slow per-element via ImagePixel.
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride_elems;
+                for x in 0..src_stride {
+                    dst[d + x] = T::from_u8(src[s + x]);
+                }
+            }
+        }
+    }
 }

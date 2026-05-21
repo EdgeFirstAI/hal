@@ -284,6 +284,124 @@ upsampled_protos)` per output pixel using a fragment shader. See
 [`../image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 for the GPU-side fused algorithm.
 
+## Tracing Spans
+
+Every public decode entry point emits a [`tracing::trace_span!`] tree. The
+spans are recorded as Chrome JSON when [`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
+is active and have near-zero overhead otherwise (a single relaxed atomic
+load per call site).
+
+### Naming convention
+
+Span names follow `<crate>.<function>[.<operation>[.<sub-operation>]]`:
+
+- **`<crate>.<function>`** — top-level span: the public function the user
+  invoked (e.g. `decoder.decode`, `decoder.decode_proto`). For this crate
+  those are the entry points on [`Decoder`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.Decoder.html).
+- **`<crate>.<function>.<operation>`** — meaningful internal work done as
+  part of that function (e.g. `decoder.decode.yolo_quant_flat`,
+  `decoder.decode.process_masks`).
+- **`<crate>.<function>.<operation>.<sub-operation>`** — further
+  decomposition where it aids optimisation (e.g.
+  `decoder.decode.per_scale_to_masks.process_masks`).
+- **`<crate>.<shared_op>[.<sub-operation>]`** — shared building blocks
+  reached from *multiple* user-facing functions; the function prefix is
+  omitted because a single source location can only carry one static name
+  (e.g. `decoder.nms_get_boxes.suppress` and `decoder.per_scale_run.level`
+  are both invoked from `decoder.decode` and `decoder.decode_proto`). The
+  parent span in the recorded trace identifies the actual caller.
+
+A span is worth adding when the work inside it is **meaningful for
+optimisation and has enough complexity to justify the overhead** — roughly
+500 µs on Cortex-A53 as a guideline.
+
+### Span tree
+
+```text
+decoder.decode                                          [user-facing fn]
+│ fields: path = "yolo_seg_det" | "yolo_split_seg_det" | "modelpack" | …
+│         n_outputs
+│
+├── decoder.decode.yolo_quant_flat                      [flat-tensor kernels]
+├── decoder.decode.yolo_float_flat
+├── decoder.decode.yolo_quant_split
+├── decoder.decode.yolo_float_split
+│
+├── decoder.decode.process_masks                        [coeff @ protos → per-detect mask, materialised path]
+│   fields: n, mode = "float" | "quant"
+│
+└── decoder.decode.per_scale_to_masks                   [per-scale → materialised masks bridge]
+    ├── decoder.decode.per_scale_to_masks.get_boxes     ← wraps decoder.nms_get_boxes
+    │   └── decoder.nms_get_boxes
+    └── decoder.decode.per_scale_to_masks.process_masks ← wraps decoder.decode.process_masks
+        └── decoder.decode.process_masks
+
+decoder.decode_proto                                    [user-facing fn]
+│ fields: path, n_outputs
+│
+├── decoder.decode_proto.extract_proto_data             [build ProtoData; no mask materialisation]
+│   fields: n, num_protos, layout, mode = "float" | "quant"
+│
+└── decoder.decode_proto.per_scale_to_proto_data        [per-scale → ProtoData bridge]
+    ├── decoder.decode_proto.per_scale_to_proto_data.get_boxes
+    │   └── decoder.nms_get_boxes
+    └── decoder.decode_proto.per_scale_to_proto_data.extract
+        └── decoder.decode_proto.extract_proto_data
+
+# Shared building blocks (reached from both decode and decode_proto;
+# parent in the trace tells you which one)
+
+decoder.per_scale_run                                   [the per-scale NEON hot path]
+│ fields: n_levels, encoding, nc, nm
+├── decoder.per_scale_run.resolve_bindings
+├── decoder.per_scale_run.level                         ← per FPN scale (80×80, 40×40, 20×20)
+│   │ fields: li, stride, h, w, anchors, layout
+│   ├── decoder.per_scale_run.level.boxes               ← DFL or LTRB box decode
+│   │   field: encoding
+│   ├── decoder.per_scale_run.level.scores              ← class-score dequant + sigmoid
+│   │   field: activation
+│   └── decoder.per_scale_run.level.mask_coefs          ← mask coefficient dequant (32-D)
+├── decoder.per_scale_run.protos                        ← proto-mask dequant (160×160×32)
+└── decoder.per_scale_run.widen_f32                     ← f16 → f32 widen or zero-copy borrow
+    field: kind = "f32_borrow" | "f16_widen"
+
+decoder.nms_get_boxes                                   [post-NMS candidate selection]
+│ fields: n_candidates, n_after_topk, n_after_nms, n_detections
+├── decoder.nms_get_boxes.score_filter                  ← max-class score threshold filter
+├── decoder.nms_get_boxes.top_k                         ← partial sort, retain pre_nms_top_k
+│   field: k
+├── decoder.nms_get_boxes.suppress                      ← class-agnostic / class-aware IoU NMS
+└── decoder.nms_get_boxes.dequant_boxes                 ← int8 → f32 on survivors only (quant path)
+    field: n
+```
+
+### What each span measures (mapped to reference YOLO post-processing)
+
+| Span                                            | Reference equivalent (Ultralytics)                      | What it does |
+|-------------------------------------------------|---------------------------------------------------------|--------------|
+| `decoder.decode`                                | `non_max_suppression(...)` + segmentation `process_mask`| Top-level decode entry. The `path` field tells you which model topology was selected at builder time. |
+| `decoder.decode_proto`                          | `decode` + skip `process_mask` (returns coeffs/protos)  | Returns proto data instead of materialised masks; pair with `image.materialize_masks` or the fused GPU shader. |
+| `decoder.decode.yolo_{quant,float}_{flat,split}`| `preds.transpose(-1, -2)` + `xywh2xyxy` + per-row filter| Flat-tensor and legacy split-tensor YOLO post-processing (pre-per-scale). Each kernel walks `(4 + nc, anchors)` once. |
+| `decoder.decode.process_masks`                  | `process_mask` / `process_mask_native`                  | `sigmoid(coefficients @ protos)` + crop to detection bbox. The `mode` field is the input dtype (float kernel vs. fused i8/i16 path). |
+| `decoder.decode_proto.extract_proto_data`       | n/a (HAL-specific)                                      | Pack per-detection coefficient rows + protos into a `ProtoData` for the GPU fused shader. The `n == 0` early-exit avoids a ~819 KB proto copy. |
+| `decoder.decode.per_scale_to_masks`             | n/a (HAL-specific bridge)                               | Plumbing between the per-scale outputs and the materialised-mask post-processing. |
+| `decoder.decode_proto.per_scale_to_proto_data`  | n/a (HAL-specific bridge)                               | Same bridge into the proto-extraction post-processing. |
+| `decoder.per_scale_run`                         | Anchor-free `dist2bbox` over multi-scale FPN heads      | The NEON-vectorised hot path for Ara-2 DVM and certain TFLite exports where the head is pre-split per FPN scale. Shared across `decode` and `decode_proto`. |
+| `decoder.per_scale_run.resolve_bindings`        | Plan-time tensor → role mapping                         | Walks the schema-derived `Plan` once to match input tensors to box / score / mc / protos roles. |
+| `decoder.per_scale_run.level`                   | One FPN scale (e.g. 80×80, 40×40, 20×20)                | All per-anchor work for one scale. Use the `li` and `anchors` fields to attribute cost to the dominant scale (level 0 has ~16× more anchors than level 2). |
+| `decoder.per_scale_run.level.boxes`             | `dist2bbox(dfl(x[:4*reg_max]))` or `ltrb2bbox`          | Box decode; DFL is the per-anchor bottleneck on Cortex-A53. |
+| `decoder.per_scale_run.level.scores`            | `sigmoid(class_logits)` per anchor                      | ~32% of decode time on imx95-evk per the per-stage estimate. The `activation` field distinguishes `sigmoid` from `none`. |
+| `decoder.per_scale_run.level.mask_coefs`        | Mask-coefficient dequant (no sigmoid)                   | 32-D coefficient stream per anchor. |
+| `decoder.per_scale_run.protos`                  | `protos` head dequant (NHWC or NCHW → NHWC)             | One-time per-frame proto-mask dequant; the GPU shader consumes the resulting f32/f16 array as a texture. |
+| `decoder.per_scale_run.widen_f32`               | n/a (HAL-specific)                                      | If the per-scale path produced f16 buffers, widen to f32 for the legacy NMS kernels. `kind = "f32_borrow"` means zero allocation. |
+| `decoder.nms_get_boxes`                         | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes. The `n_candidates → n_after_topk → n_after_nms → n_detections` fields tell you where candidates were dropped. Shared across detection paths. |
+| `decoder.nms_get_boxes.score_filter`            | `xc = candidates.amax(1) > conf`                        | Per-row max-class score threshold filter. |
+| `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial sort to `pre_nms_top_k` candidates (default 300; raise to anchor count for COCO mAP at `conf=0.001`). |
+| `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
+| `decoder.nms_get_boxes.dequant_boxes`           | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
+
+[`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
+
 ## Performance Considerations
 
 - **Quantized integer math** — `decode_quantized` and `decode_quantized_proto` operate directly on int8/uint8 buffers, avoiding the cost of producing an intermediate dequantized `f32` tensor.

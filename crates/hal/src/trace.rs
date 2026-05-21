@@ -185,7 +185,7 @@ mod tests {
 
         // Emit a span to ensure the file gets content
         {
-            let _span = tracing::trace_span!("test_span", key = "value").entered();
+            let _span = tracing::trace_span!("hal.test_span", key = "value").entered();
         }
 
         // Stop should deactivate
