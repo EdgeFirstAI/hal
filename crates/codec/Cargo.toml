@@ -23,6 +23,7 @@ kamadak-exif = { workspace = true }
 log = { workspace = true }
 num-traits = { workspace = true }
 opencv = { workspace = true, optional = true }
+tracing = { workspace = true }
 turbojpeg = { version = "0.5", optional = true }
 zune-png = { workspace = true }
 

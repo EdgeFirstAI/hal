@@ -125,8 +125,17 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     opts: &DecodeOptions,
     state: &mut JpegDecoderState,
 ) -> crate::Result<ImageInfo> {
+    let _span = tracing::trace_span!(
+        "codec.decode_jpeg",
+        dtype = std::any::type_name::<T>(),
+        n_bytes = data.len(),
+    )
+    .entered();
     // Parse all marker segments
-    let headers = markers::parse_markers(data)?;
+    let headers = {
+        let _s = tracing::trace_span!("codec.jpeg.parse_markers").entered();
+        markers::parse_markers(data)?
+    };
 
     let hdr = &headers.header;
     let mut img_w = hdr.width as usize;
@@ -221,24 +230,31 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             // because native rows would overflow the rotated tensor stride.
             let native_stride = img_w * channels;
             state.exif_scratch.resize(native_stride * img_h, 0);
-            mcu::decode_image(
-                data,
-                &headers,
-                mcu_scratch,
-                &mut state.exif_scratch,
-                native_stride,
-                output_fmt,
-            )?;
-            apply_exif_u8(
-                &mut state.exif_scratch,
-                native_stride,
-                &mut img_w,
-                &mut img_h,
-                channels,
-                rotation_deg,
-                flip_h,
-                &mut state.rot_scratch,
-            );
+            {
+                let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
+                mcu::decode_image(
+                    data,
+                    &headers,
+                    mcu_scratch,
+                    &mut state.exif_scratch,
+                    native_stride,
+                    output_fmt,
+                )?;
+            }
+            {
+                let _s =
+                    tracing::trace_span!("codec.jpeg.apply_exif", rotation_deg, flip_h,).entered();
+                apply_exif_u8(
+                    &mut state.exif_scratch,
+                    native_stride,
+                    &mut img_w,
+                    &mut img_h,
+                    channels,
+                    rotation_deg,
+                    flip_h,
+                    &mut state.rot_scratch,
+                );
+            }
             // exif_scratch now holds post-rotation pixels at stride
             // `img_w * channels`. Copy into the tensor at `dst_stride`,
             // which honors any pitch padding.
@@ -250,6 +266,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
                     .copy_from_slice(&state.exif_scratch[src_off..src_off + final_native_stride]);
             }
         } else {
+            let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
             mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
         }
     } else {
@@ -258,17 +275,21 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         let temp_size = temp_stride * img_h;
         state.exif_scratch.resize(temp_size, 0);
 
-        mcu::decode_image(
-            data,
-            &headers,
-            mcu_scratch,
-            &mut state.exif_scratch,
-            temp_stride,
-            output_fmt,
-        )?;
+        {
+            let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
+            mcu::decode_image(
+                data,
+                &headers,
+                mcu_scratch,
+                &mut state.exif_scratch,
+                temp_stride,
+                output_fmt,
+            )?;
+        }
 
         // Apply EXIF transformations on the temp buffer
         if flip_h || rotation_deg != 0 {
+            let _s = tracing::trace_span!("codec.jpeg.apply_exif", rotation_deg, flip_h,).entered();
             apply_exif_u8(
                 &mut state.exif_scratch,
                 temp_stride,
@@ -282,6 +303,11 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         }
 
         // Convert u8 → T and write to tensor at stride offsets
+        let _s = tracing::trace_span!(
+            "codec.jpeg.type_convert",
+            dtype = std::any::type_name::<T>(),
+        )
+        .entered();
         let src_stride = img_w * channels;
         let dst_stride_elems = dst_stride / elem_size;
 
