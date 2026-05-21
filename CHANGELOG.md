@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2] - 2026-05-21
+
+### Changed
+
+- **Tracing span rename — observable surface, not API.** All `tracing::trace_span!`
+  call sites across the workspace adopt a uniform `<crate>.<subsystem>.<operation>`
+  naming convention (snake_case, dotted). Span names appear as labels in
+  Perfetto / Chrome traces; any saved query, dashboard, or filter that targets
+  the old names will need updating. See the per-crate ARCHITECTURE.md "Tracing
+  Spans" sections for the authoritative mapping.
+
+  Notable replacements (full list in the per-crate docs):
+
+  | Old name (collision) | New name |
+  |---|---|
+  | `decode` (4 YOLO entry points + 2 segdet inner kernels) | `decoder.yolo.decode_{quant,float}_{flat,split}` and `decoder.nms.get_boxes` |
+  | `score_filter` / `top_k` / `nms` / `box_dequant` | `decoder.nms.{score_filter,top_k,suppress,dequant_boxes}` |
+  | `process_masks` | `decoder.process_masks` |
+  | `extract_proto` | `decoder.extract_proto_data` |
+  | `per_scale_decode` and `box` / `score` / `mc` | `decoder.per_scale.{run,boxes,scores,mask_coefs}` |
+  | `per_scale_bridge::*` | `decoder.per_scale.{widen_f32,to_proto_data,to_masks,bridge_*}` |
+  | `Decoder::decode` / `Decoder::decode_proto` | `decoder.{decode,decode_proto}` |
+  | `image_convert` / `draw_masks` | `image.{convert,draw_decoded_masks}` |
+  | `g2d_convert` / `gl_convert` | `image.{g2d,gl}.convert` |
+  | `gl_pass1_to_rgba` / `gl_pass2_pack_rgb` / `gl_pass2_to_planar` | `image.gl.{pack_rgb.pass1_rgba,pack_rgb.pass2_pack,nv12_to_planar.pass1_rgba,nv12_to_planar.pass2_deinterleave}` |
+  | `cpu_format_convert` / `cpu_resize` | `image.cpu.{format_convert,resize_flip_rotate}` |
+  | `materialize_masks` / `mask_i8_fastpath` / `mask_i16_i8_fastpath` | `image.materialize_masks` and `image.masks.{kernel_i8,kernel_i16xi8,kernel_i8_scaled,kernel_i16xi8_scaled}` |
+  | `tracker_update` / `predict` / `match_*` | `tracker.{update,predict,match_high_conf,match_low_conf}` |
+  | `tensor_alloc` / `tensor_map` | `tensor.{alloc,map}` |
+  | `py_*` | `python.*` |
+
+### Added
+
+- Tracing spans in the `edgefirst-codec` crate (previously had none):
+  `codec.decode_jpeg`, `codec.decode_png`, plus inner spans
+  `codec.jpeg.{parse_markers,mcu_loop,apply_exif,type_convert}` and
+  `codec.png.zune_decode`. The JPEG marker-parse, MCU decode loop, and EXIF
+  rotation phases are now individually visible in Perfetto.
+- `tracing` workspace dependency added to `edgefirst-codec`.
+- "Tracing Spans" sections in `crates/decoder/ARCHITECTURE.md`,
+  `crates/image/ARCHITECTURE.md`, and `crates/codec/ARCHITECTURE.md` —
+  authoritative span tree + per-span operation description, satisfying the
+  cross-reference promise made in `README.md#performance-tracing`.
+
 ## [0.23.1] - 2026-05-19
 
 ### Fixed

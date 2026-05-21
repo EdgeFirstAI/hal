@@ -165,7 +165,7 @@ pub(crate) fn run<'a>(
     // Perfetto's flame graph; per-level / per-role child spans below
     // give the per-stage decomposition we need to find hotspots.
     let _outer = tracing::trace_span!(
-        "per_scale_decode",
+        "decoder.per_scale.run",
         n_levels = plan.levels.len(),
         encoding = ?plan.box_encoding,
         nc = plan.num_classes,
@@ -173,7 +173,7 @@ pub(crate) fn run<'a>(
     )
     .entered();
     let bind = {
-        let _s = tracing::trace_span!("resolve_bindings").entered();
+        let _s = tracing::trace_span!("decoder.per_scale.resolve_bindings").entered();
         resolve_bindings(plan, inputs)?
     };
 
@@ -194,7 +194,7 @@ pub(crate) fn run<'a>(
     // When the schema declares NCHW protos, we transpose into the NHWC
     // scratch before dequant, matching the per-level NCHW strategy.
     if let (Some(proto_input), Some(proto_dispatch)) = (bind.protos, plan.proto_dispatch) {
-        let _s = tracing::trace_span!("protos").entered();
+        let _s = tracing::trace_span!("decoder.per_scale.protos").entered();
         let q = quant_from_tensor(proto_input, "protos", 0)?;
         let proto_layout = plan.proto_layout.unwrap_or(Layout::Nhwc);
         // Destructure to get disjoint borrows on `protos` and
@@ -261,7 +261,7 @@ fn run_levels_sequential(
         // Per-level span groups all role work (box / score / mc) for one
         // FPN scale. `h*w` is the dominant cost factor.
         let _level_span = tracing::trace_span!(
-            "level",
+            "decoder.per_scale.level",
             li = li,
             stride = lvl.stride,
             h = lvl.h,
@@ -283,7 +283,8 @@ fn run_levels_sequential(
         // bottleneck on Cortex-A53; this span isolates the cost from
         // score / mc.
         {
-            let _s = tracing::trace_span!("box", encoding = ?plan.box_encoding).entered();
+            let _s = tracing::trace_span!("decoder.per_scale.boxes", encoding = ?plan.box_encoding)
+                .entered();
             let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
             let dst = boxes_level_slice_of(boxes, lvl.anchor_offset, lvl.h * lvl.w);
             let box_channels = box_channel_count_for_level(lvl);
@@ -304,7 +305,7 @@ fn run_levels_sequential(
         // the per-stage estimate; isolating it lets us see whether the
         // dequant or sigmoid dominates after NEON wiring.
         {
-            let _s = tracing::trace_span!("score", activation = ?plan.score_activation).entered();
+            let _s = tracing::trace_span!("decoder.per_scale.scores", activation = ?plan.score_activation).entered();
             let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
             let dst =
                 scores_level_slice_of(scores, lvl.anchor_offset, lvl.h * lvl.w, plan.num_classes);
@@ -337,7 +338,7 @@ fn run_levels_sequential(
             plan.mc_dispatch,
             Some(plan.num_mask_coefs).filter(|&n| n > 0),
         ) {
-            let _s = tracing::trace_span!("mc").entered();
+            let _s = tracing::trace_span!("decoder.per_scale.mask_coefs").entered();
             let q = quant_from_tensor(mc_input, "mask_coefs", li)?;
             let mc_buf = mask_coefs.as_mut().ok_or_else(|| {
                 DecoderError::Internal(
@@ -502,7 +503,7 @@ fn process_one_level_nhwc(
     mc_dst: Option<crate::per_scale::kernels::dispatch::DstSliceMut<'_>>,
 ) -> DecoderResult<()> {
     let _level_span = tracing::trace_span!(
-        "level",
+        "decoder.per_scale.level",
         li = li,
         stride = lvl.stride,
         h = lvl.h,
@@ -513,7 +514,8 @@ fn process_one_level_nhwc(
     .entered();
 
     {
-        let _s = tracing::trace_span!("box", encoding = ?plan.box_encoding).entered();
+        let _s = tracing::trace_span!("decoder.per_scale.boxes", encoding = ?plan.box_encoding)
+            .entered();
         let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
         with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
             plan.box_dispatch.run(input, q, lvl, box_dst)
@@ -521,7 +523,9 @@ fn process_one_level_nhwc(
     }
 
     {
-        let _s = tracing::trace_span!("score", activation = ?plan.score_activation).entered();
+        let _s =
+            tracing::trace_span!("decoder.per_scale.scores", activation = ?plan.score_activation)
+                .entered();
         let q = quant_from_tensor(lvl_bind.scores, "scores", li)?;
         with_mapped_input(lvl_bind.scores, "scores", li, |input| {
             plan.score_dispatch.run(
@@ -541,7 +545,7 @@ fn process_one_level_nhwc(
         Some(plan.num_mask_coefs).filter(|&n| n > 0),
         mc_dst,
     ) {
-        let _s = tracing::trace_span!("mc").entered();
+        let _s = tracing::trace_span!("decoder.per_scale.mask_coefs").entered();
         let q = quant_from_tensor(mc_input, "mask_coefs", li)?;
         with_mapped_input(mc_input, "mask_coefs", li, |input| {
             mc_dispatch.run(input, q, num_mc_gt0, lvl, mc_dst)

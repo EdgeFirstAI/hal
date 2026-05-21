@@ -84,6 +84,12 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
     scratch: &mut Vec<u8>,
     rot_scratch: &mut Vec<u8>,
 ) -> crate::Result<ImageInfo> {
+    let _span = tracing::trace_span!(
+        "codec.decode_png",
+        dtype = std::any::type_name::<T>(),
+        n_bytes = data.len(),
+    )
+    .entered();
     let dest_fmt = opts.format.unwrap_or(PixelFormat::Rgb);
 
     let zune_opts = DecoderOptions::default()
@@ -185,7 +191,10 @@ fn decode_png_via_decoding_result<T: ImagePixel>(
     img_w: usize,
     img_h: usize,
 ) -> crate::Result<ImageInfo> {
-    let result = decoder.decode()?;
+    let result = {
+        let _s = tracing::trace_span!("codec.png.zune_decode", path = "native_u16").entered();
+        decoder.decode()?
+    };
 
     let final_channels = dest_fmt.channels();
     let elem_size = std::mem::size_of::<T>();
@@ -360,7 +369,10 @@ fn decode_png_via_u8<T: ImagePixel>(
     };
     let decoded_size = img_w * img_h * decode_channels;
     scratch.resize(decoded_size, 0);
-    decoder.decode_into(scratch)?;
+    {
+        let _s = tracing::trace_span!("codec.png.zune_decode", path = "u8").entered();
+        decoder.decode_into(scratch)?;
+    }
 
     // Strip LumaA → Grey if needed
     let (src_pixels, src_channels) = if strip_luma_alpha {

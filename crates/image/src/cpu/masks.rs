@@ -229,7 +229,7 @@ impl CPUProcessor {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
         let _span = tracing::trace_span!(
-            "materialize_masks",
+            "image.materialize_masks",
             mode = "proto",
             n_detections = detect.len(),
         )
@@ -604,7 +604,7 @@ impl CPUProcessor {
         use edgefirst_tensor::{DType, TensorMapTrait, TensorTrait};
 
         let _span = tracing::trace_span!(
-            "materialize_masks",
+            "image.materialize_masks",
             mode = "scaled",
             n_detections = detect.len(),
             width,
@@ -982,7 +982,7 @@ fn proto_segmentations_i8_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "mask_i8_fastpath",
+        "image.masks.kernel_i8",
         n = detect.len(),
         proto_h,
         proto_w,
@@ -1199,7 +1199,7 @@ fn proto_segmentations_i16_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "mask_i16_i8_fastpath",
+        "image.masks.kernel_i16xi8",
         n = detect.len(),
         proto_h,
         proto_w,
@@ -2024,7 +2024,7 @@ fn scaled_segmentations_i8_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "mask_i8_fastpath",
+        "image.masks.kernel_i8_scaled",
         n = detect.len(),
         proto_h,
         proto_w,
@@ -2326,7 +2326,7 @@ fn scaled_segmentations_i16_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "mask_i16_i8_fastpath",
+        "image.masks.kernel_i16xi8_scaled",
         n = detect.len(),
         proto_h,
         proto_w,

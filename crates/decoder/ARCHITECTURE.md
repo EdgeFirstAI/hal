@@ -276,6 +276,98 @@ upsampled_protos)` per output pixel using a fragment shader. See
 [`../image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 for the GPU-side fused algorithm.
 
+## Tracing Spans
+
+Every public decode entry point emits a [`tracing::trace_span!`] tree. The
+spans are recorded as Chrome JSON when [`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
+is active and have near-zero overhead otherwise (a single relaxed atomic
+load per call site).
+
+Span names follow the convention `<crate>.<subsystem>.<operation>`. Inner
+spans keep the full prefix so a Perfetto cell makes sense in isolation and
+queries can filter by subsystem (e.g. all `decoder.nms.*`).
+
+### Span tree
+
+```text
+decoder.decode  (or decoder.decode_proto)               [entry point]
+│ fields: path = "yolo_seg_det" | "yolo_split_seg_det" | "modelpack" | …
+│         n_outputs
+│
+├── decoder.per_scale.run                                [per-scale fast path]
+│   │ fields: n_levels, encoding, nc, nm
+│   ├── decoder.per_scale.resolve_bindings
+│   ├── decoder.per_scale.level                          ← per FPN scale (80×80, 40×40, 20×20)
+│   │   │ fields: li, stride, h, w, anchors, layout
+│   │   ├── decoder.per_scale.boxes                      ← DFL or LTRB box decode
+│   │   │   fields: encoding
+│   │   ├── decoder.per_scale.scores                     ← class-score dequant + sigmoid
+│   │   │   fields: activation
+│   │   └── decoder.per_scale.mask_coefs                 ← mask coefficient dequant (32-D)
+│   └── decoder.per_scale.protos                         ← proto-mask dequant (160×160×32)
+│
+├── decoder.per_scale.widen_f32                          [f16 → f32 widen or zero-copy borrow]
+│   field: kind = "f32_borrow" | "f16_widen"
+│
+├── decoder.per_scale.to_proto_data                      [bridge → ProtoData]
+│   ├── decoder.per_scale.bridge_get_boxes               ← wraps decoder.nms.get_boxes
+│   │   └── decoder.nms.get_boxes
+│   └── decoder.per_scale.bridge_extract_proto
+│       └── decoder.extract_proto_data (mode = "float")
+│
+├── decoder.per_scale.to_masks                           [bridge → materialised masks]
+│   ├── decoder.per_scale.bridge_get_boxes
+│   │   └── decoder.nms.get_boxes
+│   └── decoder.per_scale.bridge_process_masks
+│       └── decoder.process_masks (mode = "float")
+│
+├── decoder.yolo.decode_quant_flat                       [flat/legacy quant detection]
+├── decoder.yolo.decode_float_flat                       [flat/legacy float detection]
+├── decoder.yolo.decode_quant_split                      [split-tensor quant detection]
+├── decoder.yolo.decode_float_split                      [split-tensor float detection]
+│
+├── decoder.nms.get_boxes                                [post-NMS candidate selection]
+│   │ fields: n_candidates, n_after_topk, n_after_nms, n_detections
+│   ├── decoder.nms.score_filter                         ← max-class score threshold filter
+│   ├── decoder.nms.top_k                                ← partial sort, retain pre_nms_top_k
+│   │   field: k
+│   ├── decoder.nms.suppress                             ← class-agnostic / class-aware IoU NMS
+│   └── decoder.nms.dequant_boxes                        ← int8 → f32 on survivors only (quant path)
+│       field: n
+│
+├── decoder.process_masks                                [coefficient @ protos → per-detect mask]
+│   fields: n, mode = "float" | "quant"
+│
+└── decoder.extract_proto_data                           [build ProtoData for GPU fused render]
+    fields: n, num_protos, layout = "nhwc" | "nchw", mode = "float" | "quant"
+```
+
+### What each span measures (mapped to reference YOLO post-processing)
+
+| Span                                | Reference equivalent (Ultralytics)                      | What it does |
+|-------------------------------------|---------------------------------------------------------|--------------|
+| `decoder.decode`                    | `non_max_suppression(...)` + segmentation `process_mask`| Top-level decode entry. The `path` field tells you which model topology was selected at builder time. |
+| `decoder.decode_proto`              | `decode` + skip `process_mask` (returns coeffs/protos)  | Returns proto data instead of materialised masks; pair with `image.materialize_masks` or the fused GPU shader. |
+| `decoder.yolo.decode_*_{flat,split}`| `preds.transpose(-1, -2)` + `xywh2xyxy` + per-row filter| Flat-tensor and legacy split-tensor YOLO post-processing (pre-per-scale). Each kernel walks `(4 + nc, anchors)` once. |
+| `decoder.per_scale.run`             | Anchor-free `dist2bbox` over multi-scale FPN heads      | The NEON-vectorised hot path for Ara-2 DVM and certain TFLite exports where the head is pre-split per FPN scale. |
+| `decoder.per_scale.resolve_bindings`| Plan-time tensor → role mapping                         | Walks the schema-derived `Plan` once to match input tensors to box / score / mc / protos roles. |
+| `decoder.per_scale.level`           | One FPN scale (e.g. 80×80, 40×40, 20×20)                | All per-anchor work for one scale. Use the `li` and `anchors` fields to attribute cost to the dominant scale (level 0 has ~16× more anchors than level 2). |
+| `decoder.per_scale.boxes`           | `dist2bbox(dfl(x[:4*reg_max]))` or `ltrb2bbox`          | Box decode; DFL is the per-anchor bottleneck on Cortex-A53. |
+| `decoder.per_scale.scores`          | `sigmoid(class_logits)` per anchor                      | ~32% of decode time on imx95-evk per the per-stage estimate. The `activation` field distinguishes `sigmoid` from `none`. |
+| `decoder.per_scale.mask_coefs`      | Mask-coefficient dequant (no sigmoid)                   | 32-D coefficient stream per anchor. |
+| `decoder.per_scale.protos`          | `protos` head dequant (NHWC or NCHW → NHWC)             | One-time per-frame protein-mask dequant; the GPU shader consumes the resulting f32/f16 array as a texture. |
+| `decoder.per_scale.widen_f32`       | n/a (HAL-specific)                                      | If the per-scale path produced f16 buffers, widen to f32 for the legacy NMS kernels. `kind = "f32_borrow"` means zero allocation. |
+| `decoder.per_scale.to_*`            | n/a (HAL-specific bridge)                               | Plumbing between the per-scale outputs and the legacy `impl_yolo_segdet_*` kernels. The `bridge_*` inner spans wrap the corresponding shared kernel spans. |
+| `decoder.nms.get_boxes`             | `non_max_suppression`                                   | Composite span over score_filter + top_k + suppress + dequant_boxes. The `n_candidates → n_after_topk → n_after_nms → n_detections` fields tell you where candidates were dropped. |
+| `decoder.nms.score_filter`          | `xc = candidates.amax(1) > conf`                        | Per-row max-class score threshold filter. |
+| `decoder.nms.top_k`                 | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial sort to `pre_nms_top_k` candidates (default 300; raise to anchor count for COCO mAP at `conf=0.001`). |
+| `decoder.nms.suppress`              | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
+| `decoder.nms.dequant_boxes`         | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
+| `decoder.process_masks`             | `process_mask` / `process_mask_native`                  | `sigmoid(coefficients @ protos)` + crop to detection bbox. The `mode` field is the input dtype (float kernel vs. fused i8/i16 path). |
+| `decoder.extract_proto_data`        | n/a (HAL-specific)                                      | Pack per-detection coefficient rows + protos into a `ProtoData` for the GPU fused shader. The `n == 0` early-exit avoids a ~819 KB proto copy. |
+
+[`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
+
 ## Performance Considerations
 
 - **Quantized integer math** — `decode_quantized` and `decode_quantized_proto` operate directly on int8/uint8 buffers, avoiding the cost of producing an intermediate dequantized `f32` tensor.
