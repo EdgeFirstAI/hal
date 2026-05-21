@@ -191,11 +191,7 @@ fn decode_png_via_decoding_result<T: ImagePixel>(
     img_w: usize,
     img_h: usize,
 ) -> crate::Result<ImageInfo> {
-    let result = {
-        let _s =
-            tracing::trace_span!("codec.decode_png.zune_decode", path = "native_u16").entered();
-        decoder.decode()?
-    };
+    let result = run_zune_decode(&mut decoder)?;
 
     let final_channels = dest_fmt.channels();
     let elem_size = std::mem::size_of::<T>();
@@ -370,10 +366,7 @@ fn decode_png_via_u8<T: ImagePixel>(
     };
     let decoded_size = img_w * img_h * decode_channels;
     scratch.resize(decoded_size, 0);
-    {
-        let _s = tracing::trace_span!("codec.decode_png.zune_decode", path = "u8").entered();
-        decoder.decode_into(scratch)?;
-    }
+    run_zune_decode_into(&mut decoder, scratch)?;
 
     // Strip LumaA → Grey if needed
     let (src_pixels, src_channels) = if strip_luma_alpha {
@@ -594,6 +587,29 @@ fn convert_pixels_u16(src: &[u16], src_ch: usize, dst_ch: usize, pixel_count: us
         }
     }
     out
+}
+
+/// Native-bit-depth `decode()` wrapped in its own span. Lifted out of
+/// `decode_png_via_decoding_result` so the per-row dispatch loop there
+/// doesn't pay a cognitive-complexity point for the span scope.
+#[inline]
+fn run_zune_decode(
+    decoder: &mut PngDecoder<zune_png::zune_core::bytestream::ZCursor<&[u8]>>,
+) -> crate::Result<DecodingResult> {
+    let _s = tracing::trace_span!("codec.decode_png.zune_decode", path = "native_u16").entered();
+    Ok(decoder.decode()?)
+}
+
+/// `decode_into(&mut [u8])` wrapped in its own span. Counterpart to
+/// `run_zune_decode` for the u8 fast path.
+#[inline]
+fn run_zune_decode_into(
+    decoder: &mut PngDecoder<zune_png::zune_core::bytestream::ZCursor<&[u8]>>,
+    scratch: &mut [u8],
+) -> crate::Result<()> {
+    let _s = tracing::trace_span!("codec.decode_png.zune_decode", path = "u8").entered();
+    decoder.decode_into(scratch)?;
+    Ok(())
 }
 
 #[cfg(test)]
