@@ -1693,7 +1693,7 @@ impl ImageProcessorTrait for ImageProcessor {
         let src_fmt = src.format();
         let dst_fmt = dst.format();
         let _span = tracing::trace_span!(
-            "image_convert",
+            "image.convert",
             ?src_fmt,
             ?dst_fmt,
             src_memory = ?src.memory(),
@@ -1817,7 +1817,7 @@ impl ImageProcessorTrait for ImageProcessor {
         overlay: MaskOverlay<'_>,
     ) -> Result<()> {
         let _span = tracing::trace_span!(
-            "draw_masks",
+            "image.draw_decoded_masks",
             n_detections = detect.len(),
             n_segmentations = segmentation.len(),
         )

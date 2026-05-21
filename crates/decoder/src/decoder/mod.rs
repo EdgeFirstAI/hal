@@ -906,7 +906,7 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
     ) -> Result<(), DecoderError> {
         let path = self.decode_path_label();
-        let _span = tracing::trace_span!("Decoder::decode", path = path, n_outputs = outputs.len())
+        let _span = tracing::trace_span!("decoder.decode", path = path, n_outputs = outputs.len())
             .entered();
         // Per-scale fast path — selected at builder time when the schema
         // declares per-scale children with DFL or LTRB encoding.
@@ -990,7 +990,7 @@ impl Decoder {
     ) -> Result<Option<ProtoData>, DecoderError> {
         let path = self.decode_path_label();
         let _span = tracing::trace_span!(
-            "Decoder::decode_proto",
+            "decoder.decode_proto",
             path = path,
             n_outputs = outputs.len()
         )
