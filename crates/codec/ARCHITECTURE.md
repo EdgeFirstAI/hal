@@ -301,41 +301,50 @@ decode. Spans are captured by
 into Chrome JSON for Perfetto. The cost when no subscriber is active is a
 single relaxed atomic load per call site.
 
-Span names follow `<crate>.<subsystem>.<operation>`. The codec entry points
-are format-specific (`codec.decode_jpeg`, `codec.decode_png`) and the inner
-spans isolate the structural phases of each decoder.
+### Naming convention
+
+Span names follow `<crate>.<function>[.<operation>[.<sub-operation>]]`:
+
+- **`<crate>.<function>`** — top-level span: the public function the user
+  invoked. The codec exposes format-specific entry points (`codec.decode_jpeg`,
+  `codec.decode_png`) selected automatically from the magic bytes.
+- **`<crate>.<function>.<operation>`** — meaningful internal work
+  (`codec.decode_jpeg.parse_markers`, `codec.decode_jpeg.mcu_loop`, etc.).
+- A span is worth adding when the work inside it is meaningful for
+  optimisation and has enough complexity to justify the overhead — roughly
+  500 µs on Cortex-A53 as a guideline.
 
 ### Span tree
 
 ```text
-codec.decode_jpeg                                       [JPEG entry point]
+codec.decode_jpeg                                       [user-facing fn]
 │ fields: dtype = "u8" | "i8" | "u16" | "i16" | "f32", n_bytes
 │
-├── codec.jpeg.parse_markers                            ← parse SOF0/DQT/DHT/DRI/SOS/APP1, read EXIF
-├── codec.jpeg.mcu_loop                                 ← Huffman + IDCT + upsample + colour-convert
-├── codec.jpeg.apply_exif                               ← EXIF orientation transform (rotation/flip)
+├── codec.decode_jpeg.parse_markers                     ← parse SOF0/DQT/DHT/DRI/SOS/APP1, read EXIF
+├── codec.decode_jpeg.mcu_loop                          ← Huffman + IDCT + upsample + colour-convert
+├── codec.decode_jpeg.apply_exif                        ← EXIF orientation transform (rotation/flip)
 │   fields: rotation_deg, flip_h
-└── codec.jpeg.type_convert                             ← u8 → T conversion (skipped for u8 target)
+└── codec.decode_jpeg.type_convert                      ← u8 → T conversion (skipped for u8 target)
     field: dtype
 
-codec.decode_png                                        [PNG entry point]
+codec.decode_png                                        [user-facing fn]
 │ fields: dtype, n_bytes
 │
-└── codec.png.zune_decode                               ← delegate to zune-png
+└── codec.decode_png.zune_decode                        ← delegate to zune-png
     field: path = "u8" | "native_u16"
 ```
 
 ### What each span measures (mapped to the JPEG / PNG decode pipeline)
 
-| Span                       | What is happening inside | Reference equivalent |
-|----------------------------|--------------------------|----------------------|
-| `codec.decode_jpeg`        | Full JPEG decode: marker parsing, MCU decode loop, optional EXIF rotation, optional type conversion to non-u8 targets. | Baseline JPEG decode per ITU T.81 + EXIF 2.32. |
-| `codec.jpeg.parse_markers` | Walk the JPEG byte stream once: parse SOF0 (start-of-frame), DQT (quantisation tables), DHT (Huffman tables), DRI (restart interval), SOS (start-of-scan), and APP1 (EXIF) segments. Builds Huffman LUTs and quant tables, extracts EXIF bytes. | Equivalent to libjpeg's `jpeg_read_header` + DHT/DQT table builds. |
-| `codec.jpeg.mcu_loop`      | The core decode loop: for each MCU row, Huffman-decode + dequant-fuse blocks → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2 selected at init) → bilinear chroma upsample (4:2:0 / 4:2:2 → 4:4:4) → BT.601 YCbCr → RGB/RGBA/BGRA/Grey/NV12 colour conversion → strided write into the tensor. Allocation-free after warmup. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, but with the IDCT / chroma-upsample / colour-convert kernels handwritten and SIMD-dispatched per-CPU. |
-| `codec.jpeg.apply_exif`    | In-place rotation / horizontal flip on the decoded scratch buffer using `kamadak-exif`'s orientation tag. Skipped when `apply_exif=false` or for NV12 output (which doesn't support rotation). | Equivalent to libjpeg-turbo's `jpegtran -copy all -rotate ...` orientation transform. |
-| `codec.jpeg.type_convert`  | Vectorised u8 → target-type conversion at the row level: `*1/255` for f32, `*257` for u16, `*257 ^ 0x8000` for i16, `^ 0x80` for i8. NEON or SSE2 dispatch per row. Skipped for u8 targets (those write directly into the tensor during the MCU loop). | No libjpeg equivalent — this is the ML-quantisation conversion layer specific to EdgeFirst's tensor types. |
-| `codec.decode_png`         | Full PNG decode: header parse, native or 8-bit `zune-png` decode, optional EXIF rotation, format conversion to the requested `PixelFormat`. | PNG decode per ISO/IEC 15948 (RFC 2083). |
-| `codec.png.zune_decode`    | The bulk of PNG cost: zlib inflate + PNG filter reversal inside [`zune-png`](https://docs.rs/zune-png). `path = "u8"` is the strided-output fast path; `path = "native_u16"` preserves 16-bit-per-channel PNGs and is used for u16/i16/f32 tensor targets. | Equivalent to libpng's `png_read_image`. |
+| Span                              | What is happening inside | Reference equivalent |
+|-----------------------------------|--------------------------|----------------------|
+| `codec.decode_jpeg`               | Full JPEG decode: marker parsing, MCU decode loop, optional EXIF rotation, optional type conversion to non-u8 targets. | Baseline JPEG decode per ITU T.81 + EXIF 2.32. |
+| `codec.decode_jpeg.parse_markers` | Walk the JPEG byte stream once: parse SOF0 (start-of-frame), DQT (quantisation tables), DHT (Huffman tables), DRI (restart interval), SOS (start-of-scan), and APP1 (EXIF) segments. Builds Huffman LUTs and quant tables, extracts EXIF bytes. | Equivalent to libjpeg's `jpeg_read_header` + DHT/DQT table builds. |
+| `codec.decode_jpeg.mcu_loop`      | The core decode loop: for each MCU row, Huffman-decode + dequant-fuse blocks → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2 selected at init) → bilinear chroma upsample (4:2:0 / 4:2:2 → 4:4:4) → BT.601 YCbCr → RGB/RGBA/BGRA/Grey/NV12 colour conversion → strided write into the tensor. Allocation-free after warmup. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, but with the IDCT / chroma-upsample / colour-convert kernels handwritten and SIMD-dispatched per-CPU. |
+| `codec.decode_jpeg.apply_exif`    | In-place rotation / horizontal flip on the decoded scratch buffer using `kamadak-exif`'s orientation tag. Skipped when `apply_exif=false` or for NV12 output (which doesn't support rotation). | Equivalent to libjpeg-turbo's `jpegtran -copy all -rotate ...` orientation transform. |
+| `codec.decode_jpeg.type_convert`  | Vectorised u8 → target-type conversion at the row level: `*1/255` for f32, `*257` for u16, `*257 ^ 0x8000` for i16, `^ 0x80` for i8. NEON or SSE2 dispatch per row. Skipped for u8 targets (those write directly into the tensor during the MCU loop). | No libjpeg equivalent — this is the ML-quantisation conversion layer specific to EdgeFirst's tensor types. |
+| `codec.decode_png`                | Full PNG decode: header parse, native or 8-bit `zune-png` decode, optional EXIF rotation, format conversion to the requested `PixelFormat`. | PNG decode per ISO/IEC 15948 (RFC 2083). |
+| `codec.decode_png.zune_decode`    | The bulk of PNG cost: zlib inflate + PNG filter reversal inside [`zune-png`](https://docs.rs/zune-png). `path = "u8"` is the strided-output fast path; `path = "native_u16"` preserves 16-bit-per-channel PNGs and is used for u16/i16/f32 tensor targets. | Equivalent to libpng's `png_read_image`. |
 
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 

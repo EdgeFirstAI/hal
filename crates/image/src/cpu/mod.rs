@@ -599,7 +599,7 @@ impl CPUProcessor {
         let tmp_fmt;
         if intermediate != src_fmt {
             let _s = tracing::trace_span!(
-                "image.cpu.format_convert",
+                "image.convert.cpu.format_convert",
                 from = ?src_fmt,
                 to = ?intermediate,
                 pass = "pre_resize",
@@ -618,11 +618,11 @@ impl CPUProcessor {
         // format must be RGB/RGBA/GREY
         debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
         if tmp_fmt == dst_fmt {
-            let _s = tracing::trace_span!("image.cpu.resize_flip_rotate").entered();
+            let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
             self.resize_flip_rotate_pf(tmp, dst, dst_fmt, rotation, flip, crop)?;
         } else if !need_resize_flip_rotation {
             let _s = tracing::trace_span!(
-                "image.cpu.format_convert",
+                "image.convert.cpu.format_convert",
                 from = ?tmp_fmt,
                 to = ?dst_fmt,
                 pass = "direct",
@@ -643,12 +643,12 @@ impl CPUProcessor {
                 Self::convert_format_pf(dst, &mut tmp2, dst_fmt, tmp_fmt)?;
             }
             {
-                let _s = tracing::trace_span!("image.cpu.resize_flip_rotate").entered();
+                let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
                 self.resize_flip_rotate_pf(tmp, &mut tmp2, tmp_fmt, rotation, flip, crop)?;
             }
             {
                 let _s = tracing::trace_span!(
-                    "image.cpu.format_convert",
+                    "image.convert.cpu.format_convert",
                     from = ?tmp_fmt,
                     to = ?dst_fmt,
                     pass = "post_resize",

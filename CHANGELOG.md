@@ -11,30 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Tracing span rename — observable surface, not API.** All `tracing::trace_span!`
-  call sites across the workspace adopt a uniform `<crate>.<subsystem>.<operation>`
-  naming convention (snake_case, dotted). Span names appear as labels in
-  Perfetto / Chrome traces; any saved query, dashboard, or filter that targets
-  the old names will need updating. See the per-crate ARCHITECTURE.md "Tracing
-  Spans" sections for the authoritative mapping.
+- **Tracing span rename — observable surface, not API.** All
+  `tracing::trace_span!` call sites across the workspace adopt a uniform
+  `<crate>.<function>[.<operation>[.<sub-operation>]]` naming convention
+  (snake_case, dotted). The `<function>` component is the public user-facing
+  function the trace was rooted at (`decoder.decode`, `image.convert`,
+  `codec.decode_jpeg`, …); inner spans nest under it. Shared internal
+  building blocks reached from multiple top-level functions
+  (`decoder.per_scale_run`, `decoder.nms_get_boxes`) omit the function prefix
+  because a single source location can only carry one static name — the
+  parent span in the recorded trace identifies the caller. New spans should
+  follow the rough guideline of >500 µs on Cortex-A53 to justify the
+  instrumentation.
+
+  Span names appear as labels in Perfetto / Chrome traces; any saved query,
+  dashboard, or filter that targets the old names will need updating. See
+  the per-crate ARCHITECTURE.md "Tracing Spans" sections for the
+  authoritative mapping.
 
   Notable replacements (full list in the per-crate docs):
 
   | Old name (collision) | New name |
   |---|---|
-  | `decode` (4 YOLO entry points + 2 segdet inner kernels) | `decoder.yolo.decode_{quant,float}_{flat,split}` and `decoder.nms.get_boxes` |
-  | `score_filter` / `top_k` / `nms` / `box_dequant` | `decoder.nms.{score_filter,top_k,suppress,dequant_boxes}` |
-  | `process_masks` | `decoder.process_masks` |
-  | `extract_proto` | `decoder.extract_proto_data` |
-  | `per_scale_decode` and `box` / `score` / `mc` | `decoder.per_scale.{run,boxes,scores,mask_coefs}` |
-  | `per_scale_bridge::*` | `decoder.per_scale.{widen_f32,to_proto_data,to_masks,bridge_*}` |
+  | `decode` (4 YOLO entry points + 2 segdet inner kernels) | `decoder.decode.yolo_{quant,float}_{flat,split}` and `decoder.nms_get_boxes` |
+  | `score_filter` / `top_k` / `nms` / `box_dequant` | `decoder.nms_get_boxes.{score_filter,top_k,suppress,dequant_boxes}` |
+  | `process_masks` | `decoder.decode.process_masks` |
+  | `extract_proto` | `decoder.decode_proto.extract_proto_data` |
+  | `per_scale_decode` and `box` / `score` / `mc` | `decoder.per_scale_run` and `decoder.per_scale_run.level.{boxes,scores,mask_coefs}` |
+  | `per_scale_bridge::*` | `decoder.{decode.per_scale_to_masks,decode_proto.per_scale_to_proto_data,per_scale_run.widen_f32}` |
   | `Decoder::decode` / `Decoder::decode_proto` | `decoder.{decode,decode_proto}` |
   | `image_convert` / `draw_masks` | `image.{convert,draw_decoded_masks}` |
-  | `g2d_convert` / `gl_convert` | `image.{g2d,gl}.convert` |
-  | `gl_pass1_to_rgba` / `gl_pass2_pack_rgb` / `gl_pass2_to_planar` | `image.gl.{pack_rgb.pass1_rgba,pack_rgb.pass2_pack,nv12_to_planar.pass1_rgba,nv12_to_planar.pass2_deinterleave}` |
-  | `cpu_format_convert` / `cpu_resize` | `image.cpu.{format_convert,resize_flip_rotate}` |
-  | `materialize_masks` / `mask_i8_fastpath` / `mask_i16_i8_fastpath` | `image.materialize_masks` and `image.masks.{kernel_i8,kernel_i16xi8,kernel_i8_scaled,kernel_i16xi8_scaled}` |
-  | `tracker_update` / `predict` / `match_*` | `tracker.{update,predict,match_high_conf,match_low_conf}` |
+  | `g2d_convert` / `gl_convert` | `image.convert.{g2d,gl}` |
+  | `gl_pass1_to_rgba` / `gl_pass2_pack_rgb` / `gl_pass2_to_planar` | `image.convert.gl.{pack_rgb.pass1_rgba,pack_rgb.pass2_pack,nv12_to_planar.pass1_rgba,nv12_to_planar.pass2_deinterleave}` |
+  | `cpu_format_convert` / `cpu_resize` | `image.convert.cpu.{format_convert,resize_flip_rotate}` |
+  | `materialize_masks` / `mask_i8_fastpath` / `mask_i16_i8_fastpath` | `image.materialize_masks` and `image.materialize_masks.{kernel_i8,kernel_i16xi8,kernel_i8_scaled,kernel_i16xi8_scaled}` |
+  | `tracker_update` / `predict` / `match_*` | `tracker.update` and `tracker.update.{predict,match_high_conf,match_low_conf}` |
   | `tensor_alloc` / `tensor_map` | `tensor.{alloc,map}` |
   | `py_*` | `python.*` |
 
@@ -42,9 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Tracing spans in the `edgefirst-codec` crate (previously had none):
   `codec.decode_jpeg`, `codec.decode_png`, plus inner spans
-  `codec.jpeg.{parse_markers,mcu_loop,apply_exif,type_convert}` and
-  `codec.png.zune_decode`. The JPEG marker-parse, MCU decode loop, and EXIF
-  rotation phases are now individually visible in Perfetto.
+  `codec.decode_jpeg.{parse_markers,mcu_loop,apply_exif,type_convert}` and
+  `codec.decode_png.zune_decode`. The JPEG marker-parse, MCU decode loop,
+  and EXIF rotation phases are now individually visible in Perfetto.
 - `tracing` workspace dependency added to `edgefirst-codec`.
 - "Tracing Spans" sections in `crates/decoder/ARCHITECTURE.md`,
   `crates/image/ARCHITECTURE.md`, and `crates/codec/ARCHITECTURE.md` —

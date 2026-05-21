@@ -369,14 +369,14 @@ where
 
         // First pass: match high-confidence detections
         if !self.tracklets.is_empty() {
-            let _s = tracing::trace_span!("tracker.predict").entered();
+            let _s = tracing::trace_span!("tracker.update.predict").entered();
             for track in &mut self.tracklets {
                 track.filter.predict();
             }
         }
 
         if !self.tracklets.is_empty() {
-            let _s = tracing::trace_span!("tracker.match_high_conf").entered();
+            let _s = tracing::trace_span!("tracker.update.match_high_conf").entered();
             let costs = self.compute_costs(
                 boxes,
                 self.track_high_conf,
@@ -400,7 +400,7 @@ where
 
         // Second pass: match remaining tracklets to low-confidence detections
         if !self.tracklets.is_empty() {
-            let _s = tracing::trace_span!("tracker.match_low_conf").entered();
+            let _s = tracing::trace_span!("tracker.update.match_low_conf").entered();
             let costs = self.compute_costs(boxes, 0.0, self.track_iou, &matched, &tracked);
             if let Ok(ans) = lapjv(&costs) {
                 self.process_assignments(

@@ -133,7 +133,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     .entered();
     // Parse all marker segments
     let headers = {
-        let _s = tracing::trace_span!("codec.jpeg.parse_markers").entered();
+        let _s = tracing::trace_span!("codec.decode_jpeg.parse_markers").entered();
         markers::parse_markers(data)?
     };
 
@@ -231,7 +231,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             let native_stride = img_w * channels;
             state.exif_scratch.resize(native_stride * img_h, 0);
             {
-                let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
+                let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
                 mcu::decode_image(
                     data,
                     &headers,
@@ -243,7 +243,8 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             }
             {
                 let _s =
-                    tracing::trace_span!("codec.jpeg.apply_exif", rotation_deg, flip_h,).entered();
+                    tracing::trace_span!("codec.decode_jpeg.apply_exif", rotation_deg, flip_h,)
+                        .entered();
                 apply_exif_u8(
                     &mut state.exif_scratch,
                     native_stride,
@@ -266,7 +267,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
                     .copy_from_slice(&state.exif_scratch[src_off..src_off + final_native_stride]);
             }
         } else {
-            let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
+            let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
             mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
         }
     } else {
@@ -276,7 +277,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         state.exif_scratch.resize(temp_size, 0);
 
         {
-            let _s = tracing::trace_span!("codec.jpeg.mcu_loop").entered();
+            let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
             mcu::decode_image(
                 data,
                 &headers,
@@ -289,7 +290,8 @@ pub fn decode_jpeg_into<T: ImagePixel>(
 
         // Apply EXIF transformations on the temp buffer
         if flip_h || rotation_deg != 0 {
-            let _s = tracing::trace_span!("codec.jpeg.apply_exif", rotation_deg, flip_h,).entered();
+            let _s = tracing::trace_span!("codec.decode_jpeg.apply_exif", rotation_deg, flip_h,)
+                .entered();
             apply_exif_u8(
                 &mut state.exif_scratch,
                 temp_stride,
@@ -304,7 +306,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
 
         // Convert u8 → T and write to tensor at stride offsets
         let _s = tracing::trace_span!(
-            "codec.jpeg.type_convert",
+            "codec.decode_jpeg.type_convert",
             dtype = std::any::type_name::<T>(),
         )
         .entered();

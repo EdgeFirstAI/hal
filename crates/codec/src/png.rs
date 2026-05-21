@@ -192,7 +192,8 @@ fn decode_png_via_decoding_result<T: ImagePixel>(
     img_h: usize,
 ) -> crate::Result<ImageInfo> {
     let result = {
-        let _s = tracing::trace_span!("codec.png.zune_decode", path = "native_u16").entered();
+        let _s =
+            tracing::trace_span!("codec.decode_png.zune_decode", path = "native_u16").entered();
         decoder.decode()?
     };
 
@@ -370,7 +371,7 @@ fn decode_png_via_u8<T: ImagePixel>(
     let decoded_size = img_w * img_h * decode_channels;
     scratch.resize(decoded_size, 0);
     {
-        let _s = tracing::trace_span!("codec.png.zune_decode", path = "u8").entered();
+        let _s = tracing::trace_span!("codec.decode_png.zune_decode", path = "u8").entered();
         decoder.decode_into(scratch)?;
     }
 
