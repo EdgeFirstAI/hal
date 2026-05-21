@@ -1173,7 +1173,7 @@ where
     /// ```
     pub fn new(shape: &[usize], memory: Option<TensorMemory>, name: Option<&str>) -> Result<Self> {
         let _span = tracing::trace_span!(
-            "tensor_alloc",
+            "tensor.alloc",
             ?shape,
             memory = ?memory,
             dtype = std::any::type_name::<T>(),
@@ -1778,7 +1778,7 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         let _span = tracing::trace_span!(
-            "tensor_map",
+            "tensor.map",
             memory = ?self.storage.memory(),
         )
         .entered();
