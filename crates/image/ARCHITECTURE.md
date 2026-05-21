@@ -572,68 +572,87 @@ approach prioritizes correctness across all targets.
 
 ## Tracing Spans
 
-`ImageProcessor::convert()` and `materialize_masks()` / `draw_decoded_masks()`
+`ImageProcessor::convert()`, `materialize_masks()`, and `draw_decoded_masks()`
 emit a [`tracing::trace_span!`] tree describing the backend-dispatch decision
 and every internal pass. Spans are captured by
 [`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
 into Chrome JSON for Perfetto and cost a single relaxed atomic load per call
 site when no subscriber is active.
 
-Span names follow `<crate>.<subsystem>.<operation>`; inner spans keep the full
-prefix so a Perfetto cell makes sense without its parent track.
+### Naming convention
+
+Span names follow `<crate>.<function>[.<operation>[.<sub-operation>]]`:
+
+- **`<crate>.<function>`** — top-level span: the public function the user
+  invoked (`image.convert`, `image.materialize_masks`, `image.draw_decoded_masks`).
+- **`<crate>.<function>.<operation>`** — meaningful internal work; backend
+  dispatch within `convert()` lives at this level
+  (`image.convert.gl`, `image.convert.g2d`, `image.convert.cpu`).
+- **`<crate>.<function>.<operation>.<sub-operation>`** — further
+  decomposition where it aids optimisation (`image.convert.gl.pack_rgb.pass1_rgba`,
+  `image.convert.cpu.format_convert`).
+
+A span is worth adding when the work inside it is meaningful for
+optimisation and has enough complexity to justify the overhead — roughly
+500 µs on Cortex-A53 as a guideline.
 
 ### Span tree
 
 ```text
-image.convert                                           [orchestrator]
+image.convert                                           [user-facing fn, orchestrator]
 │ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip
 │
-├── image.gl.convert                                    [OpenGL backend, picked first]
+├── image.convert.gl                                    [OpenGL backend, picked first]
 │   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory
-│   ├── image.gl.pack_rgb.pass1_rgba                    ← NV12 → intermediate RGBA (resize + crop + flip)
-│   ├── image.gl.pack_rgb.pass2_pack                    ← intermediate RGBA → packed RGB (3:4 width ratio)
-│   ├── image.gl.nv12_to_planar.pass1_rgba              ← Vivante 2-pass: NV12 → intermediate RGBA
-│   └── image.gl.nv12_to_planar.pass2_deinterleave      ← Vivante 2-pass: RGBA → PlanarRgb planes
+│   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV12 → intermediate RGBA (resize + crop + flip)
+│   ├── image.convert.gl.pack_rgb.pass2_pack            ← intermediate RGBA → packed RGB (3:4 width ratio)
+│   ├── image.convert.gl.nv12_to_planar.pass1_rgba      ← Vivante 2-pass: NV12 → intermediate RGBA
+│   └── image.convert.gl.nv12_to_planar.pass2_deinterleave ← Vivante 2-pass: RGBA → PlanarRgb planes
 │
-├── image.g2d.convert                                   [NXP i.MX G2D backend, picked second]
+├── image.convert.g2d                                   [NXP i.MX G2D backend, picked second]
 │   fields: src_fmt, dst_fmt
 │
-└── image.cpu.convert                                   [universal fallback]
-    ├── image.cpu.format_convert                        ← per-pixel format conversion
+└── image.convert.cpu                                   [universal fallback, parent implicit]
+    ├── image.convert.cpu.format_convert                ← per-pixel format conversion
     │   fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
-    └── image.cpu.resize_flip_rotate                    ← fast_image_resize + rayon
+    └── image.convert.cpu.resize_flip_rotate            ← fast_image_resize + rayon
 
-image.draw_decoded_masks                                [mask overlay onto image]
+image.draw_decoded_masks                                [user-facing fn]
 fields: n_detections, n_segmentations
 
-image.materialize_masks                                 [proto data → mask matrices]
+image.materialize_masks                                 [user-facing fn]
 │ fields: n_detections, mode = "proto" | "scaled", width?, height?
-├── image.masks.kernel_i8                               ← i8 coeff × i8 proto, proto-resolution
-├── image.masks.kernel_i16xi8                           ← i16 coeff × i8 proto, proto-resolution
-├── image.masks.kernel_i8_scaled                        ← i8 coeff × i8 proto, scaled to dst W×H
-└── image.masks.kernel_i16xi8_scaled                    ← i16 coeff × i8 proto, scaled to dst W×H
+├── image.materialize_masks.kernel_i8                   ← i8 coeff × i8 proto, proto-resolution
+├── image.materialize_masks.kernel_i16xi8               ← i16 coeff × i8 proto, proto-resolution
+├── image.materialize_masks.kernel_i8_scaled            ← i8 coeff × i8 proto, scaled to dst W×H
+└── image.materialize_masks.kernel_i16xi8_scaled        ← i16 coeff × i8 proto, scaled to dst W×H
     fields: n, proto_h, proto_w, num_protos, layout, (width, height for *_scaled)
 ```
 
+> The CPU backend has no top-level `image.convert.cpu` span of its own; the
+> CPU dispatch enters via `image.convert.cpu.format_convert` and/or
+> `image.convert.cpu.resize_flip_rotate` directly. Parent in the trace is
+> `image.convert`.
+
 ### What each span measures (mapped to the `convert()` inner workings)
 
-| Span                                | What is happening inside | Key observations |
-|-------------------------------------|--------------------------|------------------|
-| `image.convert`                     | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
-| `image.gl.convert`                  | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, optional `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and any `glFinish` at the end. |
-| `image.gl.pack_rgb.pass1_rgba`      | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
-| `image.gl.pack_rgb.pass2_pack`      | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
-| `image.gl.nv12_to_planar.pass1_rgba`| NV12 → intermediate RGBA (the Vivante GC7000UL workaround for the GPU hang on single-pass NV12 → PlanarRgb). | Selected automatically when `is_vivante && src == Nv12 && dst.layout == Planar`. |
-| `image.gl.nv12_to_planar.pass2_deinterleave` | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
-| `image.g2d.convert`                 | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
-| `image.cpu.format_convert`          | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
-| `image.cpu.resize_flip_rotate`      | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
-| `image.draw_decoded_masks`          | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
-| `image.materialize_masks`           | Wrapper around the four `image.masks.kernel_*` kernels, paired with letterbox inversion and bbox-clipped row iteration. `mode = "proto"` returns proto-resolution masks; `mode = "scaled"` resamples to `(width, height)`. | Use the proto-resolution mode when you only need IoU computation against ground truth at the proto grid (the default Ultralytics evaluation mode). |
-| `image.masks.kernel_i8`             | Fused i8 dequant + i8 × i8 → i32 matmul + sigmoid at proto resolution. NEON FP16 on aarch64. | The fastest path; avoids producing an intermediate f32 protos buffer. |
-| `image.masks.kernel_i16xi8`         | i16 coeff dequant + i16 × i8 → i32 matmul. Used when mask coefficients are stored at i16. | Preserves the i16 dynamic range that an i8 coeff dequant would lose. |
-| `image.masks.kernel_i8_scaled`      | Same fused i8 path as above, but per-output-pixel bilinear sample of the proto field (no intermediate proto-resolution mask). | Algebraically equivalent to `process_mask_native` from Ultralytics (`retina_masks=True`); empirical mask IoU 0.993 vs. Ultralytics on COCO val2017. |
-| `image.masks.kernel_i16xi8_scaled`  | i16 variant of the above scaled kernel. | Same shape and algorithm; different coefficient dtype. |
+| Span                                                   | What is happening inside | Key observations |
+|--------------------------------------------------------|--------------------------|------------------|
+| `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
+| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, optional `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and any `glFinish` at the end. |
+| `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
+| `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
+| `image.convert.gl.nv12_to_planar.pass1_rgba`           | NV12 → intermediate RGBA (the Vivante GC7000UL workaround for the GPU hang on single-pass NV12 → PlanarRgb). | Selected automatically when `is_vivante && src == Nv12 && dst.layout == Planar`. |
+| `image.convert.gl.nv12_to_planar.pass2_deinterleave`   | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
+| `image.convert.g2d`                                    | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
+| `image.convert.cpu.format_convert`                     | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
+| `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
+| `image.draw_decoded_masks`                             | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
+| `image.materialize_masks`                              | Wrapper around the four `kernel_*` spans, paired with letterbox inversion and bbox-clipped row iteration. `mode = "proto"` returns proto-resolution masks; `mode = "scaled"` resamples to `(width, height)`. | Use the proto-resolution mode when you only need IoU computation against ground truth at the proto grid (the default Ultralytics evaluation mode). |
+| `image.materialize_masks.kernel_i8`                    | Fused i8 dequant + i8 × i8 → i32 matmul + sigmoid at proto resolution. NEON FP16 on aarch64. | The fastest path; avoids producing an intermediate f32 protos buffer. |
+| `image.materialize_masks.kernel_i16xi8`                | i16 coeff dequant + i16 × i8 → i32 matmul. Used when mask coefficients are stored at i16. | Preserves the i16 dynamic range that an i8 coeff dequant would lose. |
+| `image.materialize_masks.kernel_i8_scaled`             | Same fused i8 path, but per-output-pixel bilinear sample of the proto field (no intermediate proto-resolution mask). | Algebraically equivalent to `process_mask_native` from Ultralytics (`retina_masks=True`); empirical mask IoU 0.993 vs. Ultralytics on COCO val2017. |
+| `image.materialize_masks.kernel_i16xi8_scaled`         | i16 variant of the above scaled kernel. | Same shape and algorithm; different coefficient dtype. |
 
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 

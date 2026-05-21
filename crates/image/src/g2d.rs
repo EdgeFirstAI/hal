@@ -61,7 +61,7 @@ impl G2DProcessor {
         crop: Crop,
     ) -> Result<()> {
         let _span = tracing::trace_span!(
-            "image.g2d.convert",
+            "image.convert.g2d",
             src_fmt = ?src_dyn.format(),
             dst_fmt = ?dst_dyn.format(),
         )

@@ -982,7 +982,7 @@ fn proto_segmentations_i8_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "image.masks.kernel_i8",
+        "image.materialize_masks.kernel_i8",
         n = detect.len(),
         proto_h,
         proto_w,
@@ -1199,7 +1199,7 @@ fn proto_segmentations_i16_i8(
     use edgefirst_tensor::QuantMode;
 
     let _span = tracing::trace_span!(
-        "image.masks.kernel_i16xi8",
+        "image.materialize_masks.kernel_i16xi8",
         n = detect.len(),
         proto_h,
         proto_w,

@@ -68,7 +68,7 @@ fn widen_to_f32<'a>(decoded: &'a DecodedOutputsRef<'a>) -> WidenedF32<'a> {
         BufferRef::F32(_) => "f32_borrow",
         BufferRef::F16(_) => "f16_widen",
     };
-    let _span = trace_span!("decoder.per_scale.widen_f32", kind = kind).entered();
+    let _span = trace_span!("decoder.per_scale_run.widen_f32", kind = kind).entered();
 
     let n = decoded.total_anchors;
     let nc = decoded.num_classes;
@@ -119,7 +119,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
 ) -> Result<Option<ProtoData>, DecoderError> {
-    let _span = trace_span!("decoder.per_scale.to_proto_data").entered();
+    let _span = trace_span!("decoder.decode_proto.per_scale_to_proto_data").entered();
     let widened = widen_to_f32(decoded);
     let n = widened.n;
     let nc = widened.nc;
@@ -133,7 +133,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
     output_boxes.clear();
 
     let mut det_indices = {
-        let _s = trace_span!("decoder.per_scale.bridge_get_boxes").entered();
+        let _s = trace_span!("decoder.decode_proto.per_scale_to_proto_data.get_boxes").entered();
         impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_view,
             scores_view,
@@ -151,7 +151,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
 
     match (widened.mask_coefs.as_ref(), widened.protos.as_ref()) {
         (Some(mc), Some(pr)) => {
-            let _s = trace_span!("decoder.per_scale.bridge_extract_proto").entered();
+            let _s = trace_span!("decoder.decode_proto.per_scale_to_proto_data.extract").entered();
             let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc.as_ref())
                 .map_err(|e| DecoderError::Internal(format!("per_scale mc view: {e}")))?;
             let pr_view = pr.view();
@@ -184,7 +184,7 @@ pub(super) fn per_scale_to_masks<'a>(
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
 ) -> Result<(), DecoderError> {
-    let _span = trace_span!("decoder.per_scale.to_masks").entered();
+    let _span = trace_span!("decoder.decode.per_scale_to_masks").entered();
     let widened = widen_to_f32(decoded);
     let n = widened.n;
     let nc = widened.nc;
@@ -199,7 +199,7 @@ pub(super) fn per_scale_to_masks<'a>(
     output_masks.clear();
 
     let mut det_indices = {
-        let _s = trace_span!("decoder.per_scale.bridge_get_boxes").entered();
+        let _s = trace_span!("decoder.decode.per_scale_to_masks.get_boxes").entered();
         impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_view,
             scores_view,
@@ -218,7 +218,7 @@ pub(super) fn per_scale_to_masks<'a>(
 
     match (widened.mask_coefs.as_ref(), widened.protos.as_ref()) {
         (Some(mc), Some(pr)) => {
-            let _s = trace_span!("decoder.per_scale.bridge_process_masks").entered();
+            let _s = trace_span!("decoder.decode.per_scale_to_masks.process_masks").entered();
             let mc_view = ArrayView2::<f32>::from_shape((n, nm), mc.as_ref())
                 .map_err(|e| DecoderError::Internal(format!("per_scale mc view: {e}")))?;
             let pr_view = pr.view();
