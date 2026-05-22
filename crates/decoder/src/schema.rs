@@ -2479,4 +2479,57 @@ outputs:
         };
         assert_eq!(scores.shape, vec![1, 80, 8400]);
     }
+
+    /// `model: { end2end: false }` in a v2 schema must survive JSON parsing and
+    /// lower to `ConfigOutputs { end2end: Some(false), .. }` via
+    /// `to_legacy_config_outputs`.  This is the critical path for YOLO26 models
+    /// exported without embedded NMS.
+    #[test]
+    fn model_end2end_false_parsed_and_lowered_to_legacy_config() {
+        let j = r#"{
+          "schema_version": 2,
+          "decoder_version": "yolo26",
+          "model": { "end2end": false },
+          "outputs": [
+            {
+              "name": "detection",
+              "type": "detection",
+              "decoder": "ultralytics",
+              "shape": [1, 37, 8400],
+              "dshape": [{"batch": 1}, {"num_features": 37}, {"num_boxes": 8400}],
+              "normalized": true
+            },
+            {
+              "name": "protos",
+              "type": "protos",
+              "decoder": "ultralytics",
+              "shape": [1, 32, 160, 160],
+              "dshape": [{"batch": 1}, {"num_protos": 32}, {"height": 160}, {"width": 160}]
+            }
+          ]
+        }"#;
+        let schema = SchemaV2::parse_json(j).unwrap();
+
+        // Parsed correctly into the ModelSpec.
+        assert_eq!(
+            schema.model.as_ref().and_then(|m| m.end2end),
+            Some(false),
+            "model.end2end must deserialise to Some(false)"
+        );
+
+        // Lowered correctly to the legacy config.
+        let legacy = schema
+            .to_legacy_config_outputs()
+            .expect("lowering must succeed");
+        assert_eq!(
+            legacy.end2end,
+            Some(false),
+            "end2end must be Some(false) in the lowered ConfigOutputs"
+        );
+        assert_eq!(
+            legacy.decoder_version,
+            Some(crate::configs::DecoderVersion::Yolo26),
+            "decoder_version must be preserved"
+        );
+    }
 }

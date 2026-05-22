@@ -234,10 +234,12 @@ pub enum DecoderType {
 /// - `Yolov5`, `Yolov8`, `Yolo11`: Traditional models requiring external
 ///   NMS
 /// - `Yolo26`: End-to-end models with NMS embedded in the model
-///   architecture
+///   architecture *by default*. Set `end2end: false` in the config to
+///   override this assumption when the model was exported without embedded
+///   NMS — the decoder will then apply its own NMS instead.
 ///
 /// When `decoder_version` is set to `Yolo26`, the decoder uses end-to-end
-/// model types regardless of the `nms` setting.
+/// model types unless `end2end: false` is also set.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy, Hash, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DecoderVersion {
@@ -251,7 +253,9 @@ pub enum DecoderVersion {
     #[serde(rename = "yolo11")]
     Yolo11,
     /// YOLO26 - end-to-end model with embedded NMS (one-to-one matching
-    /// heads)
+    /// heads) by default. Can be combined with `end2end: false` to opt out
+    /// of the end-to-end path when the model was exported without embedded
+    /// NMS.
     #[serde(rename = "yolo26")]
     Yolo26,
 }

@@ -30,7 +30,9 @@ pub struct ConfigOutputs {
     pub nms: Option<configs::Nms>,
     /// Decoder version for Ultralytics models. Determines the decoding
     /// strategy.
-    /// - `Some(Yolo26)` — end-to-end model with embedded NMS
+    /// - `Some(Yolo26)` — end-to-end model with embedded NMS by default;
+    ///   set `end2end: false` to override when the model was exported without
+    ///   embedded NMS
     /// - `Some(Yolov5/Yolov8/Yolo11)` — traditional models requiring external
     ///   NMS
     /// - `None` — infer from other settings (legacy behavior)
@@ -38,10 +40,11 @@ pub struct ConfigOutputs {
     pub decoder_version: Option<configs::DecoderVersion>,
     /// Whether the model has NMS embedded (end-to-end export).
     ///
-    /// When `Some(false)`, the model was exported without embedded NMS even
-    /// if `decoder_version` is `yolo26`; HAL will apply its own NMS.
-    /// `None` defers to the architecture default inferred from
-    /// `decoder_version`.
+    /// - `Some(true)` — model has embedded NMS; HAL skips its own NMS step.
+    /// - `Some(false)` — model was exported without embedded NMS even if
+    ///   `decoder_version` is `yolo26`; HAL will apply its own NMS.
+    /// - `None` — defer to the architecture default inferred from
+    ///   `decoder_version` (`yolo26` implies `true`, all others imply `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end2end: Option<bool>,
 }

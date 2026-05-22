@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ModelSpec` struct in `SchemaV2` with an `end2end: Option<bool>` field that
-  propagates from the `model.end2end` key in EdgeFirst Studio 
+  propagates from the `model.end2end` key in EdgeFirst Studio
   metadata JSON/YAML (DE-2576).
 - `end2end: Option<bool>` field on `ConfigOutputs` so the decoder builder can
   read the flag after schema-to-config conversion (DE-2576).

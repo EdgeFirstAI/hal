@@ -148,12 +148,23 @@ The feature dimension is the smaller of the two non-batch dimensions
 
 The routing priority is:
 
-1. **`model.end2end: false`** — explicit opt-out. Regardless of
+1. **Explicit opt-out via `end2end: false`** — regardless of
    `decoder_version`, HAL applies its own NMS and routes to the
    standard `YoloSegDet` / `YoloDet` path. Use this for YOLO26 models
    exported without embedded NMS (Ultralytics `end2end=False`).
 
-2. **`decoder_version: "yolo26"`** (and `model.end2end` absent or `true`)
+   The field name and location depend on which metadata format you use:
+
+   | Format | Where to place the flag |
+   |--------|------------------------|
+   | Schema v2 JSON/YAML (`schema_version: 2`) | Nested under the `model` object: `model: { end2end: false }` |
+   | Legacy v1 JSON/YAML (no `schema_version`) | Root-level field: `end2end: false` alongside `decoder_version` |
+
+   Using `model: { end2end: false }` in a legacy (v1) file has no effect
+   because the v1 parser does not read the `model` key; the root-level
+   `end2end` field must be used instead.
+
+2. **`decoder_version: "yolo26"`** (and `end2end` absent or `true`)
    — selects one of the `YoloEndToEnd*` variants. NMS is bypassed; the
    model emits post-NMS `[B, N, 6+]` rows of
    `(x1, y1, x2, y2, conf, class, ...)`.
