@@ -218,8 +218,15 @@ impl GlPlatform for MacosPlatform {
         egl: &Egl,
         dpy: egl::Display,
         buf: &PlatformGpuBuffer,
-        _tex_id: u32,
+        tex_id: u32,
     ) -> Result<(), Error> {
+        let _span = tracing::trace_span!(
+            "image.gl.bind_texture",
+            platform = "macos",
+            target = "sampler",
+            tex_id,
+        )
+        .entered();
         // `EGL_BACK_BUFFER` is the buffer identifier required by
         // eglBindTexImage; pbuffer surfaces have a single back buffer
         // by convention.
@@ -237,12 +244,24 @@ impl GlPlatform for MacosPlatform {
         buf: &PlatformGpuBuffer,
         tex_id: u32,
     ) -> Result<(), Error> {
+        let _span = tracing::trace_span!(
+            "image.gl.bind_texture",
+            platform = "macos",
+            target = "render_target",
+            tex_id,
+        )
+        .entered();
         // On macOS the same `eglBindTexImage` is the entry point — the
         // resulting texture can be both sampled and attached to an FBO
         // as a color attachment (the caller does the FBO setup with
         // glFramebufferTexture2D, which lives in the GL processor, not
         // here).
-        Self::bind_as_texture(egl, dpy, buf, tex_id)
+        const EGL_BACK_BUFFER: i32 = 0x3084;
+        let pbuf = match buf {
+            PlatformGpuBuffer::IoSurface { pbuf } => *pbuf,
+        };
+        egl.bind_tex_image(dpy, pbuf, EGL_BACK_BUFFER)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))
     }
 
     fn release_buffer(egl: &Egl, dpy: egl::Display, buf: PlatformGpuBuffer) {

@@ -56,6 +56,7 @@ const EGL_TEXTURE_2D: i32 = 0x305F;
 // from the spike. These have been part of OpenGL ES since 3.0 / the
 // GL_EXT_texture_format_BGRA8888 extension.
 const GL_RG: i32 = 0x8227;
+const GL_RGBA: i32 = 0x1908;
 const GL_BGRA_EXT: i32 = 0x80E1;
 const GL_UNSIGNED_BYTE: i32 = 0x1401;
 
@@ -63,6 +64,7 @@ const GL_UNSIGNED_BYTE: i32 = 0x1401;
 // backend. The spike validated these against `EGL_BAD_ATTRIBUTE`-style
 // failures.
 const FOURCC_2C08: u32 = u32::from_be_bytes(*b"2C08"); // 2-channel 8-bit (YUYV-as-GL_RG)
+const FOURCC_RGBA: u32 = u32::from_be_bytes(*b"RGBA"); // 32-bit RGBA8888
 const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA"); // 32-bit BGRA8888
 
 // ---------------------------------------------------------------------------
@@ -132,8 +134,19 @@ impl ImageLayout {
                 width,
                 height,
             }),
-            // BGRA 4 bytes per pixel — natural fit for ANGLE.
-            PixelFormat::Bgra | PixelFormat::Rgba => Ok(Self {
+            // The IOSurface FourCC matches the tensor's in-memory byte
+            // order: 'RGBA' for Rgba (so a CPU readback sees R,G,B,A),
+            // 'BGRA' for Bgra. ANGLE supports both and pairs each with
+            // the matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE`
+            // (`GL_RGBA` vs `GL_BGRA_EXT`); the shader writes the same
+            // logical RGBA and ANGLE handles the order under the hood.
+            PixelFormat::Rgba => Ok(Self {
+                fourcc: FOURCC_RGBA,
+                bytes_per_element: 4,
+                width,
+                height,
+            }),
+            PixelFormat::Bgra => Ok(Self {
                 fourcc: FOURCC_BGRA,
                 bytes_per_element: 4,
                 width,
@@ -156,6 +169,7 @@ impl ImageLayout {
     fn gl_internal_format(&self) -> i32 {
         match self.fourcc {
             FOURCC_2C08 => GL_RG,
+            FOURCC_RGBA => GL_RGBA,
             FOURCC_BGRA => GL_BGRA_EXT,
             _ => GL_BGRA_EXT,
         }

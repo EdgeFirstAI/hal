@@ -36,7 +36,7 @@
 
 use crate::{
     error::{Error, Result},
-    BufferIdentity, TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    BufferIdentity, PixelFormat, TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use log::trace;
 use num_traits::Num;
@@ -317,6 +317,60 @@ where
         })
     }
 
+    /// Allocate an image-formatted IOSurface — proper FourCC + per-pixel
+    /// byte count + 2D dimensions, suitable for binding directly via
+    /// `EGL_ANGLE_iosurface_client_buffer` on the GL backend.
+    ///
+    /// Unlike `new_with_byte_size`, the returned IOSurface has the
+    /// format ANGLE expects when the GL backend later wraps it in a
+    /// pbuffer. Used by `Tensor::image()` on macOS when the caller
+    /// requests `TensorMemory::Dma`.
+    pub(crate) fn new_image(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        shape: &[usize],
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let _span = tracing::info_span!(
+            "tensor.iosurface.create",
+            width,
+            height,
+            ?format,
+        )
+        .entered();
+
+        let (fourcc, bpe) = image_fourcc_and_bpe(format).ok_or_else(|| {
+            Error::NotImplemented(format!(
+                "IoSurfaceTensor::new_image: format {format:?} has no IOSurface FourCC mapping"
+            ))
+        })?;
+        let dict = unsafe { build_props(width, height, bpe, fourcc) }?;
+        let ptr = unsafe { IOSurfaceCreate(dict) };
+        unsafe { CFRelease(dict) };
+        let surface = OwnedIoSurface::from_created(ptr)?;
+        let alloc = unsafe { IOSurfaceGetAllocSize(surface.as_ptr()) };
+
+        let name = match name {
+            Some(s) => s.to_owned(),
+            None => format!("iosurface-img-{}", uuid::Uuid::new_v4()),
+        };
+
+        trace!(
+            "IoSurfaceTensor::new_image: name={name} {width}x{height} {format:?} fourcc=0x{fourcc:08x} bytes={alloc}",
+        );
+
+        Ok(Self {
+            name,
+            surface,
+            shape: shape.to_vec(),
+            _marker: PhantomData,
+            identity: BufferIdentity::new(),
+            buf_size: alloc,
+            is_imported: false,
+        })
+    }
+
     /// Wrap an existing IOSurface as a tensor. Used by the GL backend
     /// when importing an externally-allocated surface (e.g. from
     /// VideoToolbox or cross-process `IOSurfaceID` lookup).
@@ -521,11 +575,37 @@ where
 // ---------------------------------------------------------------------------
 
 /// `L008` (kCVPixelFormatType_OneComponent8) — single-channel 8-bit
-/// layout. Used for the raw-byte allocations from
-/// `IoSurfaceTensor::new_with_byte_size`. The GL backend creates
-/// separate IOSurfaces with proper image FourCCs (YUYV/NV12/BGRA) for
-/// image tensors — see `crates/image/src/gl/iosurface_import.rs`.
+/// layout used for raw-byte allocations from
+/// `IoSurfaceTensor::new_with_byte_size`.
 const FOURCC_L008: u32 = u32::from_be_bytes(*b"L008");
+
+/// IOSurface FourCC + bytes-per-element mapping for image-formatted
+/// IOSurfaces. The GL backend's
+/// `EGL_ANGLE_iosurface_client_buffer` import requires the IOSurface
+/// pixel format to match the GL internal format / type combination —
+/// ANGLE validates `IOSurfaceGetBytesPerElement` against the requested
+/// `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` and rejects mismatches with
+/// `EGL_BAD_ATTRIBUTE`. The mapping here is the authoritative table
+/// keyed by the HAL's `PixelFormat`.
+///
+/// Formats not listed are not supported by the GL backend on macOS;
+/// callers fall back to SHM/Mem and a CPU code path.
+fn image_fourcc_and_bpe(format: PixelFormat) -> Option<(u32, usize)> {
+    match format {
+        // YUYV is 4:2:2 packed (2 bytes/pixel); sampled as GL_RG via
+        // FourCC '2C08' (kCVPixelFormatType_TwoComponent8).
+        PixelFormat::Yuyv => Some((u32::from_be_bytes(*b"2C08"), 2)),
+        // The FourCC matches the in-memory byte order: 'RGBA' for Rgba
+        // tensors, 'BGRA' for Bgra. ANGLE supports both via
+        // `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE = GL_RGBA` / `GL_BGRA_EXT`
+        // and produces the matching shader output. Mapping both to
+        // 'BGRA' would put the IOSurface bytes in BGRA order, which is
+        // wrong for the Rgba contract.
+        PixelFormat::Rgba => Some((u32::from_be_bytes(*b"RGBA"), 4)),
+        PixelFormat::Bgra => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        _ => None,
+    }
+}
 
 unsafe fn build_props(
     width: usize,

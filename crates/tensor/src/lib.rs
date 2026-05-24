@@ -970,6 +970,24 @@ where
     // reaching the storage layer, so defining a stub here would be
     // dead code and fail the `-D warnings` clippy gate on macOS CI.
 
+    /// Allocate an image-formatted IOSurface-backed storage (macOS).
+    ///
+    /// Used by `Tensor::image()` when the caller requests
+    /// `TensorMemory::Dma` and the format has an IOSurface FourCC
+    /// mapping (YUYV, RGBA, BGRA today). Falls back to `new_with_byte_size`
+    /// otherwise.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn new_image_iosurface(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        shape: &[usize],
+        name: Option<&str>,
+    ) -> Result<Self> {
+        IoSurfaceTensor::<T>::new_image(width, height, format, shape, name)
+            .map(TensorStorage::Dma)
+    }
+
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
     #[cfg(unix)]
@@ -1253,6 +1271,28 @@ where
                 vec![total_h, width]
             }
         };
+
+        // macOS Dma path: allocate a format-aware IOSurface (FourCC +
+        // 2D dimensions) so the GL backend can bind it via
+        // `EGL_ANGLE_iosurface_client_buffer`. Without this, the IOSurface
+        // would default to a generic byte buffer (FourCC 'L008') and
+        // ANGLE would reject the import with `EGL_BAD_ATTRIBUTE`.
+        // Falls back to the generic path for formats without an
+        // IOSurface mapping (NV12, planar, etc.).
+        #[cfg(target_os = "macos")]
+        if matches!(memory, Some(TensorMemory::Dma)) {
+            if let Ok(storage) = TensorStorage::<T>::new_image_iosurface(
+                width, height, format, &shape, None,
+            ) {
+                let mut t = Self::wrap(storage);
+                t.format = Some(format);
+                return Ok(t);
+            }
+            // If new_image_iosurface fails (unsupported format), fall
+            // through to the generic Tensor::new path which may pick
+            // up SHM/Mem instead.
+        }
+
         let mut t = Self::new(&shape, memory, None)?;
         t.format = Some(format);
         Ok(t)

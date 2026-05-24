@@ -93,6 +93,7 @@ PIPELINE_CONFIGS = [
     ("jetson-orin-nano", "CPU", "Heap", "pipeline-cpu"),
     ("x86-desktop", "GL", "PBO", "pipeline-opengl"),
     ("x86-desktop", "CPU", "Heap", "pipeline-cpu"),
+    ("mbp-m2-max", "GL", "IOSurface", "pipeline-opengl"),
     ("mbp-m2-max", "CPU", "Heap", "pipeline-cpu"),
 ]
 
@@ -108,6 +109,7 @@ MASK_CONFIGS = [
     ("jetson-orin-nano", "CPU", "Heap", "mask-cpu"),
     ("x86-desktop", "GL", "PBO", "mask-opengl"),
     ("x86-desktop", "CPU", "Heap", "mask-cpu"),
+    ("mbp-m2-max", "GL", "IOSurface", "mask-opengl"),
     ("mbp-m2-max", "CPU", "Heap", "mask-cpu"),
 ]
 
@@ -118,5 +120,5 @@ TENSOR_CONFIGS = [
     ("rpi5-hailo", ["mem", "shm", "dma"]),
     ("jetson-orin-nano", ["mem", "shm", "dma"]),
     ("x86-desktop", ["mem", "shm"]),
-    ("mbp-m2-max", ["mem", "shm"]),
+    ("mbp-m2-max", ["mem", "shm", "dma"]),
 ]

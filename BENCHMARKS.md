@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.7
-**Last Updated:** May 22, 2026
-**Status:** Adds macOS (Apple Silicon, `mbp-m2-max`) as a developer platform. Custom JPEG decoder with NEON SIMD (AArch64), SSE4.1/SSSE3 SIMD (x86-64), and vectorised type conversion: 20–22% faster than image crate on ARM, matches or beats image crate on x86.
+**Version:** 3.8
+**Last Updated:** May 24, 2026
+**Status:** Adds macOS GPU backend on Apple Silicon (`mbp-m2-max`) via ANGLE + IOSurface. The same GLES 3.0 shaders that drive the Linux GPU path now drive Metal through ANGLE, and `TensorMemory::Dma` is implemented over IOSurface for zero-copy bind. YUYV→RGBA convert speedups vs the Apple Silicon CPU path: **1.32×** at 1080p and **4.76×** at 4K. Memcpy through IOSurface is also **2.7× faster than SHM** at 4K.
 
 ---
 
@@ -274,12 +274,13 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **Model** | MacBook Pro Mac14,5 |
 | **SoC** | Apple M2 Max |
 | **CPU** | 12 cores (8 Performance + 4 Efficiency, ARMv8.6-A, NEON + dotprod + i8mm + FP16) |
-| **GPU** | Apple integrated (used by HAL via ANGLE + IOSurface) |
+| **GPU** | Apple integrated 38-core (M2 Max), driven via ANGLE → Metal |
 | **RAM** | 32 GB unified memory |
 | **OS** | macOS 26+ (`aarch64-apple-darwin`) |
 | **G2D** | No (Linux-only) |
-| **DMA-buf** | No (Linux-only); HAL uses IOSurface as the zero-copy primitive |
-| **Notes** | Apple Silicon developer platform. GPU acceleration via ANGLE + IOSurface translating the same GLES 3.0 shaders used on Linux to Metal. |
+| **DMA-buf** | No (Linux-only); HAL maps `TensorMemory::Dma` onto IOSurface for zero-copy bind |
+| **GL Transfer Backend** | IOSurface (zero-copy via `EGL_ANGLE_iosurface_client_buffer`) |
+| **Notes** | Apple Silicon developer platform. The Homebrew ANGLE tap supplies `libEGL.dylib` and `libGLESv2.dylib`; ANGLE translates GLES 3.0 → Metal so the same shader source used on Linux GPUs runs unchanged here. GPU coverage is intentionally limited at present — only YUYV→RGBA is implemented in the macOS shader pack; the rest of `ImageProcessor::convert` falls back to CPU. |
 
 ---
 
@@ -308,6 +309,15 @@ Measures `Tensor::new()` latency for each buffer type and resolution.
 | jetson-orin-nano | SHM | 14 us | 14 us | 14 us |
 | x86-desktop | MEM | 105 us | 268 us | 807 us |
 | x86-desktop | SHM | 2.0 us | 2.0 us | 2.0 us |
+| mbp-m2-max | MEM | 28 us | 65 us | 323 us |
+| mbp-m2-max | SHM | 2.0 us | 2.0 us | 2.0 us |
+| mbp-m2-max | DMA | 16 us | 16 us | 16 us |
+
+Apple Silicon DMA-row is IOSurface: allocation cost is dominated by the
+`IOSurfaceCreate` round-trip into the kernel, not the buffer size, so it
+stays at ~16 µs from 720p to 4K. The Linux DMA-buf path scales linearly
+with size because the kernel zeros the buffer pages on allocation; macOS
+defers initialization to first touch.
 
 #### Map/Unmap Latency
 
@@ -323,6 +333,30 @@ Measures `tensor.map()` round-trip latency.
 | rpi5-hailo | DMA | 99 us | 220 us | 869 us |
 | jetson-orin-nano | SHM | 3.0 us | 3.0 us | 3.0 us |
 | x86-desktop | SHM | 1.0 us | 1.0 us | 1.0 us |
+| mbp-m2-max | SHM | 0.5 us | 0.5 us | 0.5 us |
+| mbp-m2-max | DMA | 0.5 us | 0.5 us | 0.5 us |
+
+IOSurface map on macOS is a `IOSurfaceLock` call on a buffer the kernel
+already owns; it stays sub-microsecond across all sizes. SHM is a single
+`fstat` + cached `mmap` of an already-open file descriptor.
+
+#### Memcpy Throughput
+
+Measures `tensor.map(); copy_from_slice(src)` on a single CPU thread,
+filling the full image. Captures the cost of touching the backing memory
+through the chosen buffer kind.
+
+| Platform | Buffer | 720p (3.5 MB) | 1080p (7.9 MB) | 4K (31.6 MB) |
+|----------|--------|---------------|----------------|---------------|
+| mbp-m2-max | MEM | 89 us — 39.6 GiB/s | 255 us — 30.3 GiB/s | 688 us — 45.0 GiB/s |
+| mbp-m2-max | SHM | 211 us — 16.7 GiB/s | 502 us — 15.4 GiB/s | 1.7 ms — 18.3 GiB/s |
+| mbp-m2-max | DMA | 82 us — 41.4 GiB/s | 247 us — 31.2 GiB/s | 614 us — 50.3 GiB/s |
+
+IOSurface (Dma) and heap (Mem) deliver comparable bandwidth because both
+hit cached unified memory. SHM is 2–2.7× slower at every resolution: the
+shared-memory file lives behind a `mmap` that doesn't get the same
+prefetcher treatment as anonymous heap. **Verdict: prefer Dma over Shm on
+macOS when you need a backing tensor that the GL backend can also import.**
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
 
@@ -341,6 +375,7 @@ Measures `tensor.map()` round-trip latency.
 | jetson-orin-nano | GL | DMA | — | — | — | — | — |
 | jetson-orin-nano | CPU | Heap | 6.1 ms | 5.9 ms | — | 5.3 ms | 6.2 ms |
 | x86-desktop | CPU | Heap | 3.0 ms | 1.5 ms | — | 1.8 ms | 5.4 ms |
+| mbp-m2-max | CPU | Heap | 1.5 ms | 1.7 ms | 2.0 ms | 1.3 ms | — |
 
 **4K → 640×640:**
 
@@ -357,6 +392,7 @@ Measures `tensor.map()` round-trip latency.
 | jetson-orin-nano | GL | DMA | — | — | — |
 | jetson-orin-nano | CPU | Heap | 18.4 ms | 20.0 ms | 14.9 ms |
 | x86-desktop | CPU | Heap | 9.5 ms | 6.7 ms | 9.0 ms |
+| mbp-m2-max | CPU | Heap | 4.6 ms | 4.4 ms | 3.7 ms |
 
 ### Format Conversion (Same Size, No Resize)
 
@@ -375,6 +411,20 @@ Measures `tensor.map()` round-trip latency.
 | jetson-orin-nano | GL | DMA | — | — | — | 1.5 ms | 4.2 ms | 1.5 ms |
 | jetson-orin-nano | CPU | Heap | 3.0 ms | 2.8 ms | 2.1 ms | 789 us | 3.2 ms | 1.4 ms |
 | x86-desktop | CPU | Heap | 516 us | 559 us | 256 us | 261 us | 758 us | 219 us |
+| mbp-m2-max | GL | IOSurface | 409 us | — | — | — | — | — |
+| mbp-m2-max | CPU | Heap | 541 us | 499 us | 329 us | 141 us | 784 us | 314 us |
+
+The macOS GL row only covers YUYV→RGBA today; other format pairs fall
+through to CPU. Even with that single working pair the speedup is **1.3×**
+at 1080p, and (see the 4K convert below) **4.8×** at 3840×2160 because the
+GPU path is essentially bandwidth-bound while CPU scales with pixel count.
+
+**3840×2160 → 3840×2160 (4K convert):**
+
+| Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA |
+|----------|---------|--------|-----------|----------|-----------|
+| mbp-m2-max | GL | IOSurface | 458 us | — | — |
+| mbp-m2-max | CPU | Heap | 2.2 ms | 2.0 ms | 1.4 ms |
 
 ### Decoder Post-Processing
 
@@ -394,6 +444,8 @@ All CPU-only (decoder is not GPU-accelerated).
 | jetson-orin-nano | f32 | 2.2 ms | — | — | — |
 | x86-desktop | i8 (quant) | 82 us | 189 us | 4.0 us | 383 us |
 | x86-desktop | f32 | 460 us | — | — | — |
+| mbp-m2-max | i8 (quant) | 29 us | 25 us | 2.0 us | 376 us |
+| mbp-m2-max | f32 | 221 us | — | — | — |
 
 **YOLOv8 Segmentation (mask coefficient → pixel decode):**
 
@@ -409,6 +461,8 @@ All CPU-only (decoder is not GPU-accelerated).
 | jetson-orin-nano | f32 | 2.2 ms |
 | x86-desktop | i8 (quant) | 352 us |
 | x86-desktop | f32 | 663 us |
+| mbp-m2-max | i8 (quant) | 246 us |
+| mbp-m2-max | f32 | 413 us |
 
 ### Image Codec Decode (`edgefirst-codec`)
 
@@ -431,6 +485,8 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx95-frdm (A55) | giraffe 640 (640×640) | 11.5 ms | 12.7 ms | **9% faster** |
 | x86-desktop | zidane 720p (1280×720) | 1.7 ms | 1.6 ms | 6% slower |
 | x86-desktop | giraffe 640 (640×640) | 1.7 ms | 1.9 ms | **12% faster** |
+| mbp-m2-max (M2 Max) | zidane 720p (1280×720) | 1.4 ms | 2.0 ms | **30% faster** |
+| mbp-m2-max (M2 Max) | giraffe 640 (640×640) | 1.8 ms | — | — |
 
 **JPEG Decode — RGBA / BGRA u8:**
 
@@ -442,6 +498,8 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx95-frdm | BGRA | 14.0 ms | +2.2% | |
 | x86-desktop | RGBA | 1.6 ms | −6% | SSE2 unpack interleave |
 | x86-desktop | BGRA | 1.7 ms | 0% | SSE2 unpack with swapped R/B |
+| mbp-m2-max | RGBA | 1.5 ms | +7% | NEON vst4 interleaved store |
+| mbp-m2-max | BGRA | 1.5 ms | +7% | NEON vst4 with swapped R/B |
 
 **JPEG Decode — NV12 (skip color conversion):**
 
@@ -450,6 +508,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm | 11.0 ms | **−24%** | Direct Y copy + Cb/Cr interleave, no YCbCr→RGB |
 | imx95-frdm | 10.4 ms | **−24%** | |
 | x86-desktop | 1.3 ms | **−24%** | |
+| mbp-m2-max | 1.2 ms | **−17%** | |
 
 **JPEG Decode — RGB f32:**
 
@@ -458,6 +517,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm | 16.8 ms | 1.17× | u8 decode + NEON vectorised f32 normalization |
 | imx95-frdm | 16.2 ms | 1.18× | |
 | x86-desktop | 2.0 ms | 1.18× | SSE2 vectorised f32 normalization |
+| mbp-m2-max | 1.7 ms | 1.21× | NEON vectorised f32 normalization |
 
 **JPEG Strided Decode (720p image → 1080p tensor):**
 
@@ -466,6 +526,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm | 14.3 ms | 0% | Zero overhead — MCU loop writes directly at stride |
 | imx95-frdm | 13.8 ms | 0% | |
 | x86-desktop | 1.6 ms | 0% | |
+| mbp-m2-max | 1.4 ms | 0% | |
 
 **PNG Decode — RGB u8:**
 
@@ -474,6 +535,7 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 | imx8mp-frdm | 29.6 ms | 28.8 ms | 33.9 ms |
 | imx95-frdm | 26.5 ms | 25.4 ms | 29.3 ms |
 | x86-desktop | 4.8 ms | 4.8 ms | 4.8 ms |
+| mbp-m2-max | 5.3 ms | 5.3 ms | 5.2 ms |
 
 **Key Observations:**
 - On AArch64, the custom JPEG decoder with NEON SIMD is **20–22% faster** than the `image` crate (which uses zune-jpeg internally). The NEON kernels optimize IDCT, YCbCr→RGB color conversion, and chroma upsampling.
@@ -594,6 +656,7 @@ done
 | jetson-orin-nano | GL | DMA | 556 us | 3.0 ms | 1.7 ms |
 | jetson-orin-nano | CPU | Heap | 873 us | 22.1 ms | 1.9 ms |
 | x86-desktop | CPU | Heap | 648 us | 5.1 ms | 635 us |
+| mbp-m2-max | CPU | Heap | 215 us | 6.9 ms | 419 us |
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
@@ -617,6 +680,7 @@ The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays
 | rpi5-hailo | 376 us | 1.4 ms |
 | jetson-orin-nano | 440 us | 1.6 ms |
 | x86-desktop | 381 us | 903 us |
+| mbp-m2-max | 222 us | 862 us |
 
 ### materialize_masks Batched-GEMM Optimisation
 
@@ -1024,12 +1088,26 @@ allocation.
 
 16. ~~**Orin Nano GL/PBO pipeline hangs during warmup**~~ — Resolved: PBO deadlock in `setup_renderbuffer_non_dma` fixed by routing PBO destinations through `setup_renderbuffer_from_pbo` which avoids re-entering the GL thread channel. GL/PBO results now collected.
 
+17. **mbp-m2-max GL coverage is YUYV→RGBA only** — The `MacosGlProcessor` ships
+    with a single fragment shader (BT.709 YUYV→RGBA, limited range). All other
+    convert pairs, resize, rotation, flip, crop, and mask draw operations
+    return `NotImplemented`/`NotSupported` and the harness falls back to CPU.
+    Pipeline GL benchmarks therefore only show two working rows
+    (`convert/1920x1080/YUYV->RGBA` and `convert/3840x2160/YUYV->RGBA`); the
+    rest of the pipeline table is identical to the CPU-only column. Closing
+    this gap is straightforward — the same GLSL ES 3.0 shaders that run on
+    Linux GPUs work unchanged through ANGLE — but each new shader needs the
+    matching IOSurface FourCC entry in `tensor::iosurface::image_fourcc_and_bpe`
+    and `image::gl::iosurface_import::ImageLayout::for_format`. Tracked
+    separately from the v3.8 buffer-infrastructure baseline.
+
 ---
 
 ## Changelog
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA GL convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Update letterbox / format-conversion / decoder / mask-decode / codec tables with mbp-m2-max rows. |
 | 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |
 | 3.6 | 2026-05-17 | Add decode→letterbox pipeline benchmark (`decode_pipeline_benchmark`, `pipeline_demo`): cross-platform results on imx8mp-frdm, imx95-frdm, rpi5-hailo, orin-nano, x86-desktop. Zero heap allocations verified on all DMA-BUF platforms via strace. Auto-detect DMA/PBO/Mem memory type. |
 | 3.5 | 2026-05-18 | Perf-driven optimizations: 11-bit Huffman LUT (was 9-bit); batch byte-stuffing in bitstream refill; SSE4.1 IDCT with native `mullo_epi32` and `min/max` clamping; SSSE3 RGB shuffle store; NEON+SSE2 vectorised u8→f32/u16/i16 conversion. f32 decode now only 1.17× slower than u8 (was 4.0×); x86 RGB within 6% of image crate (was 25%); all results updated on 3 platforms. |

@@ -42,6 +42,8 @@ mod context;
 mod dma_import;
 #[cfg(target_os = "macos")]
 mod iosurface_import;
+#[cfg(target_os = "macos")]
+mod macos_processor;
 mod platform;
 #[cfg(target_os = "linux")]
 mod processor;
@@ -60,6 +62,8 @@ pub use context::probe_egl_displays;
 // No re-export needed at the mod.rs level.
 #[cfg(target_os = "linux")]
 pub use threaded::GLProcessorThreaded;
+#[cfg(target_os = "macos")]
+pub use macos_processor::MacosGlProcessor;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
 /// `'static` because the underlying `libloading::Library` is intentionally
@@ -143,6 +147,12 @@ pub(crate) enum TransferBackend {
     /// the GPU can actually render through DMA-buf-backed textures.
     DmaBuf,
 
+    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS).
+    /// Available when ANGLE's Metal backend is loaded and the EGL
+    /// extension is advertised. The IOSurface is wrapped as an EGL
+    /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
+    IOSurface,
+
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
     /// but OpenGL is present. Data stays in GPU-accessible memory.
     Pbo,
@@ -158,6 +168,13 @@ impl TransferBackend {
     /// Returns `true` if DMA-buf zero-copy is available.
     pub(crate) fn is_dma(self) -> bool {
         self == TransferBackend::DmaBuf
+    }
+
+    /// Returns `true` if a zero-copy transfer path is in use, regardless
+    /// of which OS-specific GPU buffer kind backs it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn is_zero_copy(self) -> bool {
+        matches!(self, TransferBackend::DmaBuf | TransferBackend::IOSurface)
     }
 }
 
