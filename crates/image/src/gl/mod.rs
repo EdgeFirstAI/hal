@@ -40,6 +40,8 @@ mod cache;
 mod context;
 #[cfg(target_os = "linux")]
 mod dma_import;
+#[cfg(target_os = "macos")]
+mod iosurface_import;
 mod platform;
 #[cfg(target_os = "linux")]
 mod processor;

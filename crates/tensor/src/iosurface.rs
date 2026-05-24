@@ -364,6 +364,31 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Tensor<T>::iosurface_ref accessor — macOS-only.
+//
+// The GL backend (image crate) calls this when importing an
+// IOSurface-backed tensor as an EGL pbuffer. Returns None for tensors
+// backed by SHM/Mem/Pbo since they have no associated IOSurface.
+// ---------------------------------------------------------------------------
+
+impl<T> crate::Tensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Borrow the underlying `IOSurfaceRef` for this tensor (macOS only).
+    ///
+    /// Returns `Some(ptr)` when the tensor is backed by IOSurface (i.e.
+    /// `TensorMemory::Dma` on macOS), `None` otherwise. The pointer is
+    /// borrowed — its lifetime is tied to the tensor.
+    pub fn iosurface_ref(&self) -> Option<*mut c_void> {
+        match &self.storage {
+            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.surface.as_ptr()),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IoSurfaceMap — locked-for-CPU view.
 // ---------------------------------------------------------------------------
 
