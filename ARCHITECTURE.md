@@ -43,6 +43,36 @@ The internal dependency graph and external dependency list live in
 
 ---
 
+## Platform Support Matrix
+
+The HAL targets three tiers of platforms with different acceleration
+primitives. The `TensorMemory` enum is shared across all tiers (same
+discriminants over the C ABI); the underlying storage and the GL
+transfer backend differ.
+
+| Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) |
+|------------|--------------------------------------|------------------------|------------------------|
+| `TensorMemory::Mem` | Heap | Heap | Heap |
+| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` |
+| `TensorMemory::Dma` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) |
+| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) |
+| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE |
+| GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal |
+| Hardware 2D blitter | G2D on NXP i.MX | — | — |
+| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` |
+| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) |
+| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` |
+| Portable probe | `is_gpu_buffer_available()` — works on all three |
+
+The portable `is_gpu_buffer_available()` is the recommended cross-platform
+gate when the question is "can I ask for `TensorMemory::Dma` and expect a
+zero-copy GPU-importable buffer?" The platform-specific probes
+(`is_dma_available`, `is_iosurface_available`) remain when callers need
+to know *which* primitive is in use — e.g. to decide whether to call
+`hal_tensor_clone_fd` (Linux) vs `hal_tensor_iosurface_id` (macOS).
+
+---
+
 ## Design Patterns
 
 The workspace consistently applies a small set of Rust idioms across all
@@ -212,6 +242,8 @@ When no subscriber is installed (the default), the interest cache is
 | `g2d_` | G2D hardware backend | `g2d_convert` |
 | `py_` | Python binding entry point | `py_decode`, `py_convert` |
 | `gl_pass1_` / `gl_pass2_` | Multi-pass GL sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
+| `image.gl.` | macOS GL platform layer (parallel processor) | `image.gl.platform_init`, `image.gl.import_buffer`, `image.gl.bind_texture`, `image.gl.convert` |
+| `tensor.iosurface.` | macOS IOSurface tensor allocation | `tensor.iosurface.create` |
 
 Field conventions:
 
@@ -221,6 +253,8 @@ Field conventions:
 - `*_memory` — tensor memory backend (`Dma` / `Shm` / `Mem`)
 - `layout` — data layout (`nhwc` / `nchw`)
 - `pass` — multi-pass identifier (`pre_resize` / `post_resize` / `direct`)
+- `platform` — `"linux"` or `"macos"` — emitted by spans that live in the GL platform layer
+- `backend` — for `image.gl.platform_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"pbo"` / `"sync"`)
 
 Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
 

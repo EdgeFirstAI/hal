@@ -40,6 +40,10 @@ pub mod edgefirst_hal {
 
         m.add_function(wrap_pyfunction!(version, m)?)?;
         m.add_function(wrap_pyfunction!(build_info, m)?)?;
+        m.add_function(wrap_pyfunction!(is_dma_available, m)?)?;
+        m.add_function(wrap_pyfunction!(is_iosurface_available, m)?)?;
+        m.add_function(wrap_pyfunction!(is_gpu_buffer_available, m)?)?;
+        m.add_function(wrap_pyfunction!(is_shm_available, m)?)?;
 
         m.add_class::<tensor::PyTensor>()?;
         m.add_class::<tensor::PyTensorMemory>()?;
@@ -100,6 +104,37 @@ pub mod edgefirst_hal {
             env!("CARGO_PKG_VERSION"),
             f16_impl
         )
+    }
+
+    /// True when Linux DMA-BUF heap allocation is available.
+    ///
+    /// macOS callers should use `is_iosurface_available()` or the
+    /// portable `is_gpu_buffer_available()` instead.
+    #[pyfunction]
+    fn is_dma_available() -> bool {
+        ::edgefirst_hal::tensor::is_dma_available()
+    }
+
+    /// True when macOS IOSurface allocation is available (always
+    /// false on non-macOS platforms).
+    #[pyfunction]
+    fn is_iosurface_available() -> bool {
+        ::edgefirst_hal::tensor::is_iosurface_available()
+    }
+
+    /// True when a platform-native GPU-coherent buffer kind is
+    /// available — DMA-BUF on Linux, IOSurface on macOS. Use this
+    /// when you only care whether `TensorMemory.DMA` will succeed.
+    #[pyfunction]
+    fn is_gpu_buffer_available() -> bool {
+        ::edgefirst_hal::tensor::is_gpu_buffer_available()
+    }
+
+    /// True when POSIX shared memory allocation is available
+    /// (Linux + macOS).
+    #[pyfunction]
+    fn is_shm_available() -> bool {
+        ::edgefirst_hal::tensor::is_shm_available()
     }
 
     /// Trace capture context manager for Perfetto/Chrome JSON output.

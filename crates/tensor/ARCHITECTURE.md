@@ -18,6 +18,7 @@ straight from a V4L2 camera.
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs) | local | Public surface: `Tensor<T>`, `TensorTrait`, `TensorMemory`, `BufferIdentity`, multi-plane composition (`from_planes`) |
 | [`dma.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dma.rs) | local | `DmaTensor<T>` — Linux DMA-BUF allocation via `dma-heap` |
 | [`dmabuf.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dmabuf.rs) | local | `mmap` + `DMA_BUF_IOCTL_SYNC` cache-coherency helpers used by `DmaMap` |
+| [`iosurface.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/iosurface.rs) | local | `IoSurfaceTensor<T>` — macOS IOSurface allocation via raw FFI to the IOSurface + CoreFoundation frameworks (the macOS counterpart to `DmaTensor`) |
 | [`shm.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/shm.rs) | local | `ShmTensor<T>` — POSIX shared memory backend |
 | [`mem.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/mem.rs) | local | `MemTensor<T>` — heap-backed tensor with no syscalls |
 | [`pbo.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/pbo.rs) | local | `PboTensor<T>` — wrapper around an OpenGL Pixel Buffer Object plus the `PboOps` trait the GL backend implements |
@@ -236,14 +237,54 @@ in the project ARCHITECTURE.md for the full two-layer story.
 
 | Platform | DMA | SHM | Mem | PBO |
 |----------|-----|-----|-----|-----|
-| Linux (NXP i.MX, x86_64, aarch64) | Yes | Yes | Yes | Yes (with OpenGL feature) |
-| macOS | No | Yes | Yes | No |
+| Linux (NXP i.MX, x86_64, aarch64) | Yes (DMA-BUF) | Yes | Yes | Yes (with OpenGL feature) |
+| macOS | Yes (IOSurface) | Yes | Yes | No |
 | Other Unix | No | Yes | Yes | No |
 | Windows | No | No | Yes | No |
 
-The `dma-heap` and `libc` dependencies are gated on `cfg(target_os =
-"linux")` in `Cargo.toml`; non-Linux builds simply skip the DMA backend
-without compile errors.
+### `TensorMemory::Dma` is unified across Linux and macOS
+
+`TensorMemory::Dma` is a single enum variant on both platforms — same
+discriminant value, same `HalTensorMemory::Dma=1` over the C ABI — but
+the underlying storage type differs:
+
+- **Linux**: `TensorStorage::Dma(DmaTensor<T>)` backed by a DMA-BUF fd
+  from `/dev/dma_heap/*`.
+- **macOS**: `TensorStorage::Dma(IoSurfaceTensor<T>)` backed by an
+  `IOSurfaceRef` from the IOSurface framework.
+
+Match arms work identically on both platforms because the
+`TensorTrait` impl is the same shape (`new`, `map`, `name`, `memory`,
+`buffer_identity`) regardless of which inner type is in play. The only
+methods that genuinely differ are the platform-specific *export*
+handles:
+
+- **Linux**: `clone_fd()` produces a duplicated DMA-BUF fd suitable
+  for passing to V4L2, the GL backend's `EGL_EXT_image_dma_buf_import`
+  path, or any other Linux GPU API.
+- **macOS**: `surface_id()` returns an `IOSurfaceID` (`u32`) stable
+  across processes — pair it with a Mach port or XPC handoff so the
+  receiver can call `IOSurfaceLookup(id)` to recover the
+  `IOSurfaceRef`. `surface_ref()` returns the borrowed pointer for
+  direct handoff to ANGLE's `EGL_ANGLE_iosurface_client_buffer`, to
+  CIImage, AVSampleBufferDisplayLayer, etc.
+
+`from_iosurface()` (the import-side constructor) is macOS-only and
+mirrors `from_fd()` — the receiver retains the surface for the
+tensor's lifetime; the producer keeps its own retain count.
+
+### Cross-platform availability probes
+
+| Probe | Returns true when |
+|-------|-------------------|
+| `is_dma_available()` | Linux DMA-BUF heap is mountable. False on every other OS. |
+| `is_iosurface_available()` | macOS IOSurface framework is present. False on every other OS. |
+| `is_gpu_buffer_available()` | The platform-native GPU-coherent kind is available (Linux: dma; macOS: iosurface). The portable probe — prefer this one when you only care whether `TensorMemory::Dma` will succeed. |
+| `is_shm_available()` | `shm_open` works. True on Linux and macOS, false on Windows. |
+
+The Linux-specific `dma-heap` and macOS-specific `IOSurface` /
+`CoreFoundation` framework links are gated by per-target sections in
+`Cargo.toml`; each platform only pulls in the deps it needs.
 
 ## Cross-References
 
