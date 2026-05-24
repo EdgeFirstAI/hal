@@ -67,9 +67,11 @@ impl HalDtype {
 pub enum HalTensorMemory {
     /// Regular system memory allocation (available on all platforms)
     Mem = 0,
-    /// Direct Memory Access allocation (Linux only, enables hardware acceleration)
+    /// GPU-coherent buffer allocation. DMA-buf on Linux, IOSurface on
+    /// macOS. Enables hardware acceleration via zero-copy import into
+    /// the GL backend.
     Dma = 1,
-    /// POSIX Shared Memory allocation (Linux only, for IPC)
+    /// POSIX Shared Memory allocation (Unix: Linux + macOS, for IPC)
     Shm = 2,
     /// GPU Pixel Buffer Object allocation (zero-copy GPU upload/readback)
     Pbo = 3,
@@ -208,16 +210,41 @@ macro_rules! dispatch_map {
 // Memory Availability Functions
 // ============================================================================
 
-/// Check if DMA (Direct Memory Access) buffer allocation is available.
+/// Check if Linux DMA-BUF buffer allocation is available.
 ///
-/// DMA buffers enable zero-copy data sharing between CPU and hardware
-/// accelerators. This is only available on Linux systems with DMA-BUF heap
-/// support.
+/// DMA-BUF buffers enable zero-copy data sharing between CPU and hardware
+/// accelerators on Linux. macOS callers should use
+/// hal_is_iosurface_available() or the portable
+/// hal_is_gpu_buffer_available() instead.
 ///
-/// @return true if DMA allocation is available, false otherwise
+/// @return true if DMA-BUF allocation is available, false otherwise
 #[no_mangle]
 pub extern "C" fn hal_is_dma_available() -> bool {
     edgefirst_tensor::is_dma_available()
+}
+
+/// Check if macOS IOSurface allocation is available.
+///
+/// IOSurface is the macOS zero-copy GPU buffer primitive (analogous to
+/// Linux DMA-BUF). Returns false on non-macOS platforms.
+///
+/// @return true if IOSurface allocation is available, false otherwise
+#[no_mangle]
+pub extern "C" fn hal_is_iosurface_available() -> bool {
+    edgefirst_tensor::is_iosurface_available()
+}
+
+/// Check if a platform-appropriate GPU-coherent buffer kind is available.
+///
+/// Portable probe that dispatches to hal_is_dma_available() on Linux and
+/// hal_is_iosurface_available() on macOS. Use this when writing
+/// cross-platform code that wants to know whether HAL_TENSOR_DMA will
+/// succeed without caring which primitive backs it.
+///
+/// @return true if HAL_TENSOR_DMA allocation will succeed, false otherwise
+#[no_mangle]
+pub extern "C" fn hal_is_gpu_buffer_available() -> bool {
+    edgefirst_tensor::is_gpu_buffer_available()
 }
 
 /// Check if POSIX shared memory allocation is available.
@@ -338,6 +365,70 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
         let _ = (dtype, fd, shape, ndim, name);
         set_error_null(libc::ENOTSUP)
     }
+}
+
+/// Wrap an existing IOSurface as a tensor (macOS only).
+///
+/// The IOSurface is retained for the tensor's lifetime; the caller keeps
+/// its own reference and must release the original IOSurface
+/// independently (via CFRelease or by dropping the producing handle).
+///
+/// Use this to import IOSurfaces from VideoToolbox / AVFoundation /
+/// CoreVideo, or to recover a tensor from an IOSurfaceID received over
+/// a Mach port or XPC connection — call IOSurfaceLookup(id) first to
+/// obtain the IOSurfaceRef, then pass it here.
+///
+/// **GL backend interaction**: the resulting tensor reports
+/// HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by
+/// the GL backend via EGL_ANGLE_iosurface_client_buffer with no extra
+/// copy.
+///
+/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
+/// @param surface_ref Pointer to a valid IOSurfaceRef (typed as void*)
+/// @param shape Array of dimension sizes (ndim elements)
+/// @param ndim Number of dimensions (1-8)
+/// @param name Optional tensor name for debugging (can be NULL)
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL shape, NULL surface_ref, or ndim outside [1, 8]
+/// - EIO: Failed to import IOSurface (e.g. dead pointer)
+/// - ENOTSUP: Not supported on this platform (non-macOS)
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn hal_tensor_from_iosurface(
+    dtype: HalDtype,
+    surface_ref: *mut std::ffi::c_void,
+    shape: *const size_t,
+    ndim: size_t,
+    name: *const c_char,
+) -> *mut HalTensor {
+    check_null_ret_null!(shape, surface_ref);
+    if ndim == 0 || ndim > 8 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
+    let name_opt = unsafe { c_str_to_option(name) };
+    let dt: DType = dtype.into();
+
+    let tensor = try_or_null!(
+        unsafe { TensorDyn::from_iosurface(surface_ref, shape_slice, dt, name_opt) },
+        libc::EIO
+    );
+    Box::into_raw(Box::new(HalTensor { inner: tensor }))
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "macos"))]
+pub unsafe extern "C" fn hal_tensor_from_iosurface(
+    _dtype: HalDtype,
+    _surface_ref: *mut std::ffi::c_void,
+    _shape: *const size_t,
+    _ndim: size_t,
+    _name: *const c_char,
+) -> *mut HalTensor {
+    set_error_null(libc::ENOTSUP)
 }
 
 /// Free a tensor and release its resources.
@@ -515,6 +606,86 @@ pub unsafe extern "C" fn hal_tensor_dmabuf_clone(tensor: *const HalTensor) -> c_
 #[cfg(not(target_os = "linux"))]
 pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c_int {
     set_error(libc::ENOTSUP)
+}
+
+/// Return the IOSurfaceID for a tensor backed by IOSurface (macOS only).
+///
+/// The IOSurfaceID is a 32-bit handle stable for the lifetime of the
+/// IOSurface; it can be passed across process boundaries (typically via
+/// a Mach port or XPC connection) and recovered on the other side via
+/// IOSurfaceLookup(id). Returns 0 when the tensor is not
+/// IOSurface-backed; 0 is a sentinel and not a valid IOSurfaceID.
+///
+/// @param tensor Tensor handle
+/// @return IOSurfaceID on success, 0 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn hal_tensor_iosurface_id(tensor: *const HalTensor) -> u32 {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return 0;
+    }
+    match unsafe { &*tensor }.inner.iosurface_id() {
+        Some(id) => id,
+        None => {
+            set_error(libc::ENOTSUP);
+            0
+        }
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "macos"))]
+pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u32 {
+    set_error(libc::ENOTSUP);
+    0
+}
+
+/// Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+///
+/// The returned pointer is borrowed; its lifetime is tied to the tensor
+/// handle. Do not call CFRelease on it. Use this when you need to pass
+/// the IOSurface to a native macOS API (e.g. CIImage,
+/// AVSampleBufferDisplayLayer) that takes an IOSurfaceRef directly,
+/// without going through the IOSurfaceID indirection.
+///
+/// Returns NULL when the tensor is not IOSurface-backed.
+///
+/// @param tensor Tensor handle
+/// @return Borrowed IOSurfaceRef on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+#[no_mangle]
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn hal_tensor_iosurface_ref(
+    tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    match unsafe { &*tensor }.inner.iosurface_ref() {
+        Some(ptr) => ptr,
+        None => {
+            set_error(libc::ENOTSUP);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "macos"))]
+pub unsafe extern "C" fn hal_tensor_iosurface_ref(
+    _tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    set_error(libc::ENOTSUP);
+    std::ptr::null_mut()
 }
 
 /// Reshape a tensor to a new shape.
@@ -1302,6 +1473,117 @@ mod tests {
             // NULL tensor should return -1 with EINVAL
             assert_eq!(hal_tensor_dmabuf_clone(std::ptr::null()), -1);
             assert_eq!(errno::errno().0, libc::EINVAL);
+
+            hal_tensor_free(tensor);
+        }
+    }
+
+    /// Probe symbols are always defined; verify the cross-platform contract.
+    /// On Linux: gpu_buffer == dma_available, iosurface == false.
+    /// On macOS: gpu_buffer == iosurface_available, dma_available depends
+    /// on Linux-specific heap presence (always false in practice on macOS).
+    #[test]
+    fn test_gpu_buffer_probes_dispatch_per_platform() {
+        let dma = hal_is_dma_available();
+        let ios = hal_is_iosurface_available();
+        let any = hal_is_gpu_buffer_available();
+
+        // `any` must reflect the platform-native probe.
+        #[cfg(target_os = "linux")]
+        assert_eq!(any, dma, "Linux: gpu_buffer_available should follow dma");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            any, ios,
+            "macOS: gpu_buffer_available should follow iosurface"
+        );
+
+        // On non-macOS targets, iosurface is always false.
+        #[cfg(not(target_os = "macos"))]
+        assert!(!ios, "IOSurface is macOS-only");
+        // On non-Linux targets, dma is always false.
+        #[cfg(not(target_os = "linux"))]
+        assert!(!dma, "DMA-BUF is Linux-only");
+    }
+
+    /// On macOS, allocating a Dma tensor produces an IOSurface that
+    /// hal_tensor_iosurface_id can extract. On non-macOS, the symbol
+    /// returns 0 with ENOTSUP.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_iosurface_id_roundtrip_macos() {
+        if !hal_is_iosurface_available() {
+            eprintln!("SKIPPED: IOSurface not available on this host");
+            return;
+        }
+        unsafe {
+            let shape: [size_t; 3] = [720, 1280, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Dma,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null(), "Dma allocation should succeed on macOS");
+
+            let id = hal_tensor_iosurface_id(tensor);
+            assert!(id != 0, "valid IOSurface should have nonzero ID");
+
+            let surf = hal_tensor_iosurface_ref(tensor);
+            assert!(!surf.is_null(), "IOSurfaceRef should be non-null");
+
+            // hal_tensor_from_iosurface re-imports the same surface.
+            // It must succeed and report the same ID — IOSurfaceID is
+            // stable for the lifetime of the underlying surface.
+            let imported = hal_tensor_from_iosurface(
+                HalDtype::U8,
+                surf,
+                shape.as_ptr(),
+                shape.len(),
+                std::ptr::null(),
+            );
+            assert!(!imported.is_null(), "re-import should succeed");
+            assert_eq!(
+                hal_tensor_iosurface_id(imported),
+                id,
+                "re-imported IOSurfaceID must match the original"
+            );
+
+            hal_tensor_free(imported);
+            hal_tensor_free(tensor);
+        }
+    }
+
+    /// On non-macOS, the IOSurface accessors return error sentinels
+    /// without crashing. Mem-backed tensors should never report an
+    /// IOSurfaceID even on macOS.
+    #[test]
+    fn test_iosurface_accessors_reject_non_iosurface_tensor() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let tensor = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!tensor.is_null());
+
+            // Mem-backed tensor: no IOSurface → 0 with ENOTSUP on macOS,
+            // ENOTSUP on every other platform.
+            let id = hal_tensor_iosurface_id(tensor);
+            assert_eq!(id, 0);
+            assert_eq!(errno::errno().0, libc::ENOTSUP);
+
+            // NULL tensor → 0 with EINVAL on every platform.
+            errno::set_errno(errno::Errno(0));
+            let id = hal_tensor_iosurface_id(std::ptr::null());
+            assert_eq!(id, 0);
+            #[cfg(target_os = "macos")]
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            #[cfg(not(target_os = "macos"))]
+            assert_eq!(errno::errno().0, libc::ENOTSUP);
 
             hal_tensor_free(tensor);
         }

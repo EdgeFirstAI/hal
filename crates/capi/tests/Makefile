@@ -23,14 +23,12 @@ RELEASE_LIB_DIR := $(TARGET_DIR)/release
 DEBUG_LIB_DIR := $(TARGET_DIR)/debug
 
 # Detect available library
-ifeq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.so),)
-  ifeq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.a),)
-    LIB_DIR := $(DEBUG_LIB_DIR)
-  else
-    LIB_DIR := $(RELEASE_LIB_DIR)
-  endif
-else
+# macOS dylib + Linux so: probe both before falling back to a static
+# archive or the debug build dir.
+ifneq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.so $(RELEASE_LIB_DIR)/libedgefirst_hal.dylib $(RELEASE_LIB_DIR)/libedgefirst_hal.a),)
   LIB_DIR := $(RELEASE_LIB_DIR)
+else
+  LIB_DIR := $(DEBUG_LIB_DIR)
 endif
 
 # Include path
@@ -56,7 +54,9 @@ ifeq ($(UNAME_S),Linux)
   LDFLAGS := -L$(LIB_DIR) -Wl,-rpath,$(LIB_DIR)
   LIBS := -ledgefirst_hal -lm -lpthread -ldl
 else ifeq ($(UNAME_S),Darwin)
-  LDFLAGS := -L$(LIB_DIR)
+  # -Wl,-rpath embeds the absolute lib dir so the test binary finds
+  # libedgefirst_hal.dylib without DYLD_LIBRARY_PATH at runtime.
+  LDFLAGS := -L$(LIB_DIR) -Wl,-rpath,$(LIB_DIR)
   LIBS := -ledgefirst_hal -lm -lpthread
 else
   $(error Unsupported platform: $(UNAME_S))

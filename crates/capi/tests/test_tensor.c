@@ -268,12 +268,18 @@ static void test_tensor_dma_memory(void) {
     ASSERT_NOT_NULL(t);
     ASSERT_EQ(HAL_TENSOR_MEMORY_DMA, hal_tensor_memory_type(t));
 
-    // Clone FD should work for DMA tensors
+    // Platform-specific export path: fd on Linux, IOSurfaceID on macOS.
+    // The Dma tensor must expose whichever handle its platform uses.
+#ifdef __linux__
     int fd = hal_tensor_clone_fd(t);
     ASSERT_TRUE(fd >= 0);
-
-    // Close the cloned fd
     close(fd);
+#elif defined(__APPLE__)
+    uint32_t id = hal_tensor_iosurface_id(t);
+    ASSERT_TRUE(id != 0);
+    void* surf = hal_tensor_iosurface_ref(t);
+    ASSERT_NOT_NULL(surf);
+#endif
 
     // Map and verify we can write data
     struct hal_tensor_map* map = hal_tensor_map_create(t);
@@ -298,6 +304,40 @@ static void test_tensor_dma_memory(void) {
     hal_tensor_free(t);
     TEST_PASS();
 }
+
+#ifdef __APPLE__
+// IOSurface round-trip: hal_tensor_from_iosurface must recover a
+// tensor that shares the same IOSurfaceID as the original.
+static void test_tensor_iosurface_roundtrip(void) {
+    TEST("tensor_iosurface_roundtrip");
+
+    if (!hal_is_iosurface_available()) {
+        TEST_SKIP("IOSurface not available");
+        return;
+    }
+
+    size_t shape[] = {720, 1280, 4};
+    struct hal_tensor* t =
+        hal_tensor_new(HAL_DTYPE_U8, shape, 3, HAL_TENSOR_MEMORY_DMA, "iosurface_rt");
+    ASSERT_NOT_NULL(t);
+
+    uint32_t id = hal_tensor_iosurface_id(t);
+    ASSERT_TRUE(id != 0);
+
+    void* surf = hal_tensor_iosurface_ref(t);
+    ASSERT_NOT_NULL(surf);
+
+    struct hal_tensor* imported =
+        hal_tensor_from_iosurface(HAL_DTYPE_U8, surf, shape, 3, NULL);
+    ASSERT_NOT_NULL(imported);
+    ASSERT_EQ(HAL_TENSOR_MEMORY_DMA, hal_tensor_memory_type(imported));
+    ASSERT_EQ(id, hal_tensor_iosurface_id(imported));
+
+    hal_tensor_free(imported);
+    hal_tensor_free(t);
+    TEST_PASS();
+}
+#endif
 
 static void test_tensor_clone_fd_mem_fails(void) {
     TEST("tensor_clone_fd_mem_fails");
@@ -368,9 +408,12 @@ void run_tensor_tests(void) {
     test_tensor_reshape();
     test_tensor_reshape_invalid();
 
-    // DMA tests (Linux-specific)
+    // DMA tests (Linux DMA-BUF + macOS IOSurface)
     test_tensor_dma_memory();
     test_tensor_clone_fd_mem_fails();
+#ifdef __APPLE__
+    test_tensor_iosurface_roundtrip();
+#endif
 
     // Quantization accessor tests
     test_tensor_quantization_float_returns_null();

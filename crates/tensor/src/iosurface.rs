@@ -440,6 +440,45 @@ where
             _ => None,
         }
     }
+
+    /// Return the IOSurfaceID for cross-process IOSurface lookup
+    /// (macOS only). Returns `None` when the tensor is not
+    /// IOSurface-backed.
+    ///
+    /// The ID is stable for the lifetime of the IOSurface and can be
+    /// passed across process boundaries; the receiver recovers the
+    /// `IOSurfaceRef` via `IOSurfaceLookup(id)`.
+    pub fn iosurface_id(&self) -> Option<u32> {
+        match &self.storage {
+            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.surface_id()),
+            _ => None,
+        }
+    }
+
+    /// Wrap an externally-allocated IOSurface as a tensor (macOS only).
+    ///
+    /// Used to import IOSurfaces from VideoToolbox, AVFoundation, or
+    /// other producers, and to recover a tensor from an IOSurfaceID
+    /// received over a Mach port or XPC connection. The surface is
+    /// retained for the tensor's lifetime; the external owner keeps
+    /// its own reference and must release it independently.
+    ///
+    /// # Safety
+    ///
+    /// `surface_ref` must be a valid live `IOSurfaceRef`. Passing a
+    /// stale or invalid pointer is UB. `shape` must match the
+    /// IOSurface's pixel dimensions and element count.
+    pub unsafe fn from_iosurface(
+        surface_ref: *mut c_void,
+        shape: &[usize],
+        name: Option<&str>,
+    ) -> Result<Self>
+    where
+        T: num_traits::Num,
+    {
+        let inner = unsafe { IoSurfaceTensor::<T>::from_surface(surface_ref, shape, name)? };
+        Ok(crate::Tensor::wrap(crate::TensorStorage::Dma(inner)))
+    }
 }
 
 // ---------------------------------------------------------------------------
