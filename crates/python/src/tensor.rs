@@ -112,7 +112,8 @@ impl PyImageInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum PyTensorMemory {
-    #[cfg(target_os = "linux")]
+    /// Platform-native zero-copy GPU buffer: DMA-BUF on Linux,
+    /// IOSurface on macOS. Same Python name on both platforms.
     DMA,
     #[cfg(unix)]
     SHM,
@@ -123,7 +124,6 @@ pub enum PyTensorMemory {
 impl From<PyTensorMemory> for TensorMemory {
     fn from(value: PyTensorMemory) -> Self {
         match value {
-            #[cfg(target_os = "linux")]
             PyTensorMemory::DMA => TensorMemory::Dma,
             #[cfg(unix)]
             PyTensorMemory::SHM => TensorMemory::Shm,
@@ -136,7 +136,6 @@ impl From<PyTensorMemory> for TensorMemory {
 impl From<TensorMemory> for PyTensorMemory {
     fn from(value: TensorMemory) -> Self {
         match value {
-            #[cfg(target_os = "linux")]
             TensorMemory::Dma => PyTensorMemory::DMA,
             #[cfg(unix)]
             TensorMemory::Shm => PyTensorMemory::SHM,

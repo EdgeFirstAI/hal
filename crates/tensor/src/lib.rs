@@ -32,6 +32,8 @@ mod dma;
 mod dmabuf;
 mod error;
 mod format;
+#[cfg(target_os = "macos")]
+mod iosurface;
 mod mem;
 mod pbo;
 #[cfg(unix)]
@@ -40,6 +42,8 @@ mod tensor_dyn;
 
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
+#[cfg(target_os = "macos")]
+pub use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
 pub use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
@@ -776,10 +780,20 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorMemory {
-    #[cfg(target_os = "linux")]
-    /// Direct Memory Access (DMA) allocation. Incurs additional
-    /// overhead for memory reading/writing with the CPU.  Allows for
-    /// hardware acceleration when supported.
+    /// Platform-native zero-copy GPU buffer.
+    ///
+    /// On Linux this is a DMA-BUF (`DmaTensor` in `crates/tensor/src/dma.rs`)
+    /// allocated via the DRM/dma-heap subsystem. On macOS this is an
+    /// IOSurface (`IoSurfaceTensor` in `crates/tensor/src/iosurface.rs`).
+    /// Both fit into the same `TensorStorage::Dma` slot at the trait
+    /// level — the public C API discriminant (`HalTensorMemory::Dma=1`)
+    /// works on both platforms with no ABI break.
+    ///
+    /// Allows hardware-accelerated paths (OpenGL backend on Linux via
+    /// `EGL_EXT_image_dma_buf_import`; macOS via
+    /// `EGL_ANGLE_iosurface_client_buffer`). CPU access via `map()`
+    /// incurs cache-coherency overhead on Linux DMA-BUF and is similar
+    /// in cost on IOSurface; SHM/Mem are cheaper for CPU-only workloads.
     Dma,
     #[cfg(unix)]
     /// POSIX Shared Memory allocation. Suitable for inter-process
@@ -797,7 +811,6 @@ pub enum TensorMemory {
 impl From<TensorMemory> for String {
     fn from(memory: TensorMemory) -> Self {
         match memory {
-            #[cfg(target_os = "linux")]
             TensorMemory::Dma => "dma".to_owned(),
             #[cfg(unix)]
             TensorMemory::Shm => "shm".to_owned(),
@@ -812,7 +825,6 @@ impl TryFrom<&str> for TensorMemory {
 
     fn try_from(s: &str) -> Result<Self> {
         match s {
-            #[cfg(target_os = "linux")]
             "dma" => Ok(TensorMemory::Dma),
             #[cfg(unix)]
             "shm" => Ok(TensorMemory::Shm),
@@ -829,8 +841,14 @@ pub(crate) enum TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Platform-native zero-copy GPU buffer. Inner type differs per
+    /// target: `DmaTensor` on Linux (DMA-BUF fd), `IoSurfaceTensor` on
+    /// macOS (CFRetained IOSurface). The shared variant name keeps the
+    /// public `TensorMemory::Dma` discriminant stable across platforms.
     #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
+    #[cfg(target_os = "macos")]
+    Dma(IoSurfaceTensor<T>),
     #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
@@ -851,6 +869,15 @@ where
             Some(TensorMemory::Dma) => {
                 DmaTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
+            #[cfg(target_os = "macos")]
+            Some(TensorMemory::Dma) => {
+                IoSurfaceTensor::<T>::new(shape, name).map(TensorStorage::Dma)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Some(TensorMemory::Dma) => Err(crate::error::Error::NotImplemented(
+                "TensorMemory::Dma is only available on Linux (DMA-BUF) and macOS (IOSurface)"
+                    .to_owned(),
+            )),
             #[cfg(unix)]
             Some(TensorMemory::Shm) => {
                 ShmTensor::<T>::new(shape, name).map(TensorStorage::Shm)
@@ -883,9 +910,27 @@ where
                             }
                         }
                     }
-                    #[cfg(all(unix, not(target_os = "linux")))]
+                    #[cfg(target_os = "macos")]
                     {
-                        // macOS/BSD: Try SHM -> Mem (no DMA)
+                        // macOS: Try IOSurface -> SHM -> Mem. IOSurface
+                        // is the GPU-shareable backend (zero-copy via
+                        // ANGLE), filling the same role as DMA-BUF on
+                        // Linux. Falls back to SHM if IOSurface alloc
+                        // fails (memory pressure or sandboxed contexts).
+                        match IoSurfaceTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
+                            Err(_) => match ShmTensor::<T>::new(shape, name)
+                                .map(TensorStorage::Shm)
+                            {
+                                Ok(tensor) => Ok(tensor),
+                                Err(_) => MemTensor::<T>::new(shape, name)
+                                    .map(TensorStorage::Mem),
+                            },
+                        }
+                    }
+                    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+                    {
+                        // Other Unix (BSD): Try SHM -> Mem (no DMA)
                         match ShmTensor::<T>::new(shape, name) {
                             Ok(tensor) => Ok(TensorStorage::Shm(tensor)),
                             Err(_) => {
@@ -979,7 +1024,6 @@ where
     #[cfg(unix)]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.clone_fd(),
             TensorStorage::Shm(t) => t.clone_fd(),
             TensorStorage::Mem(t) => t.clone_fd(),
@@ -989,7 +1033,6 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(_) => TensorMemory::Dma,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
@@ -1000,7 +1043,6 @@ where
 
     fn name(&self) -> String {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.name(),
@@ -1011,7 +1053,6 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.shape(),
@@ -1022,7 +1063,6 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.reshape(shape),
@@ -1033,7 +1073,6 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.map(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.map(),
@@ -1044,7 +1083,6 @@ where
 
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
-            #[cfg(target_os = "linux")]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.buffer_identity(),
@@ -1891,6 +1929,8 @@ where
 {
     #[cfg(target_os = "linux")]
     Dma(DmaMap<T>),
+    #[cfg(target_os = "macos")]
+    IoSurface(IoSurfaceMap<T>),
     #[cfg(unix)]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
@@ -1905,6 +1945,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.shape(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.shape(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
@@ -1916,6 +1958,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.unmap(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.unmap(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
@@ -1927,6 +1971,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_slice(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
@@ -1938,6 +1984,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_mut_slice(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
@@ -1956,6 +2004,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
@@ -1972,6 +2022,8 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref_mut(),
+            #[cfg(target_os = "macos")]
+            TensorMap::IoSurface(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
@@ -1984,28 +2036,72 @@ where
 // Platform availability helpers
 // ============================================================================
 
-/// Check if DMA memory allocation is available on this system.
-///
-/// Returns `true` only on Linux systems with DMA-BUF heap access (typically
-/// requires running as root or membership in a video/render group).
-/// Always returns `false` on non-Linux platforms (macOS, Windows, etc.).
-///
-/// This function caches its result after the first call for efficiency.
+/// Cached result of the Linux DMA-BUF availability probe.
 #[cfg(target_os = "linux")]
 static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// Cached result of the macOS IOSurface availability probe.
+#[cfg(target_os = "macos")]
+static IOSURFACE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Check if DMA memory allocation is available on this system.
+/// Check if Linux DMA-BUF allocation is available on this system.
+///
+/// Linux-specific availability check (typically requires `/dev/dma_heap`
+/// access — running as root or membership in a video/render group). For
+/// portable code that wants "any zero-copy GPU buffer", use
+/// [`is_gpu_buffer_available`] which also covers IOSurface on macOS.
+///
+/// This function caches its result after the first call.
 #[cfg(target_os = "linux")]
 pub fn is_dma_available() -> bool {
     *DMA_AVAILABLE.get_or_init(|| Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok())
 }
 
-/// Check if DMA memory allocation is available on this system.
-///
-/// Always returns `false` on non-Linux platforms since DMA-BUF is Linux-specific.
+/// Always returns `false` on non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
 pub fn is_dma_available() -> bool {
     false
+}
+
+/// Check if macOS IOSurface allocation is available on this system.
+///
+/// IOSurface is part of the macOS OS and is essentially always present;
+/// this probe catches degraded scenarios such as memory pressure or
+/// sandboxed contexts where `IOSurfaceCreate` fails. The result is
+/// cached after the first call.
+///
+/// Always returns `false` on non-macOS platforms.
+#[cfg(target_os = "macos")]
+pub fn is_iosurface_available() -> bool {
+    *IOSURFACE_AVAILABLE.get_or_init(|| {
+        // Probe via the same Dma path — on macOS this routes through
+        // IoSurfaceTensor::new.
+        Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_iosurface_available() -> bool {
+    false
+}
+
+/// Portable probe for the platform's native zero-copy GPU buffer
+/// allocator (DMA-BUF on Linux, IOSurface on macOS). Returns `false` on
+/// Windows and other platforms with no equivalent. Use this when writing
+/// cross-platform code that cares whether the `Dma` tensor variant will
+/// work, not which underlying mechanism is used.
+pub fn is_gpu_buffer_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        is_dma_available()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        is_iosurface_available()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 /// Check if POSIX shared memory allocation is available on this system.
@@ -2401,14 +2497,30 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
-        // On macOS/BSD, auto-detection tries SHM first, falls back to Mem
+        // macOS auto-fallback chain: IOSurface (Dma) → SHM → Mem.
+        // Healthy systems always return Dma; SHM/Mem only appear under
+        // memory pressure or sandboxed contexts where IOSurfaceCreate
+        // fails.
+        let m = tensor.memory();
+        assert!(
+            matches!(m, TensorMemory::Dma | TensorMemory::Shm | TensorMemory::Mem),
+            "Unexpected auto-fallback result on macOS: {m:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn test_tensor() {
+        let shape = vec![1];
+        let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+        // Other Unix (BSD): auto-detection tries SHM first, falls back to Mem.
         assert!(
             tensor.memory() == TensorMemory::Shm || tensor.memory() == TensorMemory::Mem,
-            "Expected SHM or Mem on macOS, got {:?}",
+            "Expected SHM or Mem, got {:?}",
             tensor.memory()
         );
     }

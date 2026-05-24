@@ -204,6 +204,86 @@ def gen_decode_cost_table(data_dir: Path):
         print(f"| {platform} | {fmt_us(proto)} | {fmt_us(materialize)} |")
 
 
+# ============================================================================
+# OpenCV Comparison (CPU-only platforms)
+# ============================================================================
+
+
+def _ratio(hal: float | None, cv: float | None) -> str:
+    """Format hal/opencv speed ratio. >1 means hal is slower."""
+    if hal is None or cv is None or cv <= 0:
+        return "—"
+    return f"{hal / cv:.2f}×"
+
+
+def gen_opencv_letterbox_4k(data_dir: Path):
+    """4K letterbox to 640×640: hal CPU vs OpenCV, per-platform."""
+    print("\n**4K letterbox → 640×640 (hal CPU vs OpenCV, single-threaded):**\n")
+    print(
+        "| Platform | Operation | hal | OpenCV | hal/OpenCV |"
+    )
+    print(
+        "|----------|-----------|-----|--------|------------|"
+    )
+
+    ops = [
+        ("YUYV→RGBA", "letterbox/3840x2160/YUYV->640x640/RGBA",
+                       "letterbox/opencv-1cpu/3840x2160/YUYV->640x640/RGBA"),
+        ("YUYV→RGB",  "letterbox/3840x2160/YUYV->640x640/RGB",
+                       "letterbox/opencv-1cpu/3840x2160/YUYV->640x640/RGB"),
+        ("NV12→RGBA", "letterbox/3840x2160/NV12->640x640/RGBA",
+                       "letterbox/opencv-1cpu/3840x2160/NV12->640x640/RGBA"),
+        ("NV12→RGB",  "letterbox/3840x2160/NV12->640x640/RGB",
+                       "letterbox/opencv-1cpu/3840x2160/NV12->640x640/RGB"),
+    ]
+    for platform in PLATFORMS:
+        hal_data = load_json(data_dir, platform, "pipeline-cpu")
+        cv_data = load_json(data_dir, platform, "opencv")
+        if hal_data is None or cv_data is None:
+            continue
+        for label, hal_key, cv_key in ops:
+            hal = get_bench(hal_data, hal_key)
+            cv = get_bench(cv_data, cv_key)
+            if hal is None and cv is None:
+                continue
+            print(f"| {platform} | {label} | {fmt_us(hal)} | {fmt_us(cv)} | {_ratio(hal, cv)} |")
+
+
+def gen_opencv_convert_1080p(data_dir: Path):
+    """1080p same-size convert: hal CPU vs OpenCV, per-platform."""
+    print("\n**1080p convert (same size, hal CPU vs OpenCV, single-threaded):**\n")
+    print(
+        "| Platform | Operation | hal | OpenCV | hal/OpenCV |"
+    )
+    print(
+        "|----------|-----------|-----|--------|------------|"
+    )
+
+    ops = [
+        ("YUYV→RGBA", "convert/1920x1080/YUYV->RGBA",
+                       "convert/opencv-1cpu/1920x1080/YUYV->RGBA"),
+        ("YUYV→RGB",  "convert/1920x1080/YUYV->RGB",
+                       "convert/opencv-1cpu/1920x1080/YUYV->RGB"),
+        ("NV12→RGBA", "convert/1920x1080/NV12->RGBA",
+                       "convert/opencv-1cpu/1920x1080/NV12->RGBA"),
+        ("NV12→RGB",  "convert/1920x1080/NV12->RGB",
+                       "convert/opencv-1cpu/1920x1080/NV12->RGB"),
+        ("RGB→RGBA",  "convert/1920x1080/RGB->RGBA",
+                       "convert/opencv-1cpu/1920x1080/RGB->RGBA"),
+    ]
+    for platform in PLATFORMS:
+        hal_data = load_json(data_dir, platform, "pipeline-cpu")
+        cv_data = load_json(data_dir, platform, "opencv")
+        if hal_data is None or cv_data is None:
+            continue
+        for label, hal_key, cv_key in ops:
+            hal = get_bench(hal_data, hal_key)
+            cv = get_bench(cv_data, cv_key)
+            if hal is None and cv is None:
+                continue
+            print(f"| {platform} | {label} | {fmt_us(hal)} | {fmt_us(cv)} | {_ratio(hal, cv)} |")
+
+
 if __name__ == "__main__":
     data_dir = parse_data_dir("Generate benchmark tables.")
 
@@ -226,3 +306,6 @@ if __name__ == "__main__":
     gen_mask_table(data_dir)
     gen_hybrid_comparison_table(data_dir)
     gen_decode_cost_table(data_dir)
+    # gen_opencv_letterbox_4k / gen_opencv_convert_1080p are defined above
+    # for local developer use (run by hand after `cargo bench --features opencv`)
+    # but not emitted into BENCHMARKS.md.

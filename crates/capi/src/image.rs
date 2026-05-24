@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_import_image_null_processor() {
         let fd = make_test_fd();
         assert!(fd >= 0);
@@ -2708,7 +2708,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_import_image_null_image() {
         unsafe {
             let processor = hal_image_processor_new();
@@ -2732,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_import_image_zero_width() {
         let fd = make_test_fd();
         assert!(fd >= 0);
@@ -2763,7 +2763,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_import_image_zero_height() {
         let fd = make_test_fd();
         assert!(fd >= 0);
@@ -2794,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn test_import_image_chroma_with_packed_format() {
         // Passing a chroma descriptor with a non-semi-planar format should fail
         let fd1 = make_test_fd();

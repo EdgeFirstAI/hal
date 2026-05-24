@@ -1,9 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 #![cfg(feature = "opengl")]
+// Many types defined at the `gl` module root (EglDisplayKind,
+// TransferBackend, RegionOfInterest, etc.) are consumed by the Linux-
+// only inner modules (`context`, `processor`, ...). On macOS those inner
+// modules are cfg'd out, so the shared types appear unused. They will
+// be exercised by `platform/macos.rs` once Phase 4 wires the macOS code
+// path; until then suppress the lint on non-Linux targets only.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+// The OS gate above admits macOS; the inner modules below are
+// per-platform-gated until the macOS path is wired up (Phase 4).
+// `platform/` is the cross-platform abstraction layer and is the only
+// module currently visible on macOS — its `MacosPlatform` impl returns
+// `NotImplemented` from every method until Tasks 36-37 land.
+
+#[cfg(target_os = "linux")]
 macro_rules! function {
     () => {{
         fn f() {}
@@ -20,19 +34,44 @@ macro_rules! function {
     }};
 }
 
+#[cfg(target_os = "linux")]
 mod cache;
+#[cfg(target_os = "linux")]
 mod context;
+#[cfg(target_os = "linux")]
 mod dma_import;
+mod platform;
+#[cfg(target_os = "linux")]
 mod processor;
+#[cfg(target_os = "linux")]
 mod resources;
+#[cfg(target_os = "linux")]
 mod shaders;
+#[cfg(target_os = "linux")]
 mod tests;
+#[cfg(target_os = "linux")]
 mod threaded;
 
+#[cfg(target_os = "linux")]
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
+#[cfg(target_os = "linux")]
 pub use threaded::GLProcessorThreaded;
+
+/// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
+/// `'static` because the underlying `libloading::Library` is intentionally
+/// leaked at first load (see `EGL_LIB` in `context.rs` and the equivalent
+/// on macOS — drivers may retain internal state past explicit cleanup, so
+/// dlclose can SIGBUS on process exit).
+///
+/// Defined here at the `gl` module root so the `platform/` trait and both
+/// platform implementations can name it without dragging in a cross-cfg
+/// re-export. The Linux `context.rs` and the macOS `platform/macos.rs`
+/// both use this same alias.
+pub(super) type Egl = khronos_egl::Instance<
+    khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
+>;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///

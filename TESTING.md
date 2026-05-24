@@ -67,6 +67,71 @@ pip install slipcover
 
 ---
 
+## macOS Setup
+
+The full HAL test suite assumes a CPU build by default. To exercise the
+OpenGL backend on macOS the test process needs to load ANGLE's
+`libEGL.dylib` / `libGLESv2.dylib` and to be code-signed with
+entitlements that permit loading third-party dylibs.
+
+### 1. Install and re-sign ANGLE
+
+Follow the install steps in
+[README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration).
+On Tahoe (macOS 26+) the post-install `codesign --force --sign -` step
+is mandatory — without it the test process is killed by the kernel with
+no stdout and exit code 137.
+
+If a test dies with no output, check
+`~/Library/Logs/DiagnosticReports/` for a crash report; the failure mode
+for missing/broken ANGLE signatures is
+`SIGKILL (Code Signature Invalid)`.
+
+### 2. Sign your test binary with the right entitlements
+
+On Tahoe a binary that `dlopen`s third-party dylibs needs the
+`disable-library-validation` entitlement even when those dylibs are
+ad-hoc signed. The HAL ships an `entitlements.plist` covering this for
+its own tests and benchmarks.
+
+For ad-hoc spike binaries (e.g. `spikes/angle_iosurface/`):
+
+```bash
+cargo build --release
+codesign --force --sign - \
+  --entitlements entitlements.plist \
+  ./target/release/spike
+```
+
+For `cargo test` and `cargo nextest run`, the test harness rebuilds
+binaries under `target/{debug,release}/deps/`. The simplest workflow is
+to sign all binaries in that directory before running:
+
+```bash
+find target/release/deps -type f -perm +111 -maxdepth 1 \
+  -exec codesign --force --sign - --entitlements entitlements.plist {} \;
+```
+
+The signing pass is fast (sub-second per binary) and re-running it is
+idempotent. The recommended workflow on macOS is to wrap your test
+command with a `scripts/test-macos.sh` helper that does the sign step
+first.
+
+### 3. Verify ANGLE is reachable
+
+A minimal smoke test:
+
+```bash
+RUST_LOG=edgefirst_image=debug \
+  cargo run --release --example pipeline_demo 2>&1 | head -20
+```
+
+You should see lines mentioning `ANGLE` and `Metal Renderer`. If you see
+the CPU backend selected, ANGLE didn't load — re-check the codesign
+steps above.
+
+---
+
 ## Rust Unit Tests
 
 Rust tests are co-located with source code in `#[cfg(test)]` modules:

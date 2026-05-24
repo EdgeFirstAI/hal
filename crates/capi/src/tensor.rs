@@ -79,13 +79,13 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
-            #[cfg(target_os = "linux")]
+            // Dma covers DMA-BUF on Linux and IOSurface on macOS.
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
             #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
             HalTensorMemory::Pbo => Some(TensorMemory::Pbo),
-            #[cfg(not(target_os = "linux"))]
-            _ => Some(TensorMemory::Mem),
+            #[cfg(not(unix))]
+            HalTensorMemory::Shm => Some(TensorMemory::Mem),
         }
     }
 }
@@ -94,7 +94,8 @@ impl From<TensorMemory> for HalTensorMemory {
     fn from(mem: TensorMemory) -> Self {
         match mem {
             TensorMemory::Mem => HalTensorMemory::Mem,
-            #[cfg(target_os = "linux")]
+            // Dma covers DMA-BUF on Linux and IOSurface on macOS — same
+            // discriminant value, ABI-stable across platforms.
             TensorMemory::Dma => HalTensorMemory::Dma,
             #[cfg(unix)]
             TensorMemory::Shm => HalTensorMemory::Shm,

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Entitlements for HAL test and example binaries on macOS.
+
+    Required on macOS 26 (Tahoe) and later for any HAL binary that loads
+    ANGLE's libEGL.dylib / libGLESv2.dylib at runtime. Tahoe's strict
+    code-signing enforcement refuses to dlopen dylibs whose signatures
+    don't match the loading process's signing identity unless the loading
+    process explicitly opts out via this entitlement.
+
+    Usage:
+        codesign --force --sign - --entitlements entitlements.plist \
+            ./target/release/your-binary
+
+    These entitlements are appropriate for local development, CI test
+    runners, and ad-hoc-signed binaries. The official EdgeFirst-signed
+    binary distribution uses a different signing configuration (full
+    Developer ID + notarization) and does not require these entitlements
+    because the bundled ANGLE dylibs are re-signed under the same Team ID
+    as the HAL binary.
+
+    See TESTING.md § macOS Setup for the full workflow.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Allow loading dylibs (e.g. ANGLE) that are not signed by the same
+         Team ID as this binary. Required for ad-hoc signed builds that load
+         ANGLE from Homebrew. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Allow DYLD_* environment variables to be honored. Useful for
+         debugging library load issues (DYLD_PRINT_LIBRARIES etc). -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- Allow JIT / executable-memory mappings. ANGLE's Metal backend
+         generates and executes shader code at runtime; some Metal paths
+         hit this. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>

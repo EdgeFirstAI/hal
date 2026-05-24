@@ -1,8 +1,8 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.5
-**Last Updated:** May 18, 2026
-**Status:** Custom JPEG decoder with NEON SIMD (AArch64), SSE4.1/SSSE3 SIMD (x86-64), and vectorised type conversion: 20–22% faster than image crate on ARM, matches or beats image crate on x86
+**Version:** 3.7
+**Last Updated:** May 22, 2026
+**Status:** Adds macOS (Apple Silicon, `mbp-m2-max`) as a developer platform. Custom JPEG decoder with NEON SIMD (AArch64), SSE4.1/SSSE3 SIMD (x86-64), and vectorised type conversion: 20–22% faster than image crate on ARM, matches or beats image crate on x86.
 
 ---
 
@@ -265,6 +265,21 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **G2D** | No |
 | **DMA-buf** | DMA allocation works but NVIDIA EGL cannot import — PBO path |
 | **Notes** | Development platform; PBO backend primary, DMA-buf roundtrip fails |
+
+### mbp-m2-max
+
+| Property | Value |
+|----------|-------|
+| **Platform ID** | `mbp-m2-max` |
+| **Model** | MacBook Pro Mac14,5 |
+| **SoC** | Apple M2 Max |
+| **CPU** | 12 cores (8 Performance + 4 Efficiency, ARMv8.6-A, NEON + dotprod + i8mm + FP16) |
+| **GPU** | Apple integrated (used by HAL via ANGLE + IOSurface) |
+| **RAM** | 32 GB unified memory |
+| **OS** | macOS 26+ (`aarch64-apple-darwin`) |
+| **G2D** | No (Linux-only) |
+| **DMA-buf** | No (Linux-only); HAL uses IOSurface as the zero-copy primitive |
+| **Notes** | Apple Silicon developer platform. GPU acceleration via ANGLE + IOSurface translating the same GLES 3.0 shaders used on Linux to Metal. |
 
 ---
 
@@ -1015,6 +1030,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |
 | 3.6 | 2026-05-17 | Add decode→letterbox pipeline benchmark (`decode_pipeline_benchmark`, `pipeline_demo`): cross-platform results on imx8mp-frdm, imx95-frdm, rpi5-hailo, orin-nano, x86-desktop. Zero heap allocations verified on all DMA-BUF platforms via strace. Auto-detect DMA/PBO/Mem memory type. |
 | 3.5 | 2026-05-18 | Perf-driven optimizations: 11-bit Huffman LUT (was 9-bit); batch byte-stuffing in bitstream refill; SSE4.1 IDCT with native `mullo_epi32` and `min/max` clamping; SSSE3 RGB shuffle store; NEON+SSE2 vectorised u8→f32/u16/i16 conversion. f32 decode now only 1.17× slower than u8 (was 4.0×); x86 RGB within 6% of image crate (was 25%); all results updated on 3 platforms. |
 | 3.4 | 2026-05-17 | Add SSE2 SIMD kernels for x86-64: IDCT, YCbCr→RGB/RGBA/BGRA color conversion, and horizontal chroma upsample. x86 JPEG decode now 1.75× faster than scalar; within 25% of image crate for 720p and matches/beats it for 640×640. Update all x86-desktop results. |

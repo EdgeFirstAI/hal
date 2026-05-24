@@ -34,6 +34,13 @@ libc = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Raw FFI bindings to IOSurface and CoreFoundation; lighter touch than the
+# objc2 wrappers and matches the production spike at
+# spikes/angle_iosurface/. The IOSurface and CoreFoundation frameworks are
+# linked via the `#[link]` attribute inside the iosurface module.
+libc = { workspace = true }
+
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
 serde_json = { workspace = true }
