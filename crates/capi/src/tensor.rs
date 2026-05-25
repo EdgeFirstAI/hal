@@ -82,7 +82,12 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
         match mem {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
             // Dma covers DMA-BUF on Linux and IOSurface on macOS.
+            // On platforms without a GPU-buffer backend, fall back to Mem
+            // so callers don't get a misleading ENOMEM.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            HalTensorMemory::Dma => Some(TensorMemory::Mem),
             #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
             HalTensorMemory::Pbo => Some(TensorMemory::Pbo),

@@ -768,15 +768,9 @@ impl MacosGlProcessor {
 }
 
 fn pixel_format_discriminant(fmt: PixelFormat) -> u8 {
-    // `PixelFormat` has no `repr(u8)`, so derive a stable u8 by hashing
-    // its Debug representation. Collisions are vanishingly unlikely in
-    // the small set of formats this backend cares about. If a collision
-    // ever happens it just means a pbuffer gets created twice — a
-    // performance bug, not a correctness one.
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{fmt:?}").hash(&mut h);
-    (h.finish() & 0xFF) as u8
+    // PixelFormat is #[repr(u8)] so the cast is a guaranteed
+    // collision-free discriminant.
+    fmt as u8
 }
 
 impl Drop for MacosGlProcessor {
