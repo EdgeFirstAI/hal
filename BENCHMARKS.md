@@ -2,7 +2,7 @@
 
 **Version:** 3.8
 **Last Updated:** May 24, 2026
-**Status:** Adds macOS GPU backend on Apple Silicon (`mbp-m2-max`) via ANGLE + IOSurface. The same GLES 3.0 shaders that drive the Linux GPU path now drive Metal through ANGLE, and `TensorMemory::Dma` is implemented over IOSurface for zero-copy bind. YUYV→RGBA convert speedups vs the Apple Silicon CPU path: **1.32×** at 1080p and **4.76×** at 4K. Memcpy through IOSurface is also **2.7× faster than SHM** at 4K.
+**Status:** Adds macOS GPU backend on Apple Silicon (`mbp-m2-max`) via ANGLE + IOSurface. The same GLES 3.0 shaders that drive the Linux GPU path now drive Metal through ANGLE, and `TensorMemory::Dma` is implemented over IOSurface for zero-copy bind. YUYV→RGBA **same-size format-conversion** speedups vs the Apple Silicon CPU path: **1.32×** at 1080p and **4.76×** at 4K. Letterbox-pipeline GL benchmarks for `mbp-m2-max` are not yet available — only the same-size convert path is shader-implemented today (see Known Gap #17 below). Memcpy through IOSurface is also **2.7× faster than SHM** at 4K.
 
 ---
 
@@ -1078,6 +1078,10 @@ allocation.
 
 ### Missing Format Coverage
 
+12. **No same-size convert benchmark for desktop Linux + Mesa x86_64 GL path** —
+    The matrix has GL letterbox for that platform but no same-size convert
+    column; the few rows are absorbed into the i.MX comparison.
+
 13. **No NV16 benchmarks** — NV16 (4:2:2 semi-planar) CPU conversion exists but G2D/GL paths and benchmarks are missing.
 
 ### Missing Scenarios
@@ -1095,10 +1099,17 @@ allocation.
     Pipeline GL benchmarks therefore only show two working rows
     (`convert/1920x1080/YUYV->RGBA` and `convert/3840x2160/YUYV->RGBA`); the
     rest of the pipeline table is identical to the CPU-only column. Closing
-    this gap is straightforward — the same GLSL ES 3.0 shaders that run on
-    Linux GPUs work unchanged through ANGLE — but each new shader needs the
-    matching IOSurface FourCC entry in `tensor::iosurface::image_fourcc_and_bpe`
-    and `image::gl::iosurface_import::ImageLayout::for_format`. Tracked
+    this gap is mostly mechanical — the same GLSL ES 3.0 shaders that run on
+    Linux GPUs work unchanged through ANGLE — but each new shader needs
+    **three** synchronized entries:
+    (1) a GLSL ES 3.0 source string in `crates/image/src/gl/macos_processor.rs`,
+    (2) a FourCC + bytes-per-element mapping in
+    `tensor::iosurface::image_fourcc_and_bpe`, and
+    (3) a matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` entry in
+    `image::gl::iosurface_import::ImageLayout::gl_internal_format`. The
+    third entry is the one that fails silently — ANGLE validates the
+    GL-format ↔ FourCC pairing at `eglCreatePbufferFromClientBuffer` time
+    and returns a vague `EGL_BAD_ATTRIBUTE` when they disagree. Tracked
     separately from the v3.8 buffer-infrastructure baseline.
 
 ---
@@ -1107,7 +1118,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA GL convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Update letterbox / format-conversion / decoder / mask-decode / codec tables with mbp-m2-max rows. |
+| 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA same-size convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Add mbp-m2-max **CPU-only** rows to letterbox / decoder / mask-decode / codec tables; add mbp-m2-max **GL** rows (YUYV→RGBA only) to the same-size format-conversion and 4K-convert tables. Letterbox GL rows pending Gap #17 closure. |
 | 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |
 | 3.6 | 2026-05-17 | Add decode→letterbox pipeline benchmark (`decode_pipeline_benchmark`, `pipeline_demo`): cross-platform results on imx8mp-frdm, imx95-frdm, rpi5-hailo, orin-nano, x86-desktop. Zero heap allocations verified on all DMA-BUF platforms via strace. Auto-detect DMA/PBO/Mem memory type. |
 | 3.5 | 2026-05-18 | Perf-driven optimizations: 11-bit Huffman LUT (was 9-bit); batch byte-stuffing in bitstream refill; SSE4.1 IDCT with native `mullo_epi32` and `min/max` clamping; SSSE3 RGB shuffle store; NEON+SSE2 vectorised u8→f32/u16/i16 conversion. f32 decode now only 1.17× slower than u8 (was 4.0×); x86 RGB within 6% of image crate (was 25%); all results updated on 3 platforms. |

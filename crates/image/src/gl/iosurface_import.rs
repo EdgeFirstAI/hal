@@ -14,8 +14,9 @@
 //! `glEGLImageTargetTexture2DOES`. macOS uses
 //! `eglCreatePbufferFromClientBuffer` with `EGL_IOSURFACE_ANGLE` to
 //! produce an `EGLSurface` (pbuffer) that is bound to a texture via
-//! `eglBindTexImage`. The `PlatformGpuBuffer` enum in `platform/mod.rs`
-//! hides this difference from the rest of the GL backend.
+//! `eglBindTexImage`. The macOS path is invoked from
+//! [`super::macos_processor::MacosGlProcessor::convert_yuyv_to_rgba`];
+//! Linux callers do not go through this module.
 //!
 //! See `spikes/angle_iosurface/` (local, gitignored) for the proof-of-
 //! concept that validates each constant + attribute combination.
@@ -116,6 +117,12 @@ const K_CF_NUMBER_LONG_TYPE: i32 = 10;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 
 /// IOSurface layout parameters for image-backed surfaces.
+///
+/// `fourcc` and `bytes_per_element` come from
+/// [`edgefirst_tensor::image_iosurface_layout`] — the single source of
+/// truth for the `PixelFormat → (FourCC, bpe)` mapping. The image crate
+/// only owns the FourCC → GL-internal-format map below, since the GL
+/// constants are an image-side concern.
 struct ImageLayout {
     fourcc: u32,
     bytes_per_element: usize,
@@ -125,41 +132,20 @@ struct ImageLayout {
 
 impl ImageLayout {
     fn for_format(fmt: PixelFormat, width: usize, height: usize) -> Result<Self, Error> {
-        match fmt {
-            // YUYV is 4:2:2 — 2 bytes per pixel. ANGLE samples it as
-            // GL_RG / UNSIGNED_BYTE using IOSurface FourCC 2C08.
-            PixelFormat::Yuyv => Ok(Self {
-                fourcc: FOURCC_2C08,
-                bytes_per_element: 2,
-                width,
-                height,
-            }),
-            // The IOSurface FourCC matches the tensor's in-memory byte
-            // order: 'RGBA' for Rgba (so a CPU readback sees R,G,B,A),
-            // 'BGRA' for Bgra. ANGLE supports both and pairs each with
-            // the matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE`
-            // (`GL_RGBA` vs `GL_BGRA_EXT`); the shader writes the same
-            // logical RGBA and ANGLE handles the order under the hood.
-            PixelFormat::Rgba => Ok(Self {
-                fourcc: FOURCC_RGBA,
-                bytes_per_element: 4,
-                width,
-                height,
-            }),
-            PixelFormat::Bgra => Ok(Self {
-                fourcc: FOURCC_BGRA,
-                bytes_per_element: 4,
-                width,
-                height,
-            }),
-            // NV12, planar, and other formats need multi-plane IOSurface
-            // setup that the current spike-derived code doesn't yet
-            // cover. Bail out so the caller falls back to CPU.
-            other => Err(Error::NotImplemented(format!(
-                "IOSurface allocation for PixelFormat::{other:?} not yet supported \
-                 (multi-plane IOSurface needs separate property dictionary)"
-            ))),
-        }
+        let (fourcc, bytes_per_element) = edgefirst_tensor::image_iosurface_layout(fmt)
+            .ok_or_else(|| {
+                Error::NotImplemented(format!(
+                    "IOSurface allocation for PixelFormat::{fmt:?} not yet supported \
+                     (no FourCC mapping in edgefirst_tensor::image_iosurface_layout — \
+                     multi-plane formats need separate property dictionary setup)"
+                ))
+            })?;
+        Ok(Self {
+            fourcc,
+            bytes_per_element,
+            width,
+            height,
+        })
     }
 
     fn gl_type(&self) -> i32 {
@@ -167,10 +153,16 @@ impl ImageLayout {
     }
 
     fn gl_internal_format(&self) -> i32 {
+        // The FourCC ↔ GL-internal-format mapping is image-side: the
+        // tensor crate owns the FourCC choice (via `image_iosurface_layout`)
+        // and this side owns the GL pairing. Adding a new shader requires
+        // both sides to agree.
         match self.fourcc {
             FOURCC_2C08 => GL_RG,
             FOURCC_RGBA => GL_RGBA,
             FOURCC_BGRA => GL_BGRA_EXT,
+            // Defensive fallback — should be unreachable given
+            // `image_iosurface_layout` only returns the three above.
             _ => GL_BGRA_EXT,
         }
     }

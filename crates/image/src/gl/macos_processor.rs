@@ -7,18 +7,32 @@
 //! Linux implementation lives in `gl/threaded.rs` and is structurally
 //! more elaborate because of vendor-driver thread-safety constraints
 //! (Vivante galcore in particular). ANGLE's Metal backend is
-//! thread-safe enough that we run GL inline under a mutex instead of
-//! through a dedicated thread + command channel.
+//! thread-safe enough that we run GL inline under a process-wide mutex
+//! instead of through a dedicated thread + command channel.
 //!
 //! Format coverage in this initial implementation:
-//!   * YUYV → RGBA / BGRA — full shader-based BT.709 limited-range conversion
+//!   * YUYV → RGBA — full shader-based BT.709 limited-range conversion
 //!
 //! Other format pairs and the mask-rendering / decoder paths return
 //! `NotImplemented` and fall back to the CPU backend, matching the
 //! contract the Linux backend uses for unsupported combinations on a
 //! given GPU driver.
 //!
-//! See `crates/image/src/gl/platform/macos.rs` for the platform layer
+//! ## Resource model
+//!
+//! The ANGLE EGL display + context + dummy pbuffer are *process-global*,
+//! shared via `SHARED_DISPLAY` on first construction. The Linux backend
+//! makes the same choice for the same reason — `eglTerminate` is
+//! ref-counted but never safely terminable mid-process, and ANGLE's
+//! Metal device is a singleton. Per-instance state is limited to the
+//! cached shader program, VBO/VAO/FBO, transient texture handles, and
+//! the IOSurface→pbuffer cache.
+//!
+//! GL/EGL calls are serialised behind a single static `GL_MUTEX` so
+//! concurrent `MacosGlProcessor` instances do not race on the shared
+//! context's current-thread state.
+//!
+//! See `crates/image/src/gl/platform/macos.rs` for the platform helpers
 //! this processor builds on, and `crates/image/src/gl/iosurface_import.rs`
 //! for the IOSurface allocation + EGL pbuffer attribute setup.
 
@@ -26,15 +40,19 @@
 
 use super::iosurface_import;
 use super::platform::macos::MacosPlatform;
-use super::platform::GlPlatform;
+// `MacosPlatform::{load_egl_lib, create_display}` are the two macOS-specific
+// helpers; everything else (pbuffer creation, texture binding, FBO setup,
+// shader compilation) is inline here. See platform/mod.rs for the seam
+// rationale.
 use super::Egl;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{PixelFormat, TensorDyn};
 use khronos_egl as egl;
 use log::debug;
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
 // EGL constants reused across the macOS path. The "production" constants in
@@ -125,6 +143,161 @@ fn load_gl_once(egl: &Egl) {
 }
 
 // ---------------------------------------------------------------------------
+// Process-global ANGLE EGL display + context + dummy pbuffer.
+//
+// `eglTerminate` is ref-counted but never safely terminable mid-process
+// (ANGLE's Metal device is a per-process singleton, and any in-flight GL
+// command from any thread aborts when the display goes away). The Linux
+// backend uses a `SharedEglDisplay` in `context.rs` for the same reason.
+// Sharing here also avoids hammering `eglInitialize` from every
+// `MacosGlProcessor::new()` call.
+//
+// `GL_MUTEX` serialises every `eglMakeCurrent` + GL call across all
+// `MacosGlProcessor` instances — ANGLE's Metal backend is internally
+// thread-safe enough that a single global mutex is the right granularity.
+// Per-instance mutexes would race on the current-thread context state
+// because the EGL context is shared.
+// ---------------------------------------------------------------------------
+
+/// All process-global EGL state. Use [`shared_display`] to access.
+struct SharedAngleDisplay {
+    /// Static-lifetime EGL handle. The actual ANGLE libEGL.dylib is
+    /// leaked at first dlopen and never closed.
+    egl: Egl,
+    display: egl::Display,
+    config: egl::Config,
+    context: egl::Context,
+    /// Tiny scratch surface kept alive so the context can be made
+    /// current outside of a `convert` call (e.g. for shader compile,
+    /// resource allocation, or `Drop`-time cleanup).
+    dummy_pbuffer: egl::Surface,
+}
+
+// SAFETY: every member is either a leak'd static, an EGL handle (which
+// the ANGLE driver synchronises internally), or a pointer to driver-
+// owned state. Access is gated by GL_MUTEX.
+unsafe impl Send for SharedAngleDisplay {}
+unsafe impl Sync for SharedAngleDisplay {}
+
+static SHARED_DISPLAY: OnceLock<std::result::Result<SharedAngleDisplay, String>> = OnceLock::new();
+static GL_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Acquire a reference to the process-global ANGLE display, initialising
+/// it on first call. Subsequent calls return the same handle. The error
+/// case is cached too — once ANGLE fails to load we don't keep retrying.
+fn shared_display() -> Result<&'static SharedAngleDisplay> {
+    SHARED_DISPLAY
+        .get_or_init(|| init_shared_display().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|s| Error::Io(std::io::Error::other(s.clone())))
+}
+
+fn init_shared_display() -> Result<SharedAngleDisplay> {
+    let _span = tracing::info_span!(
+        "image.gl_init",
+        platform = "macos",
+        backend = "iosurface",
+    )
+    .entered();
+
+    // 1. Load ANGLE libEGL and bring up an EGL instance.
+    let egl_lib = MacosPlatform::load_egl_lib()
+        .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
+    let egl: Egl = unsafe {
+        khronos_egl::Instance::<
+            khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
+        >::load_required_from(egl_lib)
+    }
+    .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
+
+    // 2. Metal-backed display from MacosPlatform.
+    let display = MacosPlatform::create_display(&egl)?;
+    let (maj, min) = egl
+        .initialize(display)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
+    debug!("MacosGlProcessor: EGL {maj}.{min} initialised via ANGLE (process-global)");
+
+    egl.bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
+
+    // 3. Choose an EGL config that supports GLES 3 + PBUFFER +
+    //    EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D.
+    let cfg_attribs = [
+        EGL_RENDERABLE_TYPE,
+        EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE,
+        EGL_PBUFFER_BIT,
+        EGL_RED_SIZE,
+        8,
+        EGL_GREEN_SIZE,
+        8,
+        EGL_BLUE_SIZE,
+        8,
+        EGL_ALPHA_SIZE,
+        8,
+        iosurface_import::EGL_BIND_TO_TEXTURE_TARGET_ANGLE,
+        0x305F, // EGL_TEXTURE_2D
+        egl::NONE,
+    ];
+    let config = egl
+        .choose_first_config(display, &cfg_attribs)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("eglChooseConfig: {e:?}"))))?
+        .ok_or_else(|| {
+            Error::NotSupported("no EGL config with GLES3+PBUFFER+TEXTURE_2D bind".into())
+        })?;
+
+    // 4. GLES3 context.
+    let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
+    let context = egl
+        .create_context(display, config, None, &ctx_attribs)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("eglCreateContext: {e:?}"))))?;
+
+    // 5. Dummy pbuffer for context-current bring-up.
+    let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
+    let dummy_pbuffer = egl.create_pbuffer_surface(display, config, &dummy_attribs).map_err(|e| {
+        // Clean up the context we just created before bailing.
+        let _ = egl.destroy_context(display, context);
+        Error::Io(std::io::Error::other(format!(
+            "eglCreatePbufferSurface(dummy): {e:?}"
+        )))
+    })?;
+
+    // 6. Load GL function pointers via the now-initialised display.
+    //    Make-current is required for some drivers to expose GLES symbols.
+    if let Err(e) = egl.make_current(display, Some(dummy_pbuffer), Some(dummy_pbuffer), Some(context)) {
+        let _ = egl.destroy_surface(display, dummy_pbuffer);
+        let _ = egl.destroy_context(display, context);
+        return Err(Error::Io(std::io::Error::other(format!(
+            "eglMakeCurrent(dummy): {e:?}"
+        ))));
+    }
+    load_gl_once(&egl);
+    let _ = egl.make_current(display, None, None, None);
+
+    Ok(SharedAngleDisplay {
+        egl,
+        display,
+        config,
+        context,
+        dummy_pbuffer,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Mutex helpers.
+//
+// `GL_MUTEX.lock()` can return a `PoisonError` if a previous panic left
+// the mutex poisoned. Recover by extracting the inner guard — the GL
+// state behind it is just a `()` and there's no invariant to honour.
+// Using `unwrap()` here would turn any panic in `convert_*` into a
+// permanent failure of every subsequent call.
+// ---------------------------------------------------------------------------
+
+fn lock_gl() -> MutexGuard<'static, ()> {
+    GL_MUTEX.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+// ---------------------------------------------------------------------------
 // The processor itself.
 //
 // Holds: EGL display + config + context, the compiled YUYV→RGBA program,
@@ -138,14 +311,8 @@ fn load_gl_once(egl: &Egl) {
 // ---------------------------------------------------------------------------
 
 pub struct MacosGlProcessor {
-    egl: Egl,
-    display: egl::Display,
-    config: egl::Config,
-    context: egl::Context,
-    /// Tiny scratch surface kept alive so the context can be made
-    /// current outside of a `convert` call (e.g. for shader recompile).
-    dummy_pbuffer: egl::Surface,
-
+    /// Per-instance GL resources. EGL display/context/dummy_pbuffer
+    /// live in `SHARED_DISPLAY` (process-global).
     program_yuyv_to_rgba: u32,
     uniform_src: i32,
     uniform_src_size: i32,
@@ -155,14 +322,27 @@ pub struct MacosGlProcessor {
     src_tex: u32,
     dst_tex: u32,
 
-    lock: Mutex<()>,
+    /// (IOSurfaceID, format-as-u32) → cached EGL pbuffer surface.
+    /// Same-tensor convert() calls reuse the pbuffer instead of paying
+    /// `eglCreatePbufferFromClientBuffer` every frame.
+    ///
+    /// The cache is guarded by `GL_MUTEX` (so accessed only while the
+    /// caller holds the GL lock), but lives on the processor rather
+    /// than globally so each processor's resource lifetime is
+    /// independent and easy to reason about. ANGLE's pbuffers are
+    /// per-display, not per-context, so this is sound.
+    pbuf_cache: Mutex<HashMap<PbufferCacheKey, egl::Surface>>,
 }
 
-// SAFETY: MacosGlProcessor's only non-`Sync` state is the EGL context,
-// which we serialize behind `lock`. Calls to GL/EGL go through the
-// mutex via `with_current_context`.
-unsafe impl Send for MacosGlProcessor {}
-unsafe impl Sync for MacosGlProcessor {}
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+struct PbufferCacheKey {
+    iosurface_id: u32,
+    /// Discriminant of the [`PixelFormat`] — ANGLE validates
+    /// FourCC/GL-format agreement at pbuffer-creation time, so two
+    /// different formats over the same IOSurface need distinct pbuffers
+    /// even though that pairing is unusual in practice.
+    format_disc: u8,
+}
 
 impl std::fmt::Debug for MacosGlProcessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -172,133 +352,194 @@ impl std::fmt::Debug for MacosGlProcessor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RAII guards.
+// ---------------------------------------------------------------------------
+
+/// Makes the shared EGL context current on the calling thread for its
+/// lifetime, then releases it on drop. Drop runs even on panic, so the
+/// next `MacosGlProcessor::convert*` call on a different processor (or
+/// the same one after a panic recovery) sees a clean make-current state.
+struct MakeCurrentGuard<'d> {
+    egl: &'d Egl,
+    display: egl::Display,
+}
+
+impl<'d> MakeCurrentGuard<'d> {
+    fn new(d: &'d SharedAngleDisplay) -> Result<Self> {
+        d.egl
+            .make_current(
+                d.display,
+                Some(d.dummy_pbuffer),
+                Some(d.dummy_pbuffer),
+                Some(d.context),
+            )
+            .map_err(|e| Error::Io(std::io::Error::other(format!("eglMakeCurrent: {e:?}"))))?;
+        Ok(Self {
+            egl: &d.egl,
+            display: d.display,
+        })
+    }
+}
+
+impl Drop for MakeCurrentGuard<'_> {
+    fn drop(&mut self) {
+        // Release the context on this thread. Failure here is logged
+        // but ignored — Drop must not panic, and the next make-current
+        // will overwrite the state anyway.
+        let _ = self.egl.make_current(self.display, None, None, None);
+    }
+}
+
+/// Owns an `eglBindTexImage` binding. On drop calls `eglReleaseTexImage`
+/// — required by the EGL spec before the pbuffer can be destroyed and
+/// strictly necessary for ANGLE on some Metal device states.
+struct BoundTexImage<'d> {
+    egl: &'d Egl,
+    display: egl::Display,
+    pbuf: egl::Surface,
+    bound: bool,
+}
+
+impl<'d> BoundTexImage<'d> {
+    fn bind(d: &'d SharedAngleDisplay, pbuf: egl::Surface) -> Result<Self> {
+        d.egl
+            .bind_tex_image(d.display, pbuf, EGL_BACK_BUFFER)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))?;
+        Ok(Self {
+            egl: &d.egl,
+            display: d.display,
+            pbuf,
+            bound: true,
+        })
+    }
+}
+
+impl Drop for BoundTexImage<'_> {
+    fn drop(&mut self) {
+        if self.bound {
+            let _ = self
+                .egl
+                .release_tex_image(self.display, self.pbuf, EGL_BACK_BUFFER);
+        }
+    }
+}
+
 impl MacosGlProcessor {
     pub fn new() -> Result<Self> {
-        let _span = tracing::info_span!(
-            "image.gl.platform_init",
-            platform = "macos",
-            backend = "iosurface",
-        )
-        .entered();
+        // SHARED_DISPLAY caches both successes and failures, so this is
+        // cheap on the hot path. It also surfaces "ANGLE not installed"
+        // exactly once per process.
+        let d = shared_display()?;
 
-        // 1. Load ANGLE libEGL and bring up an EGL instance.
-        let egl_lib = MacosPlatform::load_egl_lib()
-            .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
-        let egl: Egl = unsafe {
-            khronos_egl::Instance::<
-                khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
-            >::load_required_from(egl_lib)
-        }
-        .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
+        // Per-instance setup runs under the GL mutex so we don't race
+        // with another processor's convert() on context-current state.
+        let _guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
 
-        // 2. Get the Metal-backed display from MacosPlatform and initialize.
-        let (display, _platform_display) = MacosPlatform::create_display(&egl)?;
-        let (maj, min) = egl
-            .initialize(display)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
-        debug!("MacosGlProcessor: EGL {maj}.{min} initialised via ANGLE");
+        // SAFETY: serialized via `_guard`; context is current via
+        // `_current`. Each helper handles its own internal cleanup on
+        // error; if a step later in this sequence fails, the
+        // `InstanceCleanup` scope guard below tears down the partially
+        // built state.
+        unsafe {
+            // Build the per-instance resources behind a scope guard so
+            // any error path below cleans up GL allocations rather than
+            // leaking them.
+            let program = compile_program(VERTEX_SHADER, YUYV_TO_RGBA_FRAGMENT)?;
+            // From here on, every fallible step must reach Drop-cleanup
+            // for `program` if it fails. The simplest pattern: stash
+            // resources in `Option<u32>` and let `InstanceCleanup` Drop
+            // delete whichever are still `Some`.
 
-        egl.bind_api(egl::OPENGL_ES_API)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
+            struct InstanceCleanup {
+                program: Option<u32>,
+                vbo: Option<u32>,
+                vao: Option<u32>,
+                fbo: Option<u32>,
+                src_tex: Option<u32>,
+                dst_tex: Option<u32>,
+            }
+            impl Drop for InstanceCleanup {
+                fn drop(&mut self) {
+                    // SAFETY: only one current context per thread; we
+                    // hold the GL mutex transitively via the caller.
+                    unsafe {
+                        if let Some(p) = self.program {
+                            gls::gl::DeleteProgram(p);
+                        }
+                        if let Some(b) = self.vbo {
+                            gls::gl::DeleteBuffers(1, &b);
+                        }
+                        if let Some(a) = self.vao {
+                            gls::gl::DeleteVertexArrays(1, &a);
+                        }
+                        if let Some(f) = self.fbo {
+                            gls::gl::DeleteFramebuffers(1, &f);
+                        }
+                        if let Some(t) = self.src_tex {
+                            gls::gl::DeleteTextures(1, &t);
+                        }
+                        if let Some(t) = self.dst_tex {
+                            gls::gl::DeleteTextures(1, &t);
+                        }
+                    }
+                }
+            }
+            let mut cleanup = InstanceCleanup {
+                program: Some(program),
+                vbo: None,
+                vao: None,
+                fbo: None,
+                src_tex: None,
+                dst_tex: None,
+            };
 
-        // 3. Choose an EGL config that supports GLES 3 + PBUFFER +
-        //    EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D.
-        let cfg_attribs = [
-            EGL_RENDERABLE_TYPE,
-            EGL_OPENGL_ES3_BIT,
-            EGL_SURFACE_TYPE,
-            EGL_PBUFFER_BIT,
-            EGL_RED_SIZE,
-            8,
-            EGL_GREEN_SIZE,
-            8,
-            EGL_BLUE_SIZE,
-            8,
-            EGL_ALPHA_SIZE,
-            8,
-            iosurface_import::EGL_BIND_TO_TEXTURE_TARGET_ANGLE,
-            0x305F, // EGL_TEXTURE_2D
-            egl::NONE,
-        ];
-        let config = egl
-            .choose_first_config(display, &cfg_attribs)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglChooseConfig: {e:?}"))))?
-            .ok_or_else(|| {
-                Error::NotSupported("no EGL config with GLES3+PBUFFER+TEXTURE_2D bind".into())
-            })?;
+            let (uniform_src, uniform_src_size) = {
+                let loc_src =
+                    gls::gl::GetUniformLocation(program, c"src".as_ptr() as *const _);
+                let loc_size =
+                    gls::gl::GetUniformLocation(program, c"src_size".as_ptr() as *const _);
+                (loc_src, loc_size)
+            };
 
-        // 4. Create the GLES3 context.
-        let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
-        let context = egl
-            .create_context(display, config, None, &ctx_attribs)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglCreateContext: {e:?}"))))?;
-
-        // 5. 16×16 dummy pbuffer to make the context current for shader
-        //    compilation and resource creation.
-        let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
-        let dummy_pbuffer = egl
-            .create_pbuffer_surface(display, config, &dummy_attribs)
-            .map_err(|e| {
-                Error::Io(std::io::Error::other(format!(
-                    "eglCreatePbufferSurface(dummy): {e:?}"
-                )))
-            })?;
-        egl.make_current(display, Some(dummy_pbuffer), Some(dummy_pbuffer), Some(context))
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglMakeCurrent: {e:?}"))))?;
-
-        // 6. Load GL function pointers from ANGLE's libGLESv2 via EGL.
-        load_gl_once(&egl);
-
-        // 7. Compile the YUYV → RGBA program.
-        let program_yuyv_to_rgba = unsafe { compile_program(VERTEX_SHADER, YUYV_TO_RGBA_FRAGMENT)? };
-        let (uniform_src, uniform_src_size) = unsafe {
-            let loc_src = gls::gl::GetUniformLocation(
-                program_yuyv_to_rgba,
-                c"src".as_ptr() as *const _,
-            );
-            let loc_size = gls::gl::GetUniformLocation(
-                program_yuyv_to_rgba,
-                c"src_size".as_ptr() as *const _,
-            );
-            (loc_src, loc_size)
-        };
-
-        // 8. Fullscreen-quad VBO + VAO.
-        #[rustfmt::skip]
-        let quad: [f32; 16] = [
-            -1.0,-1.0,  0.0, 0.0,
-             1.0,-1.0,  1.0, 0.0,
-            -1.0, 1.0,  0.0, 1.0,
-             1.0, 1.0,  1.0, 1.0,
-        ];
-        let (vao, vbo) = unsafe {
+            // Fullscreen-quad VBO + VAO.
+            #[rustfmt::skip]
+            let quad: [f32; 16] = [
+                -1.0,-1.0,  0.0, 0.0,
+                 1.0,-1.0,  1.0, 0.0,
+                -1.0, 1.0,  0.0, 1.0,
+                 1.0, 1.0,  1.0, 1.0,
+            ];
             let mut vbo = 0u32;
             let mut vao = 0u32;
             gls::gl::GenBuffers(1, &mut vbo);
+            cleanup.vbo = Some(vbo);
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, vbo);
             gls::gl::BufferData(
                 gls::gl::ARRAY_BUFFER,
-                (quad.len() * std::mem::size_of::<f32>()) as isize,
+                std::mem::size_of_val(&quad) as isize,
                 quad.as_ptr() as *const _,
                 gls::gl::STATIC_DRAW,
             );
             gls::gl::GenVertexArrays(1, &mut vao);
+            cleanup.vao = Some(vao);
             gls::gl::BindVertexArray(vao);
             gls::gl::VertexAttribPointer(0, 2, gls::gl::FLOAT, 0, 16, std::ptr::null());
             gls::gl::EnableVertexAttribArray(0);
             gls::gl::VertexAttribPointer(1, 2, gls::gl::FLOAT, 0, 16, 8 as *const _);
             gls::gl::EnableVertexAttribArray(1);
-            (vao, vbo)
-        };
 
-        // 9. FBO + two transient texture handles.
-        let (fbo, src_tex, dst_tex) = unsafe {
+            // FBO + two transient texture handles.
             let mut fbo = 0u32;
             let mut src_tex = 0u32;
             let mut dst_tex = 0u32;
             gls::gl::GenFramebuffers(1, &mut fbo);
+            cleanup.fbo = Some(fbo);
             gls::gl::GenTextures(1, &mut src_tex);
+            cleanup.src_tex = Some(src_tex);
             gls::gl::GenTextures(1, &mut dst_tex);
+            cleanup.dst_tex = Some(dst_tex);
             for tex in [src_tex, dst_tex] {
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
                 gls::gl::TexParameteri(
@@ -322,48 +563,60 @@ impl MacosGlProcessor {
                     gls::gl::CLAMP_TO_EDGE as i32,
                 );
             }
-            (fbo, src_tex, dst_tex)
-        };
 
-        // 10. Release the context so subsequent convert() calls can
-        //     reclaim it under the mutex.
-        egl.make_current(display, None, None, None).ok();
+            // Construction succeeded — disarm `cleanup` so its Drop
+            // doesn't tear down the resources we're about to hand out.
+            let program = cleanup.program.take().unwrap();
+            let vbo = cleanup.vbo.take().unwrap();
+            let vao = cleanup.vao.take().unwrap();
+            let fbo = cleanup.fbo.take().unwrap();
+            let src_tex = cleanup.src_tex.take().unwrap();
+            let dst_tex = cleanup.dst_tex.take().unwrap();
+            std::mem::forget(cleanup);
 
-        Ok(Self {
-            egl,
-            display,
-            config,
-            context,
-            dummy_pbuffer,
-            program_yuyv_to_rgba,
-            uniform_src,
-            uniform_src_size,
-            vao,
-            vbo,
-            fbo,
-            src_tex,
-            dst_tex,
-            lock: Mutex::new(()),
-        })
+            Ok(Self {
+                program_yuyv_to_rgba: program,
+                uniform_src,
+                uniform_src_size,
+                vao,
+                vbo,
+                fbo,
+                src_tex,
+                dst_tex,
+                pbuf_cache: Mutex::new(HashMap::new()),
+            })
+        }
     }
 
     /// Whether the requested conversion is supported by the GL backend.
     /// Used by `ImageProcessor::convert` to decide whether to dispatch
     /// here or fall back to CPU.
+    ///
+    /// Only `YUYV → RGBA` is implemented today. `YUYV → BGRA` is
+    /// deliberately *not* in this set even though the IOSurface
+    /// FourCC `'BGRA'` is supported by ANGLE — the current shader
+    /// writes `vec4(r, g, b, 1.0)`, which lands as RGBA bytes in the
+    /// CPU readback regardless of FourCC. A dedicated BGRA shader
+    /// (writing `vec4(b, g, r, 1.0)`) needs to land before we widen
+    /// the support set.
     pub fn supports(src_fmt: PixelFormat, dst_fmt: PixelFormat) -> bool {
-        matches!(
-            (src_fmt, dst_fmt),
-            (PixelFormat::Yuyv, PixelFormat::Rgba | PixelFormat::Bgra)
-        )
+        matches!((src_fmt, dst_fmt), (PixelFormat::Yuyv, PixelFormat::Rgba))
     }
 
     /// The actual conversion path. Caller guarantees `supports(src_fmt, dst_fmt)`.
-    fn convert_yuyv_to_rgba(&self, src: &TensorDyn, dst: &mut TensorDyn) -> Result<()> {
+    fn convert_yuyv_to_rgba(
+        &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+    ) -> Result<()> {
         let _span = tracing::trace_span!(
-            "image.gl.convert",
-            backend = "iosurface",
-            src_fmt = ?src.format(),
-            dst_fmt = ?dst.format(),
+            "image.convert",
+            backend = "gl",
+            platform = "macos",
+            src_fmt = ?src_fmt,
+            dst_fmt = ?dst_fmt,
         )
         .entered();
 
@@ -393,76 +646,40 @@ impl MacosGlProcessor {
         })?;
 
         // Both tensors MUST be IOSurface-backed for the zero-copy path.
-        // If not, fall back to CPU (the caller's dispatch chain handles
-        // this — we just return NotSupported here).
         let src_iosurface = src_u8.iosurface_ref().ok_or_else(|| {
-            Error::NotSupported(
-                "GL convert: source tensor is not IOSurface-backed".into(),
-            )
+            Error::NotSupported("GL convert: source tensor is not IOSurface-backed".into())
         })?;
         let dst_iosurface = dst_u8.iosurface_ref().ok_or_else(|| {
-            Error::NotSupported(
-                "GL convert: destination tensor is not IOSurface-backed".into(),
-            )
+            Error::NotSupported("GL convert: destination tensor is not IOSurface-backed".into())
         })?;
+        let src_id = src_u8.iosurface_id().unwrap_or(0);
+        let dst_id = dst_u8.iosurface_id().unwrap_or(0);
 
-        let _guard = self.lock.lock().unwrap();
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
 
-        // SAFETY: serialized by self.lock; EGL/GL calls require a
-        // current context; tensor pointers are alive for the call's
-        // duration.
+        // Look up (or create) the source/dest pbuffers in the cache.
+        // Cache miss path calls `eglCreatePbufferFromClientBuffer` and
+        // inserts; cache hit returns the existing surface.
+        let src_pbuf = self.get_or_create_pbuffer(
+            d, src_id, src_iosurface, src_fmt, src_w, src_h,
+        )?;
+        let dst_pbuf = self.get_or_create_pbuffer(
+            d, dst_id, dst_iosurface, dst_fmt, dst_w, dst_h,
+        )?;
+
+        // SAFETY: GL mutex held; context current via `_current`. Each
+        // pbuffer's tex-image binding is owned by a `BoundTexImage` RAII
+        // guard so eglReleaseTexImage runs even on panic.
         unsafe {
-            self.egl
-                .make_current(
-                    self.display,
-                    Some(self.dummy_pbuffer),
-                    Some(self.dummy_pbuffer),
-                    Some(self.context),
-                )
-                .map_err(|e| {
-                    Error::Io(std::io::Error::other(format!("eglMakeCurrent: {e:?}")))
-                })?;
-
-            // Bind source IOSurface to a pbuffer + glBindTexImage.
-            let src_pbuf = iosurface_import::create_iosurface_pbuffer(
-                &self.egl,
-                self.display,
-                self.config,
-                src_iosurface,
-                src.format().unwrap_or(PixelFormat::Rgba),
-                src_w,
-                src_h,
-            )?;
-            // Bind destination IOSurface similarly.
-            let dst_pbuf = iosurface_import::create_iosurface_pbuffer(
-                &self.egl,
-                self.display,
-                self.config,
-                dst_iosurface,
-                dst.format().unwrap_or(PixelFormat::Rgba),
-                dst_w,
-                dst_h,
-            )?;
-
             // Source texture binding.
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
-            self.egl
-                .bind_tex_image(self.display, src_pbuf, EGL_BACK_BUFFER)
-                .map_err(|e| {
-                    Error::Io(std::io::Error::other(format!(
-                        "eglBindTexImage(src): {e:?}"
-                    )))
-                })?;
+            let _src_bound = BoundTexImage::bind(d, src_pbuf)?;
 
             // Destination texture binding + attach to FBO.
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.dst_tex);
-            self.egl
-                .bind_tex_image(self.display, dst_pbuf, EGL_BACK_BUFFER)
-                .map_err(|e| {
-                    Error::Io(std::io::Error::other(format!(
-                        "eglBindTexImage(dst): {e:?}"
-                    )))
-                })?;
+            let _dst_bound = BoundTexImage::bind(d, dst_pbuf)?;
             gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.fbo);
             gls::gl::FramebufferTexture2D(
                 gls::gl::FRAMEBUFFER,
@@ -489,39 +706,100 @@ impl MacosGlProcessor {
             gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
             gls::gl::Finish();
 
-            // Cleanup transient pbuffers.
-            let _ = self.egl.destroy_surface(self.display, src_pbuf);
-            let _ = self.egl.destroy_surface(self.display, dst_pbuf);
-
-            self.egl.make_current(self.display, None, None, None).ok();
+            // `_src_bound` and `_dst_bound` Drop release the tex-image
+            // bindings here. The pbuffers themselves stay in the cache.
         }
         Ok(())
     }
+
+    /// Look up or create the EGL pbuffer wrapping a given IOSurface.
+    ///
+    /// Cache key is `(iosurface_id, format_discriminant)`. The cache is
+    /// keyed by IOSurfaceID rather than `BufferIdentity` so externally
+    /// imported surfaces (via `Tensor::from_iosurface`) share a cache
+    /// slot with internally allocated ones — same underlying surface,
+    /// same pbuffer.
+    ///
+    /// IOSurfaceID `0` is treated as un-cacheable: it's the sentinel
+    /// returned by `iosurface_id()` when the tensor's IOSurface backing
+    /// is somehow malformed (shouldn't happen but the path stays sound).
+    fn get_or_create_pbuffer(
+        &self,
+        d: &SharedAngleDisplay,
+        iosurface_id: u32,
+        surface_ref: *mut c_void,
+        format: PixelFormat,
+        width: usize,
+        height: usize,
+    ) -> Result<egl::Surface> {
+        let key = PbufferCacheKey {
+            iosurface_id,
+            format_disc: pixel_format_discriminant(format),
+        };
+        if iosurface_id != 0 {
+            let cache = self.pbuf_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(&pbuf) = cache.get(&key) {
+                return Ok(pbuf);
+            }
+        }
+        // SAFETY: surface_ref borrowed from a live tensor; config has
+        // EGL_BIND_TO_TEXTURE_TARGET_ANGLE set.
+        let pbuf = unsafe {
+            iosurface_import::create_iosurface_pbuffer(
+                &d.egl, d.display, d.config, surface_ref, format, width, height,
+            )?
+        };
+        if iosurface_id != 0 {
+            let mut cache = self.pbuf_cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.insert(key, pbuf);
+        }
+        Ok(pbuf)
+    }
+}
+
+fn pixel_format_discriminant(fmt: PixelFormat) -> u8 {
+    // `PixelFormat` has no `repr(u8)`, so derive a stable u8 by hashing
+    // its Debug representation. Collisions are vanishingly unlikely in
+    // the small set of formats this backend cares about. If a collision
+    // ever happens it just means a pbuffer gets created twice — a
+    // performance bug, not a correctness one.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("{fmt:?}").hash(&mut h);
+    (h.finish() & 0xFF) as u8
 }
 
 impl Drop for MacosGlProcessor {
     fn drop(&mut self) {
-        let _guard = self.lock.lock().ok();
+        // Best-effort cleanup; Drop must not panic.
+        let Ok(d) = shared_display() else {
+            return; // ANGLE never initialised — nothing to clean up.
+        };
+        let _gl_guard = lock_gl();
+        let _current = match MakeCurrentGuard::new(d) {
+            Ok(g) => g,
+            Err(_) => return,
+        };
         unsafe {
-            // Best-effort cleanup; failures here are logged but not
-            // propagated since Drop must not panic.
-            let _ = self.egl.make_current(
-                self.display,
-                Some(self.dummy_pbuffer),
-                Some(self.dummy_pbuffer),
-                Some(self.context),
-            );
+            // Destroy cached pbuffers.
+            let mut cache = self
+                .pbuf_cache
+                .get_mut()
+                .map(std::mem::take)
+                .unwrap_or_default();
+            for (_, pbuf) in cache.drain() {
+                let _ = d.egl.destroy_surface(d.display, pbuf);
+            }
+            // Per-instance GL resources.
             gls::gl::DeleteFramebuffers(1, &self.fbo);
             gls::gl::DeleteTextures(1, &self.src_tex);
             gls::gl::DeleteTextures(1, &self.dst_tex);
             gls::gl::DeleteBuffers(1, &self.vbo);
             gls::gl::DeleteVertexArrays(1, &self.vao);
             gls::gl::DeleteProgram(self.program_yuyv_to_rgba);
-            let _ = self.egl.make_current(self.display, None, None, None);
-            let _ = self.egl.destroy_surface(self.display, self.dummy_pbuffer);
-            let _ = self.egl.destroy_context(self.display, self.context);
-            // Display is process-wide-shared by ANGLE convention; not
-            // terminated here to avoid disturbing other consumers.
+            // Shared EGL display/context/dummy_pbuffer outlive every
+            // processor instance and are never destroyed — see the
+            // module docstring for why.
         }
     }
 }
@@ -559,7 +837,7 @@ impl ImageProcessorTrait for MacosGlProcessor {
                 "MacosGlProcessor: {src_fmt:?} → {dst_fmt:?} not in the initial GL coverage set"
             )));
         }
-        self.convert_yuyv_to_rgba(src, dst)
+        self.convert_yuyv_to_rgba(src, dst, src_fmt, dst_fmt)
     }
 
     fn draw_decoded_masks(
@@ -600,8 +878,41 @@ impl ImageProcessorTrait for MacosGlProcessor {
 
 unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> Result<u32> {
     let vs = compile_shader(gls::gl::VERTEX_SHADER, vertex_src)?;
+    // From this point on, `vs` and (later) `fs` and `program` are owned
+    // by the helper and must be cleaned up on any error path. Track them
+    // in an Option and let `ProgramBuild`'s Drop clean up whatever is
+    // still present when we leave the function abnormally.
+    struct ProgramBuild {
+        vs: Option<u32>,
+        fs: Option<u32>,
+        program: Option<u32>,
+    }
+    impl Drop for ProgramBuild {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(p) = self.program {
+                    gls::gl::DeleteProgram(p);
+                }
+                if let Some(s) = self.fs {
+                    gls::gl::DeleteShader(s);
+                }
+                if let Some(s) = self.vs {
+                    gls::gl::DeleteShader(s);
+                }
+            }
+        }
+    }
+    let mut state = ProgramBuild {
+        vs: Some(vs),
+        fs: None,
+        program: None,
+    };
+
     let fs = compile_shader(gls::gl::FRAGMENT_SHADER, fragment_src)?;
+    state.fs = Some(fs);
+
     let program = gls::gl::CreateProgram();
+    state.program = Some(program);
     gls::gl::AttachShader(program, vs);
     gls::gl::AttachShader(program, fs);
     gls::gl::LinkProgram(program);
@@ -611,13 +922,20 @@ unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> Result<u32> {
         let mut log = [0u8; 4096];
         let mut len = 0i32;
         gls::gl::GetProgramInfoLog(program, log.len() as i32, &mut len, log.as_mut_ptr() as *mut _);
+        // `state` Drop deletes program + fs + vs as we return.
         return Err(Error::Internal(format!(
             "program link failed: {}",
             String::from_utf8_lossy(&log[..len.max(0) as usize])
         )));
     }
-    gls::gl::DeleteShader(vs);
-    gls::gl::DeleteShader(fs);
+
+    // Success: detach shaders + delete them (GL drops them when
+    // unreferenced by any program). Disarm state so it doesn't delete
+    // the program we're returning.
+    gls::gl::DeleteShader(state.vs.take().unwrap());
+    gls::gl::DeleteShader(state.fs.take().unwrap());
+    let program = state.program.take().unwrap();
+    std::mem::forget(state);
     Ok(program)
 }
 

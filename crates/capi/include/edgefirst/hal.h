@@ -2468,7 +2468,13 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
  *
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @param surface_ref Pointer to a valid IOSurfaceRef (typed as void*)
- * @param shape Array of dimension sizes (ndim elements)
+ * @param shape Array of dimension sizes (ndim elements). The product of
+ *              all dimensions times sizeof(dtype) must not exceed the
+ *              IOSurface's allocated byte size — HAL does not validate
+ *              this; mismatches produce out-of-bounds reads/writes on
+ *              subsequent hal_tensor_map_create() calls. Use
+ *              IOSurfaceGetAllocSize() on the source surface to size
+ *              the shape correctly.
  * @param ndim Number of dimensions (1-8)
  * @param name Optional tensor name for debugging (can be NULL)
  * @return New tensor handle on success, NULL on error
@@ -2591,11 +2597,19 @@ int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
  * The IOSurfaceID is a 32-bit handle stable for the lifetime of the
  * IOSurface; it can be passed across process boundaries (typically via
  * a Mach port or XPC connection) and recovered on the other side via
- * IOSurfaceLookup(id). Returns 0 when the tensor is not
- * IOSurface-backed; 0 is a sentinel and not a valid IOSurfaceID.
+ * IOSurfaceLookup(id). Returns 0 with errno set when the tensor is not
+ * IOSurface-backed or on error.
+ *
+ * **Sentinel caveat**: Apple does not formally document `0` as an
+ * invalid IOSurfaceID; in practice the kernel allocator starts at low
+ * non-zero values and a freshly allocated surface always reports a
+ * nonzero ID, so we use `0` as the error sentinel. If you receive a
+ * reportedly zero ID from a foreign producer (uncommon), check `errno`:
+ * `0` with `errno == 0` is treated as "no IOSurface backing" (success
+ * path returned a degenerate ID); any nonzero errno is an error.
  *
  * @param tensor Tensor handle
- * @return IOSurfaceID on success, 0 on error
+ * @return IOSurfaceID on success, 0 on error (check errno)
  * @par Errors (errno):
  * - EINVAL: NULL tensor
  * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
@@ -2606,15 +2620,23 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
  * Borrow the raw IOSurfaceRef backing a tensor (macOS only).
  *
  * The returned pointer is borrowed; its lifetime is tied to the tensor
- * handle. Do not call CFRelease on it. Use this when you need to pass
- * the IOSurface to a native macOS API (e.g. CIImage,
- * AVSampleBufferDisplayLayer) that takes an IOSurfaceRef directly,
+ * handle. The caller does NOT hold a retain count on the returned
+ * IOSurface — if you need the surface to outlive the HalTensor, call
+ * CFRetain() on the returned pointer and pair it with a matching
+ * CFRelease() once you're done. Do NOT call CFRelease() on the borrowed
+ * pointer without a matching CFRetain() first; that would drop the
+ * HalTensor's own retain and produce a use-after-free.
+ *
+ * Use this when you need to pass the IOSurface to a native macOS API
+ * (e.g. CIImage, AVSampleBufferDisplayLayer,
+ * CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
  * without going through the IOSurfaceID indirection.
  *
  * Returns NULL when the tensor is not IOSurface-backed.
  *
  * @param tensor Tensor handle
- * @return Borrowed IOSurfaceRef on success, NULL on error
+ * @return Borrowed IOSurfaceRef (typed as void*) on success, NULL on
+ *         error. Borrowed — do NOT CFRelease without first CFRetaining.
  * @par Errors (errno):
  * - EINVAL: NULL tensor
  * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform

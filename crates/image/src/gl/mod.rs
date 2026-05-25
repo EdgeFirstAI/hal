@@ -169,13 +169,6 @@ impl TransferBackend {
     pub(crate) fn is_dma(self) -> bool {
         self == TransferBackend::DmaBuf
     }
-
-    /// Returns `true` if a zero-copy transfer path is in use, regardless
-    /// of which OS-specific GPU buffer kind backs it.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub(crate) fn is_zero_copy(self) -> bool {
-        matches!(self, TransferBackend::DmaBuf | TransferBackend::IOSurface)
-    }
 }
 
 /// Interpolation mode for int8 proto textures (GL_R8I cannot use GL_LINEAR).

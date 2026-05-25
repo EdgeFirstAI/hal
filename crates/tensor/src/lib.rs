@@ -43,7 +43,7 @@ mod tensor_dyn;
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
 #[cfg(target_os = "macos")]
-pub use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
+pub use crate::iosurface::{image_iosurface_layout, IoSurfaceMap, IoSurfaceTensor};
 pub use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]

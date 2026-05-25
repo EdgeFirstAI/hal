@@ -54,10 +54,18 @@ ifeq ($(UNAME_S),Linux)
   LDFLAGS := -L$(LIB_DIR) -Wl,-rpath,$(LIB_DIR)
   LIBS := -ledgefirst_hal -lm -lpthread -ldl
 else ifeq ($(UNAME_S),Darwin)
-  # -Wl,-rpath embeds the absolute lib dir so the test binary finds
-  # libedgefirst_hal.dylib without DYLD_LIBRARY_PATH at runtime.
-  LDFLAGS := -L$(LIB_DIR) -Wl,-rpath,$(LIB_DIR)
-  LIBS := -ledgefirst_hal -lm -lpthread
+  # Cargo places both the C-API cdylib (libedgefirst_hal.dylib) and the
+  # PyO3 extension under the same name in target/<profile>/. The PyO3
+  # extension is the one written last and only exports `_PyInit_*`;
+  # linking against it produces dozens of undefined references for the
+  # actual C API symbols. To make the C tests work regardless of which
+  # cdylib won the build race, link explicitly against the static
+  # archive on Darwin. Required CoreFoundation/IOSurface frameworks
+  # come along automatically via cargo metadata.
+  LDFLAGS := -L$(LIB_DIR)
+  LIBS := $(LIB_DIR)/libedgefirst_hal.a -lm -lpthread \
+          -framework CoreFoundation -framework IOSurface -framework Security \
+          -framework SystemConfiguration
 else
   $(error Unsupported platform: $(UNAME_S))
 endif

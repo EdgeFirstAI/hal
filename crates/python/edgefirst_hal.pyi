@@ -946,12 +946,35 @@ class Tensor:
 
             Hand this off to native macOS APIs that take an ``IOSurfaceRef``
             directly (``CIImage``, ``AVSampleBufferDisplayLayer``,
-            ``CVPixelBufferCreateWithIOSurface``). Wrap with
-            ``ctypes.c_void_p(...)`` before passing to a ctypes-bound function.
-            The pointer's lifetime is tied to this tensor — do not call
-            ``CFRelease`` on it.
+            ``CVPixelBufferCreateWithIOSurface``). The integer value is a
+            raw pointer — wrap it with ``ctypes.c_void_p(...)`` before
+            passing to a ctypes-bound function.
+
+            The pointer's lifetime is tied to this tensor — the HAL holds
+            the only retain count. If the surface must outlive this
+            tensor, call ``CFRetain`` (via ctypes) on the pointer and
+            pair it with a matching ``CFRelease``. Do *not* call
+            ``CFRelease`` on the borrowed pointer without first
+            ``CFRetain``-ing — that would drop HAL's retain and produce
+            a use-after-free.
 
             Returns ``None`` when the tensor is not IOSurface-backed.
+
+            Example — hand the surface to ``CIImage``::
+
+                import ctypes
+                from edgefirst_hal import Tensor, TensorMemory
+
+                # Create the tensor (or import an existing IOSurface).
+                t = Tensor.image(1280, 720, "rgba", mem=TensorMemory.DMA)
+
+                # Wrap the raw IOSurfaceRef for ctypes handoff.
+                surf_ptr = ctypes.c_void_p(t.iosurface_ref)
+
+                # `ci_image_with_iosurface` is whatever native API you
+                # bound via ctypes; the IOSurface stays valid while `t`
+                # is alive.
+                # ci_image_with_iosurface(surf_ptr)
             """
 
     def map(self) -> TensorMap:

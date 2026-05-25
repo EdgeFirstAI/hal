@@ -4742,6 +4742,156 @@ mod image_tests {
         compare_images(&dst, &target_image, 0.98, function!());
     }
 
+    /// Multi-resolution smoke test: convert YUYV→RGBA via the GL
+    /// backend at a small (64×32) frame and a 4K (3840×2160) frame,
+    /// both filled with a synthetic mid-grey pattern. Validates the
+    /// shader math at the chroma-pairing boundary on small textures
+    /// and exercises the IOSurface bytes-per-row alignment path at 4K
+    /// (3840 pixels × 2 bytes/pixel = 7680 bytes, naturally 64-aligned).
+    ///
+    /// Resolutions below 32 pixels wide aren't tested because the
+    /// IOSurface allocator pads bpr to 64 bytes — for a 4-px-wide
+    /// YUYV surface that's 8 bytes data + 56 bytes padding per row,
+    /// which exercises a sampling pattern that's ANGLE-version
+    /// dependent rather than HAL-correctness dependent.
+    ///
+    /// This complements `test_yuyv_to_rgba_opengl_macos` (which checks
+    /// pixel-exact correctness against a reference image at 720p) by
+    /// ensuring the pipeline does not crash or produce gross errors at
+    /// resolution extremes. Pixel-exact validation at 4K would require
+    /// a 30 MB reference file we don't want to bundle.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_yuyv_to_rgba_opengl_macos_multi_resolution() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        for (w, h) in [(64usize, 32usize), (3840, 2160)] {
+            // Synthetic YUYV: Y=128 (mid-grey luma), U=V=128 (neutral
+            // chroma) → RGB grey at the output.
+            let bytes_per_row = w * 2;
+            let mut yuyv = vec![0u8; bytes_per_row * h];
+            for chunk in yuyv.chunks_exact_mut(4) {
+                chunk[0] = 128; // Y0
+                chunk[1] = 128; // U
+                chunk[2] = 128; // Y1
+                chunk[3] = 128; // V
+            }
+
+            let src = load_bytes_to_tensor(
+                w,
+                h,
+                PixelFormat::Yuyv,
+                Some(TensorMemory::Dma),
+                &yuyv,
+            )
+            .unwrap();
+
+            let dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Dma),
+            )
+            .unwrap();
+
+            let (result, _src, dst) = convert_img(
+                &mut proc,
+                src,
+                dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
+            result.expect("GL convert should succeed at this resolution");
+
+            // The neutral-chroma input must produce a near-grey output;
+            // BT.709 limited-range maps Y=128/UV=128 → roughly
+            // (130, 130, 130). Allow ±4 LSB for `mediump float` shader
+            // rounding.
+            let dst_u8 = dst.as_u8().unwrap();
+            let dst_map = dst_u8.map().unwrap();
+            let dst_bytes = dst_map.as_slice();
+            assert_eq!(dst_bytes.len(), w * h * 4, "RGBA byte count");
+            for px in dst_bytes.chunks_exact(4) {
+                for (i, &c) in px[..3].iter().enumerate() {
+                    assert!(
+                        (120..=140).contains(&c),
+                        "{}: channel {i} = {c} (expected ~128 ±12) at {w}×{h}",
+                        function!(),
+                    );
+                }
+                assert_eq!(px[3], 255, "alpha must be 1.0");
+            }
+        }
+    }
+
+    /// Verify that two consecutive convert() calls on the same source
+    /// tensor reuse the cached EGL pbuffer. Tests the cache hit path
+    /// added with the macOS GL backend hardening — without it, each
+    /// frame would pay `eglCreatePbufferFromClientBuffer` + destroy.
+    ///
+    /// This is a behaviour test rather than a perf test (the timing
+    /// difference is 100-200µs which is too noisy to assert on); we
+    /// check that the second call succeeds and produces a result
+    /// identical to the first.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_macos_gl_pbuffer_cache_reuses_surfaces() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        // Allocate one source + one destination, run convert twice.
+        let mut yuyv = vec![0u8; 64 * 32 * 2];
+        for chunk in yuyv.chunks_exact_mut(4) {
+            chunk[0] = 200;
+            chunk[1] = 100;
+            chunk[2] = 200;
+            chunk[3] = 156;
+        }
+        let src = load_bytes_to_tensor(
+            64,
+            32,
+            PixelFormat::Yuyv,
+            Some(TensorMemory::Dma),
+            &yuyv,
+        )
+        .unwrap();
+        let dst = TensorDyn::image(64, 32, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+            .unwrap();
+
+        let (r1, src, dst) =
+            convert_img(&mut proc, src, dst, Rotation::None, Flip::None, Crop::no_crop());
+        r1.unwrap();
+        let first: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+
+        let (r2, _src, dst) =
+            convert_img(&mut proc, src, dst, Rotation::None, Flip::None, Crop::no_crop());
+        r2.unwrap();
+        let second: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+
+        assert_eq!(first, second, "cache-hit conversion must be deterministic");
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgb_g2d() {

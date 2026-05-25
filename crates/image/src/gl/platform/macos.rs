@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! macOS platform implementation of the OpenGL backend.
+//! macOS platform helpers for the OpenGL backend.
 //!
 //! Uses Google ANGLE (translating OpenGL ES 3.0 to Metal) as the libEGL
 //! provider, and Apple IOSurface as the zero-copy buffer interchange.
@@ -11,15 +11,31 @@
 //! IOSurface via `EGL_ANGLE_iosurface_client_buffer` and binds it as a
 //! texture source via `eglBindTexImage`.
 //!
-//! See `spikes/angle_iosurface/` (local, gitignored) for the spike that
-//! validates this approach end-to-end at 7-30× speedup over naive
-//! upload/download on Apple M2 Max.
+//! ## Seam shape
+//!
+//! Only two operations need a platform-specific spelling at the macOS GL
+//! backend layer today:
+//!
+//! 1. [`MacosPlatform::load_egl_lib`] — locate and dlopen ANGLE's
+//!    `libEGL.dylib`.
+//! 2. [`MacosPlatform::create_display`] — bring up an ANGLE Metal
+//!    display via `eglGetPlatformDisplayEXT`.
+//!
+//! Everything downstream (pbuffer import, texture binding, FBO setup,
+//! shader compilation, lifetime management) lives in
+//! [`super::super::macos_processor`] and [`super::super::iosurface_import`].
+//! Those modules call these two functions directly — no trait, no enum
+//! dispatch. The trait-based `GlPlatform` seam that existed earlier in
+//! this branch was unused scaffolding and has been removed.
+//!
+//! A future `WindowsPlatform` (ANGLE + D3D11 shared textures) will most
+//! likely follow the same two-function seam shape, with its own
+//! `windows_processor.rs` and `d3d11_import.rs` companions. The seam
+//! does not need to be a trait until and unless two platforms end up
+//! sharing a processor implementation.
 
-use super::super::iosurface_import;
-use super::super::{Egl, TransferBackend};
-use super::{GlPlatform, PlatformDisplay, PlatformGpuBuffer};
+use super::super::Egl;
 use crate::Error;
-use edgefirst_tensor::{PixelFormat, Tensor};
 use khronos_egl as egl;
 use log::{debug, warn};
 use std::sync::OnceLock;
@@ -37,22 +53,40 @@ const EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE: i32 = 0x3489;
 /// context.rs).
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 
-/// Search path for libEGL.dylib (Homebrew's ANGLE tap). Override via
-/// the `EDGEFIRST_ANGLE_PATH` environment variable — used when a hal
-/// binary bundles its own ANGLE alongside the executable.
+/// Default search paths for `libEGL.dylib`. Order matters:
+///
+/// 1. Homebrew installs (Apple Silicon, then Intel).
+/// 2. `@loader_path` — alongside the loading binary. Lets bundled
+///    distributions ship ANGLE in `Frameworks/` or beside the
+///    executable without needing `EDGEFIRST_ANGLE_PATH`.
+/// 3. `@executable_path` — alongside the main executable when the
+///    loader isn't itself the executable.
+/// 4. Bare `libEGL.dylib` — last-resort fallback through the dyld
+///    search path (`DYLD_LIBRARY_PATH`, etc.).
+///
+/// `EDGEFIRST_ANGLE_PATH` (env var) is prepended at runtime — see
+/// [`load_egl_lib`].
 const ANGLE_SEARCH_PATHS: &[&str] = &[
     "/opt/homebrew/opt/angle/lib/libEGL.dylib",
     "/usr/local/opt/angle/lib/libEGL.dylib",
-    // `@loader_path/libEGL.dylib` resolution happens inside dlopen when
-    // the path is just `libEGL.dylib`. Listed last as a fallback so
-    // explicit Homebrew installs win when both are present.
+    "@loader_path/libEGL.dylib",
+    "@loader_path/../Frameworks/libEGL.dylib",
+    "@executable_path/libEGL.dylib",
+    "@executable_path/../Frameworks/libEGL.dylib",
     "libEGL.dylib",
 ];
 
+/// macOS-specific platform helpers. Currently exposes two associated
+/// functions; see the module docstring for the rationale.
 pub(in super::super) struct MacosPlatform;
 
-impl GlPlatform for MacosPlatform {
-    fn load_egl_lib() -> Result<&'static libloading::Library, Error> {
+impl MacosPlatform {
+    /// Locate and dlopen ANGLE's `libEGL.dylib`. Returns a cached static
+    /// reference on success; subsequent calls return the same handle.
+    ///
+    /// Search order: `EDGEFIRST_ANGLE_PATH` env var (if set) → entries
+    /// in [`ANGLE_SEARCH_PATHS`].
+    pub(in super::super) fn load_egl_lib() -> Result<&'static libloading::Library, Error> {
         if let Some(lib) = EGL_LIB.get() {
             return Ok(lib);
         }
@@ -93,7 +127,13 @@ impl GlPlatform for MacosPlatform {
         ))))
     }
 
-    fn create_display(egl: &Egl) -> Result<(egl::Display, PlatformDisplay), Error> {
+    /// Bring up an ANGLE Metal-backed EGL display.
+    ///
+    /// `egl` must wrap a libEGL handle obtained from [`load_egl_lib`]
+    /// — the call goes through ANGLE's `EGL_EXT_platform_base` client
+    /// extension, which is not present in Apple's system EGL (Apple
+    /// ships none).
+    pub(in super::super) fn create_display(egl: &Egl) -> Result<egl::Display, Error> {
         // ANGLE's libEGL exposes EGL_EXT_platform_base as a client
         // extension. We must call eglGetPlatformDisplayEXT explicitly
         // with platform = EGL_PLATFORM_ANGLE_ANGLE and a type attrib
@@ -137,140 +177,7 @@ impl GlPlatform for MacosPlatform {
             )));
         }
         // SAFETY: raw is a valid EGLDisplay pointer per the spec.
-        let display = unsafe { egl::Display::from_ptr(raw) };
-        Ok((display, PlatformDisplay::AngleMetal))
-    }
-
-    fn probe_transfer_backend(egl: &Egl, dpy: egl::Display) -> TransferBackend {
-        let exts = egl
-            .query_string(Some(dpy), egl::EXTENSIONS)
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if exts.contains("EGL_ANGLE_iosurface_client_buffer") {
-            debug!("MacosPlatform: EGL_ANGLE_iosurface_client_buffer available");
-            // TransferBackend gains an IOSurface variant in Task 38;
-            // until then fall back to Sync so the existing dispatch
-            // never picks the unimplemented path.
-            TransferBackend::Sync
-        } else {
-            warn!(
-                "MacosPlatform: EGL_ANGLE_iosurface_client_buffer missing — \
-                 ANGLE build may not include IOSurface support, GPU \
-                 backend will fall back to CPU"
-            );
-            TransferBackend::Sync
-        }
-    }
-
-    fn import_buffer(
-        egl: &Egl,
-        dpy: egl::Display,
-        cfg: Option<egl::Config>,
-        _ctx: egl::Context,
-        tensor: &Tensor<u8>,
-        fmt: PixelFormat,
-    ) -> Result<PlatformGpuBuffer, Error> {
-        let _span = tracing::trace_span!(
-            "image.gl.import_buffer",
-            platform = "macos",
-            format = ?fmt,
-        )
-        .entered();
-
-        let surface_ref = iosurface_import::tensor_iosurface_ref(tensor).ok_or_else(|| {
-            Error::NotSupported(
-                "macOS GL backend requires an IOSurface-backed tensor (TensorMemory::Dma); \
-                 SHM/Mem/Pbo cannot be imported via EGL_ANGLE_iosurface_client_buffer"
-                    .into(),
-            )
-        })?;
-        let config = cfg.ok_or_else(|| {
-            Error::Internal(
-                "MacosPlatform::import_buffer: missing egl::Config (SharedEglDisplay must \
-                 carry an explicit config on macOS for pbuffer creation)"
-                    .into(),
-            )
-        })?;
-        let width = tensor.width().ok_or_else(|| {
-            Error::InvalidShape("import_buffer: tensor has no width".into())
-        })?;
-        let height = tensor.height().ok_or_else(|| {
-            Error::InvalidShape("import_buffer: tensor has no height".into())
-        })?;
-
-        // SAFETY: surface_ref is borrowed from a live tensor, config is
-        // a valid EGLConfig with EGL_BIND_TO_TEXTURE_TARGET_ANGLE set.
-        let pbuf = unsafe {
-            iosurface_import::create_iosurface_pbuffer(
-                egl,
-                dpy,
-                config,
-                surface_ref,
-                fmt,
-                width,
-                height,
-            )?
-        };
-        Ok(PlatformGpuBuffer::IoSurface { pbuf })
-    }
-
-    fn bind_as_texture(
-        egl: &Egl,
-        dpy: egl::Display,
-        buf: &PlatformGpuBuffer,
-        tex_id: u32,
-    ) -> Result<(), Error> {
-        let _span = tracing::trace_span!(
-            "image.gl.bind_texture",
-            platform = "macos",
-            target = "sampler",
-            tex_id,
-        )
-        .entered();
-        // `EGL_BACK_BUFFER` is the buffer identifier required by
-        // eglBindTexImage; pbuffer surfaces have a single back buffer
-        // by convention.
-        const EGL_BACK_BUFFER: i32 = 0x3084;
-        let pbuf = match buf {
-            PlatformGpuBuffer::IoSurface { pbuf } => *pbuf,
-        };
-        egl.bind_tex_image(dpy, pbuf, EGL_BACK_BUFFER)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))
-    }
-
-    fn bind_as_render_target(
-        egl: &Egl,
-        dpy: egl::Display,
-        buf: &PlatformGpuBuffer,
-        tex_id: u32,
-    ) -> Result<(), Error> {
-        let _span = tracing::trace_span!(
-            "image.gl.bind_texture",
-            platform = "macos",
-            target = "render_target",
-            tex_id,
-        )
-        .entered();
-        // On macOS the same `eglBindTexImage` is the entry point — the
-        // resulting texture can be both sampled and attached to an FBO
-        // as a color attachment (the caller does the FBO setup with
-        // glFramebufferTexture2D, which lives in the GL processor, not
-        // here).
-        const EGL_BACK_BUFFER: i32 = 0x3084;
-        let pbuf = match buf {
-            PlatformGpuBuffer::IoSurface { pbuf } => *pbuf,
-        };
-        egl.bind_tex_image(dpy, pbuf, EGL_BACK_BUFFER)
-            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))
-    }
-
-    fn release_buffer(egl: &Egl, dpy: egl::Display, buf: PlatformGpuBuffer) {
-        let pbuf = match buf {
-            PlatformGpuBuffer::IoSurface { pbuf } => pbuf,
-        };
-        if let Err(e) = egl.destroy_surface(dpy, pbuf) {
-            warn!("MacosPlatform::release_buffer: destroy_surface failed: {e:?}");
-        }
+        Ok(unsafe { egl::Display::from_ptr(raw) })
     }
 }
 
@@ -285,8 +192,8 @@ mod tests {
     /// Successful loading of the dylib does NOT validate that the
     /// signature is correct for Tahoe (would require dlopen, which CI
     /// binaries can't do without entitlements). The signature validation
-    /// step lives in the wider integration test once ImageProcessor is
-    /// wired to use MacosPlatform.
+    /// step lives in the wider integration test
+    /// (`test_yuyv_to_rgba_opengl_macos` in `crates/image/src/lib.rs`).
     #[test]
     fn load_egl_lib_finds_homebrew_angle_or_skips() {
         let exists_at_any = ANGLE_SEARCH_PATHS

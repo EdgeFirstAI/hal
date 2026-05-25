@@ -518,6 +518,22 @@ Look for `ANGLE (Apple, ANGLE Metal Renderer: ...)` in the bring-up log.
 If ANGLE is missing or signatures are still broken you will see a
 warning and the CPU backend is selected.
 
+### Custom ANGLE locations
+
+If your ANGLE install is not in `/opt/homebrew/opt/angle/lib` (or
+`/usr/local/opt/angle/lib` on Intel Macs), set `EDGEFIRST_ANGLE_PATH`
+to the directory containing `libEGL.dylib` and `libGLESv2.dylib`:
+
+```bash
+EDGEFIRST_ANGLE_PATH=/path/to/angle/lib cargo run --release ...
+```
+
+The lookup order is: `EDGEFIRST_ANGLE_PATH` → Homebrew → `@loader_path`
+(alongside the binary) → `@executable_path` → unqualified `libEGL.dylib`
+on the dyld search path. For bundled distributions, drop the re-signed
+ANGLE dylibs next to the executable (or into `<App>.app/Contents/Frameworks/`)
+and no env var is needed.
+
 ### When you don't need this setup
 
 - **`pip install edgefirst-hal`** — the macOS wheel ships ANGLE bundled
@@ -555,6 +571,7 @@ For the C library and consumer linking, see
 | `EDGEFIRST_FORCE_TRANSFER` | Force GL transfer: `pbo`, `dmabuf`, or `sync` |
 | `EDGEFIRST_OPENGL_RENDERSURFACE` | `1` enables EGL renderbuffer path for non-`dma_heap` DMA-BUF (i.MX 95 Neutron NPU) |
 | `EDGEFIRST_PROTO_COMPUTE` | `1` enables GLES 3.1 compute shader for HWC→CHW proto repack |
+| `EDGEFIRST_ANGLE_PATH` | macOS only: directory containing `libEGL.dylib` / `libGLESv2.dylib`. Overrides the default search (Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |
 | `RUST_LOG` | Standard `env_logger` filter — `RUST_LOG=edgefirst_image=debug` for backend dispatch + cache stats |
 

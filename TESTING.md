@@ -78,9 +78,10 @@ entitlements that permit loading third-party dylibs.
 
 Follow the install steps in
 [README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration).
-On Tahoe (macOS 26+) the post-install `codesign --force --sign -` step
-is mandatory — without it the test process is killed by the kernel with
-no stdout and exit code 137.
+The post-install `codesign --force --sign -` step is mandatory on macOS
+26 (Tahoe) and any earlier release running a hardened-runtime binary —
+without it the test process is killed by the kernel with no stdout and
+exit code 137.
 
 If a test dies with no output, check
 `~/Library/Logs/DiagnosticReports/` for a crash report; the failure mode
@@ -89,33 +90,45 @@ for missing/broken ANGLE signatures is
 
 ### 2. Sign your test binary with the right entitlements
 
-On Tahoe a binary that `dlopen`s third-party dylibs needs the
-`disable-library-validation` entitlement even when those dylibs are
-ad-hoc signed. The HAL ships an `entitlements.plist` covering this for
-its own tests and benchmarks.
+Any binary with hardened runtime enabled that `dlopen`s third-party
+dylibs needs the `disable-library-validation` entitlement, even when
+those dylibs are ad-hoc signed. On Tahoe (macOS 26+) this is required
+even for ad-hoc-signed binaries running outside a distribution context;
+older macOS releases enforce it only for hardened-runtime builds. The
+HAL ships an `entitlements.plist` covering this for its own tests and
+benchmarks.
 
-For ad-hoc spike binaries (e.g. `spikes/angle_iosurface/`):
+#### The easy way: `scripts/test-macos.sh`
 
 ```bash
-cargo build --release
-codesign --force --sign - \
-  --entitlements entitlements.plist \
-  ./target/release/spike
+scripts/test-macos.sh                       # full suite
+scripts/test-macos.sh -p edgefirst-image    # one crate
+scripts/test-macos.sh test_yuyv_to_rgba_opengl_macos   # one test
+PROFILE=release scripts/test-macos.sh       # release tests
 ```
 
-For `cargo test` and `cargo nextest run`, the test harness rebuilds
-binaries under `target/{debug,release}/deps/`. The simplest workflow is
-to sign all binaries in that directory before running:
+The helper builds with `--tests`, signs every binary in
+`target/<profile>/deps/` with the workspace `entitlements.plist`, then
+forwards remaining arguments to `cargo nextest run`. Re-running it is
+idempotent (signing the same binary twice is a no-op).
+
+#### The manual way
+
+For one-off binaries (e.g. a release build of an example):
+
+```bash
+cargo build --release --example pipeline_demo
+codesign --force --sign - \
+  --entitlements entitlements.plist \
+  ./target/release/examples/pipeline_demo
+```
+
+For ad-hoc test binaries:
 
 ```bash
 find target/release/deps -type f -perm +111 -maxdepth 1 \
   -exec codesign --force --sign - --entitlements entitlements.plist {} \;
 ```
-
-The signing pass is fast (sub-second per binary) and re-running it is
-idempotent. The recommended workflow on macOS is to wrap your test
-command with a `scripts/test-macos.sh` helper that does the sign step
-first.
 
 ### 3. Verify ANGLE is reachable
 

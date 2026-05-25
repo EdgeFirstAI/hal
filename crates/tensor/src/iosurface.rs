@@ -280,8 +280,13 @@ where
         byte_size: usize,
         name: Option<&str>,
     ) -> Result<Self> {
-        let _span = tracing::info_span!(
-            "tensor.iosurface.create",
+        // Span name follows the project convention `<crate>.<function>`
+        // (see `ARCHITECTURE.md § Span naming conventions`). The
+        // `memory = "iosurface"` field tags the variant so traces can
+        // filter macOS-specific allocations.
+        let _span = tracing::trace_span!(
+            "tensor.alloc",
+            memory = "iosurface",
             byte_size,
         )
         .entered();
@@ -332,8 +337,9 @@ where
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
-        let _span = tracing::info_span!(
-            "tensor.iosurface.create",
+        let _span = tracing::trace_span!(
+            "tensor.alloc",
+            memory = "iosurface",
             width,
             height,
             ?format,
@@ -379,10 +385,21 @@ where
     /// retained for the tensor's lifetime; the external owner keeps its
     /// own reference and must release it independently.
     ///
+    /// The type-erased public entry point is [`crate::TensorDyn::from_iosurface`]
+    /// (and [`crate::Tensor::from_iosurface`] for the typed wrapper);
+    /// most callers should prefer those over calling this inner
+    /// constructor directly.
+    ///
     /// # Safety
     ///
     /// The caller must ensure `surface_ref` is a valid live
     /// `IOSurfaceRef`. Passing a stale or invalid pointer is UB.
+    ///
+    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()` must
+    /// not exceed the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`). This constructor does not validate the
+    /// invariant; a mismatched shape produces out-of-bounds reads or
+    /// writes in subsequent [`crate::Tensor::map`] calls.
     pub unsafe fn from_surface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -466,8 +483,13 @@ where
     /// # Safety
     ///
     /// `surface_ref` must be a valid live `IOSurfaceRef`. Passing a
-    /// stale or invalid pointer is UB. `shape` must match the
-    /// IOSurface's pixel dimensions and element count.
+    /// stale or invalid pointer is UB.
+    ///
+    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()`
+    /// must not exceed the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`). HAL does not validate this contract;
+    /// a mismatched shape produces out-of-bounds reads or writes in
+    /// subsequent [`Tensor::map`] calls.
     pub unsafe fn from_iosurface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -596,6 +618,16 @@ where
     fn deref_mut(&mut self) -> &mut [T] {
         let ptr = self.base_ptr.as_ptr() as *mut T;
         let len = self.elem_count();
+        // Symmetric with `Deref::deref` — without this an oversized
+        // mutable write proceeds silently in release builds even
+        // though the read path would have caught the same mismatch.
+        debug_assert!(
+            len * std::mem::size_of::<T>() <= self.buf_size,
+            "IoSurfaceMap deref_mut: {} elems × {} bytes > buf_size {}",
+            len,
+            std::mem::size_of::<T>(),
+            self.buf_size,
+        );
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 }
@@ -624,8 +656,11 @@ const FOURCC_L008: u32 = u32::from_be_bytes(*b"L008");
 /// pixel format to match the GL internal format / type combination —
 /// ANGLE validates `IOSurfaceGetBytesPerElement` against the requested
 /// `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` and rejects mismatches with
-/// `EGL_BAD_ATTRIBUTE`. The mapping here is the authoritative table
-/// keyed by the HAL's `PixelFormat`.
+/// `EGL_BAD_ATTRIBUTE`. **This function is the single source of truth
+/// for the `PixelFormat → (FourCC, bpe)` mapping** — the image crate's
+/// macOS GL backend reads it via [`image_iosurface_layout`] when
+/// constructing the EGL pbuffer attribute list. Keep the two layers in
+/// sync by not duplicating this table.
 ///
 /// Formats not listed are not supported by the GL backend on macOS;
 /// callers fall back to SHM/Mem and a CPU code path.
@@ -644,6 +679,23 @@ fn image_fourcc_and_bpe(format: PixelFormat) -> Option<(u32, usize)> {
         PixelFormat::Bgra => Some((u32::from_be_bytes(*b"BGRA"), 4)),
         _ => None,
     }
+}
+
+/// Public re-export of the `PixelFormat → (FourCC, bytes-per-element)`
+/// mapping for callers in other crates (specifically the `edgefirst-image`
+/// macOS GL backend). The FourCC is the cross-crate identifier — the GL
+/// backend maps it to the matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE`
+/// internally.
+///
+/// The image crate must use this function rather than duplicating the
+/// table; a drift between the allocation and import sides produced a
+/// silent R↔B swap during macOS bring-up (mapping Rgba to `'BGRA'`),
+/// which is why the table now lives in one place.
+///
+/// Returns `None` when the format does not have a defined IOSurface
+/// FourCC mapping in HAL (NV12, planar layouts, etc).
+pub fn image_iosurface_layout(format: PixelFormat) -> Option<(u32, usize)> {
+    image_fourcc_and_bpe(format)
 }
 
 unsafe fn build_props(

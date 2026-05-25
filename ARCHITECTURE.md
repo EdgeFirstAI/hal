@@ -242,8 +242,7 @@ When no subscriber is installed (the default), the interest cache is
 | `g2d_` | G2D hardware backend | `g2d_convert` |
 | `py_` | Python binding entry point | `py_decode`, `py_convert` |
 | `gl_pass1_` / `gl_pass2_` | Multi-pass GL sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
-| `image.gl.` | macOS GL platform layer (parallel processor) | `image.gl.platform_init`, `image.gl.import_buffer`, `image.gl.bind_texture`, `image.gl.convert` |
-| `tensor.iosurface.` | macOS IOSurface tensor allocation | `tensor.iosurface.create` |
+| `image.gl_init`, `image.convert` (with `backend = "gl"`) | macOS GL processor entry points — same `<crate>.<function>` shape as the Linux GL spans, with a `platform` field tagging the OS and a `backend` field tagging the dispatch target. |
 
 Field conventions:
 
