@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-05-25
+
+### Added
+
+- `hal_tensor_set_quantization(tensor, scale, zero_point)` — C API to
+  attach per-tensor affine quantization metadata to an integer tensor.
+  Required when wrapping framework buffers (e.g. NNStreamer `GstMemory`
+  outputs) that carry no quant of their own before feeding them to a
+  schema-driven `hal_decoder_decode_proto()` call. Mirrors the Rust
+  `TensorDyn::set_quantization` contract: integer tensors accept; float
+  tensors reject with `EINVAL`.
+
+### Changed
+
+- **C decoder errno mapping rewritten.** `hal_decoder_decode`,
+  `hal_decoder_decode_proto`, and `hal_decoder_decode_tracked`
+  previously collapsed every `DecoderError` variant to `EIO`, masking
+  caller-side preconditions as "internal" faults. A new
+  `errno_for_decoder_error()` mapper now splits the variants:
+  - **`EINVAL` (caller-side input is malformed or incomplete)** —
+    `InvalidShape`, `InvalidConfig`, `NoConfig`, `DtypeMismatch`,
+    `QuantMissing`, `Yaml`, `Json`, `NotSupported`, `NDArrayShape`.
+  - **`EIO` (internal/library fault the caller cannot fix)** —
+    `Internal`, `KernelDispatchUnreachable`, `ForcedKernelUnavailable`.
+
+  In particular, **missing per-tensor quantization on integer decoder
+  inputs now surfaces as `EINVAL` instead of `EIO`**, so operators
+  triaging GStreamer / NNStreamer pipelines can read the upstream
+  wiring bug directly rather than as a hardware/library failure. The
+  full `DecoderError` variant is still logged via `log::error!` for
+  diagnostics.
+
+- Doxygen `@par Errors` blocks on the three decoder entry points
+  reworded to describe the new caller-vs-internal split.
+
 ## [0.23.2] - 2026-05-21
 
 ### Changed

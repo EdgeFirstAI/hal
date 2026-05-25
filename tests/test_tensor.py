@@ -674,7 +674,9 @@ def test_iosurface_from_null_raises():
         Tensor.from_iosurface(0, [16, 16, 4], dtype="uint8")
 
 
-@pytest.mark.skipif(sys.platform == "darwin", reason="probe asymmetry only on non-macOS")
+@pytest.mark.skipif(
+    sys.platform == "darwin", reason="probe asymmetry only on non-macOS"
+)
 def test_iosurface_unavailable_on_non_macos():
     """Non-macOS platforms expose the probe but it always returns False."""
     import edgefirst_hal as hal

@@ -744,6 +744,39 @@ pub unsafe extern "C" fn hal_tensor_reshape(
     }
 }
 
+/// Attach per-tensor affine quantization metadata to an integer tensor.
+///
+/// The schema-driven per-scale decoder reads quantization live from each
+/// bound tensor via `Tensor::quantization()`. When tensors are wrapped
+/// from upstream framework buffers (e.g. NNStreamer `GstMemory` outputs)
+/// they carry no quant by default; the caller must attach it before
+/// calling `hal_decoder_decode_proto()` on a schema-driven decoder, or
+/// the decoder fails with `QuantMissing` (mapped to errno = EINVAL as a
+/// caller-side precondition violation).
+///
+/// Float tensors reject quantization — passing one returns -1 with errno
+/// = EINVAL. This mirrors the Rust `TensorDyn::set_quantization` contract.
+///
+/// @param tensor     Tensor handle (must be an integer dtype)
+/// @param scale      Quantization scale (positive float)
+/// @param zero_point Quantization zero-point (must fit the tensor dtype)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor, float dtype, or scale/zero-point out of range
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_set_quantization(
+    tensor: *mut HalTensor,
+    scale: f32,
+    zero_point: c_int,
+) -> c_int {
+    check_null!(tensor);
+    let q = edgefirst_tensor::Quantization::per_tensor(scale, zero_point);
+    match unsafe { &mut *tensor }.inner.set_quantization(q) {
+        Ok(()) => 0,
+        Err(_) => set_error(libc::EINVAL),
+    }
+}
+
 // ============================================================================
 // Tensor Map Functions
 // ============================================================================
