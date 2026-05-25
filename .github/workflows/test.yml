@@ -361,11 +361,12 @@ jobs:
         # scripts/test-macos.sh builds with --tests, signs every binary
         # with entitlements.plist (disables library validation so dlopen
         # of ad-hoc-signed ANGLE works on Tahoe), then forwards to
-        # nextest. Without the sign step the GL tests SIGKILL and
-        # silently skip.
+        # nextest. The script already injects
+        # `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
+        # so we only add the runner-specific `-j 1` here. Without the
+        # sign step the GL tests SIGKILL and silently skip.
         run: |
           ./scripts/test-macos.sh -j 1 \
-            --workspace --exclude gpu-probe --exclude edgefirst-bench \
             2>&1 | tee target/test-metrics-rust-macos.txt
 
       - name: Build C API library

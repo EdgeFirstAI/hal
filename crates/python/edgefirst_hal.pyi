@@ -918,7 +918,11 @@ class Tensor:
 
             Args:
                 surface_ref: ``IOSurfaceRef`` as ``int`` (non-zero).
-                shape: Tensor shape; must match the surface's element count.
+                shape: Tensor shape. The product of all dimensions times
+                    the element size must fit within
+                    ``IOSurfaceGetAllocSize(surface_ref)``; a mismatched
+                    shape raises ``RuntimeError`` instead of risking
+                    out-of-bounds access at map time.
                 dtype: Element type; defaults to ``"uint8"`` for image data.
                 name: Optional tensor name for debugging.
 
@@ -926,7 +930,9 @@ class Tensor:
                 A new ``Tensor`` reporting ``TensorMemory.DMA``.
 
             Raises:
-                RuntimeError: If ``surface_ref`` is null or the import fails.
+                RuntimeError: If ``surface_ref`` is null, the import
+                    fails, or the requested shape exceeds the surface's
+                    allocated size.
             """
             ...
 

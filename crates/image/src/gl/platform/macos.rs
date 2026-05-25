@@ -189,11 +189,16 @@ mod tests {
     /// host. Skips silently if the Homebrew ANGLE tap is not installed
     /// — CI runs without ANGLE should not fail this test.
     ///
-    /// Successful loading of the dylib does NOT validate that the
-    /// signature is correct for Tahoe (would require dlopen, which CI
-    /// binaries can't do without entitlements). The signature validation
-    /// step lives in the wider integration test
-    /// (`test_yuyv_to_rgba_opengl_macos` in `crates/image/src/lib.rs`).
+    /// The optional dlopen probe (which also catches missing/broken
+    /// signatures) only runs when the harness sets
+    /// `HAL_TEST_ALLOW_DLOPEN_ANGLE=1` — without that opt-in, plain
+    /// `cargo test` on macOS 26 hardened-runtime hosts would SIGKILL
+    /// the test process at dylib-load time and the failure would
+    /// surface as a silent crash with no stdout. `scripts/test-macos.sh`
+    /// signs the test binary with the library-validation entitlement
+    /// and exports the env var; the broader signature-validation path
+    /// also runs as part of the `test_yuyv_to_rgba_opengl_macos`
+    /// integration test in `crates/image/src/lib.rs`.
     #[test]
     fn load_egl_lib_finds_homebrew_angle_or_skips() {
         let exists_at_any = ANGLE_SEARCH_PATHS
@@ -206,10 +211,19 @@ mod tests {
             );
             return;
         }
-        // The first .exists() candidate should also be loadable — this
-        // catches missing/broken signatures only if the CI process has
-        // entitlements (otherwise dlopen SIGKILLs the test process,
-        // which manifests as a test failure with no stdout).
+
+        // Only attempt the actual dlopen when the harness has signed
+        // this binary with `disable-library-validation`. Outside that
+        // path we still report a successful test — the file-existence
+        // check above is the portable smoke-test, and the integration
+        // test exercises the real load path.
+        if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            eprintln!(
+                "HAL_TEST_ALLOW_DLOPEN_ANGLE unset — skipping ANGLE dlopen \
+                 probe (run via scripts/test-macos.sh to exercise it)."
+            );
+            return;
+        }
         let _ = MacosPlatform::load_egl_lib();
     }
 }

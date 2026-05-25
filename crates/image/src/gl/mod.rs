@@ -3,19 +3,23 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 #![cfg(feature = "opengl")]
-// Many types defined at the `gl` module root (EglDisplayKind,
-// TransferBackend, RegionOfInterest, etc.) are consumed by the Linux-
-// only inner modules (`context`, `processor`, ...). On macOS those inner
-// modules are cfg'd out, so the shared types appear unused. They will
-// be exercised by `platform/macos.rs` once Phase 4 wires the macOS code
-// path; until then suppress the lint on non-Linux targets only.
+// Several types defined at the `gl` module root (EglDisplayKind,
+// TransferBackend, RegionOfInterest, etc.) are consumed only by the
+// Linux-only inner modules (`context`, `processor`, ...). The macOS
+// path uses its own `MacosGlProcessor` + `iosurface_import` modules and
+// does not touch every shared type, so some appear unused on macOS.
+// Rather than fragmenting the type definitions per platform, suppress
+// the dead-code lint on non-Linux targets.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-// The OS gate above admits macOS; the inner modules below are
-// per-platform-gated until the macOS path is wired up (Phase 4).
-// `platform/` is the cross-platform abstraction layer and is the only
-// module currently visible on macOS — its `MacosPlatform` impl returns
-// `NotImplemented` from every method until Tasks 36-37 land.
+// Module layout:
+//   - `platform/` — cross-platform display/EGL-loader seam (both OSes)
+//   - Linux-only:  `context`, `processor`, `threaded`, `dma_import`,
+//                  `cache`, `resources`, `shaders`, `tests`
+//   - macOS-only:  `iosurface_import`, `macos_processor`
+// The macOS processor is parallel to (not a refactor of) the Linux
+// threaded processor — see `crates/image/ARCHITECTURE.md` for the
+// rationale and the planned convergence story.
 
 #[cfg(target_os = "linux")]
 macro_rules! function {

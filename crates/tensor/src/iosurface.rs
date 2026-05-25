@@ -395,11 +395,14 @@ where
     /// The caller must ensure `surface_ref` is a valid live
     /// `IOSurfaceRef`. Passing a stale or invalid pointer is UB.
     ///
-    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()` must
-    /// not exceed the IOSurface's allocated byte size
-    /// (`IOSurfaceGetAllocSize`). This constructor does not validate the
-    /// invariant; a mismatched shape produces out-of-bounds reads or
-    /// writes in subsequent [`crate::Tensor::map`] calls.
+    /// The shape footprint
+    /// (`shape.iter().product::<usize>() * std::mem::size_of::<T>()`) is
+    /// validated against the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`) and the constructor returns
+    /// `Err(InvalidShape)` if it does not fit. This catches accidental
+    /// mismatches that would otherwise cause out-of-bounds reads/writes
+    /// in [`crate::Tensor::map`]; it does not relax the pointer-validity
+    /// requirement above.
     pub unsafe fn from_surface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -407,6 +410,21 @@ where
     ) -> Result<Self> {
         let surface = OwnedIoSurface::from_external(surface_ref)?;
         let alloc = IOSurfaceGetAllocSize(surface.as_ptr());
+
+        let elem_size = std::mem::size_of::<T>();
+        let elems: usize = shape.iter().product();
+        let requested = elems.checked_mul(elem_size).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "from_surface: shape footprint overflows usize (shape={shape:?}, sizeof T={elem_size})",
+            ))
+        })?;
+        if requested > alloc {
+            return Err(Error::InvalidShape(format!(
+                "from_surface: shape requires {requested} bytes but IOSurface only \
+                 has {alloc} (shape={shape:?}, sizeof T={elem_size})",
+            )));
+        }
+
         let name = match name {
             Some(s) => s.to_owned(),
             None => format!("iosurface-imported-{}", uuid::Uuid::new_v4()),
@@ -485,11 +503,12 @@ where
     /// `surface_ref` must be a valid live `IOSurfaceRef`. Passing a
     /// stale or invalid pointer is UB.
     ///
-    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()`
-    /// must not exceed the IOSurface's allocated byte size
-    /// (`IOSurfaceGetAllocSize`). HAL does not validate this contract;
-    /// a mismatched shape produces out-of-bounds reads or writes in
-    /// subsequent [`Tensor::map`] calls.
+    /// HAL validates that
+    /// `shape.iter().product::<usize>() * std::mem::size_of::<T>()` fits
+    /// within the IOSurface's allocated byte size
+    /// (`IOSurfaceGetAllocSize`) and returns `Err(InvalidShape)`
+    /// otherwise. The pointer-validity requirement above is the
+    /// caller's responsibility.
     pub unsafe fn from_iosurface(
         surface_ref: *mut c_void,
         shape: &[usize],
@@ -811,5 +830,33 @@ mod tests {
         assert_eq!(t.shape(), &[256]);
         // Element count mismatch rejected
         assert!(t.reshape(&[100]).is_err());
+    }
+
+    #[test]
+    fn from_surface_rejects_shape_overflowing_alloc() {
+        // Allocate a small backing surface and try to import it under a
+        // shape whose footprint is much larger than the allocation.
+        let src = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
+        let alloc = src.buf_size;
+        let surface_ref = src.surface.as_ptr();
+
+        // u32 element type: requested bytes = (alloc + 1) * 4 ≫ alloc.
+        let bad_shape = [alloc + 1];
+        let err = unsafe {
+            IoSurfaceTensor::<u32>::from_surface(surface_ref, &bad_shape, None)
+        }
+        .expect_err("oversized shape must be rejected");
+        match err {
+            Error::InvalidShape(msg) => assert!(
+                msg.contains("IOSurface only has"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected InvalidShape, got {other:?}"),
+        }
+
+        // Sanity check: the same surface accepts a shape that does fit.
+        let ok_shape = [alloc / std::mem::size_of::<u32>()];
+        unsafe { IoSurfaceTensor::<u32>::from_surface(surface_ref, &ok_shape, None) }
+            .expect("fitting shape should succeed");
     }
 }

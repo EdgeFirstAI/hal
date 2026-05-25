@@ -386,17 +386,17 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @param surface_ref Pointer to a valid IOSurfaceRef (typed as void*)
 /// @param shape Array of dimension sizes (ndim elements). The product of
-///              all dimensions times sizeof(dtype) must not exceed the
-///              IOSurface's allocated byte size — HAL does not validate
-///              this; mismatches produce out-of-bounds reads/writes on
-///              subsequent hal_tensor_map_create() calls. Use
-///              IOSurfaceGetAllocSize() on the source surface to size
-///              the shape correctly.
+///              all dimensions times sizeof(dtype) must fit within the
+///              IOSurface's allocated byte size (see
+///              IOSurfaceGetAllocSize()). HAL rejects mismatched shapes
+///              with EINVAL rather than risking out-of-bounds access in
+///              subsequent hal_tensor_map_create() calls.
 /// @param ndim Number of dimensions (1-8)
 /// @param name Optional tensor name for debugging (can be NULL)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
-/// - EINVAL: NULL shape, NULL surface_ref, or ndim outside [1, 8]
+/// - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
+///   shape footprint exceeds the IOSurface allocation
 /// - EIO: Failed to import IOSurface (e.g. dead pointer)
 /// - ENOTSUP: Not supported on this platform (non-macOS)
 #[no_mangle]

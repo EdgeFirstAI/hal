@@ -126,7 +126,7 @@ codesign --force --sign - \
 For ad-hoc test binaries:
 
 ```bash
-find target/release/deps -type f -perm +111 -maxdepth 1 \
+find target/release/deps -maxdepth 1 -type f -perm -u+x \
   -exec codesign --force --sign - --entitlements entitlements.plist {} \;
 ```
 

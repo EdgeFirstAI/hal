@@ -53,13 +53,18 @@ echo "→ Codesigning test binaries with library-validation disabled…"
 # Sign every executable file in target/<profile>/deps that looks like a
 # test binary. Skip .d files (cargo dep manifests) and anything that's
 # already a script.
-find "$DEPS_DIR" -maxdepth 1 -type f -perm +111 \
+find "$DEPS_DIR" -maxdepth 1 -type f -perm -u+x \
     \( -name "edgefirst*-*" -o -name "hal*-*" \) \
     ! -name "*.d" ! -name "*.dSYM" \
     -exec codesign --force --sign - --entitlements "$ENTITLEMENTS" {} \; \
     > /dev/null 2>&1
 
 echo "→ Running nextest…"
+# We've just signed every test binary with the library-validation
+# entitlement, so dlopen()-based tests are safe to run here. Unit tests
+# that probe ANGLE via dlopen gate themselves on this env var so that a
+# plain `cargo test` (no codesign) does not SIGKILL on Tahoe.
+export HAL_TEST_ALLOW_DLOPEN_ANGLE=1
 exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
     --workspace --exclude gpu-probe --exclude edgefirst-bench \
     "$@"
