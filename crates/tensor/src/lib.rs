@@ -984,8 +984,7 @@ where
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
-        IoSurfaceTensor::<T>::new_image(width, height, format, shape, name)
-            .map(TensorStorage::Dma)
+        IoSurfaceTensor::<T>::new_image(width, height, format, shape, name).map(TensorStorage::Dma)
     }
 
     /// Create a new tensor storage using the given file descriptor, shape,
@@ -1277,20 +1276,28 @@ where
         // `EGL_ANGLE_iosurface_client_buffer`. Without this, the IOSurface
         // would default to a generic byte buffer (FourCC 'L008') and
         // ANGLE would reject the import with `EGL_BAD_ATTRIBUTE`.
-        // Falls back to the generic path for formats without an
-        // IOSurface mapping (NV12, planar, etc.).
+        //
+        // Guard: IOSurface rounds `bytes_per_row` up to 64-byte alignment.
+        // If the natural row pitch (`width * channels * sizeof(T)`) is not
+        // already 64-byte aligned, the padded allocation cannot be mapped
+        // as a contiguous packed tensor — CPU reads/writes would use the
+        // wrong stride. Only proceed when alignment is natural; otherwise
+        // fall through to SHM/Mem where no per-row padding exists.
         #[cfg(target_os = "macos")]
         if matches!(memory, Some(TensorMemory::Dma)) {
-            if let Ok(storage) = TensorStorage::<T>::new_image_iosurface(
-                width, height, format, &shape, None,
-            ) {
-                let mut t = Self::wrap(storage);
-                t.format = Some(format);
-                return Ok(t);
+            let natural_row_bytes = width * format.channels() * std::mem::size_of::<T>();
+            if natural_row_bytes.is_multiple_of(64) {
+                if let Ok(storage) =
+                    TensorStorage::<T>::new_image_iosurface(width, height, format, &shape, None)
+                {
+                    let mut t = Self::wrap(storage);
+                    t.format = Some(format);
+                    return Ok(t);
+                }
             }
-            // If new_image_iosurface fails (unsupported format), fall
-            // through to the generic Tensor::new path which may pick
-            // up SHM/Mem instead.
+            // If row pitch is not 64-byte aligned or new_image_iosurface
+            // fails (unsupported format), fall through to the generic
+            // Tensor::new path which picks up SHM/Mem instead.
         }
 
         let mut t = Self::new(&shape, memory, None)?;

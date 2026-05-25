@@ -161,9 +161,10 @@ impl ImageLayout {
             FOURCC_2C08 => GL_RG,
             FOURCC_RGBA => GL_RGBA,
             FOURCC_BGRA => GL_BGRA_EXT,
-            // Defensive fallback — should be unreachable given
-            // `image_iosurface_layout` only returns the three above.
-            _ => GL_BGRA_EXT,
+            other => unreachable!(
+                "unsupported IOSurface FourCC 0x{other:08X} in GL import — \
+                 add a mapping here when extending image_iosurface_layout()"
+            ),
         }
     }
 }
@@ -191,8 +192,8 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
     }
 
     let set_num = |key: &str, value: i64| -> Result<(), Error> {
-        let key_c = std::ffi::CString::new(key)
-            .map_err(|e| Error::Internal(format!("CString: {e}")))?;
+        let key_c =
+            std::ffi::CString::new(key).map_err(|e| Error::Internal(format!("CString: {e}")))?;
         let key_cf =
             CFStringCreateWithCString(std::ptr::null(), key_c.as_ptr(), K_CF_STRING_ENCODING_UTF8);
         if key_cf.is_null() {
@@ -300,8 +301,7 @@ pub(super) unsafe fn create_iosurface_pbuffer(
                 "eglCreatePbufferFromClientBuffer not exported by ANGLE libEGL",
             ))
         })?;
-    let create_pbuffer: FnCreatePbufferFromClientBuffer =
-        std::mem::transmute(create_pbuffer_ptr);
+    let create_pbuffer: FnCreatePbufferFromClientBuffer = std::mem::transmute(create_pbuffer_ptr);
 
     let attribs = [
         egl::WIDTH,
@@ -345,10 +345,7 @@ pub(super) unsafe fn create_iosurface_pbuffer(
 pub(super) fn tensor_iosurface_ref(tensor: &Tensor<u8>) -> Option<*mut std::ffi::c_void> {
     // Inspect the tensor's memory backend; only TensorMemory::Dma (which
     // is IOSurface-backed on macOS) carries the right inner type.
-    if !matches!(
-        tensor.memory(),
-        edgefirst_tensor::TensorMemory::Dma
-    ) {
+    if !matches!(tensor.memory(), edgefirst_tensor::TensorMemory::Dma) {
         return None;
     }
     tensor.iosurface_ref()

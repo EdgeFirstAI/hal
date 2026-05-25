@@ -307,12 +307,12 @@ pub use opengl_headless::GLProcessorThreaded;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::Int8InterpolationMode;
-#[cfg(target_os = "linux")]
-#[cfg(feature = "opengl")]
-pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 #[cfg(target_os = "macos")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::MacosGlProcessor;
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 use std::{fmt::Display, time::Instant};
 
 mod cpu;
@@ -1112,7 +1112,10 @@ impl ImageProcessor {
                             forced_backend: Some(ForcedBackend::OpenGl),
                         })
                     }
-                    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "opengl")))]
+                    #[cfg(not(all(
+                        any(target_os = "linux", target_os = "macos"),
+                        feature = "opengl"
+                    )))]
                     {
                         Err(Error::ForcedBackendUnavailable(
                             "opengl backend requires Linux or macOS with the 'opengl' feature \
@@ -4729,8 +4732,7 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image =
-            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -4787,23 +4789,11 @@ mod image_tests {
                 chunk[3] = 128; // V
             }
 
-            let src = load_bytes_to_tensor(
-                w,
-                h,
-                PixelFormat::Yuyv,
-                Some(TensorMemory::Dma),
-                &yuyv,
-            )
-            .unwrap();
+            let src = load_bytes_to_tensor(w, h, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
+                .unwrap();
 
-            let dst = TensorDyn::image(
-                w,
-                h,
-                PixelFormat::Rgba,
-                DType::U8,
-                Some(TensorMemory::Dma),
-            )
-            .unwrap();
+            let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                .unwrap();
 
             let (result, _src, dst) = convert_img(
                 &mut proc,
@@ -4868,24 +4858,36 @@ mod image_tests {
             chunk[2] = 200;
             chunk[3] = 156;
         }
-        let src = load_bytes_to_tensor(
+        let src = load_bytes_to_tensor(64, 32, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
+            .unwrap();
+        let dst = TensorDyn::image(
             64,
             32,
-            PixelFormat::Yuyv,
+            PixelFormat::Rgba,
+            DType::U8,
             Some(TensorMemory::Dma),
-            &yuyv,
         )
         .unwrap();
-        let dst = TensorDyn::image(64, 32, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-            .unwrap();
 
-        let (r1, src, dst) =
-            convert_img(&mut proc, src, dst, Rotation::None, Flip::None, Crop::no_crop());
+        let (r1, src, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
         r1.unwrap();
         let first: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
 
-        let (r2, _src, dst) =
-            convert_img(&mut proc, src, dst, Rotation::None, Flip::None, Crop::no_crop());
+        let (r2, _src, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
         r2.unwrap();
         let second: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
 

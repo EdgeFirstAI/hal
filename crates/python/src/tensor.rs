@@ -742,12 +742,7 @@ impl PyTensor {
         }
         let dt = parse_dtype(dtype)?;
         let tensor = unsafe {
-            TensorDyn::from_iosurface(
-                surface_ref as *mut std::ffi::c_void,
-                &shape,
-                dt,
-                name,
-            )?
+            TensorDyn::from_iosurface(surface_ref as *mut std::ffi::c_void, &shape, dt, name)?
         };
         Ok(PyTensor(tensor))
     }

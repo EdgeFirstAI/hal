@@ -64,10 +64,10 @@ mod threaded;
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
-#[cfg(target_os = "linux")]
-pub use threaded::GLProcessorThreaded;
 #[cfg(target_os = "macos")]
 pub use macos_processor::MacosGlProcessor;
+#[cfg(target_os = "linux")]
+pub use threaded::GLProcessorThreaded;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
 /// `'static` because the underlying `libloading::Library` is intentionally
@@ -79,9 +79,8 @@ pub use macos_processor::MacosGlProcessor;
 /// platform implementations can name it without dragging in a cross-cfg
 /// re-export. The Linux `context.rs` and the macOS `platform/macos.rs`
 /// both use this same alias.
-pub(super) type Egl = khronos_egl::Instance<
-    khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
->;
+pub(super) type Egl =
+    khronos_egl::Instance<khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>>;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///

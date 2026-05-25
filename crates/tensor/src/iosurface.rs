@@ -90,21 +90,13 @@ extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> CFDictionaryRef;
-    fn CFDictionarySetValue(
-        dict: CFDictionaryRef,
-        key: *const c_void,
-        value: *const c_void,
-    );
+    fn CFDictionarySetValue(dict: CFDictionaryRef, key: *const c_void, value: *const c_void);
     fn CFStringCreateWithCString(
         allocator: *const c_void,
         cstr: *const i8,
         encoding: u32,
     ) -> CFStringRef;
-    fn CFNumberCreate(
-        allocator: *const c_void,
-        ty: i32,
-        value_ptr: *const c_void,
-    ) -> CFNumberRef;
+    fn CFNumberCreate(allocator: *const c_void, ty: i32, value_ptr: *const c_void) -> CFNumberRef;
 
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
@@ -209,11 +201,7 @@ where
         Self::new_with_byte_size(shape, byte_size, name)
     }
 
-    fn from_fd(
-        _fd: std::os::fd::OwnedFd,
-        _shape: &[usize],
-        _name: Option<&str>,
-    ) -> Result<Self> {
+    fn from_fd(_fd: std::os::fd::OwnedFd, _shape: &[usize], _name: Option<&str>) -> Result<Self> {
         Err(Error::NotImplemented(
             "IoSurfaceTensor::from_fd: IOSurface is not fd-backed; use from_surface()".into(),
         ))
@@ -252,11 +240,7 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let _span = tracing::trace_span!(
-            "tensor.map",
-            memory = "iosurface",
-        )
-        .entered();
+        let _span = tracing::trace_span!("tensor.map", memory = "iosurface",).entered();
         let m = IoSurfaceMap::new(self.surface.clone(), self.shape.clone(), self.buf_size)?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -284,12 +268,8 @@ where
         // (see `ARCHITECTURE.md § Span naming conventions`). The
         // `memory = "iosurface"` field tags the variant so traces can
         // filter macOS-specific allocations.
-        let _span = tracing::trace_span!(
-            "tensor.alloc",
-            memory = "iosurface",
-            byte_size,
-        )
-        .entered();
+        let _span =
+            tracing::trace_span!("tensor.alloc", memory = "iosurface", byte_size,).entered();
 
         // SAFETY: dict is created and consumed within this block; the
         // CFDictionary stays alive across the IOSurfaceCreate call.
@@ -307,9 +287,7 @@ where
             None => format!("iosurface-{}", uuid::Uuid::new_v4()),
         };
 
-        trace!(
-            "IoSurfaceTensor::new: name={name} bytes={alloc} shape={shape:?}",
-        );
+        trace!("IoSurfaceTensor::new: name={name} bytes={alloc} shape={shape:?}",);
 
         Ok(Self {
             name,
@@ -337,14 +315,9 @@ where
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
-        let _span = tracing::trace_span!(
-            "tensor.alloc",
-            memory = "iosurface",
-            width,
-            height,
-            ?format,
-        )
-        .entered();
+        let _span =
+            tracing::trace_span!("tensor.alloc", memory = "iosurface", width, height, ?format,)
+                .entered();
 
         let (fourcc, bpe) = image_fourcc_and_bpe(format).ok_or_else(|| {
             Error::NotImplemented(format!(
@@ -842,10 +815,8 @@ mod tests {
 
         // u32 element type: requested bytes = (alloc + 1) * 4 ≫ alloc.
         let bad_shape = [alloc + 1];
-        let err = unsafe {
-            IoSurfaceTensor::<u32>::from_surface(surface_ref, &bad_shape, None)
-        }
-        .expect_err("oversized shape must be rejected");
+        let err = unsafe { IoSurfaceTensor::<u32>::from_surface(surface_ref, &bad_shape, None) }
+            .expect_err("oversized shape must be rejected");
         match err {
             Error::InvalidShape(msg) => assert!(
                 msg.contains("IOSurface only has"),

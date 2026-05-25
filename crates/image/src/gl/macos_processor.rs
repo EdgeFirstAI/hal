@@ -193,12 +193,8 @@ fn shared_display() -> Result<&'static SharedAngleDisplay> {
 }
 
 fn init_shared_display() -> Result<SharedAngleDisplay> {
-    let _span = tracing::info_span!(
-        "image.gl_init",
-        platform = "macos",
-        backend = "iosurface",
-    )
-    .entered();
+    let _span =
+        tracing::info_span!("image.gl_init", platform = "macos", backend = "iosurface",).entered();
 
     // 1. Load ANGLE libEGL and bring up an EGL instance.
     let egl_lib = MacosPlatform::load_egl_lib()
@@ -254,17 +250,24 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
 
     // 5. Dummy pbuffer for context-current bring-up.
     let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
-    let dummy_pbuffer = egl.create_pbuffer_surface(display, config, &dummy_attribs).map_err(|e| {
-        // Clean up the context we just created before bailing.
-        let _ = egl.destroy_context(display, context);
-        Error::Io(std::io::Error::other(format!(
-            "eglCreatePbufferSurface(dummy): {e:?}"
-        )))
-    })?;
+    let dummy_pbuffer = egl
+        .create_pbuffer_surface(display, config, &dummy_attribs)
+        .map_err(|e| {
+            // Clean up the context we just created before bailing.
+            let _ = egl.destroy_context(display, context);
+            Error::Io(std::io::Error::other(format!(
+                "eglCreatePbufferSurface(dummy): {e:?}"
+            )))
+        })?;
 
     // 6. Load GL function pointers via the now-initialised display.
     //    Make-current is required for some drivers to expose GLES symbols.
-    if let Err(e) = egl.make_current(display, Some(dummy_pbuffer), Some(dummy_pbuffer), Some(context)) {
+    if let Err(e) = egl.make_current(
+        display,
+        Some(dummy_pbuffer),
+        Some(dummy_pbuffer),
+        Some(context),
+    ) {
         let _ = egl.destroy_surface(display, dummy_pbuffer);
         let _ = egl.destroy_context(display, context);
         return Err(Error::Io(std::io::Error::other(format!(
@@ -496,8 +499,7 @@ impl MacosGlProcessor {
             };
 
             let (uniform_src, uniform_src_size) = {
-                let loc_src =
-                    gls::gl::GetUniformLocation(program, c"src".as_ptr() as *const _);
+                let loc_src = gls::gl::GetUniformLocation(program, c"src".as_ptr() as *const _);
                 let loc_size =
                     gls::gl::GetUniformLocation(program, c"src_size".as_ptr() as *const _);
                 (loc_src, loc_size)
@@ -620,11 +622,15 @@ impl MacosGlProcessor {
         )
         .entered();
 
-        let src_w = src.width().ok_or_else(|| Error::InvalidShape("src width".into()))?;
+        let src_w = src
+            .width()
+            .ok_or_else(|| Error::InvalidShape("src width".into()))?;
         let src_h = src
             .height()
             .ok_or_else(|| Error::InvalidShape("src height".into()))?;
-        let dst_w = dst.width().ok_or_else(|| Error::InvalidShape("dst width".into()))?;
+        let dst_w = dst
+            .width()
+            .ok_or_else(|| Error::InvalidShape("dst width".into()))?;
         let dst_h = dst
             .height()
             .ok_or_else(|| Error::InvalidShape("dst height".into()))?;
@@ -638,9 +644,9 @@ impl MacosGlProcessor {
             )));
         }
 
-        let src_u8 = src.as_u8().ok_or_else(|| {
-            Error::NotSupported("GL backend requires u8 source tensor".into())
-        })?;
+        let src_u8 = src
+            .as_u8()
+            .ok_or_else(|| Error::NotSupported("GL backend requires u8 source tensor".into()))?;
         let dst_u8 = dst.as_u8_mut().ok_or_else(|| {
             Error::NotSupported("GL backend requires u8 destination tensor".into())
         })?;
@@ -662,12 +668,10 @@ impl MacosGlProcessor {
         // Look up (or create) the source/dest pbuffers in the cache.
         // Cache miss path calls `eglCreatePbufferFromClientBuffer` and
         // inserts; cache hit returns the existing surface.
-        let src_pbuf = self.get_or_create_pbuffer(
-            d, src_id, src_iosurface, src_fmt, src_w, src_h,
-        )?;
-        let dst_pbuf = self.get_or_create_pbuffer(
-            d, dst_id, dst_iosurface, dst_fmt, dst_w, dst_h,
-        )?;
+        let src_pbuf =
+            self.get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, src_w, src_h)?;
+        let dst_pbuf =
+            self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, dst_w, dst_h)?;
 
         // SAFETY: GL mutex held; context current via `_current`. Each
         // pbuffer's tex-image binding is owned by a `BoundTexImage` RAII
@@ -746,7 +750,13 @@ impl MacosGlProcessor {
         // EGL_BIND_TO_TEXTURE_TARGET_ANGLE set.
         let pbuf = unsafe {
             iosurface_import::create_iosurface_pbuffer(
-                &d.egl, d.display, d.config, surface_ref, format, width, height,
+                &d.egl,
+                d.display,
+                d.config,
+                surface_ref,
+                format,
+                width,
+                height,
             )?
         };
         if iosurface_id != 0 {
@@ -921,7 +931,12 @@ unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> Result<u32> {
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut len = 0i32;
-        gls::gl::GetProgramInfoLog(program, log.len() as i32, &mut len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetProgramInfoLog(
+            program,
+            log.len() as i32,
+            &mut len,
+            log.as_mut_ptr() as *mut _,
+        );
         // `state` Drop deletes program + fs + vs as we return.
         return Err(Error::Internal(format!(
             "program link failed: {}",
@@ -951,7 +966,12 @@ unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut len = 0i32;
-        gls::gl::GetShaderInfoLog(shader, log.len() as i32, &mut len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetShaderInfoLog(
+            shader,
+            log.len() as i32,
+            &mut len,
+            log.as_mut_ptr() as *mut _,
+        );
         return Err(Error::Internal(format!(
             "shader compile failed (kind=0x{kind:x}): {}",
             String::from_utf8_lossy(&log[..len.max(0) as usize])
@@ -959,4 +979,3 @@ unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
     }
     Ok(shader)
 }
-

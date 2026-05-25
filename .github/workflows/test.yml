@@ -345,6 +345,7 @@ jobs:
         # skips and the entire GL backend ships untested in CI.
         run: |
           set -euxo pipefail
+          brew tap startergo/gn
           brew tap startergo/angle
           brew install startergo/angle/angle
           ANGLE_DIR="$(brew --prefix angle)/lib"

@@ -110,7 +110,9 @@ fn make_dst_mat(buf: &mut [u8], w: usize, h: usize, fmt: PixelFormat) -> Mat {
 
 /// Bytes per pixel in the destination buffer for sizing.
 fn out_bpp(fmt: PixelFormat) -> usize {
-    cv_type_bpp(fmt).map(|(_, bpp)| bpp).expect("unsupported output fmt")
+    cv_type_bpp(fmt)
+        .map(|(_, bpp)| bpp)
+        .expect("unsupported output fmt")
 }
 
 /// Map a hal `(input, output)` format pair to the corresponding OpenCV
@@ -151,8 +153,7 @@ fn bench_letterbox_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("letterbox/opencv-1cpu/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
         let mut converted = Mat::default();
         let mut resized = Mat::default();
 
@@ -183,8 +184,7 @@ fn bench_letterbox_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("letterbox/opencv-multi/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
         let mut converted = Mat::default();
         let mut resized = Mat::default();
 
@@ -230,8 +230,7 @@ fn bench_convert_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("convert/opencv-1cpu/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
             set_num_threads(1).unwrap();
@@ -245,8 +244,7 @@ fn bench_convert_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("convert/opencv-multi/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
             set_num_threads(0).unwrap();
@@ -276,8 +274,7 @@ fn bench_resize_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("resize/opencv-1cpu/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
         let mut converted = Mat::default();
         let mut resized = Mat::default();
 
@@ -303,8 +300,7 @@ fn bench_resize_opencv(config: &BenchConfig, suite: &mut BenchSuite) {
     {
         let name = format!("resize/opencv-multi/{}", config.id());
         let mut dst_data = vec![0u8; config.out_w * config.out_h * out_bpp];
-        let mut dst_mat =
-            make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
+        let mut dst_mat = make_dst_mat(&mut dst_data, config.out_w, config.out_h, config.out_fmt);
         let mut converted = Mat::default();
         let mut resized = Mat::default();
 
