@@ -154,6 +154,7 @@ pub(crate) enum TransferBackend {
     /// Available when ANGLE's Metal backend is loaded and the EGL
     /// extension is advertised. The IOSurface is wrapped as an EGL
     /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
+    #[cfg(target_os = "macos")]
     IOSurface,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
