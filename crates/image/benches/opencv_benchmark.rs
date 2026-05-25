@@ -11,8 +11,8 @@
 //! - Outputs: RGBA, RGB, GREY (single-channel)
 //! - Operations: letterbox, convert, resize
 //! - Resolutions: 1280×720, 1920×1080, 3840×2160 →
-//!                640×640 / 1280×1280 (letterbox), same-size (convert),
-//!                various (resize)
+//!   640×640 / 1280×1280 (letterbox), same-size (convert),
+//!   various (resize)
 //!
 //! Operations OpenCV cannot natively express (PlanarRgb output, i8
 //! quantized outputs, VYUY/Nv16 input) are deliberately omitted — the
