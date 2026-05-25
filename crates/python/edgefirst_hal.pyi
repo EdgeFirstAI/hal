@@ -6,6 +6,37 @@ import sys
 
 """EdgeFirst HAL Python bindings."""
 
+def version() -> str:
+    """Return the HAL version string (matches ``Cargo.toml``)."""
+
+def build_info() -> str:
+    """Return a human-readable build configuration string."""
+
+def is_dma_available() -> bool:
+    """True when Linux DMA-BUF heap allocation is available.
+
+    macOS callers should use :func:`is_iosurface_available` or the
+    portable :func:`is_gpu_buffer_available` instead.
+    """
+
+def is_iosurface_available() -> bool:
+    """True when macOS IOSurface allocation is available.
+
+    Always returns ``False`` on non-macOS platforms.
+    """
+
+def is_gpu_buffer_available() -> bool:
+    """True when a platform-native GPU-coherent buffer kind is available.
+
+    Dispatches to :func:`is_dma_available` on Linux and
+    :func:`is_iosurface_available` on macOS. Use this when you only care
+    whether ``TensorMemory.DMA`` will succeed without caring which
+    primitive backs it.
+    """
+
+def is_shm_available() -> bool:
+    """True when POSIX shared memory allocation is available (Unix only)."""
+
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -856,6 +887,101 @@ class Tensor:
                 RuntimeError: If the tensor is not DMA-backed or fd clone fails.
             """
             ...
+
+    if sys.platform == "darwin":
+        @staticmethod
+        def from_iosurface(
+            surface_ref: int,
+            shape: list[int],
+            dtype: Literal[
+                "int8",
+                "uint8",
+                "int16",
+                "uint16",
+                "int32",
+                "uint32",
+                "int64",
+                "uint64",
+                "float32",
+                "float64",
+            ] = "uint8",
+            name: None | str = None,
+        ) -> Tensor:
+            """Wrap an externally-allocated IOSurface as a Tensor (macOS only).
+
+            ``surface_ref`` is an ``IOSurfaceRef`` cast to ``int`` — typically
+            obtained via ``ctypes`` from a CoreVideo / AVFoundation /
+            VideoToolbox handle, or via ``IOSurfaceLookup(id)`` to recover a
+            surface received over XPC. The surface is retained for the
+            tensor's lifetime; the caller keeps its own reference and must
+            release it independently.
+
+            Args:
+                surface_ref: ``IOSurfaceRef`` as ``int`` (non-zero).
+                shape: Tensor shape. The product of all dimensions times
+                    the element size must fit within
+                    ``IOSurfaceGetAllocSize(surface_ref)``; a mismatched
+                    shape raises ``RuntimeError`` instead of risking
+                    out-of-bounds access at map time.
+                dtype: Element type; defaults to ``"uint8"`` for image data.
+                name: Optional tensor name for debugging.
+
+            Returns:
+                A new ``Tensor`` reporting ``TensorMemory.DMA``.
+
+            Raises:
+                RuntimeError: If ``surface_ref`` is null, the import
+                    fails, or the requested shape exceeds the surface's
+                    allocated size.
+            """
+            ...
+
+        @property
+        def iosurface_id(self) -> int | None:
+            """``IOSurfaceID`` for cross-process surface sharing (macOS only).
+
+            Returns ``None`` when the tensor is not IOSurface-backed. The ID
+            is a 32-bit handle stable for the lifetime of the IOSurface; it
+            can be passed across process boundaries (Mach port, XPC) and
+            recovered via ``IOSurfaceLookup(id)``.
+            """
+
+        @property
+        def iosurface_ref(self) -> int | None:
+            """Borrowed ``IOSurfaceRef`` as an ``int`` (macOS only).
+
+            Hand this off to native macOS APIs that take an ``IOSurfaceRef``
+            directly (``CIImage``, ``AVSampleBufferDisplayLayer``,
+            ``CVPixelBufferCreateWithIOSurface``). The integer value is a
+            raw pointer — wrap it with ``ctypes.c_void_p(...)`` before
+            passing to a ctypes-bound function.
+
+            The pointer's lifetime is tied to this tensor — the HAL holds
+            the only retain count. If the surface must outlive this
+            tensor, call ``CFRetain`` (via ctypes) on the pointer and
+            pair it with a matching ``CFRelease``. Do *not* call
+            ``CFRelease`` on the borrowed pointer without first
+            ``CFRetain``-ing — that would drop HAL's retain and produce
+            a use-after-free.
+
+            Returns ``None`` when the tensor is not IOSurface-backed.
+
+            Example — hand the surface to ``CIImage``::
+
+                import ctypes
+                from edgefirst_hal import Tensor, TensorMemory
+
+                # Create the tensor (or import an existing IOSurface).
+                t = Tensor.image(1280, 720, "rgba", mem=TensorMemory.DMA)
+
+                # Wrap the raw IOSurfaceRef for ctypes handoff.
+                surf_ptr = ctypes.c_void_p(t.iosurface_ref)
+
+                # `ci_image_with_iosurface` is whatever native API you
+                # bound via ctypes; the IOSurface stays valid while `t`
+                # is alive.
+                # ci_image_with_iosurface(surf_ptr)
+            """
 
     def map(self) -> TensorMap:
         """Map the tensor's memory for direct read/write access.

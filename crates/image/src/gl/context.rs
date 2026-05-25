@@ -187,7 +187,9 @@ pub(super) fn get_egl_lib() -> Result<&'static libloading::Library, crate::Error
     }
 }
 
-pub(super) type Egl = Instance<Dynamic<&'static libloading::Library, EGL1_4>>;
+// `Egl` type alias now lives at `super::Egl` (in `gl/mod.rs`) so both the
+// Linux and macOS platform modules can use it without cross-cfg re-exports.
+pub(super) use super::Egl;
 
 /// Probe for available EGL displays supporting headless OpenGL ES 3.0.
 ///

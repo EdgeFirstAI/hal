@@ -59,6 +59,10 @@ def test_dtype(dtype, size, fmt, itemsize, val1, val2):
         _ = m[0]
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="DMA-BUF fd is Linux-only; macOS IOSurface uses surface_id/ref",
+)
 def test_from_fd_dma():
     try:
         tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
@@ -83,6 +87,10 @@ def test_from_fd_dma():
             assert m[i] == 233
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="DMA-BUF fd is Linux-only; macOS IOSurface uses surface_id/ref",
+)
 def test_dma_zero_copy_perf():
     try:
         tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
@@ -592,3 +600,83 @@ def test_from_numpy_non_array():
     t = Tensor([3, 4], dtype="uint8")
     with pytest.raises((RuntimeError, TypeError)):
         t.from_numpy([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
+
+
+# ============================================================================
+# macOS IOSurface bindings
+# ============================================================================
+#
+# These tests exercise the macOS IOSurface tensor path
+# (`Tensor.from_iosurface`, `Tensor.iosurface_id`, `Tensor.iosurface_ref`,
+# and the four `is_*_available` probes). They skip silently on non-macOS
+# platforms so the same test suite runs on Linux CI without modification.
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
+def test_iosurface_probes_dispatch_per_platform():
+    """The four probe functions should reflect platform reality."""
+    import edgefirst_hal as hal
+
+    assert hal.is_shm_available() is True, "macOS has POSIX shm"
+    assert hal.is_dma_available() is False, "macOS has no Linux DMA-BUF heap"
+    # IOSurface may be unavailable in sandboxed or degraded contexts;
+    # only assert the dispatch relationship (gpu_buffer delegates to iosurface).
+    assert hal.is_gpu_buffer_available() == hal.is_iosurface_available()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
+def test_iosurface_id_is_some_for_dma_tensor():
+    """A DMA-allocated tensor on macOS reports a non-None IOSurfaceID."""
+    import edgefirst_hal as hal
+
+    if not hal.is_iosurface_available():
+        pytest.skip("IOSurface not available on this host")
+
+    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
+    assert t.memory == TensorMemory.DMA
+    assert t.iosurface_id is not None
+    assert t.iosurface_id != 0, "0 is the error sentinel"
+    assert t.iosurface_ref is not None
+    assert t.iosurface_ref != 0, "ref pointer must be non-null"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
+def test_iosurface_id_is_none_for_mem_tensor():
+    """A Mem-backed tensor on macOS reports None for both iosurface accessors."""
+    t = Tensor([16], dtype="float32", mem=TensorMemory.MEM)
+    assert t.memory == TensorMemory.MEM
+    assert t.iosurface_id is None
+    assert t.iosurface_ref is None
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
+def test_iosurface_roundtrip_via_from_iosurface():
+    """from_iosurface(t.iosurface_ref) recovers a tensor sharing the same surface."""
+    import edgefirst_hal as hal
+
+    if not hal.is_iosurface_available():
+        pytest.skip("IOSurface not available on this host")
+
+    t = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
+    original_id = t.iosurface_id
+    original_ref = t.iosurface_ref
+
+    imported = Tensor.from_iosurface(original_ref, [720, 1280, 4], dtype="uint8")
+    assert imported.memory == TensorMemory.DMA
+    assert imported.iosurface_id == original_id, "re-imported ID must match"
+    assert imported.iosurface_ref == original_ref, "re-imported ref must match"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="IOSurface is macOS-only")
+def test_iosurface_from_null_raises():
+    """from_iosurface(0) (NULL pointer) must raise rather than crash."""
+    with pytest.raises((RuntimeError, IOError, ValueError)):
+        Tensor.from_iosurface(0, [16, 16, 4], dtype="uint8")
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="probe asymmetry only on non-macOS")
+def test_iosurface_unavailable_on_non_macos():
+    """Non-macOS platforms expose the probe but it always returns False."""
+    import edgefirst_hal as hal
+
+    assert hal.is_iosurface_available() is False

@@ -26,6 +26,9 @@ shutdown quirks of each driver stack.
 | [`cpu/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/cpu) | local | `CPUProcessor` — fast_image_resize + rayon, plus the f16 mask kernels |
 | [`g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs) | local | `G2DProcessor` — NXP i.MX G2D 2D-engine bindings |
 | [`gl/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/gl) | local | OpenGL backend: threaded wrapper, context, EGL+PBO caches, shaders, DMA-BUF import |
+| [`gl/platform/macos.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | local | `MacosPlatform::{load_egl_lib, create_display}` — two associated functions, the only macOS-specific helpers the GL backend needs. No trait, no enum dispatch. Linux helpers live directly in `gl/context.rs`. |
+| [`gl/iosurface_import.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/iosurface_import.rs) | local | macOS-only: builds the `EGL_ANGLE_iosurface_client_buffer` attribute list and converts a tensor's IOSurface into an EGL pbuffer. |
+| [`gl/macos_processor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) | local | macOS-only single-threaded GL pipeline (ANGLE → Metal). Parallel to `gl/processor.rs` rather than a refactor — the Linux processor stays untouched. |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/error.rs) | local | `Error` (with `From<std::io::Error>` for ergonomic `?` propagation in user code) |
 
 ## Key Types and Traits
@@ -53,26 +56,36 @@ classDiagram
     class ImageProcessor {
         cpu: Option~CPUProcessor~
         g2d: Option~G2DProcessor~
-        opengl: Option~GLProcessorThreaded~
+        opengl: Option~GLProcessorThreaded~ (Linux)
+        opengl: Option~MacosGlProcessor~ (macOS)
         +new() orchestrator with fallback chain
         +create_image(w, h, PixelFormat, DType, mem) GPU-optimal alloc
     }
 
-    class G2DProcessor { NXP i.MX G2D hardware }
-    class GLProcessorThreaded { Owns the GL thread + message channel }
+    class G2DProcessor { NXP i.MX G2D hardware (Linux) }
+    class GLProcessorThreaded { Linux GL: dedicated thread + channel }
     class GLProcessorST { Single-threaded GL impl, owns EGL + GL state }
+    class MacosGlProcessor { macOS GL: ANGLE+IOSurface, single-thread + GL_MUTEX }
     class CPUProcessor { fast_image_resize + rayon }
 
     ImageProcessorTrait <|.. ImageProcessor
     ImageProcessorTrait <|.. G2DProcessor
     ImageProcessorTrait <|.. GLProcessorThreaded
     ImageProcessorTrait <|.. GLProcessorST
+    ImageProcessorTrait <|.. MacosGlProcessor
     ImageProcessorTrait <|.. CPUProcessor
     ImageProcessor o-- G2DProcessor
-    ImageProcessor o-- GLProcessorThreaded
+    ImageProcessor o-- GLProcessorThreaded : Linux
+    ImageProcessor o-- MacosGlProcessor : macOS
     ImageProcessor o-- CPUProcessor
     GLProcessorThreaded *-- GLProcessorST : owns via thread
 ```
+
+The macOS GL backend (`MacosGlProcessor`) is a parallel implementation
+of `ImageProcessorTrait` rather than a wrapper over `GLProcessorThreaded`
+— see "macOS GL backend" below for why. The `opengl` field on
+`ImageProcessor` is cfg'd to the right type per OS so the public API
+shape stays uniform.
 
 `ImageProcessor` dispatch priority is **OpenGL (GPU) → G2D (where supported)
 → CPU (always available)**. Environment variables `EDGEFIRST_DISABLE_GL`,
@@ -145,9 +158,123 @@ zero-copy shader pipeline used on DMA platforms.
 
 | Backend | Detection | GPU upload | GPU readback |
 |---------|-----------|------------|--------------|
-| `DmaBuf` | `verify_dma_buf_roundtrip()` passes | `EGL_EXT_image_dma_buf_import` (zero-copy) | EGLImage export (zero-copy) |
+| `DmaBuf` | `verify_dma_buf_roundtrip()` passes (Linux) | `EGL_EXT_image_dma_buf_import` (zero-copy) | EGLImage export (zero-copy) |
+| `IOSurface` | macOS + `EGL_ANGLE_iosurface_client_buffer` present | `eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE)` + `eglBindTexImage` (zero-copy) | Same pbuffer is the FBO color attachment; CPU readback via `IOSurfaceLock` |
 | `Pbo` | GLES 3.0 available, DMA-buf fails | `GL_PIXEL_UNPACK_BUFFER` | `GL_PIXEL_PACK_BUFFER` |
 | `Sync` | Final fallback | `glTexImage2D` (host pointer) | `glReadnPixels` (host pointer) |
+
+`DmaBuf` and `IOSurface` are both zero-copy paths, just with different
+EGL extensions backing them — the choice is platform-bound and the
+processor doesn't need a runtime predicate to tell them apart.
+
+### GL platform seam
+
+The GL backend lives in two parallel processors today:
+
+- `GLProcessorThreaded` (in `gl/processor.rs`) — Linux, threaded, owns
+  the EGLImage cache and PBO machinery.
+- `MacosGlProcessor` (in `gl/macos_processor.rs`) — macOS, single-
+  threaded, mutex-protected, ANGLE-driven.
+
+Each processor calls into its own platform-specific bring-up code. The
+only macOS-specific helpers the rest of the backend needs are:
+
+| Function | Purpose |
+|----------|---------|
+| [`MacosPlatform::load_egl_lib`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | Locate and dlopen ANGLE's `libEGL.dylib` (search order: `EDGEFIRST_ANGLE_PATH` → Homebrew → `@loader_path` → `@executable_path` → dyld). |
+| [`MacosPlatform::create_display`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | Bring up an ANGLE Metal display via `eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE)`. |
+
+The pbuffer import, texture binding, FBO setup, and shader compilation
+are inline inside [`MacosGlProcessor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) — there is no shared cross-platform
+trait. An earlier draft of this branch defined a `GlPlatform` trait
+that the macOS processor was meant to route through, but the trait was
+never wired up and was removed before merge. If and when Linux and
+macOS share a processor implementation (e.g. as part of a Windows
+backend bringup), the seam can be reintroduced; until then it would be
+fiction.
+
+The EGL flow itself differs by platform:
+
+```mermaid
+sequenceDiagram
+    participant Tensor as Tensor (Dma)
+    participant Backend as GL processor
+    participant Driver as EGL+GLES driver
+
+    Note over Tensor,Driver: Linux (DMA-BUF)
+    Tensor->>Backend: clone_fd() → dmabuf fd
+    Backend->>Driver: eglCreateImageKHR(<br/>EGL_LINUX_DMA_BUF_EXT, fd, ...)
+    Driver-->>Backend: EGLImage handle
+    Backend->>Driver: glEGLImageTargetTexture2DOES<br/>(tex_id, image)
+    Note right of Backend: cached in EglImageCache<br/>by BufferIdentity
+
+    Note over Tensor,Driver: macOS (IOSurface)
+    Tensor->>Backend: iosurface_ref() → IOSurfaceRef
+    Backend->>Driver: eglCreatePbufferFromClientBuffer(<br/>EGL_IOSURFACE_ANGLE, surface, ...)
+    Driver-->>Backend: EGLSurface (pbuffer)
+    Backend->>Driver: eglBindTexImage(<br/>pbuf, EGL_BACK_BUFFER)
+    Note right of Backend: pbuffer cached by<br/>IOSurfaceID in PbufferCache
+```
+
+The destination handling mirrors the source: on Linux the same
+`EGLImage` can back an FBO color attachment via
+`glFramebufferTexture2D`. On macOS the same pbuffer is sampled *and*
+serves as the render target — `eglBindTexImage` makes it texture-
+addressable while `glFramebufferTexture2D` makes it framebuffer-
+addressable. Both bindings are valid simultaneously because ANGLE's
+Metal backend reference-counts the underlying Metal texture.
+
+### macOS GL backend (`gl/macos_processor.rs`)
+
+The macOS implementation is a parallel single-threaded GL processor
+rather than a refactor of the threaded Linux pipeline. Two reasons:
+
+1. **Metal is thread-safe enough** — ANGLE's Metal backend handles
+   the cross-thread coordination internally, so the Linux galcore
+   workaround (a dedicated GL thread serializing every call) buys
+   nothing on macOS. A `Mutex<()>` guarding GL calls is sufficient.
+
+2. **Scope** — the threaded `processor.rs` is ~5500 lines tightly
+   coupled to DMA-BUF caching, PBO tensors, and the Linux EGL image
+   cache. Rewriting it cross-platform would have been a refactor
+   larger than the macOS port itself. Parallel `MacosGlProcessor`
+   keeps the Linux code untouched.
+
+The macOS backend ships with a single fragment shader today (BT.709
+limited-range YUYV → RGBA). Other convert pairs return
+`NotSupported` and `ImageProcessor::convert` falls back to CPU. Each
+new shader needs:
+
+- A GLSL ES 3.0 source in `macos_processor.rs`.
+- A FourCC entry for the destination layout in
+  `tensor::iosurface::image_fourcc_and_bpe`. (For RGBA the FourCC is
+  `'RGBA'` — not `'BGRA'` — so the CPU readback sees the bytes in the
+  same order the tensor's logical `PixelFormat` reports. Mapping
+  Rgba to `'BGRA'` looks correct under the GL pipeline but produces a
+  silent channel swap on CPU readback; the existing similarity test
+  catches it.)
+- A matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` entry in
+  `gl/iosurface_import.rs::ImageLayout::gl_internal_format` (the GL
+  texture format must agree with the IOSurface FourCC — ANGLE
+  validates this at `eglCreatePbufferFromClientBuffer` time).
+
+### ANGLE constant gotchas
+
+The `EGL_ANGLE_iosurface_client_buffer` extension uses these
+constants (lifted from `ANGLE/include/EGL/eglext_angle.h`):
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `EGL_IOSURFACE_ANGLE` | `0x3454` | Client buffer type passed to `eglCreatePbufferFromClientBuffer`. |
+| `EGL_IOSURFACE_PLANE_ANGLE` | `0x345A` | Which IOSurface plane to bind (0 for single-plane, separate calls for NV12 Y/UV). |
+| `EGL_TEXTURE_RECTANGLE_ANGLE` | `0x345B` | Texture target for the pbuffer — but **most callers want 2D, not rectangle**. |
+| `EGL_TEXTURE_TYPE_ANGLE` | `0x345C` | GL type token for shader sampling (`GL_UNSIGNED_BYTE` etc). **Easy to confuse with 0x345B.** |
+| `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` | `0x345D` | GL internal format the IOSurface bytes are interpreted as (`GL_RG`, `GL_RGBA`, `GL_BGRA_EXT`). |
+| `EGL_BIND_TO_TEXTURE_TARGET_ANGLE` | `0x348D` | Required EGL config attribute: must equal `EGL_TEXTURE_2D` for the pbuffer to be `eglBindTexImage`-able. |
+
+The 0x345B vs 0x345C swap is the kind of bug that survives review and
+only manifests at runtime as a vague `EGL_BAD_ATTRIBUTE` — worth
+calling out.
 
 ### GL thread architecture
 
@@ -687,7 +814,8 @@ in the project README for the user-facing rules and validation patterns.
 | Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
 | Linux desktop / NVIDIA | OpenGL (PBO path), CPU | DMA-buf import unsupported; PBO path provides zero-copy |
 | Linux desktop / Mesa x86_64 | OpenGL, CPU | DMA-heap permission required for DMA path |
-| macOS | CPU | No GPU/G2D |
+| macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | YUYV → RGBA implemented; other convert pairs fall back to CPU (see [`MacosGlProcessor::supports`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) and BENCHMARKS.md Known Gap #17). IOSurface zero-copy via `EGL_ANGLE_iosurface_client_buffer`. |
+| macOS (no ANGLE) | CPU | `MacosGlProcessor::new()` fails at `ImageProcessor::new()` time; the GPU dispatch is never attempted. |
 | Other Unix | CPU | No GPU/G2D |
 
 ## Cross-References

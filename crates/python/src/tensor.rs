@@ -112,7 +112,8 @@ impl PyImageInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum PyTensorMemory {
-    #[cfg(target_os = "linux")]
+    /// Platform-native zero-copy GPU buffer: DMA-BUF on Linux,
+    /// IOSurface on macOS. Same Python name on both platforms.
     DMA,
     #[cfg(unix)]
     SHM,
@@ -123,7 +124,6 @@ pub enum PyTensorMemory {
 impl From<PyTensorMemory> for TensorMemory {
     fn from(value: PyTensorMemory) -> Self {
         match value {
-            #[cfg(target_os = "linux")]
             PyTensorMemory::DMA => TensorMemory::Dma,
             #[cfg(unix)]
             PyTensorMemory::SHM => TensorMemory::Shm,
@@ -136,7 +136,6 @@ impl From<PyTensorMemory> for TensorMemory {
 impl From<TensorMemory> for PyTensorMemory {
     fn from(value: TensorMemory) -> Self {
         match value {
-            #[cfg(target_os = "linux")]
             TensorMemory::Dma => PyTensorMemory::DMA,
             #[cfg(unix)]
             TensorMemory::Shm => PyTensorMemory::SHM,
@@ -717,6 +716,37 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
+    /// Wrap an externally-allocated IOSurface as a Tensor (macOS only).
+    ///
+    /// `surface_ref` is an `IOSurfaceRef` cast to `int` — typically
+    /// obtained via `ctypes` from a CoreVideo / AVFoundation /
+    /// VideoToolbox handle, or via `IOSurfaceLookup(id)` to recover a
+    /// surface received over XPC. The surface is retained for the
+    /// tensor's lifetime; the caller keeps its own reference.
+    ///
+    /// Raises RuntimeError on non-macOS platforms.
+    #[cfg(target_os = "macos")]
+    #[staticmethod]
+    #[pyo3(signature = (surface_ref, shape, dtype = "uint8", name = None))]
+    fn from_iosurface(
+        surface_ref: usize,
+        shape: Vec<usize>,
+        dtype: &str,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        if surface_ref == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "surface_ref must be a non-zero IOSurfaceRef",
+            )));
+        }
+        let dt = parse_dtype(dtype)?;
+        let tensor = unsafe {
+            TensorDyn::from_iosurface(surface_ref as *mut std::ffi::c_void, &shape, dt, name)?
+        };
+        Ok(PyTensor(tensor))
+    }
+
     #[getter]
     fn dtype(&self) -> String {
         dtype_to_str(self.0.dtype()).to_string()
@@ -774,6 +804,33 @@ impl PyTensor {
     fn dmabuf_clone(&self) -> Result<RawFd> {
         let owned = self.0.dmabuf_clone()?;
         Ok(owned.into_raw_fd())
+    }
+
+    /// IOSurfaceID for cross-process surface sharing (macOS only).
+    ///
+    /// Returns None when the tensor is not IOSurface-backed. The ID is
+    /// a 32-bit handle stable for the lifetime of the IOSurface; it
+    /// can be passed across process boundaries and recovered via
+    /// `IOSurfaceLookup(id)`.
+    #[cfg(target_os = "macos")]
+    #[getter]
+    fn iosurface_id(&self) -> Option<u32> {
+        self.0.iosurface_id()
+    }
+
+    /// Borrowed `IOSurfaceRef` as an integer (macOS only).
+    ///
+    /// Use this to hand the surface off to native macOS APIs that take
+    /// an IOSurfaceRef directly (CIImage, AVSampleBufferDisplayLayer,
+    /// CVPixelBufferCreateWithIOSurface). Wrap with `ctypes.c_void_p(...)`
+    /// before passing to a ctypes-bound C function. The pointer's
+    /// lifetime is tied to this tensor — do not call CFRelease on it.
+    ///
+    /// Returns None when the tensor is not IOSurface-backed.
+    #[cfg(target_os = "macos")]
+    #[getter]
+    fn iosurface_ref(&self) -> Option<usize> {
+        self.0.iosurface_ref().map(|p| p as usize)
     }
 
     fn map(&self) -> Result<PyTensorMap> {

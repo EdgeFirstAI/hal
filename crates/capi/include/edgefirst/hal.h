@@ -373,11 +373,13 @@ typedef enum hal_tensor_memory {
    */
   HAL_TENSOR_MEMORY_MEM = 0,
   /**
-   * Direct Memory Access allocation (Linux only, enables hardware acceleration)
+   * GPU-coherent buffer allocation. DMA-buf on Linux, IOSurface on
+   * macOS. Enables hardware acceleration via zero-copy import into
+   * the GL backend.
    */
   HAL_TENSOR_MEMORY_DMA = 1,
   /**
-   * POSIX Shared Memory allocation (Linux only, for IPC)
+   * POSIX Shared Memory allocation (Unix: Linux + macOS, for IPC)
    */
   HAL_TENSOR_MEMORY_SHM = 2,
   /**
@@ -2346,15 +2348,38 @@ int hal_log_init_file(FILE *stream, enum hal_log_level max_level);
 int hal_log_init_callback(hal_log_callback cb, void *userdata, enum hal_log_level max_level);
 
 /**
- * Check if DMA (Direct Memory Access) buffer allocation is available.
+ * Check if Linux DMA-BUF buffer allocation is available.
  *
- * DMA buffers enable zero-copy data sharing between CPU and hardware
- * accelerators. This is only available on Linux systems with DMA-BUF heap
- * support.
+ * DMA-BUF buffers enable zero-copy data sharing between CPU and hardware
+ * accelerators on Linux. macOS callers should use
+ * hal_is_iosurface_available() or the portable
+ * hal_is_gpu_buffer_available() instead.
  *
- * @return true if DMA allocation is available, false otherwise
+ * @return true if DMA-BUF allocation is available, false otherwise
  */
 bool hal_is_dma_available(void);
+
+/**
+ * Check if macOS IOSurface allocation is available.
+ *
+ * IOSurface is the macOS zero-copy GPU buffer primitive (analogous to
+ * Linux DMA-BUF). Returns false on non-macOS platforms.
+ *
+ * @return true if IOSurface allocation is available, false otherwise
+ */
+bool hal_is_iosurface_available(void);
+
+/**
+ * Check if a platform-appropriate GPU-coherent buffer kind is available.
+ *
+ * Portable probe that dispatches to hal_is_dma_available() on Linux and
+ * hal_is_iosurface_available() on macOS. Use this when writing
+ * cross-platform code that wants to know whether HAL_TENSOR_DMA will
+ * succeed without caring which primitive backs it.
+ *
+ * @return true if HAL_TENSOR_DMA allocation will succeed, false otherwise
+ */
+bool hal_is_gpu_buffer_available(void);
 
 /**
  * Check if POSIX shared memory allocation is available.
@@ -2423,6 +2448,46 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
                                       const size_t *shape,
                                       size_t ndim,
                                       const char *name);
+
+/**
+ * Wrap an existing IOSurface as a tensor (macOS only).
+ *
+ * The IOSurface is retained for the tensor's lifetime; the caller keeps
+ * its own reference and must release the original IOSurface
+ * independently (via CFRelease or by dropping the producing handle).
+ *
+ * Use this to import IOSurfaces from VideoToolbox / AVFoundation /
+ * CoreVideo, or to recover a tensor from an IOSurfaceID received over
+ * a Mach port or XPC connection — call IOSurfaceLookup(id) first to
+ * obtain the IOSurfaceRef, then pass it here.
+ *
+ * **GL backend interaction**: the resulting tensor reports
+ * HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by
+ * the GL backend via EGL_ANGLE_iosurface_client_buffer with no extra
+ * copy.
+ *
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @param surface_ref Pointer to a valid IOSurfaceRef (typed as void*)
+ * @param shape Array of dimension sizes (ndim elements). The product of
+ *              all dimensions times sizeof(dtype) must fit within the
+ *              IOSurface's allocated byte size (see
+ *              IOSurfaceGetAllocSize()). HAL rejects mismatched shapes
+ *              with EINVAL rather than risking out-of-bounds access in
+ *              subsequent hal_tensor_map_create() calls.
+ * @param ndim Number of dimensions (1-8)
+ * @param name Optional tensor name for debugging (can be NULL)
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
+ *   shape footprint exceeds the IOSurface allocation
+ * - EIO: Failed to import IOSurface (e.g. dead pointer)
+ * - ENOTSUP: Not supported on this platform (non-macOS)
+ */
+struct hal_tensor *hal_tensor_from_iosurface(enum hal_dtype dtype,
+                                             void *surface_ref,
+                                             const size_t *shape,
+                                             size_t ndim,
+                                             const char *name);
 
 /**
  * Free a tensor and release its resources.
@@ -2525,6 +2590,58 @@ int hal_tensor_clone_fd(const struct hal_tensor *tensor);
  * - EIO: Failed to clone file descriptor
  */
 int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
+
+/**
+ * Return the IOSurfaceID for a tensor backed by IOSurface (macOS only).
+ *
+ * The IOSurfaceID is a 32-bit handle stable for the lifetime of the
+ * IOSurface; it can be passed across process boundaries (typically via
+ * a Mach port or XPC connection) and recovered on the other side via
+ * IOSurfaceLookup(id). Returns 0 with errno set when the tensor is not
+ * IOSurface-backed or on error.
+ *
+ * **Sentinel caveat**: Apple does not formally document `0` as an
+ * invalid IOSurfaceID; in practice the kernel allocator starts at low
+ * non-zero values and a freshly allocated surface always reports a
+ * nonzero ID, so we use `0` as the error sentinel. If you receive a
+ * reportedly zero ID from a foreign producer (uncommon), check `errno`:
+ * `0` with `errno == 0` is treated as "no IOSurface backing" (success
+ * path returned a degenerate ID); any nonzero errno is an error.
+ *
+ * @param tensor Tensor handle
+ * @return IOSurfaceID on success, 0 on error (check errno)
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ */
+uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
+
+/**
+ * Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+ *
+ * The returned pointer is borrowed; its lifetime is tied to the tensor
+ * handle. The caller does NOT hold a retain count on the returned
+ * IOSurface — if you need the surface to outlive the HalTensor, call
+ * CFRetain() on the returned pointer and pair it with a matching
+ * CFRelease() once you're done. Do NOT call CFRelease() on the borrowed
+ * pointer without a matching CFRetain() first; that would drop the
+ * HalTensor's own retain and produce a use-after-free.
+ *
+ * Use this when you need to pass the IOSurface to a native macOS API
+ * (e.g. CIImage, AVSampleBufferDisplayLayer,
+ * CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
+ * without going through the IOSurfaceID indirection.
+ *
+ * Returns NULL when the tensor is not IOSurface-backed.
+ *
+ * @param tensor Tensor handle
+ * @return Borrowed IOSurfaceRef (typed as void*) on success, NULL on
+ *         error. Borrowed — do NOT CFRelease without first CFRetaining.
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ */
+void *hal_tensor_iosurface_ref(const struct hal_tensor *tensor);
 
 /**
  * Reshape a tensor to a new shape.

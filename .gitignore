@@ -37,6 +37,11 @@ env.sh
 # Benchmark intermediate data (JSON results, logs)
 /benchmarks/
 
+# Local-only proof-of-concept spike projects. Each lives outside the
+# workspace (its own Cargo.toml with `[workspace]` section) and gets
+# folded into the main code or deleted once the experiment concludes.
+/spikes/
+
 # C API build artifacts
 crates/capi/build/
 

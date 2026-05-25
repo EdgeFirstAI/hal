@@ -335,15 +335,40 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Install ANGLE (Homebrew tap) and re-sign dylibs
+        # ANGLE provides the libEGL.dylib + libGLESv2.dylib that
+        # translate OpenGL ES 3.0 to Metal. Homebrews install_name_tool
+        # post-install pass invalidates the upstream signatures
+        # (Homebrew/brew#19144), so re-sign ad-hoc before any HAL
+        # binary tries to dlopen them. Without this step the
+        # test_yuyv_to_rgba_opengl_macos integration test silently
+        # skips and the entire GL backend ships untested in CI.
+        run: |
+          set -euxo pipefail
+          brew tap startergo/gn
+          brew tap startergo/angle
+          brew install startergo/angle/angle
+          ANGLE_DIR="$(brew --prefix angle)/lib"
+          codesign --force --sign - "$ANGLE_DIR/libEGL.dylib"
+          codesign --force --sign - "$ANGLE_DIR/libGLESv2.dylib"
+          echo "ANGLE installed at $ANGLE_DIR"
+
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
         # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
         run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench -- -D warnings
 
       - name: Run Rust tests
+        # scripts/test-macos.sh builds with --tests, signs every binary
+        # with entitlements.plist (disables library validation so dlopen
+        # of ad-hoc-signed ANGLE works on Tahoe), then forwards to
+        # nextest. The script already injects
+        # `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
+        # so we only add the runner-specific `-j 1` here. Without the
+        # sign step the GL tests SIGKILL and silently skip.
         run: |
-
-          cargo nextest run --workspace -j 1 --exclude gpu-probe --exclude edgefirst-bench 2>&1 | tee target/test-metrics-rust-macos.txt
+          ./scripts/test-macos.sh -j 1 \
+            2>&1 | tee target/test-metrics-rust-macos.txt
 
       - name: Build C API library
         run: cargo build --release -p edgefirst-hal-capi

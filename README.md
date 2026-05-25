@@ -460,11 +460,90 @@ caller code.
 |---------|--------------|---------------|-------|---------|
 | DMA tensors | Yes | Yes | No | No |
 | PBO tensors (GPU) | Yes | Yes | No | No |
+| IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | No |
 | Shared memory tensors | Yes | Yes | Yes | No |
 | Heap tensors | Yes | Yes | Yes | Yes |
 | G2D acceleration | Yes | No | No | No |
-| OpenGL acceleration | Yes (optional) | Yes (optional) | No | No |
+| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | No |
 | CPU fallback | Yes | Yes | Yes | Yes |
+
+On macOS the OpenGL backend is enabled when [ANGLE](https://github.com/google/angle)
+is installed — see [macOS GPU Acceleration](#macos-gpu-acceleration) below
+for setup. If ANGLE is not present the HAL falls back to the CPU backend.
+
+## macOS GPU Acceleration
+
+The HAL uses [Google's ANGLE](https://github.com/google/angle) to translate
+the same OpenGL ES 3.0 calls used on Linux to Metal, and Apple's
+[IOSurface](https://developer.apple.com/documentation/iosurface) for
+zero-copy buffer interchange (the role DMA-BUF plays on Linux). ANGLE is
+not part of macOS and must be installed separately. If it is not present
+at runtime the HAL logs a warning and falls back to the CPU backend.
+
+### Source / Cargo installs
+
+Install ANGLE via the third-party Homebrew tap:
+
+```bash
+brew install startergo/angle/angle
+```
+
+Then re-sign the installed dylibs. Homebrew's `install_name_tool` step
+invalidates the bundled code signatures and macOS 26 (Tahoe) refuses to
+load dylibs with broken signatures at `dlopen` time, which manifests as
+an immediate `SIGKILL (Code Signature Invalid)` with no stdout. The
+canonical workaround is an ad-hoc re-sign:
+
+```bash
+codesign --force --sign - $(brew --prefix)/opt/angle/lib/libEGL.dylib
+codesign --force --sign - $(brew --prefix)/opt/angle/lib/libGLESv2.dylib
+```
+
+This is a one-time step per ANGLE install; the next `brew upgrade angle`
+needs the re-sign again. See
+[Homebrew/brew#19144](https://github.com/Homebrew/brew/issues/19144) for
+the upstream tracking issue.
+
+The HAL locates `libEGL.dylib` through the standard dyld search path.
+On Apple Silicon, `/opt/homebrew/lib` is on the default search path; on
+Intel Macs `/usr/local/lib` is.
+
+### Verifying the GPU backend is active
+
+```bash
+RUST_LOG=edgefirst_image=debug cargo run --release --example pipeline_demo
+```
+
+Look for `ANGLE (Apple, ANGLE Metal Renderer: ...)` in the bring-up log.
+If ANGLE is missing or signatures are still broken you will see a
+warning and the CPU backend is selected.
+
+### Custom ANGLE locations
+
+If your ANGLE install is not in `/opt/homebrew/opt/angle/lib` (or
+`/usr/local/opt/angle/lib` on Intel Macs), set `EDGEFIRST_ANGLE_PATH`
+to the directory containing `libEGL.dylib` and `libGLESv2.dylib`:
+
+```bash
+EDGEFIRST_ANGLE_PATH=/path/to/angle/lib cargo run --release ...
+```
+
+The lookup order is: `EDGEFIRST_ANGLE_PATH` → Homebrew → `@loader_path`
+(alongside the binary) → `@executable_path` → unqualified `libEGL.dylib`
+on the dyld search path. For bundled distributions, drop the re-signed
+ANGLE dylibs next to the executable (or into `<App>.app/Contents/Frameworks/`)
+and no env var is needed.
+
+### When you don't need this setup
+
+- **`pip install edgefirst-hal`** — the macOS wheel ships ANGLE bundled
+  alongside the Python extension; no separate install required.
+- **EdgeFirst-signed binary distribution** — official binary releases
+  bundle ANGLE re-signed under the EdgeFirst Apple Developer ID. Install
+  and run with no additional setup.
+
+These channels exist precisely so end users do not need to deal with the
+Homebrew install or re-signing step.
 
 ## Build System
 
@@ -492,6 +571,7 @@ For the C library and consumer linking, see
 | `EDGEFIRST_FORCE_TRANSFER` | Force GL transfer: `pbo`, `dmabuf`, or `sync` |
 | `EDGEFIRST_OPENGL_RENDERSURFACE` | `1` enables EGL renderbuffer path for non-`dma_heap` DMA-BUF (i.MX 95 Neutron NPU) |
 | `EDGEFIRST_PROTO_COMPUTE` | `1` enables GLES 3.1 compute shader for HWC→CHW proto repack |
+| `EDGEFIRST_ANGLE_PATH` | macOS only: directory containing `libEGL.dylib` / `libGLESv2.dylib`. Overrides the default search (Homebrew → `@loader_path` → `@executable_path` → `libEGL.dylib` on dyld). Set this when deploying a bundled or custom-signed ANGLE alongside the binary. |
 | `EDGEFIRST_TESTDATA_DIR` | Override testdata location (used by benches and CI) |
 | `RUST_LOG` | Standard `env_logger` filter — `RUST_LOG=edgefirst_image=debug` for backend dispatch + cache stats |
 

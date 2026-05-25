@@ -3,9 +3,10 @@
 
 //! Tensor memory allocation and mapping benchmarks.
 //!
-//! Benchmarks alloc and map for Mem, Shm (Linux), and Dma (Linux + DMA)
-//! backends across four resolutions using the fork-free `edgefirst-bench`
-//! harness. Tests both u8 (unsigned) and i8 (signed, used for int8 models).
+//! Benchmarks alloc and map for Mem, Shm (Unix), and Dma (Linux DMA-buf +
+//! macOS IOSurface) backends across four resolutions using the fork-free
+//! `edgefirst-bench` harness. Tests both u8 (unsigned) and i8 (signed,
+//! used for int8 models).
 //!
 //! ## Run benchmarks (host)
 //! ```bash
@@ -17,8 +18,7 @@
 //! ./tensor_benchmark --bench
 //! ```
 
-#[cfg(target_os = "linux")]
-use edgefirst_tensor::is_dma_available;
+use edgefirst_tensor::is_gpu_buffer_available;
 use edgefirst_tensor::{Tensor, TensorMapTrait as _, TensorMemory, TensorTrait as _};
 use num_traits::Num;
 
@@ -95,28 +95,34 @@ fn main() {
     bench_backend::<u8>(&mut suite, TensorMemory::Mem, "mem", "u8");
     bench_backend::<i8>(&mut suite, TensorMemory::Mem, "mem", "i8");
 
-    // Shm and Dma backends — Linux only
-    #[cfg(target_os = "linux")]
+    // Shm — Unix (Linux + macOS); Dma — Linux DMA-buf or macOS IOSurface
+    #[cfg(unix)]
     {
         bench_backend::<u8>(&mut suite, TensorMemory::Shm, "shm", "u8");
         bench_backend::<i8>(&mut suite, TensorMemory::Shm, "shm", "i8");
 
-        if is_dma_available() {
+        if is_gpu_buffer_available() {
             bench_backend::<u8>(&mut suite, TensorMemory::Dma, "dma", "u8");
             bench_backend::<i8>(&mut suite, TensorMemory::Dma, "dma", "i8");
         } else {
-            println!("\n  {:50} [skipped: DMA unavailable]", "alloc+map/dma/*");
+            println!(
+                "\n  {:50} [skipped: GPU buffer (DMA-buf / IOSurface) unavailable]",
+                "alloc+map/dma/*"
+            );
         }
     }
 
     bench_memcpy(&mut suite, TensorMemory::Mem, "mem");
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         bench_memcpy(&mut suite, TensorMemory::Shm, "shm");
-        if is_dma_available() {
+        if is_gpu_buffer_available() {
             bench_memcpy(&mut suite, TensorMemory::Dma, "dma");
         } else {
-            println!("\n  {:50} [skipped: DMA unavailable]", "memcpy/dma/*");
+            println!(
+                "\n  {:50} [skipped: GPU buffer (DMA-buf / IOSurface) unavailable]",
+                "memcpy/dma/*"
+            );
         }
     }
 

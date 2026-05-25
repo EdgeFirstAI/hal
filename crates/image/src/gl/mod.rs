@@ -1,9 +1,27 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 #![cfg(feature = "opengl")]
+// Several types defined at the `gl` module root (EglDisplayKind,
+// TransferBackend, RegionOfInterest, etc.) are consumed only by the
+// Linux-only inner modules (`context`, `processor`, ...). The macOS
+// path uses its own `MacosGlProcessor` + `iosurface_import` modules and
+// does not touch every shared type, so some appear unused on macOS.
+// Rather than fragmenting the type definitions per platform, suppress
+// the dead-code lint on non-Linux targets.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+// Module layout:
+//   - `platform/` — cross-platform display/EGL-loader seam (both OSes)
+//   - Linux-only:  `context`, `processor`, `threaded`, `dma_import`,
+//                  `cache`, `resources`, `shaders`, `tests`
+//   - macOS-only:  `iosurface_import`, `macos_processor`
+// The macOS processor is parallel to (not a refactor of) the Linux
+// threaded processor — see `crates/image/ARCHITECTURE.md` for the
+// rationale and the planned convergence story.
+
+#[cfg(target_os = "linux")]
 macro_rules! function {
     () => {{
         fn f() {}
@@ -20,19 +38,49 @@ macro_rules! function {
     }};
 }
 
+#[cfg(target_os = "linux")]
 mod cache;
+#[cfg(target_os = "linux")]
 mod context;
+#[cfg(target_os = "linux")]
 mod dma_import;
+#[cfg(target_os = "macos")]
+mod iosurface_import;
+#[cfg(target_os = "macos")]
+mod macos_processor;
+mod platform;
+#[cfg(target_os = "linux")]
 mod processor;
+#[cfg(target_os = "linux")]
 mod resources;
+#[cfg(target_os = "linux")]
 mod shaders;
+#[cfg(target_os = "linux")]
 mod tests;
+#[cfg(target_os = "linux")]
 mod threaded;
 
+#[cfg(target_os = "linux")]
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
+#[cfg(target_os = "macos")]
+pub use macos_processor::MacosGlProcessor;
+#[cfg(target_os = "linux")]
 pub use threaded::GLProcessorThreaded;
+
+/// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
+/// `'static` because the underlying `libloading::Library` is intentionally
+/// leaked at first load (see `EGL_LIB` in `context.rs` and the equivalent
+/// on macOS — drivers may retain internal state past explicit cleanup, so
+/// dlclose can SIGBUS on process exit).
+///
+/// Defined here at the `gl` module root so the `platform/` trait and both
+/// platform implementations can name it without dragging in a cross-cfg
+/// re-export. The Linux `context.rs` and the macOS `platform/macos.rs`
+/// both use this same alias.
+pub(super) type Egl =
+    khronos_egl::Instance<khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>>;
 
 /// Identifies the type of EGL display used for headless OpenGL ES rendering.
 ///
@@ -101,6 +149,13 @@ pub(crate) enum TransferBackend {
     /// platform where `EGL_EXT_image_dma_buf_import` is present AND
     /// the GPU can actually render through DMA-buf-backed textures.
     DmaBuf,
+
+    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS).
+    /// Available when ANGLE's Metal backend is loaded and the EGL
+    /// extension is advertised. The IOSurface is wrapped as an EGL
+    /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
+    #[cfg(target_os = "macos")]
+    IOSurface,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
     /// but OpenGL is present. Data stays in GPU-accessible memory.

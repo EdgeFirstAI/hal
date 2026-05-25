@@ -170,22 +170,13 @@ static inline int get_test_exit_code(void) {
     return tests_failed > 0 ? 1 : 0;
 }
 
-// Check if DMA is available (Linux-specific)
+// Check if a platform-native GPU-coherent buffer is available.
+// Returns 1 when HAL_TENSOR_MEMORY_DMA will produce a real DMA-BUF
+// (Linux) or IOSurface (macOS), 0 when it would silently fall back
+// to SHM/Mem. Uses the hal_is_gpu_buffer_available() probe rather
+// than a trial allocation.
 static inline int is_dma_available(void) {
-#ifdef __linux__
-    // Try to create a small DMA tensor
-    size_t shape[] = {16};
-    struct hal_tensor* t = hal_tensor_new(HAL_DTYPE_U8, shape, 1, HAL_TENSOR_MEMORY_DMA, NULL);
-    if (t != NULL) {
-        // Check if it actually got DMA memory
-        int has_dma = (hal_tensor_memory_type(t) == HAL_TENSOR_MEMORY_DMA);
-        hal_tensor_free(t);
-        return has_dma;
-    }
-    return 0;
-#else
-    return 0;
-#endif
+    return hal_is_gpu_buffer_available() ? 1 : 0;
 }
 
 // Check if hardware accelerated image processing is available

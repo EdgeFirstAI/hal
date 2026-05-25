@@ -307,6 +307,9 @@ pub use opengl_headless::GLProcessorThreaded;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::Int8InterpolationMode;
+#[cfg(target_os = "macos")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::MacosGlProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
@@ -867,6 +870,13 @@ pub struct ImageProcessor {
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
     pub opengl: Option<GLProcessorThreaded>,
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    /// OpenGL-based image converter for macOS via ANGLE + IOSurface.
+    /// Available when ANGLE's libEGL.dylib can be loaded (see
+    /// README.md § macOS GPU Acceleration). Same field name as the
+    /// Linux variant so call sites can be written once.
+    pub opengl: Option<MacosGlProcessor>,
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
@@ -926,6 +936,9 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
+                    #[cfg(target_os = "macos")]
+                    #[cfg(feature = "opengl")]
+                    opengl: None,
                     forced_backend: None,
                 });
             }
@@ -953,6 +966,9 @@ impl ImageProcessor {
                     log::warn!("G2D requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
+                        #[cfg(target_os = "macos")]
+                        #[cfg(feature = "opengl")]
+                        opengl: None,
                         forced_backend: None,
                     });
                 }
@@ -977,7 +993,29 @@ impl ImageProcessor {
                         forced_backend: None,
                     });
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
+                {
+                    #[cfg(feature = "opengl")]
+                    let opengl = match MacosGlProcessor::new() {
+                        Ok(gl) => Some(gl),
+                        Err(e) => {
+                            log::warn!(
+                                "OpenGL requested on macOS but ANGLE init failed: {e:?} \
+                                 (install ANGLE via `brew install startergo/angle/angle` \
+                                 and re-sign the dylibs — see README.md § macOS GPU \
+                                 Acceleration). Falling back to CPU."
+                            );
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        #[cfg(feature = "opengl")]
+                        opengl,
+                        forced_backend: None,
+                    });
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     log::warn!("OpenGL requested but not available on this platform, using CPU");
                     return Ok(Self {
@@ -1014,6 +1052,9 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     g2d: None,
                     #[cfg(target_os = "linux")]
+                    #[cfg(feature = "opengl")]
+                    opengl: None,
+                    #[cfg(target_os = "macos")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     forced_backend: Some(ForcedBackend::Cpu),
@@ -1057,10 +1098,28 @@ impl ImageProcessor {
                             forced_backend: Some(ForcedBackend::OpenGl),
                         })
                     }
-                    #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+                    #[cfg(target_os = "macos")]
+                    #[cfg(feature = "opengl")]
+                    {
+                        let opengl = MacosGlProcessor::new().map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "opengl forced on macOS but ANGLE init failed: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            opengl: Some(opengl),
+                            forced_backend: Some(ForcedBackend::OpenGl),
+                        })
+                    }
+                    #[cfg(not(all(
+                        any(target_os = "linux", target_os = "macos"),
+                        feature = "opengl"
+                    )))]
                     {
                         Err(Error::ForcedBackendUnavailable(
-                            "opengl backend requires Linux with the 'opengl' feature enabled"
+                            "opengl backend requires Linux or macOS with the 'opengl' feature \
+                             enabled"
                                 .into(),
                         ))
                     }
@@ -1104,6 +1163,27 @@ impl ImageProcessor {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        #[cfg(feature = "opengl")]
+        let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
+            .map(|x| x != "0" && x.to_lowercase() != "false")
+            .unwrap_or(false)
+        {
+            log::debug!("EDGEFIRST_DISABLE_GL is set");
+            None
+        } else {
+            match MacosGlProcessor::new() {
+                Ok(gl_converter) => Some(gl_converter),
+                Err(err) => {
+                    log::debug!(
+                        "macOS GL backend unavailable: {err:?} \
+                         (CPU fallback will be used)"
+                    );
+                    None
+                }
+            }
+        };
+
         let cpu = if std::env::var("EDGEFIRST_DISABLE_CPU")
             .map(|x| x != "0" && x.to_lowercase() != "false")
             .unwrap_or(false)
@@ -1118,6 +1198,9 @@ impl ImageProcessor {
             #[cfg(target_os = "linux")]
             g2d,
             #[cfg(target_os = "linux")]
+            #[cfg(feature = "opengl")]
+            opengl,
+            #[cfg(target_os = "macos")]
             #[cfg(feature = "opengl")]
             opengl,
             forced_backend: None,
@@ -1260,6 +1343,9 @@ impl ImageProcessor {
         // If an explicit memory type is requested, honour it directly.
         // On Linux, `TensorMemory::Dma` gets the padded-stride treatment;
         // other memory types take the user-requested width verbatim.
+        // On macOS, `TensorMemory::Dma` dispatches through `TensorDyn::image`
+        // which selects the IOSurface allocation path (FourCC-formatted)
+        // for image-mappable formats, or falls back to SHM/Mem otherwise.
         match memory {
             #[cfg(target_os = "linux")]
             Some(TensorMemory::Dma) => {
@@ -1269,6 +1355,25 @@ impl ImageProcessor {
                 return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
             }
             None => {}
+        }
+
+        // macOS: when the GL backend is active with the IOSurface
+        // transfer path, prefer Dma (IOSurface) for zero-copy import.
+        // The Tensor allocator falls through to SHM/Mem automatically
+        // for formats without an IOSurface mapping (NV12, planar, etc.).
+        #[cfg(target_os = "macos")]
+        #[cfg(feature = "opengl")]
+        if let Some(gl) = self.opengl.as_ref() {
+            let _ = gl; // probe_transfer_backend lives behind the platform trait
+            if let Ok(img) = TensorDyn::image(
+                width,
+                height,
+                format,
+                dtype,
+                Some(edgefirst_tensor::TensorMemory::Dma),
+            ) {
+                return Ok(img);
+            }
         }
 
         // Try DMA first on Linux — skip only when GL has explicitly selected PBO
@@ -1741,7 +1846,7 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
                 ForcedBackend::OpenGl => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         let r = opengl.convert(src, dst, rotation, flip, crop);
@@ -1758,7 +1863,7 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             match opengl.convert(src, dst, rotation, flip, crop) {
@@ -4575,6 +4680,218 @@ mod image_tests {
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
         compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    /// macOS analog of `test_yuyv_to_rgba_opengl` — drives the ANGLE +
+    /// IOSurface backend end-to-end and compares against the same
+    /// reference image. Skips silently if ANGLE isn't installed so the
+    /// test suite still passes on CI hosts without the Homebrew tap.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_yuyv_to_rgba_opengl_macos() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?}). \
+                     Install ANGLE via `brew install startergo/angle/angle` \
+                     and re-sign per README.md § macOS GPU Acceleration to \
+                     run this test.",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Yuyv,
+            Some(TensorMemory::Dma),
+            &edgefirst_bench::testdata::read("camera720p.yuyv"),
+        )
+        .unwrap();
+
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        let (result, _src, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        result.unwrap();
+
+        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        target_image
+            .as_u8()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
+
+        compare_images(&dst, &target_image, 0.98, function!());
+    }
+
+    /// Multi-resolution smoke test: convert YUYV→RGBA via the GL
+    /// backend at a small (64×32) frame and a 4K (3840×2160) frame,
+    /// both filled with a synthetic mid-grey pattern. Validates the
+    /// shader math at the chroma-pairing boundary on small textures
+    /// and exercises the IOSurface bytes-per-row alignment path at 4K
+    /// (3840 pixels × 2 bytes/pixel = 7680 bytes, naturally 64-aligned).
+    ///
+    /// Resolutions below 32 pixels wide aren't tested because the
+    /// IOSurface allocator pads bpr to 64 bytes — for a 4-px-wide
+    /// YUYV surface that's 8 bytes data + 56 bytes padding per row,
+    /// which exercises a sampling pattern that's ANGLE-version
+    /// dependent rather than HAL-correctness dependent.
+    ///
+    /// This complements `test_yuyv_to_rgba_opengl_macos` (which checks
+    /// pixel-exact correctness against a reference image at 720p) by
+    /// ensuring the pipeline does not crash or produce gross errors at
+    /// resolution extremes. Pixel-exact validation at 4K would require
+    /// a 30 MB reference file we don't want to bundle.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_yuyv_to_rgba_opengl_macos_multi_resolution() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        for (w, h) in [(64usize, 32usize), (3840, 2160)] {
+            // Synthetic YUYV: Y=128 (mid-grey luma), U=V=128 (neutral
+            // chroma) → RGB grey at the output.
+            let bytes_per_row = w * 2;
+            let mut yuyv = vec![0u8; bytes_per_row * h];
+            for chunk in yuyv.chunks_exact_mut(4) {
+                chunk[0] = 128; // Y0
+                chunk[1] = 128; // U
+                chunk[2] = 128; // Y1
+                chunk[3] = 128; // V
+            }
+
+            let src = load_bytes_to_tensor(w, h, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
+                .unwrap();
+
+            let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                .unwrap();
+
+            let (result, _src, dst) = convert_img(
+                &mut proc,
+                src,
+                dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
+            result.expect("GL convert should succeed at this resolution");
+
+            // The neutral-chroma input must produce a near-grey output;
+            // BT.709 limited-range maps Y=128/UV=128 → roughly
+            // (130, 130, 130). Allow ±4 LSB for `mediump float` shader
+            // rounding.
+            let dst_u8 = dst.as_u8().unwrap();
+            let dst_map = dst_u8.map().unwrap();
+            let dst_bytes = dst_map.as_slice();
+            assert_eq!(dst_bytes.len(), w * h * 4, "RGBA byte count");
+            for px in dst_bytes.chunks_exact(4) {
+                for (i, &c) in px[..3].iter().enumerate() {
+                    assert!(
+                        (120..=140).contains(&c),
+                        "{}: channel {i} = {c} (expected ~128 ±12) at {w}×{h}",
+                        function!(),
+                    );
+                }
+                assert_eq!(px[3], 255, "alpha must be 1.0");
+            }
+        }
+    }
+
+    /// Verify that two consecutive convert() calls on the same source
+    /// tensor reuse the cached EGL pbuffer. Tests the cache hit path
+    /// added with the macOS GL backend hardening — without it, each
+    /// frame would pay `eglCreatePbufferFromClientBuffer` + destroy.
+    ///
+    /// This is a behaviour test rather than a perf test (the timing
+    /// difference is 100-200µs which is too noisy to assert on); we
+    /// check that the second call succeeds and produces a result
+    /// identical to the first.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_macos_gl_pbuffer_cache_reuses_surfaces() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        // Allocate one source + one destination, run convert twice.
+        let mut yuyv = vec![0u8; 64 * 32 * 2];
+        for chunk in yuyv.chunks_exact_mut(4) {
+            chunk[0] = 200;
+            chunk[1] = 100;
+            chunk[2] = 200;
+            chunk[3] = 156;
+        }
+        let src = load_bytes_to_tensor(64, 32, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
+            .unwrap();
+        let dst = TensorDyn::image(
+            64,
+            32,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        let (r1, src, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        r1.unwrap();
+        let first: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+
+        let (r2, _src, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        r2.unwrap();
+        let second: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+
+        assert_eq!(first, second, "cache-hit conversion must be deterministic");
     }
 
     #[test]

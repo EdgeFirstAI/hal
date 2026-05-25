@@ -23,14 +23,12 @@ RELEASE_LIB_DIR := $(TARGET_DIR)/release
 DEBUG_LIB_DIR := $(TARGET_DIR)/debug
 
 # Detect available library
-ifeq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.so),)
-  ifeq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.a),)
-    LIB_DIR := $(DEBUG_LIB_DIR)
-  else
-    LIB_DIR := $(RELEASE_LIB_DIR)
-  endif
-else
+# macOS dylib + Linux so: probe both before falling back to a static
+# archive or the debug build dir.
+ifneq ($(wildcard $(RELEASE_LIB_DIR)/libedgefirst_hal.so $(RELEASE_LIB_DIR)/libedgefirst_hal.dylib $(RELEASE_LIB_DIR)/libedgefirst_hal.a),)
   LIB_DIR := $(RELEASE_LIB_DIR)
+else
+  LIB_DIR := $(DEBUG_LIB_DIR)
 endif
 
 # Include path
@@ -56,8 +54,18 @@ ifeq ($(UNAME_S),Linux)
   LDFLAGS := -L$(LIB_DIR) -Wl,-rpath,$(LIB_DIR)
   LIBS := -ledgefirst_hal -lm -lpthread -ldl
 else ifeq ($(UNAME_S),Darwin)
+  # Cargo places both the C-API cdylib (libedgefirst_hal.dylib) and the
+  # PyO3 extension under the same name in target/<profile>/. The PyO3
+  # extension is the one written last and only exports `_PyInit_*`;
+  # linking against it produces dozens of undefined references for the
+  # actual C API symbols. To make the C tests work regardless of which
+  # cdylib won the build race, link explicitly against the static
+  # archive on Darwin. Required CoreFoundation/IOSurface frameworks
+  # come along automatically via cargo metadata.
   LDFLAGS := -L$(LIB_DIR)
-  LIBS := -ledgefirst_hal -lm -lpthread
+  LIBS := $(LIB_DIR)/libedgefirst_hal.a -lm -lpthread \
+          -framework CoreFoundation -framework IOSurface -framework Security \
+          -framework SystemConfiguration
 else
   $(error Unsupported platform: $(UNAME_S))
 endif

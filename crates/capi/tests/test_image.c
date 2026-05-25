@@ -341,16 +341,26 @@ static void test_tensor_image_dma(void) {
         return;
     }
 
-    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_DMA);
+    // macOS IOSurface allocation requires a format with a defined
+    // FourCC (Yuyv / Rgba / Bgra today); RGB falls through to SHM and
+    // there's no fd or IOSurface to inspect. Use RGBA so the test
+    // exercises the Dma path on both Linux DMA-buf and macOS IOSurface.
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_DMA);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(640, hal_tensor_width(img));
     ASSERT_EQ(480, hal_tensor_height(img));
 
-    // Clone FD should work for DMA images
+    // Platform-specific export path: fd on Linux, IOSurfaceID on macOS.
+#ifdef __linux__
     int fd = hal_tensor_clone_fd(img);
     ASSERT_TRUE(fd >= 0);
     close(fd);
+#elif defined(__APPLE__)
+    ASSERT_EQ(HAL_TENSOR_MEMORY_DMA, hal_tensor_memory_type(img));
+    uint32_t id = hal_tensor_iosurface_id(img);
+    ASSERT_TRUE(id != 0);
+#endif
 
     hal_tensor_free(img);
     TEST_PASS();
