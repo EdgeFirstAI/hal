@@ -1050,6 +1050,7 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(_) => TensorMemory::Dma,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
@@ -1060,6 +1061,7 @@ where
 
     fn name(&self) -> String {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.name(),
@@ -1070,6 +1072,7 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.shape(),
@@ -1080,6 +1083,7 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.reshape(shape),
@@ -1090,6 +1094,7 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(t) => t.map(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.map(),
@@ -1100,6 +1105,7 @@ where
 
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.buffer_identity(),
