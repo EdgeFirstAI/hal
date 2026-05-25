@@ -1266,8 +1266,11 @@ struct hal_decoder *hal_decoder_new(const struct hal_decoder_params *params);
  * @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
- * - EIO: Decoding failed
+ * - EINVAL: Invalid caller input (NULL decoder/outputs/out_boxes,
+ *   mixed dtypes, shape/dtype mismatch with the configured schema,
+ *   missing per-tensor quant on integer inputs, malformed config)
+ * - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+ *   dispatch, hardware-feature mismatch)
  */
 int hal_decoder_decode(const struct hal_decoder *decoder,
                        const struct hal_tensor *const *outputs,
@@ -1302,8 +1305,12 @@ int hal_decoder_decode(const struct hal_decoder *decoder,
  * @return Prototype data handle (caller must free with `hal_proto_data_free()`),
  *         or NULL for detection-only models or on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
- * - EIO: Decoding failed
+ * - EINVAL: Invalid caller input (NULL decoder/outputs/out_boxes,
+ *   shape/dtype mismatch with the configured schema, missing per-tensor
+ *   quant on integer inputs, malformed config). See the internal log
+ *   for the exact `DecoderError` variant.
+ * - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+ *   dispatch, hardware-feature mismatch)
  */
 struct hal_proto_data *hal_decoder_decode_proto(const struct hal_decoder *decoder,
                                                 const struct hal_tensor *const *outputs,
@@ -1556,8 +1563,11 @@ void hal_segmentation_list_free(struct hal_segmentation_list *list);
  * @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL decoder/tracker/outputs/out_boxes, mixed dtypes)
- * - EIO: Decoding failed
+ * - EINVAL: Invalid caller input (NULL decoder/tracker/outputs/out_boxes,
+ *   mixed dtypes, shape/dtype mismatch with the configured schema,
+ *   missing per-tensor quant on integer inputs, malformed config)
+ * - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+ *   dispatch, hardware-feature mismatch)
  */
 int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
                                struct hal_bytetrack *tracker,
@@ -2656,6 +2666,41 @@ void *hal_tensor_iosurface_ref(const struct hal_tensor *tensor);
  * - EINVAL: NULL tensor/shape, ndim is 0, or element count mismatch
  */
 int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t ndim);
+
+/**
+ * Attach per-tensor affine quantization metadata to an integer tensor.
+ *
+ * The schema-driven per-scale decoder reads quantization live from each
+ * bound tensor via `Tensor::quantization()`. When tensors are wrapped
+ * from upstream framework buffers (e.g. NNStreamer `GstMemory` outputs)
+ * they carry no quant by default; the caller must attach it before
+ * calling `hal_decoder_decode_proto()` on a schema-driven decoder, or
+ * the decoder fails with `QuantMissing` (mapped to errno = EINVAL as a
+ * caller-side precondition violation).
+ *
+ * The C boundary actively validates inputs (the Rust constructor
+ * `Quantization::per_tensor` and `TensorDyn::set_quantization` do not):
+ *
+ * - `scale` must be finite and strictly positive. NaN, ±∞, zero, and
+ *   negative values are rejected with `EINVAL`. (Some training tooling
+ *   permits negative scales as a mathematical equivalence, but real
+ *   runtime kernels in this codebase assume `scale > 0`.)
+ * - `zero_point` must fit the tensor's integer dtype range
+ *   (`u8: 0..=255`, `i8: -128..=127`, `u16: 0..=65535`, `i16:
+ *   -32768..=32767`, `u32/u64: >= 0`, `i32/i64`: any `int`). Out-of-range
+ *   values are rejected with `EINVAL`.
+ * - Float tensors reject quantization with `EINVAL`. This mirrors the
+ *   Rust `TensorDyn::set_quantization` contract.
+ *
+ * @param tensor     Tensor handle (must be an integer dtype)
+ * @param scale      Quantization scale (must be finite and > 0)
+ * @param zero_point Quantization zero-point (must fit the tensor dtype)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor, float dtype, non-finite/non-positive scale,
+ *   or zero_point out of range for the tensor's integer dtype
+ */
+int hal_tensor_set_quantization(struct hal_tensor *tensor, float scale, int zero_point);
 
 /**
  * Map a tensor for CPU access.

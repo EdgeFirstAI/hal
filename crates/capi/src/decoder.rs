@@ -13,12 +13,42 @@ use crate::{
 };
 use edgefirst_decoder::{
     configs, configs::Nms, dequantize_cpu_chunked, segmentation_to_mask, ConfigOutput, Decoder,
-    DecoderBuilder, DetectBox, Quantization, Segmentation,
+    DecoderBuilder, DecoderError, DetectBox, Quantization, Segmentation,
 };
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 use edgefirst_tracker::TrackInfo;
 use libc::{c_char, c_int, size_t};
 use std::ffi::CStr;
+
+/// Map a `DecoderError` to a POSIX errno that distinguishes caller-side
+/// preconditions from runtime/library faults.
+///
+/// `EINVAL` is returned for variants that describe a malformed or
+/// incomplete input from the caller — bad shape, dtype mismatch, missing
+/// quantization metadata, unparseable config, etc. Operators triaging
+/// these can correct the upstream pipeline.
+///
+/// `EIO` is reserved for internal failures the caller cannot fix —
+/// poisoned mutexes, unreachable kernel dispatch, hardware-feature
+/// mismatches.
+fn errno_for_decoder_error(e: &DecoderError) -> c_int {
+    match e {
+        // Caller-side preconditions
+        DecoderError::InvalidShape(_)
+        | DecoderError::InvalidConfig(_)
+        | DecoderError::NoConfig
+        | DecoderError::DtypeMismatch { .. }
+        | DecoderError::QuantMissing { .. }
+        | DecoderError::Yaml(_)
+        | DecoderError::Json(_)
+        | DecoderError::NotSupported(_)
+        | DecoderError::NDArrayShape(_) => libc::EINVAL,
+        // Runtime / library faults
+        DecoderError::Internal(_)
+        | DecoderError::KernelDispatchUnreachable(_)
+        | DecoderError::ForcedKernelUnavailable { .. } => libc::EIO,
+    }
+}
 
 /// Quantization parameters for dequantizing tensor data.
 #[repr(C)]
@@ -1034,8 +1064,11 @@ pub unsafe extern "C" fn hal_decoder_new(params: *const HalDecoderParams) -> *mu
 /// @param out_segmentations Output parameter for segmentation list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes, mixed dtypes)
-/// - EIO: Decoding failed
+/// - EINVAL: Invalid caller input (NULL decoder/outputs/out_boxes,
+///   mixed dtypes, shape/dtype mismatch with the configured schema,
+///   missing per-tensor quant on integer inputs, malformed config)
+/// - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+///   dispatch, hardware-feature mismatch)
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_decode(
     decoder: *const HalDecoder,
@@ -1059,12 +1092,13 @@ pub unsafe extern "C" fn hal_decoder_decode(
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(100);
     let mut masks: Vec<Segmentation> = Vec::new();
 
-    try_or_errno!(
-        (*decoder)
-            .inner
-            .decode(&tensor_refs, &mut boxes, &mut masks),
-        libc::EIO
-    );
+    if let Err(e) = (*decoder)
+        .inner
+        .decode(&tensor_refs, &mut boxes, &mut masks)
+    {
+        log::error!("hal_decoder_decode: {e:#?}");
+        return set_error(errno_for_decoder_error(&e));
+    }
 
     *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
 
@@ -1101,8 +1135,12 @@ pub unsafe extern "C" fn hal_decoder_decode(
 /// @return Prototype data handle (caller must free with `hal_proto_data_free()`),
 ///         or NULL for detection-only models or on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/outputs/out_boxes)
-/// - EIO: Decoding failed
+/// - EINVAL: Invalid caller input (NULL decoder/outputs/out_boxes,
+///   shape/dtype mismatch with the configured schema, missing per-tensor
+///   quant on integer inputs, malformed config). See the internal log
+///   for the exact `DecoderError` variant.
+/// - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+///   dispatch, hardware-feature mismatch)
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_decode_proto(
     decoder: *const HalDecoder,
@@ -1131,7 +1169,7 @@ pub unsafe extern "C" fn hal_decoder_decode_proto(
         Ok(r) => r,
         Err(e) => {
             log::error!("hal_decoder_decode_proto: {e:#?}");
-            set_error(libc::EIO);
+            set_error(errno_for_decoder_error(&e));
             return std::ptr::null_mut();
         }
     };
@@ -1651,8 +1689,11 @@ pub unsafe extern "C" fn hal_segmentation_list_free(list: *mut HalSegmentationLi
 /// @param out_tracks Output parameter for track info list (can be NULL; caller must free if non-NULL)
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL decoder/tracker/outputs/out_boxes, mixed dtypes)
-/// - EIO: Decoding failed
+/// - EINVAL: Invalid caller input (NULL decoder/tracker/outputs/out_boxes,
+///   mixed dtypes, shape/dtype mismatch with the configured schema,
+///   missing per-tensor quant on integer inputs, malformed config)
+/// - EIO: Internal decoder fault (mutex poisoning, unreachable kernel
+///   dispatch, hardware-feature mismatch)
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_decode_tracked(
     decoder: *const HalDecoder,
@@ -1682,17 +1723,17 @@ pub unsafe extern "C" fn hal_decoder_decode_tracked(
     let mut masks: Vec<Segmentation> = Vec::new();
     let mut tracks: Vec<TrackInfo> = Vec::new();
 
-    try_or_errno!(
-        (*decoder).inner.decode_tracked(
-            &mut (*tracker).inner,
-            timestamp,
-            &tensor_refs,
-            &mut boxes,
-            &mut masks,
-            &mut tracks
-        ),
-        libc::EIO
-    );
+    if let Err(e) = (*decoder).inner.decode_tracked(
+        &mut (*tracker).inner,
+        timestamp,
+        &tensor_refs,
+        &mut boxes,
+        &mut masks,
+        &mut tracks,
+    ) {
+        log::error!("hal_decoder_decode_tracked: {e:#?}");
+        return set_error(errno_for_decoder_error(&e));
+    }
 
     *out_boxes = Box::into_raw(Box::new(HalDetectBoxList { boxes }));
 

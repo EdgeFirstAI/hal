@@ -744,6 +744,83 @@ pub unsafe extern "C" fn hal_tensor_reshape(
     }
 }
 
+/// Attach per-tensor affine quantization metadata to an integer tensor.
+///
+/// The schema-driven per-scale decoder reads quantization live from each
+/// bound tensor via `Tensor::quantization()`. When tensors are wrapped
+/// from upstream framework buffers (e.g. NNStreamer `GstMemory` outputs)
+/// they carry no quant by default; the caller must attach it before
+/// calling `hal_decoder_decode_proto()` on a schema-driven decoder, or
+/// the decoder fails with `QuantMissing` (mapped to errno = EINVAL as a
+/// caller-side precondition violation).
+///
+/// The C boundary actively validates inputs (the Rust constructor
+/// `Quantization::per_tensor` and `TensorDyn::set_quantization` do not):
+///
+/// - `scale` must be finite and strictly positive. NaN, ±∞, zero, and
+///   negative values are rejected with `EINVAL`. (Some training tooling
+///   permits negative scales as a mathematical equivalence, but real
+///   runtime kernels in this codebase assume `scale > 0`.)
+/// - `zero_point` must fit the tensor's integer dtype range
+///   (`u8: 0..=255`, `i8: -128..=127`, `u16: 0..=65535`, `i16:
+///   -32768..=32767`, `u32/u64: >= 0`, `i32/i64`: any `int`). Out-of-range
+///   values are rejected with `EINVAL`.
+/// - Float tensors reject quantization with `EINVAL`. This mirrors the
+///   Rust `TensorDyn::set_quantization` contract.
+///
+/// @param tensor     Tensor handle (must be an integer dtype)
+/// @param scale      Quantization scale (must be finite and > 0)
+/// @param zero_point Quantization zero-point (must fit the tensor dtype)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor, float dtype, non-finite/non-positive scale,
+///   or zero_point out of range for the tensor's integer dtype
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_set_quantization(
+    tensor: *mut HalTensor,
+    scale: f32,
+    zero_point: c_int,
+) -> c_int {
+    check_null!(tensor);
+
+    if !scale.is_finite() || scale <= 0.0 {
+        return set_error(libc::EINVAL);
+    }
+
+    let dtype = unsafe { &*tensor }.inner.dtype();
+    if !zero_point_fits_dtype(zero_point, dtype) {
+        return set_error(libc::EINVAL);
+    }
+
+    let q = edgefirst_tensor::Quantization::per_tensor(scale, zero_point);
+    match unsafe { &mut *tensor }.inner.set_quantization(q) {
+        Ok(()) => 0,
+        Err(_) => set_error(libc::EINVAL),
+    }
+}
+
+/// Range-check a C `int` zero-point against a tensor integer dtype.
+///
+/// Float dtypes return `false` — they're rejected separately by the
+/// `TensorDyn::set_quantization` path. The unsigned 32/64-bit cases only
+/// need a non-negativity check because the input is already a 32-bit
+/// signed int, so `i32::MAX` trivially fits both `u32::MAX` and `u64::MAX`.
+fn zero_point_fits_dtype(zp: c_int, dtype: DType) -> bool {
+    match dtype {
+        DType::U8 => (0..=u8::MAX as c_int).contains(&zp),
+        DType::I8 => (i8::MIN as c_int..=i8::MAX as c_int).contains(&zp),
+        DType::U16 => (0..=u16::MAX as c_int).contains(&zp),
+        DType::I16 => (i16::MIN as c_int..=i16::MAX as c_int).contains(&zp),
+        DType::U32 | DType::U64 => zp >= 0,
+        DType::I32 | DType::I64 => true,
+        DType::F16 | DType::F32 | DType::F64 => false,
+        // `DType` is `#[non_exhaustive]`. Any future dtype lands here and
+        // is rejected until this match is updated — fail closed rather
+        // than silently accept unknown quantization for unknown dtypes.
+        _ => false,
+    }
+}
+
 // ============================================================================
 // Tensor Map Functions
 // ============================================================================
@@ -1613,6 +1690,123 @@ mod tests {
             assert_eq!(errno::errno().0, libc::ENOTSUP);
 
             hal_tensor_free(tensor);
+        }
+    }
+
+    /// `hal_tensor_set_quantization` rejects NULL, non-finite/non-positive
+    /// scale, float dtypes, and out-of-range zero-points; accepts the
+    /// boundary integer values for each integer dtype.
+    #[test]
+    fn test_hal_tensor_set_quantization_validation() {
+        unsafe {
+            let shape: [size_t; 1] = [4];
+
+            // NULL tensor → EINVAL.
+            assert_eq!(
+                hal_tensor_set_quantization(std::ptr::null_mut(), 0.1, 0),
+                -1
+            );
+            assert_eq!(errno::errno().0, libc::EINVAL);
+
+            let u8_t = hal_tensor_new(
+                HalDtype::U8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!u8_t.is_null());
+
+            // Scale validation: NaN, +inf, -inf, 0, negative all reject.
+            for bad_scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.1] {
+                errno::set_errno(errno::Errno(0));
+                assert_eq!(
+                    hal_tensor_set_quantization(u8_t, bad_scale, 0),
+                    -1,
+                    "scale={bad_scale} should reject",
+                );
+                assert_eq!(errno::errno().0, libc::EINVAL);
+            }
+
+            // u8 zero_point bounds: -1 rejects, 256 rejects, 0 and 255 accept.
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(u8_t, 0.5, -1), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(u8_t, 0.5, 256), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            assert_eq!(hal_tensor_set_quantization(u8_t, 0.5, 0), 0);
+            assert_eq!(hal_tensor_set_quantization(u8_t, 0.5, 255), 0);
+            hal_tensor_free(u8_t);
+
+            // i8 zero_point bounds: -129 rejects, 128 rejects, -128 and 127 accept.
+            let i8_t = hal_tensor_new(
+                HalDtype::I8,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(i8_t, 0.5, -129), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(i8_t, 0.5, 128), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            assert_eq!(hal_tensor_set_quantization(i8_t, 0.5, -128), 0);
+            assert_eq!(hal_tensor_set_quantization(i8_t, 0.5, 127), 0);
+            hal_tensor_free(i8_t);
+
+            // i16 zero_point boundary checks.
+            let i16_t = hal_tensor_new(
+                HalDtype::I16,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(
+                hal_tensor_set_quantization(i16_t, 0.5, i16::MIN as c_int - 1),
+                -1
+            );
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            assert_eq!(
+                hal_tensor_set_quantization(i16_t, 0.5, i16::MIN as c_int),
+                0
+            );
+            assert_eq!(
+                hal_tensor_set_quantization(i16_t, 0.5, i16::MAX as c_int),
+                0
+            );
+            hal_tensor_free(i16_t);
+
+            // u32 zero_point: any non-negative i32 is accepted; -1 rejects.
+            let u32_t = hal_tensor_new(
+                HalDtype::U32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(u32_t, 0.5, -1), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            assert_eq!(hal_tensor_set_quantization(u32_t, 0.5, c_int::MAX), 0);
+            hal_tensor_free(u32_t);
+
+            // Float tensor rejects regardless of scale/zero_point validity.
+            let f32_t = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            errno::set_errno(errno::Errno(0));
+            assert_eq!(hal_tensor_set_quantization(f32_t, 0.5, 0), -1);
+            assert_eq!(errno::errno().0, libc::EINVAL);
+            hal_tensor_free(f32_t);
         }
     }
 }
