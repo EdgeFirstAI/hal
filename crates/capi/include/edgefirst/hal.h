@@ -2678,15 +2678,27 @@ int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t nd
  * the decoder fails with `QuantMissing` (mapped to errno = EINVAL as a
  * caller-side precondition violation).
  *
- * Float tensors reject quantization — passing one returns -1 with errno
- * = EINVAL. This mirrors the Rust `TensorDyn::set_quantization` contract.
+ * The C boundary actively validates inputs (the Rust constructor
+ * `Quantization::per_tensor` and `TensorDyn::set_quantization` do not):
+ *
+ * - `scale` must be finite and strictly positive. NaN, ±∞, zero, and
+ *   negative values are rejected with `EINVAL`. (Some training tooling
+ *   permits negative scales as a mathematical equivalence, but real
+ *   runtime kernels in this codebase assume `scale > 0`.)
+ * - `zero_point` must fit the tensor's integer dtype range
+ *   (`u8: 0..=255`, `i8: -128..=127`, `u16: 0..=65535`, `i16:
+ *   -32768..=32767`, `u32/u64: >= 0`, `i32/i64`: any `int`). Out-of-range
+ *   values are rejected with `EINVAL`.
+ * - Float tensors reject quantization with `EINVAL`. This mirrors the
+ *   Rust `TensorDyn::set_quantization` contract.
  *
  * @param tensor     Tensor handle (must be an integer dtype)
- * @param scale      Quantization scale (positive float)
+ * @param scale      Quantization scale (must be finite and > 0)
  * @param zero_point Quantization zero-point (must fit the tensor dtype)
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: NULL tensor, float dtype, or scale/zero-point out of range
+ * - EINVAL: NULL tensor, float dtype, non-finite/non-positive scale,
+ *   or zero_point out of range for the tensor's integer dtype
  */
 int hal_tensor_set_quantization(struct hal_tensor *tensor, float scale, int zero_point);
 

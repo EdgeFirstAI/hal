@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attach per-tensor affine quantization metadata to an integer tensor.
   Required when wrapping framework buffers (e.g. NNStreamer `GstMemory`
   outputs) that carry no quant of their own before feeding them to a
-  schema-driven `hal_decoder_decode_proto()` call. Mirrors the Rust
-  `TensorDyn::set_quantization` contract: integer tensors accept; float
-  tensors reject with `EINVAL`.
+  schema-driven `hal_decoder_decode_proto()` call. The C boundary
+  actively validates inputs that the Rust `Quantization::per_tensor`
+  constructor does not: `scale` must be finite and strictly positive
+  (NaN, ±∞, zero, negative all reject with `EINVAL`); `zero_point`
+  must fit the tensor's integer dtype range (e.g. `0..=255` for `u8`,
+  `-128..=127` for `i8`); float tensors reject with `EINVAL`.
 
 ### Changed
 
