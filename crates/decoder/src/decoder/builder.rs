@@ -1087,12 +1087,14 @@ impl DecoderBuilder {
         // The per-scale subsystem (DFL/LTRB → dist2bbox → sigmoid) emits
         // boxes in pixel coordinates by design — `(grid + dist) * stride`
         // — independently of any `normalized: true` annotation in the
-        // schema. The schema's `normalized` flag describes the model's
-        // training-time convention, not the runtime output coord space
-        // for this code path. Override to `Some(false)` when the
-        // per-scale path is active so `Decoder::normalized_boxes()`
-        // matches what `decode_proto`/`decode` actually produce; the
-        // legacy / non-per-scale paths still honor the schema flag.
+        // schema. Override to `Some(false)` so the per-scale bridge's
+        // call to `yolo::maybe_normalize_boxes_in_place` fires and
+        // divides by `input_dims`, yielding `[0, 1]` output. The
+        // accessor `Decoder::normalized_boxes()` applies the
+        // pixel→normalized upgrade for the per-scale path and for any
+        // legacy `ModelType` whose every entry point normalizes
+        // uniformly (currently `YoloSegDet`, `YoloSplitSegDet`, and
+        // `YoloSegDet2Way`); other paths surface the raw flag.
         let normalized = if per_scale_plan.is_some() {
             Some(false)
         } else {

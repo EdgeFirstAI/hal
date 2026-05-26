@@ -1503,8 +1503,12 @@ fn assert_per_scale_decode_with_masks_succeeds(model_label: &str, fixture_filena
         .expect("build decoder");
 
     // Sanity: schema-derived input_dims must be present for normalization
-    // to take effect (per-scale builder forces normalized = Some(false)).
-    assert_eq!(decoder.normalized_boxes(), Some(false));
+    // to take effect (per-scale builder forces the internal normalized
+    // policy to Some(false) so the in-place divisor runs). With both
+    // pieces in place, the public accessor reports the post-decode
+    // contract: Some(true), i.e. boxes already in [0, 1] when the
+    // caller receives them.
+    assert_eq!(decoder.normalized_boxes(), Some(true));
     assert!(
         decoder.input_dims().is_some(),
         "{model_label} fixture schema must declare input dims so the \

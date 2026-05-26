@@ -1258,7 +1258,7 @@ impl Decoder {
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
         // Step 1: boxes + scores (2-level nesting, 36 paths).
-        let det_indices = with_quantized!(boxes_tensor, b, {
+        let mut det_indices = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Self::swap_axes_if_needed(b, boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
@@ -1279,6 +1279,11 @@ impl Decoder {
                 )
             })
         });
+        crate::yolo::maybe_normalize_boxes_in_place(
+            &mut det_indices,
+            self.normalized,
+            self.input_dims,
+        );
 
         // Step 2: masks + protos (2-level nesting, 36 paths).
         let proto = with_quantized!(mask_tensor, m, {
@@ -1353,6 +1358,8 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
         ))
     }
@@ -1394,7 +1401,7 @@ impl Decoder {
             Self::find_outputs_with_shape_quantized(&protos.shape, outputs, &skip)?;
 
         // Step 1: Slice detection into boxes + scores, run NMS.
-        let det_indices = with_quantized!(det_tensor, d, {
+        let mut det_indices = with_quantized!(det_tensor, d, {
             let det = Self::swap_axes_if_needed(d, detection.into());
             let det = det.slice(s![0, .., ..]);
             let boxes_view = det.slice(s![..4, ..]);
@@ -1409,6 +1416,11 @@ impl Decoder {
                 self.max_det,
             )
         });
+        crate::yolo::maybe_normalize_boxes_in_place(
+            &mut det_indices,
+            self.normalized,
+            self.input_dims,
+        );
 
         // Step 2: Extract proto data from separate mask_coeff + protos.
         let proto = with_quantized!(mask_tensor, m, {
@@ -1482,6 +1494,8 @@ impl Decoder {
             self.nms,
             self.pre_nms_top_k,
             self.max_det,
+            self.normalized,
+            self.input_dims,
             output_boxes,
         ))
     }
@@ -1730,7 +1744,7 @@ macro_rules! process_tracked_yolo_segmentation {
                     postprocess_yolo_seg(&box_tensor, num_protos);
 
                 // Run NMS and box extraction
-                let detect_boxes = impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                let mut detect_boxes = impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_boxes),
                     $self.score_threshold,
@@ -1738,6 +1752,17 @@ macro_rules! process_tracked_yolo_segmentation {
                     $self.nms,
                     $self.pre_nms_top_k,
                     $self.max_det,
+                );
+
+                // Pull pixel-space boxes into `[0, 1]` before tracking so
+                // tracked locations, masks, and accessor-reported coords
+                // share a single space across all `YoloSegDet` entry
+                // points (`decode`, `decode_proto`, `decode_tracked`,
+                // `decode_tracked_proto`) — see EDGEAI-1303.
+                crate::yolo::maybe_normalize_boxes_in_place(
+                    &mut detect_boxes,
+                    $self.normalized,
+                    $self.input_dims,
                 );
 
                 // Update tracker logic
@@ -1819,7 +1844,7 @@ macro_rules! process_tracked_yolo_segmentation_split {
         let (protos_tensor, _) =
             Decoder::find_outputs_with_shape_quantized(&$protos.shape, $outputs, &skip)?;
 
-        let boxes = with_quantized!(boxes_tensor, b, {
+        let mut boxes = with_quantized!(boxes_tensor, b, {
             with_quantized!(scores_tensor, s, {
                 let boxes_tensor = Decoder::swap_axes_if_needed(b, $boxes.into());
                 let boxes_tensor = boxes_tensor.slice(s![0, .., ..]);
@@ -1840,6 +1865,13 @@ macro_rules! process_tracked_yolo_segmentation_split {
                 )
             })
         });
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSplitSegDet` entry points
+        // (`decode`, `decode_proto`, `decode_tracked`,
+        // `decode_tracked_proto`) — see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, $self.normalized, $self.input_dims);
 
         let (new_boxes, old_boxes) =
             Decoder::update_tracker_yolo_segdet($tracker, $timestamp, boxes, $output_tracks);
@@ -1918,7 +1950,7 @@ macro_rules! process_tracked_yolo_segmentation_2way {
             Decoder::find_outputs_with_shape_quantized(&$protos.shape, $outputs, &skip)?;
 
         // Step 1: Slice combined detection into boxes + scores, run NMS
-        let boxes = with_quantized!(det_tensor, d, {
+        let mut boxes = with_quantized!(det_tensor, d, {
             let det = Decoder::swap_axes_if_needed(d, $detection.into());
             let det = det.slice(s![0, .., ..]);
             let boxes_view = det.slice(s![..4, ..]);
@@ -1933,6 +1965,13 @@ macro_rules! process_tracked_yolo_segmentation_2way {
                 $self.max_det,
             )
         });
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSegDet2Way` entry points
+        // (`decode`, `decode_proto`, `decode_tracked`,
+        // `decode_tracked_proto`) — see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, $self.normalized, $self.input_dims);
 
         // Tracker: integrate before mask extraction
         let (new_boxes, old_boxes) =
@@ -2086,7 +2125,7 @@ impl Decoder {
         let num_protos = protos_tensor.shape()[2];
         let (boxes_tensor, scores_tensor, mask_tensor) =
             postprocess_yolo_seg(&boxes_tensor, num_protos);
-        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        let mut boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_tensor,
             scores_tensor,
             self.score_threshold,
@@ -2095,6 +2134,13 @@ impl Decoder {
             self.pre_nms_top_k,
             self.max_det,
         );
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSegDet` entry points (`decode`,
+        // `decode_proto`, `decode_tracked`, `decode_tracked_proto`) —
+        // see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         let (new_boxes, old_boxes) =
             Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
@@ -2196,7 +2242,7 @@ impl Decoder {
 
         let (boxes_tensor, scores_tensor, mask_tensor) =
             postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
-        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        let mut boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_tensor,
             scores_tensor,
             self.score_threshold,
@@ -2205,6 +2251,13 @@ impl Decoder {
             self.pre_nms_top_k,
             self.max_det,
         );
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSplitSegDet` entry points
+        // (`decode`, `decode_proto`, `decode_tracked`,
+        // `decode_tracked_proto`) — see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         let (new_boxes, old_boxes) =
             Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
@@ -3013,7 +3066,7 @@ impl Decoder {
 
         let (boxes_view, scores_view, mask_tensor) =
             postprocess_yolo_split_segdet(boxes_view, scores_view, mask_tensor);
-        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        let mut boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_view,
             scores_view,
             self.score_threshold,
@@ -3022,6 +3075,13 @@ impl Decoder {
             self.pre_nms_top_k,
             self.max_det,
         );
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSegDet2Way` entry points
+        // (`decode`, `decode_proto`, `decode_tracked`,
+        // `decode_tracked_proto`) — see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         // Tracker integrates after NMS, before mask materialization
         let (new_boxes, old_boxes) =
@@ -3132,7 +3192,7 @@ impl Decoder {
 
         let (boxes_view, scores_view, mask_tensor) =
             postprocess_yolo_split_segdet(boxes_view, scores_view, mask_tensor);
-        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        let mut boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_view,
             scores_view,
             self.score_threshold,
@@ -3141,6 +3201,13 @@ impl Decoder {
             self.pre_nms_top_k,
             self.max_det,
         );
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSegDet2Way` entry points
+        // (`decode`, `decode_proto`, `decode_tracked`,
+        // `decode_tracked_proto`) — see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         // Tracker integrates before mask extraction
         let (new_boxes, old_boxes) =

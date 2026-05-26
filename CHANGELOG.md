@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-05-26
+
+### Fixed
+
+- GStreamer bridge double-normalized detections: `Decoder::normalized_boxes()`
+  returned `Some(false)` ("pixel-space") even for paths that had already
+  divided bbox channels by `(W, H)` via `yolo::maybe_normalize_boxes_in_place`,
+  causing callers reading `Some(false)` to divide a second time and
+  collapse detections to ~0.
+
+  **Root cause.** Before this release, `maybe_normalize_boxes_in_place`
+  was absent from the tracker entry points (`decode_tracked`,
+  `decode_tracked_proto`) and from the proto entry points for the
+  seg/mask/proto model families. The helper was also missing entirely
+  from `YoloSplitSegDet` and `YoloSegDet2Way` paths. The accessor had
+  no way to report the actual post-decode coordinate space.
+
+  **Implementation fix.** `maybe_normalize_boxes_in_place` is now called
+  uniformly across every entry point for four paths:
+
+  1. **Per-scale decoders** (schema-v2 per-scale layout, DFL/LTRB
+     dist2bbox path): unchanged from 0.24.0; already normalized
+     uniformly.
+  2. **`ModelType::YoloSegDet`**: helper added to
+     `process_tracked_yolo_segmentation!` and
+     `process_tracked_yolo_segdet_float`.
+  3. **`ModelType::YoloSplitSegDet`**: helper added to
+     `process_tracked_yolo_segmentation_split!` and
+     `process_tracked_yolo_segdet_split_float`; `_proto` variants
+     updated; `impl_yolo_split_segdet_float_proto` signature extended
+     to accept `normalized` and `input_dims`.
+  4. **`ModelType::YoloSegDet2Way`**: helper added to
+     `process_tracked_yolo_segmentation_2way!` and the inline
+     tracked-2way float helpers; `_proto` variants updated.
+
+  Total new call sites: 8 (7 in `postprocess.rs`, 1 in `yolo.rs`).
+
+  **Accessor fix.** `Decoder::normalized_boxes()` now reports the
+  post-decode coordinate space for all four paths. The
+  `legacy_path_normalizes_uniformly()` predicate was extended to cover
+  `YoloSegDet`, `YoloSplitSegDet`, and `YoloSegDet2Way` (previously
+  only `YoloSegDet`). When the schema declares `normalized: false` and
+  `input_dims` is a valid non-zero pair, the accessor returns
+  `Some(true)` rather than the raw `Some(false)`.
+
+  **Intentional raw-flag paths.** Detection-only (`YoloDet`,
+  `YoloSplitDet`), end-to-end YOLO (`YoloEndToEnd*`), `ModelPack*`, and
+  the schema-v2 merge program return the raw schema annotation unchanged.
+  These paths have distinct coordinate conventions or lack the protobox
+  safety-net coupling. Callers receiving `Some(false)` from these model
+  types must call `input_dims()` and divide themselves.
+
+  Callers must not re-normalize when the accessor reports `Some(true)`.
+
 ## [0.24.0] - 2026-05-25
 
 ### Added

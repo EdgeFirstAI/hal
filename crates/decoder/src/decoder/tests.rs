@@ -4017,7 +4017,10 @@ outputs:
             // scores, mask coefficients per-scale, NHWC protos), build
             // a decoder, and confirm:
             //   * a DecodeProgram is attached (split schema)
-            //   * normalized == false (pixel coords per HAILORT spec)
+            //   * `normalized_boxes() == Some(true)`: HAILORT emits
+            //     pixel-space coords, but the per-scale path normalizes
+            //     internally using the schema's input_dims — the public
+            //     accessor reports the post-decode state
             //   * the DFL reg_max extracted from the program == 16
             //     (= 64 feature channels ÷ 4)
             let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
@@ -4032,7 +4035,7 @@ outputs:
                 decoder.decode_program.is_some(),
                 "Hailo schema has per-scale children; DecodeProgram required"
             );
-            assert_eq!(decoder.normalized_boxes(), Some(false));
+            assert_eq!(decoder.normalized_boxes(), Some(true));
             assert_eq!(
                 decoder.decode_program.as_ref().unwrap().boxes_reg_max(),
                 Some(16),

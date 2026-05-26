@@ -1332,12 +1332,48 @@ struct hal_proto_data *hal_decoder_decode_proto(const struct hal_decoder *decode
 char *hal_decoder_model_type(const struct hal_decoder *decoder);
 
 /**
- * Get whether the decoder produces normalized box coordinates.
+ * Get the coordinate format of the boxes the decoder emits to the caller.
+ *
+ * Four decode paths invoke `yolo::maybe_normalize_boxes_in_place`
+ * uniformly across every entry point (`hal_decoder_decode`,
+ * `hal_decoder_decode_proto`, and tracked variants, both quantized and
+ * float). For these paths this function reports the post-decode
+ * coordinate space rather than the raw schema annotation:
+ *
+ * - Per-scale decoders (schema-v2 per-scale layout, DFL/LTRB dist2bbox
+ *   path): the bridge always normalizes before returning.
+ * - `ModelType::YoloSegDet`: combined-output segmentation models; the
+ *   helper fires across all entry points and element-type variants.
+ * - `ModelType::YoloSplitSegDet`: split-output segmentation models;
+ *   aligned across `decode`, `decode_proto`, `decode_tracked`, and
+ *   `decode_tracked_proto` for both quantized and float variants.
+ * - `ModelType::YoloSegDet2Way`: two-way segmentation models; same
+ *   four entry points and both element-type variants.
+ *
+ * For all four paths, when the schema declares `normalized: false` and
+ * `hal_decoder_input_dims()` is known (non-zero), the decoder has
+ * already divided by `(W, H)` and the caller receives `[0, 1]` boxes:
+ * - Returns `1` when `normalized: true` OR when `normalized: false`
+ *   with valid input dims (division already applied).
+ * - Returns `0` when `normalized: false` and input dims are unknown
+ *   (pixel-space leaks out).
+ * - Returns `-1` when the normalization flag is absent from the schema.
+ *
+ * All other decoders — detection-only (`YoloDet`, `YoloSplitDet`),
+ * end-to-end YOLO (`YoloEndToEnd*`), and `ModelPack*` — return the
+ * raw schema annotation verbatim. Callers that receive `0` from these
+ * model types must call `hal_decoder_input_dims()` and divide themselves
+ * if `[0, 1]` output is required.
+ *
+ * Callers MUST NOT re-normalize when this function returns `1`; dividing
+ * already-normalized coordinates by `(W, H)` again collapses detections
+ * to ~0.
  *
  * @param decoder Decoder handle
  * @return 1 if boxes are in normalized [0,1] coordinates,
  *         0 if boxes are in pixel coordinates,
  *        -1 if unknown or decoder is NULL
+ * @see hal_decoder_input_dims
  */
 int hal_decoder_normalized_boxes(const struct hal_decoder *decoder);
 

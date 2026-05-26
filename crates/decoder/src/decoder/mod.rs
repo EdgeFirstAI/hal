@@ -290,16 +290,53 @@ impl Decoder {
         &self.model_type
     }
 
-    /// Returns the box coordinate format if known from the model config.
+    /// Returns the coordinate format of the boxes the decoder emits to
+    /// the caller.
     ///
-    /// - `Some(true)`: Boxes are in normalized [0,1] coordinates
-    /// - `Some(false)`: Boxes are in pixel coordinates relative to model input
-    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
-    ///   1.0)
+    /// - `Some(true)`: Boxes are in normalized `[0, 1]` coordinates
+    /// - `Some(false)`: Boxes are in pixel coordinates relative to the
+    ///   model input
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
+    ///   > 1.0)
     ///
-    /// This is determined by the model config's `normalized` field, not the NMS
-    /// mode. When coordinates are in pixels or unknown, the caller may need
-    /// to normalize using the model input dimensions.
+    /// This describes the **post-decode** coordinate space, not the raw
+    /// schema annotation. The decoder applies EDGEAI-1303 normalization
+    /// (dividing bbox channels by `(input_w, input_h)`) on a per-path
+    /// basis, not unconditionally. Four paths are known to invoke the
+    /// helper uniformly across all of their entry points (`decode`,
+    /// `decode_proto`, and — where applicable — `decode_tracked` and
+    /// `decode_tracked_proto`):
+    ///
+    /// 1. The **per-scale fast path** (DFL/LTRB → dist2bbox → sigmoid),
+    ///    which emits pixel-space boxes by design and always normalizes
+    ///    before returning.
+    /// 2. [`ModelType::YoloSegDet`](crate::ModelType::YoloSegDet), whose
+    ///    quantized and float, tracked and untracked, masks and proto
+    ///    variants each call the helper after NMS.
+    /// 3. [`ModelType::YoloSplitSegDet`](crate::ModelType::YoloSplitSegDet),
+    ///    aligned across `decode`, `decode_proto`, `decode_tracked`,
+    ///    and `decode_tracked_proto` for both quantized and float
+    ///    variants.
+    /// 4. [`ModelType::YoloSegDet2Way`](crate::ModelType::YoloSegDet2Way),
+    ///    aligned across the same four entry points and both element
+    ///    type variants.
+    ///
+    /// When any of those paths is active and the schema declares
+    /// `normalized: false` with valid [`input_dims`](Self::input_dims),
+    /// this accessor reports `Some(true)` to match what the caller
+    /// actually receives.
+    ///
+    /// The remaining model types still surface the raw schema flag
+    /// because their post-decode contract differs:
+    /// [`ModelType::YoloDet`](crate::ModelType::YoloDet) and
+    /// [`ModelType::YoloSplitDet`](crate::ModelType::YoloSplitDet)
+    /// (detection-only, no protobox crop coupling), the
+    /// `YoloEndToEnd*` family (model embeds its own NMS and emits its
+    /// own coordinate space), and the `ModelPack*` family (separate
+    /// model conventions). For those, this accessor returns
+    /// `self.normalized` verbatim and leaves it to the caller to
+    /// handle pixel-space output explicitly (e.g. divide by
+    /// `input_dims()` themselves).
     ///
     /// # Examples
     ///
@@ -316,7 +353,57 @@ impl Decoder {
     /// # }
     /// ```
     pub fn normalized_boxes(&self) -> Option<bool> {
-        self.normalized
+        // Four paths invoke `yolo::maybe_normalize_boxes_in_place`
+        // uniformly across every entry point that can reach them:
+        //   - the per-scale fast path (always normalizes by design),
+        //   - `ModelType::YoloSegDet` (helper fires in
+        //     `decode`/`decode_proto` via `yolo::impl_yolo_segdet_*` and
+        //     in `decode_tracked`/`decode_tracked_proto` via the
+        //     `process_tracked_yolo_segmentation!` macro and
+        //     `process_tracked_yolo_segdet_float`),
+        //   - `ModelType::YoloSplitSegDet` (helper fires in
+        //     `decode_yolo_split_segdet_*`, `impl_yolo_split_segdet_*`,
+        //     `process_tracked_yolo_segmentation_split!`, and
+        //     `process_tracked_yolo_segdet_split_float`), and
+        //   - `ModelType::YoloSegDet2Way` (helper fires in
+        //     `decode_yolo_segdet_2way_*`, the float decode routes
+        //     through `impl_yolo_split_segdet_float*`,
+        //     `process_tracked_yolo_segmentation_2way!`, and the
+        //     inline tracked-2way float helpers).
+        // For those, `normalized == Some(false)` with valid `input_dims`
+        // upgrades to a post-decode `Some(true)`. Other paths invoke
+        // the helper inconsistently across `ModelType` variants and
+        // tracked/proto entry points — surface the raw schema flag
+        // there and let callers handle pixel-space output explicitly.
+        if self.per_scale.is_some() || self.legacy_path_normalizes_uniformly() {
+            match (self.normalized, self.input_dims) {
+                (Some(true), _) => Some(true),
+                (Some(false), Some((w, h))) if w != 0 && h != 0 => Some(true),
+                (Some(false), _) => Some(false),
+                (None, _) => None,
+            }
+        } else {
+            self.normalized
+        }
+    }
+
+    /// Returns true for legacy `ModelType` dispatch paths that are known
+    /// to call `yolo::maybe_normalize_boxes_in_place` on every entry
+    /// point (`decode`, `decode_proto`, `decode_tracked`,
+    /// `decode_tracked_proto`, both quantized and float variants).
+    ///
+    /// Used by [`normalized_boxes`](Self::normalized_boxes) to gate the
+    /// pixel→normalized upgrade for non-per-scale model types whose
+    /// post-decode contract matches the per-scale path. Extend this
+    /// list as additional `ModelType` variants are brought into
+    /// uniform-normalization alignment.
+    fn legacy_path_normalizes_uniformly(&self) -> bool {
+        matches!(
+            self.model_type,
+            ModelType::YoloSegDet { .. }
+                | ModelType::YoloSplitSegDet { .. }
+                | ModelType::YoloSegDet2Way { .. }
+        )
     }
 
     /// Model input dimensions `(width, height)` captured from the
@@ -324,13 +411,21 @@ impl Decoder {
     /// schema did not declare an input spec (e.g. flat YAML configs
     /// or `DecoderBuilder::add_output(...)` programmatic builds).
     ///
-    /// Used together with [`normalized_boxes`](Self::normalized_boxes):
-    /// when the decoder reports `normalized_boxes() == Some(false)` and
-    /// `input_dims()` is `Some((w, h))`, the decoder divides post-NMS
-    /// bbox coordinates by `(w, h)` so they enter the canonical `[0, 1]`
-    /// range before mask cropping (EDGEAI-1303). When `input_dims()` is
-    /// `None`, the decoder cannot perform the division and the existing
-    /// `protobox` `> 2.0` reject acts as a safety net.
+    /// Drives EDGEAI-1303 normalization on the paths that invoke the
+    /// helper uniformly: when the schema declares pixel-space outputs
+    /// and `input_dims()` is `Some((w, h))`, the per-scale bridge and
+    /// the `ModelType::YoloSegDet`, `ModelType::YoloSplitSegDet`, and
+    /// `ModelType::YoloSegDet2Way` dispatch paths divide post-NMS
+    /// bbox coordinates by `(w, h)` so they enter the canonical
+    /// `[0, 1]` range before mask cropping / tracker dispatch, and
+    /// [`normalized_boxes`](Self::normalized_boxes) reports
+    /// `Some(true)` to match. The remaining legacy `ModelType`
+    /// dispatch paths (detection-only `YoloDet`/`YoloSplitDet`, the
+    /// `YoloEndToEnd*` family, and the `ModelPack*` family) do not
+    /// apply this division — see
+    /// [`normalized_boxes`](Self::normalized_boxes) for the per-path
+    /// contract. The legacy `protobox` `> 2.0` reject acts as a safety
+    /// net for paths that emit pixel-space coordinates.
     ///
     /// # Examples
     ///
