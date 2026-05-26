@@ -1406,6 +1406,8 @@ pub(crate) fn impl_yolo_split_segdet_float_proto<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    normalized: Option<bool>,
+    input_dims: Option<(usize, usize)>,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1413,7 +1415,7 @@ where
 {
     let (boxes_tensor, scores_tensor, mask_tensor) =
         postprocess_yolo_split_segdet(boxes_tensor, scores_tensor, mask_tensor);
-    let det_indices = impl_yolo_segdet_get_boxes::<B, _, _>(
+    let mut det_indices = impl_yolo_segdet_get_boxes::<B, _, _>(
         boxes_tensor,
         scores_tensor,
         score_threshold,
@@ -1422,6 +1424,7 @@ where
         pre_nms_top_k,
         max_det,
     );
+    maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
     extract_proto_data_float(det_indices, mask_tensor, protos, output_boxes)
 }

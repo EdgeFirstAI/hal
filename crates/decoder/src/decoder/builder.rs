@@ -1093,8 +1093,8 @@ impl DecoderBuilder {
         // accessor `Decoder::normalized_boxes()` applies the
         // pixel→normalized upgrade for the per-scale path and for any
         // legacy `ModelType` whose every entry point normalizes
-        // uniformly (currently `YoloSegDet`); other paths surface the
-        // raw flag.
+        // uniformly (currently `YoloSegDet`, `YoloSplitSegDet`, and
+        // `YoloSegDet2Way`); other paths surface the raw flag.
         let normalized = if per_scale_plan.is_some() {
             Some(false)
         } else {
