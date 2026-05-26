@@ -1,0 +1,113 @@
+{
+  "schema_version": 2,
+  "name": "modelpack-csp19n-320x320-rgb-t-aaa1",
+  "description": "ModelPack detection-only, 2 FPN scales, logical layout",
+  "author": "Au-Zone Technologies",
+  "host": {
+    "studio_server": "test.edgefirst.studio",
+    "project_id": "1123",
+    "session": "t-aaa1",
+    "username": "tester"
+  },
+  "dataset": {
+    "name": "synthetic",
+    "id": "ds-1c8",
+    "classes": [
+      "cat", "dog", "person", "car", "truck",
+      "bus", "bike", "plane", "boat", "traffic_light",
+      "fire_hydrant", "stop_sign", "bird"
+    ]
+  },
+  "input": {
+    "shape": [1, 320, 320, 3],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "detection": true,
+    "segmentation": false,
+    "model_name": "nano",
+    "backbone": "cspdarknet19",
+    "model_size": "nano",
+    "task": "detection",
+    "anchors": [
+      [[10, 13], [16, 30], [33, 23]],
+      [[30, 61], [62, 45], [59, 119]]
+    ],
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.5,
+    "score": 0.25,
+    "nms": "hal",
+    "preprocessing": "resize",
+    "normalization": "unsigned"
+  },
+  "nms": "class_agnostic",
+  "calibration": "calibration-ds-1c8-aaaaaaaa.safetensors",
+  "outputs": [
+    {
+      "name": "output_0",
+      "type": "detection",
+      "encoding": "anchor",
+      "decoder": "modelpack",
+      "normalized": true,
+      "shape": [1, 20, 20, 54],
+      "dshape": [
+        {"batch": 1},
+        {"height": 20},
+        {"width": 20},
+        {"num_anchors_x_features": 54}
+      ],
+      "stride": [16, 16],
+      "anchors": [[0.031, 0.041], [0.050, 0.094], [0.103, 0.072]],
+      "dtype": "float32",
+      "quantization": null
+    },
+    {
+      "name": "output_1",
+      "type": "detection",
+      "encoding": "anchor",
+      "decoder": "modelpack",
+      "normalized": true,
+      "shape": [1, 10, 10, 54],
+      "dshape": [
+        {"batch": 1},
+        {"height": 10},
+        {"width": 10},
+        {"num_anchors_x_features": 54}
+      ],
+      "stride": [32, 32],
+      "anchors": [[0.094, 0.191], [0.194, 0.141], [0.184, 0.372]],
+      "dtype": "float32",
+      "quantization": null
+    }
+  ],
+  "split_hints": [
+    {
+      "type": "quantization_split",
+      "target": "output_0",
+      "input_dtype": "uint8",
+      "output_dtype": "int8",
+      "strides": [16],
+      "anchors_per_cell": 3,
+      "description": "ModelPack anchor-grid at stride 16: 3 anchors × (4 box + 1 obj + 13 classes) = 54 channels interleaved",
+      "boundaries": [
+        {"name": "detection_grid", "channels": [0, 54], "activation": "sigmoid"}
+      ]
+    },
+    {
+      "type": "quantization_split",
+      "target": "output_1",
+      "input_dtype": "uint8",
+      "output_dtype": "int8",
+      "strides": [32],
+      "anchors_per_cell": 3,
+      "description": "ModelPack anchor-grid at stride 32: 3 anchors × (4 box + 1 obj + 13 classes) = 54 channels interleaved",
+      "boundaries": [
+        {"name": "detection_grid", "channels": [0, 54], "activation": "sigmoid"}
+      ]
+    }
+  ]
+}

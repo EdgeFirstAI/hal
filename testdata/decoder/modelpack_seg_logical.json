@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "name": "modelpack-csp19n-seg-320x320-rgb-t-aaa2",
+  "description": "ModelPack segmentation-only, logical layout",
+  "author": "Au-Zone Technologies",
+  "host": {
+    "studio_server": "test.edgefirst.studio",
+    "project_id": "1123",
+    "session": "t-aaa2",
+    "username": "tester"
+  },
+  "dataset": {
+    "name": "synthetic",
+    "id": "ds-1c8",
+    "classes": ["road", "lane", "sidewalk", "vehicle", "person"]
+  },
+  "input": {
+    "shape": [1, 320, 320, 3],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "detection": false,
+    "segmentation": true,
+    "model_name": "nano",
+    "backbone": "cspdarknet19",
+    "model_size": "nano",
+    "task": "segmentation",
+    "anchors": null,
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.5,
+    "score": 0.25,
+    "nms": "none",
+    "preprocessing": "resize",
+    "normalization": "unsigned"
+  },
+  "calibration": "calibration-ds-1c8-bbbbbbbb.safetensors",
+  "outputs": [
+    {
+      "name": "output_0",
+      "type": "segmentation",
+      "decoder": "modelpack",
+      "shape": [1, 160, 160, 6],
+      "dshape": [
+        {"batch": 1},
+        {"height": 160},
+        {"width": 160},
+        {"num_classes": 6}
+      ],
+      "dtype": "float32",
+      "quantization": null
+    }
+  ],
+  "split_hints": [
+    {
+      "type": "quantization_split",
+      "target": "output_0",
+      "input_dtype": "uint8",
+      "output_dtype": "int8",
+      "description": "ModelPack segmentation: 6 classes (5 annotated + background)",
+      "boundaries": [
+        {"name": "segmentation", "channels": [0, 6], "activation": "softmax"}
+      ]
+    }
+  ]
+}

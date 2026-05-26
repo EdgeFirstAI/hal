@@ -1,0 +1,95 @@
+{
+  "schema_version": 2,
+  "name": "modelpack-csp19n-320x320-rgb-t-aaa1-quant",
+  "description": "ModelPack detection-only, 2 FPN scales, compiled INT8 layout. Each FPN scale is its own physical tensor with `quantization` and `dtype: int8` populated directly on the logical output — ModelPack anchor-grid outputs are already per-scale, so converters do not introduce further per-scale children (no nested `outputs[]`).",
+  "author": "Au-Zone Technologies",
+  "host": {
+    "studio_server": "test.edgefirst.studio",
+    "project_id": "1123",
+    "session": "t-aaa1",
+    "username": "tester"
+  },
+  "dataset": {
+    "name": "synthetic",
+    "id": "ds-1c8",
+    "classes": [
+      "cat", "dog", "person", "car", "truck",
+      "bus", "bike", "plane", "boat", "traffic_light",
+      "fire_hydrant", "stop_sign", "bird"
+    ]
+  },
+  "input": {
+    "shape": [1, 320, 320, 3],
+    "cameraadaptor": "rgb",
+    "input_channels": 3,
+    "output_channels": 3
+  },
+  "model": {
+    "detection": true,
+    "segmentation": false,
+    "model_name": "nano",
+    "backbone": "cspdarknet19",
+    "model_size": "nano",
+    "task": "detection",
+    "anchors": [
+      [[10, 13], [16, 30], [33, 23]],
+      [[30, 61], [62, 45], [59, 119]]
+    ],
+    "end2end": false
+  },
+  "validation": {
+    "iou": 0.5,
+    "score": 0.25,
+    "nms": "hal",
+    "preprocessing": "resize",
+    "normalization": "unsigned"
+  },
+  "nms": "class_agnostic",
+  "calibration": "calibration-ds-1c8-aaaaaaaa.safetensors",
+  "outputs": [
+    {
+      "name": "output_0",
+      "type": "detection",
+      "encoding": "anchor",
+      "decoder": "modelpack",
+      "normalized": true,
+      "shape": [1, 20, 20, 54],
+      "dshape": [
+        {"batch": 1},
+        {"height": 20},
+        {"width": 20},
+        {"num_anchors_x_features": 54}
+      ],
+      "stride": [16, 16],
+      "anchors": [[0.031, 0.041], [0.050, 0.094], [0.103, 0.072]],
+      "dtype": "int8",
+      "quantization": {
+        "scale": 0.05,
+        "zero_point": 0,
+        "dtype": "int8"
+      }
+    },
+    {
+      "name": "output_1",
+      "type": "detection",
+      "encoding": "anchor",
+      "decoder": "modelpack",
+      "normalized": true,
+      "shape": [1, 10, 10, 54],
+      "dshape": [
+        {"batch": 1},
+        {"height": 10},
+        {"width": 10},
+        {"num_anchors_x_features": 54}
+      ],
+      "stride": [32, 32],
+      "anchors": [[0.094, 0.191], [0.194, 0.141], [0.184, 0.372]],
+      "dtype": "int8",
+      "quantization": {
+        "scale": 0.07,
+        "zero_point": 5,
+        "dtype": "int8"
+      }
+    }
+  ]
+}
