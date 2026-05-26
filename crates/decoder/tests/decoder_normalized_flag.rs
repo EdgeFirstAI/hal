@@ -9,12 +9,31 @@
 //! decoding with `InvalidShape("…un-normalized…")` even though
 //! the schema correctly described their coordinate space.
 //!
-//! Also pins the public `Decoder::normalized_boxes()` contract: when
-//! the schema declares pixel-space outputs AND `input_dims` is known,
-//! the in-place normalizer runs internally, so the accessor reports
-//! `Some(true)` (the post-decode state), not the raw schema flag.
-//! Callers must not re-normalize when the accessor reports `Some(true)`
-//! — doing so collapses coordinates to ~0.
+//! Pins the public `Decoder::normalized_boxes()` per-path contract.
+//! See the rustdoc on `Decoder::normalized_boxes` for the canonical
+//! statement. In short:
+//!
+//! * **Per-scale path** (`per_scale.is_some()`): the accessor upgrades
+//!   `normalized=false` + valid `input_dims` to `Some(true)` because
+//!   every per-scale entry point unconditionally calls
+//!   `maybe_normalize_boxes_in_place`. Pinned by `per_scale_parity.rs`
+//!   and `decoder/tests.rs` (hailo fixture).
+//!
+//! * **Non-per-scale paths**: the accessor returns the raw schema flag
+//!   (`self.normalized`) regardless of `input_dims`. Even when the
+//!   in-place helper runs internally (e.g. `YoloSegDet`, `YoloSplitSegDet`
+//!   on `decode`), the accessor under-claims because not every entry
+//!   point on those `ModelType` variants is uniform — callers must handle
+//!   pixel-space output explicitly when the flag says `Some(false)`.
+//!
+//! This file pins:
+//! (a) non-per-scale raw-flag passthrough (`pixel_space_input_with_normalized_false_decodes`
+//!     and `split_schema_pixel_space_with_normalized_false_decodes`),
+//! (b) in-place normalization actually runs despite the accessor
+//!     under-claiming (the `for b in &boxes` coordinate-range assertions),
+//! (c) no-input-dims passthrough (`normalized_false_without_input_dims_reports_false`),
+//! (d) `normalized=None` passthrough (`normalized_none_reports_none`),
+//! (e) `normalized=true` direct passthrough (`normalized_true_reports_true`).
 
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox};
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -123,12 +142,16 @@ fn pixel_space_input_with_normalized_false_decodes() {
         .build()
         .expect("schema-driven decoder must build");
 
+    // Non-per-scale path: the accessor surfaces the raw schema flag.
+    // The in-place normalizer still runs internally (confirmed below by
+    // coordinate-range assertions), but `normalized_boxes()` under-claims
+    // because not every YoloSegDet entry point is uniform across decode
+    // variants — see `Decoder::normalized_boxes` rustdoc.
     assert_eq!(
         decoder.normalized_boxes(),
-        Some(true),
-        "schema declared normalized: false but input_dims are known, so the \
-         decoder internally normalizes; the accessor must report the \
-         post-decode contract (Some(true)), not the raw schema flag",
+        Some(false),
+        "non-per-scale YoloSegDet: accessor returns raw schema flag; \
+         in-place normalization runs internally but is not reflected here",
     );
     assert_eq!(
         decoder.input_dims(),
@@ -305,10 +328,13 @@ fn split_schema_pixel_space_with_normalized_false_decodes() {
         .build()
         .expect("split schema must build");
 
-    // Post-decode contract: schema says pixel-space, input_dims known,
-    // so the SplitSegDet path internally normalizes — accessor reports
-    // Some(true) to match what the caller actually receives.
-    assert_eq!(decoder.normalized_boxes(), Some(true));
+    // Non-per-scale path: accessor returns the raw schema flag.
+    // YoloSplitSegDet calls maybe_normalize_boxes_in_place on decode()
+    // but not uniformly across all entry points, so normalized_boxes()
+    // under-claims — returns Some(false) (the raw schema flag), not
+    // Some(true). Coordinate-range assertions below confirm the helper
+    // still ran internally.
+    assert_eq!(decoder.normalized_boxes(), Some(false));
     assert_eq!(decoder.input_dims(), Some((IMG, IMG)));
 
     let owned = build_split_inputs();
@@ -334,10 +360,14 @@ fn split_schema_pixel_space_with_normalized_false_decodes() {
     }
 }
 
-/// `normalized_boxes()` contract: when the schema declares pixel-space
-/// outputs (`normalized: false`) but `input_dims` is unknown, the
-/// in-place normalizer cannot run and the decoder leaks pixel-space
-/// boxes — the accessor must report `Some(false)` in that case.
+/// Non-per-scale path, `normalized=false`, no `input_dims`: accessor
+/// returns the raw schema flag `Some(false)`.
+///
+/// On non-per-scale paths the accessor always surfaces the raw
+/// `self.normalized` field regardless of `input_dims`. The absence of
+/// `input_dims` also means the in-place normalizer cannot fire, so this
+/// is doubly correct: the flag reflects both the schema declaration and
+/// the runtime behaviour.
 ///
 /// Constructed programmatically via `add_output` to deliberately leave
 /// `input_dims` unset (the v2 schema path would always populate them).
@@ -363,10 +393,124 @@ fn normalized_false_without_input_dims_reports_false() {
         None,
         "programmatic build must leave input_dims unset",
     );
+    // Non-per-scale: raw schema flag is surfaced unconditionally.
     assert_eq!(
         decoder.normalized_boxes(),
         Some(false),
-        "without input_dims the in-place normalizer cannot run; \
-         pixel-space leaks out, so the accessor must report Some(false)",
+        "non-per-scale: accessor returns raw schema flag; \
+         input_dims absent so the helper cannot run either",
     );
+}
+
+/// Non-per-scale path, `normalized=None`: accessor returns `None`.
+///
+/// When the schema omits the `normalized` field the accessor propagates
+/// the absence directly for non-per-scale decoders.
+#[test]
+fn normalized_none_reports_none() {
+    use edgefirst_decoder::{configs, ConfigOutput};
+
+    let det = configs::Detection {
+        anchors: None,
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, FEAT, N],
+        dshape: Vec::new(),
+        normalized: None,
+    };
+    let decoder = DecoderBuilder::default()
+        .add_output(ConfigOutput::Detection(det))
+        .build()
+        .expect("programmatic decoder must build");
+
+    assert_eq!(
+        decoder.normalized_boxes(),
+        None,
+        "non-per-scale: absent normalized field must propagate as None",
+    );
+}
+
+/// Non-per-scale path, `normalized=true`: accessor returns `Some(true)`.
+///
+/// When the schema explicitly declares boxes are already normalized the
+/// accessor surfaces that flag directly on non-per-scale paths.
+#[test]
+fn normalized_true_reports_true() {
+    use edgefirst_decoder::{configs, ConfigOutput};
+
+    let det = configs::Detection {
+        anchors: None,
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, FEAT, N],
+        dshape: Vec::new(),
+        normalized: Some(true),
+    };
+    let decoder = DecoderBuilder::default()
+        .add_output(ConfigOutput::Detection(det))
+        .build()
+        .expect("programmatic decoder must build");
+
+    assert_eq!(
+        decoder.normalized_boxes(),
+        Some(true),
+        "non-per-scale: normalized=true schema flag must propagate as Some(true)",
+    );
+}
+
+/// Non-per-scale path, `normalized=false` with valid `input_dims`:
+/// accessor returns `Some(false)` (raw schema flag), even though the
+/// in-place normalizer runs during `decode()`.
+///
+/// This is the key distinction from the per-scale path: non-per-scale
+/// decoders surface the raw `self.normalized` unconditionally because
+/// not every `ModelType` entry point calls `maybe_normalize_boxes_in_place`
+/// uniformly. Callers that need the post-decode coordinate state must
+/// inspect the actual box values rather than relying solely on this flag.
+///
+/// Verified here: the accessor reports `Some(false)` AND the decoded
+/// boxes are in `[0, 1]` (the helper did fire internally).
+#[test]
+fn non_per_scale_normalized_false_with_input_dims_reports_false_but_normalizes() {
+    let schema: SchemaV2 = serde_json::from_str(&schema_json(false)).unwrap();
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.5)
+        .with_iou_threshold(0.99)
+        .with_schema(schema)
+        .build()
+        .expect("schema-driven decoder must build");
+
+    assert_eq!(
+        decoder.input_dims(),
+        Some((IMG, IMG)),
+        "v2 schema must populate input_dims from the input spec",
+    );
+    // Non-per-scale: accessor returns the raw schema flag, not the
+    // post-decode state, even though input_dims is present.
+    assert_eq!(
+        decoder.normalized_boxes(),
+        Some(false),
+        "non-per-scale: accessor returns raw schema flag regardless of input_dims",
+    );
+
+    // But the in-place helper still fires during decode().
+    let owned = build_inputs();
+    let inputs: Vec<&TensorDyn> = owned.iter().collect();
+    let mut boxes: Vec<DetectBox> = Vec::with_capacity(50);
+    let mut masks: Vec<edgefirst_decoder::Segmentation> = Vec::with_capacity(50);
+    decoder
+        .decode(&inputs, &mut boxes, &mut masks)
+        .expect("pixel-space decode must succeed (EDGEAI-1303)");
+
+    assert!(!boxes.is_empty(), "expected detections to survive NMS");
+    for b in &boxes {
+        assert!(
+            (0.0..=1.0).contains(&b.bbox.xmin)
+                && (0.0..=1.0).contains(&b.bbox.ymin)
+                && (0.0..=1.0).contains(&b.bbox.xmax)
+                && (0.0..=1.0).contains(&b.bbox.ymax),
+            "decoded bbox {:?} must be in [0, 1] despite accessor reporting Some(false)",
+            b.bbox,
+        );
+    }
 }
