@@ -66,6 +66,7 @@ fn assert_coffeecup_parity(fixture_filename: &str, score_tol: f32, iou_floor: f3
         .with_schema(schema)
         .with_iou_threshold(nms.iou_threshold)
         .with_score_threshold(nms.score_threshold)
+        .with_max_det(nms.max_detections as usize)
         .build()
         .expect("build decoder");
 
@@ -74,7 +75,7 @@ fn assert_coffeecup_parity(fixture_filename: &str, score_tol: f32, iou_floor: f3
         .expect("build tensors from fixture");
     let inputs: Vec<&TensorDyn> = owned_tensors.iter().collect();
 
-    let mut hal_boxes: Vec<DetectBox> = Vec::with_capacity(300);
+    let mut hal_boxes: Vec<DetectBox> = Vec::with_capacity(nms.max_detections as usize);
     let mut hal_masks: Vec<Segmentation> = Vec::new();
     decoder
         .decode(&inputs, &mut hal_boxes, &mut hal_masks)

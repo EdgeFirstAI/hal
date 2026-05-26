@@ -164,7 +164,9 @@ def infer_tflite(model_path: Path, image_uint8_nhwc: np.ndarray) -> dict[tuple[i
     """Run TFLite inference; return {shape: raw_int8_tensor}.
 
     Binds outputs by shape (TFLite output names like ``PartitionedCall:0``
-    don't map to schema names like ``output_0``).
+    don't map to schema names like ``output_0``). Per-tensor quantization
+    parameters travel via the embedded ``edgefirst.json`` instead of being
+    threaded out of this function.
     """
     try:
         from tflite_runtime.interpreter import Interpreter
@@ -175,13 +177,11 @@ def infer_tflite(model_path: Path, image_uint8_nhwc: np.ndarray) -> dict[tuple[i
     in_det = interp.get_input_details()[0]
     interp.set_tensor(in_det["index"], image_uint8_nhwc)
     interp.invoke()
-    raw = {}
-    quants = {}
+    raw: dict[tuple[int, ...], np.ndarray] = {}
     for od in interp.get_output_details():
         t = interp.get_tensor(od["index"])
         raw[tuple(int(x) for x in t.shape)] = t
-        quants[tuple(int(x) for x in t.shape)] = od["quantization"]
-    return raw, quants
+    return raw
 
 
 def infer_onnx(model_path: Path, image_uint8_nhwc: np.ndarray) -> dict[tuple[int, ...], np.ndarray]:
@@ -195,8 +195,7 @@ def infer_onnx(model_path: Path, image_uint8_nhwc: np.ndarray) -> dict[tuple[int
     # NCHW float32 [1, 3, H, W]; normalize uint8/255.0
     img_nchw = (image_uint8_nhwc.astype(np.float32) / 255.0).transpose(0, 3, 1, 2)
     outs = sess.run(None, {in_meta.name: img_nchw})
-    raw = {tuple(int(x) for x in t.shape): t for t in outs}
-    return raw, {}
+    return {tuple(int(x) for x in t.shape): t for t in outs}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -406,9 +405,9 @@ def main() -> None:
 
     # 3. Inference
     if suffix == ".tflite":
-        raw_by_shape, _quant_by_shape = infer_tflite(model_path, image_uint8)
+        raw_by_shape = infer_tflite(model_path, image_uint8)
     else:
-        raw_by_shape, _ = infer_onnx(model_path, image_uint8)
+        raw_by_shape = infer_onnx(model_path, image_uint8)
 
     raw_by_name = raw_tensors_by_name(raw_by_shape, schema)
     dequant_by_name = dequantize_tensors(raw_by_shape, schema)
@@ -445,11 +444,14 @@ def main() -> None:
         for spec in schema["outputs"]
         if spec.get("quantization") is not None
     }
+    # Key name ``max_detections`` matches PerScaleFixture::load() so the
+    # Rust test reads the actual fixture-time cap instead of falling back
+    # to the loader's default.
     nms_cfg = {
         "mode": "class_agnostic",
         "score_threshold": cfg.score_threshold,
         "iou_threshold": cfg.iou_threshold,
-        "max_output": cfg.max_output,
+        "max_detections": cfg.max_output,
     }
     metadata = {
         "format_version": "1",
