@@ -11,21 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `Decoder::normalized_boxes()` (and the C / Python equivalents
-  `hal_decoder_normalized_boxes` / `Decoder.normalized_boxes`) now
-  reports the post-decode coordinate space, not the raw schema
-  annotation. When the schema declared `normalized: false` but the
-  decoder's `input_dims` were known, every decode path internally
-  divided bbox channels by `(W, H)` via
-  `yolo::maybe_normalize_boxes_in_place` — so the boxes the caller
-  received were already in `[0, 1]`. The accessor nonetheless returned
-  `Some(false)` ("pixel-space"), causing downstream callers that
-  trusted the flag (e.g. the GStreamer bridge) to re-divide by the
-  model dimensions and collapse detections to ~0. The accessor now
-  returns `Some(true)` whenever the internal helper runs; it returns
-  `Some(false)` only when `input_dims` is unknown and pixel-space
-  genuinely leaks out. Callers must not re-normalize when the accessor
-  reports `Some(true)`.
+- GStreamer bridge double-normalized detections: the per-scale decode
+  path divides bbox channels by `(W, H)` via
+  `yolo::maybe_normalize_boxes_in_place` before returning, but
+  `Decoder::normalized_boxes()` returned `Some(false)` ("pixel-space"),
+  causing the bridge to divide a second time and collapse detections to
+  ~0.
+
+  Fix scope: per-scale decoders now flip from `Some(false)` to
+  `Some(true)` post-decode when `input_dims` is known and non-zero.
+  Non-per-scale decoders (legacy `ModelType` dispatch, schema-v2 merge
+  program, tracked, end-to-end YOLO, ModelPack, detection-only,
+  split-proto variants) return the raw schema annotation unchanged —
+  normalization is inconsistent across entry points for those paths and
+  no single post-decode flag is correct. Callers receiving `Some(false)`
+  from a non-per-scale decoder must call `input_dims()` and divide
+  themselves if `[0, 1]` output is required.
+
+  Callers must not re-normalize when the accessor reports `Some(true)`.
 
 ## [0.24.0] - 2026-05-25
 

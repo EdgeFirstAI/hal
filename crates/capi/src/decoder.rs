@@ -1239,21 +1239,40 @@ pub unsafe extern "C" fn hal_decoder_model_type(decoder: *const HalDecoder) -> *
 
 /// Get the coordinate format of the boxes the decoder emits to the caller.
 ///
-/// Reports the **post-decode** state, not the raw schema annotation: when
-/// the schema declares pixel-space outputs but `hal_decoder_input_dims()`
-/// is known, the decoder internally divides bbox channels by `(W, H)`
-/// before returning, so the boxes the caller receives are in `[0, 1]`
-/// and this function returns `1`. Only when no input dimensions are
-/// available does pixel-space leak out and this function return `0`.
+/// The return value depends on which decode path is active:
 ///
-/// Callers MUST NOT re-normalize when this function returns `1`;
-/// dividing already-normalized coordinates by `(W, H)` again collapses
-/// detections to ~0.
+/// **Per-scale decoders** (`decoder` was built from a schema-v2 config
+/// that produces a per-scale layout): the per-scale bridge unconditionally
+/// calls `yolo::maybe_normalize_boxes_in_place` before returning, so
+/// this function reports the post-decode coordinate space:
+/// - Returns `1` when the schema declares `normalized: true`, **or**
+///   when the schema declares `normalized: false` and
+///   `hal_decoder_input_dims()` is known (the bridge divided by `(W, H)`;
+///   the caller receives `[0, 1]` boxes).
+/// - Returns `0` when the schema declares `normalized: false` and
+///   `hal_decoder_input_dims()` is zero or unknown (pixel-space leaks out).
+/// - Returns `-1` when the normalization flag is absent from the schema.
+///
+/// **All other decoders** (legacy `ModelType` dispatch, schema-v2 merge
+/// program, tracked variants, end-to-end YOLO, ModelPack, detection-only,
+/// and several split-proto variants): this function returns the raw schema
+/// annotation verbatim. Some of these paths normalize internally for
+/// certain model types or entry points and not others; because
+/// `decode` and `decode_proto` can route the same `ModelType` through
+/// paths with different normalization behavior, a single post-decode flag
+/// cannot be computed. Callers that receive `0` from this function on a
+/// non-per-scale decoder must call `hal_decoder_input_dims()` and divide
+/// themselves if they need `[0, 1]` output.
+///
+/// Callers MUST NOT re-normalize when this function returns `1`; dividing
+/// already-normalized coordinates by `(W, H)` again collapses detections
+/// to ~0.
 ///
 /// @param decoder Decoder handle
 /// @return 1 if boxes are in normalized [0,1] coordinates,
 ///         0 if boxes are in pixel coordinates,
 ///        -1 if unknown or decoder is NULL
+/// @see hal_decoder_input_dims
 #[no_mangle]
 pub unsafe extern "C" fn hal_decoder_normalized_boxes(decoder: *const HalDecoder) -> c_int {
     if decoder.is_null() {
