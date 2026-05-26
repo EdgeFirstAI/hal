@@ -290,16 +290,25 @@ impl Decoder {
         &self.model_type
     }
 
-    /// Returns the box coordinate format if known from the model config.
+    /// Returns the coordinate format of the boxes the decoder emits to
+    /// the caller.
     ///
-    /// - `Some(true)`: Boxes are in normalized [0,1] coordinates
-    /// - `Some(false)`: Boxes are in pixel coordinates relative to model input
-    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate >
-    ///   1.0)
+    /// - `Some(true)`: Boxes are in normalized `[0, 1]` coordinates
+    /// - `Some(false)`: Boxes are in pixel coordinates relative to the
+    ///   model input
+    /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
+    ///   > 1.0)
     ///
-    /// This is determined by the model config's `normalized` field, not the NMS
-    /// mode. When coordinates are in pixels or unknown, the caller may need
-    /// to normalize using the model input dimensions.
+    /// This describes the **post-decode** coordinate space, not the raw
+    /// schema annotation. When the schema declares `normalized: false`
+    /// but [`input_dims`](Self::input_dims) is known, every decode path
+    /// internally divides bbox channels by `(input_w, input_h)` before
+    /// returning, so the boxes the caller receives are already in
+    /// `[0, 1]`. In that case this accessor reports `Some(true)` to
+    /// match what the caller actually sees. Only when no input
+    /// dimensions are available (so the internal normalization cannot
+    /// run) does pixel-space leak through and this accessor reports
+    /// `Some(false)`.
     ///
     /// # Examples
     ///
@@ -316,7 +325,18 @@ impl Decoder {
     /// # }
     /// ```
     pub fn normalized_boxes(&self) -> Option<bool> {
-        self.normalized
+        // Report the effective post-decode coordinate space. The
+        // internal `self.normalized` is the *input* policy fed to
+        // `yolo::maybe_normalize_boxes_in_place`; that helper divides
+        // by `input_dims` exactly when `normalized == Some(false)` and
+        // `input_dims` is a non-zero `(w, h)`. The output the caller
+        // sees is therefore normalized in that case — surface that.
+        match (self.normalized, self.input_dims) {
+            (Some(true), _) => Some(true),
+            (Some(false), Some((w, h))) if w != 0 && h != 0 => Some(true),
+            (Some(false), _) => Some(false),
+            (None, _) => None,
+        }
     }
 
     /// Model input dimensions `(width, height)` captured from the
@@ -324,13 +344,16 @@ impl Decoder {
     /// schema did not declare an input spec (e.g. flat YAML configs
     /// or `DecoderBuilder::add_output(...)` programmatic builds).
     ///
-    /// Used together with [`normalized_boxes`](Self::normalized_boxes):
-    /// when the decoder reports `normalized_boxes() == Some(false)` and
-    /// `input_dims()` is `Some((w, h))`, the decoder divides post-NMS
-    /// bbox coordinates by `(w, h)` so they enter the canonical `[0, 1]`
-    /// range before mask cropping (EDGEAI-1303). When `input_dims()` is
-    /// `None`, the decoder cannot perform the division and the existing
-    /// `protobox` `> 2.0` reject acts as a safety net.
+    /// Drives EDGEAI-1303 normalization: when the schema declares
+    /// pixel-space outputs and `input_dims()` is `Some((w, h))`, the
+    /// decoder divides post-NMS bbox coordinates by `(w, h)` so they
+    /// enter the canonical `[0, 1]` range before mask cropping. With
+    /// the division applied, [`normalized_boxes`](Self::normalized_boxes)
+    /// reports `Some(true)` to match what the caller actually receives.
+    /// When `input_dims()` is `None` the decoder cannot perform the
+    /// division — pixel-space leaks out, `normalized_boxes()` reports
+    /// `Some(false)`, and the legacy `protobox` `> 2.0` reject acts as
+    /// a safety net.
     ///
     /// # Examples
     ///

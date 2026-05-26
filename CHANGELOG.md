@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-05-26
+
+### Fixed
+
+- `Decoder::normalized_boxes()` (and the C / Python equivalents
+  `hal_decoder_normalized_boxes` / `Decoder.normalized_boxes`) now
+  reports the post-decode coordinate space, not the raw schema
+  annotation. When the schema declared `normalized: false` but the
+  decoder's `input_dims` were known, every decode path internally
+  divided bbox channels by `(W, H)` via
+  `yolo::maybe_normalize_boxes_in_place` — so the boxes the caller
+  received were already in `[0, 1]`. The accessor nonetheless returned
+  `Some(false)` ("pixel-space"), causing downstream callers that
+  trusted the flag (e.g. the GStreamer bridge) to re-divide by the
+  model dimensions and collapse detections to ~0. The accessor now
+  returns `Some(true)` whenever the internal helper runs; it returns
+  `Some(false)` only when `input_dims` is unknown and pixel-space
+  genuinely leaks out. Callers must not re-normalize when the accessor
+  reports `Some(true)`.
+
 ## [0.24.0] - 2026-05-25
 
 ### Added

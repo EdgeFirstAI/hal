@@ -1237,7 +1237,18 @@ pub unsafe extern "C" fn hal_decoder_model_type(decoder: *const HalDecoder) -> *
     str_to_c_string(&snake)
 }
 
-/// Get whether the decoder produces normalized box coordinates.
+/// Get the coordinate format of the boxes the decoder emits to the caller.
+///
+/// Reports the **post-decode** state, not the raw schema annotation: when
+/// the schema declares pixel-space outputs but `hal_decoder_input_dims()`
+/// is known, the decoder internally divides bbox channels by `(W, H)`
+/// before returning, so the boxes the caller receives are in `[0, 1]`
+/// and this function returns `1`. Only when no input dimensions are
+/// available does pixel-space leak out and this function return `0`.
+///
+/// Callers MUST NOT re-normalize when this function returns `1`;
+/// dividing already-normalized coordinates by `(W, H)` again collapses
+/// detections to ~0.
 ///
 /// @param decoder Decoder handle
 /// @return 1 if boxes are in normalized [0,1] coordinates,

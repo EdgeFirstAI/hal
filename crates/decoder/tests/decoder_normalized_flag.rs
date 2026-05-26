@@ -8,6 +8,13 @@
 //! (which emit pixel-space boxes at imgsz=640) failed end-to-end
 //! decoding with `InvalidShape("…un-normalized…")` even though
 //! the schema correctly described their coordinate space.
+//!
+//! Also pins the public `Decoder::normalized_boxes()` contract: when
+//! the schema declares pixel-space outputs AND `input_dims` is known,
+//! the in-place normalizer runs internally, so the accessor reports
+//! `Some(true)` (the post-decode state), not the raw schema flag.
+//! Callers must not re-normalize when the accessor reports `Some(true)`
+//! — doing so collapses coordinates to ~0.
 
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox};
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -118,8 +125,10 @@ fn pixel_space_input_with_normalized_false_decodes() {
 
     assert_eq!(
         decoder.normalized_boxes(),
-        Some(false),
-        "schema declared normalized: false; decoder should report Some(false)",
+        Some(true),
+        "schema declared normalized: false but input_dims are known, so the \
+         decoder internally normalizes; the accessor must report the \
+         post-decode contract (Some(true)), not the raw schema flag",
     );
     assert_eq!(
         decoder.input_dims(),
@@ -296,7 +305,10 @@ fn split_schema_pixel_space_with_normalized_false_decodes() {
         .build()
         .expect("split schema must build");
 
-    assert_eq!(decoder.normalized_boxes(), Some(false));
+    // Post-decode contract: schema says pixel-space, input_dims known,
+    // so the SplitSegDet path internally normalizes — accessor reports
+    // Some(true) to match what the caller actually receives.
+    assert_eq!(decoder.normalized_boxes(), Some(true));
     assert_eq!(decoder.input_dims(), Some((IMG, IMG)));
 
     let owned = build_split_inputs();
@@ -320,4 +332,41 @@ fn split_schema_pixel_space_with_normalized_false_decodes() {
             b.bbox,
         );
     }
+}
+
+/// `normalized_boxes()` contract: when the schema declares pixel-space
+/// outputs (`normalized: false`) but `input_dims` is unknown, the
+/// in-place normalizer cannot run and the decoder leaks pixel-space
+/// boxes — the accessor must report `Some(false)` in that case.
+///
+/// Constructed programmatically via `add_output` to deliberately leave
+/// `input_dims` unset (the v2 schema path would always populate them).
+#[test]
+fn normalized_false_without_input_dims_reports_false() {
+    use edgefirst_decoder::{configs, ConfigOutput};
+
+    let det = configs::Detection {
+        anchors: None,
+        decoder: configs::DecoderType::Ultralytics,
+        quantization: None,
+        shape: vec![1, FEAT, N],
+        dshape: Vec::new(),
+        normalized: Some(false),
+    };
+    let decoder = DecoderBuilder::default()
+        .add_output(ConfigOutput::Detection(det))
+        .build()
+        .expect("programmatic decoder must build");
+
+    assert_eq!(
+        decoder.input_dims(),
+        None,
+        "programmatic build must leave input_dims unset",
+    );
+    assert_eq!(
+        decoder.normalized_boxes(),
+        Some(false),
+        "without input_dims the in-place normalizer cannot run; \
+         pixel-space leaks out, so the accessor must report Some(false)",
+    );
 }
