@@ -300,15 +300,24 @@ impl Decoder {
     ///   > 1.0)
     ///
     /// This describes the **post-decode** coordinate space, not the raw
-    /// schema annotation. When the schema declares `normalized: false`
-    /// but [`input_dims`](Self::input_dims) is known, every decode path
-    /// internally divides bbox channels by `(input_w, input_h)` before
-    /// returning, so the boxes the caller receives are already in
-    /// `[0, 1]`. In that case this accessor reports `Some(true)` to
-    /// match what the caller actually sees. Only when no input
-    /// dimensions are available (so the internal normalization cannot
-    /// run) does pixel-space leak through and this accessor reports
-    /// `Some(false)`.
+    /// schema annotation. The decoder applies EDGEAI-1303 normalization
+    /// (dividing bbox channels by `(input_w, input_h)`) on a per-path
+    /// basis, not unconditionally. The per-scale fast path always runs
+    /// the helper before returning, so when that path is active and
+    /// the schema declares `normalized: false` with valid
+    /// [`input_dims`](Self::input_dims), this accessor reports
+    /// `Some(true)` to match what the caller actually receives.
+    ///
+    /// All other paths (legacy `ModelType` dispatch and the schema-v2
+    /// merge program) only invoke the helper for a subset of model
+    /// types and entry points — detection-only YOLO, end-to-end YOLO,
+    /// ModelPack, tracked, and several split-proto variants do **not**
+    /// normalize. Because `Decoder::decode` and `Decoder::decode_proto`
+    /// can route the same `ModelType` through paths with different
+    /// normalization behavior, this accessor reports the raw schema
+    /// annotation (`self.normalized`) for non-per-scale decoders and
+    /// leaves it to the caller to handle pixel-space output (e.g.
+    /// divide by `input_dims()` themselves).
     ///
     /// # Examples
     ///
@@ -325,17 +334,24 @@ impl Decoder {
     /// # }
     /// ```
     pub fn normalized_boxes(&self) -> Option<bool> {
-        // Report the effective post-decode coordinate space. The
-        // internal `self.normalized` is the *input* policy fed to
-        // `yolo::maybe_normalize_boxes_in_place`; that helper divides
-        // by `input_dims` exactly when `normalized == Some(false)` and
-        // `input_dims` is a non-zero `(w, h)`. The output the caller
-        // sees is therefore normalized in that case — surface that.
-        match (self.normalized, self.input_dims) {
-            (Some(true), _) => Some(true),
-            (Some(false), Some((w, h))) if w != 0 && h != 0 => Some(true),
-            (Some(false), _) => Some(false),
-            (None, _) => None,
+        // Per-scale is the only path whose `decode`/`decode_proto`
+        // entry points unconditionally call
+        // `yolo::maybe_normalize_boxes_in_place` before returning, so
+        // it is the only path where `normalized == Some(false)` with
+        // valid `input_dims` upgrades to a post-decode `Some(true)`.
+        // Other paths invoke the helper inconsistently across
+        // `ModelType` variants and tracked/proto entry points — surface
+        // the raw schema flag there and let callers handle pixel-space
+        // output explicitly.
+        if self.per_scale.is_some() {
+            match (self.normalized, self.input_dims) {
+                (Some(true), _) => Some(true),
+                (Some(false), Some((w, h))) if w != 0 && h != 0 => Some(true),
+                (Some(false), _) => Some(false),
+                (None, _) => None,
+            }
+        } else {
+            self.normalized
         }
     }
 
@@ -344,16 +360,18 @@ impl Decoder {
     /// schema did not declare an input spec (e.g. flat YAML configs
     /// or `DecoderBuilder::add_output(...)` programmatic builds).
     ///
-    /// Drives EDGEAI-1303 normalization: when the schema declares
-    /// pixel-space outputs and `input_dims()` is `Some((w, h))`, the
-    /// decoder divides post-NMS bbox coordinates by `(w, h)` so they
-    /// enter the canonical `[0, 1]` range before mask cropping. With
-    /// the division applied, [`normalized_boxes`](Self::normalized_boxes)
-    /// reports `Some(true)` to match what the caller actually receives.
-    /// When `input_dims()` is `None` the decoder cannot perform the
-    /// division — pixel-space leaks out, `normalized_boxes()` reports
-    /// `Some(false)`, and the legacy `protobox` `> 2.0` reject acts as
-    /// a safety net.
+    /// Drives EDGEAI-1303 normalization on the per-scale fast path:
+    /// when the schema declares pixel-space outputs and `input_dims()`
+    /// is `Some((w, h))`, the per-scale bridge divides post-NMS bbox
+    /// coordinates by `(w, h)` so they enter the canonical `[0, 1]`
+    /// range before mask cropping, and
+    /// [`normalized_boxes`](Self::normalized_boxes) reports
+    /// `Some(true)` to match. Legacy `ModelType` dispatch and the
+    /// schema-v2 merge program apply this division for some model
+    /// types and entry points but not others — see
+    /// [`normalized_boxes`](Self::normalized_boxes) for the per-path
+    /// contract. The legacy `protobox` `> 2.0` reject acts as a safety
+    /// net for paths that emit pixel-space coordinates.
     ///
     /// # Examples
     ///

@@ -1090,9 +1090,11 @@ impl DecoderBuilder {
         // schema. Override to `Some(false)` so the per-scale bridge's
         // call to `yolo::maybe_normalize_boxes_in_place` fires and
         // divides by `input_dims`, yielding `[0, 1]` output. The
-        // accessor `Decoder::normalized_boxes()` consults both this
-        // field and `input_dims` to report the *post-decode* contract
-        // (it returns `Some(true)` whenever the helper will run).
+        // accessor `Decoder::normalized_boxes()` only applies the
+        // pixel→normalized upgrade for the per-scale path (it is the
+        // sole path that unconditionally normalizes on both `decode`
+        // and `decode_proto`); non-per-scale paths surface the raw
+        // flag.
         let normalized = if per_scale_plan.is_some() {
             Some(false)
         } else {
