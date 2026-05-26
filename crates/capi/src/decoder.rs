@@ -1239,35 +1239,36 @@ pub unsafe extern "C" fn hal_decoder_model_type(decoder: *const HalDecoder) -> *
 
 /// Get the coordinate format of the boxes the decoder emits to the caller.
 ///
-/// Two decode paths invoke `yolo::maybe_normalize_boxes_in_place`
+/// Four decode paths invoke `yolo::maybe_normalize_boxes_in_place`
 /// uniformly across every entry point (`hal_decoder_decode`,
-/// `hal_decoder_decode_proto`, and tracked variants). For these paths,
-/// this function reports the post-decode coordinate space rather than the
-/// raw schema annotation:
+/// `hal_decoder_decode_proto`, and tracked variants, both quantized and
+/// float). For these paths this function reports the post-decode
+/// coordinate space rather than the raw schema annotation:
 ///
-/// - **Per-scale decoders** (schema-v2 per-scale layout, DFL/LTRB
-///   dist2bbox path): the bridge always normalizes before returning.
-/// - **`ModelType::YoloSegDet`** (combined-output segmentation models):
-///   the helper fires across all entry points, including tracker paths,
-///   for both quantized and float variants.
+/// - Per-scale decoders (schema-v2 per-scale layout, DFL/LTRB dist2bbox
+///   path): the bridge always normalizes before returning.
+/// - `ModelType::YoloSegDet`: combined-output segmentation models; the
+///   helper fires across all entry points and element-type variants.
+/// - `ModelType::YoloSplitSegDet`: split-output segmentation models;
+///   aligned across `decode`, `decode_proto`, `decode_tracked`, and
+///   `decode_tracked_proto` for both quantized and float variants.
+/// - `ModelType::YoloSegDet2Way`: two-way segmentation models; same
+///   four entry points and both element-type variants.
 ///
-/// For both of these paths:
-/// - Returns `1` when the schema declares `normalized: true`, **or**
-///   when the schema declares `normalized: false` and
-///   `hal_decoder_input_dims()` is known (the decoder already divided by
-///   `(W, H)`; the caller receives `[0, 1]` boxes).
-/// - Returns `0` when the schema declares `normalized: false` and
-///   `hal_decoder_input_dims()` is zero or unknown (pixel-space leaks
-///   out).
+/// For all four paths, when the schema declares `normalized: false` and
+/// `hal_decoder_input_dims()` is known (non-zero), the decoder has
+/// already divided by `(W, H)` and the caller receives `[0, 1]` boxes:
+/// - Returns `1` when `normalized: true` OR when `normalized: false`
+///   with valid input dims (division already applied).
+/// - Returns `0` when `normalized: false` and input dims are unknown
+///   (pixel-space leaks out).
 /// - Returns `-1` when the normalization flag is absent from the schema.
 ///
-/// **All other decoders** (legacy `ModelType` dispatch other than
-/// `YoloSegDet`, including `YoloSplitSegDet`, `YoloSegDet2Way`,
-/// end-to-end YOLO, ModelPack, and detection-only models): this function
-/// returns the raw schema annotation verbatim. These paths invoke the
-/// normalization helper only on a subset of entry points. Callers that
-/// receive `0` from these decoders must call `hal_decoder_input_dims()`
-/// and divide themselves if `[0, 1]` output is required.
+/// All other decoders — detection-only (`YoloDet`, `YoloSplitDet`),
+/// end-to-end YOLO (`YoloEndToEnd*`), and `ModelPack*` — return the
+/// raw schema annotation verbatim. Callers that receive `0` from these
+/// model types must call `hal_decoder_input_dims()` and divide themselves
+/// if `[0, 1]` output is required.
 ///
 /// Callers MUST NOT re-normalize when this function returns `1`; dividing
 /// already-normalized coordinates by `(W, H)` again collapses detections

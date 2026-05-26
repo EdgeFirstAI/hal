@@ -958,30 +958,34 @@ impl PyDecoder {
     /// - ``None``: Unknown, caller must infer (e.g., check if any
     ///   coordinate > 1.0)
     ///
-    /// Two decode paths invoke the normalization helper uniformly across
+    /// Four decode paths invoke the normalization helper uniformly across
     /// all entry points (``decode``, ``decode_proto``, ``decode_tracked``,
-    /// both quantized and float). For these, this getter reports the
-    /// post-decode coordinate space rather than the raw schema annotation:
+    /// ``decode_tracked_proto``, both quantized and float). For these,
+    /// this getter reports the post-decode coordinate space rather than
+    /// the raw schema annotation:
     ///
-    /// **Per-scale decoders**: the bridge always divides by ``(W, H)``
-    /// before returning. When the schema declares ``normalized: false``
-    /// and :attr:`input_dims` is a valid tuple, this returns ``True``
-    /// (the bridge already divided; the caller receives ``[0, 1]``
-    /// boxes). When :attr:`input_dims` is ``None`` or zero, pixel-space
-    /// leaks out and this returns ``False``.
+    /// - **Per-scale decoders**: the bridge always divides by ``(W, H)``
+    ///   before returning.
+    /// - **:attr:`ModelType.YoloSegDet`**: combined-output segmentation
+    ///   models; helper fires across all entry points and element-type
+    ///   variants.
+    /// - **:attr:`ModelType.YoloSplitSegDet`**: split-output segmentation
+    ///   models; aligned across all four entry points for both quantized
+    ///   and float variants.
+    /// - **:attr:`ModelType.YoloSegDet2Way`**: two-way segmentation
+    ///   models; same four entry points and both element-type variants.
     ///
-    /// **``ModelType.YoloSegDet``**: combined-output segmentation models
-    /// whose quantized and float, tracked and untracked, masks and proto
-    /// variants each call the helper after NMS. Same return-value
-    /// semantics as the per-scale path above.
+    /// For all four paths, when the schema declares ``normalized: false``
+    /// and :attr:`input_dims` is a valid ``(W, H)`` tuple, the decoder
+    /// has already divided and returns ``True``. When :attr:`input_dims`
+    /// is ``None`` or zero, pixel-space leaks out and returns ``False``.
     ///
-    /// **All other decoders** (legacy ``ModelType`` dispatch other than
-    /// ``YoloSegDet``, including ``YoloSplitSegDet``, ``YoloSegDet2Way``,
-    /// end-to-end YOLO, ModelPack, detection-only): returns the raw schema
-    /// annotation. These paths invoke normalization only on a subset of
-    /// entry points. Callers that receive ``False`` from these decoders
-    /// must consult :attr:`input_dims` and divide themselves if ``[0, 1]``
-    /// output is required.
+    /// **All other decoders** — detection-only (``YoloDet``,
+    /// ``YoloSplitDet``), end-to-end YOLO (``YoloEndToEnd*``), and
+    /// ``ModelPack*`` — return the raw schema annotation. Callers that
+    /// receive ``False`` from these model types must consult
+    /// :attr:`input_dims` and divide themselves if ``[0, 1]`` output is
+    /// required.
     ///
     /// Callers must not re-normalize when this returns ``True``; dividing
     /// already-normalized coordinates by ``(W, H)`` collapses detections
@@ -996,17 +1000,18 @@ impl PyDecoder {
     ///
     /// Set to a non-``None`` value via the ``input_dims`` constructor
     /// kwarg, or sourced from the schema's ``input.shape`` /
-    /// ``input.dshape`` when building from a v2 schema. On the
-    /// **per-scale** path and for **``ModelType.YoloSegDet``**, when the
-    /// schema declares pixel-space outputs and ``input_dims`` is a valid
-    /// tuple, the decoder divides post-NMS box coordinates by ``(W, H)``
-    /// so they enter the canonical ``[0, 1]`` range before mask cropping;
-    /// :attr:`normalized_boxes` then reports ``True`` to match. On all
-    /// other decode paths the division is applied only for a subset of
-    /// model types and entry points — see :attr:`normalized_boxes` for
-    /// the per-path contract. When ``None``, those two paths skip
-    /// normalization and pixel-space boxes will trip the ``protobox``
-    /// safety guard.
+    /// ``input.dshape`` when building from a v2 schema. On the per-scale
+    /// path and for ``ModelType.YoloSegDet``, ``ModelType.YoloSplitSegDet``,
+    /// and ``ModelType.YoloSegDet2Way``, when the schema declares
+    /// pixel-space outputs and ``input_dims`` is a valid tuple, the
+    /// decoder divides post-NMS box coordinates by ``(W, H)`` so they
+    /// enter the canonical ``[0, 1]`` range before mask cropping;
+    /// :attr:`normalized_boxes` then reports ``True`` to match. All other
+    /// decode paths (detection-only, end-to-end YOLO, ModelPack) do not
+    /// apply this division — see :attr:`normalized_boxes` for the
+    /// per-path contract. When ``None``, the four uniform-normalization
+    /// paths skip division and pixel-space boxes will trip the
+    /// ``protobox`` safety guard.
     #[getter(input_dims)]
     fn get_input_dims(&self) -> Option<(usize, usize)> {
         self.decoder.input_dims()
