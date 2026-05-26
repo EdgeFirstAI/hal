@@ -1730,7 +1730,7 @@ macro_rules! process_tracked_yolo_segmentation {
                     postprocess_yolo_seg(&box_tensor, num_protos);
 
                 // Run NMS and box extraction
-                let detect_boxes = impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
+                let mut detect_boxes = impl_yolo_split_segdet_quant_get_boxes::<XYWH, _, _>(
                     (boxes_tensor, quant_boxes),
                     (scores_tensor, quant_boxes),
                     $self.score_threshold,
@@ -1738,6 +1738,17 @@ macro_rules! process_tracked_yolo_segmentation {
                     $self.nms,
                     $self.pre_nms_top_k,
                     $self.max_det,
+                );
+
+                // Pull pixel-space boxes into `[0, 1]` before tracking so
+                // tracked locations, masks, and accessor-reported coords
+                // share a single space across all `YoloSegDet` entry
+                // points (`decode`, `decode_proto`, `decode_tracked`,
+                // `decode_tracked_proto`) — see EDGEAI-1303.
+                crate::yolo::maybe_normalize_boxes_in_place(
+                    &mut detect_boxes,
+                    $self.normalized,
+                    $self.input_dims,
                 );
 
                 // Update tracker logic
@@ -2086,7 +2097,7 @@ impl Decoder {
         let num_protos = protos_tensor.shape()[2];
         let (boxes_tensor, scores_tensor, mask_tensor) =
             postprocess_yolo_seg(&boxes_tensor, num_protos);
-        let boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
+        let mut boxes = impl_yolo_segdet_get_boxes::<XYWH, _, _>(
             boxes_tensor,
             scores_tensor,
             self.score_threshold,
@@ -2095,6 +2106,13 @@ impl Decoder {
             self.pre_nms_top_k,
             self.max_det,
         );
+
+        // Pull pixel-space boxes into `[0, 1]` before tracking so tracked
+        // locations, masks, and accessor-reported coords share a single
+        // space across all `YoloSegDet` entry points (`decode`,
+        // `decode_proto`, `decode_tracked`, `decode_tracked_proto`) —
+        // see EDGEAI-1303.
+        crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
         let (new_boxes, old_boxes) =
             Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
