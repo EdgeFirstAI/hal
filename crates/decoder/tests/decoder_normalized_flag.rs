@@ -19,21 +19,29 @@
 //!   `maybe_normalize_boxes_in_place`. Pinned by `per_scale_parity.rs`
 //!   and `decoder/tests.rs` (hailo fixture).
 //!
-//! * **Non-per-scale paths**: the accessor returns the raw schema flag
-//!   (`self.normalized`) regardless of `input_dims`. Even when the
-//!   in-place helper runs internally (e.g. `YoloSegDet`, `YoloSplitSegDet`
-//!   on `decode`), the accessor under-claims because not every entry
-//!   point on those `ModelType` variants is uniform — callers must handle
-//!   pixel-space output explicitly when the flag says `Some(false)`.
+//! * **`ModelType::YoloSegDet`**: as of the EDGEAI-1303 tracker extension
+//!   in this release, `decode`, `decode_proto`, `decode_tracked`, and
+//!   `decode_tracked_proto` all call `maybe_normalize_boxes_in_place`
+//!   uniformly. The accessor therefore upgrades `normalized=false` +
+//!   valid `input_dims` to `Some(true)`, matching the per-scale contract.
+//!
+//! * **`YoloSplitSegDet`, `YoloSegDet2Way`, and all other non-per-scale
+//!   paths**: the accessor returns the raw schema flag (`self.normalized`)
+//!   regardless of `input_dims`. These model types do not invoke the
+//!   in-place helper uniformly across all entry points — callers must
+//!   handle pixel-space output explicitly when the flag says `Some(false)`.
 //!
 //! This file pins:
-//! (a) non-per-scale raw-flag passthrough (`pixel_space_input_with_normalized_false_decodes`
-//!     and `split_schema_pixel_space_with_normalized_false_decodes`),
-//! (b) in-place normalization actually runs despite the accessor
-//!     under-claiming (the `for b in &boxes` coordinate-range assertions),
-//! (c) no-input-dims passthrough (`normalized_false_without_input_dims_reports_false`),
-//! (d) `normalized=None` passthrough (`normalized_none_reports_none`),
-//! (e) `normalized=true` direct passthrough (`normalized_true_reports_true`).
+//! (a) `YoloSegDet` accessor upgrade (`pixel_space_input_with_normalized_false_decodes`
+//!     and `yolo_segdet_tracker_path_normalizes`),
+//! (b) in-place normalization verifiable by coordinate-range assertions
+//!     (`for b in &boxes` checks throughout),
+//! (c) non-per-scale, non-`YoloSegDet` raw-flag passthrough
+//!     (`split_schema_pixel_space_with_normalized_false_decodes` and
+//!     `non_per_scale_non_yolo_segdet_normalized_false_with_input_dims_reports_false`),
+//! (d) no-input-dims passthrough (`normalized_false_without_input_dims_reports_false`),
+//! (e) `normalized=None` passthrough (`normalized_none_reports_none`),
+//! (f) `normalized=true` direct passthrough (`normalized_true_reports_true`).
 
 use edgefirst_decoder::{schema::SchemaV2, DecoderBuilder, DetectBox};
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
@@ -142,16 +150,15 @@ fn pixel_space_input_with_normalized_false_decodes() {
         .build()
         .expect("schema-driven decoder must build");
 
-    // Non-per-scale path: the accessor surfaces the raw schema flag.
-    // The in-place normalizer still runs internally (confirmed below by
-    // coordinate-range assertions), but `normalized_boxes()` under-claims
-    // because not every YoloSegDet entry point is uniform across decode
-    // variants — see `Decoder::normalized_boxes` rustdoc.
+    // YoloSegDet now normalizes uniformly across all entry points (decode,
+    // decode_proto, decode_tracked) after EDGEAI-1303 was extended to the
+    // tracker paths in this release — accessor upgrades Some(false)+input_dims
+    // to Some(true) to match.
     assert_eq!(
         decoder.normalized_boxes(),
-        Some(false),
-        "non-per-scale YoloSegDet: accessor returns raw schema flag; \
-         in-place normalization runs internally but is not reflected here",
+        Some(true),
+        "YoloSegDet: accessor must upgrade Some(false)+input_dims to Some(true) \
+         now that every entry point calls maybe_normalize_boxes_in_place uniformly",
     );
     assert_eq!(
         decoder.input_dims(),
@@ -328,12 +335,10 @@ fn split_schema_pixel_space_with_normalized_false_decodes() {
         .build()
         .expect("split schema must build");
 
-    // Non-per-scale path: accessor returns the raw schema flag.
-    // YoloSplitSegDet calls maybe_normalize_boxes_in_place on decode()
-    // but not uniformly across all entry points, so normalized_boxes()
-    // under-claims — returns Some(false) (the raw schema flag), not
-    // Some(true). Coordinate-range assertions below confirm the helper
-    // still ran internally.
+    // YoloSplitSegDet is intentionally still asymmetric (tracker macro and
+    // proto variants don't call the helper) — accessor returns raw Some(false).
+    // See Decoder::normalized_boxes rustdoc. Coordinate-range assertions below
+    // confirm the helper still ran internally on the decode() path.
     assert_eq!(decoder.normalized_boxes(), Some(false));
     assert_eq!(decoder.input_dims(), Some((IMG, IMG)));
 
@@ -458,20 +463,24 @@ fn normalized_true_reports_true() {
     );
 }
 
-/// Non-per-scale path, `normalized=false` with valid `input_dims`:
-/// accessor returns `Some(false)` (raw schema flag), even though the
-/// in-place normalizer runs during `decode()`.
+/// Regression for the architect's `e18873d` change: the `decode_tracked` path
+/// on a `YoloSegDet` schema with `normalized=false` and valid `input_dims` must:
 ///
-/// This is the key distinction from the per-scale path: non-per-scale
-/// decoders surface the raw `self.normalized` unconditionally because
-/// not every `ModelType` entry point calls `maybe_normalize_boxes_in_place`
-/// uniformly. Callers that need the post-decode coordinate state must
-/// inspect the actual box values rather than relying solely on this flag.
+/// 1. Report `Some(true)` from `normalized_boxes()` — proving the accessor
+///    upgrade arm covers `ModelType::YoloSegDet` on the tracker path.
+/// 2. Produce boxes in `[0, 1]` — proving `maybe_normalize_boxes_in_place`
+///    fires inside the tracker dispatch (via `process_tracked_yolo_segdet_float`
+///    and the quantized macro equivalent).
 ///
-/// Verified here: the accessor reports `Some(false)` AND the decoded
-/// boxes are in `[0, 1]` (the helper did fire internally).
+/// Without the `e18873d` patch, `decode_tracked` on this schema skipped the
+/// helper and returned pixel-space coordinates, silently breaking every caller
+/// that relied on the accessor's truthful `Some(true)` signal. This test
+/// ensures a future refactor cannot reintroduce that asymmetry without failing.
+#[cfg(feature = "tracker")]
 #[test]
-fn non_per_scale_normalized_false_with_input_dims_reports_false_but_normalizes() {
+fn yolo_segdet_tracker_path_normalizes() {
+    use edgefirst_tracker::ByteTrackBuilder;
+
     let schema: SchemaV2 = serde_json::from_str(&schema_json(false)).unwrap();
     let decoder = DecoderBuilder::default()
         .with_score_threshold(0.5)
@@ -480,27 +489,97 @@ fn non_per_scale_normalized_false_with_input_dims_reports_false_but_normalizes()
         .build()
         .expect("schema-driven decoder must build");
 
+    // Accessor must upgrade: YoloSegDet + normalized=false + input_dims → Some(true).
+    assert_eq!(
+        decoder.normalized_boxes(),
+        Some(true),
+        "YoloSegDet tracker path: accessor must report Some(true) after EDGEAI-1303 \
+         was extended to cover decode_tracked in e18873d",
+    );
+
+    let owned = build_inputs();
+    let inputs: Vec<&TensorDyn> = owned.iter().collect();
+
+    let mut tracker = ByteTrackBuilder::new()
+        .track_update(0.1)
+        .track_high_conf(0.3)
+        .build();
+    let mut output_boxes: Vec<DetectBox> = Vec::with_capacity(50);
+    let mut output_masks: Vec<edgefirst_decoder::Segmentation> = Vec::with_capacity(50);
+    let mut output_tracks: Vec<edgefirst_decoder::TrackInfo> = Vec::with_capacity(50);
+
+    decoder
+        .decode_tracked(
+            &mut tracker,
+            0,
+            &inputs,
+            &mut output_boxes,
+            &mut output_masks,
+            &mut output_tracks,
+        )
+        .expect("YoloSegDet decode_tracked must succeed with pixel-space input");
+
+    assert!(
+        !output_boxes.is_empty(),
+        "expected detections to survive NMS on the tracker path",
+    );
+    for b in &output_boxes {
+        assert!(
+            (0.0..=1.0).contains(&b.bbox.xmin)
+                && (0.0..=1.0).contains(&b.bbox.ymin)
+                && (0.0..=1.0).contains(&b.bbox.xmax)
+                && (0.0..=1.0).contains(&b.bbox.ymax),
+            "tracker-path bbox {:?} not in [0, 1]; maybe_normalize_boxes_in_place \
+             did not fire in decode_tracked — e18873d regression",
+            b.bbox,
+        );
+    }
+}
+
+/// Non-per-scale, non-`YoloSegDet` path (`YoloSplitSegDet`), `normalized=false`
+/// with valid `input_dims`: accessor returns `Some(false)` (raw schema flag)
+/// because `YoloSplitSegDet` is intentionally still asymmetric — its tracker
+/// macro and proto variants do not call `maybe_normalize_boxes_in_place`
+/// uniformly. The `decode()` entry point does invoke the helper internally
+/// (confirmed by the coordinate-range assertions), but because not all entry
+/// points are uniform the accessor does not upgrade to `Some(true)`.
+///
+/// This pins the contract that only `per_scale` and `ModelType::YoloSegDet`
+/// trigger the upgrade arm; other `ModelType` variants must remain at their
+/// raw schema annotation. See `Decoder::normalized_boxes` rustdoc.
+#[test]
+fn non_per_scale_non_yolo_segdet_normalized_false_with_input_dims_reports_false() {
+    let schema: SchemaV2 = serde_json::from_str(&split_schema_json(false)).unwrap();
+    let decoder = DecoderBuilder::default()
+        .with_score_threshold(0.5)
+        .with_iou_threshold(0.99)
+        .with_schema(schema)
+        .build()
+        .expect("split schema must build");
+
     assert_eq!(
         decoder.input_dims(),
         Some((IMG, IMG)),
         "v2 schema must populate input_dims from the input spec",
     );
-    // Non-per-scale: accessor returns the raw schema flag, not the
-    // post-decode state, even though input_dims is present.
+    // YoloSplitSegDet is intentionally still asymmetric (tracker macro and
+    // proto variants do not call the helper) — accessor returns the raw schema
+    // flag Some(false), not Some(true), even though input_dims is present.
     assert_eq!(
         decoder.normalized_boxes(),
         Some(false),
-        "non-per-scale: accessor returns raw schema flag regardless of input_dims",
+        "YoloSplitSegDet: accessor must return raw schema flag; \
+         only per_scale and YoloSegDet trigger the upgrade arm",
     );
 
-    // But the in-place helper still fires during decode().
-    let owned = build_inputs();
+    // The in-place helper still fires on the decode() entry point.
+    let owned = build_split_inputs();
     let inputs: Vec<&TensorDyn> = owned.iter().collect();
     let mut boxes: Vec<DetectBox> = Vec::with_capacity(50);
     let mut masks: Vec<edgefirst_decoder::Segmentation> = Vec::with_capacity(50);
     decoder
         .decode(&inputs, &mut boxes, &mut masks)
-        .expect("pixel-space decode must succeed (EDGEAI-1303)");
+        .expect("split-schema pixel-space decode must succeed (EDGEAI-1303)");
 
     assert!(!boxes.is_empty(), "expected detections to survive NMS");
     for b in &boxes {
