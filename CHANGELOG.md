@@ -18,15 +18,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   causing the bridge to divide a second time and collapse detections to
   ~0.
 
-  Fix scope: per-scale decoders now flip from `Some(false)` to
-  `Some(true)` post-decode when `input_dims` is known and non-zero.
-  Non-per-scale decoders (legacy `ModelType` dispatch, schema-v2 merge
-  program, tracked, end-to-end YOLO, ModelPack, detection-only,
-  split-proto variants) return the raw schema annotation unchanged —
-  normalization is inconsistent across entry points for those paths and
-  no single post-decode flag is correct. Callers receiving `Some(false)`
-  from a non-per-scale decoder must call `input_dims()` and divide
-  themselves if `[0, 1]` output is required.
+  Fix scope: two paths now flip from `Some(false)` to `Some(true)`
+  post-decode when `input_dims` is known and non-zero:
+
+  1. **Per-scale decoders** (schema-v2 per-scale layout, DFL/LTRB
+     dist2bbox path): the bridge always normalizes before returning and
+     the accessor was updated to match.
+  2. **`ModelType::YoloSegDet`**: the
+     `yolo::maybe_normalize_boxes_in_place` helper was missing from the
+     tracker code paths (`process_tracked_yolo_segmentation!` macro and
+     `process_tracked_yolo_segdet_float`). Those calls are now present,
+     making normalization uniform across `decode`, `decode_proto`,
+     `decode_tracked`, and `decode_tracked_proto` for both quantized and
+     float variants. `Decoder::normalized_boxes()` was extended to
+     upgrade `YoloSegDet` alongside the per-scale path via the new
+     `legacy_path_normalizes_uniformly()` predicate.
+
+  All other model types (`YoloSplitSegDet`, `YoloSegDet2Way`,
+  end-to-end YOLO, ModelPack, detection-only, and schema-v2 merge
+  program) return the raw schema annotation unchanged — normalization is
+  not uniform across entry points for those paths and the accessor would
+  lie if it upgraded them. Callers receiving `Some(false)` from these
+  decoders must call `input_dims()` and divide themselves if `[0, 1]`
+  output is required.
 
   Callers must not re-normalize when the accessor reports `Some(true)`.
 
