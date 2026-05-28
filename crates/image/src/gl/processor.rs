@@ -3305,15 +3305,15 @@ impl GLProcessorST {
                 );
             }
             // Reset the texture swizzle to identity before returning. The
-            // loop above left `TEXTURE_SWIZZLE_R` pointing at GL_BLUE (the
-            // last iteration's value) so that pass 3 would write the blue
-            // plane. The GLES spec says `GL_TEXTURE_SWIZZLE_*` is undefined
-            // for `GL_TEXTURE_EXTERNAL_OES`, but NXP Vivante and Mali drivers
-            // honor it on external textures and the swizzle persists across
-            // subsequent samples — including the bg blit in
+            // loop above left `TEXTURE_SWIZZLE_R` pointing at the last
+            // requested planar channel (`GL_BLUE` for RGB, `GL_ALPHA` when
+            // `alpha` is true). The GLES spec says `GL_TEXTURE_SWIZZLE_*` is
+            // undefined for `GL_TEXTURE_EXTERNAL_OES`, but NXP Vivante and
+            // Mali drivers honor it on external textures and the swizzle
+            // persists across subsequent samples — including the bg blit in
             // `draw_decoded_masks`, which then channel-permutes the entire
-            // overlay's background (`canvas.R := src.B`). Restoring identity
-            // before any later sampler sees this texture is the safe move.
+            // overlay's background. Restoring identity before any later
+            // sampler sees this texture is the safe move.
             gls::gl::TexParameteri(
                 texture_target,
                 gls::gl::TEXTURE_SWIZZLE_R,
@@ -3450,8 +3450,10 @@ impl GLProcessorST {
             // Reset the texture swizzle to identity (see the matching
             // comment in `draw_camera_texture_to_rgb_planar` above). This
             // path operates on a `TEXTURE_2D` intermediate, which honors the
-            // swizzle per spec — leaving `TEXTURE_SWIZZLE_R = GL_BLUE`
-            // poisons every later sampler bound to this texture object.
+            // swizzle per spec — leaving `TEXTURE_SWIZZLE_R` set to the last
+            // planar channel selected (for example `GL_BLUE` for RGB or
+            // `GL_ALPHA` for RGBA) poisons every later sampler bound to this
+            // texture object.
             gls::gl::TexParameteri(
                 texture_target,
                 gls::gl::TEXTURE_SWIZZLE_R,
