@@ -48,6 +48,15 @@ pub struct GLProcessorST {
     has_float_linear: bool,
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
     pub(super) has_bgra: bool,
+    /// Whether `GL_EXT_color_buffer_float` is advertised in the
+    /// extension string. Gates F32 destination tensors on the IOSurface
+    /// render path. The probe is extension-string only; GLES 3.2 core
+    /// also exposes F32 color buffers but the version-based path isn't
+    /// wired through `gl_check_support` today.
+    pub(super) supports_f32_color: bool,
+    /// Whether GL_EXT_color_buffer_half_float is available — gates F16
+    /// destination tensors on the IOSurface render path.
+    pub(super) supports_f16_color: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
@@ -334,8 +343,14 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra, is_vivante, is_software_renderer) =
-            Self::gl_check_support()?;
+        let (
+            has_float_linear,
+            has_bgra,
+            is_vivante,
+            is_software_renderer,
+            supports_f32_color,
+            supports_f16_color,
+        ) = Self::gl_check_support()?;
 
         // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
         // implementations that are slower and less capable than our native CPU
@@ -467,6 +482,8 @@ impl GLProcessorST {
             proto_segmentation_f32_program,
             has_float_linear,
             has_bgra,
+            supports_f32_color,
+            supports_f16_color,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
             vertex_buffer,
@@ -1224,8 +1241,12 @@ impl GLProcessorST {
 
     /// Query GL capabilities and detect GPU vendor/renderer type.
     ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer)`.
-    fn gl_check_support() -> Result<(bool, bool, bool, bool), crate::Error> {
+    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer,
+    /// supports_f32_color, supports_f16_color)`. The two float-color flags
+    /// gate the F32 / F16 destination paths on the IOSurface render path
+    /// (independent extensions: a configuration may have one but not the
+    /// other).
+    fn gl_check_support() -> Result<(bool, bool, bool, bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -1289,7 +1310,24 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra, is_vivante, is_software_renderer))
+        // Float-color-buffer extensions gate F32/F16 destinations on the
+        // IOSurface render path. The two extensions are independent: a
+        // configuration may expose one but not the other, so consumers
+        // (e.g. profiler/ORT CoreML path) probe each separately and pick
+        // the preferred dtype.
+        let supports_f32_color = extensions.contains("GL_EXT_color_buffer_float");
+        let supports_f16_color = extensions.contains("GL_EXT_color_buffer_half_float");
+        log::debug!("GL_EXT_color_buffer_float: {supports_f32_color}");
+        log::debug!("GL_EXT_color_buffer_half_float: {supports_f16_color}");
+
+        Ok((
+            has_float_linear,
+            has_bgra,
+            is_vivante,
+            is_software_renderer,
+            supports_f32_color,
+            supports_f16_color,
+        ))
     }
 
     /// Invalidate EGL binding state on all destination textures.

@@ -851,6 +851,34 @@ pub(crate) enum ForcedBackend {
     OpenGl,
 }
 
+/// Reports which float-color-buffer extensions the GPU backend
+/// detected. Returned by [`ImageProcessor::supported_render_dtypes`];
+/// the two flags are independent so a configuration that exposes one
+/// extension but not the other is honestly reported.
+///
+/// **IOSurface render path caveat (macOS):** the GL
+/// extension probe is necessary but not sufficient for IOSurface
+/// destinations. ANGLE's `EGL_ANGLE_iosurface_client_buffer`
+/// extension accepts exactly one float (type, internal_format) pair
+/// — `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F — and rejects every
+/// `(GL_FLOAT, *)` combination with `EGL_BAD_ATTRIBUTE` regardless of
+/// whether `GL_EXT_color_buffer_float` is present. Practically:
+/// * `f16 == true` ⇒ F16 PlanarRgb IOSurface destinations work via
+///   the RGBA16F-packed path.
+/// * `f32 == true` only signals the GL render-target capability; F32
+///   IOSurface allocation is rejected upstream by
+///   [`edgefirst_tensor::image_iosurface_layout`], so HAL has no F32
+///   IOSurface path today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderDtypeSupport {
+    /// `GL_EXT_color_buffer_float` is available. F32 IOSurface
+    /// destinations are still unusable — see the type-level doc.
+    pub f32: bool,
+    /// `GL_EXT_color_buffer_half_float` is available — F16 PlanarRgb
+    /// destinations work on the IOSurface render path.
+    pub f16: bool,
+}
+
 /// Image converter that uses available hardware acceleration or CPU as a
 /// fallback.
 #[derive(Debug)]
@@ -911,6 +939,33 @@ impl ImageProcessor {
     /// ```
     pub fn new() -> Result<Self> {
         Self::with_config(ImageProcessorConfig::default())
+    }
+
+    /// Report which float dtypes the GPU can render to as IOSurface
+    /// color attachments.
+    ///
+    /// Consumers (notably the EdgeFirst profiler's ONNX+CoreML path)
+    /// query this to choose between F32 and F16 input tensors for the
+    /// zero-copy preprocessing ring. Either or both can be `false` on
+    /// older ANGLE / older macOS / non-GPU configurations; CPU staging
+    /// remains the correct fallback in that case.
+    ///
+    /// Always returns `RenderDtypeSupport { f32: false, f16: false }`
+    /// on platforms without an OpenGL backend or when the `opengl`
+    /// feature is disabled.
+    pub fn supported_render_dtypes(&self) -> RenderDtypeSupport {
+        #[cfg(all(target_os = "macos", feature = "opengl"))]
+        if let Some(gl) = self.opengl.as_ref() {
+            return gl.supported_render_dtypes();
+        }
+        // Linux GLProcessorThreaded does not yet expose the float-color
+        // probes through its message channel — the IOSurface render
+        // path is macOS-only for now. Linux callers get the conservative
+        // answer and stay on the existing u8 paths.
+        RenderDtypeSupport {
+            f32: false,
+            f16: false,
+        }
     }
 
     /// Creates a new `ImageProcessor` with the given configuration.
