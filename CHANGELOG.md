@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-05-28
+
+### Fixed
+
+- GL overlay channel-permuted background on i.MX targets:
+  `GLProcessorST::draw_camera_texture_to_rgb_planar` and its `_2d`
+  intermediate variant set `GL_TEXTURE_SWIZZLE_R` to `GL_RED`,
+  `GL_GREEN`, `GL_BLUE` across three loop iterations so the single-
+  channel R8 output of each pass picks up the matching source
+  component, but returned with the swizzle parked at `GL_BLUE` (the
+  last iteration's value). On NXP Vivante GC7000 and Mali Valhall
+  drivers — both of which honour `GL_TEXTURE_SWIZZLE_*` on
+  `GL_TEXTURE_EXTERNAL_OES` despite the GLES spec leaving it
+  undefined — the residual swizzle persisted into the next sampler
+  read of the long-lived `camera_eglimage_texture`, including the
+  bg blit inside `draw_decoded_masks`. Every overlay pixel landed
+  with `canvas.R := src.B` while G/B/A stayed correct, producing
+  the characteristic green-on-warm / magenta-on-cool tint on the
+  overlay background in the saved JPEG. Mesa ignored the swizzle on
+  external textures, so the CI golden image
+  (`testdata/output_render_gl.jpg`) was clean and the unit test
+  using `giraffe.jpg` did not surface the bug.
+
+  Both paths now restore `GL_TEXTURE_SWIZZLE_R` to `GL_RED` before
+  returning, keeping the texture's per-channel swizzle at the GLES
+  identity. `TEXTURE_SWIZZLE_G/B/A` are not touched inside either
+  function, so a single `glTexParameteri` call per path is enough
+  to restore identity. Verified end-to-end through the
+  `ara2-rs` `yolov8` example on `imx8mp-frdm` (Vivante GC7000Lite)
+  and `imx95-frdm` (Mali Valhall): both produced the expected
+  natural-colour overlay with clean green bounding boxes after the
+  fix, and both reproduced the `canvas.R := src.B` corruption
+  without it.
+
 ## [0.24.1] - 2026-05-26
 
 ### Fixed
