@@ -55,12 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `Tensor::<T>::image()` is now bounded `T: 'static` so the runtime
-  `DType` can be derived from `T` at compile time via the new
-  internal `dtype_of::<T>()` helper. All numeric types that satisfy
-  the existing `Num + Clone + Debug + Send + Sync` bounds also
-  satisfy `'static`; the additional bound is a no-op for in-tree
-  callers and external numeric types alike.
+- **(Potentially breaking)** `Tensor::<T>::image()` is now bounded
+  `T: 'static` so the runtime `DType` can be derived from `T` via the
+  new internal `dtype_of::<T>()` helper (`TypeId`-based, hence the
+  `'static` requirement). Every numeric type HAL ships, and every
+  primitive numeric type, already satisfies `'static`, so in-tree and
+  typical external callers are unaffected. The bound does, however,
+  exclude any user-defined element type that borrows non-`'static`
+  references even while satisfying `Num + Clone + Debug + Send +
+  Sync` — such a type would no longer compile through `image()`. We
+  judge this combination to be vanishingly rare for pixel element
+  types, but it is a real API constraint, not a no-op.
 - `Tensor::<T>::image(.., Some(TensorMemory::Dma))` now **rejects**
   combinations whose natural row pitch isn't 64-byte aligned with a
   clear `InvalidArgument` error that names the alignment requirement
@@ -91,13 +96,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Notes
 
 - **macOS only.** The IOSurface render path is gated on
-  `cfg(target_os = "macos")`. The Linux GL backend
-  (`GLProcessorThreaded`) detects the float-color extensions and
-  surfaces them through `RenderDtypeSupport` for forward-compat,
-  but the equivalent DMA-BUF zero-copy render path is not yet
-  wired through its message channel. Linux callers stay on the
-  existing u8 paths and receive `RenderDtypeSupport { f32: false,
-  f16: false }` until the DMA-BUF render path lands.
+  `cfg(target_os = "macos")`. The Linux GL backend probes the
+  float-color extensions internally (stored on `GLProcessorST`) for
+  forward-compat, but does **not** yet thread them out through
+  `ImageProcessor::supported_render_dtypes()` — that accessor
+  currently returns `RenderDtypeSupport { f32: false, f16: false }`
+  on Linux because no DMA-BUF zero-copy render destination is wired
+  through the threaded backend's message channel. Linux callers stay
+  on the existing u8 paths until that path lands.
 - **No F32 IOSurface path.** ANGLE's
   `EGL_ANGLE_iosurface_client_buffer` extension specifies exactly
   one float `(type, internal_format)` pair —

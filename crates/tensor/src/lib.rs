@@ -206,6 +206,12 @@ impl fmt::Display for DType {
 /// where the GPU backend cares about whether the bytes are u8 / f16 /
 /// f32 even though the static `Tensor<T>` carries the same information
 /// at the type level.
+///
+/// macOS-only: the sole caller is the IOSurface DMA branch in
+/// `Tensor::<T>::image()`, which is itself `cfg(target_os = "macos")`.
+/// Leaving this ungated makes it dead code on every other target, which
+/// fails CI under `-D warnings`.
+#[cfg(target_os = "macos")]
 pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
     use std::any::TypeId;
     let id = TypeId::of::<T>();
@@ -1400,7 +1406,8 @@ where
                      IOSurface rounds bytes_per_row up to 64 bytes, so a \
                      contiguous CPU map of this tensor would read garbage. \
                      {pad_hint}pass memory=None to auto-fall-back to SHM, or \
-                     pass memory=Some(TensorMemory::Mem) explicitly."
+                     pass memory=Some(TensorMemory::Shm) or \
+                     Some(TensorMemory::Mem) explicitly."
                 )));
             }
             // Alignment OK. Try image-formatted IOSurface; on any

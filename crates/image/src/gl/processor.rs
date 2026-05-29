@@ -49,13 +49,21 @@ pub struct GLProcessorST {
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
     pub(super) has_bgra: bool,
     /// Whether `GL_EXT_color_buffer_float` is advertised in the
-    /// extension string. Gates F32 destination tensors on the IOSurface
-    /// render path. The probe is extension-string only; GLES 3.2 core
-    /// also exposes F32 color buffers but the version-based path isn't
-    /// wired through `gl_check_support` today.
+    /// extension string, i.e. the GPU can render to an F32 color
+    /// attachment. The probe is extension-string only — GLES 3.2 core
+    /// also mandates F32 color buffers, but this flag does not consult
+    /// `GL_VERSION`, so a 3.2-core context without the extension string
+    /// reports `false`. On this (Linux) backend the flag is a
+    /// forward-compat capability probe surfaced through
+    /// `RenderDtypeSupport`; no float render destination is wired
+    /// through the message channel yet (the macOS IOSurface render path
+    /// is the only consumer of float destinations today).
     pub(super) supports_f32_color: bool,
-    /// Whether GL_EXT_color_buffer_half_float is available — gates F16
-    /// destination tensors on the IOSurface render path.
+    /// Whether `GL_EXT_color_buffer_half_float` is advertised, i.e. the
+    /// GPU can render to an F16 color attachment. Same forward-compat
+    /// capability-probe semantics as `supports_f32_color`: reported via
+    /// `RenderDtypeSupport` but not yet consumed by any Linux render
+    /// destination.
     pub(super) supports_f16_color: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
@@ -1243,9 +1251,11 @@ impl GLProcessorST {
     ///
     /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer,
     /// supports_f32_color, supports_f16_color)`. The two float-color flags
-    /// gate the F32 / F16 destination paths on the IOSurface render path
+    /// report whether the GPU can render to F32 / F16 color attachments
     /// (independent extensions: a configuration may have one but not the
-    /// other).
+    /// other). On this Linux backend they are forward-compat capability
+    /// probes surfaced via `RenderDtypeSupport`; the macOS IOSurface path
+    /// is the only render destination that consumes float dtypes today.
     fn gl_check_support() -> Result<(bool, bool, bool, bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
