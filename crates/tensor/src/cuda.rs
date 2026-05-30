@@ -29,6 +29,7 @@ pub(crate) struct CudaTable {
     pub external_memory_get_mapped_buffer:
         unsafe extern "C" fn(*mut *mut c_void, ExternalMemory, *const c_void) -> CudaError,
     pub destroy_external_memory: unsafe extern "C" fn(ExternalMemory) -> CudaError,
+    pub memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> CudaError,
 }
 
 static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
@@ -53,6 +54,7 @@ fn load() -> Option<CudaTable> {
         import_external_memory: sym!("cudaImportExternalMemory"),
         external_memory_get_mapped_buffer: sym!("cudaExternalMemoryGetMappedBuffer"),
         destroy_external_memory: sym!("cudaDestroyExternalMemory"),
+        memcpy: sym!("cudaMemcpy"),
     })
 }
 
@@ -63,6 +65,29 @@ pub(crate) fn table() -> Option<&'static CudaTable> {
 /// True iff libcudart loaded and all interop symbols resolved. Cached, cheap.
 pub fn cuda_available() -> bool {
     table().is_some()
+}
+
+/// `cudaMemcpyDeviceToHost` — copies from device (GPU) to host (CPU).
+pub const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+
+/// Copy `count` bytes from a CUDA device pointer to host. Returns `false` on
+/// failure or if libcudart is unavailable.
+///
+/// # Safety
+///
+/// The caller must ensure:
+/// - `host` points to at least `count` bytes of writable memory.
+/// - `device` points to at least `count` bytes of valid CUDA device memory
+///   (i.e. obtained from a `CudaMap::device_ptr()` while the map is live).
+pub unsafe fn memcpy_device_to_host(
+    host: *mut c_void,
+    device: *const c_void,
+    count: usize,
+) -> bool {
+    match table() {
+        Some(t) => (t.memcpy)(host, device, count, CUDA_MEMCPY_DEVICE_TO_HOST) == 0,
+        None => false,
+    }
 }
 
 /// Register a GL buffer (PBO) with CUDA. Returns the resource as `usize`

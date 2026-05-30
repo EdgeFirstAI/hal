@@ -51,7 +51,7 @@ pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use cuda::{
     cuda_available, gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    CudaGlOps, CudaHandle, CudaMap,
+    memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
 };
 pub use error::{Error, Result};
 pub use format::{PixelFormat, PixelLayout};
