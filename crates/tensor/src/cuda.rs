@@ -6,7 +6,7 @@
 use libloading::Library;
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_uint};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) type CudaError = c_int; // cudaSuccess == 0
 pub(crate) type GraphicsResource = *mut c_void; // cudaGraphicsResource_t
@@ -65,6 +65,126 @@ pub fn cuda_available() -> bool {
     table().is_some()
 }
 
+/// Routes `cudaGraphicsMapResources`/Unmap/Unregister through the GL worker
+/// thread (the GL context must be current there). Implemented by the image crate.
+pub trait CudaGlOps: Send + Sync {
+    fn map(&self, resource: GraphicsResource) -> Option<(*mut c_void, usize)>;
+    fn unmap(&self, resource: GraphicsResource);
+    fn unregister(&self, resource: GraphicsResource);
+}
+
+enum CudaBacking {
+    #[allow(dead_code)] // consumed by C3/C4
+    GlBuffer {
+        resource: GraphicsResource,
+        ops: Arc<dyn CudaGlOps>,
+    },
+    #[allow(dead_code)] // consumed by C3/C4
+    ExternalMem {
+        ext_mem: ExternalMemory,
+        dptr: *mut c_void,
+    },
+}
+
+// SAFETY: CUDA handles/ptrs are process-global; GlBuffer routes to the GL
+// worker; ExternalMem ptr is valid via the per-device primary context.
+unsafe impl Send for CudaBacking {}
+unsafe impl Sync for CudaBacking {}
+
+/// CUDA registration for a GPU-backed tensor. Held as `Option` on the tensor.
+pub struct CudaHandle {
+    kind: CudaBacking,
+    size: usize,
+}
+
+impl CudaHandle {
+    #[allow(dead_code)] // consumed by C3/C4
+    pub(crate) fn new_gl(resource: GraphicsResource, size: usize, ops: Arc<dyn CudaGlOps>) -> Self {
+        Self {
+            kind: CudaBacking::GlBuffer { resource, ops },
+            size,
+        }
+    }
+
+    #[allow(dead_code)] // consumed by C3/C4
+    pub(crate) fn new_external(ext_mem: ExternalMemory, dptr: *mut c_void, size: usize) -> Self {
+        Self {
+            kind: CudaBacking::ExternalMem { ext_mem, dptr },
+            size,
+        }
+    }
+
+    /// Map to a device pointer. `GlBuffer` routes to the GL worker;
+    /// `ExternalMem` is persistent (no per-call map/unmap).
+    pub fn map(&self) -> Option<CudaMap<'_>> {
+        match &self.kind {
+            CudaBacking::GlBuffer { resource, ops } => {
+                let (ptr, len) = ops.map(*resource)?;
+                Some(CudaMap {
+                    ptr,
+                    len,
+                    unmap: Some((ops.clone(), *resource)),
+                    _marker: std::marker::PhantomData,
+                })
+            }
+            CudaBacking::ExternalMem { dptr, .. } => Some(CudaMap {
+                ptr: *dptr,
+                len: self.size,
+                unmap: None,
+                _marker: std::marker::PhantomData,
+            }),
+        }
+    }
+}
+
+impl Drop for CudaHandle {
+    fn drop(&mut self) {
+        match &self.kind {
+            CudaBacking::GlBuffer { resource, ops } => ops.unregister(*resource),
+            CudaBacking::ExternalMem { ext_mem, .. } => {
+                if let Some(t) = table() {
+                    unsafe { (t.destroy_external_memory)(*ext_mem) };
+                }
+            }
+        }
+    }
+}
+
+/// Scoped CUDA device-pointer mapping. `Drop` unmaps a `GlBuffer` (so GL may
+/// reuse the PBO for the next `convert()` call). `ExternalMem` mappings are
+/// persistent — `Drop` is a no-op.
+pub struct CudaMap<'a> {
+    ptr: *mut c_void,
+    len: usize,
+    unmap: Option<(Arc<dyn CudaGlOps>, GraphicsResource)>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl CudaMap<'_> {
+    /// Raw device pointer to the mapped buffer.
+    pub fn device_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// Length of the mapping in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the mapping covers zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for CudaMap<'_> {
+    fn drop(&mut self) {
+        if let Some((ops, r)) = self.unmap.take() {
+            ops.unmap(r);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +195,47 @@ mod tests {
             assert!(table().is_some(), "table present when available");
         }
         // total + non-panicking either way
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct MockOps {
+        unmaps: Arc<AtomicUsize>,
+    }
+    impl CudaGlOps for MockOps {
+        fn map(&self, _r: GraphicsResource) -> Option<(*mut std::ffi::c_void, usize)> {
+            Some((0x1000usize as *mut _, 4096))
+        }
+        fn unmap(&self, _r: GraphicsResource) {
+            self.unmaps.fetch_add(1, Ordering::SeqCst);
+        }
+        fn unregister(&self, _r: GraphicsResource) {}
+    }
+    #[test]
+    fn cudamap_guard_unmaps_on_drop_for_glbuffer() {
+        let unmaps = Arc::new(AtomicUsize::new(0));
+        let h = CudaHandle::new_gl(
+            0x1usize as GraphicsResource,
+            4096,
+            Arc::new(MockOps {
+                unmaps: unmaps.clone(),
+            }),
+        );
+        {
+            let m = h.map().expect("map");
+            assert_eq!(m.device_ptr() as usize, 0x1000);
+            assert_eq!(m.len(), 4096);
+        }
+        assert_eq!(
+            unmaps.load(Ordering::SeqCst),
+            1,
+            "Drop must unmap a GlBuffer"
+        );
     }
 }

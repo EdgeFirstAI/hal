@@ -49,7 +49,7 @@ pub use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
-pub use cuda::cuda_available;
+pub use cuda::{cuda_available, CudaGlOps, CudaHandle, CudaMap};
 pub use error::{Error, Result};
 pub use format::{PixelFormat, PixelLayout};
 use num_traits::Num;
