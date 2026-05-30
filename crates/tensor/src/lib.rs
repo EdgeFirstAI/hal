@@ -70,6 +70,97 @@ pub use tensor_dyn::TensorDyn;
 /// lockstep with the `half` workspace dep.
 pub use half::f16;
 
+// =============================================================================
+// RGBA16F packed-layout geometry — single source of truth
+//
+// A `PlanarRgb` [3,H,W] or `PlanarRgba` [4,H,W] f16 tensor is represented
+// on the GPU as an RGBA16F surface (the only float format accepted by the
+// ANGLE IOSurface extension). Four contiguous f16 elements are packed into
+// each 8-byte RGBA16F texel, yielding a `(W/4, C*H)` surface.
+//
+// All call sites that need these dimensions must use `packed_rgba16f_layout`
+// so the rule lives in exactly one place. Currently consumed by:
+//  - `crates/tensor/src/iosurface.rs` `new_image` (macOS IOSurface alloc)
+//  - `crates/image/src/gl/processor.rs` — migrated in a subsequent task.
+// =============================================================================
+
+/// Geometry of the RGBA16F-packed surface backing a planar F16 image tensor.
+///
+/// ANGLE only supports one float `(type, internal_format)` pair for IOSurface
+/// import: `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F (8 bytes/texel). To map a
+/// `[C, H, W]` f16 planar tensor onto such a surface, 4 contiguous f16
+/// elements are packed into each RGBA16F texel, yielding a surface of
+/// `(W/4, C*H)` texels at 8 bytes/texel. The byte stream is identical to a
+/// (nonexistent) R16F `(W, C*H)` surface and can be consumed as `&[f16]`
+/// with shape `[1, C, H, W]` without rearrangement.
+///
+/// Obtain via [`packed_rgba16f_layout`] — never construct directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRgba16fLayout {
+    /// Surface width in texels (`width / 4`).
+    pub surface_w: usize,
+    /// Surface height in texels (`planes * height`).
+    pub surface_h: usize,
+    /// Bytes per RGBA16F texel (always 8).
+    pub bytes_per_texel: usize,
+    /// Row pitch in bytes (`surface_w * 8`).
+    pub pitch: usize,
+}
+
+/// Canonical geometry for the RGBA16F-packed surface backing a planar F16
+/// image tensor.
+///
+/// Returns `Some(layout)` only when **all** of the following hold:
+///
+/// - `dtype == DType::F16`
+/// - `format` is `PixelFormat::PlanarRgb` (3 planes) or
+///   `PixelFormat::PlanarRgba` (4 planes)
+/// - `width % 4 == 0`
+///
+/// Returns `None` for any other `(format, dtype)` combination or misaligned
+/// width — callers must fall back to a non-packed path or return a
+/// context-appropriate error.
+///
+/// # Examples
+///
+/// ```rust
+/// use edgefirst_tensor::{packed_rgba16f_layout, PixelFormat, DType};
+///
+/// let layout = packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 640, 480).unwrap();
+/// assert_eq!(layout.surface_w, 160);
+/// assert_eq!(layout.surface_h, 1440);
+/// assert_eq!(layout.bytes_per_texel, 8);
+/// assert_eq!(layout.pitch, 1280);
+/// ```
+pub fn packed_rgba16f_layout(
+    format: PixelFormat,
+    dtype: DType,
+    width: usize,
+    height: usize,
+) -> Option<PackedRgba16fLayout> {
+    if dtype != DType::F16 {
+        return None;
+    }
+    let planes = match format {
+        PixelFormat::PlanarRgb => 3,
+        PixelFormat::PlanarRgba => 4,
+        _ => return None,
+    };
+    if !width.is_multiple_of(4) {
+        return None;
+    }
+    let surface_w = width / 4;
+    let surface_h = planes * height;
+    let bytes_per_texel = 8;
+    let pitch = surface_w * bytes_per_texel;
+    Some(PackedRgba16fLayout {
+        surface_w,
+        surface_h,
+        bytes_per_texel,
+        pitch,
+    })
+}
+
 /// Per-plane DMA-BUF descriptor for external buffer import.
 ///
 /// Owns a duplicated file descriptor plus optional stride and offset metadata.
@@ -3424,5 +3515,44 @@ mod tests {
             map.as_slice().iter().all(|&b| b == 0xAB),
             "SHM tensor data should be writable and readable"
         );
+    }
+
+    // =========================================================================
+    // packed_rgba16f_layout — host-runnable geometry unit tests (TDD)
+    // =========================================================================
+
+    #[test]
+    fn packed_rgba16f_layout_planar_rgb_f16() {
+        let layout =
+            packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 640, 640).expect("Some");
+        assert_eq!(layout.surface_w, 160);
+        assert_eq!(layout.surface_h, 1920);
+        assert_eq!(layout.bytes_per_texel, 8);
+        assert_eq!(layout.pitch, 1280);
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_planar_rgba_f16() {
+        let layout =
+            packed_rgba16f_layout(PixelFormat::PlanarRgba, DType::F16, 640, 640).expect("Some");
+        assert_eq!(layout.surface_w, 160);
+        assert_eq!(layout.surface_h, 2560); // 4 planes
+        assert_eq!(layout.bytes_per_texel, 8);
+        assert_eq!(layout.pitch, 1280);
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_rejects_misaligned() {
+        assert!(packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 642, 640).is_none());
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_rejects_non_f16() {
+        // Non-F16 dtype with planar RGB
+        assert!(packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::U8, 640, 640).is_none());
+        // Non-planar format with F32
+        assert!(packed_rgba16f_layout(PixelFormat::Rgb, DType::F32, 640, 640).is_none());
+        // Packed Rgba with F16 is not a planar format → None
+        assert!(packed_rgba16f_layout(PixelFormat::Rgba, DType::F16, 640, 640).is_none());
     }
 }

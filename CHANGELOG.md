@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-export of `half::f16` from the tensor crate root so downstream
   crates can write `Tensor::<edgefirst_tensor::f16>::image(...)`
   without taking a direct `half` dependency.
+- Linux GPU float preprocessing: F16 NCHW (`PlanarRgb`) and F32 NHWC
+  (`Rgb`) via PBO readback, plus F16 zero-copy DMA-BUF render on
+  V3D/Mali GPUs. Enables low-copy `convert()` output for HailoRT (F32)
+  and TensorRT (F16) consumers.
+- `gpu-probe`: F16/F32 float render-target capability probe (texture-FBO
+  renderability, F16 dma-buf render, PBO readback timing).
+- `ImageProcessor::supported_render_dtypes()` now reports real GPU
+  float-render capability on Linux (previously always reported none).
 
 ### Changed
 
@@ -95,31 +103,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- **macOS only.** The IOSurface render path is gated on
-  `cfg(target_os = "macos")`. The Linux GL backend probes the
-  float-color extensions internally (stored on `GLProcessorST`) for
-  forward-compat, but does **not** yet thread them out through
-  `ImageProcessor::supported_render_dtypes()` — that accessor
-  currently returns `RenderDtypeSupport { f32: false, f16: false }`
-  on Linux because no DMA-BUF zero-copy render destination is wired
-  through the threaded backend's message channel. Linux callers stay
-  on the existing u8 paths until that path lands.
-- **No F32 IOSurface path.** ANGLE's
+- **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
+  returns the GPU's actual `GL_EXT_color_buffer_half_float` /
+  `GL_EXT_color_buffer_float` probe results on Linux. Vivante GC7000UL
+  always returns `{ f16: false, f32: false }` (float readback 170–320 ms —
+  disabled); V3D/Mali and Tegra report the extensions they expose.
+  `convert()` to F16/F32 destinations never errors — it falls back to CPU
+  when the GPU float path is unavailable.
+- **No F32 IOSurface path (macOS).** ANGLE's
   `EGL_ANGLE_iosurface_client_buffer` extension specifies exactly
   one float `(type, internal_format)` pair —
   `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F. Every `(GL_FLOAT, *)`
   combination is rejected with `EGL_BAD_ATTRIBUTE` even when
   `GL_EXT_color_buffer_float` is present. `image_iosurface_layout`
   therefore returns `None` for any F32 combination; callers that
-  request F32 IOSurface allocation get an explicit
-  `NotImplemented` error and fall back to SHM/Mem + CPU staging.
+  request F32 IOSurface allocation get an explicit `NotImplemented`
+  error and fall back to SHM/Mem + CPU staging.
+- **F32 DMA-BUF not supported (all platforms).** No 32-bit-float DRM
+  fourcc exists; `create_image(memory: Some(Dma), dtype: F32)` returns
+  `NotSupported`. F32 uses PBO transfer instead.
 - **PlanarRgb only on the convert dispatch.** The RGBA16F-packed
   fragment shader and viewport are sized for 3 channel planes.
-  `MacosGlProcessor::supports()` and the convert dispatch
-  currently reject `(Rgba, PlanarRgba)` to avoid mis-rendering the
-  alpha plane; a 4-plane shader variant is the right follow-up. The
-  IOSurface allocation side correctly sizes PlanarRgba surfaces
-  for 4 planes, so the limitation is on the render path only.
+  `MacosGlProcessor::supports()` and the convert dispatch currently
+  reject `(Rgba, PlanarRgba)` to avoid mis-rendering the alpha plane.
+- **CPU float fallback is always present.** When the GL and G2D backends
+  cannot handle a float destination (unsupported combo, rotation set, or
+  unavailable hardware), `ImageProcessor::convert()` falls back to CPU
+  for any pixel-format pair. Resize is performed at u8 precision before
+  widening to F16/F32; normalization is `[0, 1]`.
 
 ## [0.24.2] - 2026-05-28
 

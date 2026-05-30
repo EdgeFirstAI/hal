@@ -44,6 +44,11 @@ mod cache;
 mod context;
 #[cfg(target_os = "linux")]
 mod dma_import;
+// Cfg-agnostic: the float render-path classifier is the single source of
+// truth for the "(PixelFormat, DType, TensorMemory) → float path" decision and
+// is compiled on every platform so both the Linux and macOS backends share one
+// definition (see `crates/image/ARCHITECTURE.md`, review item #4).
+mod float_dispatch;
 #[cfg(target_os = "macos")]
 mod iosurface_import;
 #[cfg(target_os = "macos")]
@@ -55,6 +60,7 @@ mod processor;
 mod resources;
 #[cfg(target_os = "linux")]
 mod shaders;
+mod shaders_common;
 #[cfg(target_os = "linux")]
 mod tests;
 #[cfg(target_os = "linux")]

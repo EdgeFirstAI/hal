@@ -17,11 +17,17 @@ mod tests;
 
 /// CPUConverter implements the ImageProcessor trait using the fallback CPU
 /// implementation for image processing.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CPUProcessor {
     resizer: fast_image_resize::Resizer,
     options: fast_image_resize::ResizeOptions,
     colors: [[u8; 4]; 20],
+    /// Reusable scratch tensor for the U8→float widen path.
+    ///
+    /// Holds a U8 image in the destination's pixel format and dimensions.
+    /// Reallocated only when the format or dimensions change, amortising
+    /// the heap allocation across repeated same-size conversions.
+    widen_scratch: Option<TensorDyn>,
 }
 
 unsafe impl Send for CPUProcessor {}
@@ -148,6 +154,7 @@ impl CPUProcessor {
             resizer,
             options,
             colors: crate::DEFAULT_COLORS_U8,
+            widen_scratch: None,
         }
     }
 
@@ -162,6 +169,7 @@ impl CPUProcessor {
             resizer,
             options,
             colors: crate::DEFAULT_COLORS_U8,
+            widen_scratch: None,
         }
     }
 
@@ -434,6 +442,21 @@ impl ImageProcessorTrait for CPUProcessor {
     }
 }
 
+/// Widen a `u8` source buffer into a typed destination buffer element-by-element.
+///
+/// `f` converts a single `u8` element to `T`. The implementation is a plain
+/// `iter`/`zip` loop so LLVM can auto-vectorise it (e.g. for the `f32` case).
+///
+/// # Panics (debug)
+/// Panics in debug mode if `src.len() != dst.len()`.
+#[inline]
+fn widen_into<T: Copy>(src: &[u8], dst: &mut [T], f: impl Fn(u8) -> T) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (o, &b) in dst.iter_mut().zip(src.iter()) {
+        *o = f(b);
+    }
+}
+
 // Internal methods — dtype-aware dispatch layer.
 impl CPUProcessor {
     /// Top-level conversion dispatcher: handles dtype combinations.
@@ -467,6 +490,54 @@ impl CPUProcessor {
                 // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
                 let mut map = dst_u8.map()?;
                 apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
+                Ok(())
+            }
+            (DType::U8, d @ (DType::F32 | DType::F16)) => {
+                let src_u8 = src.as_u8().unwrap();
+                let dw = dst.width().ok_or(Error::NotAnImage)?;
+                let dh = dst.height().ok_or(Error::NotAnImage)?;
+                // Reuse the scratch tensor when format and dimensions match;
+                // otherwise reallocate and cache the new scratch.  Take the
+                // scratch out of `self` so that `convert_u8` can borrow `self`
+                // exclusively, then restore it afterwards.
+                let scratch_matches = self.widen_scratch.as_ref().is_some_and(|t| {
+                    t.width() == Some(dw) && t.height() == Some(dh) && t.format() == Some(dst_fmt)
+                });
+                let mut tmp = if scratch_matches {
+                    self.widen_scratch.take().unwrap()
+                } else {
+                    TensorDyn::image(dw, dh, dst_fmt, DType::U8, Some(TensorMemory::Mem))?
+                };
+                {
+                    let tmp_u8 = tmp.as_u8_mut().unwrap();
+                    self.convert_u8(src_u8, tmp_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                }
+                // Widen the u8 scratch into the float destination, then restore
+                // the scratch for reuse on the next call.
+                {
+                    let tmp_u8 = tmp.as_u8().unwrap();
+                    let src_map = tmp_u8.map()?;
+                    match d {
+                        DType::F32 => {
+                            let dst_t = dst.as_f32_mut().unwrap();
+                            let mut dst_map = dst_t.map()?;
+                            debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
+                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
+                                b as f32 / 255.0
+                            });
+                        }
+                        DType::F16 => {
+                            let dst_t = dst.as_f16_mut().unwrap();
+                            let mut dst_map = dst_t.map()?;
+                            debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
+                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
+                                half::f16::from_f32(b as f32 / 255.0)
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                self.widen_scratch = Some(tmp);
                 Ok(())
             }
             (s, d) => Err(Error::NotSupported(format!("dtype {s} -> {d}",))),

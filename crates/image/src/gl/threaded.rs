@@ -67,6 +67,46 @@ enum GLProcessorMessage {
     PboDelete(u32), // fire-and-forget, no reply
 }
 
+/// Compute the flat element count for a PBO image buffer of the given format.
+///
+/// NV12 and NV16 are semiplanar with non-trivial element counts; all other
+/// formats use `width * height * channels`.
+fn pbo_elem_count(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> usize {
+    let channels = format.channels();
+    match format.layout() {
+        edgefirst_tensor::PixelLayout::SemiPlanar => match format {
+            edgefirst_tensor::PixelFormat::Nv12 => width * height * 3 / 2,
+            edgefirst_tensor::PixelFormat::Nv16 => width * height * 2,
+            _ => width * height * channels,
+        },
+        edgefirst_tensor::PixelLayout::Packed | edgefirst_tensor::PixelLayout::Planar => {
+            width * height * channels
+        }
+        _ => width * height * channels,
+    }
+}
+
+/// Compute the tensor shape for a PBO image of the given format.
+///
+/// Planar: `[channels, height, width]`.
+/// SemiPlanar: `[total_h, width]` (NV12 total_h = height*3/2; NV16 total_h = height*2).
+/// All others: `[height, width, channels]`.
+fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> Vec<usize> {
+    let channels = format.channels();
+    match format.layout() {
+        edgefirst_tensor::PixelLayout::Planar => vec![channels, height, width],
+        edgefirst_tensor::PixelLayout::SemiPlanar => {
+            let total_h = match format {
+                edgefirst_tensor::PixelFormat::Nv12 => height * 3 / 2,
+                edgefirst_tensor::PixelFormat::Nv16 => height * 2,
+                _ => height * 2,
+            };
+            vec![total_h, width]
+        }
+        _ => vec![height, width, channels],
+    }
+}
+
 /// Implements PboOps by sending commands to the GL thread.
 ///
 /// Uses a `WeakSender` so that PBO images don't keep the GL thread's channel
@@ -137,6 +177,9 @@ pub struct GLProcessorThreaded {
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
     transfer_backend: TransferBackend,
+    /// Float render dtype support, probed at construction time and
+    /// adjusted for Vivante GC7000UL (whose float readback is 170-320 ms).
+    render_dtype_support: crate::RenderDtypeSupport,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -181,7 +224,10 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok(gl_converter.gl_context.transfer_backend));
+            let _ = create_ctx_send.send(Ok((
+                gl_converter.gl_context.transfer_backend,
+                gl_converter.supported_render_dtypes(),
+            )));
             let mut poisoned = false;
             while let Some(msg) = recv.blocking_recv() {
                 // Serialize all GL operations across GLProcessorST instances.
@@ -473,20 +519,21 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let transfer_backend = match create_ctx_recv.blocking_recv() {
+        let (transfer_backend, render_dtype_support) = match create_ctx_recv.blocking_recv() {
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Error::Internal(
                     "GL converter error messaging closed without update".to_string(),
                 ));
             }
-            Ok(Ok(tb)) => tb,
+            Ok(Ok((tb, rds))) => (tb, rds),
         };
 
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
             transfer_backend,
+            render_dtype_support,
         })
     }
 }
@@ -644,21 +691,7 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
 
-        let channels = format.channels();
-        let size = match format.layout() {
-            edgefirst_tensor::PixelLayout::SemiPlanar => {
-                // NV12: W*H*3/2, NV16: W*H*2
-                match format {
-                    edgefirst_tensor::PixelFormat::Nv12 => width * height * 3 / 2,
-                    edgefirst_tensor::PixelFormat::Nv16 => width * height * 2,
-                    _ => width * height * channels,
-                }
-            }
-            edgefirst_tensor::PixelLayout::Packed | edgefirst_tensor::PixelLayout::Planar => {
-                width * height * channels
-            }
-            _ => width * height * channels,
-        };
+        let size = pbo_elem_count(width, height, format);
         if size == 0 {
             return Err(Error::OpenGl("Invalid image dimensions".to_string()));
         }
@@ -676,18 +709,7 @@ impl GLProcessorThreaded {
             sender: sender.downgrade(),
         });
 
-        let shape = match format.layout() {
-            edgefirst_tensor::PixelLayout::Planar => vec![channels, height, width],
-            edgefirst_tensor::PixelLayout::SemiPlanar => {
-                let total_h = match format {
-                    edgefirst_tensor::PixelFormat::Nv12 => height * 3 / 2,
-                    edgefirst_tensor::PixelFormat::Nv16 => height * 2,
-                    _ => height * 2,
-                };
-                vec![total_h, width]
-            }
-            _ => vec![height, width, channels],
-        };
+        let shape = pbo_shape(width, height, format);
 
         let pbo_tensor =
             edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
@@ -699,9 +721,98 @@ impl GLProcessorThreaded {
         Ok(tensor)
     }
 
+    /// Create a PBO-backed [`TensorDyn`] image on the GL thread with the given dtype.
+    ///
+    /// Sizes the underlying GL buffer by `elems * dtype.size()` and wraps it in
+    /// the appropriately-typed [`PboTensor`]. Supports `DType::U8`, `DType::F16`,
+    /// and `DType::F32`; returns an error for other dtypes.
+    pub(crate) fn create_pbo_image_dtype(
+        &self,
+        width: usize,
+        height: usize,
+        format: edgefirst_tensor::PixelFormat,
+        dtype: edgefirst_tensor::DType,
+    ) -> Result<TensorDyn, Error> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
+
+        let elems = pbo_elem_count(width, height, format);
+        if elems == 0 {
+            return Err(Error::OpenGl("Invalid image dimensions".to_string()));
+        }
+
+        let size = elems
+            .checked_mul(dtype.size())
+            .ok_or_else(|| Error::OpenGl("PBO size overflow".to_string()))?;
+
+        // Allocate PBO on the GL thread
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::PboCreate(size, tx))
+            .map_err(|_| Error::OpenGl("GL thread channel closed".to_string()))?;
+        let buffer_id = rx
+            .blocking_recv()
+            .map_err(|_| Error::OpenGl("GL thread did not respond".to_string()))??;
+
+        let ops: std::sync::Arc<dyn edgefirst_tensor::PboOps> = std::sync::Arc::new(GlPboOps {
+            sender: sender.downgrade(),
+        });
+
+        let shape = pbo_shape(width, height, format);
+
+        let map_err = |e: edgefirst_tensor::Error| {
+            Error::OpenGl(format!("PBO tensor creation failed: {e:?}"))
+        };
+        let set_err = |e: edgefirst_tensor::Error| {
+            Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}"))
+        };
+
+        match dtype {
+            edgefirst_tensor::DType::U8 => {
+                let pbo =
+                    edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
+                        .map_err(map_err)?;
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                t.set_format(format).map_err(set_err)?;
+                Ok(TensorDyn::from(t))
+            }
+            edgefirst_tensor::DType::F16 => {
+                let pbo = edgefirst_tensor::PboTensor::<edgefirst_tensor::f16>::from_pbo(
+                    buffer_id, size, &shape, None, ops,
+                )
+                .map_err(map_err)?;
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                t.set_format(format).map_err(set_err)?;
+                Ok(TensorDyn::from(t))
+            }
+            edgefirst_tensor::DType::F32 => {
+                let pbo = edgefirst_tensor::PboTensor::<f32>::from_pbo(
+                    buffer_id, size, &shape, None, ops,
+                )
+                .map_err(map_err)?;
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                t.set_format(format).map_err(set_err)?;
+                Ok(TensorDyn::from(t))
+            }
+            other => Err(Error::OpenGl(format!("unsupported PBO dtype {other:?}"))),
+        }
+    }
+
     /// Returns the active transfer backend.
     pub(crate) fn transfer_backend(&self) -> TransferBackend {
         self.transfer_backend
+    }
+
+    /// Report which float dtypes the GPU can render to.
+    ///
+    /// Values are probed once at construction time and adjusted for
+    /// Vivante GC7000UL, whose float readback latency (170-320 ms) makes
+    /// GL float destinations impractical; `ImageProcessor::convert()` falls
+    /// back to CPU float output (normalized to `[0, 1]`) for these targets.
+    pub(crate) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
+        self.render_dtype_support
     }
 }
 

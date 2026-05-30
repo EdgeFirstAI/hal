@@ -192,6 +192,34 @@ soft-float `__extendhfsf2` helper) via
 [`scripts/audit_f16_codegen.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/audit_f16_codegen.sh)
 `<target-triple>`. Requires `cargo install cargo-show-asm`.
 
+## Float Render Tests
+
+GPU float preprocessing (F16/F32) is covered by gated integration and unit
+tests. All skip gracefully when the required hardware or capability is absent.
+
+| Test name | Gate | What it covers |
+|-----------|------|----------------|
+| `convert_f16_nchw_pbo_roundtrip` | GL available + `supported_render_dtypes().f16` | F16 `PlanarRgb` NCHW PBO: encode, render, readback, value check |
+| `convert_f32_nhwc_pbo_roundtrip` | GL available + `supported_render_dtypes().f32` | F32 `Rgb` NHWC PBO: render, readback, value check |
+| `convert_f32_nhwc_pbo_resize_bilinear` | GL available + `supported_render_dtypes().f32` | F32 PBO readback after bilinear resize |
+| `convert_f16_nchw_dma_roundtrip` | V3D/Mali DMA-BUF + `supported_render_dtypes().f16` | F16 zero-copy DMA-BUF render path |
+| `cpu_convert_u8_to_f16_planar_rgb` | none (CPU) | CPU widen: u8 resize then f16 NCHW planar layout |
+| `cpu_convert_u8_to_f32_rgb` | none (CPU) | CPU widen: u8 resize then f32 NHWC layout |
+| `convert_rgba_to_f16_cpu` / `*_falls_back` | GL absent or Vivante | CPU fallback engaged when GPU float unavailable |
+| `supported_render_dtypes_linux_smoke` | GL available (Linux) | `supported_render_dtypes()` reports real values on Linux |
+| `create_image_f32_dma_rejected` | Linux | `create_image(F32, Some(Dma))` → `NotSupported` |
+
+**Capability probe tool:** `crates/gpu-probe` (`cargo run -p gpu-probe --
+--probe-only`) measures per-target float render capability (texture FBO
+renderability, F16 DMA-BUF render, PBO readback timing) and prints a
+`RenderDtypeSupport` summary. Run it on each board before enabling float
+paths in production pipelines.
+
+**Vivante skip:** tests that require GPU float are automatically skipped on
+Vivante GC7000UL targets where `supported_render_dtypes()` returns
+`{ f16: false, f32: false }`. The CPU fallback tests (`*_cpu`, `*_falls_back`)
+verify the fallback produces correct `[0, 1]` normalized output on those hosts.
+
 ## Coverage Notes
 
 - Participates in workspace `cargo llvm-cov`; lcov output appears under

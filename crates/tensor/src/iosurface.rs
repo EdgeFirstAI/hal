@@ -36,7 +36,8 @@
 
 use crate::{
     error::{Error, Result},
-    BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait,
+    TensorMemory, TensorTrait,
 };
 use log::trace;
 use num_traits::Num;
@@ -343,36 +344,26 @@ where
         //     'RGhA') for float IOSurfaces. We pack 4 contiguous f16
         //     elements of the planar `[C, H, W]` byte stream into
         //     each RGBA16F pixel — surface dimensions become
-        //     `(W/4, C*H)`. The byte layout is identical to a
-        //     (nonexistent) R16F `(W, C*H)` surface and ORT consumes
-        //     the locked base address as `&[f16]` with shape
-        //     `[1, C, H, W]` without rearrangement. W must be a
-        //     multiple of 4 for the packing to align — caller's
-        //     responsibility (validated below).
+        //     `(W/4, C*H)` via `packed_rgba16f_layout`. The byte
+        //     layout is identical to a (nonexistent) R16F `(W, C*H)`
+        //     surface and ORT consumes the locked base address as
+        //     `&[f16]` with shape `[1, C, H, W]` without
+        //     rearrangement. W must be a multiple of 4 for the
+        //     packing to align — validated by `packed_rgba16f_layout`.
         let (surface_width, surface_height) = match (format, dtype) {
-            (PixelFormat::PlanarRgb, DType::F16) => {
-                if !width.is_multiple_of(4) {
-                    return Err(Error::InvalidShape(format!(
-                        "PlanarRgb F16 IOSurface requires width%4==0 for RGBA16F packing \
-                         (got width={width})"
-                    )));
-                }
-                let sh = height.checked_mul(3).ok_or_else(|| {
-                    Error::InvalidShape(format!("PlanarRgb height overflow (height={height})"))
-                })?;
-                (width / 4, sh)
-            }
-            (PixelFormat::PlanarRgba, DType::F16) => {
-                if !width.is_multiple_of(4) {
-                    return Err(Error::InvalidShape(format!(
-                        "PlanarRgba F16 IOSurface requires width%4==0 for RGBA16F packing \
-                         (got width={width})"
-                    )));
-                }
-                let sh = height.checked_mul(4).ok_or_else(|| {
-                    Error::InvalidShape(format!("PlanarRgba height overflow (height={height})"))
-                })?;
-                (width / 4, sh)
+            (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
+                // Delegate W%4 check and (W/4, C*H) computation to the
+                // canonical single source of truth. The only failure mode
+                // here is misaligned width (packed_rgba16f_layout returns
+                // None); overflow is not possible at these dimensions.
+                let layout =
+                    packed_rgba16f_layout(format, dtype, width, height).ok_or_else(|| {
+                        Error::InvalidShape(format!(
+                            "{format:?} F16 IOSurface requires width%4==0 for RGBA16F packing \
+                             (got width={width})"
+                        ))
+                    })?;
+                (layout.surface_w, layout.surface_h)
             }
             (PixelFormat::PlanarRgb, _) => {
                 let sh = height.checked_mul(3).ok_or_else(|| {

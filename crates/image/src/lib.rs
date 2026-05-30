@@ -851,32 +851,52 @@ pub(crate) enum ForcedBackend {
     OpenGl,
 }
 
-/// Reports which float-color-buffer extensions the GPU backend
-/// detected. Returned by [`ImageProcessor::supported_render_dtypes`];
-/// the two flags are independent so a configuration that exposes one
-/// extension but not the other is honestly reported.
+/// Reports which float-color-buffer extensions the GPU backend detected.
+/// Returned by [`ImageProcessor::supported_render_dtypes`]; the two flags
+/// are independent.
 ///
-/// **IOSurface render path caveat (macOS):** the GL
-/// extension probe is necessary but not sufficient for IOSurface
-/// destinations. ANGLE's `EGL_ANGLE_iosurface_client_buffer`
-/// extension accepts exactly one float (type, internal_format) pair
-/// — `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F — and rejects every
-/// `(GL_FLOAT, *)` combination with `EGL_BAD_ATTRIBUTE` regardless of
-/// whether `GL_EXT_color_buffer_float` is present. Practically:
-/// * `f16 == true` ⇒ F16 PlanarRgb IOSurface destinations work via
-///   the RGBA16F-packed path.
-/// * `f32 == true` only signals the GL render-target capability; F32
-///   IOSurface allocation is rejected upstream by
-///   [`edgefirst_tensor::image_iosurface_layout`], so HAL has no F32
-///   IOSurface path today.
+/// **Linux:** reflects the real probe results from `GL_EXT_color_buffer_half_float`
+/// and `GL_EXT_color_buffer_float`. On V3D (RPi 5) and Mali-G310 (i.MX 95)
+/// both flags are typically `true`; on Vivante GC7000UL both are forced
+/// `false` (float readback measured 170–320 ms — disabled). Tegra Orin
+/// exposes both via PBO; the flags match the GPU report.
+///
+/// **macOS (ANGLE):** `f16 == true` gates the RGBA16F-packed IOSurface
+/// path for F16 `PlanarRgb` destinations. `f32` reflects the GL
+/// extension probe but is not actionable — ANGLE's
+/// `EGL_ANGLE_iosurface_client_buffer` rejects every `(GL_FLOAT, *)`
+/// combination with `EGL_BAD_ATTRIBUTE`, so there is no F32 IOSurface
+/// path.
+///
+/// Regardless of these flags, [`ImageProcessor::convert`] never returns
+/// an error due to float capability — it falls back to CPU when the GPU
+/// path is unavailable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderDtypeSupport {
-    /// `GL_EXT_color_buffer_float` is available. F32 IOSurface
-    /// destinations are still unusable — see the type-level doc.
+    /// `GL_EXT_color_buffer_float` is available on the current GPU.
+    ///
+    /// On Linux, `true` enables F32 `Rgb` NHWC PBO readback. On macOS
+    /// this flag is informational only — no F32 IOSurface path exists.
     pub f32: bool,
-    /// `GL_EXT_color_buffer_half_float` is available — F16 PlanarRgb
-    /// destinations work on the IOSurface render path.
+    /// `GL_EXT_color_buffer_half_float` is available on the current GPU.
+    ///
+    /// On Linux, `true` enables F16 `PlanarRgb` NCHW PBO readback and,
+    /// on V3D/Mali, zero-copy DMA-BUF render. On macOS, `true` enables
+    /// F16 `PlanarRgb` via RGBA16F-packed IOSurface (zero-copy).
     pub f16: bool,
+}
+
+/// Returns `true` when a float PBO destination should be attempted for `dtype`.
+///
+/// Only F16 and F32 are eligible, and only when the corresponding flag in
+/// `support` is set. U8/I8 and all other dtypes return `false` — they are
+/// handled by the existing `dtype.size() == 1` PBO gate.
+pub(crate) fn float_pbo_eligible(dtype: DType, support: RenderDtypeSupport) -> bool {
+    match dtype {
+        DType::F16 => support.f16,
+        DType::F32 => support.f32,
+        _ => false,
+    }
 }
 
 /// Image converter that uses available hardware acceleration or CPU as a
@@ -941,27 +961,27 @@ impl ImageProcessor {
         Self::with_config(ImageProcessorConfig::default())
     }
 
-    /// Report which float dtypes the GPU can render to as IOSurface
-    /// color attachments.
+    /// Report which float dtypes the GPU can render to.
     ///
-    /// Consumers (notably the EdgeFirst profiler's ONNX+CoreML path)
-    /// query this to choose between F32 and F16 input tensors for the
-    /// zero-copy preprocessing ring. Either or both can be `false` on
-    /// older ANGLE / older macOS / non-GPU configurations; CPU staging
-    /// remains the correct fallback in that case.
+    /// Probes `GL_EXT_color_buffer_half_float` and
+    /// `GL_EXT_color_buffer_float` once at `ImageProcessor::new()` time
+    /// and caches the result. Call this once at startup to decide whether
+    /// to request F16 or F32 destination tensors; [`create_image`] uses
+    /// the result internally to auto-select float PBO when supported.
     ///
-    /// Always returns `RenderDtypeSupport { f32: false, f16: false }`
-    /// on platforms without an OpenGL backend or when the `opengl`
-    /// feature is disabled.
+    /// Returns `RenderDtypeSupport { f32: false, f16: false }` when no
+    /// OpenGL backend is active or the `opengl` feature is disabled.
+    ///
+    /// [`create_image`]: Self::create_image
     pub fn supported_render_dtypes(&self) -> RenderDtypeSupport {
         #[cfg(all(target_os = "macos", feature = "opengl"))]
         if let Some(gl) = self.opengl.as_ref() {
             return gl.supported_render_dtypes();
         }
-        // Linux GLProcessorThreaded does not yet expose the float-color
-        // probes through its message channel — the IOSurface render
-        // path is macOS-only for now. Linux callers get the conservative
-        // answer and stay on the existing u8 paths.
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        if let Some(gl) = self.opengl.as_ref() {
+            return gl.supported_render_dtypes();
+        }
         RenderDtypeSupport {
             f32: false,
             f16: false,
@@ -1275,7 +1295,7 @@ impl ImageProcessor {
 
     /// Create a [`TensorDyn`] image with the best available memory backend.
     ///
-    /// Priority: DMA-buf → PBO (byte-sized types: u8, i8) → system memory.
+    /// Priority: DMA-buf → float PBO (F16/F32) → u8/i8 PBO → system memory.
     ///
     /// Use this method instead of [`TensorDyn::image()`] when the tensor will
     /// be used with [`ImageProcessor::convert()`]. It selects the optimal
@@ -1288,12 +1308,23 @@ impl ImageProcessor {
     /// backend implementations ([`CPUProcessor`], etc.) do not have this
     /// cross-backend visibility.
     ///
+    /// **Float dtype behaviour:** when `dtype` is `F16` or `F32` and
+    /// [`supported_render_dtypes`] reports the GPU supports that type,
+    /// `memory: None` auto-selects a float PBO (Linux) or IOSurface (macOS
+    /// F16 only). If GPU float support is absent the allocation falls through
+    /// to `TensorMemory::Mem`; [`convert`] then uses the CPU path.
+    /// Passing `memory: Some(TensorMemory::Dma)` with `dtype: F32` always
+    /// returns `Error::NotSupported` — no 32-bit-float DRM fourcc exists.
+    ///
+    /// [`supported_render_dtypes`]: Self::supported_render_dtypes
+    /// [`convert`]: ImageProcessorTrait::convert
+    ///
     /// # Arguments
     ///
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `format` - Pixel format
-    /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::I8`)
+    /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::F16`, `DType::F32`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
     ///
@@ -1404,6 +1435,14 @@ impl ImageProcessor {
         match memory {
             #[cfg(target_os = "linux")]
             Some(TensorMemory::Dma) => {
+                // F32 has no 32-bit-float DRM fourcc; callers must use PBO instead.
+                if dtype == DType::F32 {
+                    return Err(Error::NotSupported(
+                        "F32 has no 32-bit-float DRM format for DMA-BUF; \
+                         use TensorMemory::Pbo for F32"
+                            .to_string(),
+                    ));
+                }
                 return try_dma();
             }
             Some(mem) => {
@@ -1477,6 +1516,24 @@ impl ImageProcessor {
                         return Ok(TensorDyn::from(t));
                     }
                     Err(e) => log::debug!("PBO image creation failed, falling back to Mem: {e:?}"),
+                }
+            }
+        }
+
+        // Try float PBO when the GPU backend reports support for this dtype.
+        // Falls through to Mem on error (same policy as u8 PBO above).
+        #[cfg(target_os = "linux")]
+        #[cfg(feature = "opengl")]
+        if float_pbo_eligible(dtype, self.supported_render_dtypes()) {
+            if let Some(gl) = &self.opengl {
+                match gl.create_pbo_image_dtype(width, height, format, dtype) {
+                    Ok(t) => return Ok(t),
+                    Err(e) => {
+                        log::debug!(
+                            "Float PBO image creation failed for {dtype:?}, \
+                             falling back to Mem: {e:?}"
+                        );
+                    }
                 }
             }
         }
@@ -2825,51 +2882,48 @@ mod image_tests {
 
     #[test]
     fn test_disable_env_var() -> Result<(), Error> {
+        // Acquire the env-var mutex for the entire test body so we never race
+        // with test_force_backend_* or test_draw_proto_masks_no_cpu_returns_error.
+        let _lock = acquire_env_lock();
+
+        // Snapshot ALL env vars we might touch so the RAII guard restores them
+        // on exit (even on panic), preventing env-var poisoning of other tests.
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+
         // EDGEFIRST_FORCE_BACKEND takes precedence over EDGEFIRST_DISABLE_*,
-        // so clear it for the duration of this test to avoid races with
-        // test_force_backend_cpu running in parallel.
-        let saved_force = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        // so clear it for the duration of this test.
         unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
 
         #[cfg(target_os = "linux")]
         {
-            let original = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
             unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
             let converter = ImageProcessor::new()?;
-            match original {
-                Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
-                None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
-            }
             assert!(converter.g2d.is_none());
+            unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") };
         }
 
         #[cfg(target_os = "linux")]
         #[cfg(feature = "opengl")]
         {
-            let original = std::env::var("EDGEFIRST_DISABLE_GL").ok();
             unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
             let converter = ImageProcessor::new()?;
-            match original {
-                Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
-                None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
-            }
             assert!(converter.opengl.is_none());
+            unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") };
         }
 
-        let original = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
         let converter = ImageProcessor::new()?;
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
-        }
         assert!(converter.cpu.is_none());
+        unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") };
 
-        let original_cpu = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
+        // Disable everything — convert must return NoConverter.
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        let original_gl = std::env::var("EDGEFIRST_DISABLE_GL").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-        let original_g2d = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
         let mut converter = ImageProcessor::new()?;
 
@@ -2884,24 +2938,7 @@ mod image_tests {
             Crop::no_crop(),
         );
         assert!(matches!(result, Err(Error::NoConverter)));
-
-        match original_cpu {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
-        }
-        match original_gl {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
-        }
-        match original_g2d {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
-        }
-        match saved_force {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-
+        // _guard restores all env vars on drop.
         Ok(())
     }
 
@@ -6374,27 +6411,20 @@ mod image_tests {
 
     #[test]
     fn test_force_backend_cpu() {
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
-        let result = ImageProcessor::new();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-        let converter = result.unwrap();
+        let converter = ImageProcessor::new().unwrap();
         assert!(converter.cpu.is_some());
         assert_eq!(converter.forced_backend, Some(ForcedBackend::Cpu));
     }
 
     #[test]
     fn test_force_backend_invalid() {
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "invalid") };
         let result = ImageProcessor::new();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
         assert!(
             matches!(&result, Err(Error::ForcedBackendUnavailable(s)) if s.contains("unknown")),
             "invalid backend value should return ForcedBackendUnavailable error: {result:?}"
@@ -6403,14 +6433,10 @@ mod image_tests {
 
     #[test]
     fn test_force_backend_unset() {
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
-        let result = ImageProcessor::new();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-        let converter = result.unwrap();
+        let converter = ImageProcessor::new().unwrap();
         assert!(converter.forced_backend.is_none());
     }
 
@@ -6420,30 +6446,21 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_no_cpu_returns_error() {
-        // Disable CPU backend to trigger the error path
-        let original_cpu = std::env::var("EDGEFIRST_DISABLE_CPU").ok();
+        // Serialize against all other env-var-mutating tests.
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&[
+            "EDGEFIRST_FORCE_BACKEND",
+            "EDGEFIRST_DISABLE_GL",
+            "EDGEFIRST_DISABLE_G2D",
+            "EDGEFIRST_DISABLE_CPU",
+        ]);
+
+        // Disable all backends so cpu.is_none() after construction.
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", "1") };
-        let original_gl = std::env::var("EDGEFIRST_DISABLE_GL").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", "1") };
-        let original_g2d = std::env::var("EDGEFIRST_DISABLE_G2D").ok();
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
 
-        let result = ImageProcessor::new();
-
-        match original_cpu {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_CPU", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_CPU") },
-        }
-        match original_gl {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_GL", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_GL") },
-        }
-        match original_g2d {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_DISABLE_G2D") },
-        }
-
-        let mut converter = result.unwrap();
+        let mut converter = ImageProcessor::new().unwrap();
         assert!(converter.cpu.is_none(), "CPU should be disabled");
 
         let dst = TensorDyn::image(
@@ -6486,16 +6503,12 @@ mod image_tests {
 
     #[test]
     fn test_draw_proto_masks_cpu_fallback_works() {
-        // Force CPU-only backend to ensure the CPU fallback path executes
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        // Force CPU-only backend to ensure the CPU fallback path executes.
+        // Serialized under ENV_MUTEX so we don't race with disable-var tests.
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
-        let result = ImageProcessor::new();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-
-        let mut converter = result.unwrap();
+        let mut converter = ImageProcessor::new().unwrap();
         assert!(converter.cpu.is_some());
 
         let dst = TensorDyn::image(
@@ -6552,27 +6565,66 @@ mod image_tests {
     // asserted output and fails loudly.
     // ============================================================
 
-    /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or
-    /// removed), restoring the prior value afterward. Tests are mutated
-    /// env-serialized via the process-wide `FORCE_BACKEND_MUTEX`.
-    fn with_force_backend<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
-        use std::sync::{Mutex, MutexGuard, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard: MutexGuard<()> = LOCK
+    // =========================================================================
+    // Env-var serialisation helpers
+    //
+    // ALL tests that mutate any EDGEFIRST_* backend env var must hold
+    // ENV_MUTEX for their full duration.  This single mutex serialises
+    // test_disable_env_var, test_draw_proto_masks_no_cpu_returns_error,
+    // test_force_backend_*, with_force_backend, and with_env — preventing
+    // any two of them from racing in a parallel `cargo test` run.
+    // =========================================================================
+
+    /// Acquire the process-wide env-var mutex.  Returns a guard that must be
+    /// kept alive for the entire duration of the test body.
+    fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII guard that snapshots a set of env vars on construction and
+    /// restores them on `Drop`, even if the test panics.
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        /// Snapshot the current values of `names`.  Call this while holding
+        /// the env lock (the lock is not taken here — that is the caller's
+        /// responsibility so the lock scope can be wider than the guard).
+        fn snapshot(names: &[&'static str]) -> Self {
+            Self {
+                vars: names.iter().map(|&k| (k, std::env::var(k).ok())).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.vars {
+                match v {
+                    Some(s) => unsafe { std::env::set_var(k, s) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    /// Run `body` with `EDGEFIRST_FORCE_BACKEND` temporarily set (or
+    /// removed), restoring the prior value afterward. Tests are env-
+    /// serialized via the process-wide `ENV_MUTEX`.
+    fn with_force_backend<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         match value {
             Some(v) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", v) },
             None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
         }
-        let r = body();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
-        r
+        body()
     }
 
     /// Allocate an RGBA image tensor and pre-fill every byte with a
@@ -6927,14 +6979,12 @@ mod image_tests {
 
     #[test]
     fn test_set_format_then_cpu_convert() {
-        // Force CPU backend (save/restore to avoid leaking into other tests)
-        let original = std::env::var("EDGEFIRST_FORCE_BACKEND").ok();
+        // Force CPU backend; serialized under ENV_MUTEX to avoid racing with
+        // test_force_backend_* and test_disable_env_var.
+        let _lock = acquire_env_lock();
+        let _guard = EnvGuard::snapshot(&["EDGEFIRST_FORCE_BACKEND"]);
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
         let mut processor = ImageProcessor::new().unwrap();
-        match original {
-            Some(s) => unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", s) },
-            None => unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") },
-        }
 
         // Load a source image
         let image = edgefirst_bench::testdata::read("zidane.jpg");
@@ -6963,6 +7013,9 @@ mod image_tests {
     /// hardware backends (OpenGL, G2D) are exercised on capable targets.
     #[test]
     fn test_multiple_image_processors_same_thread() {
+        // Hold the env mutex so env-var-mutating tests can't corrupt the state
+        // seen by ImageProcessor::new() calls during this test.
+        let _lock = acquire_env_lock();
         let mut processors: Vec<ImageProcessor> = (0..4)
             .map(|_| ImageProcessor::new().expect("ImageProcessor::new() failed"))
             .collect();
@@ -6993,6 +7046,10 @@ mod image_tests {
         use std::time::Duration;
 
         const TIMEOUT: Duration = Duration::from_secs(60);
+
+        // Hold the env mutex so env-var-mutating tests can't corrupt ImageProcessor::new()
+        // calls made inside the spawned threads during this test.
+        let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
 
@@ -7044,6 +7101,10 @@ mod image_tests {
         const N: usize = 4;
         const ROUNDS: usize = 10;
         const TIMEOUT: Duration = Duration::from_secs(60);
+
+        // Hold the env mutex so env-var-mutating tests can't corrupt ImageProcessor::new()
+        // calls made inside the spawned threads during this test.
+        let _lock = acquire_env_lock();
 
         let (tx, rx) = mpsc::channel::<()>();
 
@@ -7101,5 +7162,563 @@ mod image_tests {
         rx.recv_timeout(TIMEOUT).unwrap_or_else(|_| {
             panic!("test_image_processors_concurrent_operations timed out after {TIMEOUT:?}")
         });
+    }
+
+    // =========================================================================
+    // F16 / F32 auto-chain fallback integration tests
+    // =========================================================================
+
+    /// Proves the auto-chain (OpenGL → G2D → CPU) NEVER errors for a float
+    /// combo the GL path does NOT cover.
+    ///
+    /// `Yuyv → Rgb F32` is not handled by the GL float render path (which
+    /// only covers `Rgba → PlanarRgb F16` and `Rgba → Rgb F32`), so the
+    /// chain falls through to the CPU float path. Before commit 868a7649
+    /// added CPU U8→F32/F16 support this would have returned `Err`; now it
+    /// must return `Ok` with output in `[0, 1]` and all values finite.
+    #[test]
+    fn convert_f32_auto_never_errors_non_gl_combo() {
+        const W: usize = 64;
+        const H: usize = 64;
+
+        // Build a small synthetic YUYV source (Y=128, U=128, V=128 → near-grey).
+        // YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V] per macropixel.
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Yuyv, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            let data = map.as_mut_slice();
+            for chunk in data.chunks_exact_mut(4) {
+                chunk[0] = 128; // Y0
+                chunk[1] = 128; // U
+                chunk[2] = 160; // Y1 — distinct so a layout bug is visible
+                chunk[3] = 128; // V
+            }
+        }
+
+        let mut dst =
+            TensorDyn::image(W, H, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem)).unwrap();
+
+        let mut proc = ImageProcessor::new().unwrap();
+        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        assert!(
+            result.is_ok(),
+            "auto-chain Yuyv→Rgb F32 must not error: {:?}",
+            result.err()
+        );
+
+        // Verify all output values are finite and in [0, 1].
+        let map = dst.as_f32().unwrap().map().unwrap();
+        let floats = map.as_slice();
+        assert_eq!(floats.len(), W * H * 3, "unexpected output element count");
+        for (i, &v) in floats.iter().enumerate() {
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "output[{i}]={v} is not finite or not in [0,1]"
+            );
+        }
+
+        // WEAK-1: Anti-all-zero spot-check.  A Y=128 YUYV source normalises to
+        // ≈0.502 on the luma channel.  If the buffer is all-zero (e.g. the CPU
+        // path never wrote to it) this assertion catches the regression.
+        let first_non_zero = floats.iter().find(|&&v| v > 0.01);
+        assert!(
+            first_non_zero.is_some(),
+            "all-zero output detected — CPU path likely did not write to the destination buffer"
+        );
+        // Y=128 → luma ≈ 0.502.  Spot-check the first pixel's R channel
+        // (which carries luma for a near-grey YUV source).
+        let r0 = floats[0];
+        assert!(
+            (r0 - 0.502_f32).abs() < 0.05,
+            "first pixel R={r0} expected ≈0.502 (Y=128 neutral grey from YUYV source)"
+        );
+    }
+
+    /// Proves CPU-forced `Rgba → PlanarRgb F16` correctness.
+    ///
+    /// Uses a source with clearly distinct per-channel values so a
+    /// plane-swap or layout bug surfaces immediately. Tolerance is 2^-9
+    /// (one F16 ULP at 0.5, i.e. roughly 1/512).
+    #[test]
+    fn convert_f16_forced_cpu_correct() {
+        const W: usize = 16;
+        const H: usize = 16;
+        const TOL: f32 = 1.0 / 512.0; // 2^-9
+
+        // pixel (y,x): R = 50+x, G = 100+y*8, B = 200
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            let data = map.as_mut_slice();
+            for y in 0..H {
+                for x in 0..W {
+                    let i = y * W + x;
+                    data[i * 4] = (50 + x) as u8; // R: 50..65
+                    data[i * 4 + 1] = (100 + y * 8) as u8; // G: 100..220
+                    data[i * 4 + 2] = 200; // B: constant
+                    data[i * 4 + 3] = 255;
+                }
+            }
+        }
+
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .expect("forced-CPU Rgba→PlanarRgb F16 must not error");
+
+        let src_map = src.as_u8().unwrap().map().unwrap();
+        let src_bytes = src_map.as_slice();
+        let dst_map = dst.as_f16().unwrap().map().unwrap();
+        let dst_halfs = dst_map.as_slice();
+
+        let plane = W * H;
+        assert_eq!(dst_halfs.len(), plane * 3, "wrong output element count");
+
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                let r_exp = src_bytes[i * 4] as f32 / 255.0;
+                let g_exp = src_bytes[i * 4 + 1] as f32 / 255.0;
+                let b_exp = src_bytes[i * 4 + 2] as f32 / 255.0;
+
+                let r_got = dst_halfs[i].to_f32();
+                let g_got = dst_halfs[plane + i].to_f32();
+                let b_got = dst_halfs[2 * plane + i].to_f32();
+
+                assert!(
+                    (r_got - r_exp).abs() <= TOL,
+                    "R plane ({x},{y}): got {r_got}, expected {r_exp}"
+                );
+                assert!(
+                    (g_got - g_exp).abs() <= TOL,
+                    "G plane ({x},{y}): got {g_got}, expected {g_exp}"
+                );
+                assert!(
+                    (b_got - b_exp).abs() <= TOL,
+                    "B plane ({x},{y}): got {b_got}, expected {b_exp}"
+                );
+
+                // Catch plane-swap: R and G must differ (they have different formulas).
+                if src_bytes[i * 4] != src_bytes[i * 4 + 1] {
+                    assert_ne!(r_got, g_got, "R and G planes must differ at ({x},{y})");
+                }
+            }
+        }
+    }
+
+    /// Proves the auto-chain falls through to CPU for `Rgba → Rgb F32` with
+    /// rotation set.
+    ///
+    /// The GL float render path rejects any call where rotation ≠ None,
+    /// returning an error that causes the chain to continue. Before the CPU
+    /// float fallback this would have produced an error at the end of the
+    /// chain; now it must reach CPU and return `Ok` with finite `[0, 1]` output.
+    #[test]
+    fn convert_f32_with_rotation_falls_back() {
+        const W: usize = 16;
+        const H: usize = 16;
+
+        // RGBA8 source with a known gradient (distinct per-channel values).
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            let data = map.as_mut_slice();
+            for y in 0..H {
+                for x in 0..W {
+                    let i = y * W + x;
+                    data[i * 4] = (x * 16) as u8; // R
+                    data[i * 4 + 1] = (y * 16) as u8; // G
+                    data[i * 4 + 2] = 128; // B
+                    data[i * 4 + 3] = 255;
+                }
+            }
+        }
+
+        // Rotation swaps W and H, so dst is [W, H] (H×W output).
+        let mut dst = TensorDyn::image(
+            H, // dst W = src H after 90° rotation
+            W, // dst H = src W after 90° rotation
+            PixelFormat::Rgb,
+            DType::F32,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let mut proc = ImageProcessor::new().unwrap();
+        let result = proc.convert(
+            &src,
+            &mut dst,
+            Rotation::Clockwise90,
+            Flip::None,
+            Crop::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "auto-chain Rgba→Rgb F32 with Rot90 must not error: {:?}",
+            result.err()
+        );
+
+        let map = dst.as_f32().unwrap().map().unwrap();
+        let floats = map.as_slice();
+        assert_eq!(floats.len(), H * W * 3, "unexpected output element count");
+        for (i, &v) in floats.iter().enumerate() {
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "output[{i}]={v} is not finite or not in [0,1]"
+            );
+        }
+    }
+
+    /// GL-vs-CPU identity parity for `Rgba → PlanarRgb F16`.
+    ///
+    /// Converts the same RGBA8 source via forced `OpenGl` and forced `Cpu`,
+    /// then verifies the two F16 output tensors agree element-wise within
+    /// 2^-8 (two F16 ULPs at 0.5). Skipped when OpenGL or F16 render is
+    /// unavailable.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    fn convert_f16_gl_cpu_parity_identity() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: convert_f16_gl_cpu_parity_identity - OpenGL not available");
+            return;
+        }
+
+        const W: usize = 16;
+        const H: usize = 16;
+        const TOL: f32 = 1.0 / 256.0; // 2^-8
+
+        // pixel (y,x): R = 40+x, G = 80+y*10, B = 180
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            let data = map.as_mut_slice();
+            for y in 0..H {
+                for x in 0..W {
+                    let i = y * W + x;
+                    data[i * 4] = (40 + x) as u8; // R
+                    data[i * 4 + 1] = (80 + y * 10) as u8; // G
+                    data[i * 4 + 2] = 180; // B
+                    data[i * 4 + 3] = 255;
+                }
+            }
+        }
+
+        // GL path.
+        let gl_result = {
+            let mut gl_proc = match ImageProcessor::with_config(ImageProcessorConfig {
+                backend: ComputeBackend::OpenGl,
+                ..Default::default()
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "SKIPPED: convert_f16_gl_cpu_parity_identity - GL backend unavailable: {e}"
+                    );
+                    return;
+                }
+            };
+
+            if !gl_proc.supported_render_dtypes().f16 {
+                eprintln!("SKIPPED: convert_f16_gl_cpu_parity_identity - F16 render not supported");
+                return;
+            }
+
+            let mut dst = TensorDyn::image(
+                W,
+                H,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::Mem),
+            )
+            .unwrap();
+            match gl_proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
+                Ok(()) => dst,
+                Err(e) => {
+                    eprintln!(
+                        "SKIPPED: convert_f16_gl_cpu_parity_identity - GL convert failed: {e}"
+                    );
+                    return;
+                }
+            }
+        };
+
+        // CPU path.
+        let cpu_result = {
+            let mut cpu_proc = ImageProcessor::with_config(ImageProcessorConfig {
+                backend: ComputeBackend::Cpu,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut dst = TensorDyn::image(
+                W,
+                H,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::Mem),
+            )
+            .unwrap();
+            cpu_proc
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .expect("forced-CPU Rgba→PlanarRgb F16 must not error");
+            dst
+        };
+
+        // Compare element-wise.
+        let gl_map = gl_result.as_f16().unwrap().map().unwrap();
+        let cpu_map = cpu_result.as_f16().unwrap().map().unwrap();
+        let gl_halfs = gl_map.as_slice();
+        let cpu_halfs = cpu_map.as_slice();
+
+        assert_eq!(
+            gl_halfs.len(),
+            cpu_halfs.len(),
+            "GL and CPU output sizes differ"
+        );
+
+        let plane = W * H;
+        let channel_names = ["R", "G", "B"];
+        for (idx, (gl_h, cpu_h)) in gl_halfs.iter().zip(cpu_halfs.iter()).enumerate() {
+            let gl_v = gl_h.to_f32();
+            let cpu_v = cpu_h.to_f32();
+            let err = (gl_v - cpu_v).abs();
+            let ch = channel_names[idx / plane];
+            let pixel = idx % plane;
+            assert!(
+                err <= TOL,
+                "GL vs CPU mismatch at {ch}[{pixel}]: GL={gl_v}, CPU={cpu_v}, err={err} > tol={TOL}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // GAP-1: supported_render_dtypes() Linux smoke test
+    // =========================================================================
+
+    /// Exercises the real Linux GL path that reads `gl.supported_render_dtypes()`.
+    /// Skipped when no GL backend is available (CI/host without a GPU).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "opengl"))]
+    fn supported_render_dtypes_linux_smoke() {
+        let proc = match ImageProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: supported_render_dtypes_linux_smoke — ImageProcessor::new() failed: {e}");
+                return;
+            }
+        };
+        if proc.opengl.is_none() {
+            eprintln!("SKIPPED: supported_render_dtypes_linux_smoke — no GL backend on this host");
+            return;
+        }
+        // The call must complete without panicking or deadlocking.
+        let support = proc.supported_render_dtypes();
+        eprintln!(
+            "supported_render_dtypes_linux_smoke: f16={} f32={}",
+            support.f16, support.f32
+        );
+        // No assertion on the specific values — they are hardware-dependent.
+    }
+
+    // =========================================================================
+    // GAP-2: F16 PlanarRgb with width NOT divisible by 4 falls back to CPU
+    // =========================================================================
+
+    /// The GL float render path rejects PlanarRgb F16 destinations whose width
+    /// is not a multiple of 4 (the packed RGBA16F swizzle trick requires W%4==0).
+    /// The auto-chain must transparently fall through to the CPU path, which has
+    /// no such restriction.  W=18, H=16 is chosen so W%4 == 2.
+    #[test]
+    fn convert_f16_pbo_non_4_aligned_width_falls_back() {
+        const W: usize = 18; // 18 % 4 == 2 — NOT divisible by 4
+        const H: usize = 16;
+
+        // RGBA8 source filled with a flat mid-grey.
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            let data = map.as_mut_slice();
+            for chunk in data.chunks_exact_mut(4) {
+                chunk[0] = 128;
+                chunk[1] = 64;
+                chunk[2] = 200;
+                chunk[3] = 255;
+            }
+        }
+
+        // F16 PlanarRgb destination in Mem (GL would use PBO, but we want
+        // to exercise the fallback chain without hardware dependency).
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        // Use the default auto-chain so the GL path can attempt and reject,
+        // then the CPU path succeeds.
+        let mut proc = ImageProcessor::new().unwrap();
+        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        assert!(
+            result.is_ok(),
+            "auto-chain PlanarRgb F16 W%4!=0 must not error (CPU fallback): {:?}",
+            result.err()
+        );
+
+        // All output values must be finite and in [0, 1].
+        let map = dst.as_f16().unwrap().map().unwrap();
+        let halfs = map.as_slice();
+        assert_eq!(halfs.len(), W * H * 3, "unexpected element count");
+        for (i, h) in halfs.iter().enumerate() {
+            let v = h.to_f32();
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "output[{i}]={v} is not finite or not in [0,1]"
+            );
+        }
+    }
+
+    // =========================================================================
+    // GAP-4: NV12 → Rgb F32 and NV12 → PlanarRgb F16, forced CPU
+    // =========================================================================
+
+    /// CPU widen-composition: NV12 (non-RGBA source) → Rgb F32.
+    ///
+    /// NV12 requires a two-stage CPU conversion (NV12→Rgba then Rgba→F32)
+    /// which was untested. A wrong intermediate format selection silently
+    /// produces garbage. Y=128, U=V=128 → near-neutral grey → R≈G≈B≈0.5.
+    #[test]
+    fn convert_nv12_to_rgb_f32_cpu() {
+        const W: usize = 16;
+        const H: usize = 16; // must be even for NV12
+
+        // Build a valid NV12 tensor: shape [H*3/2, W], luma=128, chroma=128.
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            map.as_mut_slice().fill(128); // Y=128, U=V=128 → neutral grey
+        }
+
+        let mut dst =
+            TensorDyn::image(W, H, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem)).unwrap();
+
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        assert!(
+            result.is_ok(),
+            "forced-CPU NV12→Rgb F32 must not error: {:?}",
+            result.err()
+        );
+
+        let map = dst.as_f32().unwrap().map().unwrap();
+        let floats = map.as_slice();
+        assert_eq!(floats.len(), W * H * 3, "unexpected element count");
+        for (i, &v) in floats.iter().enumerate() {
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "output[{i}]={v} is not finite or not in [0,1]"
+            );
+        }
+        // Anti-all-zero: Y=128 → luma channel ≈ 0.5 after YUV→RGB.
+        let non_zero = floats.iter().any(|&v| v > 0.01);
+        assert!(non_zero, "all-zero output from NV12→Rgb F32 CPU path");
+    }
+
+    /// CPU widen-composition: NV12 (non-RGBA source) → PlanarRgb F16.
+    ///
+    /// Same rationale as `convert_nv12_to_rgb_f32_cpu` but for F16 output.
+    #[test]
+    fn convert_nv12_to_planar_rgb_f16_cpu() {
+        const W: usize = 16;
+        const H: usize = 16;
+
+        let src =
+            TensorDyn::image(W, H, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            map.as_mut_slice().fill(128);
+        }
+
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
+        assert!(
+            result.is_ok(),
+            "forced-CPU NV12→PlanarRgb F16 must not error: {:?}",
+            result.err()
+        );
+
+        let map = dst.as_f16().unwrap().map().unwrap();
+        let halfs = map.as_slice();
+        assert_eq!(halfs.len(), W * H * 3, "unexpected element count");
+        for (i, h) in halfs.iter().enumerate() {
+            let v = h.to_f32();
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "output[{i}]={v} is not finite or not in [0,1]"
+            );
+        }
+        let non_zero = halfs.iter().any(|h| h.to_f32() > 0.01);
+        assert!(non_zero, "all-zero output from NV12→PlanarRgb F16 CPU path");
+    }
+
+    // =========================================================================
+    // GAP-5: create_image F32 + DMA must return NotSupported
+    // =========================================================================
+
+    /// There is no DRM FourCC for F32 images, so `create_image` with
+    /// `TensorMemory::Dma` and `DType::F32` must return `Err(NotSupported)`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn create_image_f32_dma_rejected() {
+        let proc = ImageProcessor::new().unwrap();
+        let result = proc.create_image(
+            64,
+            64,
+            PixelFormat::Rgb,
+            DType::F32,
+            Some(TensorMemory::Dma),
+        );
+        assert!(
+            result.is_err(),
+            "create_image(F32, Dma) must fail — no DRM fourcc for f32"
+        );
     }
 }

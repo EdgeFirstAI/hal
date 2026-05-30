@@ -149,73 +149,11 @@ void main() {
 ///
 /// Width must be a multiple of 4 (enforced by HAL at IOSurface
 /// allocation time).
-const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str = r#"#version 300 es
-precision highp float;
-precision highp int;
-uniform sampler2D src;
-uniform vec2 dst_image_size;  // (W, H) — destination plane size
-uniform vec4 src_rect_uv;     // (origin_u, origin_v, size_u, size_v)
-uniform vec4 dst_rect_px;     // (origin_x, origin_y, w, h) within one plane
-uniform vec3 pad_color;       // per-channel normalized pad value
-out vec4 frag;
-
-// Sample one planar element. Returns the per-channel value at
-// (in_plane_x, in_plane_y) for the given plane (0=R, 1=G, 2=B).
-// Pad value is returned when (in_plane_x, in_plane_y) is outside
-// `dst_rect_px`.
-float sample_planar_element(float in_plane_x, float in_plane_y, float plane) {
-    bool inside_dst = (in_plane_x >= dst_rect_px.x) &&
-                      (in_plane_x <  dst_rect_px.x + dst_rect_px.z) &&
-                      (in_plane_y >= dst_rect_px.y) &&
-                      (in_plane_y <  dst_rect_px.y + dst_rect_px.w);
-    if (inside_dst) {
-        float u = (in_plane_x - dst_rect_px.x) / dst_rect_px.z;
-        float v = (in_plane_y - dst_rect_px.y) / dst_rect_px.w;
-        vec2 src_uv = src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw;
-        vec4 rgba = texture(src, src_uv);
-        if (plane < 0.5) {
-            return rgba.r;
-        } else if (plane < 1.5) {
-            return rgba.g;
-        } else {
-            return rgba.b;
-        }
-    } else {
-        if (plane < 0.5) {
-            return pad_color.r;
-        } else if (plane < 1.5) {
-            return pad_color.g;
-        } else {
-            return pad_color.b;
-        }
-    }
-}
-
-void main() {
-    // gl_FragCoord is at pixel center (n+0.5). Floor for the integer
-    // index of the output pixel on the (W/4 × 3H) surface.
-    int ox = int(floor(gl_FragCoord.x));
-    int oy = int(floor(gl_FragCoord.y));
-
-    float plane = floor(float(oy) / dst_image_size.y);
-    float in_plane_y = float(oy) - plane * dst_image_size.y + 0.5;
-
-    // Sample 4 consecutive in-plane x positions. Pixel center is
-    // (x+0.5) so the first element of pixel `ox` starts at logical
-    // tensor column `ox*4` — add 0.5 for the texel center sampled
-    // by the bilinear filter.
-    float base_x = float(ox * 4) + 0.5;
-    float e0 = sample_planar_element(base_x + 0.0, in_plane_y, plane);
-    float e1 = sample_planar_element(base_x + 1.0, in_plane_y, plane);
-    float e2 = sample_planar_element(base_x + 2.0, in_plane_y, plane);
-    float e3 = sample_planar_element(base_x + 3.0, in_plane_y, plane);
-
-    // RGBA16F framebuffer narrows each f32 to f16 on write. The
-    // resulting byte layout in the locked IOSurface is exactly the
-    // [3, H, W] f16 planar order the consumer expects.
-    frag = vec4(e0, e1, e2, e3);
-}
-"#;
+///
+/// Single source of truth lives in [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`],
+/// shared with the Linux PBO/DMA-BUF path (`shaders.rs`).
+const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str =
+    super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT;
 
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
@@ -1294,6 +1232,18 @@ impl ImageProcessorTrait for MacosGlProcessor {
                 "MacosGlProcessor: {src_fmt:?} → {dst_fmt:?} not in the initial GL coverage set"
             )));
         }
+        // The float render-path decision is named once for every platform by
+        // `gl::float_dispatch::FloatRenderPath`; the F16 arm below corresponds
+        // to `FloatRenderPath::IoSurfaceF16Nchw`. It is NOT routed through the
+        // shared `classify_float_render` because (a) a macOS IOSurface tensor
+        // reports `TensorMemory::Dma` (the IOSurface backing shares the `Dma`
+        // slot), so the classifier cannot distinguish it from a Linux DMA-BUF
+        // destination, and (b) this match also dispatches the non-float YUYV
+        // path and a format-specific F16-required error that are not part of
+        // the float decision. Converging it onto the classifier would be a
+        // non-mechanical rewrite of working, ANGLE-tested code we cannot
+        // compile or exercise on the Linux host; the inline match is retained
+        // deliberately. See `gl::float_dispatch` for the shared definition.
         match (src_fmt, dst_fmt, dst.dtype()) {
             // Zero-copy preprocessing path: RGBA8 → PlanarRgb F16 via
             // RGBA16F-packed IOSurface. F32 is intentionally NOT in the
