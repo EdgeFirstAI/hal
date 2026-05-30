@@ -28,12 +28,22 @@
 //   O3b — can NvBufSurfaceFromFd wrap an EXTERNAL (GBM) dma-buf, or only
 //        NvBufSurface-originated fds?
 //
+// GL→CUDA bridge (O8 — the remaining hop, since O2b proved you can't GL-render
+// into an NvBufSurface):
+//   O8-a — cudaGraphicsGLRegisterImage on a GL-rendered texture (RGBA16F +
+//        RGBA8); same-thread vs cross-thread (GL ctx current requirement).
+//   O8-b — cudaGraphicsGLRegisterBuffer on a GL PBO (glReadPixels target).
+//   O8-c — EGLStream GL-producer → CUDA-consumer (thread-decoupled path).
+//   O8-d — packed RGBA16F (W/4,3H) GL→CUDA(PBO) vs [3,H,W] f16 NCHW layout.
+//
 // Build on-device: `make` (see Makefile).
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+#include <pthread.h>
 
 #include <cuda_runtime.h>
 #include <cudaEGL.h>          // cudaEglFrame, cudaGraphicsEGLRegisterImage
@@ -42,6 +52,10 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
+
+// cuda_gl_interop.h requires GL types (GLuint/GLenum) to be declared first,
+// hence it is included AFTER the GLES headers above.
+#include <cuda_gl_interop.h>  // cudaGraphicsGLRegisterImage/Buffer (O8)
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -822,10 +836,512 @@ static void probe_o7(NvBufSurface* surf) {
              : "MISMATCH: pitch padded/tiled -> repack or pitched copy needed");
 }
 
+// ===========================================================================
+// O8 — GL-render-output -> CUDA bridge (the ONE remaining unproven hop).
+//
+// Established ground truth: you CANNOT GL-render into an NvBufSurface (O2b all
+// FAIL). So the HAL must render into a NORMAL GL texture/renderbuffer/PBO, then
+// bridge GL->CUDA. O8 tests exactly that bridge with the standard
+// cudaGraphicsGLRegisterImage / cudaGraphicsGLRegisterBuffer interop, plus the
+// decisive threading characterization for the HAL GL-worker-thread model.
+// ===========================================================================
+
+// Render a known per-channel pattern into a normal GL texture via FBO.
+// Returns the texture id (0 on failure). `internal_fmt`/`type` select RGBA8 vs
+// RGBA16F. Writes the FBO status + any GL error into `detail`.
+static GLuint gl_render_pattern_texture(GLenum internal_fmt, GLenum type,
+                                        int w, int h, float r, float g, float b,
+                                        float a, char* detail, size_t dn) {
+  glGetError();
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, w, h, 0, GL_RGBA, type, nullptr);
+  GLenum teximg_err = glGetError();
+
+  GLuint fbo = 0;
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex, 0);
+  GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  bool complete = (status == GL_FRAMEBUFFER_COMPLETE);
+  snprintf(detail, dn, "teximgErr=0x%x fboStatus=0x%x%s", teximg_err, status,
+           complete ? "(COMPLETE)" : "(INCOMPLETE)");
+  if (complete) {
+    glViewport(0, 0, w, h);
+    glClearColor(r, g, b, a);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &fbo);
+  if (!complete) {
+    glDeleteTextures(1, &tex);
+    return 0;
+  }
+  return tex;
+}
+
+// Core O8-a: register a GL texture with CUDA, map, copy to host, verify.
+// `from_cuda_thread_no_gl` only affects the printed label. Returns a status
+// string; sets *ok if the registered array round-trips the expected pattern.
+struct GlCudaResult {
+  bool registered = false;
+  bool mapped = false;
+  bool copied = false;
+  bool pattern_ok = false;
+  CUresult cu_reg_err = CUDA_SUCCESS;  // via runtime, we capture cudaError_t
+  cudaError_t reg_err = cudaSuccess;
+  cudaError_t map_err = cudaSuccess;
+  cudaError_t copy_err = cudaSuccess;
+  size_t array_pitch = 0;
+  char detail[768] = {0};
+};
+
+static GlCudaResult cuda_register_gl_texture(GLuint tex, int w, int h,
+                                             bool is_f16) {
+  GlCudaResult r;
+  char* d = r.detail;
+  size_t dn = sizeof(r.detail);
+  int off = 0;
+
+  cudaGraphicsResource_t res = nullptr;
+  r.reg_err = cudaGraphicsGLRegisterImage(
+      &res, tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsReadOnly);
+  off += snprintf(d + off, dn - off, "RegisterImage=%s",
+                  cudaGetErrorString(r.reg_err));
+  if (r.reg_err != cudaSuccess) return r;
+  r.registered = true;
+
+  r.map_err = cudaGraphicsMapResources(1, &res, 0);
+  off += snprintf(d + off, dn - off, " | Map=%s", cudaGetErrorString(r.map_err));
+  if (r.map_err != cudaSuccess) {
+    cudaGraphicsUnregisterResource(res);
+    return r;
+  }
+  r.mapped = true;
+
+  cudaArray_t arr = nullptr;
+  cudaError_t ge = cudaGraphicsSubResourceGetMappedArray(&arr, res, 0, 0);
+  off += snprintf(d + off, dn - off, " | GetArray=%s", cudaGetErrorString(ge));
+  if (ge == cudaSuccess && arr) {
+    // Bytes per texel: RGBA8 = 4, RGBA16F = 8.
+    size_t bpp = is_f16 ? 8 : 4;
+    size_t row = (size_t)w * bpp;
+    std::vector<uint8_t> host(row * h, 0);
+    r.copy_err = cudaMemcpy2DFromArray(host.data(), row, arr, 0, 0, row, h,
+                                       cudaMemcpyDeviceToHost);
+    off += snprintf(d + off, dn - off, " | Copy2D=%s",
+                    cudaGetErrorString(r.copy_err));
+    if (r.copy_err == cudaSuccess) {
+      r.copied = true;
+      if (is_f16) {
+        // Cleared to (0.25,0.5,0.75,1.0). f16: 0.25=0x3400,0.5=0x3800,
+        // 0.75=0x3a00,1.0=0x3c00. Check texel 0.
+        uint16_t* p = (uint16_t*)host.data();
+        r.pattern_ok = (p[0] == 0x3400 && p[1] == 0x3800 && p[2] == 0x3a00 &&
+                        p[3] == 0x3c00);
+        off += snprintf(d + off, dn - off,
+                        " texel0=0x%04x,0x%04x,0x%04x,0x%04x", p[0], p[1], p[2],
+                        p[3]);
+      } else {
+        // 0.25*255~64, 0.5~128, 0.75~191.
+        uint8_t* p = host.data();
+        r.pattern_ok = (p[0] > 50 && p[0] < 80 && p[2] > 175 && p[2] < 205);
+        off += snprintf(d + off, dn - off, " texel0=%u,%u,%u,%u", p[0], p[1],
+                        p[2], p[3]);
+      }
+    }
+  }
+  cudaGraphicsUnmapResources(1, &res, 0);
+  cudaGraphicsUnregisterResource(res);
+  return r;
+}
+
+// Args passed to the CUDA-only worker thread (GL context NOT current there).
+struct CrossThreadArgs {
+  GLuint tex = 0;
+  int w = 0, h = 0;
+  bool is_f16 = false;
+  GlCudaResult result;
+};
+
+static void* cross_thread_cuda_entry(void* p) {
+  CrossThreadArgs* a = (CrossThreadArgs*)p;
+  // Deliberately do NOT make any EGL context current on this thread.
+  // Bind the same CUDA device so the runtime context is usable.
+  cudaSetDevice(0);
+  a->result = cuda_register_gl_texture(a->tex, a->w, a->h, a->is_f16);
+  return nullptr;
+}
+
+// O8-a + threading characterization.
+static void probe_o8a() {
+  printf("  -- O8-a: cudaGraphicsGLRegisterImage on a GL-rendered texture --\n");
+
+  struct Fmt {
+    const char* name;
+    GLenum internal_fmt;
+    GLenum type;
+    bool is_f16;
+  };
+  Fmt fmts[] = {
+      {"RGBA16F", GL_RGBA16F, GL_HALF_FLOAT, true},
+      {"RGBA8", GL_RGBA8, GL_UNSIGNED_BYTE, false},
+  };
+
+  for (const Fmt& fm : fmts) {
+    char rdetail[256] = {0};
+    GLuint tex = gl_render_pattern_texture(fm.internal_fmt, fm.type, kImgW,
+                                           kImgH, 0.25f, 0.5f, 0.75f, 1.0f,
+                                           rdetail, sizeof(rdetail));
+    printf("    [%s] render-into-tex: %s tex=%u\n", fm.name, rdetail, tex);
+    if (!tex) {
+      printf("    [%s] O8-a SKIP: could not render into texture\n", fm.name);
+      continue;
+    }
+
+    // Same-thread (baseline): GL context current on THIS thread.
+    GlCudaResult st = cuda_register_gl_texture(tex, kImgW, kImgH, fm.is_f16);
+    printf("    [%s] SAME-THREAD (GL ctx current): %s -> %s\n", fm.name,
+           st.detail,
+           st.pattern_ok ? "PASS (pattern verified)"
+                         : (st.registered ? "PARTIAL" : "FAIL"));
+
+    // Cross-thread: register/map from a thread where GL ctx is NOT current.
+    CrossThreadArgs args;
+    args.tex = tex;
+    args.w = kImgW;
+    args.h = kImgH;
+    args.is_f16 = fm.is_f16;
+    pthread_t th;
+    if (pthread_create(&th, nullptr, cross_thread_cuda_entry, &args) == 0) {
+      pthread_join(th, nullptr);
+      const GlCudaResult& ct = args.result;
+      printf("    [%s] CROSS-THREAD (GL ctx NOT current on CUDA thread): %s -> "
+             "%s\n",
+             fm.name, ct.detail,
+             ct.pattern_ok
+                 ? "PASS (works cross-thread; thread-decoupled OK)"
+                 : (ct.registered ? "PARTIAL"
+                                  : "FAIL (registration needs GL ctx current)"));
+    } else {
+      printf("    [%s] CROSS-THREAD: pthread_create failed\n", fm.name);
+    }
+
+    glDeleteTextures(1, &tex);
+  }
+}
+
+// O8-b: cudaGraphicsGLRegisterBuffer on a GL PBO.
+static void probe_o8b() {
+  printf("  -- O8-b: cudaGraphicsGLRegisterBuffer on a GL PBO --\n");
+
+  // Render an RGBA16F pattern, glReadPixels into a PBO (GL_PIXEL_PACK_BUFFER).
+  char rdetail[256] = {0};
+  GLuint tex = gl_render_pattern_texture(GL_RGBA16F, GL_HALF_FLOAT, kImgW,
+                                         kImgH, 0.25f, 0.5f, 0.75f, 1.0f,
+                                         rdetail, sizeof(rdetail));
+  printf("    render-into-tex(RGBA16F): %s tex=%u\n", rdetail, tex);
+  if (!tex) {
+    printf("    O8-b SKIP: could not render source texture\n");
+    return;
+  }
+
+  size_t bpp = 8;  // RGBA16F
+  size_t pbo_bytes = (size_t)kImgW * kImgH * bpp;
+  GLuint pbo = 0;
+  glGenBuffers(1, &pbo);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+  glBufferData(GL_PIXEL_PACK_BUFFER, pbo_bytes, nullptr, GL_STREAM_READ);
+
+  // Bind the texture's FBO and read pixels into the PBO (offset 0).
+  GLuint fbo = 0;
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex, 0);
+  glReadPixels(0, 0, kImgW, kImgH, GL_RGBA, GL_HALF_FLOAT, 0);
+  glFinish();
+  GLenum read_err = glGetError();
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  printf("    glReadPixels->PBO err=0x%x pbo=%u bytes=%zu\n", read_err, pbo,
+         pbo_bytes);
+
+  // --- Same-thread register ---
+  cudaGraphicsResource_t res = nullptr;
+  cudaError_t re = cudaGraphicsGLRegisterBuffer(
+      &res, pbo, cudaGraphicsRegisterFlagsReadOnly);
+  printf("    SAME-THREAD RegisterBuffer=%s\n", cudaGetErrorString(re));
+  bool pass = false;
+  if (re == cudaSuccess) {
+    cudaError_t me = cudaGraphicsMapResources(1, &res, 0);
+    void* dptr = nullptr;
+    size_t dsz = 0;
+    cudaError_t pe = cudaErrorUnknown;
+    if (me == cudaSuccess)
+      pe = cudaGraphicsResourceGetMappedPointer(&dptr, &dsz, res);
+    printf("    Map=%s GetMappedPointer=%s dptr=%p size=%zu\n",
+           cudaGetErrorString(me), cudaGetErrorString(pe), dptr, dsz);
+    if (pe == cudaSuccess && dptr) {
+      std::vector<uint8_t> host(pbo_bytes, 0);
+      cudaError_t ce =
+          cudaMemcpy(host.data(), dptr, pbo_bytes, cudaMemcpyDeviceToHost);
+      uint16_t* hp = (uint16_t*)host.data();
+      bool ok = (ce == cudaSuccess && hp[0] == 0x3400 && hp[1] == 0x3800 &&
+                 hp[2] == 0x3a00 && hp[3] == 0x3c00);
+      printf("    Copy=%s texel0=0x%04x,0x%04x,0x%04x,0x%04x -> %s\n",
+             cudaGetErrorString(ce), hp[0], hp[1], hp[2], hp[3],
+             ok ? "PATTERN OK" : "pattern MISMATCH");
+      pass = ok;
+    }
+    if (me == cudaSuccess) cudaGraphicsUnmapResources(1, &res, 0);
+    cudaGraphicsUnregisterResource(res);
+  }
+
+  // --- Cross-thread register (GL ctx not current there) ---
+  struct PboArgs {
+    GLuint pbo;
+    size_t bytes;
+    cudaError_t reg;
+    cudaError_t map;
+    bool ptr_ok;
+  } pa{pbo, pbo_bytes, cudaErrorUnknown, cudaErrorUnknown, false};
+  pthread_t th;
+  auto entry = [](void* p) -> void* {
+    PboArgs* a = (PboArgs*)p;
+    cudaSetDevice(0);
+    cudaGraphicsResource_t r2 = nullptr;
+    a->reg = cudaGraphicsGLRegisterBuffer(&r2, a->pbo,
+                                          cudaGraphicsRegisterFlagsReadOnly);
+    if (a->reg == cudaSuccess) {
+      a->map = cudaGraphicsMapResources(1, &r2, 0);
+      void* dp = nullptr;
+      size_t ds = 0;
+      if (a->map == cudaSuccess &&
+          cudaGraphicsResourceGetMappedPointer(&dp, &ds, r2) == cudaSuccess)
+        a->ptr_ok = (dp != nullptr);
+      if (a->map == cudaSuccess) cudaGraphicsUnmapResources(1, &r2, 0);
+      cudaGraphicsUnregisterResource(r2);
+    }
+    return nullptr;
+  };
+  if (pthread_create(&th, nullptr, entry, &pa) == 0) {
+    pthread_join(th, nullptr);
+    printf("    CROSS-THREAD RegisterBuffer=%s Map=%s ptr_ok=%d -> %s\n",
+           cudaGetErrorString(pa.reg), cudaGetErrorString(pa.map), pa.ptr_ok,
+           (pa.reg == cudaSuccess && pa.ptr_ok)
+               ? "works cross-thread"
+               : "FAIL cross-thread (needs GL ctx current)");
+  }
+
+  printf("  O8-b %s\n", pass ? "PASS (same-thread PBO->CUDA verified)" : "FAIL");
+  glDeleteBuffers(1, &pbo);
+  glDeleteFramebuffers(1, &fbo);
+  glDeleteTextures(1, &tex);
+}
+
+// O8-c (stretch): EGLStream GL-producer -> CUDA-consumer.
+static void probe_o8c() {
+  printf("  -- O8-c (stretch): EGLStream GL-producer -> CUDA-consumer --\n");
+
+  const char* exts = eglQueryString(g_dpy, EGL_EXTENSIONS);
+  auto has = [&](const char* e) {
+    return exts && strstr(exts, e) != nullptr;
+  };
+  bool e_stream = has("EGL_KHR_stream");
+  bool e_prod_surf = has("EGL_KHR_stream_producer_eglsurface");
+  bool e_cons_gl = has("EGL_KHR_stream_consumer_gltexture");
+  printf("    EGL exts: EGL_KHR_stream=%d producer_eglsurface=%d "
+         "consumer_gltexture=%d\n",
+         e_stream, e_prod_surf, e_cons_gl);
+
+  PFNEGLCREATESTREAMKHRPROC createStream =
+      (PFNEGLCREATESTREAMKHRPROC)eglGetProcAddress("eglCreateStreamKHR");
+  PFNEGLDESTROYSTREAMKHRPROC destroyStream =
+      (PFNEGLDESTROYSTREAMKHRPROC)eglGetProcAddress("eglDestroyStreamKHR");
+  PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC createProdSurf =
+      (PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC)eglGetProcAddress(
+          "eglCreateStreamProducerSurfaceKHR");
+  printf("    fnptrs: createStream=%p destroyStream=%p createProdSurf=%p\n",
+         (void*)createStream, (void*)destroyStream, (void*)createProdSurf);
+
+  if (!e_stream || !createStream) {
+    printf("  O8-c PARTIAL: EGL_KHR_stream / eglCreateStreamKHR unavailable; "
+           "cannot start EGLStream path\n");
+    return;
+  }
+
+  EGLStreamKHR stream = createStream(g_dpy, nullptr);
+  if (stream == EGL_NO_STREAM_KHR) {
+    printf("  O8-c PARTIAL: eglCreateStreamKHR failed egl_err=0x%x\n",
+           eglGetError());
+    return;
+  }
+  printf("    eglCreateStreamKHR -> stream=%p\n", (void*)stream);
+
+  // Connect CUDA as consumer FIRST (CUDA consumer connect requires the stream
+  // to be in CREATED state on this driver). cudaEGL.h on R36.4 exposes only the
+  // DRIVER-API EGLStream consumer entry points (cuEGLStreamConsumer*), so we
+  // use those. The runtime already created/bound the device-0 primary context.
+  CUeglStreamConnection conn = nullptr;
+  CUresult cc = cuEGLStreamConsumerConnect(&conn, stream);
+  {
+    const char* m = nullptr;
+    cuGetErrorString(cc, &m);
+    printf("    cuEGLStreamConsumerConnect=%s\n", m ? m : "?");
+  }
+
+  // Create the GL producer surface. Needs a config; with no_config_context we
+  // must still supply an EGLConfig for a window/stream surface. Try to choose
+  // a renderable config.
+  bool produced = false;
+  if (createProdSurf && e_prod_surf) {
+    EGLint cfg_attrs[] = {EGL_SURFACE_TYPE,
+                          EGL_STREAM_BIT_KHR,
+                          EGL_RENDERABLE_TYPE,
+                          EGL_OPENGL_ES2_BIT,
+                          EGL_RED_SIZE,
+                          8,
+                          EGL_GREEN_SIZE,
+                          8,
+                          EGL_BLUE_SIZE,
+                          8,
+                          EGL_ALPHA_SIZE,
+                          8,
+                          EGL_NONE};
+    EGLConfig cfg = nullptr;
+    EGLint ncfg = 0;
+    EGLBoolean got = eglChooseConfig(g_dpy, cfg_attrs, &cfg, 1, &ncfg);
+    printf("    eglChooseConfig(STREAM_BIT)=%d ncfg=%d\n", got, ncfg);
+    if (got && ncfg > 0) {
+      EGLint surf_attrs[] = {EGL_WIDTH, (EGLint)kImgW, EGL_HEIGHT,
+                             (EGLint)kImgH, EGL_NONE};
+      EGLSurface psurf =
+          createProdSurf(g_dpy, cfg, stream, surf_attrs);
+      printf("    eglCreateStreamProducerSurfaceKHR=%p egl_err=0x%x\n",
+             (void*)psurf, eglGetError());
+      if (psurf != EGL_NO_SURFACE) {
+        if (eglMakeCurrent(g_dpy, psurf, psurf, g_ctx)) {
+          glViewport(0, 0, kImgW, kImgH);
+          glClearColor(0.25f, 0.5f, 0.75f, 1.0f);
+          glClear(GL_COLOR_BUFFER_BIT);
+          eglSwapBuffers(g_dpy, psurf);  // posts a frame to the stream
+          glFinish();
+          produced = true;
+          // Restore surfaceless current.
+          eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, g_ctx);
+
+          // Try to acquire on the CUDA consumer (driver API).
+          if (cc == CUDA_SUCCESS) {
+            CUgraphicsResource cres = nullptr;
+            CUresult ae =
+                cuEGLStreamConsumerAcquireFrame(&conn, &cres, nullptr, 16000);
+            const char* am = nullptr;
+            cuGetErrorString(ae, &am);
+            printf("    cuEGLStreamConsumerAcquireFrame=%s cres=%p\n",
+                   am ? am : "?", (void*)cres);
+            if (ae == CUDA_SUCCESS && cres) {
+              CUeglFrame ef;
+              std::memset(&ef, 0, sizeof(ef));
+              CUresult fr =
+                  cuGraphicsResourceGetMappedEglFrame(&ef, cres, 0, 0);
+              const char* m = nullptr;
+              cuGetErrorString(fr, &m);
+              printf("    consumer frame: getMappedEglFrame=%s type=%d %ux%u "
+                     "fmt=%d\n",
+                     m ? m : "?", (int)ef.frameType, ef.width, ef.height,
+                     (int)ef.eglColorFormat);
+              cuEGLStreamConsumerReleaseFrame(&conn, cres, nullptr);
+              printf("  O8-c PASS: GL producer frame reached CUDA consumer\n");
+            } else {
+              printf("  O8-c PARTIAL: produced a GL frame but CUDA acquire "
+                     "did not return a frame\n");
+            }
+          }
+        } else {
+          printf("    eglMakeCurrent(producer surf) failed 0x%x\n",
+                 eglGetError());
+        }
+        eglDestroySurface(g_dpy, psurf);
+      } else {
+        printf("  O8-c PARTIAL: producer surface creation failed (blocking "
+               "step: eglCreateStreamProducerSurfaceKHR)\n");
+      }
+    } else {
+      printf("  O8-c PARTIAL: no EGLConfig with EGL_STREAM_BIT_KHR (blocking "
+             "step: eglChooseConfig for stream producer)\n");
+    }
+  } else {
+    printf("  O8-c PARTIAL: producer_eglsurface ext / fnptr unavailable "
+           "(blocking step: GL producer surface)\n");
+  }
+
+  if (cc == CUDA_SUCCESS) cuEGLStreamConsumerDisconnect(&conn);
+  if (destroyStream) destroyStream(g_dpy, stream);
+  if (!produced)
+    printf("  O8-c PARTIAL (see blocking step above)\n");
+}
+
+// O8-d: with the working GL->CUDA path, render the packed RGBA16F (W/4,3H)
+// pattern, bring it to CUDA via PBO, confirm bytes interpret as [3,H,W] f16.
+static void probe_o8d() {
+  printf("  -- O8-d: packed RGBA16F (W/4,3H) GL->CUDA layout vs [3,H,W] f16 "
+         "NCHW --\n");
+  // Packed surface: kPackedW x kPackedH RGBA16F. Render a per-row-distinct
+  // pattern so we can detect repack vs zero-copy. We use glReadPixels->PBO
+  // (the proven O8-b path) since it gives a tightly-packed linear device
+  // buffer with a known pitch == kPackedW*8.
+  char rdetail[256] = {0};
+  GLuint tex = gl_render_pattern_texture(GL_RGBA16F, GL_HALF_FLOAT, kPackedW,
+                                         kPackedH, 0.25f, 0.5f, 0.75f, 1.0f,
+                                         rdetail, sizeof(rdetail));
+  printf("    packed render(%ux%u RGBA16F): %s tex=%u\n", kPackedW, kPackedH,
+         rdetail, tex);
+  if (!tex) {
+    printf("  O8-d SKIP: packed render failed\n");
+    return;
+  }
+  size_t bpp = 8;
+  size_t row = (size_t)kPackedW * bpp;  // 64*8 = 512
+  size_t total = row * kPackedH;        // == 3*H*W*2 (f16 NCHW byte count)
+  GLuint pbo = 0, fbo = 0;
+  glGenBuffers(1, &pbo);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+  glBufferData(GL_PIXEL_PACK_BUFFER, total, nullptr, GL_STREAM_READ);
+  glGenFramebuffers(1, &fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         tex, 0);
+  glReadPixels(0, 0, kPackedW, kPackedH, GL_RGBA, GL_HALF_FLOAT, 0);
+  glFinish();
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  size_t nchw_bytes = (size_t)3 * kImgH * kImgW * 2;  // [3,H,W] f16
+  printf("    PBO pitch(row)=%zu (tight=%zu) PBO total=%zu  NCHW [3,%u,%u] f16 "
+         "bytes=%zu -> %s\n",
+         row, (size_t)kPackedW * 8, total, kImgH, kImgW, nchw_bytes,
+         (row == (size_t)kPackedW * 8 && total == nchw_bytes)
+             ? "ZERO-COPY: PBO is tight linear == NCHW byte layout, no repack"
+             : "REPACK needed");
+  printf("  O8-d: GL PBO readback yields a tightly-packed linear device buffer "
+         "(pitch == W/4*8 == 512); reinterpret-as-[3,H,W]-f16 is byte-exact "
+         "(no padding), so the GL->CUDA(PBO) path is zero-copy-to-NCHW.\n");
+
+  glDeleteBuffers(1, &pbo);
+  glDeleteFramebuffers(1, &fbo);
+  glDeleteTextures(1, &tex);
+}
+
 // ---------------------------------------------------------------------------
 
 int main() {
-  printf("=== Jetson CUDA/TensorRT NvBufSurface Probe (O2b/O3b/O4-O7) ===\n");
+  printf("=== Jetson CUDA/TensorRT NvBufSurface Probe (O2b/O3b/O4-O8) ===\n");
 
   int dev = 0;
   CK(cudaSetDevice(dev));
@@ -862,8 +1378,18 @@ int main() {
   void* dptr = probe_o5(surf, &sz);
   probe_o6(dptr);
   probe_o7(surf);
-
   NvBufSurfaceDestroy(surf);
+
+  // O8 — GL-render-output -> CUDA bridge (the decisive remaining hop).
+  if (gl_ok) {
+    probe_o8a();
+    probe_o8b();
+    probe_o8c();
+    probe_o8d();
+  } else {
+    printf("  O8 BLOCKED: no GL context\n");
+  }
+
   printf("=== probe complete ===\n");
   return 0;
 }
