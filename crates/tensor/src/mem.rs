@@ -27,6 +27,36 @@ where
 
 unsafe impl<T> Send for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 unsafe impl<T> Sync for MemTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+
+impl<T> MemTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Allocate `byte_capacity` bytes and set an initial logical `shape`
+    /// (whose byte size must fit the capacity).
+    pub fn with_capacity_bytes(
+        shape: &[usize],
+        byte_capacity: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        let cap_elems = byte_capacity / elem;
+        let logical: usize = shape.iter().product();
+        if logical > cap_elems {
+            return Err(Error::InsufficientCapacity {
+                needed: logical * elem,
+                capacity: byte_capacity,
+            });
+        }
+        Ok(MemTensor {
+            name: name.unwrap_or("mem_tensor").to_owned(),
+            shape: shape.to_vec(),
+            data: vec![T::zero(); cap_elems],
+            identity: crate::BufferIdentity::new(),
+        })
+    }
+}
+
 impl<T> TensorTrait<T> for MemTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -109,6 +139,23 @@ where
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
         &self.identity
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<T>()
+    }
+
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+        let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let capacity = self.capacity_bytes();
+        if needed > capacity {
+            return Err(Error::InsufficientCapacity { needed, capacity });
+        }
+        self.shape = shape.to_vec();
+        Ok(())
     }
 }
 
@@ -246,5 +293,14 @@ mod tests {
         let result = tensor.reshape(&[7]);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::ShapeMismatch(_)));
+    }
+
+    #[test]
+    fn mem_capacity_and_logical_shape() {
+        let mut t = MemTensor::<u8>::with_capacity_bytes(&[480, 640, 3], 921_600, None).unwrap();
+        assert_eq!(t.capacity_bytes(), 921_600);
+        t.set_logical_shape(&[240, 320, 3]).unwrap();
+        assert_eq!(t.shape(), &[240, 320, 3]);
+        assert!(t.set_logical_shape(&[480, 640, 4]).is_err());
     }
 }

@@ -248,6 +248,25 @@ where
     fn buffer_identity(&self) -> &BufferIdentity {
         &self.identity
     }
+
+    fn capacity_bytes(&self) -> usize {
+        self.buf_size
+    }
+
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+        let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if needed > self.buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.buf_size,
+            });
+        }
+        self.shape = shape.to_vec();
+        Ok(())
+    }
 }
 
 impl<T> IoSurfaceTensor<T>

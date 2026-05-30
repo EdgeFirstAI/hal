@@ -717,6 +717,18 @@ where
     /// must remain the same.
     fn reshape(&mut self, shape: &[usize]) -> Result<()>;
 
+    /// Bytes of the underlying allocation (>= the current logical `size()`).
+    /// Defaults to the logical size for storages without spare capacity.
+    fn capacity_bytes(&self) -> usize {
+        self.size()
+    }
+
+    /// Set the logical shape to any shape whose byte size fits the allocation
+    /// capacity, without the equal-size constraint of `reshape`.
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        self.reshape(shape)
+    }
+
     /// Map the tensor into memory and return a TensorMap for accessing the
     /// data.
     fn map(&self) -> Result<TensorMap<T>>;
@@ -1089,6 +1101,28 @@ where
             TensorStorage::Shm(t) => t.reshape(shape),
             TensorStorage::Mem(t) => t.reshape(shape),
             TensorStorage::Pbo(t) => t.reshape(shape),
+        }
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.capacity_bytes(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.capacity_bytes(),
+            TensorStorage::Mem(t) => t.capacity_bytes(),
+            TensorStorage::Pbo(t) => t.capacity_bytes(),
+        }
+    }
+
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.set_logical_shape(shape),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.set_logical_shape(shape),
+            TensorStorage::Mem(t) => t.set_logical_shape(shape),
+            TensorStorage::Pbo(t) => t.set_logical_shape(shape),
         }
     }
 
