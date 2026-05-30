@@ -383,8 +383,9 @@ static const char* test_image_jpeg_path(void) {
 static void test_tensor_decode_image_jpeg(void) {
     TEST("tensor_decode_image_jpeg");
 
-    // Create a pre-allocated tensor large enough for zidane.jpg (1280x720)
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    // Create a pre-allocated tensor large enough for zidane.jpg (1280x720).
+    // JPEG decodes to its native NV12 format, so allocate NV12.
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -418,12 +419,14 @@ static void test_tensor_decode_image_jpeg(void) {
         return;
     }
 
-    // Decode into the pre-allocated tensor
+    // Decode into the pre-allocated tensor. The decoder emits the native
+    // format (NV12 for a colour JPEG) and configures the tensor accordingly.
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image(tensor, data, (size_t)fsize, HAL_PIXEL_FORMAT_RGB, &width, &height);
+    int ret = hal_tensor_decode_image(tensor, data, (size_t)fsize, &width, &height);
     ASSERT_EQ(0, ret);
     ASSERT_EQ(1280, (int)width);
     ASSERT_EQ(720, (int)height);
+    ASSERT_EQ(HAL_PIXEL_FORMAT_NV12, hal_tensor_pixel_format(tensor));
 
     free(data);
     hal_tensor_free(tensor);
@@ -433,7 +436,8 @@ static void test_tensor_decode_image_jpeg(void) {
 static void test_tensor_decode_image_file_jpeg(void) {
     TEST("tensor_decode_image_file_jpeg");
 
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    // JPEG decodes to its native NV12 format.
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -445,7 +449,7 @@ static void test_tensor_decode_image_file_jpeg(void) {
     }
 
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image_file(tensor, path, HAL_PIXEL_FORMAT_RGBA, &width, &height);
+    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height);
     if (ret != 0) {
         // File might not exist in test environment
         hal_tensor_free(tensor);
@@ -456,6 +460,19 @@ static void test_tensor_decode_image_file_jpeg(void) {
     ASSERT_EQ(0, ret);
     ASSERT_EQ(1280, (int)width);
     ASSERT_EQ(720, (int)height);
+    ASSERT_EQ(HAL_PIXEL_FORMAT_NV12, hal_tensor_pixel_format(tensor));
+
+    // Consumers that need RGBA convert the native result themselves.
+    struct hal_image_processor* proc = hal_image_processor_new();
+    if (proc) {
+        struct hal_tensor* rgba = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+        ASSERT_NOT_NULL(rgba);
+        int cret = hal_image_processor_convert(proc, tensor, rgba, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+        ASSERT_EQ(0, cret);
+        ASSERT_EQ(HAL_PIXEL_FORMAT_RGBA, hal_tensor_pixel_format(rgba));
+        hal_tensor_free(rgba);
+        hal_image_processor_free(proc);
+    }
 
     hal_tensor_free(tensor);
     TEST_PASS();
@@ -464,8 +481,9 @@ static void test_tensor_decode_image_file_jpeg(void) {
 static void test_tensor_decode_image_native_format(void) {
     TEST("tensor_decode_image_native_format");
 
-    // Use -1 for format to let the decoder choose
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    // The decoder always emits the source's native format; for a colour JPEG
+    // that is NV12. The tensor is configured to that format on decode.
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -477,7 +495,7 @@ static void test_tensor_decode_image_native_format(void) {
     }
 
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image_file(tensor, path, -1, &width, &height);
+    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height);
     if (ret != 0) {
         hal_tensor_free(tensor);
         fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
@@ -487,6 +505,7 @@ static void test_tensor_decode_image_native_format(void) {
     ASSERT_EQ(0, ret);
     ASSERT_EQ(1280, (int)width);
     ASSERT_EQ(720, (int)height);
+    ASSERT_EQ(HAL_PIXEL_FORMAT_NV12, hal_tensor_pixel_format(tensor));
 
     hal_tensor_free(tensor);
     TEST_PASS();
@@ -496,17 +515,17 @@ static void test_tensor_decode_image_null_handling(void) {
     TEST("tensor_decode_image_null_handling");
 
     // NULL tensor
-    int ret = hal_tensor_decode_image(NULL, (const uint8_t*)"data", 4, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    int ret = hal_tensor_decode_image(NULL, (const uint8_t*)"data", 4, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     // NULL data
     struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
-    ret = hal_tensor_decode_image(tensor, NULL, 100, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ret = hal_tensor_decode_image(tensor, NULL, 100, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     // Zero length
-    ret = hal_tensor_decode_image(tensor, (const uint8_t*)"data", 0, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ret = hal_tensor_decode_image(tensor, (const uint8_t*)"data", 0, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     hal_tensor_free(tensor);
@@ -516,12 +535,12 @@ static void test_tensor_decode_image_null_handling(void) {
 static void test_tensor_decode_image_file_null_handling(void) {
     TEST("tensor_decode_image_file_null_handling");
 
-    int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
-    ret = hal_tensor_decode_image_file(tensor, NULL, HAL_PIXEL_FORMAT_RGB, NULL, NULL);
+    ret = hal_tensor_decode_image_file(tensor, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     hal_tensor_free(tensor);
