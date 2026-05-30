@@ -3315,8 +3315,11 @@ mod gl_tests {
     }
 
     // ── float_pbo_eligible unit tests ────────────────────────────────────────
-    // Pure-logic predicate; no GPU required.
+    // Pure-logic predicate; no GPU required. Linux-only: `float_pbo_eligible`
+    // is gated to the Linux GL backend (macOS uses IOSurface, not float PBO),
+    // so the symbol does not exist on macOS builds.
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn float_pbo_eligibility() {
         use crate::{float_pbo_eligible, RenderDtypeSupport};

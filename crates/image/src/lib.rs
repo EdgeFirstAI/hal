@@ -891,6 +891,15 @@ pub struct RenderDtypeSupport {
 /// Only F16 and F32 are eligible, and only when the corresponding flag in
 /// `support` is set. U8/I8 and all other dtypes return `false` — they are
 /// handled by the existing `dtype.size() == 1` PBO gate.
+///
+/// Linux-only: the float PBO readback path is the Linux GL backend's
+/// mechanism; macOS routes F16 through the RGBA16F-packed IOSurface
+/// instead and never calls this. The sole runtime caller in
+/// `create_image` is `cfg(all(target_os = "linux", feature = "opengl"))`,
+/// so leaving this ungated makes it dead code on macOS under
+/// `-D warnings`. Its unit test (`float_pbo_eligibility`) carries the
+/// matching gate.
+#[cfg(all(target_os = "linux", feature = "opengl"))]
 pub(crate) fn float_pbo_eligible(dtype: DType, support: RenderDtypeSupport) -> bool {
     match dtype {
         DType::F16 => support.f16,
@@ -7241,6 +7250,12 @@ mod image_tests {
     /// plane-swap or layout bug surfaces immediately. Tolerance is 2^-9
     /// (one F16 ULP at 0.5, i.e. roughly 1/512).
     #[test]
+    // `ImageProcessorConfig` carries a Linux-only `egl_display` field, so
+    // `{ backend, ..Default::default() }` is a genuine update on Linux but
+    // covers no remaining fields on macOS, where `clippy::needless_update`
+    // then fires. `allow` (not `expect`) because the lint is platform-
+    // conditional — it does not fire on Linux.
+    #[allow(clippy::needless_update)]
     fn convert_f16_forced_cpu_correct() {
         const W: usize = 16;
         const H: usize = 16;
@@ -7606,6 +7621,9 @@ mod image_tests {
     /// which was untested. A wrong intermediate format selection silently
     /// produces garbage. Y=128, U=V=128 → near-neutral grey → R≈G≈B≈0.5.
     #[test]
+    // Linux-only `egl_display` field makes `..Default::default()` needless
+    // on macOS only; see `convert_f16_forced_cpu_correct`.
+    #[allow(clippy::needless_update)]
     fn convert_nv12_to_rgb_f32_cpu() {
         const W: usize = 16;
         const H: usize = 16; // must be even for NV12
@@ -7652,6 +7670,9 @@ mod image_tests {
     ///
     /// Same rationale as `convert_nv12_to_rgb_f32_cpu` but for F16 output.
     #[test]
+    // Linux-only `egl_display` field makes `..Default::default()` needless
+    // on macOS only; see `convert_f16_forced_cpu_correct`.
+    #[allow(clippy::needless_update)]
     fn convert_nv12_to_planar_rgb_f16_cpu() {
         const W: usize = 16;
         const H: usize = 16;
