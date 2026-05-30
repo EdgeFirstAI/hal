@@ -36,6 +36,14 @@ pub enum Error {
         /// What was observed, e.g. `"length 32"`.
         got: String,
     },
+    /// A capacity-aware operation needs more bytes than the tensor's
+    /// underlying allocation provides.
+    InsufficientCapacity {
+        /// Bytes the requested layout needs.
+        needed: usize,
+        /// Bytes the allocation provides.
+        capacity: usize,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -59,7 +67,13 @@ impl From<ndarray::ShapeError> for Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Error::InsufficientCapacity { needed, capacity } => write!(
+                f,
+                "insufficient tensor capacity: need {needed} bytes, have {capacity}"
+            ),
+            _ => write!(f, "{self:?}"),
+        }
     }
 }
 
@@ -152,6 +166,19 @@ mod tests {
         assert!(
             msg.contains("IoError") && msg.contains("file missing"),
             "unexpected IoError message: {msg}"
+        );
+    }
+
+    #[test]
+    fn insufficient_capacity_message() {
+        let e = Error::InsufficientCapacity {
+            needed: 100,
+            capacity: 64,
+        };
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("100") && msg.contains("64"),
+            "unexpected message: {msg}"
         );
     }
 }
