@@ -363,6 +363,9 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::CudaMap(_, resp) => {
                             let _ = resp.send(None);
                         }
+                        // GL context is poisoned/dead — the GL buffer is unusable, so unmapping/
+                        // unregistering the CUDA interop is moot (the resource is reclaimed at
+                        // process exit). Same accepted "GL is gone" no-op as PboDelete above.
                         GLProcessorMessage::CudaUnmap(_) => {}
                         GLProcessorMessage::CudaUnregister(_) => {}
                     }
