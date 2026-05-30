@@ -1281,6 +1281,13 @@ pub struct Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// CUDA registration for this tensor, if any. Set after creation by
+    /// the image crate once a PBO is registered with CUDA interop.
+    ///
+    /// MUST be declared before `storage`: CUDA must unregister the GL buffer
+    /// before storage's Drop deletes it (cudaGraphicsUnregisterResource before
+    /// glDeleteBuffers). Rust drops fields in declaration order.
+    cuda: Option<crate::cuda::CudaHandle>,
     pub(crate) storage: TensorStorage<T>,
     format: Option<PixelFormat>,
     chroma: Option<Box<Tensor<T>>>,
@@ -1294,9 +1301,6 @@ where
     /// gated by the `IntegerType` trait — `Tensor<f32>` etc. carry the
     /// field for layout uniformity but have no way to read or write it.
     pub(crate) quantization: Option<Quantization>,
-    /// CUDA registration for this tensor, if any. Set after creation by
-    /// the image crate once a PBO is registered with CUDA interop.
-    cuda: Option<crate::cuda::CudaHandle>,
 }
 
 impl<T> Tensor<T>
