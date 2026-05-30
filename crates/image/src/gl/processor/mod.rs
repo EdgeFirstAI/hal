@@ -397,6 +397,23 @@ impl ImageProcessorTrait for GLProcessorST {
     }
 }
 
+/// Whether `EDGEFIRST_ALLOW_SOFTWARE_GL=1` is set, opting in to running the GL
+/// backend on a software renderer (Mesa llvmpipe/softpipe/swrast).
+///
+/// Off by default and in production; the CI coverage lane sets it so the GL
+/// render path executes on llvmpipe where no GPU exists.
+fn software_gl_override_enabled() -> bool {
+    std::env::var_os("EDGEFIRST_ALLOW_SOFTWARE_GL").is_some_and(|v| v == "1")
+}
+
+/// Decide whether to reject an initialized GL context for being a software
+/// renderer. Pure so it is unit-testable without touching the environment or a
+/// real GL context: reject only when the renderer is software AND the override
+/// is not enabled.
+fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool) -> bool {
+    is_software_renderer && !override_enabled
+}
+
 impl GLProcessorST {
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new(kind)?;
@@ -419,13 +436,27 @@ impl GLProcessorST {
         // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
         // implementations that are slower and less capable than our native CPU
         // backend. Reject them early — the caller falls back to CPU automatically.
-        if is_software_renderer {
+        //
+        // `EDGEFIRST_ALLOW_SOFTWARE_GL=1` overrides the rejection. It exists
+        // for the CI coverage lane, which runs the GL render path (e.g. the
+        // float PBO roundtrips) on Mesa llvmpipe where no GPU is available —
+        // the rendered output is numerically identical to a hardware GPU since
+        // it runs the same GLSL. Production never sets it, so the default
+        // (reject software GL, fall back to CPU) is unchanged.
+        if should_reject_software_gl(is_software_renderer, software_gl_override_enabled()) {
             return Err(crate::Error::NotSupported(
                 "software OpenGL renderer detected (llvmpipe/softpipe/swrast); \
                  GL backend disabled — check EGL ICD configuration if a \
-                 hardware GPU is expected"
+                 hardware GPU is expected (set EDGEFIRST_ALLOW_SOFTWARE_GL=1 \
+                 to override, e.g. for coverage on Mesa llvmpipe)"
                     .into(),
             ));
+        }
+        if is_software_renderer {
+            log::warn!(
+                "software OpenGL renderer in use (EDGEFIRST_ALLOW_SOFTWARE_GL=1); \
+                 slower than the CPU backend — intended for CI coverage only"
+            );
         }
 
         // Uploads and downloads are all packed with no alignment requirements
@@ -5722,5 +5753,35 @@ impl GLProcessorST {
             self.supports_f32_color,
             self.supports_f16_color,
         )
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::should_reject_software_gl;
+
+    // The override env reader (`software_gl_override_enabled`) is a thin
+    // `var_os == "1"` wrapper; it is exercised end-to-end by the GL-init path
+    // on the Mesa-llvmpipe coverage lane. The decision logic below is the part
+    // worth pinning in a pure unit test.
+
+    #[test]
+    fn software_gl_rejected_by_default() {
+        // Software renderer, no override → reject (caller falls back to CPU).
+        assert!(should_reject_software_gl(true, false));
+    }
+
+    #[test]
+    fn software_gl_allowed_with_override() {
+        // Software renderer + override → do not reject (CI coverage path).
+        assert!(!should_reject_software_gl(true, true));
+    }
+
+    #[test]
+    fn hardware_gl_never_rejected() {
+        // A hardware renderer is never rejected, override or not.
+        assert!(!should_reject_software_gl(false, false));
+        assert!(!should_reject_software_gl(false, true));
     }
 }
