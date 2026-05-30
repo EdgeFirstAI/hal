@@ -831,3 +831,45 @@ impl Drop for GLProcessorThreaded {
         let _ = self.handle.take().and_then(|h| h.join().ok());
     }
 }
+
+// `pbo_elem_count` / `pbo_shape` are pure (no GL), so they are unit-testable
+// without a GPU. The overflow→None arm of `pbo_elem_count` guards against an
+// undersized PBO allocation, so it is worth pinning explicitly.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{pbo_elem_count, pbo_shape};
+    use edgefirst_tensor::PixelFormat;
+
+    #[test]
+    fn elem_count_per_format() {
+        // Packed RGBA: w*h*4.
+        assert_eq!(pbo_elem_count(8, 4, PixelFormat::Rgba), Some(8 * 4 * 4));
+        // Packed RGB: w*h*3.
+        assert_eq!(pbo_elem_count(8, 4, PixelFormat::Rgb), Some(8 * 4 * 3));
+        // NV12 semiplanar: w*h*3/2.
+        assert_eq!(pbo_elem_count(8, 4, PixelFormat::Nv12), Some(8 * 4 * 3 / 2));
+        // NV16 semiplanar: w*h*2.
+        assert_eq!(pbo_elem_count(8, 4, PixelFormat::Nv16), Some(8 * 4 * 2));
+    }
+
+    #[test]
+    fn elem_count_overflow_is_none() {
+        // w*h already overflows usize → None (never a wrapped, undersized count).
+        assert_eq!(pbo_elem_count(usize::MAX, 2, PixelFormat::Rgba), None);
+        // w*h fits but *channels overflows → None.
+        assert_eq!(pbo_elem_count(usize::MAX, 1, PixelFormat::Rgb), None);
+    }
+
+    #[test]
+    fn shape_per_format() {
+        // Planar: [channels, height, width].
+        assert_eq!(pbo_shape(8, 4, PixelFormat::PlanarRgb), vec![3, 4, 8]);
+        // SemiPlanar NV12: [height*3/2, width].
+        assert_eq!(pbo_shape(8, 4, PixelFormat::Nv12), vec![4 * 3 / 2, 8]);
+        // SemiPlanar NV16: [height*2, width].
+        assert_eq!(pbo_shape(8, 4, PixelFormat::Nv16), vec![4 * 2, 8]);
+        // Packed: [height, width, channels].
+        assert_eq!(pbo_shape(8, 4, PixelFormat::Rgba), vec![4, 8, 4]);
+    }
+}

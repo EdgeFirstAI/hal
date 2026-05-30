@@ -3364,6 +3364,76 @@ mod cpu_tests {
         Ok(())
     }
 
+    /// Exercises the `widen_scratch` cache in `convert_dtype`'s U8→float arm:
+    /// the first convert allocates+stores the scratch, a second convert at the
+    /// same dst format/size takes the cache-hit branch, and a third at a
+    /// different size takes the reallocate branch. A single-convert test (as
+    /// all the others are) never reaches the cache-hit/realloc paths.
+    #[test]
+    fn cpu_widen_scratch_reused_across_converts() -> Result<()> {
+        fn rgba(w: usize, h: usize) -> Result<TensorDyn> {
+            let src = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+            {
+                let mut map = src.as_u8().unwrap().map()?;
+                let data = map.as_mut_slice();
+                for (i, px) in data.chunks_exact_mut(4).enumerate() {
+                    px[0] = (i * 7) as u8;
+                    px[1] = (i * 7 + 1) as u8;
+                    px[2] = (i * 7 + 2) as u8;
+                    px[3] = 255;
+                }
+            }
+            Ok(src)
+        }
+
+        // One processor instance so the scratch cache persists across calls.
+        let mut cv = CPUProcessor::default();
+
+        let src4 = rgba(4, 4)?;
+        let mut dst_a =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+        let mut dst_b =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+
+        // 1st convert: scratch is None → allocate + cache.
+        cv.convert(&src4, &mut dst_a, Rotation::None, Flip::None, Crop::default())?;
+        // 2nd convert, same dst format+size → cache-hit branch (reuse scratch).
+        cv.convert(&src4, &mut dst_b, Rotation::None, Flip::None, Crop::default())?;
+
+        // Both results must be identical and correctly normalized.
+        let a = dst_a.as_f32().unwrap().map()?;
+        let b = dst_b.as_f32().unwrap().map()?;
+        assert_eq!(a.as_slice(), b.as_slice(), "cache-hit produced different output");
+
+        // 3rd convert at a different size → scratch mismatch → realloc branch.
+        let src8 = rgba(8, 8)?;
+        let mut dst_c =
+            TensorDyn::image(8, 8, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+        cv.convert(&src8, &mut dst_c, Rotation::None, Flip::None, Crop::default())?;
+        let c = dst_c.as_f32().unwrap().map()?;
+        assert_eq!(c.as_slice().len(), 8 * 8 * 3);
+        assert!(c.as_slice().iter().all(|v| (0.0..=1.0).contains(v)));
+        Ok(())
+    }
+
+    /// `convert_dtype` returns `NotAnImage` when the destination tensor has no
+    /// pixel format (a bare, non-image tensor), rather than panicking.
+    #[test]
+    fn cpu_convert_dst_without_format_errors() -> Result<()> {
+        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+        // A plain tensor with no image format set.
+        let mut dst = TensorDyn::new(&[4, 4, 3], DType::F32, Some(TensorMemory::Mem), None)?;
+        let mut cv = CPUProcessor::default();
+        let err = cv
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotAnImage),
+            "expected NotAnImage, got {err:?}"
+        );
+        Ok(())
+    }
+
     /// RGBA8 → Rgb F32 with downscale (8x8 → 4x4): output must be in [0,1]
     /// and finite; a flat-color region survives resize exactly.
     #[test]

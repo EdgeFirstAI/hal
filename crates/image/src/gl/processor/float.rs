@@ -810,3 +810,89 @@ impl GLProcessorST {
         Ok(())
     }
 }
+
+// `float_crop_uniforms` and `float_pbo_buffer_id` are pure (no GL state), so
+// they are unit-testable without a GPU. The GL draw/upload/readback methods
+// above need a real V3D/Mali device and are covered on-target, not in CI.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{float_crop_uniforms, float_pbo_buffer_id};
+    use crate::{Crop, Error, Rect};
+
+    #[test]
+    fn crop_uniforms_default_is_full_frame_no_pad() {
+        // No src/dst rects, no pad color → sample the whole source into the
+        // whole destination with black pad.
+        let (uv, px, pad) = float_crop_uniforms(&Crop::default(), 8, 8, 4, 4).unwrap();
+        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(px, [0.0, 0.0, 4.0, 4.0]);
+        assert_eq!(pad, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn crop_uniforms_with_rects_and_pad() {
+        let crop = Crop {
+            src_rect: Some(Rect {
+                left: 2,
+                top: 2,
+                width: 4,
+                height: 4,
+            }),
+            dst_rect: Some(Rect {
+                left: 1,
+                top: 1,
+                width: 6,
+                height: 6,
+            }),
+            dst_color: Some([255, 128, 0, 255]),
+        };
+        let (uv, px, pad) = float_crop_uniforms(&crop, 8, 8, 8, 8).unwrap();
+        // src_rect normalized to UV: (2/8, 2/8, 4/8, 4/8).
+        assert_eq!(uv, [0.25, 0.25, 0.5, 0.5]);
+        // dst_rect passed through as pixels.
+        assert_eq!(px, [1.0, 1.0, 6.0, 6.0]);
+        // pad color normalized to [0,1], alpha dropped.
+        assert_eq!(pad[0], 1.0);
+        assert!((pad[1] - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(pad[2], 0.0);
+    }
+
+    #[test]
+    fn crop_uniforms_out_of_bounds_rect_errors() {
+        // src_rect exceeds the source extent → check_crop_dims rejects it.
+        let crop = Crop {
+            src_rect: Some(Rect {
+                left: 6,
+                top: 0,
+                width: 4, // 6 + 4 = 10 > src_w = 8
+                height: 4,
+            }),
+            dst_rect: None,
+            dst_color: None,
+        };
+        let err = float_crop_uniforms(&crop, 8, 8, 8, 8).unwrap_err();
+        assert!(
+            matches!(err, Error::CropInvalid(_)),
+            "expected CropInvalid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pbo_buffer_id_rejects_non_pbo_tensor() {
+        // A plain Mem-backed tensor is not PBO-backed → OpenGl error rather
+        // than a panic / bogus buffer id.
+        let t = edgefirst_tensor::Tensor::<f32>::image(
+            4,
+            4,
+            edgefirst_tensor::PixelFormat::Rgb,
+            Some(edgefirst_tensor::TensorMemory::Mem),
+        )
+        .unwrap();
+        let err = float_pbo_buffer_id(&t).unwrap_err();
+        assert!(
+            matches!(err, Error::OpenGl(_)),
+            "expected OpenGl error, got {err:?}"
+        );
+    }
+}

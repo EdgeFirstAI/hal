@@ -98,3 +98,124 @@ pub(super) fn classify_float_render(
         _ => FloatRenderPath::None,
     }
 }
+
+// Shared (NOT cfg(target_os)) so the classifier is exercised on the macOS
+// coverage lane too — the `gl::tests` `dispatch_*` tests are Linux-only, so
+// without this `classify_float_render` is compiled-but-untested on macOS.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{classify_float_render, FloatRenderPath};
+    use crate::RenderDtypeSupport;
+    use edgefirst_tensor::{DType, PixelFormat, TensorMemory};
+
+    const YES: RenderDtypeSupport = RenderDtypeSupport { f32: true, f16: true };
+    const NO: RenderDtypeSupport = RenderDtypeSupport {
+        f32: false,
+        f16: false,
+    };
+
+    #[test]
+    fn pbo_f16_when_supported() {
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Pbo,
+                YES
+            ),
+            FloatRenderPath::PboF16Nchw
+        );
+    }
+
+    #[test]
+    fn dma_f16_when_supported() {
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Dma,
+                YES
+            ),
+            FloatRenderPath::DmaF16Nchw
+        );
+    }
+
+    #[test]
+    fn pbo_f32_when_supported() {
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                DType::F32,
+                TensorMemory::Pbo,
+                YES
+            ),
+            FloatRenderPath::PboF32Nhwc
+        );
+    }
+
+    #[test]
+    fn no_path_when_capability_absent() {
+        // The format/dtype/memory tuple matches, but the GPU does not report
+        // the corresponding float capability → the guard fails → None.
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Pbo,
+                NO
+            ),
+            FloatRenderPath::None
+        );
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                DType::F32,
+                TensorMemory::Pbo,
+                NO
+            ),
+            FloatRenderPath::None
+        );
+    }
+
+    #[test]
+    fn no_path_for_unhandled_tuples() {
+        // Non-Rgba source, integer dtype, and host-memory destination all fall
+        // through to the catch-all None arm.
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Bgra,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Pbo,
+                YES
+            ),
+            FloatRenderPath::None
+        );
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                TensorMemory::Pbo,
+                YES
+            ),
+            FloatRenderPath::None
+        );
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Mem,
+                YES
+            ),
+            FloatRenderPath::None
+        );
+    }
+}

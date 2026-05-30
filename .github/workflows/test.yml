@@ -321,7 +321,9 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
-          components: clippy, rustfmt
+          # llvm-tools-preview supplies the profdata/cov tooling cargo-llvm-cov
+          # needs to turn the instrumented run into an LCOV report.
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
@@ -330,10 +332,10 @@ jobs:
           cache-on-failure: true
           cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
 
-      - name: Install cargo-nextest
+      - name: Install cargo tools
         uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-llvm-cov@0.6.16
 
       - name: Install ANGLE (Homebrew tap) and re-sign dylibs
         # ANGLE provides the libEGL.dylib + libGLESv2.dylib that
@@ -358,7 +360,7 @@ jobs:
         # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
         run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench -- -D warnings
 
-      - name: Run Rust tests
+      - name: Run Rust tests with coverage
         # scripts/test-macos.sh builds with --tests, signs every binary
         # with entitlements.plist (disables library validation so dlopen
         # of ad-hoc-signed ANGLE works on Tahoe), then forwards to
@@ -366,6 +368,15 @@ jobs:
         # `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
         # so we only add the runner-specific `-j 1` here. Without the
         # sign step the GL tests SIGKILL and silently skip.
+        #
+        # COVERAGE=1 instruments the build via cargo-llvm-cov (show-env), so
+        # the codesign step stays between build and run — this is what lets
+        # the macOS lane cover the ANGLE/IOSurface F16 GL render path that no
+        # other coverage lane exercises (x86 is headless; imx8mp/Vivante
+        # disables float GL).
+        env:
+          COVERAGE: "1"
+          COV_LCOV: target/coverage_rust.lcov
         run: |
           ./scripts/test-macos.sh -j 1 \
             2>&1 | tee target/test-metrics-rust-macos.txt
@@ -378,6 +389,17 @@ jobs:
 
           cd crates/capi/tests
           make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          # Picked up automatically by the sonarcloud job, which globs every
+          # coverage-*/**.lcov into -Dsonar.rust.lcov.reportPaths.
+          name: coverage-macos
+          path: |
+            target/coverage_rust.lcov
+          retention-days: 30
 
       - name: Upload test results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

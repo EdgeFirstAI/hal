@@ -136,6 +136,7 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 ///     ANGLE only supports `GL_HALF_FLOAT + GL_RGBA` (no
 ///     single-channel float). The tensor crate enforces
 ///     `width % 4 == 0`.
+#[cfg_attr(test, derive(Debug))]
 struct ImageLayout {
     fourcc: u32,
     bytes_per_element: usize,
@@ -467,4 +468,58 @@ pub(super) fn tensor_iosurface_ref(tensor: &Tensor<u8>) -> Option<*mut std::ffi:
         return None;
     }
     tensor.iosurface_ref()
+}
+
+// `ImageLayout::for_format` is pure geometry/validation (no GL/IOSurface
+// allocation), so it is unit-testable on the macOS coverage lane without a
+// GPU. These cover the surface-dimension computation and every error arm.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::ImageLayout;
+    use edgefirst_tensor::{DType, PixelFormat};
+
+    #[test]
+    fn planar_rgb_f16_packs_to_quarter_width_triple_height() {
+        // 16x16 PlanarRgb F16 → RGBA16F-packed (W/4, 3*H) = (4, 48).
+        let layout = ImageLayout::for_format(PixelFormat::PlanarRgb, DType::F16, 16, 16).unwrap();
+        assert_eq!(layout.surface_width, 4);
+        assert_eq!(layout.surface_height, 48);
+        assert_eq!((layout.width, layout.height), (16, 16));
+    }
+
+    #[test]
+    fn planar_rgba_f16_packs_to_quarter_width_quadruple_height() {
+        let layout = ImageLayout::for_format(PixelFormat::PlanarRgba, DType::F16, 16, 16).unwrap();
+        assert_eq!(layout.surface_width, 4);
+        assert_eq!(layout.surface_height, 64);
+    }
+
+    #[test]
+    fn planar_rgb_f16_misaligned_width_errors() {
+        // width % 4 != 0 cannot be RGBA16F-packed.
+        let err = ImageLayout::for_format(PixelFormat::PlanarRgb, DType::F16, 15, 16).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Internal(_)),
+            "expected Internal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unmapped_format_dtype_is_not_implemented() {
+        // A (format, dtype) with no FourCC mapping in image_iosurface_layout
+        // returns NotImplemented rather than a bogus layout.
+        let err = ImageLayout::for_format(PixelFormat::Nv12, DType::F32, 16, 16).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn packed_u8_format_uses_logical_dimensions() {
+        // Non-planar packed RGBA8 keeps logical (W, H) as the surface size.
+        let layout = ImageLayout::for_format(PixelFormat::Rgba, DType::U8, 16, 16).unwrap();
+        assert_eq!((layout.surface_width, layout.surface_height), (16, 16));
+    }
 }
