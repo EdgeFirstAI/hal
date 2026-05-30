@@ -20,7 +20,7 @@ INCLUDES  := -I/usr/src/jetson_multimedia_api/include \
 # nvbufsurface lives under the nvidia subdir; the rest are standard.
 LIBDIRS   := -L/usr/lib/aarch64-linux-gnu/nvidia \
              -L/usr/lib/aarch64-linux-gnu
-LIBS      := -lnvbufsurface -lcudart -lcuda -lnvinfer -lEGL -lGLESv2
+LIBS      := -lnvbufsurface -lcudart -lcuda -lnvinfer -lEGL -lGLESv2 -lgbm
 
 TARGET    := jetson_cuda_probe
 SRC       := jetson_cuda_probe.cpp
