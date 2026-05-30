@@ -13,7 +13,7 @@
 //! backend, and the workspace test convention is `-j 1` already.
 #![cfg(all(target_os = "linux", feature = "v4l2"))]
 
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{peek_info, DecodeOptions, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -161,4 +161,65 @@ fn v4l2_parity_f32_typed_tail() {
         mean < 3.0 && max_diff <= 24.0,
         "f32 typed-tail mismatch (mean={mean:.3}, max={max_diff})"
     );
+}
+
+#[test]
+fn v4l2_persistent_loop() {
+    // One decoder reused across many frames exercises the persistent stream
+    // (built once, then reused). All frames must match the CPU reference.
+    let jpeg = testdata("zidane.jpg");
+    let cpu = decode(&jpeg, 1280, 720, PixelFormat::Rgb, true);
+
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    let mut decoder = ImageDecoder::new();
+    let mut tensor =
+        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+    for i in 0..50 {
+        let info = tensor.load_image(&mut decoder, &jpeg, &opts).unwrap();
+        assert_eq!((info.width, info.height), (1280, 720));
+        let map = tensor.map().unwrap();
+        let px: &[u8] = &map;
+        assert_close(&cpu, &px[..1280 * 720 * 3], &format!("frame {i}"));
+    }
+}
+
+#[test]
+fn v4l2_geometry_change_rebuilds() {
+    // Alternating geometries force the stream to rebuild each call; the decoder
+    // must stay healthy (no wedge/leak) and keep producing valid output.
+    let z = testdata("zidane.jpg");
+    let g = testdata("giraffe.jpg");
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    let mut decoder = ImageDecoder::new();
+    let opts = DecodeOptions::default()
+        .with_format(PixelFormat::Rgb)
+        .with_exif(false);
+
+    for data in [&z, &g, &z, &g] {
+        let peeked = peek_info(data, &opts).unwrap();
+        let mut t = Tensor::<u8>::image(
+            peeked.width,
+            peeked.height,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        let info = t.load_image(&mut decoder, data, &opts).unwrap();
+        assert_eq!((info.width, info.height), (peeked.width, peeked.height));
+        let map = t.map().unwrap();
+        let px: &[u8] = &map;
+        let nonzero = px[..info.width * info.height * 3]
+            .iter()
+            .filter(|&&v| v != 0)
+            .count();
+        assert!(
+            nonzero > 1000,
+            "blank decode for {}x{}",
+            info.width,
+            info.height
+        );
+    }
 }
