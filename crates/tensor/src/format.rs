@@ -79,6 +79,30 @@ impl PixelFormat {
         }
     }
 
+    /// The tensor shape for this format at `width`×`height`, or `None` if the
+    /// dimensions are invalid for the format (e.g. NV12 with odd height) or the
+    /// format is an unsupported semi-planar variant (any `SemiPlanar` variant
+    /// other than `Nv12` and `Nv16`).
+    pub fn image_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
+        match self.layout() {
+            PixelLayout::Packed => Some(vec![height, width, self.channels()]),
+            PixelLayout::Planar => Some(vec![self.channels(), height, width]),
+            PixelLayout::SemiPlanar => {
+                let total_h = match self {
+                    PixelFormat::Nv12 => {
+                        if !height.is_multiple_of(2) {
+                            return None;
+                        }
+                        height * 3 / 2
+                    }
+                    PixelFormat::Nv16 => height * 2,
+                    _ => return None,
+                };
+                Some(vec![total_h, width])
+            }
+        }
+    }
+
     /// Returns `true` if this format encodes YUV (luma/chroma) data.
     pub const fn is_yuv(&self) -> bool {
         matches!(self, Self::Yuyv | Self::Vyuy | Self::Nv12 | Self::Nv16)

@@ -1250,32 +1250,11 @@ where
         format: PixelFormat,
         memory: Option<TensorMemory>,
     ) -> Result<Self> {
-        let shape = match format.layout() {
-            PixelLayout::Packed => vec![height, width, format.channels()],
-            PixelLayout::Planar => vec![format.channels(), height, width],
-            PixelLayout::SemiPlanar => {
-                // Contiguous semi-planar: luma + interleaved chroma in one allocation.
-                // NV12 (4:2:0): H lines luma + H/2 lines chroma = H * 3/2 total
-                // NV16 (4:2:2): H lines luma + H lines chroma = H * 2 total
-                let total_h = match format {
-                    PixelFormat::Nv12 => {
-                        if !height.is_multiple_of(2) {
-                            return Err(Error::InvalidArgument(format!(
-                                "NV12 requires even height, got {height}"
-                            )));
-                        }
-                        height * 3 / 2
-                    }
-                    PixelFormat::Nv16 => height * 2,
-                    _ => {
-                        return Err(Error::InvalidArgument(format!(
-                            "unknown semi-planar height multiplier for {format:?}"
-                        )))
-                    }
-                };
-                vec![total_h, width]
-            }
-        };
+        let shape = format.image_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
 
         // macOS Dma path: allocate a format-aware IOSurface (FourCC +
         // 2D dimensions) so the GL backend can bind it via
@@ -2219,6 +2198,31 @@ mod dtype_tests {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    #[test]
+    fn image_shape_per_layout() {
+        assert_eq!(
+            PixelFormat::Rgb.image_shape(640, 480),
+            Some(vec![480, 640, 3])
+        );
+        assert_eq!(
+            PixelFormat::Grey.image_shape(640, 480),
+            Some(vec![480, 640, 1])
+        );
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(640, 480),
+            Some(vec![720, 640])
+        );
+        assert_eq!(PixelFormat::Nv12.image_shape(640, 481), None);
+        assert_eq!(
+            PixelFormat::PlanarRgb.image_shape(640, 480),
+            Some(vec![3, 480, 640])
+        );
+        assert_eq!(
+            PixelFormat::Nv16.image_shape(640, 480),
+            Some(vec![960, 640])
+        );
+    }
 
     #[test]
     fn raw_tensor_has_no_format() {
