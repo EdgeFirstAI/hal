@@ -17,6 +17,7 @@ mod probe;
 mod probe_float_render;
 mod probe_int_textures;
 mod probe_min_sizes;
+mod probe_nvbufsurface;
 mod probe_rgb_fbo;
 
 use egl_context::GpuContext;
@@ -52,6 +53,9 @@ fn main() {
         probe_int_textures::run(&ctx);
         probe_min_sizes::run(&ctx);
         probe_float_render::run(&ctx);
+        // Jetson NvBufSurface dma-buf probe (O1-O3). Gated: SKIPs cleanly when
+        // libnvbufsurface.so is absent, so non-Jetson runs are unaffected.
+        probe_nvbufsurface::run(&ctx);
         probe_rgb_fbo::run(&ctx)
     } else {
         false
