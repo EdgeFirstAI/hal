@@ -60,7 +60,7 @@
 //! ```
 //! Page faults during the hot loop indicate unexpected allocations.
 
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use std::time::Instant;
@@ -139,7 +139,6 @@ fn load_test_images() -> Vec<ImageEntry> {
 fn bench_pipeline(
     image: &ImageEntry,
     decoder: &mut ImageDecoder,
-    opts: &DecodeOptions,
     input: &mut TensorDyn,
     output: &mut TensorDyn,
     proc: &mut ImageProcessor,
@@ -151,7 +150,7 @@ fn bench_pipeline(
 
     for _ in 0..ITERATIONS {
         let t0 = Instant::now();
-        let info = input.load_image(decoder, &image.data, opts).unwrap();
+        let info = input.load_image(decoder, &image.data).unwrap();
         let t1 = Instant::now();
 
         let (left, top, new_w, new_h) =
@@ -225,8 +224,12 @@ fn main() {
     // Allocate input tensor — larger than all test images.
     // With None (auto), DMA-BUF backed tensors are used on embedded Linux
     // for zero-copy GPU pipeline (decode → EGL image → convert).
+    //
+    // Colour JPEGs decode to their native NV12 layout; the codec configures
+    // the tensor's dims+format during the decode and the convert step below
+    // handles the NV12 → RGB colour conversion.
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, mem_type)
+        .create_image(max_w, max_h, PixelFormat::Nv12, DType::U8, mem_type)
         .expect("Failed to create input tensor");
     let input_stride = input.effective_row_stride().unwrap_or(0);
     let input_memory = input.memory();
@@ -273,11 +276,8 @@ fn main() {
         output_planar.memory()
     );
 
-    // Create decoder and options
+    // Create decoder
     let mut decoder = ImageDecoder::new();
-    let opts = DecodeOptions::default()
-        .with_format(PixelFormat::Rgb)
-        .with_exif(false);
 
     // Comprehensive warmup: exercise every (image × output) combination
     // multiple times so that all GL resources (PBOs, framebuffers),
@@ -287,7 +287,7 @@ fn main() {
     eprintln!("\n  Warmup: exercising all code paths...");
     for image in &images {
         for _ in 0..10 {
-            let info = input.load_image(&mut decoder, &image.data, &opts).unwrap();
+            let info = input.load_image(&mut decoder, &image.data).unwrap();
             let (left, top, new_w, new_h) =
                 calculate_letterbox(info.width, info.height, MODEL_W, MODEL_H);
             let crop = Crop::new()
@@ -300,7 +300,7 @@ fn main() {
     }
     for image in &images {
         for _ in 0..10 {
-            let info = input.load_image(&mut decoder, &image.data, &opts).unwrap();
+            let info = input.load_image(&mut decoder, &image.data).unwrap();
             let (left, top, new_w, new_h) =
                 calculate_letterbox(info.width, info.height, MODEL_W, MODEL_H);
             let crop = Crop::new()
@@ -333,7 +333,6 @@ fn main() {
         let (decode_us, convert_us) = bench_pipeline(
             image,
             &mut decoder,
-            &opts,
             &mut input,
             &mut output_packed,
             &mut proc,
@@ -353,7 +352,6 @@ fn main() {
         let (decode_us, convert_us) = bench_pipeline(
             image,
             &mut decoder,
-            &opts,
             &mut input,
             &mut output_planar,
             &mut proc,

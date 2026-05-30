@@ -1129,7 +1129,13 @@ mod cpu_tests {
             None,
         )
         .unwrap();
-        compare_images_convert_to_rgb(&image, &expected, 0.99, function!());
+        // Threshold 0.97 (was 0.99): the codec now decodes colour JPEGs to
+        // their native NV12 layout, so the `giraffe.jpg` background routes
+        // through an NV12 → RGBA conversion (chroma subsampling) before the
+        // mask is composited. The `output_render_cpu.jpg` golden was captured
+        // from the old direct-RGB JPEG decode, so the NV12-sourced background
+        // differs slightly. This mirrors the GL counterpart's 0.97 tolerance.
+        compare_images_convert_to_rgb(&image, &expected, 0.97, function!());
     }
 
     // =========================================================================

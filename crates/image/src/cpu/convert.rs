@@ -12,7 +12,12 @@ use super::CPUProcessor;
 
 #[inline(always)]
 pub(super) fn limit_to_full(l: u8) -> u8 {
-    (((l as u16 - 16) * 255 + (240 - 16) / 2) / (240 - 16)) as u8
+    // Expand limited-range luma (16..=240) to full-range (0..=255). Real
+    // decoded YUV (e.g. JPEG → NV12) can carry luma below 16 or above 240, so
+    // clamp into the valid limited range first to avoid u16 underflow on the
+    // `l - 16` term (and keep the result within 0..=255).
+    let l = (l as u16).clamp(16, 240);
+    (((l - 16) * 255 + (240 - 16) / 2) / (240 - 16)) as u8
 }
 
 #[inline(always)]
