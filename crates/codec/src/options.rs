@@ -1,58 +1,33 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decode options and output metadata.
+//! Output metadata returned by the decoder.
+//!
+//! The codec has no decode options: it always decodes to the source's native
+//! format (JPEG → NV12/GREY, PNG → RGB/RGBA/GREY), writes that format onto the
+//! destination tensor, and reports EXIF orientation for the caller to apply via
+//! `ImageProcessor::convert()`. It never colour-converts or rotates.
 
 use edgefirst_tensor::PixelFormat;
-
-/// Options controlling how an image is decoded.
-#[derive(Debug, Clone)]
-pub struct DecodeOptions {
-    /// Desired output pixel format. `None` uses the native format from the
-    /// file (typically RGB for JPEG, RGB/RGBA for PNG).
-    pub format: Option<PixelFormat>,
-
-    /// Whether to apply EXIF orientation metadata. Default: `true`.
-    ///
-    /// Set to `false` when the caller will handle rotation/flip externally
-    /// (e.g. via [`ImageProcessor::convert()`]).
-    pub apply_exif: bool,
-}
-
-impl Default for DecodeOptions {
-    fn default() -> Self {
-        Self {
-            format: None,
-            apply_exif: true,
-        }
-    }
-}
-
-impl DecodeOptions {
-    /// Set the desired output pixel format.
-    #[must_use]
-    pub fn with_format(mut self, format: PixelFormat) -> Self {
-        self.format = Some(format);
-        self
-    }
-
-    /// Set whether to apply EXIF orientation.
-    #[must_use]
-    pub fn with_exif(mut self, apply: bool) -> Self {
-        self.apply_exif = apply;
-        self
-    }
-}
 
 /// Metadata returned after a successful image decode.
 #[derive(Debug, Clone, Copy)]
 pub struct ImageInfo {
-    /// Width of the decoded image in pixels.
+    /// Width of the decoded image in pixels (the source's true width; the
+    /// codec does not apply EXIF rotation).
     pub width: usize,
-    /// Height of the decoded image in pixels.
+    /// Height of the decoded image in pixels (the source's true height).
     pub height: usize,
-    /// Pixel format of the decoded data written to the tensor.
+    /// Native pixel format written to the tensor (JPEG → `Nv12`/`Grey`,
+    /// PNG → `Rgb`/`Rgba`/`Grey`).
     pub format: PixelFormat,
     /// Row stride in bytes used when writing into the tensor.
     pub row_stride: usize,
+    /// EXIF orientation: clockwise rotation in degrees (0/90/180/270) the
+    /// consumer should apply downstream (e.g. via `convert()`). The codec does
+    /// **not** rotate. `0` when there is no EXIF orientation.
+    pub rotation_degrees: u16,
+    /// EXIF horizontal flip the consumer should apply downstream. `false` when
+    /// there is no EXIF orientation.
+    pub flip_horizontal: bool,
 }

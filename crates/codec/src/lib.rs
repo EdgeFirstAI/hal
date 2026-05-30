@@ -13,18 +13,18 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use edgefirst_codec::{ImageDecoder, ImageLoad, DecodeOptions};
+//! use edgefirst_codec::{ImageDecoder, ImageLoad};
 //! use edgefirst_tensor::{Tensor, TensorTrait, TensorMemory, PixelFormat};
 //!
-//! // Allocate once (at init)
-//! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem))
+//! // Allocate once (at init), sized for the largest expected image.
+//! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem))
 //!     .expect("allocation");
 //! let mut decoder = ImageDecoder::new();
 //!
-//! // Decode many (in hot loop)
+//! // Decode many (in hot loop). The decoder sets the tensor's dimensions and
+//! // native format (JPEG → Nv12/Grey); call `convert()` for RGB.
 //! let jpeg_bytes = std::fs::read("frame.jpg").unwrap();
-//! let info = tensor.load_image(&mut decoder, &jpeg_bytes, &DecodeOptions::default())
-//!     .expect("decode");
+//! let info = tensor.load_image(&mut decoder, &jpeg_bytes).expect("decode");
 //! assert!(info.width <= 1920);
 //! assert!(info.height <= 1080);
 //! ```
@@ -55,7 +55,7 @@ mod traits;
 
 pub use decoder::{peek_info, ImageDecoder};
 pub use error::{CodecError, UnsupportedFeature};
-pub use options::{DecodeOptions, ImageInfo};
+pub use options::ImageInfo;
 pub use pixel::ImagePixel;
 pub use traits::ImageLoad;
 

@@ -35,7 +35,7 @@ use crate::pixel::ImagePixel;
 use buffers::Mmap;
 use device::{ApiVariant, ProbedDevice};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
-use format::{CapKind, RowScratch};
+use format::CapKind;
 
 /// Timeout waiting for the `SOURCE_CHANGE` event after queuing the JPEG (ms).
 const SOURCE_CHANGE_TIMEOUT_MS: i32 = 200;
@@ -114,7 +114,6 @@ impl V4l2Probe {
         output_fmt: PixelFormat,
         final_w: usize,
         final_h: usize,
-        channels: usize,
         dst_stride: usize,
     ) -> Result<Option<ImageInfo>, V4l2Decode> {
         let Some(ctx) = self.ensure_probed() else {
@@ -126,18 +125,22 @@ impl V4l2Probe {
             return Ok(None);
         }
 
-        let result = ctx.decode::<T>(
-            data, dst, output_fmt, final_w, final_h, channels, dst_stride,
-        );
+        let result = ctx.decode::<T>(data, dst, output_fmt, final_w, final_h, dst_stride);
         let out = match result {
             Ok(info) => {
                 ctx.failures = 0;
                 Ok(Some(info))
             }
-            Err(DecodeErr::Reset(why)) | Err(DecodeErr::Unsupported(why)) => {
-                // Reset the device and drop the persistent stream so the next
-                // decode rebuilds cleanly, then fall back to the CPU.
+            Err(DecodeErr::Reset(why)) => {
+                // Hardware failure: reset + count toward the circuit breaker.
                 ctx.fail_reset();
+                Err(V4l2Decode::Fallback(why))
+            }
+            Err(DecodeErr::Unsupported(why)) => {
+                // A config we don't drive (e.g. 4:4:4 YUV3 → NV12, or non-601
+                // colorimetry). Reset the stream but do NOT count it as a
+                // hardware failure — the CPU handles it; the device is fine.
+                ctx.drop_stream();
                 Err(V4l2Decode::Fallback(why))
             }
             Err(DecodeErr::Fatal(e)) => Err(V4l2Decode::Fatal(e)),
@@ -166,12 +169,6 @@ impl V4l2Probe {
 /// allocated OUTPUT buffer) rebuilds the stream; a hardware failure drops it.
 pub(crate) struct V4l2Context {
     device: ProbedDevice,
-    /// Packed-u8 staging buffer (native stride), reused across decodes. The
-    /// hardware path converts CAPTURE rows into here, then the shared typed
-    /// tail writes into the destination tensor.
-    staging: Vec<u8>,
-    /// Per-row de-interleave scratch, reused across decodes.
-    row_scratch: RowScratch,
     /// The live streaming session (both queues `STREAMON` with mapped
     /// buffers), or `None` before the first decode / after a reset.
     stream: Option<Stream>,
@@ -207,8 +204,6 @@ impl V4l2Context {
     fn new(device: ProbedDevice) -> Self {
         Self {
             device,
-            staging: Vec::new(),
-            row_scratch: RowScratch::new(),
             stream: None,
             failures: 0,
         }
@@ -217,7 +212,6 @@ impl V4l2Context {
     /// Decode one image, reusing the persistent stream when the geometry
     /// matches and the JPEG fits the allocated OUTPUT buffer, otherwise
     /// rebuilding the stream first.
-    #[allow(clippy::too_many_arguments)]
     fn decode<T: ImagePixel>(
         &mut self,
         data: &[u8],
@@ -225,7 +219,6 @@ impl V4l2Context {
         output_fmt: PixelFormat,
         final_w: usize,
         final_h: usize,
-        channels: usize,
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
         let needed = ((data.len() + 4095) & !4095) as u32;
@@ -241,7 +234,7 @@ impl V4l2Context {
         } else {
             self.rebuild_stream(data, final_w, final_h, needed)?;
         }
-        self.collect::<T>(dst, output_fmt, final_w, final_h, channels, dst_stride)
+        self.collect::<T>(dst, output_fmt, final_w, final_h, dst_stride)
     }
 
     /// Fast path: copy the JPEG into the already-mapped OUTPUT buffer and queue
@@ -387,21 +380,17 @@ impl V4l2Context {
     }
 
     /// Queue the CAPTURE buffer, wait for the decode, dequeue both buffers, and
-    /// convert the result into `dst`. Shared by the build and reuse paths.
-    #[allow(clippy::too_many_arguments)]
+    /// copy the decoded native planes (NV12/GREY) into `dst`. Shared by the
+    /// build and reuse paths.
     fn collect<T: ImagePixel>(
         &mut self,
         dst: &mut Tensor<T>,
         output_fmt: PixelFormat,
         final_w: usize,
         final_h: usize,
-        channels: usize,
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
         let fd = self.device.fd();
-        let plan = format::plan_output(output_fmt)
-            .ok_or_else(|| DecodeErr::Unsupported(format!("output {output_fmt:?} unsupported")))?;
-
         let num_planes = self
             .stream
             .as_ref()
@@ -419,67 +408,83 @@ impl V4l2Context {
         // Recycle the consumed OUTPUT buffer so the next frame can re-queue it.
         dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
 
-        // Convert decoded planes → staging, cropping to the logical image.
-        let native_stride = final_w * channels;
-        self.staging.resize(native_stride * final_h, 0);
-
+        // Resolve the decoded planes. Greyscale → Y only; NV12/NV12M → Y +
+        // interleaved CbCr. 4:4:4 YUV3 → native NV12 is left to the CPU.
         let stream = self
             .stream
             .as_ref()
             .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
         let cap = &stream.cap;
-        let luma_stride = cap.luma_stride;
-        let (luma, chroma): (&[u8], Option<(&[u8], usize)>) = match (&cap.kind, cap.num_planes) {
-            // NV12M: separate Y and CbCr buffers.
+        let y_stride = cap.luma_stride;
+        let (y_plane, chroma): (&[u8], Option<(&[u8], usize)>) = match (&cap.kind, cap.num_planes) {
             (CapKind::Nv12, n) if n >= 2 => (
                 cap.maps[0].as_slice(),
                 Some((cap.maps[1].as_slice(), cap.chroma_stride)),
             ),
-            // Single-buffer NV12: Y plane followed by CbCr in one allocation.
             (CapKind::Nv12, _) => {
                 let m = cap.maps[0].as_slice();
-                let y_size = cap.luma_stride * cap.cap_h;
-                (&m[..y_size], Some((&m[y_size..], cap.luma_stride)))
+                let ys = cap.luma_stride * cap.cap_h;
+                (&m[..ys], Some((&m[ys..], cap.luma_stride)))
             }
-            // Single-plane packed/grey formats.
-            _ => (cap.maps[0].as_slice(), None),
+            (CapKind::Grey, _) => (cap.maps[0].as_slice(), None),
+            (CapKind::Yuv444Packed, _) => {
+                return Err(DecodeErr::Unsupported(
+                    "4:4:4 YUV3 capture → native NV12 not handled on hardware; using CPU".into(),
+                ));
+            }
         };
 
-        let staging = &mut self.staging;
-        let scratch = &mut self.row_scratch;
-        for y in 0..final_h {
-            let luma_row = &luma[y * luma_stride..];
-            let chroma_row = chroma.map(|(c, cs)| &c[(y / 2) * cs..]);
-            let dst_off = y * native_stride;
-            format::convert_row(
-                &cap.kind,
-                &plan,
-                luma_row,
-                chroma_row,
-                final_w,
-                scratch,
-                &mut staging[dst_off..dst_off + native_stride],
-            );
-        }
-
-        // Write staging into the destination tensor via the shared typed tail.
-        let elem_size = std::mem::size_of::<T>();
         let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
-        super::convert_rows_to_target::<T>(
-            &self.staging,
-            &mut map,
-            final_w,
-            final_h,
-            channels,
-            dst_stride,
-            elem_size,
-        );
+        let dst_bytes: &mut [T] = &mut map;
+        // SAFETY: native NV12/GREY are u8; the JPEG entry guarantees T == u8.
+        let d: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
+        };
+
+        // Crop to the logical image (the CAPTURE buffer is MCU-rounded up).
+        match output_fmt {
+            PixelFormat::Grey => {
+                for y in 0..final_h {
+                    let s = y * y_stride;
+                    let o = y * dst_stride;
+                    d[o..o + final_w].copy_from_slice(&y_plane[s..s + final_w]);
+                }
+            }
+            PixelFormat::Nv12 => {
+                let Some((cbcr, c_stride)) = chroma else {
+                    return Err(DecodeErr::Unsupported(
+                        "NV12 output requires a chroma plane from the decoder".into(),
+                    ));
+                };
+                // Y plane.
+                for y in 0..final_h {
+                    let s = y * y_stride;
+                    let o = y * dst_stride;
+                    d[o..o + final_w].copy_from_slice(&y_plane[s..s + final_w]);
+                }
+                // Interleaved CbCr plane (`final_w` bytes/row = `final_w/2` pairs).
+                let uv_base = final_h * dst_stride;
+                for cy in 0..final_h / 2 {
+                    let s = cy * c_stride;
+                    let o = uv_base + cy * dst_stride;
+                    d[o..o + final_w].copy_from_slice(&cbcr[s..s + final_w]);
+                }
+            }
+            other => {
+                return Err(DecodeErr::Unsupported(format!(
+                    "output {other:?} unsupported"
+                )));
+            }
+        }
+        drop(map);
 
         Ok(ImageInfo {
             width: final_w,
             height: final_h,
             format: output_fmt,
             row_stride: dst_stride,
+            rotation_degrees: 0,
+            flip_horizontal: false,
         })
     }
 

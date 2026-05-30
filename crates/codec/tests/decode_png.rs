@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration tests: PNG decode into Mem tensors.
+//!
+//! PNG decodes to its native format (`Rgb`/`Rgba`/`Grey`); the decoder
+//! configures the destination tensor's format and dims itself.
 
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 
 fn testdata(name: &str) -> Vec<u8> {
@@ -27,13 +30,7 @@ fn decode_zidane_png_rgb() {
     let mut tensor =
         Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
     assert_eq!(info.format, PixelFormat::Rgb);
@@ -51,36 +48,12 @@ fn decode_zidane_png_rgb() {
 }
 
 #[test]
-fn decode_zidane_png_rgba() {
-    let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
-    let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgba),
-        )
-        .unwrap();
-    assert_eq!(info.width, 1280);
-    assert_eq!(info.height, 720);
-    assert_eq!(info.format, PixelFormat::Rgba);
-}
-
-#[test]
 fn decode_png_f32() {
     let png = testdata("zidane.png");
     let mut tensor =
         Tensor::<f32>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
 
@@ -97,16 +70,14 @@ fn decode_png_into_larger_tensor() {
     let mut tensor =
         Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
+    // The decoder reconfigures the oversized tensor to the image's true dims,
+    // so the reported stride is the image row stride (1280 * 3), not the
+    // allocation width.
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
-    assert!(info.row_stride >= 1920 * 3);
+    assert_eq!(info.format, PixelFormat::Rgb);
+    assert_eq!(info.row_stride, 1280 * 3);
 }
 
 #[test]
@@ -115,11 +86,7 @@ fn decode_png_capacity_error() {
     let mut tensor =
         Tensor::<u8>::image(640, 480, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let result = tensor.load_image(
-        &mut decoder,
-        &png,
-        &DecodeOptions::default().with_format(PixelFormat::Rgb),
-    );
+    let result = tensor.load_image(&mut decoder, &png);
     assert!(result.is_err());
 }
 
@@ -129,17 +96,11 @@ fn decode_png_u16() {
     let mut tensor =
         Tensor::<u16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
 
-    // zidane.png is 8-bit RGB, so u16 values should be multiples of 257
+    // zidane.png is 8-bit RGB, so u16 values should be multiples of 257.
     let map = tensor.map().unwrap();
     let pixels: &[u16] = &map;
     let sample_count = info.width * 3;
@@ -156,17 +117,11 @@ fn decode_png_i8() {
     let mut tensor =
         Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
 
-    // i8 via XOR: should span negative and positive values
+    // i8 via XOR: should span negative and positive values.
     let map = tensor.map().unwrap();
     let pixels: &[i8] = &map;
     let sample_count = info.width * 3;
@@ -182,13 +137,7 @@ fn decode_png_i16() {
     let mut tensor =
         Tensor::<i16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let info = tensor
-        .load_image(
-            &mut decoder,
-            &png,
-            &DecodeOptions::default().with_format(PixelFormat::Rgb),
-        )
-        .unwrap();
+    let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
     assert_eq!(info.height, 720);
 
@@ -203,7 +152,7 @@ fn decode_png_i16() {
 
 #[test]
 fn decode_png_i8_xor_consistency() {
-    // Verify PNG i8 decode matches manual u8→i8 XOR conversion
+    // Verify PNG i8 decode matches manual u8→i8 XOR conversion.
     let png = testdata("zidane.png");
 
     let mut u8_tensor =
@@ -211,10 +160,9 @@ fn decode_png_i8_xor_consistency() {
     let mut i8_tensor =
         Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
-    let opts = DecodeOptions::default().with_format(PixelFormat::Rgb);
 
-    u8_tensor.load_image(&mut decoder, &png, &opts).unwrap();
-    i8_tensor.load_image(&mut decoder, &png, &opts).unwrap();
+    u8_tensor.load_image(&mut decoder, &png).unwrap();
+    i8_tensor.load_image(&mut decoder, &png).unwrap();
 
     let u8_map = u8_tensor.map().unwrap();
     let i8_map = i8_tensor.map().unwrap();
