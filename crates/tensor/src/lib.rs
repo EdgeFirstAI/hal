@@ -1506,6 +1506,37 @@ where
         Ok(())
     }
 
+    /// Set this tensor's logical dimensions and pixel format to a decoded
+    /// image, reusing the existing allocation. The shape is derived from the
+    /// format layout; fails with `Error::InsufficientCapacity` if the
+    /// allocation cannot hold `width`×`height` in `format`, or
+    /// `Error::InvalidArgument` if the dimensions are invalid for the format.
+    pub fn configure_image(
+        &mut self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+    ) -> Result<()> {
+        let shape = format.image_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
+        self.storage.set_logical_shape(&shape)?;
+        self.set_format(format)
+    }
+
+    /// Allocate an image tensor sized to hold up to `width`×`height` in
+    /// `format`, reusable for any smaller image via `configure_image`.
+    pub fn image_with_capacity(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self> {
+        Self::image(width, height, format, memory)
+    }
+
     /// Pixel format (None if not an image).
     pub fn format(&self) -> Option<PixelFormat> {
         self.format
@@ -3230,6 +3261,25 @@ mod tests {
             !is_dma_available(),
             "DMA memory allocation should NOT be available on non-Linux platforms"
         );
+    }
+
+    #[test]
+    fn configure_image_within_capacity() {
+        let mut t = Tensor::<u8>::image_with_capacity(640, 480, PixelFormat::Rgb, None).unwrap();
+        t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv12));
+        assert_eq!(t.width(), Some(320));
+        assert_eq!(t.height(), Some(240));
+        assert_eq!(t.shape(), &[360, 320]); // 240*3/2
+    }
+
+    #[test]
+    fn configure_image_too_large_errors() {
+        let mut t = Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Grey, None).unwrap();
+        let err = t
+            .configure_image(1920, 1080, PixelFormat::Nv12)
+            .unwrap_err();
+        assert!(matches!(err, Error::InsufficientCapacity { .. }));
     }
 
     /// Test that SHM memory allocation is available and usable on Unix systems.
