@@ -725,6 +725,7 @@ dependencies = [
  "env_logger",
  "half",
  "libc",
+ "libloading",
  "log",
  "ndarray 0.17.2",
  "nix 0.31.2",

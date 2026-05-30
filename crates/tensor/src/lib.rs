@@ -26,6 +26,7 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
+mod cuda;
 #[cfg(target_os = "linux")]
 mod dma;
 #[cfg(target_os = "linux")]
@@ -48,6 +49,7 @@ pub use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
+pub use cuda::cuda_available;
 pub use error::{Error, Result};
 pub use format::{PixelFormat, PixelLayout};
 use num_traits::Num;
