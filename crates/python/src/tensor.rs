@@ -92,18 +92,28 @@ pub struct PyImageInfo {
     pub width: usize,
     /// Decoded image height in pixels.
     pub height: usize,
-    /// Pixel format of the decoded data.
+    /// Native pixel format of the decoded data.
     pub format: crate::image::PyPixelFormat,
     /// Row stride in bytes used for writing.
     pub row_stride: usize,
+    /// Clockwise rotation in degrees reported by EXIF orientation (0/90/180/270).
+    /// The decode itself never rotates; the decoded dimensions are unrotated.
+    pub rotation_degrees: u16,
+    /// Horizontal flip reported by EXIF orientation. The decode never flips.
+    pub flip_horizontal: bool,
 }
 
 #[pymethods]
 impl PyImageInfo {
     fn __repr__(&self) -> String {
         format!(
-            "ImageInfo(width={}, height={}, format={:?}, row_stride={})",
-            self.width, self.height, self.format, self.row_stride
+            "ImageInfo(width={}, height={}, format={:?}, row_stride={}, rotation_degrees={}, flip_horizontal={})",
+            self.width,
+            self.height,
+            self.format,
+            self.row_stride,
+            self.rotation_degrees,
+            self.flip_horizontal
         )
     }
 }
@@ -857,44 +867,35 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
-    /// Parse the header of a JPEG/PNG byte string and return its dimensions
-    /// and pixel format without decoding pixels. Use this to allocate a
-    /// tensor at the right size before calling ``decode_image``.
+    /// Parse the header of a JPEG/PNG byte string and return its native
+    /// dimensions, pixel format, and EXIF orientation without decoding
+    /// pixels. Use this to allocate a tensor at the right size before
+    /// calling ``decode_image``.
     ///
-    /// EXIF orientation is ignored so the reported dimensions match what
-    /// ``decode_image`` will actually write (decode also ignores EXIF when
-    /// writing into a pre-allocated tensor — see ``decode_image``).
+    /// The reported dimensions are unrotated (the decode never applies EXIF
+    /// rotation); ``rotation_degrees`` / ``flip_horizontal`` report the EXIF
+    /// orientation so callers can apply it themselves if desired.
     #[staticmethod]
-    #[pyo3(signature = (data, format = None))]
-    fn peek_image_info(
-        data: &[u8],
-        format: Option<crate::image::PyPixelFormat>,
-    ) -> Result<PyImageInfo> {
-        use edgefirst_hal::codec::{peek_info, DecodeOptions};
-        let mut opts = DecodeOptions::default().with_exif(false);
-        if let Some(fmt) = format {
-            opts = opts.with_format(fmt.into());
-        }
-        let info = peek_info(data, &opts)?;
+    fn peek_image_info(data: &[u8]) -> Result<PyImageInfo> {
+        use edgefirst_hal::codec::peek_info;
+        let info = peek_info(data)?;
         Ok(PyImageInfo {
             width: info.width,
             height: info.height,
             format: crate::image::PyPixelFormat::try_from(info.format)
                 .map_err(|e| Error::Format(e.to_string()))?,
             row_stride: info.row_stride,
+            rotation_degrees: info.rotation_degrees,
+            flip_horizontal: info.flip_horizontal,
         })
     }
 
-    /// Parse the header of an image file and return its dimensions and
-    /// pixel format without decoding pixels.
+    /// Parse the header of an image file and return its native dimensions,
+    /// pixel format, and EXIF orientation without decoding pixels.
     #[staticmethod]
-    #[pyo3(signature = (filename, format = None))]
-    fn peek_image_info_file(
-        filename: &str,
-        format: Option<crate::image::PyPixelFormat>,
-    ) -> Result<PyImageInfo> {
+    fn peek_image_info_file(filename: &str) -> Result<PyImageInfo> {
         let data = std::fs::read(filename)?;
-        Self::peek_image_info(&data, format)
+        Self::peek_image_info(&data)
     }
 
     /// Save this image tensor as a JPEG file.
@@ -907,9 +908,16 @@ impl PyTensor {
 
     /// Decode image bytes (JPEG/PNG) directly into this pre-allocated tensor.
     ///
-    /// Returns an ``ImageInfo`` dict with ``width``, ``height``, ``format``,
-    /// and ``row_stride`` of the decoded image. The tensor must have
-    /// sufficient capacity (width × height) for the decoded image.
+    /// The image is decoded in its native pixel format (JPEG → ``Nv12`` for
+    /// colour / ``Grey`` for greyscale; PNG → ``Rgb`` / ``Rgba`` / ``Grey``)
+    /// and the tensor's dimensions and format are configured by the decoder
+    /// to match. The decode never rotates or flips; if you need RGB, decode
+    /// then call ``ImageProcessor.convert(...)``.
+    ///
+    /// Returns an ``ImageInfo`` with the native ``width``, ``height``,
+    /// ``format``, ``row_stride``, and the EXIF ``rotation_degrees`` /
+    /// ``flip_horizontal``. The tensor must have sufficient capacity for the
+    /// decoded image (it is reconfigured within that capacity).
     ///
     /// This is the preferred API for real-time pipelines: allocate once via
     /// ``ImageProcessor.create_image()``, then call ``decode_image()`` in
@@ -917,47 +925,35 @@ impl PyTensor {
     ///
     /// Args:
     ///     data: Raw JPEG or PNG bytes.
-    ///     format: Desired output pixel format (default: native format from file).
-    #[pyo3(signature = (data, format = None))]
-    fn decode_image(
-        &mut self,
-        data: &[u8],
-        format: Option<crate::image::PyPixelFormat>,
-    ) -> Result<PyImageInfo> {
-        use edgefirst_hal::codec::{DecodeOptions, ImageLoad};
-        let mut opts = DecodeOptions::default().with_exif(false);
-        if let Some(fmt) = format {
-            opts = opts.with_format(fmt.into());
-        }
+    fn decode_image(&mut self, data: &[u8]) -> Result<PyImageInfo> {
+        use edgefirst_hal::codec::ImageLoad;
         DECODER.with(|cell| {
             let mut decoder = cell.borrow_mut();
-            let info = self.0.load_image(&mut decoder, data, &opts)?;
+            let info = self.0.load_image(&mut decoder, data)?;
             Ok(PyImageInfo {
                 width: info.width,
                 height: info.height,
                 format: crate::image::PyPixelFormat::try_from(info.format)
                     .map_err(|e| Error::Format(e.to_string()))?,
                 row_stride: info.row_stride,
+                rotation_degrees: info.rotation_degrees,
+                flip_horizontal: info.flip_horizontal,
             })
         })
     }
 
     /// Decode an image file (JPEG/PNG) directly into this pre-allocated tensor.
     ///
-    /// Returns an ``ImageInfo`` dict with ``width``, ``height``, ``format``,
-    /// and ``row_stride`` of the decoded image.
+    /// Decodes in the source's native pixel format and configures the
+    /// tensor's dimensions and format to match. Returns an ``ImageInfo``
+    /// with the native ``width``, ``height``, ``format``, ``row_stride``,
+    /// and the EXIF ``rotation_degrees`` / ``flip_horizontal``.
     ///
     /// Args:
     ///     filename: Path to the image file.
-    ///     format: Desired output pixel format (default: native format from file).
-    #[pyo3(signature = (filename, format = None))]
-    fn decode_image_file(
-        &mut self,
-        filename: &str,
-        format: Option<crate::image::PyPixelFormat>,
-    ) -> Result<PyImageInfo> {
+    fn decode_image_file(&mut self, filename: &str) -> Result<PyImageInfo> {
         let data = std::fs::read(filename).map_err(Error::Io)?;
-        self.decode_image(&data, format)
+        self.decode_image(&data)
     }
 
     /// Pixel format of this tensor (None if not an image tensor).
