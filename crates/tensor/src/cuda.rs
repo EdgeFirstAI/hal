@@ -114,6 +114,100 @@ pub fn gl_unregister_resource(resource: usize) {
     }
 }
 
+// =============================================================================
+// DMA-BUF → CUDA external memory import (thread-independent; no GL context).
+//
+// ABI verified against CUDA 12.6 driver_types.h, LP64, stable across CUDA
+// 11/12.  The structs are layout-asserted in the `ext_mem_layout` test module
+// below — no host with both /dev/dma_heap and CUDA is available in CI, so
+// runtime validation is deferred to on-target testing (orin-nano, gpu-probe O5
+// already confirmed cudaImportExternalMemory(OpaqueFd) works on Orin).
+// =============================================================================
+
+/// `cudaExternalMemoryHandleTypeOpaqueFd` — the only handle type used for
+/// Linux DMA-BUF fds. Value verified vs. driver_types.h for CUDA 11/12.
+pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
+
+/// FFI mirror of `cudaExternalMemoryHandleDesc` (driver_types.h, LP64).
+///
+/// Layout (size 40, align 8):
+/// - `type_`       → int       @ 0
+/// - `_pad0`       → u32       @ 4  (align the union to 8)
+/// - `handle_fd`   → int       @ 8  (first member of the 16-byte union)
+/// - `_union_rest` → [u32; 3]  @ 12 (pads union to 16 bytes; ends at 24)
+/// - `size`        → u64       @ 24
+/// - `flags`       → c_uint    @ 32
+/// - `_tail`       → u32       @ 36 (struct size 40)
+#[repr(C)]
+pub(crate) struct CudaExternalMemoryHandleDesc {
+    pub type_: c_int,
+    pub _pad0: u32,
+    pub handle_fd: c_int,
+    pub _union_rest: [u32; 3],
+    pub size: u64,
+    pub flags: c_uint,
+    pub _tail: u32,
+}
+
+/// FFI mirror of `cudaExternalMemoryBufferDesc` (driver_types.h, LP64).
+///
+/// Layout (size 24, align 8):
+/// - `offset` → u64    @ 0
+/// - `size`   → u64    @ 8
+/// - `flags`  → c_uint @ 16
+/// - `_tail`  → u32    @ 20 (struct size 24)
+#[repr(C)]
+pub(crate) struct CudaExternalMemoryBufferDesc {
+    pub offset: u64,
+    pub size: u64,
+    pub flags: c_uint,
+    pub _tail: u32,
+}
+
+/// Import a DMA-BUF fd as CUDA external memory and map it to a device pointer.
+///
+/// Thread-independent — no GL context is required. CUDA dups the fd internally,
+/// so the caller's `fd` remains valid after this call returns. Returns
+/// `(ext_mem_handle, device_ptr)` on success, or `None` on any failure (missing
+/// libcudart, unsupported platform, or driver error).
+///
+/// # Safety contract (caller)
+/// - `fd` must be a valid, open DMA-BUF file descriptor for the lifetime of the
+///   returned `ExternalMemory` handle.
+/// - The caller must call `cudaDestroyExternalMemory` (via [`CudaHandle`] drop)
+///   before closing `fd`.
+///
+/// # RUNTIME-UNVALIDATED
+/// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
+/// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
+/// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
+pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
+    let t = table()?;
+    let mut desc: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
+    desc.type_ = CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD as c_int;
+    desc.handle_fd = fd;
+    desc.size = size as u64;
+    let mut ext: ExternalMemory = std::ptr::null_mut();
+    if unsafe { (t.import_external_memory)(&mut ext, &desc as *const _ as *const c_void) } != 0 {
+        return None;
+    }
+    let bdesc = CudaExternalMemoryBufferDesc {
+        offset: 0,
+        size: size as u64,
+        flags: 0,
+        _tail: 0,
+    };
+    let mut dptr: *mut c_void = std::ptr::null_mut();
+    if unsafe {
+        (t.external_memory_get_mapped_buffer)(&mut dptr, ext, &bdesc as *const _ as *const c_void)
+    } != 0
+    {
+        unsafe { (t.destroy_external_memory)(ext) };
+        return None;
+    }
+    Some((ext, dptr))
+}
+
 /// Routes `cudaGraphicsMapResources`/Unmap/Unregister through the GL worker
 /// thread (the GL context must be current there). Implemented by the image crate.
 pub trait CudaGlOps: Send + Sync {
@@ -246,6 +340,25 @@ impl Drop for CudaMap<'_> {
         if let Some((ops, r)) = self.unmap.take() {
             ops.unmap(r);
         }
+    }
+}
+
+#[cfg(test)]
+mod ext_mem_layout {
+    use super::*;
+    #[test]
+    fn external_memory_desc_abi() {
+        assert_eq!(std::mem::size_of::<CudaExternalMemoryHandleDesc>(), 40);
+        assert_eq!(std::mem::align_of::<CudaExternalMemoryHandleDesc>(), 8);
+        // size field at offset 24, flags at 32 (verified vs driver_types.h)
+        let d: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
+        let base = &d as *const _ as usize;
+        assert_eq!((&d.size as *const _ as usize) - base, 24);
+        assert_eq!((&d.flags as *const _ as usize) - base, 32);
+        assert_eq!(std::mem::size_of::<CudaExternalMemoryBufferDesc>(), 24);
+        let b: CudaExternalMemoryBufferDesc = unsafe { std::mem::zeroed() };
+        let bb = &b as *const _ as usize;
+        assert_eq!((&b.size as *const _ as usize) - bb, 8);
     }
 }
 

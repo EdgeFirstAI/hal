@@ -1404,7 +1404,15 @@ where
             dtype = std::any::type_name::<T>(),
         )
         .entered();
-        TensorStorage::new(shape, memory, name).map(Self::wrap)
+        let mut t = TensorStorage::new(shape, memory, name).map(Self::wrap)?;
+        // Best-effort: attach a CUDA ExternalMemory handle for DMA tensors on
+        // CUDA-capable hosts. Never blocks tensor creation on failure.
+        // RUNTIME-UNVALIDATED: no CUDA+dma_heap test platform available; ABI
+        // layout-asserted vs. CUDA 12.6 driver_types.h; mechanism proven by
+        // gpu-probe O5 on Orin.
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
+        Ok(t)
     }
 
     /// Create an image tensor with the given format.
@@ -2028,6 +2036,38 @@ where
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.cuda.as_ref()?.map()
     }
+
+    /// Attempt to attach a CUDA `ExternalMemory` handle for DMA-backed tensors.
+    ///
+    /// On a CUDA-capable host, imports the DMA-BUF fd via
+    /// `cudaImportExternalMemory(OpaqueFd)` and maps it to a device pointer.
+    /// Sets `self.cuda` to a persistent `ExternalMem` handle on success. No-op
+    /// if CUDA is unavailable, the tensor is not DMA-backed, or a handle is
+    /// already set. Import failure is silently ignored — the tensor remains
+    /// usable without a CUDA handle.
+    ///
+    /// # RUNTIME-UNVALIDATED
+    ///
+    /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
+    /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
+    /// by gpu-probe O5 on Orin. Best-effort: tensor creation never fails here.
+    #[cfg(target_os = "linux")]
+    pub fn try_init_dma_cuda(&mut self) {
+        // Fast-path: already imported, CUDA not available, or not a DMA tensor.
+        if self.cuda.is_some() || !crate::cuda::cuda_available() {
+            return;
+        }
+        let (raw_fd, buf_size) = match &self.storage {
+            TensorStorage::Dma(dma) => {
+                use std::os::fd::AsRawFd;
+                (dma.fd.as_raw_fd(), dma.buf_size)
+            }
+            _ => return,
+        };
+        if let Some((ext, dptr)) = crate::cuda::import_dma_fd(raw_fd, buf_size) {
+            self.cuda = Some(crate::cuda::CudaHandle::new_external(ext, dptr, buf_size));
+        }
+    }
 }
 
 // Quantization accessors — type-gated to integer element types via the
@@ -2083,7 +2123,12 @@ where
     where
         Self: Sized,
     {
-        Ok(Self::wrap(TensorStorage::from_fd(fd, shape, name)?))
+        let mut t = Self::wrap(TensorStorage::from_fd(fd, shape, name)?);
+        // Best-effort CUDA external memory import for DMA-backed tensors.
+        // RUNTIME-UNVALIDATED: see try_init_dma_cuda().
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
+        Ok(t)
     }
 
     #[cfg(unix)]
