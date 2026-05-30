@@ -65,6 +65,55 @@ pub fn cuda_available() -> bool {
     table().is_some()
 }
 
+/// Register a GL buffer (PBO) with CUDA. Returns the resource as `usize`
+/// (pointer) or `None`. MUST be called on the thread where the GL context is
+/// current.
+pub fn gl_register_buffer(buffer_id: u32) -> Option<usize> {
+    let t = table()?;
+    let mut res: GraphicsResource = std::ptr::null_mut();
+    // cudaGraphicsRegisterFlagsNone = 0
+    if unsafe { (t.graphics_gl_register_buffer)(&mut res, buffer_id, 0) } != 0 {
+        return None;
+    }
+    Some(res as usize)
+}
+
+/// Map a registered resource → `(device ptr as usize, size)`. GL-thread only.
+pub fn gl_map_resource(resource: usize) -> Option<(usize, usize)> {
+    let t = table()?;
+    let mut res = resource as GraphicsResource;
+    if unsafe { (t.graphics_map_resources)(1, &mut res, std::ptr::null_mut()) } != 0 {
+        return None;
+    }
+    let (mut ptr, mut size) = (std::ptr::null_mut::<c_void>(), 0usize);
+    if unsafe { (t.graphics_get_mapped_pointer)(&mut ptr, &mut size, res) } != 0 {
+        unsafe {
+            (t.graphics_unmap_resources)(1, &mut res, std::ptr::null_mut());
+        }
+        return None;
+    }
+    Some((ptr as usize, size))
+}
+
+/// Unmap a previously mapped resource. GL-thread only.
+pub fn gl_unmap_resource(resource: usize) {
+    if let Some(t) = table() {
+        let mut r = resource as GraphicsResource;
+        unsafe {
+            (t.graphics_unmap_resources)(1, &mut r, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Unregister a previously registered resource. GL-thread only.
+pub fn gl_unregister_resource(resource: usize) {
+    if let Some(t) = table() {
+        unsafe {
+            (t.graphics_unregister_resource)(resource as GraphicsResource);
+        }
+    }
+}
+
 /// Routes `cudaGraphicsMapResources`/Unmap/Unregister through the GL worker
 /// thread (the GL context must be current there). Implemented by the image crate.
 pub trait CudaGlOps: Send + Sync {
@@ -111,8 +160,10 @@ impl std::fmt::Debug for CudaHandle {
 }
 
 impl CudaHandle {
-    #[allow(dead_code)] // consumed by C3/C4
-    pub(crate) fn new_gl(resource: GraphicsResource, size: usize, ops: Arc<dyn CudaGlOps>) -> Self {
+    /// Construct a GL-buffer-backed CUDA handle. `resource` is the
+    /// `cudaGraphicsResource_t` returned by [`gl_register_buffer`]; `ops`
+    /// routes map/unmap/unregister back to the GL-context thread.
+    pub fn new_gl(resource: GraphicsResource, size: usize, ops: Arc<dyn CudaGlOps>) -> Self {
         Self {
             kind: CudaBacking::GlBuffer { resource, ops },
             size,

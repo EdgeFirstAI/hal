@@ -4038,4 +4038,71 @@ mod gl_tests {
 
         eprintln!("convert_f32_pbo_letterbox_pad_color: PASS");
     }
+
+    #[test]
+    fn convert_f32_pbo_cuda_map_roundtrip() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !edgefirst_tensor::cuda_available() {
+            eprintln!("SKIP: no libcudart");
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: no GL");
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIP: no f32 render");
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        {
+            let mut m = src.as_u8().unwrap().map().unwrap();
+            for i in 0..(w * h) {
+                m[i * 4] = (i % 255) as u8;
+                m[i * 4 + 1] = 0;
+                m[i * 4 + 2] = 128;
+                m[i * 4 + 3] = 255;
+            }
+        }
+        let mut dst = proc
+            .create_image(w, h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIP: dst not PBO (no CUDA-GL alloc here)");
+            return;
+        }
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        let cm = dst
+            .cuda_map()
+            .expect("cuda_map on a PBO dst on a CUDA host");
+        assert_eq!(
+            cm.len(),
+            w * h * 3 * 4,
+            "device buffer is [H,W,3] f32 bytes"
+        );
+        assert!(!cm.device_ptr().is_null());
+        assert_eq!(
+            cm.device_ptr() as usize % 256,
+            0,
+            "256-B aligned for TensorRT"
+        );
+        eprintln!(
+            "convert_f32_pbo_cuda_map_roundtrip: PASS device_ptr={:p} len={} align256={}",
+            cm.device_ptr(),
+            cm.len(),
+            (cm.device_ptr() as usize).is_multiple_of(256)
+        );
+        // drop(cm) unmaps so a subsequent convert() could reuse the PBO
+    }
 }

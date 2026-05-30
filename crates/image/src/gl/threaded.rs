@@ -65,6 +65,10 @@ enum GLProcessorMessage {
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
     PboDelete(u32), // fire-and-forget, no reply
+    CudaRegisterBuffer(u32, tokio::sync::oneshot::Sender<Option<usize>>),
+    CudaMap(usize, tokio::sync::oneshot::Sender<Option<(usize, usize)>>),
+    CudaUnmap(usize),      // fire-and-forget
+    CudaUnregister(usize), // fire-and-forget
 }
 
 /// Compute the flat element count for a PBO image buffer of the given format.
@@ -115,6 +119,43 @@ fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat)
             vec![total_h, width]
         }
         _ => vec![height, width, channels],
+    }
+}
+
+/// Best-effort registration of a freshly-created PBO with CUDA GL interop.
+///
+/// When libcudart is present, asks the GL worker (where the GL context is
+/// current) to call `cudaGraphicsGLRegisterBuffer` for `buffer_id`, then
+/// attaches a [`CudaHandle`] so `cuda_map()` can later yield a linear,
+/// 256-byte-aligned device pointer for TensorRT. On any failure (no CUDA,
+/// channel closed, registration rejected) the handle is left unset and the
+/// PBO is still usable as a normal CPU/GL buffer.
+fn register_pbo_cuda<T>(
+    tensor: &mut edgefirst_tensor::Tensor<T>,
+    buffer_id: u32,
+    size: usize,
+    sender: &Sender<GLProcessorMessage>,
+) where
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+{
+    if !edgefirst_tensor::cuda_available() {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if sender
+        .blocking_send(GLProcessorMessage::CudaRegisterBuffer(buffer_id, tx))
+        .is_ok()
+    {
+        if let Ok(Some(resource)) = rx.blocking_recv() {
+            let ops = std::sync::Arc::new(GlCudaOps {
+                sender: sender.downgrade(),
+            });
+            tensor.set_cuda_handle(edgefirst_tensor::CudaHandle::new_gl(
+                resource as *mut std::ffi::c_void,
+                size,
+                ops,
+            ));
+        }
     }
 }
 
@@ -172,6 +213,41 @@ unsafe impl edgefirst_tensor::PboOps for GlPboOps {
     fn delete_buffer(&self, buffer_id: u32) {
         if let Some(sender) = self.sender.upgrade() {
             let _ = sender.blocking_send(GLProcessorMessage::PboDelete(buffer_id));
+        }
+    }
+}
+
+/// Routes CUDA GL-interop map/unmap/unregister to the GL thread.
+///
+/// Mirrors [`GlPboOps`]: holds a [`WeakSender`] so a registered PBO doesn't
+/// keep the GL thread's channel alive. The CUDA primitives
+/// (`cudaGraphicsMapResources` etc.) require the GL context to be current,
+/// so they must execute on the dedicated GL worker thread.
+struct GlCudaOps {
+    sender: WeakSender<GLProcessorMessage>,
+}
+
+impl edgefirst_tensor::CudaGlOps for GlCudaOps {
+    fn map(&self, resource: *mut std::ffi::c_void) -> Option<(*mut std::ffi::c_void, usize)> {
+        let sender = self.sender.upgrade()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .blocking_send(GLProcessorMessage::CudaMap(resource as usize, tx))
+            .ok()?;
+        rx.blocking_recv()
+            .ok()?
+            .map(|(p, l)| (p as *mut std::ffi::c_void, l))
+    }
+
+    fn unmap(&self, resource: *mut std::ffi::c_void) {
+        if let Some(sender) = self.sender.upgrade() {
+            let _ = sender.blocking_send(GLProcessorMessage::CudaUnmap(resource as usize));
+        }
+    }
+
+    fn unregister(&self, resource: *mut std::ffi::c_void) {
+        if let Some(sender) = self.sender.upgrade() {
+            let _ = sender.blocking_send(GLProcessorMessage::CudaUnregister(resource as usize));
         }
     }
 }
@@ -281,6 +357,14 @@ impl GLProcessorThreaded {
                             let _ = resp.send(Err(poison_err));
                         }
                         GLProcessorMessage::PboDelete(_) => {}
+                        GLProcessorMessage::CudaRegisterBuffer(_, resp) => {
+                            let _ = resp.send(None);
+                        }
+                        GLProcessorMessage::CudaMap(_, resp) => {
+                            let _ = resp.send(None);
+                        }
+                        GLProcessorMessage::CudaUnmap(_) => {}
+                        GLProcessorMessage::CudaUnregister(_) => {}
                     }
                     continue;
                 }
@@ -517,6 +601,19 @@ impl GLProcessorThreaded {
                                 panic_message(e.as_ref()),
                             );
                         }
+                    }
+                    GLProcessorMessage::CudaRegisterBuffer(buffer_id, resp) => {
+                        // CUDA GL-interop must run on the GL-context thread.
+                        let _ = resp.send(edgefirst_tensor::gl_register_buffer(buffer_id));
+                    }
+                    GLProcessorMessage::CudaMap(resource, resp) => {
+                        let _ = resp.send(edgefirst_tensor::gl_map_resource(resource));
+                    }
+                    GLProcessorMessage::CudaUnmap(resource) => {
+                        edgefirst_tensor::gl_unmap_resource(resource);
+                    }
+                    GLProcessorMessage::CudaUnregister(resource) => {
+                        edgefirst_tensor::gl_unregister_resource(resource);
                     }
                 }
             }
@@ -785,6 +882,7 @@ impl GLProcessorThreaded {
                         .map_err(map_err)?;
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
                 t.set_format(format).map_err(set_err)?;
+                register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
             }
             edgefirst_tensor::DType::F16 => {
@@ -794,6 +892,7 @@ impl GLProcessorThreaded {
                 .map_err(map_err)?;
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
                 t.set_format(format).map_err(set_err)?;
+                register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
             }
             edgefirst_tensor::DType::F32 => {
@@ -803,6 +902,7 @@ impl GLProcessorThreaded {
                 .map_err(map_err)?;
                 let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
                 t.set_format(format).map_err(set_err)?;
+                register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
             }
             other => Err(Error::OpenGl(format!("unsupported PBO dtype {other:?}"))),
