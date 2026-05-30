@@ -117,9 +117,10 @@ pub struct PackedRgba16fLayout {
 ///   `PixelFormat::PlanarRgba` (4 planes)
 /// - `width % 4 == 0`
 ///
-/// Returns `None` for any other `(format, dtype)` combination or misaligned
-/// width — callers must fall back to a non-packed path or return a
-/// context-appropriate error.
+/// Returns `None` for any other `(format, dtype)` combination, misaligned
+/// width, or when the surface geometry would overflow `usize` — callers
+/// must fall back to a non-packed path or return a context-appropriate
+/// error.
 ///
 /// # Examples
 ///
@@ -141,7 +142,7 @@ pub fn packed_rgba16f_layout(
     if dtype != DType::F16 {
         return None;
     }
-    let planes = match format {
+    let planes: usize = match format {
         PixelFormat::PlanarRgb => 3,
         PixelFormat::PlanarRgba => 4,
         _ => return None,
@@ -150,9 +151,13 @@ pub fn packed_rgba16f_layout(
         return None;
     }
     let surface_w = width / 4;
-    let surface_h = planes * height;
+    // Checked arithmetic: a degenerate (height, width) could otherwise wrap
+    // and yield an under-sized layout, which downstream allocators trust for
+    // GPU/CPU buffer sizing. Overflow → None (handled like any other
+    // unsupported geometry).
+    let surface_h = planes.checked_mul(height)?;
     let bytes_per_texel = 8;
-    let pitch = surface_w * bytes_per_texel;
+    let pitch = surface_w.checked_mul(bytes_per_texel)?;
     Some(PackedRgba16fLayout {
         surface_w,
         surface_h,

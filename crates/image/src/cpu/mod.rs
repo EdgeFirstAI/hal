@@ -30,6 +30,22 @@ pub struct CPUProcessor {
     widen_scratch: Option<TensorDyn>,
 }
 
+// `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
+// added; `TensorDyn` is not `Clone`, so the derive no longer applies. Restore
+// the public `Clone` impl by hand to avoid a breaking API change. The scratch
+// cache is a private allocation amortiser, not part of the logical value, so a
+// clone starts empty rather than sharing or duplicating it.
+impl Clone for CPUProcessor {
+    fn clone(&self) -> Self {
+        Self {
+            resizer: self.resizer.clone(),
+            options: self.options,
+            colors: self.colors,
+            widen_scratch: None,
+        }
+    }
+}
+
 unsafe impl Send for CPUProcessor {}
 unsafe impl Sync for CPUProcessor {}
 

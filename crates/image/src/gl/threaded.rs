@@ -71,18 +71,29 @@ enum GLProcessorMessage {
 ///
 /// NV12 and NV16 are semiplanar with non-trivial element counts; all other
 /// formats use `width * height * channels`.
-fn pbo_elem_count(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> usize {
+///
+/// Returns `None` on `usize` overflow. A wrapped element count would size
+/// the PBO too small and corrupt memory on readback, so callers must treat
+/// `None` as an invalid-dimensions error (the same way they already reject
+/// a zero count).
+fn pbo_elem_count(
+    width: usize,
+    height: usize,
+    format: edgefirst_tensor::PixelFormat,
+) -> Option<usize> {
     let channels = format.channels();
+    let wh = width.checked_mul(height)?;
     match format.layout() {
         edgefirst_tensor::PixelLayout::SemiPlanar => match format {
-            edgefirst_tensor::PixelFormat::Nv12 => width * height * 3 / 2,
-            edgefirst_tensor::PixelFormat::Nv16 => width * height * 2,
-            _ => width * height * channels,
+            // NV12 is 1.5 bytes/px: multiply by 3 (checked) before halving.
+            edgefirst_tensor::PixelFormat::Nv12 => wh.checked_mul(3).map(|v| v / 2),
+            edgefirst_tensor::PixelFormat::Nv16 => wh.checked_mul(2),
+            _ => wh.checked_mul(channels),
         },
         edgefirst_tensor::PixelLayout::Packed | edgefirst_tensor::PixelLayout::Planar => {
-            width * height * channels
+            wh.checked_mul(channels)
         }
-        _ => width * height * channels,
+        _ => wh.checked_mul(channels),
     }
 }
 
@@ -691,10 +702,9 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
 
-        let size = pbo_elem_count(width, height, format);
-        if size == 0 {
-            return Err(Error::OpenGl("Invalid image dimensions".to_string()));
-        }
+        let size = pbo_elem_count(width, height, format)
+            .filter(|&s| s != 0)
+            .ok_or_else(|| Error::OpenGl("Invalid image dimensions".to_string()))?;
 
         // Allocate PBO on the GL thread
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -738,10 +748,9 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or(Error::OpenGl("GL processor is shutting down".to_string()))?;
 
-        let elems = pbo_elem_count(width, height, format);
-        if elems == 0 {
-            return Err(Error::OpenGl("Invalid image dimensions".to_string()));
-        }
+        let elems = pbo_elem_count(width, height, format)
+            .filter(|&e| e != 0)
+            .ok_or_else(|| Error::OpenGl("Invalid image dimensions".to_string()))?;
 
         let size = elems
             .checked_mul(dtype.size())

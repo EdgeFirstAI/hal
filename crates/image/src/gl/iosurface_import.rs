@@ -24,7 +24,7 @@
 #![cfg(target_os = "macos")]
 
 use crate::Error;
-use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorTrait};
+use edgefirst_tensor::{packed_rgba16f_layout, DType, PixelFormat, Tensor, TensorTrait};
 use khronos_egl as egl;
 
 // ---------------------------------------------------------------------------
@@ -167,27 +167,17 @@ impl ImageLayout {
                 ))
             })?;
         let (surface_width, surface_height) = match (fmt, dtype) {
-            (PixelFormat::PlanarRgb, DType::F16) => {
-                if !width.is_multiple_of(4) {
-                    return Err(Error::Internal(format!(
-                        "PlanarRgb F16 requires width%4==0 for RGBA16F packing (got {width})"
-                    )));
-                }
-                let sh = height.checked_mul(3).ok_or_else(|| {
-                    Error::Internal(format!("PlanarRgb surface height overflow (h={height})"))
+            (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
+                // Single source of truth for the RGBA16F-packed `(W/4, C*H)`
+                // geometry — see `edgefirst_tensor::packed_rgba16f_layout`.
+                // It returns `None` on width%4 != 0 or `usize` overflow.
+                let layout = packed_rgba16f_layout(fmt, dtype, width, height).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "{fmt:?} F16 RGBA16F packing requires width%4==0 and \
+                         non-overflowing geometry (got {width}x{height})"
+                    ))
                 })?;
-                (width / 4, sh)
-            }
-            (PixelFormat::PlanarRgba, DType::F16) => {
-                if !width.is_multiple_of(4) {
-                    return Err(Error::Internal(format!(
-                        "PlanarRgba F16 requires width%4==0 for RGBA16F packing (got {width})"
-                    )));
-                }
-                let sh = height.checked_mul(4).ok_or_else(|| {
-                    Error::Internal(format!("PlanarRgba surface height overflow (h={height})"))
-                })?;
-                (width / 4, sh)
+                (layout.surface_w, layout.surface_h)
             }
             (PixelFormat::PlanarRgb, _) => {
                 let sh = height.checked_mul(3).ok_or_else(|| {
@@ -264,8 +254,27 @@ impl ImageLayout {
 /// The returned `CFDictionaryRef` must be released by the caller with
 /// `CFRelease` after passing to `IOSurfaceCreate`.
 unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_void, Error> {
-    let bpr = (layout.surface_width * layout.bytes_per_element + 63) & !63;
-    let alloc_size = bpr * layout.surface_height;
+    // Checked arithmetic: an overflowing bytes-per-row or allocation size
+    // would describe an under-sized IOSurface, which the GL import then
+    // treats as a valid render target / mapped buffer — a memory-safety
+    // hazard. Fail loudly instead of wrapping.
+    let bpr = layout
+        .surface_width
+        .checked_mul(layout.bytes_per_element)
+        .and_then(|b| b.checked_add(63))
+        .map(|b| b & !63)
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "IOSurface bytes-per-row overflow (surface_width={}, bpe={})",
+                layout.surface_width, layout.bytes_per_element
+            ))
+        })?;
+    let alloc_size = bpr.checked_mul(layout.surface_height).ok_or_else(|| {
+        Error::Internal(format!(
+            "IOSurface allocation size overflow (bpr={bpr}, surface_height={})",
+            layout.surface_height
+        ))
+    })?;
 
     let dict = CFDictionaryCreateMutable(
         std::ptr::null(),
