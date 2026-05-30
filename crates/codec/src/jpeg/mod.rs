@@ -20,6 +20,10 @@ pub mod mcu;
 pub mod types;
 pub mod upsample;
 
+/// Optional V4L2 hardware JPEG-decoder backend (Linux only, `v4l2` feature).
+#[cfg(all(target_os = "linux", feature = "v4l2"))]
+mod v4l2;
+
 use crate::error::CodecError;
 use crate::exif::{apply_exif_u8, read_exif_orientation, rotated_dims};
 use crate::options::{DecodeOptions, ImageInfo};
@@ -40,6 +44,11 @@ pub struct JpegDecoderState {
     /// Reused across decodes so EXIF-rotated workloads don't re-allocate
     /// a multi-megabyte buffer per frame.
     rot_scratch: Vec<u8>,
+    /// V4L2 hardware decoder, lazily probed on first decode. Probed at most
+    /// once; a ready context is reused (and amortises per-image setup) across
+    /// decodes.
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    v4l2: v4l2::V4l2Probe,
 }
 
 impl JpegDecoderState {
@@ -48,6 +57,8 @@ impl JpegDecoderState {
             mcu_scratch: None,
             exif_scratch: Vec::new(),
             rot_scratch: Vec::new(),
+            #[cfg(all(target_os = "linux", feature = "v4l2"))]
+            v4l2: v4l2::V4l2Probe::default(),
         }
     }
 }
@@ -200,6 +211,24 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let dst_stride = dst
         .effective_row_stride()
         .unwrap_or(tensor_w * channels * elem_size);
+
+    // Try the V4L2 hardware decoder first when available. Only the common
+    // fast path goes to hardware; EXIF rotation/flip stays on the CPU. A
+    // probed-but-failing device resets itself and we fall through to the CPU
+    // decoder transparently, so output is identical either way.
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    if rotation_deg == 0 && !flip_h {
+        match state.v4l2.try_decode::<T>(
+            data, &headers, dst, output_fmt, final_w, final_h, channels, dst_stride,
+        ) {
+            Ok(Some(info)) => return Ok(info),
+            Ok(None) => {}
+            Err(v4l2::V4l2Decode::Fallback(why)) => {
+                log::debug!("v4l2 jpeg decode fell back to cpu: {why}");
+            }
+            Err(v4l2::V4l2Decode::Fatal(e)) => return Err(e),
+        }
+    }
 
     // Initialise or reuse MCU scratch buffers
     match &mut state.mcu_scratch {
@@ -438,6 +467,17 @@ fn convert_rows_to_target<T: ImagePixel>(
     let dst_stride_elems = dst_stride / elem_size;
 
     match T::dtype() {
+        edgefirst_tensor::DType::U8 => {
+            // SAFETY: T is u8 — layout-identical reinterpret of the dst slice.
+            // Straight strided copy; lets the V4L2 backend share this tail.
+            let dst_u8: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len()) };
+            for y in 0..img_h {
+                let s = y * src_stride;
+                let d = y * dst_stride;
+                dst_u8[d..d + src_stride].copy_from_slice(&src[s..s + src_stride]);
+            }
+        }
         edgefirst_tensor::DType::I8 => {
             // SAFETY: T is i8 — layout-identical reinterpret of the dst slice.
             let dst_u8: &mut [u8] =
