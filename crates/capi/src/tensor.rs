@@ -715,6 +715,86 @@ pub unsafe extern "C" fn hal_tensor_iosurface_ref(
     std::ptr::null_mut()
 }
 
+/// Map a tensor for zero-copy CUDA use (e.g. TensorRT input).
+///
+/// Returns an opaque map handle, or NULL if CUDA is unavailable for this
+/// tensor (e.g. the tensor has no CUDA handle — Mem, Shm, or DMA tensors
+/// that have not been registered with CUDA). Read the device pointer with
+/// hal_tensor_cuda_device_ptr; release with hal_tensor_cuda_unmap (required
+/// before the tensor is re-rendered or freed).
+///
+/// The mapped pointer is a CUDA device pointer usable from any thread;
+/// do not access the tensor via the HAL or GL while the map is live.
+///
+/// # Safety
+///
+/// The tensor must remain alive and must not be re-rendered or freed until
+/// hal_tensor_cuda_unmap is called on the returned handle. The caller owns
+/// the returned handle and is responsible for calling hal_tensor_cuda_unmap
+/// exactly once.
+///
+/// @param tensor Tensor handle
+/// @return Opaque CUDA map handle on success, NULL if CUDA is unavailable
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_cuda_map(tensor: *const HalTensor) -> *mut std::ffi::c_void {
+    let t = match tensor.as_ref() {
+        Some(t) => t,
+        None => return std::ptr::null_mut(),
+    };
+    match t.inner.cuda_map() {
+        Some(m) => {
+            // SAFETY: The C client must honour the contract that the tensor
+            // outlives the map.  We transmute 'a → 'static so Box can own the
+            // guard; the caller enforces the actual lifetime invariant.
+            let m_static: edgefirst_tensor::CudaMap<'static> = unsafe { std::mem::transmute(m) };
+            Box::into_raw(Box::new(m_static)) as *mut std::ffi::c_void
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Read the CUDA device pointer from a map handle returned by hal_tensor_cuda_map.
+///
+/// Returns NULL if `map` is NULL. If `out_size` is non-NULL, the size of
+/// the mapping in bytes is written to `*out_size`.
+///
+/// @param map   Opaque map handle from hal_tensor_cuda_map (may be NULL)
+/// @param out_size  Optional output pointer for the mapping size in bytes
+/// @return CUDA device pointer, or NULL if `map` is NULL
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_cuda_device_ptr(
+    map: *const std::ffi::c_void,
+    out_size: *mut libc::size_t,
+) -> *mut std::ffi::c_void {
+    if map.is_null() {
+        return std::ptr::null_mut();
+    }
+    let m = unsafe { &*(map as *const edgefirst_tensor::CudaMap<'static>) };
+    if !out_size.is_null() {
+        unsafe { *out_size = m.len() };
+    }
+    m.device_ptr()
+}
+
+/// Release a map handle from hal_tensor_cuda_map.
+///
+/// Unmaps the CUDA device pointer and frees the handle. Safe no-op when
+/// `map` is NULL. Must be called exactly once per non-NULL handle returned
+/// by hal_tensor_cuda_map, and before the corresponding tensor is freed or
+/// re-rendered.
+///
+/// @param map  Opaque map handle from hal_tensor_cuda_map (may be NULL)
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_cuda_unmap(map: *mut std::ffi::c_void) {
+    if map.is_null() {
+        return;
+    }
+    // SAFETY: `map` was produced by Box::into_raw in hal_tensor_cuda_map.
+    // Reconstructing the Box here and dropping it runs CudaMap::drop, which
+    // calls ops.unmap() for GlBuffer-backed tensors (routing to the GL worker).
+    drop(unsafe { Box::from_raw(map as *mut edgefirst_tensor::CudaMap<'static>) });
+}
+
 /// Reshape a tensor to a new shape.
 ///
 /// The total number of elements must remain the same.
@@ -1690,6 +1770,36 @@ mod tests {
             assert_eq!(errno::errno().0, libc::ENOTSUP);
 
             hal_tensor_free(tensor);
+        }
+    }
+
+    /// A Mem tensor has no CUDA handle — map returns NULL, unmap is a no-op.
+    #[test]
+    fn cuda_map_null_for_mem_tensor() {
+        unsafe {
+            let shape: [size_t; 2] = [4, 4];
+            let t = hal_tensor_new(
+                HalDtype::F32,
+                shape.as_ptr(),
+                shape.len(),
+                HalTensorMemory::Mem,
+                std::ptr::null(),
+            );
+            assert!(!t.is_null());
+
+            // No CUDA handle on a Mem tensor → map must return NULL, no crash.
+            let m = hal_tensor_cuda_map(t);
+            assert!(m.is_null(), "Mem tensor should yield a null CUDA map");
+
+            // Unmapping NULL must be a safe no-op.
+            hal_tensor_cuda_unmap(m);
+
+            // device_ptr on NULL map must return NULL, no crash.
+            let mut sz: size_t = 1;
+            let dp = hal_tensor_cuda_device_ptr(m, &mut sz);
+            assert!(dp.is_null());
+
+            hal_tensor_free(t);
         }
     }
 

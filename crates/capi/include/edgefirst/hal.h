@@ -2690,6 +2690,54 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
 void *hal_tensor_iosurface_ref(const struct hal_tensor *tensor);
 
 /**
+ * Map a tensor for zero-copy CUDA use (e.g. TensorRT input).
+ *
+ * Returns an opaque map handle, or NULL if CUDA is unavailable for this
+ * tensor (e.g. the tensor has no CUDA handle — Mem, Shm, or DMA tensors
+ * that have not been registered with CUDA). Read the device pointer with
+ * hal_tensor_cuda_device_ptr; release with hal_tensor_cuda_unmap (required
+ * before the tensor is re-rendered or freed).
+ *
+ * The mapped pointer is a CUDA device pointer usable from any thread;
+ * do not access the tensor via the HAL or GL while the map is live.
+ *
+ * # Safety
+ *
+ * The tensor must remain alive and must not be re-rendered or freed until
+ * hal_tensor_cuda_unmap is called on the returned handle. The caller owns
+ * the returned handle and is responsible for calling hal_tensor_cuda_unmap
+ * exactly once.
+ *
+ * @param tensor Tensor handle
+ * @return Opaque CUDA map handle on success, NULL if CUDA is unavailable
+ */
+void *hal_tensor_cuda_map(const struct hal_tensor *tensor);
+
+/**
+ * Read the CUDA device pointer from a map handle returned by hal_tensor_cuda_map.
+ *
+ * Returns NULL if `map` is NULL. If `out_size` is non-NULL, the size of
+ * the mapping in bytes is written to `*out_size`.
+ *
+ * @param map   Opaque map handle from hal_tensor_cuda_map (may be NULL)
+ * @param out_size  Optional output pointer for the mapping size in bytes
+ * @return CUDA device pointer, or NULL if `map` is NULL
+ */
+void *hal_tensor_cuda_device_ptr(const void *map, size_t *out_size);
+
+/**
+ * Release a map handle from hal_tensor_cuda_map.
+ *
+ * Unmaps the CUDA device pointer and frees the handle. Safe no-op when
+ * `map` is NULL. Must be called exactly once per non-NULL handle returned
+ * by hal_tensor_cuda_map, and before the corresponding tensor is freed or
+ * re-rendered.
+ *
+ * @param map  Opaque map handle from hal_tensor_cuda_map (may be NULL)
+ */
+void hal_tensor_cuda_unmap(void *map);
+
+/**
  * Reshape a tensor to a new shape.
  *
  * The total number of elements must remain the same.
