@@ -97,6 +97,19 @@ pub struct CudaHandle {
     size: usize,
 }
 
+impl std::fmt::Debug for CudaHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.kind {
+            CudaBacking::GlBuffer { .. } => "GlBuffer",
+            CudaBacking::ExternalMem { .. } => "ExternalMem",
+        };
+        f.debug_struct("CudaHandle")
+            .field("kind", &kind)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
 impl CudaHandle {
     #[allow(dead_code)] // consumed by C3/C4
     pub(crate) fn new_gl(resource: GraphicsResource, size: usize, ops: Arc<dyn CudaGlOps>) -> Self {

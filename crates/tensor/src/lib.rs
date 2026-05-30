@@ -1291,6 +1291,9 @@ where
     /// gated by the `IntegerType` trait — `Tensor<f32>` etc. carry the
     /// field for layout uniformity but have no way to read or write it.
     pub(crate) quantization: Option<Quantization>,
+    /// CUDA registration for this tensor, if any. Set after creation by
+    /// the image crate once a PBO is registered with CUDA interop.
+    cuda: Option<crate::cuda::CudaHandle>,
 }
 
 impl<T> Tensor<T>
@@ -1306,6 +1309,7 @@ where
             row_stride: None,
             plane_offset: None,
             quantization: None,
+            cuda: None,
         }
     }
 
@@ -1818,6 +1822,7 @@ where
             row_stride: luma.row_stride,
             plane_offset: luma.plane_offset,
             quantization: luma.quantization,
+            cuda: None,
         })
     }
 
@@ -1998,7 +2003,23 @@ where
             row_stride: None,
             plane_offset: None,
             quantization: None,
+            cuda: None,
         }
+    }
+
+    /// The CUDA registration for this tensor, if any (set at creation on CUDA devices).
+    pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
+        self.cuda.as_ref()
+    }
+
+    /// Attach a CUDA handle (called by ImageProcessor::create_image after registering a PBO).
+    pub fn set_cuda_handle(&mut self, h: crate::cuda::CudaHandle) {
+        self.cuda = Some(h);
+    }
+
+    /// Fast-fail CUDA map: None (no GL routing) when no handle; else map (PBO routes to the GL worker).
+    pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        self.cuda.as_ref()?.map()
     }
 }
 
@@ -3563,5 +3584,12 @@ mod tests {
         assert!(packed_rgba16f_layout(PixelFormat::Rgb, DType::F32, 640, 640).is_none());
         // Packed Rgba with F16 is not a planar format → None
         assert!(packed_rgba16f_layout(PixelFormat::Rgba, DType::F16, 640, 640).is_none());
+    }
+
+    #[test]
+    fn cuda_map_fast_fails_to_none_without_handle() {
+        let t = Tensor::<f32>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+        assert!(t.cuda().is_none());
+        assert!(t.cuda_map().is_none()); // pure local check, no GL routing
     }
 }

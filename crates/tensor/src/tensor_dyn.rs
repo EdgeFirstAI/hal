@@ -223,6 +223,20 @@ impl TensorDyn {
         self
     }
 
+    /// The CUDA registration for this tensor, if any.
+    ///
+    /// Returns `None` when no CUDA handle has been attached (the common non-CUDA case).
+    /// This check is a pure local field read — no thread routing occurs.
+    pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
+        dispatch!(self, cuda)
+    }
+
+    /// Fast-fail CUDA map: `None` when no handle is attached; else maps the
+    /// PBO through the GL worker and returns a scoped device-pointer guard.
+    pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        dispatch!(self, cuda_map)
+    }
+
     /// Quantization metadata. Returns `None` for float variants (F16, F32,
     /// F64) — quantization does not apply to floating-point tensors.
     /// Otherwise delegates to the typed `Tensor<T>::quantization()` accessor.
