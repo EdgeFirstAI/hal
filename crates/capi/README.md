@@ -368,6 +368,69 @@ if (dmabuf_fd < 0) {
 
 Linux only (`ENOTSUP` on other platforms).
 
+## CUDA Zero-Copy (TensorRT)
+
+`hal_is_cuda_available()` queries whether the CUDA runtime (`libcudart`) is
+loaded and all interop symbols resolved. The result is cached after the first
+call — subsequent calls are cheap. Gate CUDA-specific paths on this before
+calling `hal_tensor_cuda_map`.
+
+```c
+if (hal_is_cuda_available()) {
+    // libcudart is present; zero-copy paths are usable.
+}
+```
+
+### CUDA map lifecycle
+
+| Step | Function | Notes |
+|------|----------|-------|
+| Obtain device ptr | `hal_tensor_cuda_map(tensor)` | Returns opaque handle or NULL |
+| Read device address | `hal_tensor_cuda_device_ptr(handle, &size)` | Usable cross-thread via the CUDA primary context |
+| Release handle | `hal_tensor_cuda_unmap(handle)` | Must be called before freeing the tensor |
+
+**Ownership and lifetime rules:**
+- Call `hal_tensor_cuda_unmap` before `hal_tensor_free` — unmapping after
+  freeing is undefined behavior.
+- Do not write to the tensor's host buffer while a CUDA map is live.
+- The device pointer is valid until `hal_tensor_cuda_unmap` is called; do
+  not cache it beyond that point.
+
+### Fallback pattern
+
+`hal_tensor_cuda_map` returns `NULL` for tensors without a registered CUDA
+handle (all Mem and Shm tensors, and DMA tensors on systems without CUDA).
+Always check for `NULL` and fall back to the host map:
+
+```c
+#include <edgefirst/hal.h>
+#include <assert.h>
+
+size_t shape[] = {1, 3, 640, 640};
+struct hal_tensor* t = hal_tensor_new(
+    HAL_DTYPE_F32, shape, 4, HAL_TENSOR_MEMORY_DMA, "input");
+
+void* cm = hal_tensor_cuda_map(t);
+if (cm) {
+    // Zero-copy: feed the device pointer directly to TensorRT.
+    size_t sz = 0;
+    void* dptr = hal_tensor_cuda_device_ptr(cm, &sz);
+    trt_context_set_input_tensor_address("input", dptr);
+    trt_context_execute_async_v3(stream);
+    // Always unmap before freeing the tensor.
+    hal_tensor_cuda_unmap(cm);
+} else {
+    // Fallback: CPU-side host map (e.g. no libcudart, Mem tensor).
+    struct hal_tensor_map* m = hal_tensor_map_create(t);
+    assert(m != NULL);
+    float* data = (float*)hal_tensor_map_data(m);
+    assert(data != NULL);
+    // ... fill data for CPU inference ...
+    hal_tensor_map_unmap(m);
+}
+hal_tensor_free(t);
+```
+
 ## Delegate DMA-BUF API
 
 The delegate DMA-BUF framework defines the ABI contract that external NPU

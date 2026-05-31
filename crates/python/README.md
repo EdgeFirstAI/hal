@@ -141,6 +141,45 @@ from an NPU delegate), create the `Tensor` wrappers once at init and
 reuse them across frames. This avoids EGL image cache misses (~100-300us
 each on Vivante GPUs).
 
+## CUDA Zero-Copy (TensorRT)
+
+When running inference with TensorRT or cupy, `Tensor.cuda_map()` exposes a
+raw CUDA device pointer to a tensor that has been registered with CUDA (e.g.
+via the GL-CUDA interop path). The mapping is scoped by a context manager so
+the GPU buffer is released automatically for the next `convert()` call.
+
+Check availability first, then try `cuda_map()` and fall back to `map()` for
+CPU paths:
+
+```python
+import edgefirst_hal as ef
+
+# One-time check — cached after first call
+if not ef.is_cuda_available():
+    print("libcudart not found; falling back to CPU tensors")
+
+tensor = ef.ImageProcessor().create_image(640, 640, ef.PixelFormat.Rgb)
+
+cm = tensor.cuda_map()
+if cm is not None:
+    with cm as m:
+        # m.device_ptr is the raw CUDA device pointer (int)
+        # m.size is the buffer size in bytes
+        trt_context.set_input_tensor_address("input", m.device_ptr)
+        trt_context.execute_async_v3(stream)
+else:
+    # No CUDA handle on this tensor — use the CPU path
+    with tensor.map() as host:
+        run_cpu_inference(host)
+```
+
+`CudaMap` exposes:
+- `device_ptr` (`int`) — raw CUDA device pointer, suitable for
+  `cupy.ndarray.from_dlpack`, `pycuda.gpuarray`, or TensorRT
+  `set_input_tensor_address`.
+- `size` (`int`) — buffer size in bytes.
+- `release()` — explicitly release before the `with` block ends (idempotent).
+
 ## YOLO Decoding
 
 ```python

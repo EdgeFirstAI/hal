@@ -21,6 +21,7 @@ tracing = ["edgefirst-hal/tracing"]
 
 [dependencies]
 edgefirst-hal = { workspace = true, features = ["tracker"] }
+edgefirst-tensor = { workspace = true }
 env_logger = { workspace = true }
 four-char-code = { workspace = true }
 half = { workspace = true }

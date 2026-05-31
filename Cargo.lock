@@ -725,6 +725,7 @@ dependencies = [
  "env_logger",
  "half",
  "libc",
+ "libloading",
  "log",
  "ndarray 0.17.2",
  "nix 0.31.2",
@@ -757,6 +758,7 @@ version = "0.24.2"
 dependencies = [
  "approx",
  "edgefirst-hal",
+ "edgefirst-tensor",
  "env_logger",
  "four-char-code",
  "half",

@@ -352,6 +352,39 @@ reads directly from the PBO without any channel round-trip.
 tensor, so `dst.map()` is a direct memory operation with no GL thread
 message.
 
+### CUDA registration of the float PBO
+
+After `convert()` writes the float output into the PBO via
+`glReadnPixels(GL_PIXEL_PACK_BUFFER)`, the same PBO buffer can be
+registered with CUDA and accessed as a device pointer — no host copy.
+
+**Registration** happens on the GL worker thread at `create_image()` time
+(or lazily on the first `cuda_map()` call, whichever comes first) via
+`cudaGraphicsGLRegisterBuffer`. The registration persists for the lifetime
+of the `PboTensor` and is shared across all `cuda_map()` calls on that tensor.
+
+**Aliasing rule**: while `CudaMap` is alive, GL must not write into the PBO.
+The aliasing rule is a caller convention enforced by the scoped `CudaMap`
+guard lifetime: the caller maps per inference and drops the guard before
+the next `convert()` call. The guard's `Drop` impl returns the PBO to GL
+(via `cudaGraphicsUnmapResources`) so the next `convert()` can write into
+it. No runtime check in the GL worker tracks active CUDA maps.
+
+**Thread constraints**: `cudaGraphicsMapResources` (called on each
+`cuda_map()`) must run on the GL-context thread. The resulting device
+pointer is usable from any thread via the per-device CUDA primary context.
+The `CudaGlOps` trait routes the map/unmap calls through the existing GL
+thread channel, the same mechanism used by `PboOps` for PBO map/unmap.
+
+**Drop order**: `CudaGraphicsResource` (the registered handle) is owned
+inside `PboTensor` in a field declared before the PBO's GL object ID. Rust's
+field-drop order guarantees `cudaGraphicsUnregisterResource` runs before
+`glDeleteBuffers`, satisfying the CUDA–GL interop spec requirement.
+
+For the full CUDA type model, `CudaHandle` variants (GlBuffer vs
+ExternalMem), and DMA-BUF import path, see
+[`crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping).
+
 ### EGL image cache
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —
@@ -831,7 +864,7 @@ in the project README for the user-facing rules and validation patterns.
 | Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12 → PlanarRgb requires the two-pass workaround; GPU float disabled (170–320 ms readback) |
 | Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
 | Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |
-| Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO (host buffers; CUDA–GL interop Phase 2) | DMA-buf import unsupported; PBO path provides zero-copy |
+| Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO — **PBO → CUDA zero-copy implemented** (`cuda_map()` maps the PBO to a device pointer on the GL worker thread; TensorRT reads directly from device memory) | DMA-buf import unsupported; PBO path provides zero-copy to CUDA |
 | Linux desktop / Mesa x86_64 | OpenGL, CPU | GPU-dependent | DMA-heap permission required for DMA path |
 | macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA and RGBA → PlanarRgb F16 implemented; other convert pairs fall back to CPU. IOSurface zero-copy via `EGL_ANGLE_iosurface_client_buffer`. |
 | macOS (no ANGLE) | CPU | CPU only | `MacosGlProcessor::new()` fails at `ImageProcessor::new()` time; the GPU dispatch is never attempted. |
