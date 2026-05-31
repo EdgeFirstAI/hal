@@ -26,7 +26,7 @@ TARGET    := jetson_cuda_probe
 SRC       := jetson_cuda_probe.cpp
 
 $(TARGET): $(SRC)
-	$(NVCC) -O2 -std=c++17 $(INCLUDES) $(SRC) -o $(TARGET) $(LIBDIRS) $(LIBS)
+	$(NVCC) -O2 -std=c++20 $(INCLUDES) $(SRC) -o $(TARGET) $(LIBDIRS) $(LIBS)
 
 run: $(TARGET)
 	./$(TARGET)

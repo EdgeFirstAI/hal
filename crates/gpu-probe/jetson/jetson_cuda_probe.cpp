@@ -727,16 +727,28 @@ static void* probe_o5(NvBufSurface* surf, size_t* out_size) {
   int fd = (int)sp.bufferDesc;
   size_t size = sp.dataSize ? sp.dataSize : (size_t)sp.pitch * sp.height;
 
+  // cudaExternalMemoryHandleTypeOpaqueFd takes OWNERSHIP of the fd on success
+  // (CUDA closes it at cudaDestroyExternalMemory). The NvBufSurface-owned fd
+  // must remain valid for the surface's lifetime, so pass a dup — matching the
+  // Rust import_dma_fd fix that prevents a double-close on the live surface fd.
+  int dup_fd = dup(fd);
+  if (dup_fd < 0) {
+    printf("  O5 FAIL: dup(fd): %s\n", strerror(errno));
+    return nullptr;
+  }
+
   cudaExternalMemoryHandleDesc desc;
   std::memset(&desc, 0, sizeof(desc));
   desc.type = cudaExternalMemoryHandleTypeOpaqueFd;
-  desc.handle.fd = fd;
+  desc.handle.fd = dup_fd;
   desc.size = size;
 
   cudaExternalMemory_t extmem = nullptr;
   cudaError_t e = cudaImportExternalMemory(&extmem, &desc);
   if (e != cudaSuccess) {
     printf("  O5 FAIL: cudaImportExternalMemory: %s\n", cudaGetErrorString(e));
+    // Import failed — CUDA did not take ownership; reclaim and close the dup.
+    close(dup_fd);
     return nullptr;
   }
 
