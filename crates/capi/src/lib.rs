@@ -11,8 +11,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 /// Retained constructor: installs the coverage flush-on-abort handler for this
-/// crate's instrumented shared library. See `edgefirst_tensor::covguard`. Only present under coverage.
-#[cfg(coverage)]
+/// crate's instrumented shared library. See `edgefirst_tensor::covguard`. Only
+/// present under coverage on Linux (`.init_array` is ELF-only; flush is Linux-only).
+#[cfg(all(coverage, target_os = "linux"))]
 #[used]
 #[link_section = ".init_array"]
 static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {

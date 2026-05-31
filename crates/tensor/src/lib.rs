@@ -43,8 +43,9 @@ mod shm;
 mod tensor_dyn;
 
 /// Retained constructor: installs the coverage flush-on-abort handler for this
-/// crate's instrumented test binary. See `covguard`. Only present under coverage.
-#[cfg(coverage)]
+/// crate's instrumented test binary. See `covguard`. Only present under
+/// coverage on Linux (`.init_array` is ELF-only; the i.MX flush is Linux-only).
+#[cfg(all(coverage, target_os = "linux"))]
 #[used]
 #[link_section = ".init_array"]
 static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {

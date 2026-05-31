@@ -68,8 +68,9 @@ and hardware acceleration. However, this will increase the performance of the CP
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 /// Retained constructor: installs the coverage flush-on-abort handler for this
-/// crate's instrumented test binary. See `edgefirst_tensor::covguard`. Only present under coverage.
-#[cfg(coverage)]
+/// crate's instrumented test binary. See `edgefirst_tensor::covguard`. Only
+/// present under coverage on Linux (`.init_array` is ELF-only; flush is Linux-only).
+#[cfg(all(coverage, target_os = "linux"))]
 #[used]
 #[link_section = ".init_array"]
 static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
