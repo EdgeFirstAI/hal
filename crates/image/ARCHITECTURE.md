@@ -834,6 +834,134 @@ image.materialize_masks                                 [user-facing fn]
 
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 
+## Colorimetry
+
+> **Status:** investigation + design. This section documents the YCbCr↔RGB
+> colorimetry problem, what each source actually emits across our target SoCs,
+> the current (incorrect-but-uniform) behaviour, and the proposed HAL design.
+> The proper per-source implementation is tracked on the `feature/colorimetry`
+> branch. An interim stop-gap — hardcoding **BT.601 full-range** everywhere —
+> ships on the `feature/v4l2-jpeg-decoder` branch (see *Current state* below);
+> the design here supersedes it.
+
+### The three-axis problem
+
+A YCbCr (YUV) buffer cannot be converted to RGB correctly without knowing three
+independent properties, and a mismatch on any of them corrupts the result:
+
+1. **Matrix** — the luma/chroma coefficients: **BT.601** (SD/JPEG), **BT.709**
+   (HD), or **BT.2020** (UHD/HDR). A wrong matrix rotates the chroma plane,
+   tinting saturated colours (greens↔magentas) while greys stay correct.
+2. **Range / quantization** — **full** (a.k.a. JFIF / "PC" / extended, luma
+   0–255) vs **limited** (a.k.a. studio / "video", luma 16–235). A wrong range
+   crushes blacks and clips/!washes highlights and shifts overall contrast.
+3. **Transfer function / primaries** — gamma and gamut. These matter for display
+   and tone-mapping but are *not* used by the YCbCr→RGB matrix itself, so the HAL
+   can ignore them for conversion (they would matter for an HDR pipeline).
+
+So the HAL's conversion correctness reduces to picking the right **(matrix,
+range)** pair for each source buffer.
+
+### Current state (uniform BT.709 limited — wrong for most of our sources)
+
+All three `convert()` backends hardcode **BT.709, limited-range** for every YUV
+format, and there is **no colorimetry metadata** anywhere to tell them otherwise
+(a tensor carries only `PixelFormat`; `import_image(...)` and `convert(...)` take
+no colorimetry argument):
+
+| Backend | YUV→RGB matrix/range | Luma/grey |
+|---------|----------------------|-----------|
+| CPU (`cpu/convert.rs`) | `YuvRange::Limited` + `Bt709` | `limit_to_full()` (assumes *limited* luma) |
+| GL (`gl/dma_import.rs`) | `ITU_REC709` + `YUV_NARROW_RANGE` | same hint |
+| G2D (`g2d.rs`) | `set_bt709_colorspace()` | same |
+
+The codec, however, emits JPEG as **BT.601 full-range (JFIF)** — so a decoded
+NV12 converted today is doubly wrong (601≠709 matrix, full≠limited range). That
+mismatch is the original motivation for this work.
+
+### Per-source findings (what each producer actually emits)
+
+Research across the four target boards (kernel driver source, NXP/NVIDIA/RPi
+docs, libcamera, V4L2 colorspace spec — sources below):
+
+| Source | Matrix | Range | Signalling / notes |
+|--------|--------|-------|--------------------|
+| **JPEG** (all platforms) | **BT.601** | **Full (JFIF)** | Standard-defined; i.MX `mxc-jpeg` hard-codes `ycbcr_enc=601, quantization=FULL`. The codec can always tag its output 601-full with high confidence. |
+| **Video decode** (H.264/H.265/AV1) | per-stream | per-stream | **VUI-signalled** (`matrix_coefficients`, `video_full_range_flag`), *not* a silicon constant. HD/4K usually 709-limited, SD 601-limited. **Recurring bug:** decoders/buffers often default/allocate as 601 even when the stream is 709 (Jetson allocates bt601 by default; GStreamer "wants bt709" negotiation). Must read the signalled value, never infer from pixel format. |
+| **i.MX camera/ISI** (imx95, imx8mp) | BT.601 | full *or* limited | ISI driver default is 601 **limited**, but real YUV sensors advertise **full** and propagate up as `colorspace:jpeg` (601 full). ISP (NEO on imx95, ISP8000 on imx8mp) output is tuning-dependent. No resolution dependence in the ISI itself. |
+| **Pi 5 camera** (RP1 + PiSP, libcamera) | 601 or 709 | full or limited | Chosen by request type + resolution: RGB/stills/preview → `Sycc` (**601 full**); YUV <720 lines → `Smpte170m` (601 limited); YUV ≥720 → `Rec709` (**709 limited**). |
+| **Orin Nano** (NVDEC / NVJPG) | baked into format enum | baked into enum | NVIDIA encodes (matrix,range) into `NvBufSurfaceColorFormat`: suffix `_709`=BT.709, `_2020`=BT.2020, `_ER`=full range, none=601-limited. NVJPG (HW JPEG) → 601 full (`_ER`). NVDEC decode-only (no NVENC). |
+
+Cross-cutting truths:
+- **JPEG is unambiguous (601 full)** — the safe, immediate win.
+- **Video is VUI-driven** — colorimetry must be read from the bitstream and
+  carried, not inferred.
+- **Camera is BT.601 matrix** (709 only on the Pi5 HD-YUV path); **range varies**
+  and is signalled by the producer (V4L2 `quantization` / libcamera `ColorSpace`).
+- **Producers signal it; the HAL just isn't carrying it** — V4L2 (`ycbcr_enc` +
+  `quantization`), libcamera (`ColorSpace`), bitstream VUI, and NvBufSurface all
+  expose matrix+range. NVIDIA bakes it into the format enum; V4L2/libcamera keep
+  it in separate fields (the model we should mirror).
+
+### Proposed design (per-source colorimetry on the tensor)
+
+The fix is to carry colorimetry with the buffer and let `convert()` honour it,
+instead of any global guess:
+
+1. **Tensor metadata.** Add an optional `Colorimetry { matrix: Bt601 | Bt709 |
+   Bt2020, range: Full | Limited }` to the tensor (alongside `PixelFormat`).
+   `None`/unset means "unknown — apply the fallback heuristic".
+2. **Producers tag it:**
+   - Codec JPEG decode → `Bt601 + Full` (high confidence).
+   - `import_image(...)` gains a colorimetry argument the caller fills from the
+     producer's signalling (libcamera `ColorSpace`, V4L2 `ycbcr_enc` +
+     `quantization`, bitstream VUI, or NvBufSurface color-format suffix).
+3. **`convert()` consumes it** per backend, replacing the hardcoded 709/limited:
+   - CPU: pass the matching `yuv::YuvStandardMatrix` + `yuv::YuvRange` (the `yuv`
+     crate already supports Bt601/709/2020 × Full/Limited).
+   - GL: choose `ITU_REC601`/`ITU_REC709` + `YUV_FULL_RANGE`/`YUV_NARROW_RANGE`
+     EGL hints per buffer instead of the global `is_yuv` default.
+   - G2D: `set_bt601_colorspace()` / `set_bt709_colorspace()` per conversion.
+     **Caveat:** the `g2d-sys` API selects only the *matrix*; full/limited range
+     control may not be exposed — verify, and document the residual limitation if
+     G2D cannot express full-range.
+4. **Fallback when untagged** = the industry convention: **SD (≤576/720 lines) →
+   BT.601, HD → BT.709, limited range** — with an explicit override hook.
+
+### Open questions / needs on-target measurement
+
+Docs and silicon disagree exactly where it matters; confirm empirically per board
+before locking the implementation:
+- i.MX camera **range** (full vs limited) — driver default says limited, real
+  sensors often emit full (`colorspace:jpeg`). Measure the live `quantization`.
+- Whether each video decoder honours VUI or silently allocates 601.
+- Orin: whether the NVDEC surface enum faithfully reflects 709 content.
+- G2D full-range expressibility.
+
+Measurement approach: (a) record each source's *declared* colorimetry
+(`v4l2-ctl --get-fmt-video` + `media-ctl -p`; libcamera `ColorSpace`; GStreamer
+`colorimetry` caps / NvBufSurface `colorFormat`); (b) push a known test pattern
+through each source and pick the (matrix, range) hypothesis whose RGB matches
+ground truth — catching the "tag says 601 but content is 709" case.
+
+### Sources
+
+- V4L2 colorspaces (JPEG = sRGB+601+full; SMPTE170M = 601 limited; default-mapping
+  macros): <https://docs.kernel.org/userspace-api/media/v4l/colorspaces-defs.html>,
+  <https://docs.kernel.org/userspace-api/media/v4l/colorspaces-details.html>
+- i.MX `mxc-jpeg` (601 full hard-coded) and `imx8-isi` defaults (`MXC_ISI_DEF_*`):
+  <https://github.com/torvalds/linux/tree/master/drivers/media/platform/nxp>
+- Chips&Media Wave6 VUI→V4L2 mapping (i.MX95 VPU, RFC v5):
+  <https://patchwork.kernel.org/project/linux-media/patch/20260415092529.577-5-nas.chung@chipsnmedia.com/>
+- Hantro stateless decoder (imx8mp VPU; userspace parses VUI):
+  <https://docs.kernel.org/userspace-api/media/v4l/dev-stateless-decoder.html>
+- libcamera `ColorSpace` presets (Sycc/Smpte170m/Rec709) and Pi pipeline handler:
+  <https://github.com/raspberrypi/libcamera/blob/main/src/libcamera/color_space.cpp>
+- Pi 5 BCM2712 codec list (HEVC HW decode only; no H.264/JPEG HW):
+  <https://www.raspberrypi.com/documentation/computers/processors.html>
+- NVIDIA `NvBufSurfaceColorFormat` (matrix/range baked via `_709`/`_2020`/`_ER`):
+  <https://docs.nvidia.com/metropolis/deepstream/dev-guide/sdk-api/nvbufsurface_8h_source.html>
+
 ## Performance Considerations
 
 | Optimization | Why it matters |
