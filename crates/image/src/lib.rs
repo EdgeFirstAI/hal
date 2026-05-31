@@ -2440,6 +2440,13 @@ pub(crate) fn load_image_test_helper(
     match format {
         Some(f) if f != native_fmt => {
             let mut dst = TensorDyn::image(w, h, f, DType::U8, memory)?;
+            // `ImageProcessorConfig` has platform-specific fields: on Linux it
+            // carries extra GL/G2D options so `..Default::default()` is needed,
+            // but on macOS `backend` is the only field, making the update
+            // redundant (clippy::needless_update). Allow it for cross-platform
+            // parity — the alternative (field reassign) trips
+            // clippy::field_reassign_with_default on Linux instead.
+            #[allow(clippy::needless_update)]
             let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::Cpu,
                 ..Default::default()
