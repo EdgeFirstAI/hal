@@ -388,6 +388,45 @@ static void test_tensor_quantization_null_input(void) {
 }
 
 // =============================================================================
+// CUDA Capability and Fallback Tests
+// =============================================================================
+
+static void test_cuda_availability_and_fallback(void) {
+    TEST("cuda_availability_and_fallback");
+
+    // hal_is_cuda_available() must be callable and return a bool (no crash).
+    (void)hal_is_cuda_available();
+
+    // A Mem tensor has no registered CUDA handle, so cuda_map always returns
+    // NULL regardless of whether libcudart is present.  Callers must fall back
+    // to the host map in this case — verify that contract here.
+    size_t shape[] = {4, 4};
+    struct hal_tensor* t = hal_tensor_new(HAL_DTYPE_F32, shape, 2, HAL_TENSOR_MEMORY_MEM, NULL);
+    ASSERT_NOT_NULL(t);
+
+    void* cm = hal_tensor_cuda_map(t);
+    ASSERT_NULL(cm); // Mem tensor never has a CUDA mapping
+
+    if (cm) {
+        // On a real CUDA host this branch exercises the zero-copy path.
+        size_t sz = 0;
+        void* dptr = hal_tensor_cuda_device_ptr(cm, &sz);
+        ASSERT_NOT_NULL(dptr);
+        hal_tensor_cuda_unmap(cm);
+    } else {
+        // Fallback: host map must succeed for a Mem tensor.
+        struct hal_tensor_map* m = hal_tensor_map_create(t);
+        ASSERT_NOT_NULL(m);
+        void* data = hal_tensor_map_data(m);
+        ASSERT_NOT_NULL(data);
+        hal_tensor_map_unmap(m);
+    }
+
+    hal_tensor_free(t);
+    TEST_PASS();
+}
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -418,6 +457,9 @@ void run_tensor_tests(void) {
     // Quantization accessor tests
     test_tensor_quantization_float_returns_null();
     test_tensor_quantization_null_input();
+
+    // CUDA capability query and try-cuda_map / fallback pattern
+    test_cuda_availability_and_fallback();
 }
 
 #ifdef TEST_TENSOR_STANDALONE

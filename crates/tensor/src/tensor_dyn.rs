@@ -234,6 +234,40 @@ impl TensorDyn {
         self
     }
 
+    /// The CUDA registration for this tensor, if any.
+    ///
+    /// Returns `None` when no CUDA handle has been attached (the common non-CUDA case).
+    /// This check is a pure local field read — no thread routing occurs.
+    pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
+        dispatch!(self, cuda)
+    }
+
+    /// Fast-fail CUDA map: `None` when no handle is attached; else maps the
+    /// PBO through the GL worker and returns a scoped device-pointer guard.
+    ///
+    /// The same try-`cuda_map`-then-[`map`](crate::TensorTrait::map) fallback pattern that applies to
+    /// [`Tensor::cuda_map`](crate::Tensor::cuda_map) applies here: call `cuda_map()` first for a
+    /// zero-copy device pointer; when it returns `None` (no CUDA handle attached), fall back to the
+    /// typed host mapping via the inner tensor.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::TensorDyn;
+    /// # fn feed_tensorrt(_dptr: *mut std::ffi::c_void, _bytes: usize) {}
+    /// # fn demo(t: &TensorDyn) {
+    /// if let Some(cuda) = t.cuda_map() {
+    ///     feed_tensorrt(cuda.device_ptr(), cuda.len());
+    /// } else {
+    ///     // No CUDA handle — use the typed inner tensor for host access.
+    ///     // See Tensor::cuda_map for the full fallback example.
+    /// }
+    /// # }
+    /// ```
+    pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        dispatch!(self, cuda_map)
+    }
+
     /// Quantization metadata. Returns `None` for float variants (F16, F32,
     /// F64) — quantization does not apply to floating-point tensors.
     /// Otherwise delegates to the typed `Tensor<T>::quantization()` accessor.
@@ -1092,5 +1126,16 @@ mod tests {
             Tensor::<u8>::new(&[240, 640], Some(TensorMemory::Mem), Some("chroma")).unwrap();
         let combined = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap();
         assert_eq!(combined.plane_offset(), Some(4096));
+    }
+
+    #[test]
+    fn cuda_passthrough_none_for_mem_tensor() {
+        // Build a Mem-backed dynamic tensor the same way the other tests here do,
+        // then confirm the CUDA accessors pass through to None (no handle).
+        let t: TensorDyn = Tensor::<f32>::new(&[10], Some(TensorMemory::Mem), None)
+            .unwrap()
+            .into();
+        assert!(t.cuda().is_none());
+        assert!(t.cuda_map().is_none());
     }
 }

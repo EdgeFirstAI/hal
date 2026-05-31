@@ -26,6 +26,8 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
+pub mod covguard;
+mod cuda;
 #[cfg(target_os = "linux")]
 mod dma;
 #[cfg(target_os = "linux")]
@@ -40,6 +42,19 @@ mod pbo;
 mod shm;
 mod tensor_dyn;
 
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented test binary. See `covguard`. Only present under
+/// coverage on Linux (`.init_array` is ELF-only; the i.MX flush is Linux-only).
+#[cfg(all(coverage, target_os = "linux"))]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        crate::covguard::install();
+    }
+    ctor
+};
+
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
 #[cfg(target_os = "macos")]
@@ -48,6 +63,10 @@ pub use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
+pub use cuda::{
+    gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
+    is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
+};
 pub use error::{Error, Result};
 pub use format::{PixelFormat, PixelLayout};
 use num_traits::Num;
@@ -1310,6 +1329,13 @@ pub struct Tensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// CUDA registration for this tensor, if any. Set after creation by
+    /// the image crate once a PBO is registered with CUDA interop.
+    ///
+    /// MUST be declared before `storage`: CUDA must unregister the GL buffer
+    /// before storage's Drop deletes it (cudaGraphicsUnregisterResource before
+    /// glDeleteBuffers). Rust drops fields in declaration order.
+    cuda: Option<crate::cuda::CudaHandle>,
     pub(crate) storage: TensorStorage<T>,
     format: Option<PixelFormat>,
     chroma: Option<Box<Tensor<T>>>,
@@ -1338,6 +1364,7 @@ where
             row_stride: None,
             plane_offset: None,
             quantization: None,
+            cuda: None,
         }
     }
 
@@ -1425,7 +1452,16 @@ where
             dtype = std::any::type_name::<T>(),
         )
         .entered();
-        TensorStorage::new(shape, memory, name).map(Self::wrap)
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut t = TensorStorage::new(shape, memory, name).map(Self::wrap)?;
+        // Best-effort: attach a CUDA ExternalMemory handle for DMA tensors on
+        // CUDA-capable hosts. Never blocks tensor creation on failure.
+        // RUNTIME-UNVALIDATED: no CUDA+dma_heap test platform available; ABI
+        // layout-asserted vs. CUDA 12.6 driver_types.h; mechanism proven by
+        // gpu-probe O5 on Orin.
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
+        Ok(t)
     }
 
     /// Create an image tensor with the given format.
@@ -1656,6 +1692,10 @@ where
             let mut t = Self::wrap(storage);
             t.format = Some(format);
             t.row_stride = Some(row_stride_bytes);
+            // Match new()/from_fd(): a DMA tensor must attempt CUDA external-
+            // memory import so a strided DMA buffer is also zero-copy
+            // CUDA-mappable (no-op when libcudart is absent).
+            t.try_init_dma_cuda();
             Ok(t)
         }
     }
@@ -1866,6 +1906,12 @@ where
             row_stride: luma.row_stride,
             plane_offset: luma.plane_offset,
             quantization: luma.quantization,
+            // A multiplane tensor spans two DMA-BUFs (luma + chroma); CUDA
+            // external-memory import is per-fd, so there is no single device
+            // pointer for the composite. Any CUDA handle the luma plane carried
+            // is intentionally dropped — consumers needing CUDA access to
+            // multiplane data must import each plane independently.
+            cuda: None,
         })
     }
 
@@ -2046,6 +2092,79 @@ where
             row_stride: None,
             plane_offset: None,
             quantization: None,
+            cuda: None,
+        }
+    }
+
+    /// The CUDA registration for this tensor, if any (set at creation on CUDA devices).
+    pub fn cuda(&self) -> Option<&crate::cuda::CudaHandle> {
+        self.cuda.as_ref()
+    }
+
+    /// Attach a CUDA handle (called by ImageProcessor::create_image after registering a PBO).
+    pub fn set_cuda_handle(&mut self, h: crate::cuda::CudaHandle) {
+        self.cuda = Some(h);
+    }
+
+    /// Fast-fail CUDA map: None (no GL routing) when no handle; else map (PBO routes to the GL worker).
+    ///
+    /// Returns a scoped [`CudaMap`](crate::cuda::CudaMap) guard holding the raw CUDA device pointer
+    /// for the duration of the mapping. For GL-buffer-backed tensors the unmap is deferred until the
+    /// guard drops, freeing the PBO for the next `convert()` call. When no CUDA handle is attached
+    /// (the common case for plain `Mem`/`DMA` tensors without CUDA registration), returns `None`
+    /// immediately — no GL routing, no allocation.
+    ///
+    /// # Example — zero-copy CUDA input with host fallback
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
+    /// # fn feed_tensorrt(_dptr: *mut std::ffi::c_void, _bytes: usize) {}
+    /// # fn demo(t: &Tensor<f32>) {
+    /// // Try the zero-copy CUDA device pointer first.
+    /// if let Some(cuda) = t.cuda_map() {
+    ///     feed_tensorrt(cuda.device_ptr(), cuda.len());
+    ///     // `cuda` (a CudaMap guard) unmaps when it goes out of scope, freeing
+    ///     // the GPU buffer for the next convert().
+    /// } else {
+    ///     // Fall back to the host mapping when no CUDA handle is attached.
+    ///     let _host = t.map().expect("host map fallback must succeed");
+    ///     // `_host` is a TensorMap<f32> that derefs to &[f32].
+    /// }
+    /// # }
+    /// ```
+    pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
+        self.cuda.as_ref()?.map()
+    }
+
+    /// Attempt to attach a CUDA `ExternalMemory` handle for DMA-backed tensors.
+    ///
+    /// On a CUDA-capable host, imports the DMA-BUF fd via
+    /// `cudaImportExternalMemory(OpaqueFd)` and maps it to a device pointer.
+    /// Sets `self.cuda` to a persistent `ExternalMem` handle on success. No-op
+    /// if CUDA is unavailable, the tensor is not DMA-backed, or a handle is
+    /// already set. Import failure is silently ignored — the tensor remains
+    /// usable without a CUDA handle.
+    ///
+    /// # RUNTIME-UNVALIDATED
+    ///
+    /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
+    /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
+    /// by gpu-probe O5 on Orin. Best-effort: tensor creation never fails here.
+    #[cfg(target_os = "linux")]
+    pub fn try_init_dma_cuda(&mut self) {
+        // Fast-path: already imported, CUDA not available, or not a DMA tensor.
+        if self.cuda.is_some() || !crate::cuda::is_cuda_available() {
+            return;
+        }
+        let (raw_fd, buf_size) = match &self.storage {
+            TensorStorage::Dma(dma) => {
+                use std::os::fd::AsRawFd;
+                (dma.fd.as_raw_fd(), dma.buf_size)
+            }
+            _ => return,
+        };
+        if let Some((ext, dptr)) = crate::cuda::import_dma_fd(raw_fd, buf_size) {
+            self.cuda = Some(crate::cuda::CudaHandle::new_external(ext, dptr, buf_size));
         }
     }
 }
@@ -2103,7 +2222,13 @@ where
     where
         Self: Sized,
     {
-        Ok(Self::wrap(TensorStorage::from_fd(fd, shape, name)?))
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut t = Self::wrap(TensorStorage::from_fd(fd, shape, name)?);
+        // Best-effort CUDA external memory import for DMA-backed tensors.
+        // RUNTIME-UNVALIDATED: see try_init_dma_cuda().
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
+        Ok(t)
     }
 
     #[cfg(unix)]
@@ -3655,5 +3780,38 @@ mod tests {
         assert!(packed_rgba16f_layout(PixelFormat::Rgb, DType::F32, 640, 640).is_none());
         // Packed Rgba with F16 is not a planar format → None
         assert!(packed_rgba16f_layout(PixelFormat::Rgba, DType::F16, 640, 640).is_none());
+    }
+
+    #[test]
+    fn cuda_map_fast_fails_to_none_without_handle() {
+        let t = Tensor::<f32>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+        assert!(t.cuda().is_none());
+        assert!(t.cuda_map().is_none()); // pure local check, no GL routing
+    }
+
+    #[test]
+    fn cuda_returns_none_without_handle() {
+        // A plain Mem-backed tensor has no CUDA handle attached.
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
+        assert!(t.cuda().is_none(), "no CUDA handle on a Mem tensor");
+        assert!(t.cuda_map().is_none(), "fast-fail map → None");
+    }
+
+    #[test]
+    fn cuda_map_then_host_map_fallback() {
+        // The documented client pattern: try cuda_map() first; when it is None
+        // (no CUDA handle — the case for a plain Mem tensor), fall back to map().
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
+        // Bind to a named variable so the CudaMap guard (and its borrow of `t`)
+        // is dropped at the end of this statement, before the else branch borrows `t` again.
+        let cuda = t.cuda_map();
+        if let Some(_c) = cuda {
+            // On a CUDA-registered tensor we'd use the device ptr here.
+            unreachable!("a Mem tensor has no CUDA handle");
+        } else {
+            let host = t.map().expect("host map fallback must succeed");
+            // TensorMapTrait::len() returns the element count (not bytes).
+            assert_eq!(host.len(), 4); // 2*2 f32 elements
+        }
     }
 }

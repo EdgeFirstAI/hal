@@ -163,6 +163,77 @@ let guard = t.buffer_identity().weak();
 `BufferIdentity` is used internally by the image processing backends as an EGL
 image cache key to avoid redundant GPU texture imports across frames.
 
+## CUDA Tensor Mapping
+
+On CUDA-capable devices (e.g. Jetson Orin-series) the float PBO produced
+by `ImageProcessor::convert()` can be mapped directly to a CUDA device
+pointer. No link-time dependency on `libcudart` — the symbols are resolved
+at runtime via `dlopen`.
+
+### Availability probe
+
+```rust
+use edgefirst_tensor::is_cuda_available;
+
+if is_cuda_available() {
+    println!("CUDA runtime present; zero-copy path available");
+}
+```
+
+### Usage — try CUDA map, fall back to host
+
+```rust
+use edgefirst_tensor::{TensorTrait, TensorMapTrait};
+
+// Per-frame: prefer zero-copy CUDA, fall back to host map
+if let Some(cuda) = dst.cuda_map() {
+    // cuda.device_ptr() — raw CUDA device pointer, valid until `cuda` drops.
+    // cuda.len()        — byte length of the mapped region.
+    trt_enqueue(cuda.device_ptr(), cuda.len());
+    // Drop `cuda` here — releases the PBO before the next convert().
+} else {
+    let host = dst.map()?;
+    trt_enqueue_host(host.as_slice());
+}
+```
+
+`cuda_map()` returns `None` when:
+- `libcudart` is not present at runtime.
+- The tensor is not PBO- or DMA-BUF-backed.
+- CUDA registration of the backing buffer failed (logged at `warn`).
+
+The `CudaMap` guard must be dropped before the next `ImageProcessor::convert()`
+call that writes into the same tensor — the GL pipeline must not touch a
+PBO while CUDA has it mapped. See
+[ARCHITECTURE.md § Zero-copy CUDA tensor mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping)
+for the full aliasing rules, DMA-BUF import path, and drop-order contract.
+
+### C API
+
+```c
+if (hal_is_cuda_available()) {
+    void *map = hal_tensor_cuda_map(tensor);
+    if (map) {
+        size_t size   = 0;
+        void *dev_ptr = hal_tensor_cuda_device_ptr(map, &size);
+        trt_enqueue(dev_ptr, size);
+        hal_tensor_cuda_unmap(map);  // must call before next convert()
+    }
+}
+```
+
+### Python
+
+```python
+import edgefirst_hal as ef
+
+if ef.is_cuda_available():
+    cm = dst.cuda_map()          # returns CudaMap or None
+    if cm is not None:
+        with cm:                 # context manager — unmap on __exit__
+            trt_context.execute(cm.device_ptr)
+```
+
 ## Documentation
 
 - Architecture overview: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md)

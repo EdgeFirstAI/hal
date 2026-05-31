@@ -3,6 +3,19 @@
 
 #![cfg_attr(nightly, feature(f16))]
 
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented cdylib. See `edgefirst_tensor::covguard`. Only present
+/// under coverage on Linux (`.init_array` is ELF-only; flush is Linux-only).
+#[cfg(all(coverage, target_os = "linux"))]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        edgefirst_tensor::covguard::install();
+    }
+    ctor
+};
+
 use pyo3::prelude::*;
 
 pub mod decoder;
@@ -44,11 +57,13 @@ pub mod edgefirst_hal {
         m.add_function(wrap_pyfunction!(is_iosurface_available, m)?)?;
         m.add_function(wrap_pyfunction!(is_gpu_buffer_available, m)?)?;
         m.add_function(wrap_pyfunction!(is_shm_available, m)?)?;
+        m.add_function(wrap_pyfunction!(is_cuda_available, m)?)?;
 
         m.add_class::<tensor::PyTensor>()?;
         m.add_class::<tensor::PyTensorMemory>()?;
         m.add_class::<tensor::PyQuantization>()?;
         m.add_class::<tensor::PyImageInfo>()?;
+        m.add_class::<tensor::PyCudaMap>()?;
         m.add_class::<image::PyPixelFormat>()?;
         m.add_class::<image::Normalization>()?;
         m.add_class::<image::PyRect>()?;
@@ -135,6 +150,16 @@ pub mod edgefirst_hal {
     #[pyfunction]
     fn is_shm_available() -> bool {
         ::edgefirst_hal::tensor::is_shm_available()
+    }
+
+    /// True when libcudart is loaded and all CUDA interop symbols resolved.
+    ///
+    /// Checks whether zero-copy CUDA tensor mapping is available on this
+    /// system. Use this to gate CUDA-specific paths before calling
+    /// ``Tensor.cuda_map()``. The result is cached after the first call.
+    #[pyfunction]
+    fn is_cuda_available() -> bool {
+        ::edgefirst_hal::tensor::is_cuda_available()
     }
 
     /// Trace capture context manager for Perfetto/Chrome JSON output.

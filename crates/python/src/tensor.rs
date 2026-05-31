@@ -849,6 +849,40 @@ impl PyTensor {
         })
     }
 
+    /// Attempt a zero-copy CUDA device-pointer mapping.
+    ///
+    /// Returns a ``CudaMap`` context manager exposing ``device_ptr`` and
+    /// ``size``, or ``None`` if CUDA is unavailable for this tensor (libcudart
+    /// not found, or the tensor was not registered with CUDA). Fast-fails to
+    /// ``None`` without GL-thread routing.
+    ///
+    /// The recommended pattern is to try ``cuda_map()`` first and fall back to
+    /// ``map()`` when it returns ``None``::
+    ///
+    ///     cm = tensor.cuda_map()
+    ///     if cm is not None:
+    ///         with cm as m:
+    ///             trt_set_input_address(m.device_ptr)   # zero-copy GPU
+    ///     else:
+    ///         with tensor.map() as host:
+    ///             run_cpu_path(host)                    # fallback
+    fn cuda_map(slf: Bound<'_, Self>) -> Option<PyCudaMap> {
+        let owner: Py<PyTensor> = slf.clone().unbind();
+        // SAFETY: The CudaMap borrows into the tensor's storage. We extend
+        // the lifetime to 'static and keep the PyTensor alive via `_owner`.
+        // `PyCudaMap.map` is declared before `_owner`, so Rust drops the
+        // CudaMap guard before decrementing the tensor ref-count. Callers
+        // must not reshape the tensor while a CudaMap is live.
+        let borrowed = slf.borrow();
+        let map = borrowed.0.cuda_map()?;
+        let map_static: edgefirst_hal::tensor::CudaMap<'static> =
+            unsafe { std::mem::transmute(map) };
+        Some(PyCudaMap {
+            map: Some(map_static),
+            _owner: owner,
+        })
+    }
+
     // ── Image-specific methods ──────────────────────────────────────────
 
     /// Create an image tensor with the given dimensions and pixel format.
@@ -1176,6 +1210,63 @@ impl PyQuantization {
     #[getter]
     fn is_symmetric(&self) -> bool {
         self.0.is_symmetric()
+    }
+}
+
+// ─── PyCudaMap ──────────────────────────────────────────────────────────────
+
+/// Scoped zero-copy CUDA device-pointer mapping for a tensor (e.g. a TensorRT
+/// input). Use as a context manager; the mapping is released on exit so the
+/// GPU buffer can be reused by the next convert(). Obtain via Tensor.cuda_map().
+#[pyclass(name = "CudaMap")]
+pub struct PyCudaMap {
+    // FIELD ORDER IS LOAD-BEARING: `map` must be declared before `_owner` so
+    // that Rust drops `map` (the CudaMap guard) before `_owner` (the PyTensor
+    // ref-count). This preserves the invariant that the CUDA mapping is
+    // released before the tensor can be freed.
+    map: Option<edgefirst_hal::tensor::CudaMap<'static>>,
+    _owner: Py<PyTensor>,
+}
+
+// SAFETY: CudaMap holds a *mut c_void CUDA device pointer. CUDA device
+// pointers are process-global and may be used from any thread, so Send+Sync
+// are sound here. The owning PyTensor Py<> handle is also Send+Sync.
+unsafe impl Send for PyCudaMap {}
+unsafe impl Sync for PyCudaMap {}
+
+#[pymethods]
+impl PyCudaMap {
+    /// Raw CUDA device pointer (as an integer) to the mapped buffer.
+    ///
+    /// Pass to TensorRT ``setInputTensorAddress``, cupy, or pycuda for
+    /// zero-copy GPU input. Returns 0 if the mapping has been released.
+    #[getter]
+    fn device_ptr(&self) -> usize {
+        self.map.as_ref().map_or(0, |m| m.device_ptr() as usize)
+    }
+
+    /// Length of the mapping in bytes. Returns 0 if released.
+    #[getter]
+    fn size(&self) -> usize {
+        self.map.as_ref().map_or(0, |m| m.len())
+    }
+
+    fn __len__(&self) -> usize {
+        self.size()
+    }
+
+    /// Release the CUDA mapping (idempotent). Called automatically on ``with``
+    /// exit; may also be called explicitly when early release is needed.
+    fn release(&mut self) {
+        self.map = None; // drops the CudaMap guard → unmaps
+    }
+
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        slf
+    }
+
+    fn __exit__(&mut self, _exc_type: Py<PyAny>, _exc_value: Py<PyAny>, _traceback: Py<PyAny>) {
+        self.release();
     }
 }
 

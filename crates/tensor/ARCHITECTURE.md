@@ -150,6 +150,89 @@ for the EGL image cache implementation and
 [the project ARCHITECTURE Appendix C](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
 for the full cross-cutting story.
 
+## Zero-copy CUDA Tensor Mapping
+
+The CUDA surface maps the float PBO produced by `ImageProcessor::convert()`
+directly to a CUDA device pointer, enabling zero-copy inference with TensorRT
+and other CUDA consumers. The cross-crate data-flow story lives in
+[`ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping);
+this section covers the tensor-crate implementation detail.
+
+### Runtime symbol loading (`OnceLock` table)
+
+All `libcudart` entry points are resolved once via `dlopen("libcudart.so")`
+and stored in a process-global `OnceLock<CudaSymbols>`. If `libcudart` is
+absent at runtime, the `OnceLock` stores `None` and every subsequent call
+fast-fails to `None` / `false` without retrying the dlopen. There is no
+link-time dependency and no compile-time feature gate.
+
+`is_cuda_available() -> bool` returns `true` only if the symbol table was
+populated successfully.
+
+### `CudaHandle` — two backing variants
+
+| Variant | Source | Device pointer lifetime |
+|---------|--------|------------------------|
+| `GlBuffer` | `cudaGraphicsGLRegisterBuffer` on a PBO | Per-map: valid between `cudaGraphicsMapResources` and `cudaGraphicsUnmapResources` |
+| `ExternalMem` | `cudaImportExternalMemory(OpaqueFd)` on a DMA-BUF fd | Persistent: valid for the lifetime of the `CudaHandle` |
+
+Both variants expose the same `device_ptr() -> *mut c_void` / `len() -> usize`
+interface to callers via `CudaMap`.
+
+### `CudaMap` — RAII guard
+
+`CudaMap` is the scoped guard returned by `Tensor::cuda_map()` and
+`TensorDyn::cuda_map()`. Its semantics:
+
+- **Construction** — calls `cudaGraphicsMapResources` (GL-buffer path) or
+  returns the persistent pointer (external-memory path). Routing to the
+  GL worker thread is handled by `CudaGlOps`.
+- **`device_ptr() -> *mut c_void`** — the raw device pointer; valid for
+  the lifetime of the guard.
+- **`len() -> usize`** — byte length of the mapped region.
+- **`Drop`** — calls `cudaGraphicsUnmapResources` (GL-buffer path only),
+  releasing the PBO back to the GL pipeline. The PBO must not be
+  re-mapped while the guard is alive.
+
+`CudaMap` is `Send` (the device pointer is usable from any thread via the
+per-device CUDA primary context) but not `Sync` (two threads must not
+concurrently access the raw pointer without external synchronization).
+
+### `CudaGlOps` — GL-worker routing
+
+`cudaGraphicsGLRegisterBuffer` and `cudaGraphicsMapResources` must run on
+the GL-context thread. `CudaGlOps` is the trait the GL backend implements
+to route those calls through the existing GL-thread message channel —
+the same mechanism `PboOps` uses for PBO map/unmap/delete. Fast-fail
+behavior: if `cuda_map()` is called on a tensor whose `CudaGlOps`
+implementation reports that CUDA is absent or the GL thread has exited,
+the call returns `None` immediately.
+
+### DMA-BUF import (`ExternalMem` path)
+
+For DMA-BUF-backed tensors, `cuda_map()` calls
+`cudaImportExternalMemory` with `cudaExternalMemoryHandleTypeOpaqueFd`.
+The DMA-BUF fd is `dup`'d before being handed to CUDA; CUDA takes
+ownership of the dup'd fd on success (closing it when the
+`CudaExternalMemory` handle is destroyed). This path is independent of
+the GL thread.
+
+### Drop order
+
+Within a `PboTensor`'s internal state, the `CudaHandle` is owned by a
+field that is declared before the PBO storage. Rust's field-drop order
+(declaration order, reverse of construction) guarantees that
+`cudaGraphicsUnregisterResource` runs before `glDeleteBuffers`, which is
+the requirement from the CUDA–GL interop spec.
+
+### Fast-fail on the non-GL path
+
+`Tensor::cuda()` (the lower-level direct accessor, distinct from
+`cuda_map()`) returns `None` if the tensor's backing storage is not
+GPU-registered (e.g. `MemTensor`, `DmaTensor` without a CUDA import, or
+`ShmTensor`). `cuda_map()` calls `cuda()` internally and propagates the
+`None` without going to the GL thread.
+
 ## Performance Considerations
 
 ### When to use each backend

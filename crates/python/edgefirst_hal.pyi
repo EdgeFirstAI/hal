@@ -37,6 +37,14 @@ def is_gpu_buffer_available() -> bool:
 def is_shm_available() -> bool:
     """True when POSIX shared memory allocation is available (Unix only)."""
 
+def is_cuda_available() -> bool:
+    """True when libcudart is loaded and all CUDA interop symbols resolved.
+
+    Checks whether zero-copy CUDA tensor mapping is available on this system.
+    Use this to gate CUDA-specific code paths before calling
+    :meth:`Tensor.cuda_map`. The result is cached after the first call.
+    """
+
 class Nms(enum.Enum):
     """Non-Maximum Suppression mode for object detection.
 
@@ -1026,6 +1034,30 @@ class Tensor:
         """
         ...
 
+    def cuda_map(self) -> Optional[CudaMap]:
+        """Attempt a zero-copy CUDA device-pointer mapping.
+
+        Returns a :class:`CudaMap` context manager, or ``None`` if CUDA is
+        unavailable for this tensor (libcudart not found, or the tensor was
+        not registered with CUDA). Fast-fails to ``None`` without GL-thread
+        routing.
+
+        The recommended pattern is to try ``cuda_map()`` first and fall back
+        to ``map()`` when it returns ``None``::
+
+            cm = tensor.cuda_map()
+            if cm is not None:
+                with cm as m:
+                    trt_set_input_address(m.device_ptr)   # zero-copy GPU
+            else:
+                with tensor.map() as host:
+                    run_cpu_path(host)                    # CPU fallback
+
+        Returns:
+            A :class:`CudaMap` context manager, or ``None``.
+        """
+        ...
+
     @staticmethod
     def image(
         width: int,
@@ -1259,6 +1291,50 @@ class TensorMap:
     def __getbuffer__(self, view, _flags) -> None: ...
     def __releasebuffer__(self, view) -> None: ...
     def __enter__(self) -> TensorMap: ...
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
+
+class CudaMap:
+    """Scoped zero-copy CUDA device-pointer mapping for a tensor.
+
+    Obtain via :meth:`Tensor.cuda_map`. Use as a context manager; the
+    mapping is released on ``__exit__`` so the GPU buffer can be reused
+    by the next ``convert()`` call.
+
+    Example::
+
+        cm = tensor.cuda_map()
+        if cm is not None:
+            with cm as m:
+                trt_set_input_address(m.device_ptr)   # zero-copy GPU input
+        else:
+            with tensor.map() as host:
+                run_cpu_path(host)                    # CPU fallback
+    """
+
+    @property
+    def device_ptr(self) -> int:
+        """Raw CUDA device pointer as an integer.
+
+        Pass to TensorRT ``setInputTensorAddress``, cupy, or pycuda for
+        zero-copy GPU input. Returns ``0`` if the mapping has been released.
+        """
+        ...
+
+    @property
+    def size(self) -> int:
+        """Length of the mapping in bytes. Returns ``0`` if released."""
+        ...
+
+    def __len__(self) -> int: ...
+    def release(self) -> None:
+        """Release the CUDA mapping (idempotent).
+
+        Called automatically on ``with`` exit. May also be called explicitly
+        when early release is needed before the ``with`` block exits.
+        """
+        ...
+
+    def __enter__(self) -> CudaMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
 
 class PixelFormat(enum.Enum):

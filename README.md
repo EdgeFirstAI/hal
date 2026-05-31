@@ -16,6 +16,7 @@ everywhere else.
 ## Features
 
 - **Zero-copy memory management** — DMA-BUF, POSIX shared memory, OpenGL PBO, and heap with automatic backend selection
+- **Zero-copy CUDA tensor mapping** — `convert()` PBO output mapped directly to a CUDA device pointer for TensorRT and other CUDA consumers; no host round-trip on Jetson (Orin-series). See [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input).
 - **Hardware-accelerated image processing** — OpenGL → G2D → CPU dispatch with shared cache infrastructure
 - **YOLO + ModelPack decoding** — YOLOv5 / v8 / v11 / v26 (incl. end-to-end) and ModelPack post-processing
 - **Multi-object tracking** — ByteTrack with Kalman filtering and stable per-track UUIDs
@@ -108,6 +109,67 @@ struct hal_tensor *dst = hal_image_processor_create_image(
     proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
+
+### Zero-copy CUDA (TensorRT) input
+
+On CUDA-capable devices (e.g. Jetson Orin-series) the float PBO produced
+by `convert()` can be mapped directly to a CUDA device pointer with no
+host round-trip. The recommended pattern is to try `cuda_map()` first and
+fall back to the host `map()` when CUDA is unavailable:
+
+**Rust:**
+
+```rust
+use edgefirst_hal::tensor::{Tensor, TensorTrait, is_cuda_available};
+
+// At pipeline startup — check once
+if is_cuda_available() {
+    println!("CUDA present; will use zero-copy PBO→CUDA path");
+}
+
+// Per frame — try CUDA, fall back to host
+if let Some(cuda) = dst.cuda_map() {
+    // cuda.device_ptr() is a raw device pointer valid until `cuda` is dropped.
+    // Drop `cuda` before the next convert() so the PBO is free to be reused.
+    trt_enqueue(cuda.device_ptr(), cuda.len());
+    // `cuda` drops here → PBO released
+} else {
+    let host = dst.map()?;
+    trt_enqueue_host(host.as_slice());
+}
+```
+
+**Python:**
+
+```python
+import edgefirst_hal as ef
+
+proc = ef.ImageProcessor()
+dst = proc.create_image(640, 640, ef.PixelFormat.PlanarRgb, "float16")
+
+for frame in camera_frames:
+    proc.convert(frame, dst)
+    cuda = dst.cuda_map()          # CudaMap | None
+    if cuda is not None:
+        with cuda:
+            # cuda.device_ptr is a CUDA device pointer (int)
+            trt_context.execute(cuda.device_ptr)
+    else:
+        host = dst.map()
+        trt_context.execute_host(bytes(host))
+```
+
+`cuda_map()` fast-fails to `None` when `libcudart` is not present at
+runtime — no compile-time feature gate, no link-time dependency. CUDA
+register/map runs on the GL worker thread; the returned device pointer
+is usable from any thread. Drop the `CudaMap` guard before the next
+`convert()` call to release the PBO back to the GL pipeline.
+
+For the full mechanism, aliasing rules, DMA-BUF import path, and
+per-language API reference, see
+[crates/tensor/README.md § CUDA tensor mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md#cuda-tensor-mapping)
+and
+[crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping).
 
 Per-language quick-starts and richer examples live in each crate's README:
 [Rust (`edgefirst-hal`)](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/README.md),
@@ -771,7 +833,10 @@ graph TD
 2. **VPI integration** — support for NVIDIA Vision Programming Interface
 3. **Additional trackers** — SORT, Deep SORT
 4. **Async I/O** — non-blocking image loading and processing
-5. **GPU compute** — Vulkan / CUDA backends for custom operations
+
+> **Implemented:** Zero-copy CUDA tensor mapping (PBO → CUDA device pointer for
+> TensorRT) shipped in the [Unreleased] cycle. See the
+> [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input) section above.
 
 ## Support
 

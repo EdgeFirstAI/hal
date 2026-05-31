@@ -57,6 +57,39 @@ struct churn — only the function signatures form the stable contract.
 
 All `hal_*_free` functions accept `NULL` safely (no-op).
 
+## CUDA Zero-Copy
+
+`hal_is_cuda_available()` probes whether `libcudart` loaded and all CUDA
+interop symbols resolved. The result is cached in a `OnceLock` after the
+first probe — all subsequent calls are a single atomic load.
+
+`hal_tensor_cuda_map()` returns an opaque `void *` that boxes a `CudaMap`
+struct. The `Box` is converted to a raw pointer via `Box::into_raw` and its
+lifetime is **transmuted to `'static`** at the ABI boundary — this is safe
+only because the C caller contract guarantees `hal_tensor_cuda_unmap` is
+called before the tensor is freed or mutated. Violating that ordering is
+undefined behavior and will corrupt the deallocator.
+
+The device pointer returned by `hal_tensor_cuda_device_ptr` is valid while
+the map handle is live. It is usable across threads via the CUDA primary
+context, which is shared per-device and does not require an explicit `cudaSetDevice`
+on each thread. However, the CUDA runtime's internal locking is not the same
+as OpenGL's `GL_MUTEX` — GL and CUDA operations on the same PBO buffer must
+be sequenced: complete the GL render (including `glFinish`) before mapping
+for CUDA, and unmap before submitting further GL commands that touch the buffer.
+
+For the GL-registered-buffer path (`hal_tensor_cuda_map` on a PBO tensor),
+the `cudaGraphicsMapResources` / `cudaGraphicsResourceGetMappedPointer` calls
+are issued on the **GL worker thread** (inside the tokio `spawn_blocking` task
+that holds `GL_MUTEX`). The returned device pointer is then handed off to the
+caller; it is valid until `hal_tensor_cuda_unmap`, which issues
+`cudaGraphicsUnmapResources` — also on the GL worker thread.
+
+For the DMA-BUF path (`try_init_dma_cuda` on a DmaTensor), the import uses
+`cudaImportExternalMemory` with `cudaExternalMemoryHandleTypeOpaqueFd`. The
+fd is consumed by the import call; subsequent maps reuse the imported memory
+object without further kernel involvement.
+
 ## Error Convention
 
 | Return type | Success | Failure | Detail |

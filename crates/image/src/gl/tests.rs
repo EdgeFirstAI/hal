@@ -4042,4 +4042,180 @@ mod gl_tests {
 
         eprintln!("convert_f32_pbo_letterbox_pad_color: PASS");
     }
+
+    #[test]
+    fn convert_f32_pbo_cuda_map_roundtrip() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !edgefirst_tensor::is_cuda_available() {
+            eprintln!("SKIP: no libcudart");
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: no GL");
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIP: no f32 render");
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        {
+            let mut m = src.as_u8().unwrap().map().unwrap();
+            for i in 0..(w * h) {
+                m[i * 4] = (i % 255) as u8;
+                m[i * 4 + 1] = 0;
+                m[i * 4 + 2] = 128;
+                m[i * 4 + 3] = 255;
+            }
+        }
+        let mut dst = proc
+            .create_image(w, h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIP: dst not PBO (no CUDA-GL alloc here)");
+            return;
+        }
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        let cm = match dst.cuda_map() {
+            Some(cm) => cm,
+            None => {
+                eprintln!(
+                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                );
+                return;
+            }
+        };
+        assert_eq!(
+            cm.len(),
+            w * h * 3 * 4,
+            "device buffer is [H,W,3] f32 bytes"
+        );
+        assert!(!cm.device_ptr().is_null());
+        assert_eq!(
+            cm.device_ptr() as usize % 256,
+            0,
+            "256-B aligned for TensorRT"
+        );
+        eprintln!(
+            "convert_f32_pbo_cuda_map_roundtrip: PASS device_ptr={:p} len={} align256={}",
+            cm.device_ptr(),
+            cm.len(),
+            (cm.device_ptr() as usize).is_multiple_of(256)
+        );
+        // drop(cm) unmaps so a subsequent convert() could reuse the PBO
+    }
+
+    /// C7: verify that the device pointer from `cuda_map()` holds the correct
+    /// NHWC float data. Copies the device buffer back to host via `cudaMemcpy`
+    /// and checks each `[y,x,c]` element matches the normalized source value
+    /// `src[y,x,c] / 255.0` within 1e-3. Uses a 16×16 identity crop so the
+    /// expected values are exact (no bilinear rounding).
+    #[test]
+    fn convert_f32_pbo_cuda_map_numeric() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+        use std::ffi::c_void;
+
+        if !edgefirst_tensor::is_cuda_available() {
+            eprintln!("SKIP: no libcudart");
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: no GL");
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIP: no f32 render");
+            return;
+        }
+        let (w, h) = (16usize, 16usize);
+        // RGBA8 source with a known per-pixel gradient.
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        {
+            let mut m = src.as_u8().unwrap().map().unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    m[i] = ((x * 255) / w) as u8;
+                    m[i + 1] = ((y * 255) / h) as u8;
+                    m[i + 2] = 128;
+                    m[i + 3] = 255;
+                }
+            }
+        }
+        // F32 Rgb PBO destination — NHWC layout [H,W,3].
+        let mut dst = proc
+            .create_image(w, h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIP: dst not PBO");
+            return;
+        }
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+
+        let cm = match dst.cuda_map() {
+            Some(cm) => cm,
+            None => {
+                eprintln!(
+                    "SKIP: cuda_map returned None (CUDA-GL interop unavailable for this context)"
+                );
+                return;
+            }
+        };
+        let n = w * h * 3;
+        let mut host = vec![0f32; n];
+        // SAFETY: host has `n * 4` bytes allocated; device_ptr is valid for
+        // the lifetime of `cm` (cuda_map is still live here).
+        assert!(
+            unsafe {
+                edgefirst_tensor::memcpy_device_to_host(
+                    host.as_mut_ptr() as *mut c_void,
+                    cm.device_ptr() as *const c_void,
+                    n * std::mem::size_of::<f32>(),
+                )
+            },
+            "cudaMemcpy device->host failed"
+        );
+
+        // dst is NHWC [H,W,3] f32, normalized [0,1]: dst[(y*w+x)*3 + c] ≈ src_channel/255
+        let mut max_err = 0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let exp = [
+                    ((x * 255) / w) as f32 / 255.0,
+                    ((y * 255) / h) as f32 / 255.0,
+                    128.0 / 255.0,
+                ];
+                for c in 0..3 {
+                    let got = host[(y * w + x) * 3 + c];
+                    max_err = max_err.max((got - exp[c]).abs());
+                }
+            }
+        }
+        eprintln!("convert_f32_pbo_cuda_map_numeric: max_err={max_err}");
+        assert!(
+            max_err < 1e-3,
+            "device data does not match NHWC-normalized source (max_err={max_err})"
+        );
+        // drop(cm) unmaps
+    }
 }

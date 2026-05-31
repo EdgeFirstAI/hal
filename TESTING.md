@@ -616,6 +616,94 @@ for the full f16 benchmarking workflow.
 
 ---
 
+## CUDA Tensor Mapping
+
+This section covers how the CUDA zero-copy path (PBO → CUDA device pointer)
+is tested across the workspace. Per-crate detail lives in
+[`crates/tensor/TESTING.md § CUDA surface`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md#cuda-surface).
+
+### GPU-independent unit tests
+
+The CUDA surface can be fully exercised without a GPU or `libcudart`. The
+`crates/tensor` suite uses a mock `CudaGlOps` trait implementation that
+records calls to `register`, `map`, `unmap`, and `unregister` in-process:
+
+| Test | What it verifies |
+|------|------------------|
+| Mock `CudaGlOps` — map/unmap/unregister sequence | The RAII `CudaMap` guard calls `map` on construction and `unmap` on drop; `unregister` fires when the owning handle drops |
+| `Debug` impl on the handle types | No panics, no format-string UB |
+| Primitive degradation | `is_cuda_available()` returns `false` and `cuda_map()` returns `None` when `libcudart` is absent (mock the absent-library path via `OnceLock` override in test) |
+| ABI layout asserts | `sizeof` / `alignof` of the HAL's CUDA type wrappers match the layout defined in CUDA 12.6 `driver_types.h` (static assertions at compile time) |
+
+Run these on any host (no CUDA hardware required):
+
+```bash
+cargo test -p edgefirst-tensor -- --test-threads=1
+```
+
+### On-target validation
+
+Full-pipeline validation was performed on:
+
+| Platform | OS / CUDA / TensorRT | What was validated |
+|----------|----------------------|--------------------|
+| Jetson Orin-nano (O5/O6/O8) | L4T R36.4 / CUDA 12.6 / TRT 10.3 | DMA-import path, TRT `enqueue_v3`, GL-render→CUDA bridge; numeric max\_err 0.00024 vs CPU reference |
+| Desktop RTX 3090 | CUDA 12.6 | PBO→CUDA path (GL host + CUDA device) |
+
+To run the on-target CUDA tests manually:
+
+```bash
+# Cross-compile (GPU probe + tensor tests)
+cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
+  --workspace --exclude edgefirst_hal
+
+# Deploy and run on orin-nano
+scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \
+  jetson-orin-nano:/tmp/hal-tests/
+ssh jetson-orin-nano \
+  'EDGEFIRST_TESTDATA_DIR=/tmp/hal-tests/testdata \
+   /tmp/hal-tests/edgefirst_tensor-<hash> --test-threads=1'
+```
+
+CI does not run a CUDA-capable hardware runner today; the on-target results
+above serve as the validation baseline.
+
+### cuda\_map → host map fallback contract
+
+The contract `cuda_map()` returns `None` (not an error) when CUDA is
+unavailable is tested explicitly:
+
+```rust
+// In CI (no libcudart): this must return None, not panic.
+assert!(tensor.cuda_map().is_none());
+
+// The host fallback must always succeed:
+let host = tensor.map().expect("host map must work when CUDA map is None");
+```
+
+This ensures callers that use the recommended `cuda_map()`-then-`map()`
+fallback pattern work correctly on every platform, including the i.MX 8M Plus
+and macOS CI legs where CUDA is absent.
+
+### imx8mp coverage flush-guard (`edgefirst_tensor::covguard`)
+
+On the i.MX 8M Plus lane the Vivante EGL driver calls `abort()` during
+process shutdown. Under `cargo-llvm-cov` / `-Cinstrument-coverage`, an abort
+before the process writes its LLVM profile data loses all coverage for that
+run. The `covguard` module (compiled only under `-Cinstrument-coverage` via
+`cfg(coverage)`) installs a `SIGABRT` handler that:
+
+1. Calls `__llvm_profile_write_file()` to flush the in-memory coverage
+   counters to disk.
+2. Resets the signal to the default handler and re-raises `SIGABRT` so the
+   process still terminates with the correct signal and exit status.
+
+This is transparent to normal builds and test runs. Coverage-instrumented
+builds on the imx8mp CI runner pick it up automatically via the `cfg` gate;
+no action required from contributors.
+
+---
+
 ## Coverage Thresholds
 
 | Scope | Minimum threshold |
