@@ -682,3 +682,26 @@ def test_iosurface_unavailable_on_non_macos():
     import edgefirst_hal as hal
 
     assert hal.is_iosurface_available() is False
+
+
+def test_cuda_available_returns_bool():
+    """cuda_available() must be callable and return a bool (True or False)."""
+    import edgefirst_hal as hal
+
+    result = hal.cuda_available()
+    assert isinstance(result, bool)
+
+
+def test_cuda_map_falls_back_to_map():
+    """cuda_map() on a Mem tensor returns None; map() fallback still works."""
+    # Force a plain heap tensor so cuda_map() always returns None in CI
+    t = Tensor([4, 4], dtype="float32", mem=None)
+
+    cm = t.cuda_map()
+    # A Mem tensor has no CUDA handle registered — must return None
+    assert cm is None
+
+    # The CPU fallback path must still work
+    with t.map() as host:
+        # len(TensorMap) == total number of elements
+        assert len(host) == 16  # 4 * 4
