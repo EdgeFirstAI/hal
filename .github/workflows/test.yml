@@ -485,8 +485,16 @@ jobs:
           # Single-threaded is mandatory for the image crate (GL_MUTEX). The
           # float PBO roundtrips run here when the llvmpipe context comes up;
           # best-effort so a software-GL hiccup never fails CI.
+          #
+          # The `*_no_bleed_gl` crop tests assert tight per-pixel boundaries
+          # that depend on the GPU's exact texture-sampling/rounding; llvmpipe's
+          # software sampler differs slightly, so they fail here while passing
+          # on every real-GPU lane (macOS/ANGLE, V3D, Mali). Exclude them on
+          # this lane only — they remain covered by the GPU lanes — so a real
+          # regression here is not masked by known software-sampler noise.
           cargo llvm-cov nextest -p edgefirst-image --features default \
             --no-fail-fast -j 1 \
+            -E 'not test(~no_bleed_gl)' \
             --lcov --output-path target/coverage_rust.lcov \
             --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
             2>&1 | tee target/test-metrics-software-gl.txt || true
