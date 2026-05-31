@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
 //! Colorimetry C API - stable, V4L2-decoupled colorimetry representation.
