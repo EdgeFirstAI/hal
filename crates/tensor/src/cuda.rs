@@ -412,6 +412,24 @@ mod tests {
         }
         // total + non-panicking either way
     }
+
+    #[test]
+    fn pub_primitives_degrade_without_libcudart() {
+        // On hosts without libcudart (all CI coverage lanes), the public CUDA
+        // primitives must degrade cleanly — None / false / no-op, never panic.
+        // Skip on a CUDA host, where these would touch the real driver without
+        // a current GL context.
+        if cuda_available() {
+            return;
+        }
+        assert!(gl_register_buffer(0).is_none());
+        assert!(gl_map_resource(0).is_none());
+        gl_unmap_resource(0); // no-op without a table — must not panic
+        gl_unregister_resource(0); // no-op without a table — must not panic
+                                   // SAFETY: with no libcudart, memcpy_device_to_host returns false before
+                                   // touching the pointers, so null/zero args are sound here.
+        assert!(!unsafe { memcpy_device_to_host(std::ptr::null_mut(), std::ptr::null(), 0) });
+    }
 }
 
 #[cfg(test)]
@@ -468,6 +486,24 @@ mod handle_tests {
             unregisters.load(Ordering::SeqCst),
             1,
             "Dropping a GlBuffer handle must unregister"
+        );
+    }
+
+    /// A GlBuffer handle whose ops.map() fails yields None from CudaHandle::map.
+    struct NoneOps;
+    impl CudaGlOps for NoneOps {
+        fn map(&self, _r: GraphicsResource) -> Option<(*mut std::ffi::c_void, usize)> {
+            None
+        }
+        fn unmap(&self, _r: GraphicsResource) {}
+        fn unregister(&self, _r: GraphicsResource) {}
+    }
+    #[test]
+    fn glbuffer_map_returns_none_when_ops_map_fails() {
+        let h = CudaHandle::new_gl(0x9usize as GraphicsResource, 4096, Arc::new(NoneOps));
+        assert!(
+            h.map().is_none(),
+            "GlBuffer map propagates ops.map() failure"
         );
     }
 
