@@ -77,12 +77,14 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0 - rms
 
 
-# JPEG sources now decode to native NV12, so the benchmark sources go through a
-# BT.709 limited-range NV12->RGB(A) conversion before resize/rotate. That
-# differs slightly from PIL's direct JPEG RGB decode used to build references,
-# so JPEG-sourced comparisons use a looser similarity threshold than the YUYV
-# paths (which still compare at 0.98).
-JPEG_NV12_RMS = 0.95
+# JPEG sources decode to native NV12, then convert() does a BT.601 full-range
+# (JFIF) NV12->RGB(A) conversion before resize/rotate. That colorimetry now
+# matches PIL's direct JPEG RGB decode used to build references; the only
+# residual difference is the codec's 4:2:0 chroma downsampling, so these
+# comparisons hold the same 0.98 threshold as the YUYV paths.
+# (The HAL currently hardcodes BT.601 full-range for all YUV as an interim
+# stop-gap; see crates/image/ARCHITECTURE.md "Colorimetry".)
+JPEG_NV12_RMS = 0.98
 
 
 original_env = os.environ.copy()

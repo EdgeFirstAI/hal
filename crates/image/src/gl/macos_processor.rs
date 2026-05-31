@@ -11,7 +11,8 @@
 //! instead of through a dedicated thread + command channel.
 //!
 //! Format coverage in this initial implementation:
-//!   * YUYV → RGBA — full shader-based BT.709 limited-range conversion
+//!   * YUYV → RGBA — full shader-based BT.601 full-range conversion (interim
+//!     colorimetry stop-gap; see crates/image/ARCHITECTURE.md "Colorimetry")
 //!
 //! Other format pairs and the mask-rendering / decoder paths return
 //! `NotImplemented` and fall back to the CPU backend, matching the
@@ -75,7 +76,7 @@ const EGL_BACK_BUFFER: i32 = 0x3084;
 // Shaders. YUYV-as-GL_RG sampling: each source texel is (Y, C) where C
 // alternates U/V every other column. We sample the current and partner
 // texel to recover both chroma values for each output pixel, then apply
-// the BT.709 limited-range matrix.
+// the BT.601 full-range matrix (interim colorimetry stop-gap).
 //
 // The shader matches the spike at `spikes/angle_iosurface/`. Bit-near-
 // exact (≤1 LSB) match to the CPU scalar reference was validated there.
@@ -113,12 +114,16 @@ void main() {
     if (even) { u = self_rg.g; v = pair_rg.g; }
     else      { v = self_rg.g; u = pair_rg.g; }
 
-    float yp = (y * 255.0 - 16.0) * (1.164 / 255.0);
+    // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
+    // "Colorimetry"): BT.601 full-range (JFIF) to match the codec and the Linux
+    // backends until per-source colorimetry tagging lands. Full range → luma is
+    // used directly (no 16/235 expansion); BT.601 coefficients.
+    float yp = y;
     float up = u - 128.0/255.0;
     float vp = v - 128.0/255.0;
-    float r = clamp(yp + 1.793 * vp, 0.0, 1.0);
-    float g = clamp(yp - 0.213 * up - 0.533 * vp, 0.0, 1.0);
-    float b = clamp(yp + 2.112 * up, 0.0, 1.0);
+    float r = clamp(yp + 1.402 * vp, 0.0, 1.0);
+    float g = clamp(yp - 0.344 * up - 0.714 * vp, 0.0, 1.0);
+    float b = clamp(yp + 1.772 * up, 0.0, 1.0);
     frag = vec4(r, g, b, 1.0);
 }
 "#;

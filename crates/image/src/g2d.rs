@@ -40,7 +40,13 @@ impl G2DProcessor {
     /// Creates a new G2DConverter instance.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
-        g2d.set_bt709_colorspace()?;
+        // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
+        // "Colorimetry"): hardcode BT.601 to match the codec/JFIF and the other
+        // backends until per-source colorimetry tagging lands. NOTE: the g2d-sys
+        // API selects only the matrix, not full vs limited range, so G2D cannot
+        // currently express full-range — a residual limitation to revisit with
+        // the proper colorimetry implementation.
+        g2d.set_bt601_colorspace()?;
 
         log::debug!("G2DConverter created with version {:?}", g2d.version());
         Ok(Self { g2d })

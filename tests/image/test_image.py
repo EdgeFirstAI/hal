@@ -69,10 +69,11 @@ def test_flip():
     expected = load_image("testdata/zidane.jpg", "RGB")
     expected = expected[:, ::-1, :]
 
-    # Threshold 0.95: decode now produces native NV12 and convert applies a
-    # BT.709 limited-range YUV->RGB transform, which differs slightly from
-    # PIL's direct JPEG RGB decode used to build the reference.
-    assert calculate_similarity_rms_u8(n, expected) > 0.95
+    # Decode produces native NV12; convert() applies a BT.601 full-range (JFIF)
+    # YUV->RGB transform that matches PIL's direct JPEG RGB decode used to build
+    # the reference. Only the codec's 4:2:0 chroma downsampling differs, so 0.98
+    # holds. (Interim 601-full hardcode; see crates/image/ARCHITECTURE.md.)
+    assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
 def test_grey_load():

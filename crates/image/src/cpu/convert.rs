@@ -10,19 +10,21 @@ use std::ops::Shr;
 
 use super::CPUProcessor;
 
+// INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md "Colorimetry").
+// The HAL currently hardcodes BT.601 **full-range** for all YUV. Under that
+// assumption the luma plane and a Grey image share the same full 0..=255 range,
+// so the limited↔full luma remap is the identity. These helpers are kept as
+// no-ops (rather than deleting the ~9 call sites) so the proper per-source
+// colorimetry work on the `feature/colorimetry` branch can restore real range
+// handling in one place. When that lands, these become real conversions again.
 #[inline(always)]
 pub(super) fn limit_to_full(l: u8) -> u8 {
-    // Expand limited-range luma (16..=240) to full-range (0..=255). Real
-    // decoded YUV (e.g. JPEG → NV12) can carry luma below 16 or above 240, so
-    // clamp into the valid limited range first to avoid u16 underflow on the
-    // `l - 16` term (and keep the result within 0..=255).
-    let l = (l as u16).clamp(16, 240);
-    (((l - 16) * 255 + (240 - 16) / 2) / (240 - 16)) as u8
+    l
 }
 
 #[inline(always)]
 pub(super) fn full_to_limit(l: u8) -> u8 {
-    ((l as u16 * (240 - 16) + 255 / 2) / 255 + 16) as u8
+    l
 }
 
 impl CPUProcessor {
@@ -62,8 +64,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -106,8 +108,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -154,8 +156,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             dst_w as u32 * 3,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -174,8 +176,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -260,8 +262,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             dst_w as u32 * 3,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -280,8 +282,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -370,7 +372,7 @@ impl CPUProcessor {
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -389,7 +391,7 @@ impl CPUProcessor {
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -497,7 +499,7 @@ impl CPUProcessor {
             src.map()?.as_slice(),
             src_rs as u32,
             yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -559,23 +561,25 @@ impl CPUProcessor {
         let mut dst = dst.map()?;
         let dst = dst.as_mut_slice();
 
-        // compute quantized Bt.709 limited range RGB to YUV matrix
-        const KR: f64 = 0.2126f64;
-        const KB: f64 = 0.0722f64;
+        // Quantized BT.601 FULL-range RGB->YUV matrix (interim colorimetry
+        // stop-gap; see crates/image/ARCHITECTURE.md "Colorimetry"). Full range:
+        // 255 scale and no +16 luma offset; chroma stays centred at 128.
+        const KR: f64 = 0.299f64;
+        const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;
         const BIAS: i32 = 20;
 
-        const Y_R: i32 = (KR * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (219 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
 
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
+        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
 
-        const V_R: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
+        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
+        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
         const ROUND: i32 = 1 << (BIAS - 1);
         const ROUND2: i32 = 1 << BIAS;
         let process_rgba_to_yuyv = |s: &[u8; 8], d: &mut [u8; 4]| {
@@ -586,11 +590,11 @@ impl CPUProcessor {
             let r1 = r1 as i32;
             let g1 = g1 as i32;
             let b1 = b1 as i32;
-            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS) + 16) as u8;
+            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS)) as u8;
             d[1] = ((U_R * r0 + U_G * g0 + U_B * b0 + U_R * r1 + U_G * g1 + U_B * b1 + ROUND2)
                 .shr(BIAS + 1)
                 + 128) as u8;
-            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS) + 16) as u8;
+            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS)) as u8;
             d[3] = ((V_R * r0 + V_G * g0 + V_B * b0 + V_R * r1 + V_G * g1 + V_B * b1 + ROUND2)
                 .shr(BIAS + 1)
                 + 128) as u8;
@@ -640,8 +644,8 @@ impl CPUProcessor {
             &mut bi_planar_image,
             src.map()?.as_slice(),
             src_rs as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -675,7 +679,7 @@ impl CPUProcessor {
             src.map()?.as_slice(),
             src_rs as u32,
             yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvStandardMatrix::Bt601,
         )?)
     }
 
@@ -742,20 +746,21 @@ impl CPUProcessor {
 
         // compute quantized Bt.709 limited range RGB to YUV matrix
         const BIAS: i32 = 20;
-        const KR: f64 = 0.2126f64;
-        const KB: f64 = 0.0722f64;
+        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
+        const KR: f64 = 0.299f64;
+        const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;
-        const Y_R: i32 = (KR * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (219 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
 
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
+        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
 
-        const V_R: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
+        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
+        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
         const ROUND: i32 = 1 << (BIAS - 1);
         const ROUND2: i32 = 1 << BIAS;
         let process_rgb_to_yuyv = |s: &[u8; 6], d: &mut [u8; 4]| {
@@ -766,11 +771,11 @@ impl CPUProcessor {
             let r1 = r1 as i32;
             let g1 = g1 as i32;
             let b1 = b1 as i32;
-            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS) + 16) as u8;
+            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS)) as u8;
             d[1] = ((U_R * r0 + U_G * g0 + U_B * b0 + U_R * r1 + U_G * g1 + U_B * b1 + ROUND2)
                 .shr(BIAS + 1)
                 + 128) as u8;
-            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS) + 16) as u8;
+            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS)) as u8;
             d[3] = ((V_R * r0 + V_G * g0 + V_B * b0 + V_R * r1 + V_G * g1 + V_B * b1 + ROUND2)
                 .shr(BIAS + 1)
                 + 128) as u8;
@@ -819,8 +824,8 @@ impl CPUProcessor {
             &mut bi_planar_image,
             src.map()?.as_slice(),
             src_rs as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -875,8 +880,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -916,8 +921,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt709,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -1027,8 +1032,9 @@ impl CPUProcessor {
 
     pub(super) fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
         const BIAS: i32 = 20;
-        const KR: f64 = 0.2126f64;
-        const KB: f64 = 0.0722f64;
+        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
+        const KR: f64 = 0.299f64;
+        const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;
         const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
         const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
@@ -1042,29 +1048,31 @@ impl CPUProcessor {
     }
 
     pub(super) fn rgba_to_yuyv(rgba: [u8; 4]) -> [u8; 4] {
-        const KR: f64 = 0.2126f64;
-        const KB: f64 = 0.0722f64;
+        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
+        const KR: f64 = 0.299f64;
+        const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;
         const BIAS: i32 = 20;
 
-        const Y_R: i32 = (KR * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (219 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (219 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
 
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
+        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
 
-        const V_R: i32 = (0.5_f64 * (224 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (224 << BIAS) as f64 / 255.0).round() as i32;
+        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
+        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
+        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
         const ROUND: i32 = 1 << (BIAS - 1);
 
         let [r, g, b, _] = rgba;
         let r = r as i32;
         let g = g as i32;
         let b = b as i32;
-        let y = (((Y_R * r + Y_G * g + Y_B * b + ROUND) >> BIAS) + 16) as u8;
+        // Full-range BT.601: no +16 luma offset; chroma still centred at 128.
+        let y = ((Y_R * r + Y_G * g + Y_B * b + ROUND) >> BIAS) as u8;
         let u = (((U_R * r + U_G * g + U_B * b + ROUND) >> BIAS) + 128) as u8;
         let v = (((V_R * r + V_G * g + V_B * b + ROUND) >> BIAS) + 128) as u8;
 
