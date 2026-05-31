@@ -3620,11 +3620,9 @@ mod cpu_tests {
         // NV12 2x2 = 4 Y-plane bytes + 2 UV-plane bytes = 6 total.
         let bytes = [180u8, 180, 180, 180, 200, 40];
         let convert = |cm: Option<Colorimetry>| {
-            let mut src =
-                load_bytes_to_tensor(2, 2, PixelFormat::Nv12, None, &bytes).unwrap();
+            let mut src = load_bytes_to_tensor(2, 2, PixelFormat::Nv12, None, &bytes).unwrap();
             src.set_colorimetry(cm);
-            let mut dst =
-                TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
             CPUProcessor::default()
                 .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
                 .unwrap();
