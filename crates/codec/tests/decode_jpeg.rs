@@ -355,6 +355,15 @@ fn unsupported_progressive_jpeg_returns_typed_variant() {
 }
 
 #[test]
+fn jpeg_decode_tags_jfif_colorimetry() {
+    use edgefirst_tensor::Colorimetry;
+    let mut t = Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut d = ImageDecoder::new();
+    t.load_image(&mut d, &testdata("zidane.jpg")).unwrap();
+    assert_eq!(t.colorimetry(), Some(Colorimetry::jfif()));
+}
+
+#[test]
 fn partial_mcu_at_image_edge_decodes_full_width() {
     // jaguar.jpg is 789×384 — odd width, so NV12 is rejected. Instead verify
     // peek_info reports the true dims and that the odd-width NV12 decode is

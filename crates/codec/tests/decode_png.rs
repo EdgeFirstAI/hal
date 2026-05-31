@@ -8,6 +8,8 @@
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
+// colorimetry types used in the new test below
+use edgefirst_tensor::{ColorRange, ColorSpace};
 
 fn testdata(name: &str) -> Vec<u8> {
     let root = std::env::var("EDGEFIRST_TESTDATA_DIR")
@@ -177,4 +179,16 @@ fn decode_png_i8_xor_consistency() {
             u8_pixels[i], i8_pixels[i], expected
         );
     }
+}
+
+#[test]
+fn png_decode_tags_native_colorimetry() {
+    // RGB/RGBA PNG → sRGB primaries+transfer, Full range, encoding None.
+    let mut t = Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut d = ImageDecoder::new();
+    t.load_image(&mut d, &testdata("zidane.png")).unwrap();
+    let c = t.colorimetry().expect("colorimetry set");
+    assert_eq!(c.space, Some(ColorSpace::Srgb));
+    assert_eq!(c.range, Some(ColorRange::Full));
+    assert_eq!(c.encoding, None); // RGB carries no YCbCr matrix
 }

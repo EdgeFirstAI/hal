@@ -178,6 +178,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             Ok(Some(mut info)) => {
                 info.rotation_degrees = rotation_degrees;
                 info.flip_horizontal = flip_horizontal;
+                dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
                 return Ok(info);
             }
             Ok(None) => {}
@@ -205,6 +206,8 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
         mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
     }
+
+    dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
 
     Ok(ImageInfo {
         width: img_w,
