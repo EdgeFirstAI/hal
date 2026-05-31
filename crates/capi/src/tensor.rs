@@ -779,6 +779,9 @@ pub unsafe extern "C" fn hal_tensor_cuda_device_ptr(
     out_size: *mut libc::size_t,
 ) -> *mut std::ffi::c_void {
     if map.is_null() {
+        if !out_size.is_null() {
+            unsafe { *out_size = 0 };
+        }
         return std::ptr::null_mut();
     }
     let m = unsafe { &*(map as *const edgefirst_tensor::CudaMap<'static>) };
