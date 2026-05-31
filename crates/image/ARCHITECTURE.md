@@ -836,13 +836,7 @@ image.materialize_masks                                 [user-facing fn]
 
 ## Colorimetry
 
-> **Status:** investigation + design. This section documents the YCbCr↔RGB
-> colorimetry problem, what each source actually emits across our target SoCs,
-> the current (incorrect-but-uniform) behaviour, and the proposed HAL design.
-> The proper per-source implementation is tracked on the `feature/colorimetry`
-> branch. An interim stop-gap — hardcoding **BT.601 full-range** everywhere —
-> ships on the `feature/v4l2-jpeg-decoder` branch (see *Current state* below);
-> the design here supersedes it.
+> **Status:** implemented.
 
 ### The three-axis problem
 
@@ -861,23 +855,6 @@ independent properties, and a mismatch on any of them corrupts the result:
 
 So the HAL's conversion correctness reduces to picking the right **(matrix,
 range)** pair for each source buffer.
-
-### Current state (uniform BT.709 limited — wrong for most of our sources)
-
-All three `convert()` backends hardcode **BT.709, limited-range** for every YUV
-format, and there is **no colorimetry metadata** anywhere to tell them otherwise
-(a tensor carries only `PixelFormat`; `import_image(...)` and `convert(...)` take
-no colorimetry argument):
-
-| Backend | YUV→RGB matrix/range | Luma/grey |
-|---------|----------------------|-----------|
-| CPU (`cpu/convert.rs`) | `YuvRange::Limited` + `Bt709` | `limit_to_full()` (assumes *limited* luma) |
-| GL (`gl/dma_import.rs`) | `ITU_REC709` + `YUV_NARROW_RANGE` | same hint |
-| G2D (`g2d.rs`) | `set_bt709_colorspace()` | same |
-
-The codec, however, emits JPEG as **BT.601 full-range (JFIF)** — so a decoded
-NV12 converted today is doubly wrong (601≠709 matrix, full≠limited range). That
-mismatch is the original motivation for this work.
 
 ### Per-source findings (what each producer actually emits)
 
@@ -898,51 +875,71 @@ Cross-cutting truths:
   carried, not inferred.
 - **Camera is BT.601 matrix** (709 only on the Pi5 HD-YUV path); **range varies**
   and is signalled by the producer (V4L2 `quantization` / libcamera `ColorSpace`).
-- **Producers signal it; the HAL just isn't carrying it** — V4L2 (`ycbcr_enc` +
-  `quantization`), libcamera (`ColorSpace`), bitstream VUI, and NvBufSurface all
-  expose matrix+range. NVIDIA bakes it into the format enum; V4L2/libcamera keep
-  it in separate fields (the model we should mirror).
+- **Producers signal it** — V4L2 (`ycbcr_enc` + `quantization`), libcamera
+  (`ColorSpace`), bitstream VUI, and NvBufSurface all expose matrix+range. NVIDIA
+  bakes it into the format enum; V4L2/libcamera keep it in separate fields (the
+  model the HAL mirrors).
 
-### Proposed design (per-source colorimetry on the tensor)
+### Implementation
 
-The fix is to carry colorimetry with the buffer and let `convert()` honour it,
-instead of any global guess:
+#### `Colorimetry` type on the tensor
 
-1. **Tensor metadata.** Add an optional `Colorimetry { matrix: Bt601 | Bt709 |
-   Bt2020, range: Full | Limited }` to the tensor (alongside `PixelFormat`).
-   `None`/unset means "unknown — apply the fallback heuristic".
-2. **Producers tag it:**
-   - Codec JPEG decode → `Bt601 + Full` (high confidence).
-   - `import_image(...)` gains a colorimetry argument the caller fills from the
-     producer's signalling (libcamera `ColorSpace`, V4L2 `ycbcr_enc` +
-     `quantization`, bitstream VUI, or NvBufSurface color-format suffix).
-3. **`convert()` consumes it** per backend, replacing the hardcoded 709/limited:
-   - CPU: pass the matching `yuv::YuvStandardMatrix` + `yuv::YuvRange` (the `yuv`
-     crate already supports Bt601/709/2020 × Full/Limited).
-   - GL: choose `ITU_REC601`/`ITU_REC709` + `YUV_FULL_RANGE`/`YUV_NARROW_RANGE`
-     EGL hints per buffer instead of the global `is_yuv` default.
-   - G2D: `set_bt601_colorspace()` / `set_bt709_colorspace()` per conversion.
-     **Caveat:** the `g2d-sys` API selects only the *matrix*; full/limited range
-     control may not be exposed — verify, and document the residual limitation if
-     G2D cannot express full-range.
-4. **Fallback when untagged** = the industry convention: **SD (≤576/720 lines) →
-   BT.601, HD → BT.709, limited range** — with an explicit override hook.
+`edgefirst_tensor::Colorimetry` is a four-axis struct — `{ space, transfer,
+encoding, range }` — where every axis is `Option<_>` (`None` = unknown/unset).
+The enums (`ColorSpace`, `ColorTransfer`, `ColorEncoding`, `ColorRange`) are
+videostream-aligned and `#[non_exhaustive]`. Tensors and `TensorDyn` carry an
+`Option<Colorimetry>`. `None` means undefined; it is **never auto-filled** by the
+tensor layer — that invariant is strict.
 
-### Open questions / needs on-target measurement
+Helper constructors:
+- `Colorimetry::jfif()` — sRGB primaries + sRGB transfer + BT.601 encoding +
+  full range (standard JPEG/JFIF).
+- `Colorimetry::from_v4l2(colorspace, ycbcr_enc, quantization)` — converts V4L2
+  kernel constants to the HAL's decoupled enum values.
 
-Docs and silicon disagree exactly where it matters; confirm empirically per board
-before locking the implementation:
-- i.MX camera **range** (full vs limited) — driver default says limited, real
-  sensors often emit full (`colorspace:jpeg`). Measure the live `quantization`.
-- Whether each video decoder honours VUI or silently allocates 601.
-- Orin: whether the NVDEC surface enum faithfully reflects 709 content.
-- G2D full-range expressibility.
+#### Producers
 
-Measurement approach: (a) record each source's *declared* colorimetry
-(`v4l2-ctl --get-fmt-video` + `media-ctl -p`; libcamera `ColorSpace`; GStreamer
-`colorimetry` caps / NvBufSurface `colorFormat`); (b) push a known test pattern
-through each source and pick the (matrix, range) hypothesis whose RGB matches
-ground truth — catching the "tag says 601 but content is 709" case.
+| Producer | Colorimetry set |
+|----------|-----------------|
+| Codec JPEG decode (CPU + V4L2 HW) | `Colorimetry::jfif()` — BT.601 full-range, always |
+| PNG decode (`Rgb`/`Rgba`) | sRGB primaries + sRGB transfer + full range |
+| PNG decode (`Grey`) | full range only |
+| `ImageProcessor::import_image(..., colorimetry)` | caller-supplied; client adaptors fill it from the producer's signalling (V4L2 `ycbcr_enc`/`quantization`, libcamera `ColorSpace`, bitstream VUI, NvBufSurface format suffix) |
+
+Native Mac/Windows capture does not yet exist in the HAL; all camera/stream
+sources go through `import_image` on client adaptors until those paths land.
+
+#### `convert()` and the `effective_colorimetry` resolver
+
+`convert()` never mutates the source tensor. Instead it calls a pure
+`effective_colorimetry()` function at use-time that fills only the axes that are
+`None` on the tensor, using a height heuristic:
+
+- **Height ≥ 720 → BT.709, limited range** (HD convention)
+- **Height < 720 → BT.601, limited range** (SD convention)
+
+Per-axis: a tensor's explicitly set axes win; only the missing axes get the
+heuristic value. The resolved colorimetry is consumed by the backend for that
+single call and discarded.
+
+#### Backend colorimetry support
+
+| Backend | Matrix | Range | Notes |
+|---------|--------|-------|-------|
+| CPU (`cpu/convert.rs`) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — passes resolved matrix + range to the `yuv` crate |
+| GL (`gl/dma_import.rs` / macOS shader) | BT.601 / BT.709 | Full / Limited | Fully correct — selects `ITU_REC601`/`ITU_REC709` + `YUV_FULL_RANGE`/`YUV_NARROW_RANGE` EGL hints per buffer |
+| G2D (`g2d.rs`) | BT.601 / BT.709 | — | **Limitation:** `g2d-sys` exposes only `set_bt601_colorspace()` / `set_bt709_colorspace()` (matrix only). Full-range and BT.2020 YUV cannot be expressed. G2D **declines** full-range or BT.2020 YUV conversions; the dispatch falls through to GL or CPU. |
+
+#### C and Python surfaces
+
+| Layer | API |
+|-------|-----|
+| C | `hal_colorimetry` struct (4 `int` axes, 0 = unknown; values are stable HAL constants, decoupled from V4L2); `hal_tensor_set_colorimetry` / `hal_tensor_colorimetry`; `hal_colorimetry_from_v4l2`; `hal_import_image` colorimetry parameter |
+| Python | `Colorimetry` class + enum constants; `tensor.colorimetry` property; `import_image(colorimetry=...)` |
+
+Client adaptors (GStreamer elements, libcamera pipelines, etc.) use the C or
+Python surface to supply colorimetry from the producer's signalling into
+`import_image`, so `convert()` receives an accurately tagged tensor.
 
 ### Sources
 
