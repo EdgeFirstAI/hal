@@ -54,6 +54,11 @@ fn load_image_bench(
     match format {
         Some(f) if f != native_fmt => {
             let mut dst = TensorDyn::image(w, h, f, DType::U8, memory)?;
+            // `..Default::default()` is a real update on Linux (extra GL/G2D
+            // fields) but covers no remaining fields on macOS where `backend`
+            // is the only field — allow needless_update for cross-platform
+            // parity (matches sanity_check.rs and load_image_test_helper).
+            #[allow(clippy::needless_update)]
             let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
                 backend: ComputeBackend::Cpu,
                 ..Default::default()
