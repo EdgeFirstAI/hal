@@ -422,11 +422,17 @@ static void test_tensor_decode_image_jpeg(void) {
     // Decode into the pre-allocated tensor. The decoder emits the native
     // format (NV12 for a colour JPEG) and configures the tensor accordingly.
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image(tensor, data, (size_t)fsize, &width, &height);
+    uint16_t rotation = 0xFFFF;
+    bool flip = true;
+    int ret = hal_tensor_decode_image(tensor, data, (size_t)fsize, &width, &height,
+                                      &rotation, &flip);
     ASSERT_EQ(0, ret);
     ASSERT_EQ(1280, (int)width);
     ASSERT_EQ(720, (int)height);
     ASSERT_EQ(HAL_PIXEL_FORMAT_NV12, hal_tensor_pixel_format(tensor));
+    // zidane.jpg carries no EXIF orientation → identity transform reported.
+    ASSERT_EQ(0, (int)rotation);
+    ASSERT_EQ(0, (int)flip);
 
     free(data);
     hal_tensor_free(tensor);
@@ -449,7 +455,9 @@ static void test_tensor_decode_image_file_jpeg(void) {
     }
 
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height);
+    uint16_t rotation = 0xFFFF;
+    bool flip = true;
+    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height, &rotation, &flip);
     if (ret != 0) {
         // File might not exist in test environment
         hal_tensor_free(tensor);
@@ -461,6 +469,8 @@ static void test_tensor_decode_image_file_jpeg(void) {
     ASSERT_EQ(1280, (int)width);
     ASSERT_EQ(720, (int)height);
     ASSERT_EQ(HAL_PIXEL_FORMAT_NV12, hal_tensor_pixel_format(tensor));
+    ASSERT_EQ(0, (int)rotation);
+    ASSERT_EQ(0, (int)flip);
 
     // Consumers that need RGBA convert the native result themselves.
     struct hal_image_processor* proc = hal_image_processor_new();
@@ -495,7 +505,7 @@ static void test_tensor_decode_image_native_format(void) {
     }
 
     size_t width = 0, height = 0;
-    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height);
+    int ret = hal_tensor_decode_image_file(tensor, path, &width, &height, NULL, NULL);
     if (ret != 0) {
         hal_tensor_free(tensor);
         fprintf(stderr, "    SKIP: testdata/zidane.jpg not found or decode failed\n");
@@ -511,21 +521,87 @@ static void test_tensor_decode_image_native_format(void) {
     TEST_PASS();
 }
 
+// Resolve an EXIF-oriented test JPEG (zidane_exif_<tag>.jpg) from either the
+// repo root or the crate-relative testdata directory. Returns NULL if absent.
+static const char* test_image_exif_jpeg_path(const char* name) {
+    static char buf[256];
+    snprintf(buf, sizeof(buf), "testdata/%s", name);
+    if (access(buf, R_OK) == 0) {
+        return buf;
+    }
+    snprintf(buf, sizeof(buf), "../../../testdata/%s", name);
+    if (access(buf, R_OK) == 0) {
+        return buf;
+    }
+    return NULL;
+}
+
+// The decoder reports EXIF orientation in the out-params but never rotates the
+// pixels: dimensions stay at the source's native (unrotated) 1280x720, and the
+// reported (rotation, flip) is the transform the caller should apply.
+static void test_tensor_decode_image_exif_orientation(void) {
+    TEST("tensor_decode_image_exif_orientation");
+
+    // EXIF tag 3 → 180° clockwise, no flip; tag 2 → 0°, horizontal flip.
+    // (See crates/codec/src/exif.rs for the full tag→transform mapping.)
+    struct {
+        const char* name;
+        int rotation;
+        int flip;
+    } cases[] = {
+        {"zidane_exif_3.jpg", 180, 0},
+        {"zidane_exif_2.jpg", 0, 1},
+    };
+
+    int checked = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char* path = test_image_exif_jpeg_path(cases[i].name);
+        if (!path) {
+            continue;
+        }
+        struct hal_tensor* tensor = hal_tensor_new_image(
+            1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+        ASSERT_NOT_NULL(tensor);
+
+        size_t width = 0, height = 0;
+        uint16_t rotation = 0xFFFF;
+        bool flip = !cases[i].flip;
+        int ret = hal_tensor_decode_image_file(tensor, path, &width, &height,
+                                               &rotation, &flip);
+        ASSERT_EQ(0, ret);
+        // Codec never rotates → native dimensions regardless of orientation.
+        ASSERT_EQ(1280, (int)width);
+        ASSERT_EQ(720, (int)height);
+        ASSERT_EQ(cases[i].rotation, (int)rotation);
+        ASSERT_EQ(cases[i].flip, (int)flip);
+
+        hal_tensor_free(tensor);
+        checked++;
+    }
+
+    if (checked == 0) {
+        fprintf(stderr, "    SKIP: no testdata/zidane_exif_*.jpg found\n");
+        tests_run--;
+        return;
+    }
+    TEST_PASS();
+}
+
 static void test_tensor_decode_image_null_handling(void) {
     TEST("tensor_decode_image_null_handling");
 
     // NULL tensor
-    int ret = hal_tensor_decode_image(NULL, (const uint8_t*)"data", 4, NULL, NULL);
+    int ret = hal_tensor_decode_image(NULL, (const uint8_t*)"data", 4, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     // NULL data
     struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
-    ret = hal_tensor_decode_image(tensor, NULL, 100, NULL, NULL);
+    ret = hal_tensor_decode_image(tensor, NULL, 100, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     // Zero length
-    ret = hal_tensor_decode_image(tensor, (const uint8_t*)"data", 0, NULL, NULL);
+    ret = hal_tensor_decode_image(tensor, (const uint8_t*)"data", 0, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     hal_tensor_free(tensor);
@@ -535,12 +611,12 @@ static void test_tensor_decode_image_null_handling(void) {
 static void test_tensor_decode_image_file_null_handling(void) {
     TEST("tensor_decode_image_file_null_handling");
 
-    int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", NULL, NULL);
+    int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
     ASSERT_NOT_NULL(tensor);
-    ret = hal_tensor_decode_image_file(tensor, NULL, NULL, NULL);
+    ret = hal_tensor_decode_image_file(tensor, NULL, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
     hal_tensor_free(tensor);
@@ -584,6 +660,7 @@ void run_image_tests(void) {
     test_tensor_decode_image_jpeg();
     test_tensor_decode_image_file_jpeg();
     test_tensor_decode_image_native_format();
+    test_tensor_decode_image_exif_orientation();
     test_tensor_decode_image_null_handling();
     test_tensor_decode_image_file_null_handling();
 }

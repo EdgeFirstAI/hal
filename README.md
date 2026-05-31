@@ -71,14 +71,22 @@ so a single `edgefirst-hal = "0.22"` dependency is enough — no need to
 list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
 
 ```rust
-use edgefirst_hal::image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_hal::image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_hal::image::codec::{ImageDecoder, ImageLoad};
 use edgefirst_hal::tensor::{PixelFormat, DType};
 
 let bytes = std::fs::read("image.jpg")?;
-let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
 let mut processor = ImageProcessor::new()?;
+let mut decoder = ImageDecoder::new();
+
+// JPEG decodes to its native NV12 (colour); decode into an NV12 source tensor.
+let mut input = processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None)?;
+let info = input.load_image(&mut decoder, &bytes)?;
+
+// convert() handles NV12 -> RGB, resize, and any EXIF rotation the decode reported.
 let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
-processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
+processor.convert(&input, &mut output, Rotation::None, Flip::None,
+    Crop::new(0, 0, info.width, info.height))?;
 ```
 
 If you prefer to depend on the sub-crates directly (e.g. to opt out of

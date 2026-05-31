@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- V4L2 hardware JPEG decode backend (`edgefirst-codec`, Linux, default-on
+  `v4l2` feature). Capability-based probe drives any device exposing a JPEG
+  decoder through the standard V4L2 mem2mem API (lead target i.MX `mxc-jpeg`),
+  emitting the codec's native `NV12`/`GREY`. It is tried **before** the
+  software decoder and falls back transparently when no device is present, the
+  capture format is unsupported, or a per-image hardware failure occurs; a
+  circuit breaker demotes a repeatedly-failing device to CPU. A persistent
+  streaming session is kept across frames, and DMA-backed tensors with
+  MCU(16)-aligned dimensions get a zero-copy path (the hardware decodes straight
+  into the tensor's dmabuf). Env vars: `EDGEFIRST_DISABLE_V4L2=1` to force CPU,
+  `EDGEFIRST_CODEC_V4L2_DEVICE=<node>` to probe a specific device.
+- `Tensor::configure_image()` / `Tensor::image_with_capacity()` /
+  `capacity_bytes()` / `set_logical_shape()` and `TensorDyn::configure_image()`
+  (`edgefirst-tensor`): capacity-aware reconfiguration of an existing allocation
+  to a decoded image's dimensions and pixel format, erroring with
+  `InsufficientCapacity` when the image exceeds the allocation.
+- EXIF orientation reporting in `ImageInfo` (`rotation_degrees`,
+  `flip_horizontal`) for both JPEG and PNG, plus `peek_info()` to read it
+  without decoding pixels.
+- C decode API EXIF out-params: `hal_tensor_decode_image()` and
+  `hal_tensor_decode_image_file()` gained `out_rotation_degrees` /
+  `out_flip_horizontal` (both accept `NULL`).
+
+### Changed
+
+- **Breaking:** `edgefirst-codec` now decodes to the image's native format only
+  — JPEG → `Nv12` (colour) / `Grey` (greyscale), PNG → `Rgb`/`Rgba`/`Grey`. The
+  decoder configures the destination tensor's dimensions and format to match and
+  never colour-converts, resizes, or rotates. Use `ImageProcessor::convert()`
+  for `Rgb`/`Rgba`/`Bgra`, resize, and applying the reported EXIF orientation.
+  JPEG decodes to `u8` only (non-`u8` destinations return `UnsupportedDtype`).
+- **Breaking:** EXIF orientation is reported, never applied by the codec; the
+  decoded pixels and dimensions are the source's native, unrotated values.
+- **Breaking:** the C and Python decode APIs drop the output-`format`
+  parameter; the decode configures the tensor to the native format, which the
+  caller inspects (e.g. `hal_tensor_pixel_format()`) and converts as needed.
+
+### Removed
+
+- **Breaking:** `DecodeOptions` and the `opts` parameter on all
+  decode/load/peek APIs.
+- **Breaking:** the `edgefirst-image` `load_image()` free function. Decode via
+  the re-exported `codec::{ImageDecoder, ImageLoad}` into a pre-allocated tensor
+  instead.
+- The in-codec YCbCr→RGB/RGBA/BGRA colour kernels, chroma-upsample kernels, and
+  SIMD type-conversion path (these moved to `ImageProcessor::convert()`); the
+  JPEG CPU path now writes native `NV12`/`GREY` directly.
+
 ## [0.24.2] - 2026-05-28
 
 ### Fixed

@@ -443,15 +443,23 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 /// processor convert API (`hal_image_processor_convert()`) if a different
 /// format such as RGB is required.
 ///
-/// @note EXIF orientation is no longer applied automatically. The decoder
-/// reports the native (unrotated) dimensions; callers that need EXIF
-/// orientation must apply it themselves downstream.
+/// @note EXIF orientation is reported but never applied. The decoder writes
+/// the source's native (unrotated) pixels and dimensions; callers that need an
+/// upright image must apply the reported orientation themselves downstream
+/// (e.g. via `hal_image_processor_convert()`). `out_rotation_degrees` and
+/// `out_flip_horizontal` describe the transform the caller should apply: rotate
+/// clockwise by the given degrees (0/90/180/270), then flip horizontally if
+/// requested. Both are `0`/`false` when the image has no EXIF orientation.
 ///
 /// @param tensor Pre-allocated tensor to decode into
 /// @param data Pointer to encoded image data (JPEG or PNG)
 /// @param len Length of image data in bytes
 /// @param out_width If non-NULL, receives the decoded image width
 /// @param out_height If non-NULL, receives the decoded image height
+/// @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+///        rotation in degrees the caller should apply (0/90/180/270)
+/// @param out_flip_horizontal If non-NULL, receives whether the caller should
+///        also flip the image horizontally
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL tensor/data, zero length)
@@ -464,6 +472,8 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
     len: size_t,
     out_width: *mut size_t,
     out_height: *mut size_t,
+    out_rotation_degrees: *mut u16,
+    out_flip_horizontal: *mut bool,
 ) -> c_int {
     check_null!(tensor);
     check_null!(data);
@@ -490,6 +500,12 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
     if !out_height.is_null() {
         unsafe { *out_height = info.height };
     }
+    if !out_rotation_degrees.is_null() {
+        unsafe { *out_rotation_degrees = info.rotation_degrees };
+    }
+    if !out_flip_horizontal.is_null() {
+        unsafe { *out_flip_horizontal = info.flip_horizontal };
+    }
 
     0
 }
@@ -503,6 +519,10 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
 /// @param path Path to the image file
 /// @param out_width If non-NULL, receives the decoded image width
 /// @param out_height If non-NULL, receives the decoded image height
+/// @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+///        rotation in degrees the caller should apply (0/90/180/270)
+/// @param out_flip_horizontal If non-NULL, receives whether the caller should
+///        also flip the image horizontally
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8)
@@ -516,6 +536,8 @@ pub unsafe extern "C" fn hal_tensor_decode_image_file(
     path: *const c_char,
     out_width: *mut size_t,
     out_height: *mut size_t,
+    out_rotation_degrees: *mut u16,
+    out_flip_horizontal: *mut bool,
 ) -> c_int {
     check_null!(tensor);
     check_null!(path);
@@ -536,7 +558,17 @@ pub unsafe extern "C" fn hal_tensor_decode_image_file(
         }
     };
 
-    unsafe { hal_tensor_decode_image(tensor, data.as_ptr(), data.len(), out_width, out_height) }
+    unsafe {
+        hal_tensor_decode_image(
+            tensor,
+            data.as_ptr(),
+            data.len(),
+            out_width,
+            out_height,
+            out_rotation_degrees,
+            out_flip_horizontal,
+        )
+    }
 }
 
 /// Save an image tensor as JPEG.
