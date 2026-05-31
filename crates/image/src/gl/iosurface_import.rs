@@ -24,7 +24,7 @@
 #![cfg(target_os = "macos")]
 
 use crate::Error;
-use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
+use edgefirst_tensor::{packed_rgba16f_layout, DType, PixelFormat, Tensor, TensorTrait};
 use khronos_egl as egl;
 
 // ---------------------------------------------------------------------------
@@ -60,13 +60,18 @@ const GL_RG: i32 = 0x8227;
 const GL_RGBA: i32 = 0x1908;
 const GL_BGRA_EXT: i32 = 0x80E1;
 const GL_UNSIGNED_BYTE: i32 = 0x1401;
+const GL_HALF_FLOAT: i32 = 0x140B;
 
 // IOSurface FOURCC pixel-format codes recognized by ANGLE's Metal
-// backend. The spike validated these against `EGL_BAD_ATTRIBUTE`-style
-// failures.
+// backend. Per `EGL_ANGLE_iosurface_client_buffer.txt`, the only
+// supported float `(type, internal_format)` pair is `(GL_HALF_FLOAT,
+// GL_RGBA)` = RGBA16F, mapped from FourCC `'RGhA'`
+// (kCVPixelFormatType_64RGBAHalf). No R32F, R16F, or RGBA32F binding
+// is accepted by the spec — calls return `EGL_BAD_ATTRIBUTE`.
 const FOURCC_2C08: u32 = u32::from_be_bytes(*b"2C08"); // 2-channel 8-bit (YUYV-as-GL_RG)
 const FOURCC_RGBA: u32 = u32::from_be_bytes(*b"RGBA"); // 32-bit RGBA8888
 const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA"); // 32-bit BGRA8888
+const FOURCC_RGHA: u32 = u32::from_be_bytes(*b"RGhA"); // kCVPixelFormatType_64RGBAHalf
 
 // ---------------------------------------------------------------------------
 // Raw IOSurface allocation helpers.
@@ -120,36 +125,101 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 ///
 /// `fourcc` and `bytes_per_element` come from
 /// [`edgefirst_tensor::image_iosurface_layout`] — the single source of
-/// truth for the `PixelFormat → (FourCC, bpe)` mapping. The image crate
-/// only owns the FourCC → GL-internal-format map below, since the GL
-/// constants are an image-side concern.
+/// truth for the `(PixelFormat, DType) → (FourCC, bpe)` mapping. The
+/// image crate only owns the FourCC → GL-internal-format map below,
+/// since the GL constants are an image-side concern.
+///
+/// Surface dimensions:
+///   * Packed formats: `(width, height)`.
+///   * PlanarRgb / PlanarRgba F16: `(width / 4, channels * height)` —
+///     4 contiguous half-floats packed per RGBA16F pixel because
+///     ANGLE only supports `GL_HALF_FLOAT + GL_RGBA` (no
+///     single-channel float). The tensor crate enforces
+///     `width % 4 == 0`.
+#[cfg_attr(test, derive(Debug))]
 struct ImageLayout {
     fourcc: u32,
     bytes_per_element: usize,
+    /// Logical image width (consumer-visible).
     width: usize,
+    /// Logical image height (without channel-plane multiplication).
     height: usize,
+    /// Physical IOSurface width (= width / 4 for packed-planar F16).
+    surface_width: usize,
+    /// Physical IOSurface height (= height * channels for planar formats).
+    surface_height: usize,
+    dtype: DType,
+    fmt: PixelFormat,
 }
 
 impl ImageLayout {
-    fn for_format(fmt: PixelFormat, width: usize, height: usize) -> Result<Self, Error> {
-        let (fourcc, bytes_per_element) = edgefirst_tensor::image_iosurface_layout(fmt)
+    fn for_format(
+        fmt: PixelFormat,
+        dtype: DType,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, Error> {
+        let (fourcc, bytes_per_element) = edgefirst_tensor::image_iosurface_layout(fmt, dtype)
             .ok_or_else(|| {
                 Error::NotImplemented(format!(
-                    "IOSurface allocation for PixelFormat::{fmt:?} not yet supported \
+                    "IOSurface allocation for ({fmt:?}, {dtype:?}) not yet supported \
                      (no FourCC mapping in edgefirst_tensor::image_iosurface_layout — \
-                     multi-plane formats need separate property dictionary setup)"
+                     multi-plane formats and unsupported dtypes need separate handling)"
                 ))
             })?;
+        let (surface_width, surface_height) = match (fmt, dtype) {
+            (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
+                // Single source of truth for the RGBA16F-packed `(W/4, C*H)`
+                // geometry — see `edgefirst_tensor::packed_rgba16f_layout`.
+                // It returns `None` on width%4 != 0 or `usize` overflow.
+                let layout = packed_rgba16f_layout(fmt, dtype, width, height).ok_or_else(|| {
+                    Error::Internal(format!(
+                        "{fmt:?} F16 RGBA16F packing requires width%4==0 and \
+                         non-overflowing geometry (got {width}x{height})"
+                    ))
+                })?;
+                (layout.surface_w, layout.surface_h)
+            }
+            (PixelFormat::PlanarRgb, _) => {
+                let sh = height.checked_mul(3).ok_or_else(|| {
+                    Error::Internal(format!("PlanarRgb surface height overflow (h={height})"))
+                })?;
+                (width, sh)
+            }
+            (PixelFormat::PlanarRgba, _) => {
+                let sh = height.checked_mul(4).ok_or_else(|| {
+                    Error::Internal(format!("PlanarRgba surface height overflow (h={height})"))
+                })?;
+                (width, sh)
+            }
+            _ => (width, height),
+        };
         Ok(Self {
             fourcc,
             bytes_per_element,
             width,
             height,
+            surface_width,
+            surface_height,
+            dtype,
+            fmt,
         })
     }
 
     fn gl_type(&self) -> i32 {
-        GL_UNSIGNED_BYTE
+        match self.dtype {
+            DType::U8 | DType::I8 => GL_UNSIGNED_BYTE,
+            // Per `EGL_ANGLE_iosurface_client_buffer.txt`, F16 is the
+            // only ANGLE-supported float; we always use the packed
+            // `GL_HALF_FLOAT + GL_RGBA` binding regardless of whether
+            // the destination is packed Rgba or planar (planar uses
+            // 4-element pixel packing).
+            DType::F16 => GL_HALF_FLOAT,
+            other => unreachable!(
+                "ImageLayout::gl_type: dtype {other:?} not supported on the GL/IOSurface path \
+                 (rejected earlier by image_iosurface_layout)"
+            ),
+        }
     }
 
     fn gl_internal_format(&self) -> i32 {
@@ -161,6 +231,15 @@ impl ImageLayout {
             FOURCC_2C08 => GL_RG,
             FOURCC_RGBA => GL_RGBA,
             FOURCC_BGRA => GL_BGRA_EXT,
+            // RGBA16F: ANGLE's own
+            // `EGLIOSurfaceClientBufferTest::RenderToRGBA16FIOSurface`
+            // test uses the UNSIZED `GL_RGBA` (paired with
+            // `GL_HALF_FLOAT`) in the EGL pbuffer attribs. ANGLE
+            // internally promotes that pair to the sized RGBA16F
+            // framebuffer; passing the sized `GL_RGBA16F` directly
+            // is rejected with `EGL_BAD_ATTRIBUTE`. See ANGLE source
+            // `src/tests/egl_tests/EGLIOSurfaceClientBufferTest.cpp`.
+            FOURCC_RGHA => GL_RGBA,
             other => unreachable!(
                 "unsupported IOSurface FourCC 0x{other:08X} in GL import — \
                  add a mapping here when extending image_iosurface_layout()"
@@ -176,8 +255,27 @@ impl ImageLayout {
 /// The returned `CFDictionaryRef` must be released by the caller with
 /// `CFRelease` after passing to `IOSurfaceCreate`.
 unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_void, Error> {
-    let bpr = (layout.width * layout.bytes_per_element + 63) & !63;
-    let alloc_size = bpr * layout.height;
+    // Checked arithmetic: an overflowing bytes-per-row or allocation size
+    // would describe an under-sized IOSurface, which the GL import then
+    // treats as a valid render target / mapped buffer — a memory-safety
+    // hazard. Fail loudly instead of wrapping.
+    let bpr = layout
+        .surface_width
+        .checked_mul(layout.bytes_per_element)
+        .and_then(|b| b.checked_add(63))
+        .map(|b| b & !63)
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "IOSurface bytes-per-row overflow (surface_width={}, bpe={})",
+                layout.surface_width, layout.bytes_per_element
+            ))
+        })?;
+    let alloc_size = bpr.checked_mul(layout.surface_height).ok_or_else(|| {
+        Error::Internal(format!(
+            "IOSurface allocation size overflow (bpr={bpr}, surface_height={})",
+            layout.surface_height
+        ))
+    })?;
 
     let dict = CFDictionaryCreateMutable(
         std::ptr::null(),
@@ -219,8 +317,8 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
     };
 
     let result = (|| -> Result<(), Error> {
-        set_num("IOSurfaceWidth", layout.width as i64)?;
-        set_num("IOSurfaceHeight", layout.height as i64)?;
+        set_num("IOSurfaceWidth", layout.surface_width as i64)?;
+        set_num("IOSurfaceHeight", layout.surface_height as i64)?;
         set_num("IOSurfaceBytesPerElement", layout.bytes_per_element as i64)?;
         set_num("IOSurfacePixelFormat", layout.fourcc as i64)?;
         set_num("IOSurfaceBytesPerRow", bpr as i64)?;
@@ -244,10 +342,11 @@ unsafe fn build_image_props(layout: &ImageLayout) -> Result<*mut std::ffi::c_voi
 /// The returned pointer must be released with `CFRelease` exactly once.
 pub(super) unsafe fn create_image_iosurface(
     fmt: PixelFormat,
+    dtype: DType,
     width: usize,
     height: usize,
 ) -> Result<*mut std::ffi::c_void, Error> {
-    let layout = ImageLayout::for_format(fmt, width, height)?;
+    let layout = ImageLayout::for_format(fmt, dtype, width, height)?;
     let dict = build_image_props(&layout)?;
     let surface = IOSurfaceCreate(dict);
     CFRelease(dict);
@@ -283,16 +382,24 @@ type FnCreatePbufferFromClientBuffer = unsafe extern "C" fn(
 /// `surface_ref` must be a valid IOSurfaceRef live for the duration of
 /// the returned pbuffer's lifetime. `cfg` must be an EGL config with
 /// `EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D` selected.
+//
+// Eight args is one over clippy's default; every one is needed for the
+// `eglCreatePbufferFromClientBuffer` call (EGL display + config,
+// IOSurface ref, plus the image shape used by `ImageLayout`). The
+// caller already groups these naturally; bundling into a struct would
+// just push the verbosity to the call site.
+#[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn create_iosurface_pbuffer(
     egl: &super::Egl,
     display: egl::Display,
     config: egl::Config,
     surface_ref: *mut std::ffi::c_void,
     fmt: PixelFormat,
+    dtype: DType,
     width: usize,
     height: usize,
 ) -> Result<egl::Surface, Error> {
-    let layout = ImageLayout::for_format(fmt, width, height)?;
+    let layout = ImageLayout::for_format(fmt, dtype, width, height)?;
 
     let create_pbuffer_ptr = egl
         .get_proc_address("eglCreatePbufferFromClientBuffer")
@@ -305,9 +412,9 @@ pub(super) unsafe fn create_iosurface_pbuffer(
 
     let attribs = [
         egl::WIDTH,
-        width as i32,
+        layout.surface_width as i32,
         egl::HEIGHT,
-        height as i32,
+        layout.surface_height as i32,
         EGL_IOSURFACE_PLANE_ANGLE,
         0,
         EGL_TEXTURE_TARGET,
@@ -321,6 +428,9 @@ pub(super) unsafe fn create_iosurface_pbuffer(
         egl::NONE,
     ];
 
+    // DIAGNOSTIC: trace every input to eglCreatePbufferFromClientBuffer
+    // so we can correlate failures with the actual arguments. Hot loop
+    // safe — only logged at trace level.
     let raw = create_pbuffer(
         display.as_ptr(),
         EGL_IOSURFACE_ANGLE,
@@ -331,7 +441,16 @@ pub(super) unsafe fn create_iosurface_pbuffer(
     if raw.is_null() {
         let egl_err = egl.get_error();
         return Err(Error::Io(std::io::Error::other(format!(
-            "eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE) failed: {egl_err:?}"
+            "eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE) failed: \
+             {egl_err:?} (surface_ref={surface_ref:?}, \
+             surface={surface_w}x{surface_h}, fourcc=0x{fc:08x}, \
+             internal_format=0x{ifmt:04x}, type=0x{ty:04x}, bpe={bpe})",
+            surface_w = layout.surface_width,
+            surface_h = layout.surface_height,
+            fc = layout.fourcc,
+            ifmt = layout.gl_internal_format(),
+            ty = layout.gl_type(),
+            bpe = layout.bytes_per_element,
         ))));
     }
     Ok(egl::Surface::from_ptr(raw))
@@ -349,4 +468,58 @@ pub(super) fn tensor_iosurface_ref(tensor: &Tensor<u8>) -> Option<*mut std::ffi:
         return None;
     }
     tensor.iosurface_ref()
+}
+
+// `ImageLayout::for_format` is pure geometry/validation (no GL/IOSurface
+// allocation), so it is unit-testable on the macOS coverage lane without a
+// GPU. These cover the surface-dimension computation and every error arm.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::ImageLayout;
+    use edgefirst_tensor::{DType, PixelFormat};
+
+    #[test]
+    fn planar_rgb_f16_packs_to_quarter_width_triple_height() {
+        // 16x16 PlanarRgb F16 → RGBA16F-packed (W/4, 3*H) = (4, 48).
+        let layout = ImageLayout::for_format(PixelFormat::PlanarRgb, DType::F16, 16, 16).unwrap();
+        assert_eq!(layout.surface_width, 4);
+        assert_eq!(layout.surface_height, 48);
+        assert_eq!((layout.width, layout.height), (16, 16));
+    }
+
+    #[test]
+    fn planar_rgba_f16_packs_to_quarter_width_quadruple_height() {
+        let layout = ImageLayout::for_format(PixelFormat::PlanarRgba, DType::F16, 16, 16).unwrap();
+        assert_eq!(layout.surface_width, 4);
+        assert_eq!(layout.surface_height, 64);
+    }
+
+    #[test]
+    fn planar_rgb_f16_misaligned_width_errors() {
+        // width % 4 != 0 cannot be RGBA16F-packed.
+        let err = ImageLayout::for_format(PixelFormat::PlanarRgb, DType::F16, 15, 16).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Internal(_)),
+            "expected Internal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unmapped_format_dtype_is_not_implemented() {
+        // A (format, dtype) with no FourCC mapping in image_iosurface_layout
+        // returns NotImplemented rather than a bogus layout.
+        let err = ImageLayout::for_format(PixelFormat::Nv12, DType::F32, 16, 16).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::NotImplemented(_)),
+            "expected NotImplemented, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn packed_u8_format_uses_logical_dimensions() {
+        // Non-planar packed RGBA8 keeps logical (W, H) as the surface size.
+        let layout = ImageLayout::for_format(PixelFormat::Rgba, DType::U8, 16, 16).unwrap();
+        assert_eq!((layout.surface_width, layout.surface_height), (16, 16));
+    }
 }

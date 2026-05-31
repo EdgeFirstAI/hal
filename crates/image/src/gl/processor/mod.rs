@@ -25,6 +25,21 @@ use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
 
+/// Linux GL float (F16/F32) preprocessing paths. Declared as a child of
+/// `processor` so its `impl GLProcessorST` block can reach this module's
+/// private fields (the float programs, EGLImage caches, capability flags, …)
+/// without promoting them to `pub(super)`.
+mod float;
+// Re-export the float classifier/support items at the `processor` module path
+// so the dispatch in `convert()` and the `gl::tests` unit tests keep using
+// `processor::{...}` paths unchanged.
+pub(super) use float::{classify_float_render, float_render_support, FloatRenderPath};
+// `dma_f16_packed_layout` is only reached through this re-export by the
+// `gl::tests` unit tests (via `processor::dma_f16_packed_layout`); the lib body
+// itself does not reference it, so the unused-import lint can't see the use.
+#[allow(unused_imports)]
+pub(super) use float::dma_f16_packed_layout;
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
@@ -48,6 +63,21 @@ pub struct GLProcessorST {
     has_float_linear: bool,
     /// Whether GL_EXT_texture_format_BGRA8888 is available (allows BGRA destinations).
     pub(super) has_bgra: bool,
+    /// Whether `GL_EXT_color_buffer_float` is advertised in the
+    /// extension string, i.e. the GPU can render to an F32 color
+    /// attachment. The probe is extension-string only — GLES 3.2 core
+    /// also mandates F32 color buffers, but this flag does not consult
+    /// `GL_VERSION`, so a 3.2-core context without the extension string
+    /// reports `false`. Surfaced through `RenderDtypeSupport`; on Linux
+    /// this gates the F32 NHWC PBO render path
+    /// (`FloatRenderPath::PboF32Nhwc`) via `classify_float_render`.
+    pub(super) supports_f32_color: bool,
+    /// Whether `GL_EXT_color_buffer_half_float` is advertised, i.e. the
+    /// GPU can render to an F16 color attachment. Surfaced through
+    /// `RenderDtypeSupport`; on Linux this gates the F16 NCHW PBO and
+    /// zero-copy DMA-BUF render paths (`FloatRenderPath::PboF16Nchw`,
+    /// `FloatRenderPath::DmaF16Nchw`) via `classify_float_render`.
+    pub(super) supports_f16_color: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
@@ -113,6 +143,18 @@ pub struct GLProcessorST {
     texture_program_planar_2d: GlProgram,
     /// Shader: planar RGB int8 from 2D texture (two-pass NV12→RGBA→PlanarRgb workaround).
     texture_program_planar_int8_2d: GlProgram,
+    /// Shader: RGBA8 → R32F-wide F32 NHWC `[H,W,3]` packed render (PBO float path).
+    float_f32_nhwc_program: GlProgram,
+    /// Shader: RGBA8 → RGBA16F-packed F16 NCHW `[3,H,W]` render (PBO float path).
+    float_f16_nchw_program: GlProgram,
+    /// Float render target texture (R32F or RGBA16F), reattached to `convert_fbo`.
+    float_render_texture: Texture,
+    /// Cached storage spec of `float_render_texture`: `(packed_w, packed_h,
+    /// internal_format)`. Mirrors the `proto_tex_dims` pattern: only call
+    /// `TexImage2D` (storage spec) when this changes; otherwise reuse the
+    /// existing storage (skip the per-frame reallocation on the fixed-size
+    /// video path). `(0, 0, 0)` means unallocated.
+    float_render_tex_dims: (usize, usize, u32),
     pub(super) gl_context: GlContext,
 }
 
@@ -236,6 +278,37 @@ impl ImageProcessorTrait for GLProcessorST {
         crop: Crop,
     ) -> crate::Result<()> {
         crop.check_crop_dyn(src, dst)?;
+
+        // F16/F32 destination: check for a GL float render path BEFORE the u8
+        // extraction functions reject the dtype. When a path is found, dispatch
+        // to convert_float_to_pbo (stub → NotSupported → CPU fallback). When
+        // None, fall through to the existing u8 path unchanged.
+        let dst_dtype = dst.dtype();
+        if matches!(
+            dst_dtype,
+            edgefirst_tensor::DType::F16 | edgefirst_tensor::DType::F32
+        ) {
+            let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+            let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+            let support = float_render_support(
+                self.is_vivante,
+                self.supports_f32_color,
+                self.supports_f16_color,
+            );
+            let path = classify_float_render(src_fmt, dst_fmt, dst_dtype, dst.memory(), support);
+            match path {
+                FloatRenderPath::DmaF16Nchw => {
+                    return self.convert_float_to_dma(src, dst, rotation, flip, crop);
+                }
+                FloatRenderPath::None => {}
+                _ => {
+                    return self.convert_float_to_pbo(src, dst, path, rotation, flip, crop);
+                }
+            }
+            // path == None: fall through to the u8 path, which will reject
+            // F16/F32 via dyn_to_u8_dst → CPU fallback (existing behavior).
+        }
+
         let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
         let (dst_u8, dst_fmt, is_int8) = dyn_to_u8_dst(dst)?;
 
@@ -324,6 +397,23 @@ impl ImageProcessorTrait for GLProcessorST {
     }
 }
 
+/// Whether `EDGEFIRST_ALLOW_SOFTWARE_GL=1` is set, opting in to running the GL
+/// backend on a software renderer (Mesa llvmpipe/softpipe/swrast).
+///
+/// Off by default and in production; the CI coverage lane sets it so the GL
+/// render path executes on llvmpipe where no GPU exists.
+fn software_gl_override_enabled() -> bool {
+    std::env::var_os("EDGEFIRST_ALLOW_SOFTWARE_GL").is_some_and(|v| v == "1")
+}
+
+/// Decide whether to reject an initialized GL context for being a software
+/// renderer. Pure so it is unit-testable without touching the environment or a
+/// real GL context: reject only when the renderer is software AND the override
+/// is not enabled.
+fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool) -> bool {
+    is_software_renderer && !override_enabled
+}
+
 impl GLProcessorST {
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new(kind)?;
@@ -334,19 +424,39 @@ impl GLProcessorST {
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
 
-        let (has_float_linear, has_bgra, is_vivante, is_software_renderer) =
-            Self::gl_check_support()?;
+        let (
+            has_float_linear,
+            has_bgra,
+            is_vivante,
+            is_software_renderer,
+            supports_f32_color,
+            supports_f16_color,
+        ) = Self::gl_check_support()?;
 
         // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
         // implementations that are slower and less capable than our native CPU
         // backend. Reject them early — the caller falls back to CPU automatically.
-        if is_software_renderer {
+        //
+        // `EDGEFIRST_ALLOW_SOFTWARE_GL=1` overrides the rejection. It exists
+        // for the CI coverage lane, which runs the GL render path (e.g. the
+        // float PBO roundtrips) on Mesa llvmpipe where no GPU is available —
+        // the rendered output is numerically identical to a hardware GPU since
+        // it runs the same GLSL. Production never sets it, so the default
+        // (reject software GL, fall back to CPU) is unchanged.
+        if should_reject_software_gl(is_software_renderer, software_gl_override_enabled()) {
             return Err(crate::Error::NotSupported(
                 "software OpenGL renderer detected (llvmpipe/softpipe/swrast); \
                  GL backend disabled — check EGL ICD configuration if a \
-                 hardware GPU is expected"
+                 hardware GPU is expected (set EDGEFIRST_ALLOW_SOFTWARE_GL=1 \
+                 to override, e.g. for coverage on Mesa llvmpipe)"
                     .into(),
             ));
+        }
+        if is_software_renderer {
+            log::warn!(
+                "software OpenGL renderer in use (EDGEFIRST_ALLOW_SOFTWARE_GL=1); \
+                 slower than the CPU backend — intended for CI coverage only"
+            );
         }
 
         // Uploads and downloads are all packed with no alignment requirements
@@ -435,6 +545,18 @@ impl GLProcessorST {
             generate_packed_rgba8_int8_shader_2d(),
         )?;
 
+        // Float render-to-PBO programs. Both are full-viewport fragment
+        // shaders driven by `gl_FragCoord`; the standard vertex shader emits a
+        // full-screen quad so every packed output texel is visited. Crop and
+        // letterbox are entirely uniform-driven (src_rect_uv/dst_rect_px/
+        // pad_color), matching the macOS IOSurface contract.
+        let float_f32_nhwc_program =
+            GlProgram::new(generate_vertex_shader(), generate_packed_f32_nhwc_shader())?;
+        let float_f16_nchw_program = GlProgram::new(
+            generate_vertex_shader(),
+            generate_planar_rgb_f16_packed_shader(),
+        )?;
+
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
@@ -457,6 +579,10 @@ impl GLProcessorST {
             packed_rgba8_int8_program_2d,
             texture_program_planar_2d,
             texture_program_planar_int8_2d,
+            float_f32_nhwc_program,
+            float_f16_nchw_program,
+            float_render_texture: Texture::new(),
+            float_render_tex_dims: (0, 0, 0),
             camera_eglimage_texture,
             camera_normal_texture,
             segmentation_texture,
@@ -467,6 +593,8 @@ impl GLProcessorST {
             proto_segmentation_f32_program,
             has_float_linear,
             has_bgra,
+            supports_f32_color,
+            supports_f16_color,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
             vertex_buffer,
@@ -1224,8 +1352,14 @@ impl GLProcessorST {
 
     /// Query GL capabilities and detect GPU vendor/renderer type.
     ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer)`.
-    fn gl_check_support() -> Result<(bool, bool, bool, bool), crate::Error> {
+    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer,
+    /// supports_f32_color, supports_f16_color)`. The two float-color flags
+    /// report whether the GPU can render to F32 / F16 color attachments
+    /// (independent extensions: a configuration may have one but not the
+    /// other). On this Linux backend they are forward-compat capability
+    /// probes surfaced via `RenderDtypeSupport`; the macOS IOSurface path
+    /// is the only render destination that consumes float dtypes today.
+    fn gl_check_support() -> Result<(bool, bool, bool, bool, bool, bool), crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
@@ -1289,7 +1423,24 @@ impl GLProcessorST {
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
         log::debug!("GL_EXT_texture_format_BGRA8888: {has_bgra}");
 
-        Ok((has_float_linear, has_bgra, is_vivante, is_software_renderer))
+        // Float-color-buffer extensions gate F32/F16 destinations on the
+        // IOSurface render path. The two extensions are independent: a
+        // configuration may expose one but not the other, so consumers
+        // (e.g. profiler/ORT CoreML path) probe each separately and pick
+        // the preferred dtype.
+        let supports_f32_color = extensions.contains("GL_EXT_color_buffer_float");
+        let supports_f16_color = extensions.contains("GL_EXT_color_buffer_half_float");
+        log::debug!("GL_EXT_color_buffer_float: {supports_f32_color}");
+        log::debug!("GL_EXT_color_buffer_half_float: {supports_f16_color}");
+
+        Ok((
+            has_float_linear,
+            has_bgra,
+            is_vivante,
+            is_software_renderer,
+            supports_f32_color,
+            supports_f16_color,
+        ))
     }
 
     /// Invalidate EGL binding state on all destination textures.
@@ -1825,6 +1976,82 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Low-level PBO render-target setup with explicit GL format and type.
+    ///
+    /// Binds `buffer_id` as `GL_PIXEL_UNPACK_BUFFER`, calls `TexImage2D` with
+    /// the provided `internal_format`, `client_format`, and `gl_type`, then
+    /// attaches the texture to the FBO color attachment and sets the viewport.
+    ///
+    /// The `(width, height)` are the logical pixel dimensions of the render
+    /// target (caller is responsible for planar-packing remapping if needed).
+    ///
+    /// # Safety (caller responsibility)
+    /// `internal_format`, `client_format`, and `gl_type` must form a valid
+    /// `TexImage2D` combination for the bound GLES context.
+    fn setup_renderbuffer_from_pbo_inner(
+        &mut self,
+        width: i32,
+        height: i32,
+        buffer_id: u32,
+        internal_format: u32,
+        client_format: u32,
+        gl_type: u32,
+    ) -> crate::Result<()> {
+        self.convert_fbo.bind();
+        unsafe {
+            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+
+            // Upload existing PBO content to the render texture.
+            // Binding PBO as UNPACK buffer makes TexImage2D read from it.
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+            gls::gl::TexImage2D(
+                gls::gl::TEXTURE_2D,
+                0,
+                internal_format as i32,
+                width,
+                height,
+                0,
+                client_format,
+                gl_type,
+                std::ptr::null(),
+            );
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+            // TexImage2D overwrites any EGLImage binding on this texture.
+            self.render_texture.invalidate_egl_binding();
+
+            check_gl_error(function!(), line!())?;
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.render_texture.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, width, height);
+        }
+        Ok(())
+    }
+
+    /// Set up a u8 (UNSIGNED_BYTE) PBO render target for the given format.
+    ///
+    /// Computes the correct GL `format` from `dst_fmt` (handling planar
+    /// packing layout) and delegates to [`setup_renderbuffer_from_pbo_inner`]
+    /// with `UNSIGNED_BYTE` as the GL type.  The next task adds an analogous
+    /// float variant that calls the inner helper with `R32F`/`RGBA16F` and
+    /// `FLOAT`/`HALF_FLOAT` respectively.
     fn setup_renderbuffer_from_pbo(
         &mut self,
         dst: &Tensor<u8>,
@@ -1862,52 +2089,15 @@ impl GLProcessorST {
                 }
             }
         };
-        self.convert_fbo.bind();
-        unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
 
-            // Upload existing PBO content to the render texture.
-            // Binding PBO as UNPACK buffer makes TexImage2D read from it.
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, buffer_id);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
-                0,
-                format as i32,
-                width,
-                height,
-                0,
-                format,
-                gls::gl::UNSIGNED_BYTE,
-                std::ptr::null(),
-            );
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
-            // TexImage2D overwrites any EGLImage binding on this texture.
-            self.render_texture.invalidate_egl_binding();
-
-            check_gl_error(function!(), line!())?;
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
-                self.render_texture.id,
-                0,
-            );
-            check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, width, height);
-        }
-        Ok(())
+        self.setup_renderbuffer_from_pbo_inner(
+            width,
+            height,
+            buffer_id,
+            format,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+        )
     }
 
     /// Convert between two PBO-backed images.
@@ -3872,7 +4062,10 @@ impl GLProcessorST {
     }
 
     /// Look up the renderbuffer ID for a cached destination EGLImage.
-    fn cached_dst_renderbuffer(&self, img: &Tensor<u8>) -> Option<u32> {
+    fn cached_dst_renderbuffer<T>(&self, img: &Tensor<T>) -> Option<u32>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
         let luma_id = img.buffer_identity().id();
         let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
         let id = (luma_id, chroma_id);
@@ -3884,15 +4077,24 @@ impl GLProcessorST {
 
     /// Create an EGLImage from a DMA buffer with explicitly specified internal
     /// dimensions and format. Used when the GL render surface differs from the
-    /// logical image dimensions (e.g., packed RGB reinterpretation).
-    fn create_egl_image_with_dims(
+    /// logical image dimensions (e.g., packed RGB reinterpretation, or the F16
+    /// RGBA16F-packed planar destination).
+    ///
+    /// Generic over the tensor element type so it works for both `u8`
+    /// (packed-RGB DMA) and `f16` (RGBA16F-packed DMA) destinations. Only the
+    /// DMA fd, stride and offset are read from the tensor; `width`, `height`,
+    /// `drm_format` and `bpp` describe the GL-visible packed surface.
+    fn create_egl_image_with_dims<T>(
         &self,
-        img: &Tensor<u8>,
+        img: &Tensor<T>,
         width: usize,
         height: usize,
         drm_format: DrmFourcc,
         bpp: usize,
-    ) -> Result<EglImage, crate::Error> {
+    ) -> Result<EglImage, crate::Error>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
         let dma = img.as_dma().ok_or_else(|| {
             Error::NotImplemented("create_egl_image_with_dims requires DMA tensor".to_string())
         })?;
@@ -3923,17 +4125,24 @@ impl GLProcessorST {
         self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }
 
-    /// Get or create an EGLImage for a packed RGB DMA destination with
+    /// Get or create an EGLImage for a packed DMA destination with
     /// reinterpreted dimensions. Uses the dst cache keyed by buffer identity.
-    fn get_or_create_egl_image_rgb(
+    ///
+    /// Generic over the tensor element type so it serves both the `u8`
+    /// packed-RGB destination (`DrmFourcc::Abgr8888`, bpp=4) and the `f16`
+    /// RGBA16F-packed planar destination (`DrmFourcc::Abgr16161616f`, bpp=8).
+    fn get_or_create_egl_image_rgb<T>(
         &mut self,
-        img: &Tensor<u8>,
+        img: &Tensor<T>,
         _img_fmt: PixelFormat,
         width: usize,
         height: usize,
         drm_format: DrmFourcc,
         bpp: usize,
-    ) -> Result<egl::Image, crate::Error> {
+    ) -> Result<egl::Image, crate::Error>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
         let id = (img.buffer_identity().id(), None);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
@@ -5534,5 +5743,45 @@ impl GLProcessorST {
         }
         check_gl_error(function!(), line!())?;
         Ok(())
+    }
+
+    /// Report the float render support that this processor instance should
+    /// advertise.  Delegates to [`float_render_support`].
+    pub(super) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
+        float_render_support(
+            self.is_vivante,
+            self.supports_f32_color,
+            self.supports_f16_color,
+        )
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::should_reject_software_gl;
+
+    // The override env reader (`software_gl_override_enabled`) is a thin
+    // `var_os == "1"` wrapper; it is exercised end-to-end by the GL-init path
+    // on the Mesa-llvmpipe coverage lane. The decision logic below is the part
+    // worth pinning in a pure unit test.
+
+    #[test]
+    fn software_gl_rejected_by_default() {
+        // Software renderer, no override → reject (caller falls back to CPU).
+        assert!(should_reject_software_gl(true, false));
+    }
+
+    #[test]
+    fn software_gl_allowed_with_override() {
+        // Software renderer + override → do not reject (CI coverage path).
+        assert!(!should_reject_software_gl(true, true));
+    }
+
+    #[test]
+    fn hardware_gl_never_rejected() {
+        // A hardware renderer is never rejected, override or not.
+        assert!(!should_reject_software_gl(false, false));
+        assert!(!should_reject_software_gl(false, true));
     }
 }

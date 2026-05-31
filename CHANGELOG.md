@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **F16 zero-copy preprocessing on macOS via ANGLE + RGBA16F-packed
+  IOSurface.** RGBA8 input → PlanarRgb F16 output runs end-to-end on
+  the GPU and writes directly into an IOSurface that ORT consumes as
+  `&[f16]` over the locked base address — no CPU normalize pass, no
+  HWC→CHW transpose, no copy. Validated end-to-end through the
+  EdgeFirst profiler against 18 Studio sessions across YOLOv5 / YOLOv8
+  / YOLO11 / YOLO26 (n / s / m sizes) on CoreML ANE and Metal GPU
+  execution providers on Apple Silicon (M-series). AP50 delta vs the
+  ONNX-CPU FP32 baseline is in the ±0.07 noise floor on every
+  configuration; inference latency ranges from 2.9 ms (YOLOv5n on
+  Metal GPU, ~340 FPS) to 19.5 ms (YOLO11m on ANE) without any CPU
+  preprocessing overhead. Drives the four pinned-compute-unit
+  `--provider coreml-{cpu,gpu,ane}` modes that ship in the matching
+  EdgeFirst profiler release.
+- `ImageProcessor::supported_render_dtypes()` introspection returning
+  a `RenderDtypeSupport { f32, f16 }` struct that reports the GPU's
+  `GL_EXT_color_buffer_float` and `GL_EXT_color_buffer_half_float`
+  probe results. Consumers query this once at startup to decide
+  whether to engage the IOSurface fast path or fall back to CPU
+  staging. The `f16` flag is the operative one for the IOSurface
+  render path; see the per-field doc on `RenderDtypeSupport` for the
+  ANGLE-specific caveat on `f32`.
+- `Tensor::<half::f16>::image(W, H, PixelFormat::PlanarRgb,
+  Some(TensorMemory::Dma))` allocates an RGBA16F-packed IOSurface
+  sized `(W/4, 3*H)` — four contiguous f16 planar elements packed
+  per RGBA16F pixel. The contiguous byte layout matches the tensor's
+  `[3, H, W]` shape exactly so ORT (or any NCHW consumer) sees the
+  data with no transpose. `W % 4 == 0` is required and validated at
+  allocation; non-multiples produce `InvalidShape` with the
+  alignment requirement spelled out.
+- `MacosGlProcessor::convert_rgba8_to_planar_float` — a one-pass
+  fragment shader that resizes, normalizes, and transposes RGBA8
+  IOSurface input to a PlanarRgb F16 IOSurface destination with
+  full letterbox crop support (`src_rect_uv`, `dst_rect_px`,
+  `pad_color` uniforms). Wired into the standard
+  `ImageProcessor::convert` dispatch on
+  `(Rgba, PlanarRgb, F16)`.
+- `image_iosurface_layout(format, dtype)` re-export for the GL
+  backend — single source of truth for the
+  `(PixelFormat, DType) → (FourCC, bytes_per_element)` mapping.
+- Re-export of `half::f16` from the tensor crate root so downstream
+  crates can write `Tensor::<edgefirst_tensor::f16>::image(...)`
+  without taking a direct `half` dependency.
+- Linux GPU float preprocessing: F16 NCHW (`PlanarRgb`) and F32 NHWC
+  (`Rgb`) via PBO readback, plus F16 zero-copy DMA-BUF render on
+  V3D/Mali GPUs. Enables low-copy `convert()` output for HailoRT (F32)
+  and TensorRT (F16) consumers.
+- `gpu-probe`: F16/F32 float render-target capability probe (texture-FBO
+  renderability, F16 dma-buf render, PBO readback timing).
+- `ImageProcessor::supported_render_dtypes()` now reports real GPU
+  float-render capability on Linux (previously always reported none).
+
+### Changed
+
+- **(Potentially breaking)** `Tensor::<T>::image()` is now bounded
+  `T: 'static` so the runtime `DType` can be derived from `T` via the
+  new internal `dtype_of::<T>()` helper (`TypeId`-based, hence the
+  `'static` requirement). Every numeric type HAL ships, and every
+  primitive numeric type, already satisfies `'static`, so in-tree and
+  typical external callers are unaffected. The bound does, however,
+  exclude any user-defined element type that borrows non-`'static`
+  references even while satisfying `Num + Clone + Debug + Send +
+  Sync` — such a type would no longer compile through `image()`. We
+  judge this combination to be vanishingly rare for pixel element
+  types, but it is a real API constraint, not a no-op.
+- `Tensor::<T>::image(.., Some(TensorMemory::Dma))` now **rejects**
+  combinations whose natural row pitch isn't 64-byte aligned with a
+  clear `InvalidArgument` error that names the alignment requirement
+  and suggests the next-aligned width. The previous behaviour
+  silently fell through to a generic `L008` byte-bag IOSurface that
+  any GL importer later rejected with the opaque `EGL_BAD_ATTRIBUTE`
+  — a debugging poison-trap that surfaced during the profiler
+  IOSurface bring-up. `memory=None` (auto-select) keeps the
+  graceful SHM/Mem fallback; only **explicit** `Dma` requests fail
+  loudly.
+- `IoSurfaceTensor::new_image` takes a `dtype: DType` argument and
+  routes planar F16 destinations through the RGBA16F-packed geometry
+  (`width/4 × channels*height`). Internal change — public callers go
+  through `Tensor::<T>::image()` which threads the dtype
+  automatically.
+- `PbufferCacheKey` in the macOS GL backend now includes a
+  `dtype_disc` field so a tensor handed to the processor as
+  `Tensor<u8>` and the same surface seen later as
+  `Tensor<half::f16>` no longer alias under the previous
+  `(id, format)` key.
+- `eglCreatePbufferFromClientBuffer` failure now reports the full
+  EGL attribute set (FourCC, internal format, GL type,
+  bytes-per-element, surface dimensions) alongside the raw EGL
+  error code. The opaque `EGL_BAD_ATTRIBUTE` message that surfaced
+  during bring-up gave no path to the actual root cause; the
+  enriched message names every input that the kernel rejected.
+
+### Notes
+
+- **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
+  returns the GPU's actual `GL_EXT_color_buffer_half_float` /
+  `GL_EXT_color_buffer_float` probe results on Linux. Vivante GC7000UL
+  always returns `{ f16: false, f32: false }` (float readback 170–320 ms —
+  disabled); V3D/Mali and Tegra report the extensions they expose.
+  `convert()` to F16/F32 destinations never errors — it falls back to CPU
+  when the GPU float path is unavailable.
+- **No F32 IOSurface path (macOS).** ANGLE's
+  `EGL_ANGLE_iosurface_client_buffer` extension specifies exactly
+  one float `(type, internal_format)` pair —
+  `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F. Every `(GL_FLOAT, *)`
+  combination is rejected with `EGL_BAD_ATTRIBUTE` even when
+  `GL_EXT_color_buffer_float` is present. `image_iosurface_layout`
+  therefore returns `None` for any F32 combination; callers that
+  request F32 IOSurface allocation get an explicit `NotImplemented`
+  error and fall back to SHM/Mem + CPU staging.
+- **F32 DMA-BUF not supported (all platforms).** No 32-bit-float DRM
+  fourcc exists; `create_image(memory: Some(Dma), dtype: F32)` returns
+  `NotSupported`. F32 uses PBO transfer instead.
+- **PlanarRgb only on the convert dispatch.** The RGBA16F-packed
+  fragment shader and viewport are sized for 3 channel planes.
+  `MacosGlProcessor::supports()` and the convert dispatch currently
+  reject `(Rgba, PlanarRgba)` to avoid mis-rendering the alpha plane.
+- **CPU float fallback is always present.** When the GL and G2D backends
+  cannot handle a float destination (unsupported combo, rotation set, or
+  unavailable hardware), `ImageProcessor::convert()` falls back to CPU
+  for any pixel-format pair. Resize is performed at u8 precision before
+  widening to F16/F32; normalization is `[0, 1]`.
+
 ## [0.24.2] - 2026-05-28
 
 ### Fixed

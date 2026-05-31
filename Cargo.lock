@@ -706,6 +706,7 @@ dependencies = [
  "log",
  "ndarray 0.17.2",
  "ndarray-stats",
+ "num-traits",
  "opencv",
  "rayon",
  "safetensors",

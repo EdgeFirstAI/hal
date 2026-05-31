@@ -566,6 +566,79 @@ void main() {
 "
 }
 
+/// Tightly-packed NHWC F32 fragment shader for HailoRT consumption.
+///
+/// Render target is a single-channel `R32F` texture sized `(W*3, H)`:
+/// each output texel holds exactly one float for one `(pixel, channel)` pair.
+/// The mapping is `channel = x % 3`, `pixel_x = x / 3`, `pixel_y = y`,
+/// so the linear read-out of the rendered texture produces a tightly-packed
+/// `[H, W, 3]` F32 buffer (NHWC order, one image in the batch).
+///
+/// The RGBA8 source texture is fetched via a `sampler2D`, which normalizes
+/// values to `[0, 1]` automatically — no explicit `/255` division needed.
+/// Letterboxing is applied using `dst_rect_px` (the active image region in
+/// pixel coords); pixels outside that rectangle are filled with `pad_color`.
+///
+/// Source sampling uses an output-pixel-center offset (`+0.5`) so the mapped
+/// source UV lands on the correct location for bilinear resize. With LINEAR
+/// source filtering this yields a proper bilinear resample; for an identity
+/// crop (`src_w == dst_w`) the UV lands exactly on the texel center, giving an
+/// exact passthrough.
+// Consumed by `GLProcessorST` for the F32 NHWC PBO render path.
+pub(super) fn generate_packed_f32_nhwc_shader() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_tex;        // RGBA8 source, normalized fetch -> [0,1]
+uniform vec4 src_rect_uv;       // (origin_u, origin_v, size_u, size_v)
+uniform vec4 dst_rect_px;       // (origin_x, origin_y, w, h) in pixel space
+uniform vec3 pad_color;         // per-channel normalized pad value
+out float frag_value;
+void main() {
+    int ox = int(gl_FragCoord.x);
+    int oy = int(gl_FragCoord.y);
+    int channel = ox % 3;
+    int px = ox / 3;
+    int py = oy;
+    bool inside = (float(px) >= dst_rect_px.x) &&
+                  (float(px) <  dst_rect_px.x + dst_rect_px.z) &&
+                  (float(py) >= dst_rect_px.y) &&
+                  (float(py) <  dst_rect_px.y + dst_rect_px.w);
+    if (!inside) {
+        frag_value = (channel == 0) ? pad_color.r
+                   : (channel == 1) ? pad_color.g : pad_color.b;
+        return;
+    }
+    float u = (float(px) + 0.5 - dst_rect_px.x) / dst_rect_px.z;
+    float v = (float(py) + 0.5 - dst_rect_px.y) / dst_rect_px.w;
+    vec2 src_uv = src_rect_uv.xy + vec2(u, v) * src_rect_uv.zw;
+    vec4 rgba = texture(u_tex, src_uv);
+    frag_value = (channel == 0) ? rgba.r
+               : (channel == 1) ? rgba.g : rgba.b;
+}
+"
+}
+
+/// RGBA8 → packed RGBA16F PlanarRgb F16 fragment shader.
+///
+/// The render target is a single `RGBA16F` texture sized `(W/4, 3*H)`.
+/// Each output texel packs 4 half-float channel samples into its four
+/// components, so a linear readout of the rendered texture produces a
+/// tightly-packed `[3, H, W]` F16 buffer (CHW / PlanarRgb order, one plane
+/// per row-band).  Width `W` must be a multiple of 4.
+///
+/// Normalization from RGBA8 → `[0, 1]` is performed for free by the hardware
+/// texture fetch (`sampler2D` normalized fetch).  Letterboxing is applied via
+/// `dst_rect_px`; pixels outside that rectangle are filled with `pad_color`.
+///
+/// Single source of truth lives in [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`],
+/// shared with the macOS IOSurface path (`macos_processor.rs`).
+// Consumed by `GLProcessorST` for the F16 NCHW PBO and DMA-BUF render paths.
+pub(super) fn generate_planar_rgb_f16_packed_shader() -> &'static str {
+    super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT
+}
+
 pub(super) fn generate_color_shader() -> &'static str {
     "\
 #version 300 es

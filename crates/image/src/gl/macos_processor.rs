@@ -47,7 +47,7 @@ use super::platform::macos::MacosPlatform;
 use super::Egl;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
-use edgefirst_tensor::{PixelFormat, TensorDyn};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
 use khronos_egl as egl;
 use log::debug;
 use std::collections::HashMap;
@@ -123,6 +123,38 @@ void main() {
 }
 "#;
 
+/// RGBA8 source → packed RGBA16F PlanarRgb F16 destination, one draw
+/// call. F32 destinations are intentionally not supported — see the
+/// crate-level docs and `image_iosurface_layout` for the ANGLE
+/// constraint.
+///
+/// The destination IOSurface is sized `(W/4, 3*H)` RGBA16F pixels.
+/// Each output pixel holds 4 contiguous half-floats of the planar
+/// `[3, H, W]` byte stream — same byte layout as a (hypothetical)
+/// R16F `(W, 3*H)` surface would have, but bound through ANGLE's
+/// single supported float `(GL_HALF_FLOAT, GL_RGBA)` combination.
+///
+/// For output pixel `(ox, oy)`:
+///   * `plane = oy / H` (0=R, 1=G, 2=B), `in_plane_y = oy % H`
+///   * The 4 packed elements correspond to logical
+///     `in_plane_x = ox*4 + 0..3` — all in the same plane and row.
+///   * Each element samples the RGBA8 source at the proper plane
+///     channel; pad with `pad_color[plane]` outside `dst_rect_px`.
+///
+/// The texture sampler returns RGBA8 values normalized to `[0, 1]`
+/// already (GL_TEXTURE_2D with internal format RGBA8), so there's no
+/// `/ 255.0` divide in the shader — the GL fixed-function texture
+/// fetch performs the normalize for free. Resize is implicit in the
+/// `src_rect_uv` mapping; `GL_LINEAR` filtering handles interpolation.
+///
+/// Width must be a multiple of 4 (enforced by HAL at IOSurface
+/// allocation time).
+///
+/// Single source of truth lives in [`super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT`],
+/// shared with the Linux PBO/DMA-BUF path (`shaders.rs`).
+const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str =
+    super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT;
+
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
 //
@@ -171,6 +203,14 @@ struct SharedAngleDisplay {
     /// current outside of a `convert` call (e.g. for shader compile,
     /// resource allocation, or `Drop`-time cleanup).
     dummy_pbuffer: egl::Surface,
+    /// `GL_EXT_color_buffer_float` is exposed by this ANGLE/Metal
+    /// configuration. Gates F32 destination tensors on the IOSurface
+    /// render path.
+    supports_f32_color: bool,
+    /// `GL_EXT_color_buffer_half_float` is exposed by this
+    /// ANGLE/Metal configuration. Gates F16 destination tensors on
+    /// the IOSurface render path.
+    supports_f16_color: bool,
 }
 
 // SAFETY: every member is either a leak'd static, an EGL handle (which
@@ -218,6 +258,13 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
 
     // 3. Choose an EGL config that supports GLES 3 + PBUFFER +
     //    EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D.
+    //
+    // 8-bit RGBA color sizes are explicit but the config doesn't
+    // restrict half-float IOSurface texture binding — ANGLE's
+    // `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` overrides at pbuffer
+    // creation time. Verified by reading ANGLE's
+    // `EGLIOSurfaceClientBufferTest::RenderToRGBA16FIOSurface` which
+    // also binds u8 surfaces in the same context.
     let cfg_attribs = [
         EGL_RENDERABLE_TYPE,
         EGL_OPENGL_ES3_BIT,
@@ -275,6 +322,32 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
         ))));
     }
     load_gl_once(&egl);
+
+    // Probe the float-color-buffer extensions while the context is
+    // still current. ANGLE's Metal backend exposes both extensions on
+    // Apple Silicon + recent ANGLE bundles; on older configurations
+    // either or both may be missing — consumers fall back per dtype.
+    let extensions = unsafe {
+        let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
+        if ptr.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let supports_f32_color = extensions
+        .split_ascii_whitespace()
+        .any(|e| e == "GL_EXT_color_buffer_float");
+    let supports_f16_color = extensions
+        .split_ascii_whitespace()
+        .any(|e| e == "GL_EXT_color_buffer_half_float");
+    debug!(
+        "MacosGlProcessor: GL_EXT_color_buffer_float={supports_f32_color}, \
+         GL_EXT_color_buffer_half_float={supports_f16_color}"
+    );
+
     let _ = egl.make_current(display, None, None, None);
 
     Ok(SharedAngleDisplay {
@@ -283,6 +356,8 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
         config,
         context,
         dummy_pbuffer,
+        supports_f32_color,
+        supports_f16_color,
     })
 }
 
@@ -319,6 +394,16 @@ pub struct MacosGlProcessor {
     program_yuyv_to_rgba: u32,
     uniform_src: i32,
     uniform_src_size: i32,
+    /// Program: RGBA8 source IOSurface → PlanarRgb F16 destination
+    /// IOSurface — zero-copy preprocessing for ONNX+CoreML. The shader
+    /// writes RGBA16F-packed half-floats; GL handles the implicit
+    /// f32→f16 narrow at fragment-output time.
+    program_rgba8_to_planar_f16: u32,
+    uniform_rgba8_to_planar_f16_src: i32,
+    uniform_rgba8_to_planar_f16_dst_size: i32,
+    uniform_rgba8_to_planar_f16_src_rect_uv: i32,
+    uniform_rgba8_to_planar_f16_dst_rect_px: i32,
+    uniform_rgba8_to_planar_f16_pad_color: i32,
     vao: u32,
     vbo: u32,
     fbo: u32,
@@ -345,6 +430,12 @@ struct PbufferCacheKey {
     /// different formats over the same IOSurface need distinct pbuffers
     /// even though that pairing is unusual in practice.
     format_disc: u8,
+    /// Discriminant of the [`edgefirst_tensor::DType`] — a single
+    /// IOSurface can only match one dtype (the FourCC encodes the
+    /// bytes-per-element), but a tensor handed to the GL processor as
+    /// `Tensor<u8>` vs `Tensor<f32>` over the same surface ID would
+    /// otherwise collide under the previous (id, format) key.
+    dtype_disc: u8,
 }
 
 impl std::fmt::Debug for MacosGlProcessor {
@@ -576,10 +667,37 @@ impl MacosGlProcessor {
             let dst_tex = cleanup.dst_tex.take().unwrap();
             std::mem::forget(cleanup);
 
+            // Compile the RGBA8 → PlanarRgb F16 (RGBA16F-packed) program
+            // eagerly too — shader compilation is cheap and avoids a
+            // per-first-call latency spike on the hot path. The program
+            // is only dispatched when the caller actually requests an
+            // F16 PlanarRgb destination, so configurations missing
+            // GL_EXT_color_buffer_half_float still work for the existing
+            // u8 paths (the framebuffer-completeness check at first use
+            // is what surfaces the extension gap).
+            let program_rgba8_planar_f16 =
+                compile_program(VERTEX_SHADER, RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT)?;
+            let uniform_rgba8_to_planar_f16_src =
+                gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"src".as_ptr());
+            let uniform_rgba8_to_planar_f16_dst_size =
+                gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"dst_image_size".as_ptr());
+            let uniform_rgba8_to_planar_f16_src_rect_uv =
+                gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"src_rect_uv".as_ptr());
+            let uniform_rgba8_to_planar_f16_dst_rect_px =
+                gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"dst_rect_px".as_ptr());
+            let uniform_rgba8_to_planar_f16_pad_color =
+                gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"pad_color".as_ptr());
+
             Ok(Self {
                 program_yuyv_to_rgba: program,
                 uniform_src,
                 uniform_src_size,
+                program_rgba8_to_planar_f16: program_rgba8_planar_f16,
+                uniform_rgba8_to_planar_f16_src,
+                uniform_rgba8_to_planar_f16_dst_size,
+                uniform_rgba8_to_planar_f16_src_rect_uv,
+                uniform_rgba8_to_planar_f16_dst_rect_px,
+                uniform_rgba8_to_planar_f16_pad_color,
                 vao,
                 vbo,
                 fbo,
@@ -590,19 +708,284 @@ impl MacosGlProcessor {
         }
     }
 
+    /// RGBA8 IOSurface source → PlanarRgb F16 IOSurface destination.
+    ///
+    /// Single-pass GPU resize + normalize + HWC→CHW transpose. The
+    /// destination IOSurface must be allocated as
+    /// `Tensor::<f16>::image(W, H, PixelFormat::PlanarRgb,
+    /// Some(TensorMemory::Dma))` — HAL allocates an RGBA16F-packed
+    /// surface sized `(W/4, 3*H)` and this method writes 4 contiguous
+    /// f16 planar elements per fragment. The IOSurface byte layout
+    /// matches the tensor's `[3, H, W]` f16 shape exactly so ORT (or
+    /// any NCHW consumer) reads the locked base address without
+    /// transpose.
+    ///
+    /// `dst_w` / `dst_h` are the logical image dimensions (the model's
+    /// input shape), NOT the IOSurface's `(W/4, 3H)` footprint. The
+    /// caller (typically the EdgeFirst profiler's ONNX path) passes
+    /// the model's input width/height.
+    ///
+    /// Source is any RGBA8 image-shaped tensor with IOSurface storage.
+    /// Both tensors must already be allocated; this method does not
+    /// allocate.
+    ///
+    /// # Errors
+    ///
+    /// - `NotSupported` if either tensor is not IOSurface-backed, the
+    ///   destination is not F16 PlanarRgb, or the source is not RGBA.
+    /// - `NotSupported` if `GL_EXT_color_buffer_half_float` is missing
+    ///   on this configuration. Callers should pre-probe via
+    ///   [`Self::supported_render_dtypes`].
+    ///
+    /// F32 destinations are intentionally not supported: ANGLE's
+    /// `iosurface_client_buffer` extension rejects every
+    /// `(GL_FLOAT, *)` IOSurface binding with `EGL_BAD_ATTRIBUTE`, and
+    /// HAL's `image_iosurface_layout` returns `None` for any F32
+    /// combination — so the F32 surface allocation would already have
+    /// failed before reaching this method.
+    pub fn convert_rgba8_to_planar_float(
+        &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        crop: crate::Crop,
+    ) -> Result<()> {
+        let src_u8 = src
+            .as_u8()
+            .ok_or_else(|| Error::NotSupported("source tensor must be u8 RGBA".into()))?;
+        let src_fmt = src_u8.format().ok_or_else(|| {
+            Error::InvalidShape("source tensor missing PixelFormat metadata".into())
+        })?;
+        if src_fmt != PixelFormat::Rgba {
+            return Err(Error::NotSupported(format!(
+                "convert_rgba8_to_planar_float: source format must be Rgba, got {src_fmt:?}"
+            )));
+        }
+        let src_w = src_u8
+            .width()
+            .ok_or_else(|| Error::InvalidShape("src width".into()))?;
+        let src_h = src_u8
+            .height()
+            .ok_or_else(|| Error::InvalidShape("src height".into()))?;
+
+        // Resolve the destination IOSurface up-front so the borrow on
+        // `dst` is single-arm and doesn't overlap the convert call.
+        // F16 is the only supported dtype on this path; F32 IOSurface
+        // bindings are rejected by ANGLE and never reach this method.
+        let (dst_fmt, dst_w, dst_h, dst_iosurface, dst_id) = match dst {
+            TensorDyn::F16(t) => {
+                let fmt = t.format().ok_or_else(|| {
+                    Error::InvalidShape("destination tensor missing PixelFormat metadata".into())
+                })?;
+                let w = t
+                    .width()
+                    .ok_or_else(|| Error::InvalidShape("dst width".into()))?;
+                let h = t
+                    .height()
+                    .ok_or_else(|| Error::InvalidShape("dst height".into()))?;
+                let surface = t.iosurface_ref().ok_or_else(|| {
+                    Error::NotSupported(
+                        "convert_rgba8_to_planar_float: dst is not IOSurface-backed".into(),
+                    )
+                })?;
+                let id = t.iosurface_id().unwrap_or(0);
+                (fmt, w, h, surface, id)
+            }
+            other => {
+                return Err(Error::NotSupported(format!(
+                    "convert_rgba8_to_planar_float: dst dtype must be F16, got {:?} \
+                     (F32 IOSurface bindings are not accepted by ANGLE)",
+                    other.dtype()
+                )));
+            }
+        };
+        if dst_fmt != PixelFormat::PlanarRgb {
+            return Err(Error::NotSupported(format!(
+                "convert_rgba8_to_planar_float: dst format must be PlanarRgb, got {dst_fmt:?} \
+                 (PlanarRgba would mis-render because the RGBA16F-packed shader is sized for \
+                 3 channel planes; a 4-plane variant is the right follow-up)"
+            )));
+        }
+
+        let src_iosurface = src_u8.iosurface_ref().ok_or_else(|| {
+            Error::NotSupported("convert_rgba8_to_planar_float: src is not IOSurface-backed".into())
+        })?;
+        let src_id = src_u8.iosurface_id().unwrap_or(0);
+
+        let d = shared_display()?;
+        if !d.supports_f16_color {
+            return Err(Error::NotSupported(
+                "GL_EXT_color_buffer_half_float not exposed by this ANGLE/Metal configuration — \
+                 F16 PlanarRgb IOSurface render path unavailable"
+                    .into(),
+            ));
+        }
+        let dst_dtype = DType::F16;
+
+        // Validate and resolve crop rectangles into shader uniforms.
+        // `src_rect_uv` is normalized to the source's full
+        // dimensions; `dst_rect_px` is in single-plane pixel coords.
+        // `pad_color` is normalized [0,1] from the optional u8
+        // `dst_color`. When either rect is None we paint/sample the
+        // whole image — equivalent to a no-op identity transform.
+        crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
+        let src_rect_uv = match crop.src_rect {
+            Some(r) => [
+                r.left as f32 / src_w as f32,
+                r.top as f32 / src_h as f32,
+                r.width as f32 / src_w as f32,
+                r.height as f32 / src_h as f32,
+            ],
+            None => [0.0, 0.0, 1.0, 1.0],
+        };
+        let dst_rect_px = match crop.dst_rect {
+            Some(r) => [r.left as f32, r.top as f32, r.width as f32, r.height as f32],
+            None => [0.0, 0.0, dst_w as f32, dst_h as f32],
+        };
+        let pad_color = match crop.dst_color {
+            Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+            None => [0.0, 0.0, 0.0],
+        };
+
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+
+        let src_pbuf = self.get_or_create_pbuffer(
+            d,
+            src_id,
+            src_iosurface,
+            PixelFormat::Rgba,
+            DType::U8,
+            src_w,
+            src_h,
+        )?;
+        let dst_pbuf =
+            self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, dst_dtype, dst_w, dst_h)?;
+
+        // SAFETY: GL mutex held; context current via `_current`. RAII
+        // guards release tex-image bindings on Drop even on panic.
+        unsafe {
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
+            let _src_bound = BoundTexImage::bind(d, src_pbuf)?;
+
+            // Source filter — bilinear gives smooth resize. The
+            // PlanarRgb destination is RGBA16F-packed (4 contiguous
+            // f16 planar elements per fragment); linear filtering on
+            // the source RGBA8 texture is unconditionally supported.
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MIN_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+            gls::gl::TexParameteri(
+                gls::gl::TEXTURE_2D,
+                gls::gl::TEXTURE_MAG_FILTER,
+                gls::gl::LINEAR as i32,
+            );
+
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.dst_tex);
+            let _dst_bound = BoundTexImage::bind(d, dst_pbuf)?;
+            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.fbo);
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.dst_tex,
+                0,
+            );
+            let fbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
+            if fbo_status != gls::gl::FRAMEBUFFER_COMPLETE {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "{dst_dtype:?} PlanarRgb FBO incomplete: 0x{fbo_status:x} — \
+                     likely missing float color-buffer extension at runtime"
+                ))));
+            }
+
+            // Packed RGBA16F surface is sized (W/4, 3*H) — each
+            // pixel holds 4 contiguous f16 elements of the planar
+            // tensor's [3, H, W] byte stream. Viewport covers the
+            // full surface so the fragment shader visits every
+            // packed pixel.
+            let surface_w = (dst_w / 4) as i32;
+            let surface_h = (dst_h * 3) as i32;
+            gls::gl::Viewport(0, 0, surface_w, surface_h);
+            gls::gl::UseProgram(self.program_rgba8_to_planar_f16);
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
+            gls::gl::Uniform1i(self.uniform_rgba8_to_planar_f16_src, 0);
+            gls::gl::Uniform2f(
+                self.uniform_rgba8_to_planar_f16_dst_size,
+                dst_w as f32,
+                dst_h as f32,
+            );
+            gls::gl::Uniform4f(
+                self.uniform_rgba8_to_planar_f16_src_rect_uv,
+                src_rect_uv[0],
+                src_rect_uv[1],
+                src_rect_uv[2],
+                src_rect_uv[3],
+            );
+            gls::gl::Uniform4f(
+                self.uniform_rgba8_to_planar_f16_dst_rect_px,
+                dst_rect_px[0],
+                dst_rect_px[1],
+                dst_rect_px[2],
+                dst_rect_px[3],
+            );
+            gls::gl::Uniform3f(
+                self.uniform_rgba8_to_planar_f16_pad_color,
+                pad_color[0],
+                pad_color[1],
+                pad_color[2],
+            );
+            gls::gl::BindVertexArray(self.vao);
+            gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
+            gls::gl::Finish();
+        }
+        Ok(())
+    }
+
+    /// Report which float dtypes the underlying ANGLE/Metal display
+    /// can render to as IOSurface color attachments. Probes are run
+    /// once at process-global display init (cheap to call repeatedly).
+    pub fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
+        match shared_display() {
+            Ok(d) => crate::RenderDtypeSupport {
+                f32: d.supports_f32_color,
+                f16: d.supports_f16_color,
+            },
+            // The display failed to initialise; the GL backend itself
+            // would be unusable in that case, so report no float
+            // support to keep callers on the CPU fallback path.
+            Err(_) => crate::RenderDtypeSupport::default(),
+        }
+    }
+
     /// Whether the requested conversion is supported by the GL backend.
     /// Used by `ImageProcessor::convert` to decide whether to dispatch
     /// here or fall back to CPU.
     ///
-    /// Only `YUYV → RGBA` is implemented today. `YUYV → BGRA` is
-    /// deliberately *not* in this set even though the IOSurface
-    /// FourCC `'BGRA'` is supported by ANGLE — the current shader
-    /// writes `vec4(r, g, b, 1.0)`, which lands as RGBA bytes in the
-    /// CPU readback regardless of FourCC. A dedicated BGRA shader
-    /// (writing `vec4(b, g, r, 1.0)`) needs to land before we widen
-    /// the support set.
+    /// Supported conversions:
+    /// * `YUYV → RGBA` — original GL fast path.
+    /// * `RGBA → PlanarRgb` (F16 only via dispatch) — the IOSurface
+    ///   render path for ONNX/CoreML zero-copy preprocessing.
+    ///
+    /// Not in the set:
+    /// * `YUYV → BGRA` — the current shader writes `vec4(r, g, b, 1.0)`,
+    ///   which lands as RGBA bytes in CPU readback regardless of
+    ///   IOSurface FourCC. A dedicated BGRA shader (writing
+    ///   `vec4(b, g, r, 1.0)`) needs to land before we widen.
+    /// * `RGBA → PlanarRgba` — the RGBA16F-packed shader and viewport
+    ///   are sized for 3 channel planes (`dst_h * 3`). PlanarRgba is
+    ///   correctly allocated as a 4-plane IOSurface by
+    ///   `image_iosurface_layout`, but the convert would leave the
+    ///   alpha plane uninitialised. Adding a 4-plane shader variant
+    ///   is the right follow-up; until then PlanarRgba dispatches to
+    ///   CPU rather than misrendering.
     pub fn supports(src_fmt: PixelFormat, dst_fmt: PixelFormat) -> bool {
-        matches!((src_fmt, dst_fmt), (PixelFormat::Yuyv, PixelFormat::Rgba))
+        matches!(
+            (src_fmt, dst_fmt),
+            (PixelFormat::Yuyv, PixelFormat::Rgba) | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
+        )
     }
 
     /// The actual conversion path. Caller guarantees `supports(src_fmt, dst_fmt)`.
@@ -668,10 +1051,13 @@ impl MacosGlProcessor {
         // Look up (or create) the source/dest pbuffers in the cache.
         // Cache miss path calls `eglCreatePbufferFromClientBuffer` and
         // inserts; cache hit returns the existing surface.
+        // The src/dst as_u8/as_u8_mut checks above mean both tensors
+        // are u8 today. Float-dtype rendering routes through the
+        // separate `convert_rgba8_to_planar_float` call site.
         let src_pbuf =
-            self.get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, src_w, src_h)?;
+            self.get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, DType::U8, src_w, src_h)?;
         let dst_pbuf =
-            self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, dst_w, dst_h)?;
+            self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, DType::U8, dst_w, dst_h)?;
 
         // SAFETY: GL mutex held; context current via `_current`. Each
         // pbuffer's tex-image binding is owned by a `BoundTexImage` RAII
@@ -727,18 +1113,26 @@ impl MacosGlProcessor {
     /// IOSurfaceID `0` is treated as un-cacheable: it's the sentinel
     /// returned by `iosurface_id()` when the tensor's IOSurface backing
     /// is somehow malformed (shouldn't happen but the path stays sound).
+    //
+    // Eight args is one over clippy's default; every one is needed
+    // (display state, identity, raw ref, image shape, and dtype for
+    // the cache key). Bundling them into a struct would just move the
+    // verbosity to the call sites without gaining clarity.
+    #[allow(clippy::too_many_arguments)]
     fn get_or_create_pbuffer(
         &self,
         d: &SharedAngleDisplay,
         iosurface_id: u32,
         surface_ref: *mut c_void,
         format: PixelFormat,
+        dtype: DType,
         width: usize,
         height: usize,
     ) -> Result<egl::Surface> {
         let key = PbufferCacheKey {
             iosurface_id,
             format_disc: pixel_format_discriminant(format),
+            dtype_disc: dtype as u8,
         };
         if iosurface_id != 0 {
             let cache = self.pbuf_cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -755,6 +1149,7 @@ impl MacosGlProcessor {
                 d.config,
                 surface_ref,
                 format,
+                dtype,
                 width,
                 height,
             )?
@@ -801,6 +1196,7 @@ impl Drop for MacosGlProcessor {
             gls::gl::DeleteBuffers(1, &self.vbo);
             gls::gl::DeleteVertexArrays(1, &self.vao);
             gls::gl::DeleteProgram(self.program_yuyv_to_rgba);
+            gls::gl::DeleteProgram(self.program_rgba8_to_planar_f16);
             // Shared EGL display/context/dummy_pbuffer outlive every
             // processor instance and are never destroyed — see the
             // module docstring for why.
@@ -823,11 +1219,6 @@ impl ImageProcessorTrait for MacosGlProcessor {
                     .into(),
             ));
         }
-        if crop.src_rect.is_some() || crop.dst_rect.is_some() {
-            return Err(Error::NotImplemented(
-                "MacosGlProcessor: crop not yet supported; CPU fallback handles this".into(),
-            ));
-        }
         let (src_fmt, dst_fmt) = match (src.format(), dst.format()) {
             (Some(s), Some(d)) => (s, d),
             _ => {
@@ -841,7 +1232,48 @@ impl ImageProcessorTrait for MacosGlProcessor {
                 "MacosGlProcessor: {src_fmt:?} → {dst_fmt:?} not in the initial GL coverage set"
             )));
         }
-        self.convert_yuyv_to_rgba(src, dst, src_fmt, dst_fmt)
+        // The float render-path decision is named once for every platform by
+        // `gl::float_dispatch::FloatRenderPath`; the F16 arm below corresponds
+        // to `FloatRenderPath::IoSurfaceF16Nchw`. It is NOT routed through the
+        // shared `classify_float_render` because (a) a macOS IOSurface tensor
+        // reports `TensorMemory::Dma` (the IOSurface backing shares the `Dma`
+        // slot), so the classifier cannot distinguish it from a Linux DMA-BUF
+        // destination, and (b) this match also dispatches the non-float YUYV
+        // path and a format-specific F16-required error that are not part of
+        // the float decision. Converging it onto the classifier would be a
+        // non-mechanical rewrite of working, ANGLE-tested code we cannot
+        // compile or exercise on the Linux host; the inline match is retained
+        // deliberately. See `gl::float_dispatch` for the shared definition.
+        match (src_fmt, dst_fmt, dst.dtype()) {
+            // Zero-copy preprocessing path: RGBA8 → PlanarRgb F16 via
+            // RGBA16F-packed IOSurface. F32 is intentionally NOT in the
+            // set — ANGLE's `iosurface_client_buffer` extension rejects
+            // every `(GL_FLOAT, *)` pair with `EGL_BAD_ATTRIBUTE`, so
+            // F32 IOSurface allocation also fails upstream in
+            // `image_iosurface_layout`. PlanarRgba is excluded for the
+            // reasons documented on `supports()`.
+            (PixelFormat::Rgba, PixelFormat::PlanarRgb, DType::F16) => {
+                self.convert_rgba8_to_planar_float(src, dst, crop)
+            }
+            (PixelFormat::Rgba, PixelFormat::PlanarRgb, other) => {
+                Err(Error::NotSupported(format!(
+                    "MacosGlProcessor: Rgba → PlanarRgb requires F16 destination on the \
+                     IOSurface fast path (got {other:?}). F32 IOSurface bindings are not \
+                     accepted by ANGLE; export the model with F16 inputs or fall back to \
+                     a CPU stage."
+                )))
+            }
+            _ => {
+                if crop.src_rect.is_some() || crop.dst_rect.is_some() {
+                    return Err(Error::NotImplemented(
+                        "MacosGlProcessor: crop not yet supported for YUYV→RGBA; \
+                         CPU fallback handles this"
+                            .into(),
+                    ));
+                }
+                self.convert_yuyv_to_rgba(src, dst, src_fmt, dst_fmt)
+            }
+        }
     }
 
     fn draw_decoded_masks(

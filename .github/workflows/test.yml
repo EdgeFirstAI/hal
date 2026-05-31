@@ -321,7 +321,9 @@ jobs:
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
         with:
           toolchain: ${{ env.RUST_STABLE_VERSION }}
-          components: clippy, rustfmt
+          # llvm-tools-preview supplies the profdata/cov tooling cargo-llvm-cov
+          # needs to turn the instrumented run into an LCOV report.
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
@@ -330,10 +332,10 @@ jobs:
           cache-on-failure: true
           cache-bin: false  # Prevent overwriting rustup cargo shim with stale cached binary
 
-      - name: Install cargo-nextest
+      - name: Install cargo tools
         uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,cargo-llvm-cov@0.6.16
 
       - name: Install ANGLE (Homebrew tap) and re-sign dylibs
         # ANGLE provides the libEGL.dylib + libGLESv2.dylib that
@@ -358,7 +360,7 @@ jobs:
         # Exclude Linux-only crates (gpu-probe, edgefirst-bench) that depend on DMA, EGL, DRM
         run: cargo clippy --workspace --all-targets --exclude gpu-probe --exclude edgefirst-bench -- -D warnings
 
-      - name: Run Rust tests
+      - name: Run Rust tests with coverage
         # scripts/test-macos.sh builds with --tests, signs every binary
         # with entitlements.plist (disables library validation so dlopen
         # of ad-hoc-signed ANGLE works on Tahoe), then forwards to
@@ -366,6 +368,15 @@ jobs:
         # `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
         # so we only add the runner-specific `-j 1` here. Without the
         # sign step the GL tests SIGKILL and silently skip.
+        #
+        # COVERAGE=1 instruments the build via cargo-llvm-cov (show-env), so
+        # the codesign step stays between build and run — this is what lets
+        # the macOS lane cover the ANGLE/IOSurface F16 GL render path that no
+        # other coverage lane exercises (x86 is headless; imx8mp/Vivante
+        # disables float GL).
+        env:
+          COVERAGE: "1"
+          COV_LCOV: target/coverage_rust.lcov
         run: |
           ./scripts/test-macos.sh -j 1 \
             2>&1 | tee target/test-metrics-rust-macos.txt
@@ -379,6 +390,17 @@ jobs:
           cd crates/capi/tests
           make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
 
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          # Picked up automatically by the sonarcloud job, which globs every
+          # coverage-*/**.lcov into -Dsonar.rust.lcov.reportPaths.
+          name: coverage-macos
+          path: |
+            target/coverage_rust.lcov
+          retention-days: 30
+
       - name: Upload test results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
@@ -387,6 +409,105 @@ jobs:
           path: |
             target/nextest/default/test-results.xml
             target/test-metrics-*-macos.txt
+          retention-days: 30
+
+  # ===========================================================================
+  # Software-GL coverage (Mesa llvmpipe)
+  #
+  # Exercises the Linux GL float *render* path (gl/processor/float.rs PBO
+  # readback: upload_float_src / draw_float_quad / convert_float_to_pbo) with
+  # no GPU. `EDGEFIRST_ALLOW_SOFTWARE_GL=1` opts past the normal software-
+  # renderer rejection, and llvmpipe runs the same GLSL so the float PBO
+  # roundtrip value-checks are numerically valid. The DMA-BUF path
+  # (convert_float_to_dma) still needs real V3D/Mali and is not covered here.
+  #
+  # Bonus-coverage only — never a test gate: every test step is best-effort
+  # (`|| true`, `--no-fail-fast`), so if the surfaceless EGL display does not
+  # come up (GL tests then self-skip) or a GL test misbehaves on llvmpipe, the
+  # job still succeeds and uploads whatever coverage it collected. The x86 /
+  # macOS / hardware lanes remain the authoritative test gates.
+  # ===========================================================================
+  software-gl-coverage:
+    name: Software-GL Coverage (llvmpipe)
+    runs-on: ubuntu-22.04-xlarge
+    needs: checkout-lfs
+    permissions:
+      contents: read
+    env:
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      EGL_PLATFORM: surfaceless
+      EDGEFIRST_ALLOW_SOFTWARE_GL: '1'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          lfs: false  # LFS files downloaded separately
+
+      - name: Download LFS testdata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: testdata-lfs
+          path: testdata/
+
+      - name: Install Mesa llvmpipe (software OpenGL ES + EGL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dri libegl1 libegl-mesa0 libgles2 mesa-utils-extra
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          components: llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-x86_64
+          cache-on-failure: true
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@e1c4cd42111751368541a7cb5db3522bd1f846a4  # v2.78.0
+        with:
+          tool: cargo-llvm-cov@0.6.16,cargo-nextest
+
+      - name: Probe software-GL bring-up (diagnostic, non-fatal)
+        run: |
+          echo "=== eglinfo ==="
+          eglinfo -B 2>&1 | head -50 || true
+          echo "=== HAL gpu-probe (does the GL context come up on llvmpipe?) ==="
+          cargo run -p gpu-probe -- --probe-only 2>&1 | head -60 || true
+
+      - name: Run image GL tests under coverage (Mesa llvmpipe)
+        run: |
+          # Single-threaded is mandatory for the image crate (GL_MUTEX). The
+          # float PBO roundtrips run here when the llvmpipe context comes up;
+          # best-effort so a software-GL hiccup never fails CI.
+          #
+          # The `*_no_bleed_gl` crop tests assert tight per-pixel boundaries
+          # that depend on the GPU's exact texture-sampling/rounding; llvmpipe's
+          # software sampler differs slightly, so they fail here while passing
+          # on every real-GPU lane (macOS/ANGLE, V3D, Mali). Exclude them on
+          # this lane only — they remain covered by the GPU lanes — so a real
+          # regression here is not masked by known software-sampler noise.
+          cargo llvm-cov nextest -p edgefirst-image --features default \
+            --no-fail-fast -j 1 \
+            -E 'not test(~no_bleed_gl)' \
+            --lcov --output-path target/coverage_rust.lcov \
+            --ignore-filename-regex '(\.cargo|/rustc/|/target/)' \
+            2>&1 | tee target/test-metrics-software-gl.txt || true
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          # Globbed into the SonarCloud scan alongside the other coverage-*.
+          name: coverage-software-gl
+          path: |
+            target/coverage_rust.lcov
+            target/test-metrics-software-gl.txt
           retention-days: 30
 
   # ===========================================================================
@@ -1103,7 +1224,7 @@ jobs:
   # ===========================================================================
   sonarcloud:
     name: SonarCloud Analysis
-    needs: [doc-tests, build-and-test-x86, build-and-test-macos, test-arm, process-hardware-coverage]
+    needs: [doc-tests, build-and-test-x86, build-and-test-macos, software-gl-coverage, test-arm, process-hardware-coverage]
     runs-on: ubuntu-22.04
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:

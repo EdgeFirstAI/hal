@@ -3268,4 +3268,774 @@ mod gl_tests {
             );
         }
     }
+
+    // ── float_render_support unit tests ─────────────────────────────────────
+    // These are pure-logic tests; no GPU is required.
+
+    #[test]
+    fn vivante_disables_gl_float() {
+        use super::super::processor::float_render_support;
+        use crate::RenderDtypeSupport;
+        let s = float_render_support(true, true, true);
+        assert_eq!(
+            s,
+            RenderDtypeSupport {
+                f32: false,
+                f16: false
+            }
+        );
+    }
+
+    #[test]
+    fn non_vivante_reports_float_when_ext_present() {
+        use super::super::processor::float_render_support;
+        use crate::RenderDtypeSupport;
+        let s = float_render_support(false, true, true);
+        assert_eq!(
+            s,
+            RenderDtypeSupport {
+                f32: true,
+                f16: true
+            }
+        );
+    }
+
+    #[test]
+    fn no_ext_means_no_float() {
+        use super::super::processor::float_render_support;
+        use crate::RenderDtypeSupport;
+        let s = float_render_support(false, false, false);
+        assert_eq!(
+            s,
+            RenderDtypeSupport {
+                f32: false,
+                f16: false
+            }
+        );
+    }
+
+    // ── float_pbo_eligible unit tests ────────────────────────────────────────
+    // Pure-logic predicate; no GPU required. Linux-only: `float_pbo_eligible`
+    // is gated to the Linux GL backend (macOS uses IOSurface, not float PBO),
+    // so the symbol does not exist on macOS builds.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn float_pbo_eligibility() {
+        use crate::{float_pbo_eligible, RenderDtypeSupport};
+        use edgefirst_tensor::DType;
+
+        let yes = RenderDtypeSupport {
+            f32: true,
+            f16: true,
+        };
+        let no = RenderDtypeSupport {
+            f32: false,
+            f16: false,
+        };
+        assert!(float_pbo_eligible(DType::F16, yes));
+        assert!(float_pbo_eligible(DType::F32, yes));
+        assert!(!float_pbo_eligible(DType::F16, no));
+        assert!(!float_pbo_eligible(DType::U8, yes));
+    }
+
+    // ── packed F32 NHWC shader source well-formedness ────────────────────────
+    // Pure string inspection; no GPU required.
+
+    #[test]
+    fn packed_f32_nhwc_shader_source_wellformed() {
+        use super::super::shaders::generate_packed_f32_nhwc_shader;
+        let s = generate_packed_f32_nhwc_shader();
+        assert!(s.contains("#version 300 es"));
+        assert!(s.contains("frag_value"));
+        assert!(s.contains("% 3")); // channel = x % 3
+        assert!(s.contains("src_rect_uv"));
+        assert!(s.contains("dst_rect_px"));
+        assert!(s.contains("pad_color"));
+    }
+
+    // ── RGBA16F-packed PlanarRgb F16 shader source well-formedness ──────────
+    // Pure string inspection; no GPU required.
+
+    #[test]
+    fn planar_rgb_f16_packed_shader_source_wellformed() {
+        use super::super::shaders::generate_planar_rgb_f16_packed_shader;
+        let s = generate_planar_rgb_f16_packed_shader();
+        assert!(s.contains("#version 300 es"));
+        assert!(s.contains("src_rect_uv"));
+        assert!(s.contains("dst_rect_px"));
+        assert!(s.contains("pad_color"));
+        assert!(s.contains("sample_planar_element"));
+        assert!(s.contains("vec4(e0, e1, e2, e3)"));
+    }
+
+    // ── classify_float_render unit tests ────────────────────────────────────
+    // Pure-logic classifier; no GPU required.
+
+    #[test]
+    fn dispatch_hailo_f32_pbo() {
+        use super::super::processor::{classify_float_render, FloatRenderPath};
+        use crate::RenderDtypeSupport;
+        let s = RenderDtypeSupport {
+            f32: true,
+            f16: true,
+        };
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                DType::F32,
+                TensorMemory::Pbo,
+                s
+            ),
+            FloatRenderPath::PboF32Nhwc
+        );
+    }
+
+    #[test]
+    fn dispatch_orin_f16_pbo() {
+        use super::super::processor::{classify_float_render, FloatRenderPath};
+        use crate::RenderDtypeSupport;
+        let s = RenderDtypeSupport {
+            f32: true,
+            f16: true,
+        };
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Pbo,
+                s
+            ),
+            FloatRenderPath::PboF16Nchw
+        );
+    }
+
+    #[test]
+    fn dispatch_f16_dma() {
+        use super::super::processor::{classify_float_render, FloatRenderPath};
+        use crate::RenderDtypeSupport;
+        let s = RenderDtypeSupport {
+            f32: true,
+            f16: true,
+        };
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                TensorMemory::Dma,
+                s
+            ),
+            FloatRenderPath::DmaF16Nchw
+        );
+    }
+
+    #[test]
+    fn dispatch_f32_dma_is_none() {
+        use super::super::processor::{classify_float_render, FloatRenderPath};
+        use crate::RenderDtypeSupport;
+        let s = RenderDtypeSupport {
+            f32: true,
+            f16: true,
+        };
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                DType::F32,
+                TensorMemory::Dma,
+                s
+            ),
+            FloatRenderPath::None
+        );
+    }
+
+    #[test]
+    fn dispatch_no_support_is_none() {
+        use super::super::processor::{classify_float_render, FloatRenderPath};
+        use crate::RenderDtypeSupport;
+        let s = RenderDtypeSupport {
+            f32: false,
+            f16: false,
+        };
+        assert_eq!(
+            classify_float_render(
+                PixelFormat::Rgba,
+                PixelFormat::Rgb,
+                DType::F32,
+                TensorMemory::Pbo,
+                s
+            ),
+            FloatRenderPath::None
+        );
+    }
+
+    // ── dma_f16_packed_layout unit tests ────────────────────────────────────
+    // Pure geometry helper; no GPU required.
+
+    #[test]
+    fn dma_f16_layout_640x640() {
+        use super::super::processor::dma_f16_packed_layout;
+        // Logical [3,640,640] f16 → packed RGBA16F surface (160, 1920),
+        // pitch (640/4)*8 = 1280 bytes.
+        assert_eq!(dma_f16_packed_layout(640, 640), Some((160, 1920, 1280)));
+    }
+
+    #[test]
+    fn dma_f16_layout_non_multiple_of_4_rejected() {
+        use super::super::processor::dma_f16_packed_layout;
+        // W not divisible by 4 cannot be packed into whole RGBA16F texels.
+        assert_eq!(dma_f16_packed_layout(642, 640), None);
+    }
+
+    #[test]
+    fn dma_f16_layout_rectangular() {
+        use super::super::processor::dma_f16_packed_layout;
+        // Non-square, W divisible by 4: surface (320/4, 3*240), pitch (80)*8.
+        assert_eq!(dma_f16_packed_layout(320, 240), Some((80, 720, 640)));
+    }
+
+    /// On-GPU round-trip: RGBA8 → F32 NHWC `[H,W,3]` PBO via the GL float
+    /// render path. Forces the OpenGL backend (no CPU fallback) so the test
+    /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
+    /// the expected values are exact: `dst[y,x,c] == src[y,x,c] / 255`.
+    #[test]
+    fn convert_f32_nhwc_pbo_roundtrip() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        // Force the OpenGL backend so a NotSupported from the GL float path
+        // surfaces as a hard error instead of being masked by CPU fallback.
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            return;
+        }
+
+        let w = 64usize;
+        let h = 64usize;
+
+        // RGBA8 source PBO with a known gradient.
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if src.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            return;
+        }
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    map[i] = (x * 4) as u8;
+                    map[i + 1] = (y * 4) as u8;
+                    map[i + 2] = 128;
+                    map[i + 3] = 255;
+                }
+            }
+        }
+
+        // F32 Rgb PBO destination, same WxH (logical [H,W,3]).
+        let mut dst = proc
+            .create_image(w, h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            return;
+        }
+
+        // Run two converts on the same processor/source/dest so the second
+        // iteration exercises the texture size/format-cache reuse path (the
+        // float render target and PBO source texture are NOT reallocated on the
+        // 2nd call). Correctness must hold identically across both iterations.
+        let mut max_err = 0.0f32;
+        for iter in 0..2 {
+            proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+
+            let map = dst.as_f32().unwrap().map().unwrap();
+            assert_eq!(map.len(), w * h * 3);
+            for y in 0..h {
+                for x in 0..w {
+                    let expect = [
+                        (x * 4) as f32 / 255.0,
+                        (y * 4) as f32 / 255.0,
+                        128.0 / 255.0,
+                    ];
+                    for c in 0..3 {
+                        let got = map[(y * w + x) * 3 + c];
+                        let err = (got - expect[c]).abs();
+                        max_err = max_err.max(err);
+                        assert!(
+                            err < 1e-3,
+                            "f32 dst[{y},{x},{c}]={got} expected {} (err {err}) iter {iter}",
+                            expect[c]
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("convert_f32_nhwc_pbo_roundtrip: max_err={max_err} tol=1e-3 (2 iters)");
+    }
+
+    /// On-GPU resize: RGBA8 16x16 → F32 NHWC `[H,W,3]` PBO at 8x8 (2x
+    /// downscale, identity crop). The source R channel is a linear horizontal
+    /// ramp `R(x) = x * 16`, so the correct bilinear-resampled output at dst
+    /// pixel `dx` samples src at `x_src = (dx + 0.5) * 2 - 0.5 = 2*dx + 0.5`,
+    /// giving value `(2*dx + 0.5) * 16` normalized by `/255`. This value is
+    /// distinct from NEAREST (which would land on a single integer texel,
+    /// `2*dx * 16`), so the test discriminates bilinear vs NEAREST sampling.
+    #[test]
+    fn convert_f32_nhwc_pbo_resize_bilinear() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            return;
+        }
+
+        let sw = 16usize;
+        let sh = 16usize;
+        let dw = 8usize;
+        let dh = 8usize;
+
+        // RGBA8 source PBO: horizontal ramp R = x*16, G = y*16, B const.
+        let src = proc
+            .create_image(sw, sh, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if src.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            return;
+        }
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            for y in 0..sh {
+                for x in 0..sw {
+                    let i = (y * sw + x) * 4;
+                    map[i] = (x * 16) as u8;
+                    map[i + 1] = (y * 16) as u8;
+                    map[i + 2] = 64;
+                    map[i + 3] = 255;
+                }
+            }
+        }
+
+        // F32 Rgb PBO destination at the downscaled size (logical [dh,dw,3]).
+        let mut dst = proc
+            .create_image(dw, dh, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            return;
+        }
+
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+
+        let map = dst.as_f32().unwrap().map().unwrap();
+        assert_eq!(map.len(), dw * dh * 3);
+        // Bilinear: src sample position = (d + 0.5) * 2 - 0.5 = 2*d + 0.5.
+        // Edge dst pixels (d=0 sampling x_src=0.5, last d sampling beyond the
+        // last center) stay interior here: for dw=8, max x_src = 2*7+0.5=14.5,
+        // which is < 15 (last src column), so no clamping affects the ramp.
+        let tol = 2e-3f32;
+        let mut max_err = 0.0f32;
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let x_src = 2.0 * dx as f32 + 0.5;
+                let y_src = 2.0 * dy as f32 + 0.5;
+                let expect = [(x_src * 16.0) / 255.0, (y_src * 16.0) / 255.0, 64.0 / 255.0];
+                for c in 0..3 {
+                    let got = map[(dy * dw + dx) * 3 + c];
+                    let err = (got - expect[c]).abs();
+                    max_err = max_err.max(err);
+                    assert!(
+                        err < tol,
+                        "f32 resize dst[{dy},{dx},{c}]={got} expected {} (err {err})",
+                        expect[c]
+                    );
+                }
+            }
+        }
+        eprintln!("convert_f32_nhwc_pbo_resize_bilinear: max_err={max_err} tol={tol}");
+    }
+
+    /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` PBO via the GL float
+    /// render path. Forces the OpenGL backend (no CPU fallback). Identity
+    /// crop so `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
+    /// (`2^-8`).
+    #[test]
+    fn convert_f16_nchw_pbo_roundtrip() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+        use half::f16;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        if !proc.supported_render_dtypes().f16 {
+            eprintln!("SKIPPED: {} - F16 render not supported", function!());
+            return;
+        }
+
+        let w = 64usize;
+        let h = 64usize;
+
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if src.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            return;
+        }
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    map[i] = (x * 4) as u8;
+                    map[i + 1] = (y * 4) as u8;
+                    map[i + 2] = 128;
+                    map[i + 3] = 255;
+                }
+            }
+        }
+
+        // F16 PlanarRgb PBO destination, logical [3,H,W].
+        let mut dst = proc
+            .create_image(w, h, PixelFormat::PlanarRgb, DType::F16, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - F16 dst not PBO-backed", function!());
+            return;
+        }
+
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+
+        let map = dst.as_f16().unwrap().map().unwrap();
+        assert_eq!(map.len(), 3 * w * h);
+        let tol = 2.0f32.powi(-8);
+        let mut max_err = 0.0f32;
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let expect = match c {
+                        0 => (x * 4) as f32 / 255.0,
+                        1 => (y * 4) as f32 / 255.0,
+                        _ => 128.0 / 255.0,
+                    };
+                    let got: f32 = map[(c * h + y) * w + x].to_f32();
+                    let err = (got - expect).abs();
+                    max_err = max_err.max(err);
+                    assert!(
+                        err < tol,
+                        "f16 dst[{c},{y},{x}]={got} expected {expect} (err {err})"
+                    );
+                }
+            }
+        }
+        let _ = f16::from_f32(0.0); // silence unused import on configs without asserts
+        eprintln!("convert_f16_nchw_pbo_roundtrip: max_err={max_err} tol={tol}");
+    }
+
+    /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` DMA-BUF via the GL
+    /// float render path (`convert_float_to_dma`). Forces the OpenGL backend
+    /// (no CPU fallback) so any GL-path failure surfaces as a hard error
+    /// instead of being silently masked. Identity crop, so the expected values
+    /// are exact: `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
+    /// (`2^-8`).
+    ///
+    /// Skip conditions (treated as pass):
+    /// 1. GL unavailable, or F16 render not supported (e.g. Vivante).
+    /// 2. `create_image(..., Dma)` returns `Err` — no dma-heap (e.g. dev host,
+    ///    Orin-nano with permission-denied).
+    /// 3. The created tensor's `.memory()` is not `TensorMemory::Dma` — it
+    ///    fell back; only the real DMA path is of interest here.
+    ///
+    /// Runs on V3D/Mali targets where dma-heap and GL F16 render are both
+    /// available.
+    #[test]
+    fn convert_f16_nchw_dma_roundtrip() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+        use half::f16;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        // Force the OpenGL backend so a GL path error (e.g. from
+        // convert_float_to_dma) surfaces as Err instead of falling through
+        // to the CPU backend.
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        if !proc.supported_render_dtypes().f16 {
+            eprintln!(
+                "SKIPPED: {} - F16 render not supported (Vivante?)",
+                function!()
+            );
+            return;
+        }
+
+        // Use a representative size: small dma-buf imports hit per-fourcc
+        // minimum-size limits on some GPUs (Mali rejects a tiny (W/4, 3H)
+        // RGBA16F surface), so 16x16 is unrepresentative. 256x256 matches the
+        // gpu-probe's validated F16 dma-buf size and the real preprocessing
+        // regime; sizes the GPU cannot import fall back to CPU in production.
+        let w = 256usize;
+        let h = 256usize;
+
+        // RGBA8 source with a known gradient (W%4==0 so f16 packing is valid).
+        let src = proc
+            .create_image(w, h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) * 4;
+                    map[i] = ((x * 255) / w) as u8;
+                    map[i + 1] = ((y * 255) / h) as u8;
+                    map[i + 2] = 128;
+                    map[i + 3] = 255;
+                }
+            }
+        }
+
+        // F16 PlanarRgb DMA-BUF destination, logical [3,H,W].
+        // Skip if dma-heap is unavailable (permission-denied on dev host).
+        let mut dst = match proc.create_image(
+            w,
+            h,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} - F16 DMA tensor alloc failed (no dma-heap?): {e}",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        // Confirm the tensor is genuinely DMA-backed — skip if the allocator
+        // fell back to a different memory type.
+        if dst.memory() != TensorMemory::Dma {
+            eprintln!(
+                "SKIPPED: {} - F16 dst memory is {:?}, not Dma; DMA path not exercised",
+                function!(),
+                dst.memory()
+            );
+            return;
+        }
+
+        proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+
+        let map = dst.as_f16().unwrap().map().unwrap();
+        assert_eq!(map.len(), 3 * w * h);
+        let tol = 2.0f32.powi(-8);
+        let mut max_err = 0.0f32;
+        for c in 0..3 {
+            for y in 0..h {
+                for x in 0..w {
+                    let expect = match c {
+                        0 => ((x * 255) / w) as f32 / 255.0,
+                        1 => ((y * 255) / h) as f32 / 255.0,
+                        _ => 128.0 / 255.0,
+                    };
+                    let got: f32 = map[(c * h + y) * w + x].to_f32();
+                    let err = (got - expect).abs();
+                    max_err = max_err.max(err);
+                    assert!(
+                        err < tol,
+                        "f16 dma dst[{c},{y},{x}]={got} expected {expect} (err {err})"
+                    );
+                }
+            }
+        }
+        let _ = f16::from_f32(0.0); // silence unused import on configs without asserts
+        eprintln!("convert_f16_nchw_dma_roundtrip: max_err={max_err} tol={tol}");
+    }
+
+    /// GAP-3: F32 Rgb PBO destination with a `dst_rect` letterbox and
+    /// `dst_color` pad.  Exercises the `src_rect_uv` / `dst_rect_px` /
+    /// `pad_color` shader uniforms that had no test coverage.
+    ///
+    /// Setup:
+    /// - src: 4x4 RGBA8 all-solid known color (R=200, G=100, B=50, A=255)
+    /// - dst: 8x4 F32 Rgb PBO
+    /// - `dst_rect = (left:2, top:0, w:4, h:4)` → the middle 4 columns carry
+    ///   the content; the outer 2+2 columns are filled with the pad color.
+    /// - `dst_color = [114, 114, 114, 255]` (standard letterbox grey)
+    ///
+    /// Assertions:
+    /// - Pixels OUTSIDE dst_rect → ≈ 114/255 on all three channels (pad grey)
+    /// - Pixels INSIDE dst_rect  → finite & in `[0, 1]`, representing the
+    ///   content (exact normalization is GPU-dependent; we just need non-zero
+    ///   and in-range)
+    #[test]
+    fn convert_f32_pbo_letterbox_pad_color() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig, Rect};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIPPED: {} - F32 render not supported", function!());
+            return;
+        }
+
+        let src_w = 4usize;
+        let src_h = 4usize;
+        let dst_w = 8usize;
+        let dst_h = 4usize;
+
+        // RGBA8 source: solid known colour (R=200, G=100, B=50).
+        let src = proc
+            .create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if src.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - RGBA8 src not PBO-backed", function!());
+            return;
+        }
+        {
+            let mut map = src.as_u8().unwrap().map().unwrap();
+            for chunk in map.chunks_exact_mut(4) {
+                chunk[0] = 200;
+                chunk[1] = 100;
+                chunk[2] = 50;
+                chunk[3] = 255;
+            }
+        }
+
+        // F32 Rgb PBO destination (wider than src to create a letterbox).
+        let mut dst = proc
+            .create_image(dst_w, dst_h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIPPED: {} - F32 dst not PBO-backed", function!());
+            return;
+        }
+
+        // Letterbox: content lands in columns [2, 6); columns [0, 2) and
+        // [6, 8) are padded with the `dst_color`.
+        let crop = Crop::new()
+            .with_dst_rect(Some(Rect::new(2, 0, 4, 4)))
+            .with_dst_color(Some([114, 114, 114, 255]));
+
+        let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
+        assert!(
+            result.is_ok(),
+            "F32 PBO letterbox convert must not error: {:?}",
+            result.err()
+        );
+
+        let map = dst.as_f32().unwrap().map().unwrap();
+        assert_eq!(map.len(), dst_w * dst_h * 3, "unexpected element count");
+
+        let pad_expected = 114.0f32 / 255.0;
+        let pad_tol = 4.0 / 255.0; // generous: GPU blend precision
+
+        // Columns 0 and 1 are outside dst_rect → should carry the pad color.
+        for row in 0..dst_h {
+            for col in [0usize, 1usize, 6usize, 7usize] {
+                let base = (row * dst_w + col) * 3;
+                for c in 0..3 {
+                    let v = map[base + c];
+                    assert!(
+                        (v - pad_expected).abs() < pad_tol,
+                        "pad pixel ({row},{col}) ch{c}={v} expected ≈{pad_expected} (tol {pad_tol})"
+                    );
+                }
+            }
+        }
+
+        // Columns 2..6 are inside dst_rect → content, finite & in [0, 1].
+        for row in 0..dst_h {
+            for col in 2..6usize {
+                let base = (row * dst_w + col) * 3;
+                for c in 0..3 {
+                    let v = map[base + c];
+                    assert!(
+                        v.is_finite() && (0.0..=1.0).contains(&v),
+                        "content pixel ({row},{col}) ch{c}={v} is not finite or not in [0,1]"
+                    );
+                }
+            }
+        }
+
+        eprintln!("convert_f32_pbo_letterbox_pad_color: PASS");
+    }
 }
