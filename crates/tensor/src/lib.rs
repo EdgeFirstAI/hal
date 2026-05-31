@@ -1351,6 +1351,8 @@ where
     /// gated by the `IntegerType` trait — `Tensor<f32>` etc. carry the
     /// field for layout uniformity but have no way to read or write it.
     pub(crate) quantization: Option<Quantization>,
+    /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
+    colorimetry: Option<crate::Colorimetry>,
 }
 
 impl<T> Tensor<T>
@@ -1367,6 +1369,7 @@ where
             plane_offset: None,
             quantization: None,
             cuda: None,
+            colorimetry: None,
         }
     }
 
@@ -1914,6 +1917,7 @@ where
             // is intentionally dropped — consumers needing CUDA access to
             // multiplane data must import each plane independently.
             cuda: None,
+            colorimetry: luma.colorimetry,
         })
     }
 
@@ -2046,6 +2050,22 @@ where
         self
     }
 
+    /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
+        self.colorimetry
+    }
+
+    /// Attach/clear colorimetry metadata.
+    pub fn set_colorimetry(&mut self, c: Option<crate::Colorimetry>) {
+        self.colorimetry = c;
+    }
+
+    /// Builder-style colorimetry attach.
+    pub fn with_colorimetry(mut self, c: crate::Colorimetry) -> Self {
+        self.colorimetry = Some(c);
+        self
+    }
+
     /// Downcast to PBO tensor reference (for GL backends).
     pub fn as_pbo(&self) -> Option<&PboTensor<T>> {
         match &self.storage {
@@ -2095,6 +2115,7 @@ where
             plane_offset: None,
             quantization: None,
             cuda: None,
+            colorimetry: None,
         }
     }
 
@@ -3699,6 +3720,22 @@ mod tests {
             !is_dma_available(),
             "DMA memory allocation should NOT be available on non-Linux platforms"
         );
+    }
+
+    #[test]
+    fn colorimetry_defaults_none_and_roundtrips_without_auto_fill() {
+        use crate::{ColorEncoding, ColorRange, Colorimetry, PixelFormat, TensorMemory};
+        let mut t =
+            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(t.colorimetry(), None); // default undefined
+        let c = Colorimetry::default()
+            .with_encoding(ColorEncoding::Bt709)
+            .with_range(ColorRange::Limited);
+        t.set_colorimetry(Some(c));
+        assert_eq!(t.colorimetry(), Some(c));
+        // configure_image must NOT touch colorimetry
+        t.configure_image(640, 480, PixelFormat::Grey).unwrap();
+        assert_eq!(t.colorimetry(), Some(c));
     }
 
     #[test]
