@@ -26,6 +26,7 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
+pub mod colorimetry;
 pub mod covguard;
 mod cuda;
 #[cfg(target_os = "linux")]
@@ -41,6 +42,7 @@ mod pbo;
 #[cfg(unix)]
 mod shm;
 mod tensor_dyn;
+pub use colorimetry::{ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry};
 
 /// Retained constructor: installs the coverage flush-on-abort handler for this
 /// crate's instrumented test binary. See `covguard`. Only present under
