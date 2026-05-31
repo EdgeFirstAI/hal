@@ -3646,4 +3646,12 @@ mod tests {
         assert!(t.cuda().is_none());
         assert!(t.cuda_map().is_none()); // pure local check, no GL routing
     }
+
+    #[test]
+    fn cuda_returns_none_without_handle() {
+        // A plain Mem-backed tensor has no CUDA handle attached.
+        let t = Tensor::<f32>::new(&[2, 2], None, None).unwrap();
+        assert!(t.cuda().is_none(), "no CUDA handle on a Mem tensor");
+        assert!(t.cuda_map().is_none(), "fast-fail map → None");
+    }
 }

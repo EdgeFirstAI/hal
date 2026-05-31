@@ -423,6 +423,7 @@ mod handle_tests {
     };
     struct MockOps {
         unmaps: Arc<AtomicUsize>,
+        unregisters: Arc<AtomicUsize>,
     }
     impl CudaGlOps for MockOps {
         fn map(&self, _r: GraphicsResource) -> Option<(*mut std::ffi::c_void, usize)> {
@@ -431,27 +432,94 @@ mod handle_tests {
         fn unmap(&self, _r: GraphicsResource) {
             self.unmaps.fetch_add(1, Ordering::SeqCst);
         }
-        fn unregister(&self, _r: GraphicsResource) {}
+        fn unregister(&self, _r: GraphicsResource) {
+            self.unregisters.fetch_add(1, Ordering::SeqCst);
+        }
     }
     #[test]
     fn cudamap_guard_unmaps_on_drop_for_glbuffer() {
         let unmaps = Arc::new(AtomicUsize::new(0));
+        let unregisters = Arc::new(AtomicUsize::new(0));
+        {
+            let h = CudaHandle::new_gl(
+                0x1usize as GraphicsResource,
+                4096,
+                Arc::new(MockOps {
+                    unmaps: unmaps.clone(),
+                    unregisters: unregisters.clone(),
+                }),
+            );
+            {
+                let m = h.map().expect("map");
+                assert_eq!(m.device_ptr() as usize, 0x1000);
+                assert_eq!(m.len(), 4096);
+                assert!(!m.is_empty());
+            }
+            // CudaMap dropped → exactly one unmap; handle still alive → no unregister yet.
+            assert_eq!(
+                unmaps.load(Ordering::SeqCst),
+                1,
+                "Drop must unmap a GlBuffer"
+            );
+            assert_eq!(unregisters.load(Ordering::SeqCst), 0);
+        }
+        // CudaHandle dropped → exactly one unregister.
+        assert_eq!(
+            unregisters.load(Ordering::SeqCst),
+            1,
+            "Dropping a GlBuffer handle must unregister"
+        );
+    }
+
+    #[test]
+    fn glbuffer_handle_debug_and_empty_map() {
+        let unmaps = Arc::new(AtomicUsize::new(0));
+        let unregisters = Arc::new(AtomicUsize::new(0));
         let h = CudaHandle::new_gl(
-            0x1usize as GraphicsResource,
-            4096,
+            0x2usize as GraphicsResource,
+            0,
             Arc::new(MockOps {
                 unmaps: unmaps.clone(),
+                unregisters: unregisters.clone(),
             }),
         );
+        let dbg = format!("{h:?}");
+        assert!(
+            dbg.contains("GlBuffer"),
+            "debug names the backing kind: {dbg}"
+        );
+        assert!(dbg.contains("size"), "debug includes size: {dbg}");
+    }
+
+    #[test]
+    fn external_mem_map_is_persistent_and_debug_names_kind() {
+        // ExternalMem handle: map() returns the persistent device ptr directly
+        // (no GL routing, unmap is a no-op). Construct with a synthetic ptr.
+        let dptr = 0xCAFE_0000usize as *mut std::ffi::c_void;
+        let h = CudaHandle::new_external(std::ptr::null_mut(), dptr, 8192);
+        let dbg = format!("{h:?}");
+        assert!(dbg.contains("ExternalMem"), "debug names the kind: {dbg}");
+        {
+            let m = h.map().expect("ExternalMem map is always Some");
+            assert_eq!(m.device_ptr(), dptr, "persistent device ptr passthrough");
+            assert_eq!(m.len(), 8192);
+            assert!(!m.is_empty());
+            // CudaMap drops here: ExternalMem mapping has unmap=None → no-op, safe.
+        }
+        // HOST-SAFETY: dropping `h` would call the real cudaDestroyExternalMemory
+        // on this synthetic handle (libcudart is present on dev hosts). Forget it.
+        std::mem::forget(h);
+    }
+
+    #[test]
+    fn external_mem_zero_len_map_is_empty() {
+        let h = CudaHandle::new_external(std::ptr::null_mut(), std::ptr::null_mut(), 0);
         {
             let m = h.map().expect("map");
-            assert_eq!(m.device_ptr() as usize, 0x1000);
-            assert_eq!(m.len(), 4096);
+            assert_eq!(m.len(), 0);
+            assert!(m.is_empty(), "zero-length mapping is empty");
+            assert!(m.device_ptr().is_null());
         }
-        assert_eq!(
-            unmaps.load(Ordering::SeqCst),
-            1,
-            "Drop must unmap a GlBuffer"
-        );
+        std::mem::forget(h); // HOST-SAFETY: avoid real cudaDestroyExternalMemory
     }
 }
