@@ -1244,7 +1244,7 @@ impl PyImageProcessor {
     /// specified dimensions, format, and any stride/offset values. No buffer-size
     /// validation is performed.
     #[cfg(target_os = "linux")]
-    #[pyo3(signature = (fd, width, height, format, dtype = "uint8", stride = None, offset = None, chroma_fd = None, chroma_stride = None, chroma_offset = None))]
+    #[pyo3(signature = (fd, width, height, format, dtype = "uint8", stride = None, offset = None, chroma_fd = None, chroma_stride = None, chroma_offset = None, colorimetry = None))]
     #[allow(clippy::too_many_arguments)]
     pub fn import_image(
         &self,
@@ -1258,6 +1258,7 @@ impl PyImageProcessor {
         chroma_fd: Option<std::os::fd::RawFd>,
         chroma_stride: Option<usize>,
         chroma_offset: Option<usize>,
+        colorimetry: Option<crate::colorimetry::PyColorimetry>,
     ) -> Result<PyTensor> {
         use std::os::fd::BorrowedFd;
         use tensor::PlaneDescriptor;
@@ -1302,7 +1303,15 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        let dyn_tensor = proc.import_image(image_pd, chroma_pd, width, height, fmt, dt, None)?;
+        let dyn_tensor = proc.import_image(
+            image_pd,
+            chroma_pd,
+            width,
+            height,
+            fmt,
+            dt,
+            colorimetry.map(Into::into),
+        )?;
         Ok(PyTensor(dyn_tensor))
     }
 

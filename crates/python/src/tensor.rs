@@ -1106,6 +1106,19 @@ impl PyTensor {
     fn clear_quantization(&mut self) {
         self.0.clear_quantization();
     }
+
+    /// Colorimetry metadata, or ``None`` when undefined.
+    ///
+    /// Faithful: never auto-filled. Set to ``None`` to clear.
+    #[getter]
+    fn colorimetry(&self) -> Option<crate::colorimetry::PyColorimetry> {
+        self.0.colorimetry().map(Into::into)
+    }
+
+    #[setter]
+    fn set_colorimetry(&mut self, colorimetry: Option<crate::colorimetry::PyColorimetry>) {
+        self.0.set_colorimetry(colorimetry.map(Into::into));
+    }
 }
 
 // ─── PyQuantization ─────────────────────────────────────────────────────────

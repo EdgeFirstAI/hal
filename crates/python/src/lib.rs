@@ -18,6 +18,7 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 
 use pyo3::prelude::*;
 
+pub mod colorimetry;
 pub mod decoder;
 pub mod image;
 pub mod tensor;
@@ -64,6 +65,11 @@ pub mod edgefirst_hal {
         m.add_class::<tensor::PyQuantization>()?;
         m.add_class::<tensor::PyImageInfo>()?;
         m.add_class::<tensor::PyCudaMap>()?;
+        m.add_class::<colorimetry::PyColorSpace>()?;
+        m.add_class::<colorimetry::PyColorTransfer>()?;
+        m.add_class::<colorimetry::PyColorEncoding>()?;
+        m.add_class::<colorimetry::PyColorRange>()?;
+        m.add_class::<colorimetry::PyColorimetry>()?;
         m.add_class::<image::PyPixelFormat>()?;
         m.add_class::<image::Normalization>()?;
         m.add_class::<image::PyRect>()?;
