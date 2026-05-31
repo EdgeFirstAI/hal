@@ -63,7 +63,7 @@ pub(crate) fn table() -> Option<&'static CudaTable> {
 }
 
 /// True iff libcudart loaded and all interop symbols resolved. Cached, cheap.
-pub fn cuda_available() -> bool {
+pub fn is_cuda_available() -> bool {
     table().is_some()
 }
 
@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     #[test]
     fn cuda_table_loads_when_libcudart_present() {
-        let avail = cuda_available();
+        let avail = is_cuda_available();
         if avail {
             assert!(table().is_some(), "table present when available");
         }
@@ -419,7 +419,7 @@ mod tests {
         // primitives must degrade cleanly — None / false / no-op, never panic.
         // Skip on a CUDA host, where these would touch the real driver without
         // a current GL context.
-        if cuda_available() {
+        if is_cuda_available() {
             return;
         }
         assert!(gl_register_buffer(0).is_none());

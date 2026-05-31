@@ -155,7 +155,7 @@ CPU paths:
 import edgefirst_hal as ef
 
 # One-time check — cached after first call
-if not ef.cuda_available():
+if not ef.is_cuda_available():
     print("libcudart not found; falling back to CPU tensors")
 
 tensor = ef.ImageProcessor().create_image(640, 640, ef.PixelFormat.Rgb)

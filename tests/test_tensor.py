@@ -684,11 +684,11 @@ def test_iosurface_unavailable_on_non_macos():
     assert hal.is_iosurface_available() is False
 
 
-def test_cuda_available_returns_bool():
-    """cuda_available() must be callable and return a bool (True or False)."""
+def test_is_cuda_available_returns_bool():
+    """is_cuda_available() must be callable and return a bool (True or False)."""
     import edgefirst_hal as hal
 
-    result = hal.cuda_available()
+    result = hal.is_cuda_available()
     assert isinstance(result, bool)
 
 

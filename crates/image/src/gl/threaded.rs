@@ -138,7 +138,7 @@ fn register_pbo_cuda<T>(
 ) where
     T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
 {
-    if !edgefirst_tensor::cuda_available() {
+    if !edgefirst_tensor::is_cuda_available() {
         return;
     }
     let (tx, rx) = tokio::sync::oneshot::channel();

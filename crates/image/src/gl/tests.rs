@@ -4043,7 +4043,7 @@ mod gl_tests {
     fn convert_f32_pbo_cuda_map_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
-        if !edgefirst_tensor::cuda_available() {
+        if !edgefirst_tensor::is_cuda_available() {
             eprintln!("SKIP: no libcudart");
             return;
         }
@@ -4122,7 +4122,7 @@ mod gl_tests {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use std::ffi::c_void;
 
-        if !edgefirst_tensor::cuda_available() {
+        if !edgefirst_tensor::is_cuda_available() {
             eprintln!("SKIP: no libcudart");
             return;
         }

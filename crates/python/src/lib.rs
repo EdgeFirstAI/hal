@@ -57,7 +57,7 @@ pub mod edgefirst_hal {
         m.add_function(wrap_pyfunction!(is_iosurface_available, m)?)?;
         m.add_function(wrap_pyfunction!(is_gpu_buffer_available, m)?)?;
         m.add_function(wrap_pyfunction!(is_shm_available, m)?)?;
-        m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
+        m.add_function(wrap_pyfunction!(is_cuda_available, m)?)?;
 
         m.add_class::<tensor::PyTensor>()?;
         m.add_class::<tensor::PyTensorMemory>()?;
@@ -158,8 +158,8 @@ pub mod edgefirst_hal {
     /// system. Use this to gate CUDA-specific paths before calling
     /// ``Tensor.cuda_map()``. The result is cached after the first call.
     #[pyfunction]
-    fn cuda_available() -> bool {
-        ::edgefirst_hal::tensor::cuda_available()
+    fn is_cuda_available() -> bool {
+        ::edgefirst_hal::tensor::is_cuda_available()
     }
 
     /// Trace capture context manager for Perfetto/Chrome JSON output.

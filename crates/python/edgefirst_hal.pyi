@@ -37,7 +37,7 @@ def is_gpu_buffer_available() -> bool:
 def is_shm_available() -> bool:
     """True when POSIX shared memory allocation is available (Unix only)."""
 
-def cuda_available() -> bool:
+def is_cuda_available() -> bool:
     """True when libcudart is loaded and all CUDA interop symbols resolved.
 
     Checks whether zero-copy CUDA tensor mapping is available on this system.

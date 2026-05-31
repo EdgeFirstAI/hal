@@ -64,8 +64,8 @@ pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
 pub use crate::shm::{ShmMap, ShmTensor};
 pub use cuda::{
-    cuda_available, gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
+    gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
+    is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
 };
 pub use error::{Error, Result};
 pub use format::{PixelFormat, PixelLayout};
@@ -2069,7 +2069,7 @@ where
     #[cfg(target_os = "linux")]
     pub fn try_init_dma_cuda(&mut self) {
         // Fast-path: already imported, CUDA not available, or not a DMA tensor.
-        if self.cuda.is_some() || !crate::cuda::cuda_available() {
+        if self.cuda.is_some() || !crate::cuda::is_cuda_available() {
             return;
         }
         let (raw_fd, buf_size) = match &self.storage {
