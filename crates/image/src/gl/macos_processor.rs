@@ -46,9 +46,10 @@ use super::platform::macos::MacosPlatform;
 // shader compilation) is inline here. See platform/mod.rs for the seam
 // rationale.
 use super::Egl;
+use crate::colorimetry::effective_colorimetry;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
+use edgefirst_tensor::{ColorEncoding, ColorRange, DType, PixelFormat, TensorDyn};
 use khronos_egl as egl;
 use log::debug;
 use std::collections::HashMap;
@@ -93,10 +94,25 @@ void main() {
 }
 "#;
 
+// The YUV→RGB matrix and range are supplied as uniforms so a single
+// program serves every (encoding, range) combination. The host computes
+// the coefficients from the resolved per-tensor colorimetry (see
+// `yuv_to_rgb_coeffs`):
+//   * `y_offset` / `y_scale` normalise luma for the sample range
+//     (limited: 16/255, 1.164; full: 0, 1.0).
+//   * `c_vr` / `c_ug` / `c_vg` / `c_ub` are the chroma cross-terms for
+//     the encoding matrix (BT.601 / BT.709 / BT.2020), already folded
+//     with the range's chroma scaling.
 const YUYV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
 precision mediump float;
 uniform sampler2D src;
 uniform vec2 src_size;
+uniform float y_offset;   // luma black level, normalised (e.g. 16/255)
+uniform float y_scale;    // luma gain (e.g. 1.164 limited, 1.0 full)
+uniform float c_vr;       // V→R coefficient
+uniform float c_ug;       // U→G coefficient
+uniform float c_vg;       // V→G coefficient
+uniform float c_ub;       // U→B coefficient
 in vec2 v_uv;
 out vec4 frag;
 
@@ -114,16 +130,12 @@ void main() {
     if (even) { u = self_rg.g; v = pair_rg.g; }
     else      { v = self_rg.g; u = pair_rg.g; }
 
-    // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
-    // "Colorimetry"): BT.601 full-range (JFIF) to match the codec and the Linux
-    // backends until per-source colorimetry tagging lands. Full range → luma is
-    // used directly (no 16/235 expansion); BT.601 coefficients.
-    float yp = y;
+    float yp = (y - y_offset) * y_scale;
     float up = u - 128.0/255.0;
     float vp = v - 128.0/255.0;
-    float r = clamp(yp + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yp - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yp + 1.772 * up, 0.0, 1.0);
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
     frag = vec4(r, g, b, 1.0);
 }
 "#;
@@ -159,6 +171,58 @@ void main() {
 /// shared with the Linux PBO/DMA-BUF path (`shaders.rs`).
 const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str =
     super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT;
+
+/// YUV→RGB shader coefficients resolved from the per-tensor colorimetry.
+///
+/// `y_offset` / `y_scale` normalise the luma for the sample range; the
+/// four chroma cross-terms (`c_vr`, `c_ug`, `c_vg`, `c_ub`) encode the
+/// `ColorEncoding` matrix folded with the range's chroma scaling. The
+/// coefficients are derived from the BT matrix luma weights `(kr, kb)`:
+///   c_vr = 2*(1-kr) * c_scale
+///   c_ub = 2*(1-kb) * c_scale
+///   c_ug = (2*(1-kb)*kb / kg) * c_scale,  kg = 1-kr-kb
+///   c_vg = (2*(1-kr)*kr / kg) * c_scale
+/// For limited range the luma gain is 255/219 and chroma scale 255/224;
+/// for full range both are 1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct YuvToRgbCoeffs {
+    y_offset: f32,
+    y_scale: f32,
+    c_vr: f32,
+    c_ug: f32,
+    c_vg: f32,
+    c_ub: f32,
+}
+
+fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
+    // Luma weights (kr, kb) per encoding matrix.
+    let (kr, kb) = match encoding {
+        ColorEncoding::Bt601 => (0.299_f32, 0.114_f32),
+        ColorEncoding::Bt709 => (0.2126_f32, 0.0722_f32),
+        ColorEncoding::Bt2020 => (0.2627_f32, 0.0593_f32),
+        // Future encodings default to BT.709 (HD broadcast).
+        _ => (0.2126_f32, 0.0722_f32),
+    };
+    let kg = 1.0 - kr - kb;
+
+    // Range scaling. Limited: luma spans 16..235 (gain 255/219), chroma
+    // spans 16..240 (gain 255/224). Full: both unity.
+    let (y_offset, y_scale, c_scale) = match range {
+        ColorRange::Full => (0.0, 1.0, 1.0),
+        ColorRange::Limited => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
+        // Future ranges default to limited (broadcast convention).
+        _ => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
+    };
+
+    YuvToRgbCoeffs {
+        y_offset,
+        y_scale,
+        c_vr: 2.0 * (1.0 - kr) * c_scale,
+        c_ub: 2.0 * (1.0 - kb) * c_scale,
+        c_ug: (2.0 * (1.0 - kb) * kb / kg) * c_scale,
+        c_vg: (2.0 * (1.0 - kr) * kr / kg) * c_scale,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
@@ -409,6 +473,14 @@ pub struct MacosGlProcessor {
     uniform_rgba8_to_planar_f16_src_rect_uv: i32,
     uniform_rgba8_to_planar_f16_dst_rect_px: i32,
     uniform_rgba8_to_planar_f16_pad_color: i32,
+    /// YUV→RGB conversion coefficient uniforms, set per-convert from the
+    /// resolved colorimetry. See [`YuvToRgbCoeffs`].
+    uniform_y_offset: i32,
+    uniform_y_scale: i32,
+    uniform_c_vr: i32,
+    uniform_c_ug: i32,
+    uniform_c_vg: i32,
+    uniform_c_ub: i32,
     vao: u32,
     vbo: u32,
     fbo: u32,
@@ -600,6 +672,14 @@ impl MacosGlProcessor {
                     gls::gl::GetUniformLocation(program, c"src_size".as_ptr() as *const _);
                 (loc_src, loc_size)
             };
+            let uniform_y_offset =
+                gls::gl::GetUniformLocation(program, c"y_offset".as_ptr() as *const _);
+            let uniform_y_scale =
+                gls::gl::GetUniformLocation(program, c"y_scale".as_ptr() as *const _);
+            let uniform_c_vr = gls::gl::GetUniformLocation(program, c"c_vr".as_ptr() as *const _);
+            let uniform_c_ug = gls::gl::GetUniformLocation(program, c"c_ug".as_ptr() as *const _);
+            let uniform_c_vg = gls::gl::GetUniformLocation(program, c"c_vg".as_ptr() as *const _);
+            let uniform_c_ub = gls::gl::GetUniformLocation(program, c"c_ub".as_ptr() as *const _);
 
             // Fullscreen-quad VBO + VAO.
             #[rustfmt::skip]
@@ -703,6 +783,12 @@ impl MacosGlProcessor {
                 uniform_rgba8_to_planar_f16_src_rect_uv,
                 uniform_rgba8_to_planar_f16_dst_rect_px,
                 uniform_rgba8_to_planar_f16_pad_color,
+                uniform_y_offset,
+                uniform_y_scale,
+                uniform_c_vr,
+                uniform_c_ug,
+                uniform_c_vg,
+                uniform_c_ub,
                 vao,
                 vbo,
                 fbo,
@@ -1023,6 +1109,15 @@ impl MacosGlProcessor {
             .height()
             .ok_or_else(|| Error::InvalidShape("dst height".into()))?;
 
+        // Resolve the source colorimetry (pure — never mutates the
+        // tensor) and derive the YUV→RGB shader coefficients. Missing
+        // axes fall back to the HD/SD height heuristic.
+        let cm = effective_colorimetry(src);
+        let coeffs = yuv_to_rgb_coeffs(
+            cm.encoding.unwrap_or(ColorEncoding::Bt709),
+            cm.range.unwrap_or(ColorRange::Limited),
+        );
+
         // Validation: same-size only in this first cut. Resize support
         // is straightforward (just change the viewport + texture sample
         // ratio) but not in scope for the initial integration.
@@ -1097,6 +1192,13 @@ impl MacosGlProcessor {
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
             gls::gl::Uniform1i(self.uniform_src, 0);
             gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+            // YUV→RGB matrix + range, resolved from the source colorimetry.
+            gls::gl::Uniform1f(self.uniform_y_offset, coeffs.y_offset);
+            gls::gl::Uniform1f(self.uniform_y_scale, coeffs.y_scale);
+            gls::gl::Uniform1f(self.uniform_c_vr, coeffs.c_vr);
+            gls::gl::Uniform1f(self.uniform_c_ug, coeffs.c_ug);
+            gls::gl::Uniform1f(self.uniform_c_vg, coeffs.c_vg);
+            gls::gl::Uniform1f(self.uniform_c_ub, coeffs.c_ub);
             gls::gl::BindVertexArray(self.vao);
             gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
             gls::gl::Finish();
