@@ -2020,16 +2020,41 @@ impl ImageProcessorTrait for ImageProcessor {
 
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
-            match g2d.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!(
-                        "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
-                        start.elapsed()
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+            // G2D is matrix-only (no range control, no BT.2020). For any
+            // conversion with a YUV side, resolve that side's colorimetry and
+            // skip G2D entirely when it cannot be expressed (full-range YUV or
+            // BT.2020), letting the chain fall through to GL/CPU which honour
+            // range and BT.2020. YUV→RGB uses the source colorimetry; RGB→YUV
+            // uses the destination. RGB→RGB has no YUV side and is unaffected.
+            let src_is_yuv = src.format().is_some_and(|f| f.is_yuv());
+            let dst_is_yuv = dst.format().is_some_and(|f| f.is_yuv());
+            let g2d_eligible = if src_is_yuv || dst_is_yuv {
+                let cm = if src_is_yuv {
+                    crate::colorimetry::effective_colorimetry(src)
+                } else {
+                    crate::colorimetry::effective_colorimetry(dst)
+                };
+                crate::g2d::g2d_can_handle(&cm, true)
+            } else {
+                true
+            };
+            if !g2d_eligible {
+                log::trace!(
+                    "convert: auto g2d skipped {src_fmt:?}→{dst_fmt:?} \
+                     (colorimetry not expressible: full-range/BT.2020)"
+                );
+            } else {
+                match g2d.convert(src, dst, rotation, flip, crop) {
+                    Ok(_) => {
+                        log::trace!(
+                            "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
+                            start.elapsed()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                    }
                 }
             }
         }

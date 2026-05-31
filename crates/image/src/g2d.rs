@@ -3,11 +3,39 @@
 
 #![cfg(target_os = "linux")]
 
+use crate::colorimetry::effective_colorimetry;
 use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{
+    ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
+    TensorTrait,
+};
 use four_char_code::FourCharCode;
 use g2d_sys::{G2DFormat, G2DPhysical, G2DSurface, G2D};
 use std::{os::fd::AsRawFd, time::Instant};
+
+/// Pure colorimetry-eligibility predicate for the G2D backend.
+///
+/// G2D is **matrix-only**: the g2d-sys API exposes `set_bt601_colorspace()` and
+/// `set_bt709_colorspace()` (the YCbCr matrix selection) but has **no control
+/// over quantization range** — the hardware is effectively limited-range only —
+/// and exposes **no BT.2020 matrix**. Therefore:
+///
+/// - A YUV conversion whose resolved range is `Full` must be DECLINED so the
+///   `ImageProcessor` dispatch falls through to the OpenGL / CPU backends,
+///   which honour full vs limited range correctly.
+/// - Any `Bt2020`-encoded conversion must be DECLINED (G2D cannot express it),
+///   again falling through to GL / CPU.
+///
+/// `src_is_yuv` is `true` when the conversion has a YUV side whose colorimetry
+/// matters (YUV→RGB uses the source colorimetry, RGB→YUV uses the destination).
+/// For RGB→RGB (no YUV side) the full-range rule is N/A and only the BT.2020
+/// matrix restriction applies.
+pub(crate) fn g2d_can_handle(cm: &Colorimetry, src_is_yuv: bool) -> bool {
+    // G2D matrix-only (no range control) and no BT.2020: decline full-range YUV
+    // and BT.2020.
+    !(src_is_yuv && cm.range == Some(ColorRange::Full))
+        && cm.encoding != Some(ColorEncoding::Bt2020)
+}
 
 /// Convert a PixelFormat to the G2D-compatible FourCharCode.
 fn pixelfmt_to_fourcc(fmt: PixelFormat) -> FourCharCode {
@@ -38,6 +66,12 @@ unsafe impl Sync for G2DProcessor {}
 
 impl G2DProcessor {
     /// Creates a new G2DConverter instance.
+    ///
+    /// The BT.709 matrix set here is only a safe default; each `convert()` call
+    /// re-programs the matrix from the resolved colorimetry of the YUV side of
+    /// that conversion (see `convert_impl`). G2D is matrix-only — it has no
+    /// range control (limited-range only) and no BT.2020 matrix — so full-range
+    /// YUV and BT.2020 conversions are declined and fall through to GL/CPU.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
         // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
@@ -122,6 +156,41 @@ impl G2DProcessor {
                     "G2D does not support {} to {} conversion",
                     s, d
                 )));
+            }
+        }
+
+        // ── Per-conversion colorspace matrix ─────────────────────────
+        // G2D is matrix-only (no range control, no BT.2020). Resolve the
+        // colorimetry of the YUV side of this conversion and program the
+        // matching matrix before the blit. YUV→RGB uses the *source*
+        // colorimetry; RGB→YUV uses the *destination*. RGB→RGB has no YUV side
+        // so the matrix is irrelevant and left untouched.
+        //
+        // Full-range YUV and BT.2020 are declined by `g2d_can_handle` in the
+        // ImageProcessor dispatch (lib.rs) BEFORE we get here, so those fall
+        // through to the GL / CPU backends which honour range and BT.2020. We
+        // still gate here defensively so a direct G2DProcessor caller behaves.
+        let src_is_yuv = src_fmt.is_yuv();
+        let dst_is_yuv = dst_fmt.is_yuv();
+        if src_is_yuv || dst_is_yuv {
+            let cm = if src_is_yuv {
+                effective_colorimetry(src_dyn)
+            } else {
+                effective_colorimetry(dst_dyn)
+            };
+            if !g2d_can_handle(&cm, true) {
+                return Err(Error::NotSupported(format!(
+                    "G2D cannot express colorimetry {:?}/{:?} (matrix-only, \
+                     no range control, no BT.2020)",
+                    cm.encoding, cm.range
+                )));
+            }
+            match cm.encoding {
+                Some(ColorEncoding::Bt601) => self.g2d.set_bt601_colorspace()?,
+                Some(ColorEncoding::Bt709) => self.g2d.set_bt709_colorspace()?,
+                // BT.2020 already declined above; any future encoding falls
+                // back to the BT.709 matrix (closest HD-grade approximation).
+                _ => self.g2d.set_bt709_colorspace()?,
             }
         }
 
@@ -450,6 +519,29 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
         rot: 0,
         global_alpha: 0,
     })
+}
+
+#[cfg(test)]
+mod g2d_predicate_tests {
+    use super::*;
+    use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+
+    #[test]
+    fn g2d_declines_full_range_and_bt2020_yuv() {
+        let full = Colorimetry::default()
+            .with_range(ColorRange::Full)
+            .with_encoding(ColorEncoding::Bt709);
+        let lim = Colorimetry::default()
+            .with_range(ColorRange::Limited)
+            .with_encoding(ColorEncoding::Bt709);
+        let bt2020 = Colorimetry::default()
+            .with_range(ColorRange::Limited)
+            .with_encoding(ColorEncoding::Bt2020);
+        assert!(!g2d_can_handle(&full, true)); // full-range YUV → decline
+        assert!(g2d_can_handle(&lim, true)); // limited 709 YUV → ok
+        assert!(!g2d_can_handle(&bt2020, true)); // BT.2020 → decline
+        assert!(g2d_can_handle(&full, false)); // no YUV side → rule N/A → ok
+    }
 }
 
 #[cfg(feature = "g2d_test_formats")]
