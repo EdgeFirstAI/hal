@@ -330,6 +330,7 @@ pub use opengl_headless::MacosGlProcessor;
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 use std::{fmt::Display, time::Instant};
 
+mod colorimetry;
 mod cpu;
 mod error;
 mod g2d;
