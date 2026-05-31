@@ -1404,6 +1404,7 @@ where
             dtype = std::any::type_name::<T>(),
         )
         .entered();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut t = TensorStorage::new(shape, memory, name).map(Self::wrap)?;
         // Best-effort: attach a CUDA ExternalMemory handle for DMA tensors on
         // CUDA-capable hosts. Never blocks tensor creation on failure.
@@ -2123,6 +2124,7 @@ where
     where
         Self: Sized,
     {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut t = Self::wrap(TensorStorage::from_fd(fd, shape, name)?);
         // Best-effort CUDA external memory import for DMA-backed tensors.
         // RUNTIME-UNVALIDATED: see try_init_dma_cuda().

@@ -9,7 +9,7 @@ use std::os::raw::{c_int, c_uint};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) type CudaError = c_int; // cudaSuccess == 0
-pub(crate) type GraphicsResource = *mut c_void; // cudaGraphicsResource_t
+pub type GraphicsResource = *mut c_void; // cudaGraphicsResource_t
 pub(crate) type ExternalMemory = *mut c_void; // cudaExternalMemory_t
 
 #[allow(non_snake_case, dead_code)]
@@ -151,6 +151,7 @@ pub fn gl_unregister_resource(resource: usize) {
 
 /// `cudaExternalMemoryHandleTypeOpaqueFd` — the only handle type used for
 /// Linux DMA-BUF fds. Value verified vs. driver_types.h for CUDA 11/12.
+#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
 pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
 /// FFI mirror of `cudaExternalMemoryHandleDesc` (driver_types.h, LP64).
@@ -163,6 +164,7 @@ pub(crate) const CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 /// - `size`        → u64       @ 24
 /// - `flags`       → c_uint    @ 32
 /// - `_tail`       → u32       @ 36 (struct size 40)
+#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryHandleDesc {
     pub type_: c_int,
@@ -181,6 +183,7 @@ pub(crate) struct CudaExternalMemoryHandleDesc {
 /// - `size`   → u64    @ 8
 /// - `flags`  → c_uint @ 16
 /// - `_tail`  → u32    @ 20 (struct size 24)
+#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
 #[repr(C)]
 pub(crate) struct CudaExternalMemoryBufferDesc {
     pub offset: u64,
@@ -206,6 +209,7 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
 /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
 /// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
+#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
     let t = table()?;
     let mut desc: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
