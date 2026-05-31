@@ -36,6 +36,7 @@ pub(crate) struct CudaTable {
         unsafe extern "C" fn(*mut *mut c_void, ExternalMemory, *const c_void) -> CudaError,
     pub destroy_external_memory: unsafe extern "C" fn(ExternalMemory) -> CudaError,
     pub memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> CudaError,
+    pub free: unsafe extern "C" fn(*mut c_void) -> CudaError,
 }
 
 static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
@@ -61,6 +62,7 @@ fn load() -> Option<CudaTable> {
         external_memory_get_mapped_buffer: sym!("cudaExternalMemoryGetMappedBuffer"),
         destroy_external_memory: sym!("cudaDestroyExternalMemory"),
         memcpy: sym!("cudaMemcpy"),
+        free: sym!("cudaFree"),
     })
 }
 
@@ -213,7 +215,7 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
 /// layout-asserted vs. CUDA 12.6 `driver_types.h`; the mechanism is proven
 /// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
-#[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
+#[cfg(target_os = "linux")]
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
     use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
     let t = table()?;
@@ -344,9 +346,14 @@ impl Drop for CudaHandle {
     fn drop(&mut self) {
         match &self.kind {
             CudaBacking::GlBuffer { resource, ops } => ops.unregister(*resource),
-            CudaBacking::ExternalMem { ext_mem, .. } => {
+            CudaBacking::ExternalMem { ext_mem, dptr } => {
                 if let Some(t) = table() {
-                    unsafe { (t.destroy_external_memory)(*ext_mem) };
+                    // cudaExternalMemoryGetMappedBuffer's pointer must be freed with
+                    // cudaFree before destroying the external-memory handle.
+                    unsafe {
+                        (t.free)(*dptr);
+                        (t.destroy_external_memory)(*ext_mem);
+                    }
                 }
             }
         }
@@ -362,6 +369,12 @@ pub struct CudaMap<'a> {
     unmap: Option<(Arc<dyn CudaGlOps>, GraphicsResource)>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
+
+// SAFETY: the mapped device pointer is process-global and valid cross-thread
+// via the per-device CUDA primary context; the routed CudaGlOps is Send+Sync.
+// Required so callers can hold the guard on a separate inference thread.
+unsafe impl Send for CudaMap<'_> {}
+unsafe impl Sync for CudaMap<'_> {}
 
 impl CudaMap<'_> {
     /// Raw device pointer to the mapped buffer.
