@@ -15,6 +15,28 @@ mod tests;
 // bilinear_dot removed — masks.rs now uses slice-native bilinear_dot_slice
 // closure-based kernel, invoked through the local dtype dispatch below.
 
+/// Resolved colorimetry parameters for a format conversion, computed once at
+/// the dispatch site (`convert_impl`) from the appropriate tensor:
+/// - YUV→RGB conversions use the **source** tensor's colorimetry.
+/// - RGB→YUV conversions use the **destination** tensor's colorimetry.
+///
+/// `matrix`/`range` feed the `yuv` crate kernels; `src_full_range`/
+/// `dst_full_range` gate the hand-rolled luma (limited↔full) expansion in the
+/// grey/luma copy helpers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColorParams {
+    /// Matrix resolved from the YUV side (src for decode, dst for encode).
+    pub matrix: yuv::YuvStandardMatrix,
+    /// Range resolved from the YUV side (src for decode, dst for encode).
+    pub range: yuv::YuvRange,
+    /// True when the **source** tensor's resolved range is full (decode-side
+    /// luma extraction: copy luma directly instead of limited→full expansion).
+    pub src_full_range: bool,
+    /// True when the **destination** tensor's resolved range is full
+    /// (encode-side luma copies).
+    pub dst_full_range: bool,
+}
+
 /// CPUConverter implements the ImageProcessor trait using the fallback CPU
 /// implementation for image processing.
 #[derive(Debug)]
@@ -256,6 +278,7 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         src_fmt: PixelFormat,
         dst_fmt: PixelFormat,
+        cp: ColorParams,
     ) -> Result<()> {
         let _timer = FunctionTimer::new(format!(
             "ImageProcessor::convert_format {} to {}",
@@ -264,48 +287,48 @@ impl CPUProcessor {
 
         use PixelFormat::*;
         match (src_fmt, dst_fmt) {
-            (Nv12, Rgb) => Self::convert_nv12_to_rgb(src, dst),
-            (Nv12, Rgba) => Self::convert_nv12_to_rgba(src, dst),
-            (Nv12, Grey) => Self::convert_nv12_to_grey(src, dst),
-            (Yuyv, Rgb) => Self::convert_yuyv_to_rgb(src, dst),
-            (Yuyv, Rgba) => Self::convert_yuyv_to_rgba(src, dst),
-            (Yuyv, Grey) => Self::convert_yuyv_to_grey(src, dst),
+            (Nv12, Rgb) => Self::convert_nv12_to_rgb(src, dst, cp),
+            (Nv12, Rgba) => Self::convert_nv12_to_rgba(src, dst, cp),
+            (Nv12, Grey) => Self::convert_nv12_to_grey(src, dst, cp),
+            (Yuyv, Rgb) => Self::convert_yuyv_to_rgb(src, dst, cp),
+            (Yuyv, Rgba) => Self::convert_yuyv_to_rgba(src, dst, cp),
+            (Yuyv, Grey) => Self::convert_yuyv_to_grey(src, dst, cp),
             (Yuyv, Yuyv) => Self::copy_image(src, dst),
-            (Yuyv, PlanarRgb) => Self::convert_yuyv_to_8bps(src, dst),
-            (Yuyv, PlanarRgba) => Self::convert_yuyv_to_prgba(src, dst),
+            (Yuyv, PlanarRgb) => Self::convert_yuyv_to_8bps(src, dst, cp),
+            (Yuyv, PlanarRgba) => Self::convert_yuyv_to_prgba(src, dst, cp),
             (Yuyv, Nv16) => Self::convert_yuyv_to_nv16(src, dst),
-            (Vyuy, Rgb) => Self::convert_vyuy_to_rgb(src, dst),
-            (Vyuy, Rgba) => Self::convert_vyuy_to_rgba(src, dst),
-            (Vyuy, Grey) => Self::convert_vyuy_to_grey(src, dst),
+            (Vyuy, Rgb) => Self::convert_vyuy_to_rgb(src, dst, cp),
+            (Vyuy, Rgba) => Self::convert_vyuy_to_rgba(src, dst, cp),
+            (Vyuy, Grey) => Self::convert_vyuy_to_grey(src, dst, cp),
             (Vyuy, Vyuy) => Self::copy_image(src, dst),
-            (Vyuy, PlanarRgb) => Self::convert_vyuy_to_8bps(src, dst),
-            (Vyuy, PlanarRgba) => Self::convert_vyuy_to_prgba(src, dst),
+            (Vyuy, PlanarRgb) => Self::convert_vyuy_to_8bps(src, dst, cp),
+            (Vyuy, PlanarRgba) => Self::convert_vyuy_to_prgba(src, dst, cp),
             (Vyuy, Nv16) => Self::convert_vyuy_to_nv16(src, dst),
             (Rgba, Rgb) => Self::convert_rgba_to_rgb(src, dst),
             (Rgba, Rgba) => Self::copy_image(src, dst),
             (Rgba, Grey) => Self::convert_rgba_to_grey(src, dst),
-            (Rgba, Yuyv) => Self::convert_rgba_to_yuyv(src, dst),
+            (Rgba, Yuyv) => Self::convert_rgba_to_yuyv(src, dst, cp),
             (Rgba, PlanarRgb) => Self::convert_rgba_to_8bps(src, dst),
             (Rgba, PlanarRgba) => Self::convert_rgba_to_prgba(src, dst),
-            (Rgba, Nv16) => Self::convert_rgba_to_nv16(src, dst),
+            (Rgba, Nv16) => Self::convert_rgba_to_nv16(src, dst, cp),
             (Rgb, Rgb) => Self::copy_image(src, dst),
             (Rgb, Rgba) => Self::convert_rgb_to_rgba(src, dst),
             (Rgb, Grey) => Self::convert_rgb_to_grey(src, dst),
-            (Rgb, Yuyv) => Self::convert_rgb_to_yuyv(src, dst),
+            (Rgb, Yuyv) => Self::convert_rgb_to_yuyv(src, dst, cp),
             (Rgb, PlanarRgb) => Self::convert_rgb_to_8bps(src, dst),
             (Rgb, PlanarRgba) => Self::convert_rgb_to_prgba(src, dst),
-            (Rgb, Nv16) => Self::convert_rgb_to_nv16(src, dst),
+            (Rgb, Nv16) => Self::convert_rgb_to_nv16(src, dst, cp),
             (Grey, Rgb) => Self::convert_grey_to_rgb(src, dst),
             (Grey, Rgba) => Self::convert_grey_to_rgba(src, dst),
             (Grey, Grey) => Self::copy_image(src, dst),
-            (Grey, Yuyv) => Self::convert_grey_to_yuyv(src, dst),
+            (Grey, Yuyv) => Self::convert_grey_to_yuyv(src, dst, cp),
             (Grey, PlanarRgb) => Self::convert_grey_to_8bps(src, dst),
             (Grey, PlanarRgba) => Self::convert_grey_to_prgba(src, dst),
-            (Grey, Nv16) => Self::convert_grey_to_nv16(src, dst),
+            (Grey, Nv16) => Self::convert_grey_to_nv16(src, dst, cp),
 
             // the following converts are added for use in testing
-            (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst),
-            (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst),
+            (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst, cp),
+            (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst, cp),
             (PlanarRgb, Rgb) => Self::convert_8bps_to_rgb(src, dst),
             (PlanarRgb, Rgba) => Self::convert_8bps_to_rgba(src, dst),
             (PlanarRgba, Rgb) => Self::convert_prgba_to_rgb(src, dst),
@@ -314,19 +337,19 @@ impl CPUProcessor {
             // BGRA destination: convert to RGBA layout, then swap R and B
             (Bgra, Bgra) => Self::copy_image(src, dst),
             (Nv12, Bgra) => {
-                Self::convert_nv12_to_rgba(src, dst)?;
+                Self::convert_nv12_to_rgba(src, dst, cp)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Nv16, Bgra) => {
-                Self::convert_nv16_to_rgba(src, dst)?;
+                Self::convert_nv16_to_rgba(src, dst, cp)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Yuyv, Bgra) => {
-                Self::convert_yuyv_to_rgba(src, dst)?;
+                Self::convert_yuyv_to_rgba(src, dst, cp)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Vyuy, Bgra) => {
-                Self::convert_vyuy_to_rgba(src, dst)?;
+                Self::convert_vyuy_to_rgba(src, dst, cp)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Rgba, Bgra) => {
@@ -363,9 +386,19 @@ impl CPUProcessor {
         let dst_fmt = dst.format().unwrap();
         let dst_w = dst.width().unwrap();
         let dst_h = dst.height().unwrap();
+        // Resolve the YUV fill encoding from the destination tensor so the
+        // border color matches the same matrix/range as a later YUV→RGB
+        // decode of this image. RGB/Grey fills ignore these params.
+        let cm = crate::colorimetry::resolve_colorimetry(dst.colorimetry(), dst.height());
+        let cp = ColorParams {
+            matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
+            range: crate::colorimetry::yuv_range(cm.range.unwrap()),
+            src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
+            dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
+        };
         let mut dst_map = dst.map()?;
         let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h);
-        Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop)
+        Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop, cp)
     }
 
     /// Common fill dispatch by format.
@@ -374,6 +407,7 @@ impl CPUProcessor {
         fmt: PixelFormat,
         rgba: [u8; 4],
         crop: Rect,
+        cp: ColorParams,
     ) -> Result<()> {
         use PixelFormat::*;
         match fmt {
@@ -382,13 +416,13 @@ impl CPUProcessor {
             Grey => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
             Yuyv => Self::fill_image_outside_crop_(
                 (dst.0, dst.1 / 2, dst.2),
-                Self::rgba_to_yuyv(rgba),
+                Self::rgba_to_yuyv(rgba, cp),
                 Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
             ),
             PlanarRgb => Self::fill_image_outside_crop_planar(dst, Self::rgba_to_rgb(rgba), crop),
             PlanarRgba => Self::fill_image_outside_crop_planar(dst, rgba, crop),
             Nv16 => {
-                let yuyv = Self::rgba_to_yuyv(rgba);
+                let yuyv = Self::rgba_to_yuyv(rgba, cp);
                 Self::fill_image_outside_crop_yuv_semiplanar(dst, yuyv[0], [yuyv[1], yuyv[3]], crop)
             }
             _ => Err(Error::Internal(format!(
@@ -487,11 +521,33 @@ impl CPUProcessor {
         let src_fmt = src.format().ok_or(Error::NotAnImage)?;
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
 
+        // Resolve per-tensor colorimetry once, at the use site, without
+        // mutating either tensor. YUV→RGB conversions take their matrix/range
+        // from the source; RGB→YUV conversions from the destination. The grey/
+        // luma expansion is gated on the resolved range of the relevant side.
+        let src_cm = crate::colorimetry::effective_colorimetry(src);
+        let dst_cm = crate::colorimetry::effective_colorimetry(dst);
+        let src_full = src_cm.range == Some(edgefirst_tensor::ColorRange::Full);
+        let dst_full = dst_cm.range == Some(edgefirst_tensor::ColorRange::Full);
+        let src_params = ColorParams {
+            matrix: crate::colorimetry::yuv_matrix(src_cm.encoding.unwrap()),
+            range: crate::colorimetry::yuv_range(src_cm.range.unwrap()),
+            src_full_range: src_full,
+            dst_full_range: dst_full,
+        };
+        let dst_params = ColorParams {
+            matrix: crate::colorimetry::yuv_matrix(dst_cm.encoding.unwrap()),
+            range: crate::colorimetry::yuv_range(dst_cm.range.unwrap()),
+            src_full_range: src_full,
+            dst_full_range: dst_full,
+        };
         match (src.dtype(), dst.dtype()) {
             (DType::U8, DType::U8) => {
                 let src = src.as_u8().unwrap();
                 let dst = dst.as_u8_mut().unwrap();
-                self.convert_u8(src, dst, src_fmt, dst_fmt, rotation, flip, crop)
+                self.convert_u8(
+                    src, dst, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
+                )
             }
             (DType::U8, DType::I8) => {
                 // Int8 output: reinterpret the i8 destination as u8 (layout-
@@ -502,7 +558,9 @@ impl CPUProcessor {
                 // (same element size, no T-dependent drop glue). Same
                 // rationale as gl::processor::tensor_i8_as_u8_mut.
                 let dst_u8 = unsafe { &mut *(dst_i8 as *mut Tensor<i8> as *mut Tensor<u8>) };
-                self.convert_u8(src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                self.convert_u8(
+                    src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
+                )?;
                 // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
                 let mut map = dst_u8.map()?;
                 apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
@@ -526,7 +584,10 @@ impl CPUProcessor {
                 };
                 {
                     let tmp_u8 = tmp.as_u8_mut().unwrap();
-                    self.convert_u8(src_u8, tmp_u8, src_fmt, dst_fmt, rotation, flip, crop)?;
+                    self.convert_u8(
+                        src_u8, tmp_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params,
+                        dst_params,
+                    )?;
                 }
                 // Widen the u8 scratch into the float destination, then restore
                 // the scratch for reuse on the next call.
@@ -571,6 +632,8 @@ impl CPUProcessor {
         rotation: Rotation,
         flip: Flip,
         crop: Crop,
+        src_params: ColorParams,
+        dst_params: ColorParams,
     ) -> Result<()> {
         use PixelFormat::*;
 
@@ -667,9 +730,18 @@ impl CPUProcessor {
                 }
             });
 
+        // Pick the resolved colorimetry for a single conversion by its YUV
+        // side: YUV→RGB decodes use the source side, RGB→YUV encodes the dest.
+        let direct_is_yuv_src = matches!(src_fmt, Nv12 | Nv16 | Yuyv | Vyuy);
+        let direct_params = if direct_is_yuv_src {
+            src_params
+        } else {
+            dst_params
+        };
+
         // check if a direct conversion can be done
         if !need_resize_flip_rotation && Self::support_conversion_pf(src_fmt, dst_fmt) {
-            return Self::convert_format_pf(src, dst, src_fmt, dst_fmt);
+            return Self::convert_format_pf(src, dst, src_fmt, dst_fmt, direct_params);
         }
 
         // any extra checks
@@ -694,7 +766,7 @@ impl CPUProcessor {
             .entered();
             tmp_buffer = Tensor::<u8>::image(src_w, src_h, intermediate, Some(TensorMemory::Mem))?;
 
-            Self::convert_format_pf(src, &mut tmp_buffer, src_fmt, intermediate)?;
+            Self::convert_format_pf(src, &mut tmp_buffer, src_fmt, intermediate, src_params)?;
             tmp = &tmp_buffer;
             tmp_fmt = intermediate;
         } else {
@@ -715,7 +787,7 @@ impl CPUProcessor {
                 pass = "direct",
             )
             .entered();
-            Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt)?;
+            Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt, dst_params)?;
         } else {
             let mut tmp2 = Tensor::<u8>::image(dst_w, dst_h, tmp_fmt, Some(TensorMemory::Mem))?;
             if crop.dst_rect.is_some_and(|c| {
@@ -727,7 +799,7 @@ impl CPUProcessor {
                 }
             }) && crop.dst_color.is_none()
             {
-                Self::convert_format_pf(dst, &mut tmp2, dst_fmt, tmp_fmt)?;
+                Self::convert_format_pf(dst, &mut tmp2, dst_fmt, tmp_fmt, dst_params)?;
             }
             {
                 let _s = tracing::trace_span!("image.convert.cpu.resize_flip_rotate").entered();
@@ -741,7 +813,7 @@ impl CPUProcessor {
                     pass = "post_resize",
                 )
                 .entered();
-                Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt)?;
+                Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt, dst_params)?;
             }
         }
         if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {

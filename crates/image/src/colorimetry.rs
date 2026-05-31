@@ -18,8 +18,18 @@ const HD_THRESHOLD: usize = 720;
 /// specified axes, with only the missing ones filled by the height heuristic.
 /// Pure — does NOT mutate the tensor.
 pub(crate) fn effective_colorimetry(t: &TensorDyn) -> Colorimetry {
-    let hd = t.height().map(|h| h >= HD_THRESHOLD).unwrap_or(true);
-    let src = t.colorimetry().unwrap_or_default();
+    resolve_colorimetry(t.colorimetry(), t.height())
+}
+
+/// Core resolver shared by `effective_colorimetry` and any caller that already
+/// has the raw `(colorimetry, height)` pair (e.g. a `Tensor<u8>` fill target).
+/// Fills only the missing axes by the height heuristic; never mutates.
+pub(crate) fn resolve_colorimetry(
+    colorimetry: Option<Colorimetry>,
+    height: Option<usize>,
+) -> Colorimetry {
+    let hd = height.map(|h| h >= HD_THRESHOLD).unwrap_or(true);
+    let src = colorimetry.unwrap_or_default();
     Colorimetry {
         space: src.space.or(Some(if hd {
             ColorSpace::Bt709

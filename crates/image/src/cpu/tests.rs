@@ -915,13 +915,14 @@ mod cpu_tests {
             Crop::new().with_dst_rect(Some(Rect::new(0, 0, 2, 1))),
         )?;
 
-        // Interim 601-full stop-gap: grey luma maps to YUYV luma directly
-        // (full-range identity), so the row-averaged grey [4, 6] yields Y = 4, 6
-        // (previously 20, 21 under the limited-range encoding). The second dst
-        // row is outside the crop and keeps its pre-fill value.
+        // The untagged 2x2 Grey source is below the HD threshold, so the
+        // colorimetry heuristic resolves it to BT.601 limited range: grey luma
+        // is mapped into the 16..235 limited range, so the row-averaged grey
+        // [4, 6] yields Y = 20, 21. The second dst row is outside the crop and
+        // keeps its pre-fill value.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
-            &[4, 128, 6, 128, 200, 128, 200, 128]
+            &[20, 128, 21, 128, 200, 128, 200, 128]
         );
         Ok(())
     }
@@ -990,12 +991,12 @@ mod cpu_tests {
             },
         )?;
 
-        // Interim 601-full stop-gap: full-range BT.601 RGB->YUYV. Red [255,0,0]
-        // -> [Y=76, U=85, V=0]; the grey [3,3,3] src row -> Y=3 (no +16 offset),
-        // U=V=128. (Previously [63,102,63,240] / Y=19 under BT.709 limited.)
+        // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
+        // resolves it to BT.601 limited (previously a BT.709 hardcode). Red
+        // (255,0,0) → Y=81, U=90, V=240 under BT.601 limited.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
-            &[76, 85, 76, 0, 3, 128, 3, 128, 76, 85, 76, 0]
+            &[81, 90, 81, 240, 19, 128, 19, 128, 81, 90, 81, 240]
         );
         Ok(())
     }
@@ -3583,5 +3584,32 @@ mod cpu_tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn cpu_nv12_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV12: 4 luma + 1 UV pair (U=200,V=40) — saturated chroma so 601≠709.
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv12,
+                None,
+                &[180, 180, 180, 180, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
     }
 }
