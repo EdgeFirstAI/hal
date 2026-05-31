@@ -173,3 +173,46 @@ fn v4l2_geometry_change_rebuilds() {
         );
     }
 }
+
+#[test]
+fn v4l2_zero_copy_dma_nv12() {
+    // Zero-copy: decode into a DMA-backed NV12 tensor. On a target with a JPEG
+    // M2M device + dma_heap, the hardware decodes straight into the tensor
+    // (V4L2_MEMORY_DMABUF import, no plane copy); the result must match the
+    // MMAP/copy path byte-for-byte (same hardware decode). Skips cleanly where
+    // DMA allocation is unavailable (no dma_heap on this host). zidane is
+    // 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
+    let jpeg = testdata("zidane.jpg");
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    let mut dma = match Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Dma)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("skip v4l2_zero_copy_dma_nv12: no DMA allocation ({e})");
+            return;
+        }
+    };
+    let mut decoder = ImageDecoder::new();
+    let info = dma.load_image(&mut decoder, &jpeg).unwrap();
+    assert_eq!((info.width, info.height), (1280, 720));
+    assert_eq!(info.format, PixelFormat::Nv12);
+
+    // Extract a tight NV12 buffer from the (possibly pitch-padded) DMA tensor.
+    let stride = info.row_stride;
+    let (w, h) = (1280usize, 720usize);
+    let mut zc = Vec::with_capacity(w * h * 3 / 2);
+    {
+        let map = dma.map().unwrap();
+        let px: &[u8] = &map;
+        for y in 0..h {
+            zc.extend_from_slice(&px[y * stride..y * stride + w]);
+        }
+        let uv_base = h * stride;
+        for cy in 0..h / 2 {
+            zc.extend_from_slice(&px[uv_base + cy * stride..uv_base + cy * stride + w]);
+        }
+    }
+
+    // Reference: MMAP/copy path through the same backend (hardware on-target).
+    let reference = decode(&jpeg, w, h, PixelFormat::Nv12, false);
+    assert_close(&reference, &zc, "zero-copy-dma");
+}

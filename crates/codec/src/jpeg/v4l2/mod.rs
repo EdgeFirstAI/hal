@@ -4,19 +4,28 @@
 //! Optional V4L2 hardware JPEG-decoder backend (Linux only).
 //!
 //! When a Linux device exposes a JPEG decoder through the standard V4L2
-//! mem2mem API, this backend offloads the expensive Huffman + IDCT + chroma
-//! upsample to hardware and runs only a light colour-conversion pass on the
-//! CPU. It is probed lazily and entirely capability-based, so it is portable
-//! across SoCs; anything it cannot drive transparently falls back to the
-//! existing software decoder.
+//! mem2mem API, this backend offloads the decode to hardware, emitting the
+//! codec's native `NV12`/`GREY` directly. It is probed lazily and entirely
+//! capability-based, so it is portable across SoCs; anything it cannot drive
+//! transparently falls back to the existing software decoder.
 //!
 //! Targets multi-planar M2M devices (the lead target, i.MX `mxc-jpeg`) with a
 //! persistent streaming session: after the first decode at a given geometry
-//! the OUTPUT/CAPTURE buffers stay mapped and streaming, so subsequent decodes
+//! the OUTPUT/CAPTURE buffers stay set up and streaming, so subsequent decodes
 //! pay only the per-frame queue/dequeue cost. A geometry change rebuilds the
 //! stream; a hardware failure resets it and (after repeated failures) demotes
-//! the device to the CPU decoder. Single-planar devices and DMA-BUF zero-copy
-//! fall back to the CPU decoder for now.
+//! the device to the CPU decoder.
+//!
+//! Two CAPTURE paths:
+//! - **Zero-copy (DMABUF):** when the destination is a DMA tensor with
+//!   MCU(16)-aligned dimensions and the driver accepts a single-plane
+//!   contiguous CAPTURE at the tensor pitch, the tensor's dmabuf fd is imported
+//!   as the CAPTURE buffer and the hardware decodes straight into it — no copy.
+//! - **MMAP + copy:** otherwise the driver buffers are mapped and the decoded
+//!   `NV12`/`GREY` planes are copied (cropped to the logical image) into the
+//!   destination. 4:4:4 (`YUV3`) capture is left to the CPU decoder.
+//!
+//! Single-planar M2M devices fall back to the CPU decoder for now.
 
 mod buffers;
 mod device;
@@ -34,8 +43,9 @@ use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
 use buffers::Mmap;
 use device::{ApiVariant, ProbedDevice};
-use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory, TensorTrait};
 use format::CapKind;
+use std::os::fd::AsRawFd;
 
 /// Timeout waiting for the `SOURCE_CHANGE` event after queuing the JPEG (ms).
 const SOURCE_CHANGE_TIMEOUT_MS: i32 = 200;
@@ -187,6 +197,10 @@ struct Stream {
     out_map: Mmap,
     /// Driver-chosen CAPTURE (raw) format and its mapped planes.
     cap: Capture,
+    /// CAPTURE queue is in DMABUF (zero-copy) mode: the hardware decodes
+    /// straight into the caller's DMA tensor; `collect` imports the tensor fd
+    /// each frame and performs no plane copy. `false` = MMAP + copy-out.
+    dmabuf: bool,
 }
 
 /// The CAPTURE side of a stream: driver-chosen format and mapped planes.
@@ -222,17 +236,31 @@ impl V4l2Context {
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
         let needed = ((data.len() + 4095) & !4095) as u32;
+        let dma_capable = dst.memory() == TensorMemory::Dma;
+        let dst_capacity = dst.capacity_bytes();
+        // Reuse only when the geometry AND the CAPTURE memory mode match — a
+        // change in destination memory kind (DMA ↔ Mem) needs a rebuild.
         let reuse = matches!(
             &self.stream,
             Some(s) if s.jpeg_w == final_w as u32
                 && s.jpeg_h == final_h as u32
                 && s.out_sizeimage >= needed
+                && s.dmabuf == dma_capable
         );
 
         if reuse {
             self.requeue_output(data)?;
         } else {
-            self.rebuild_stream(data, final_w, final_h, needed)?;
+            self.rebuild_stream(
+                data,
+                output_fmt,
+                final_w,
+                final_h,
+                dst_stride,
+                dst_capacity,
+                dma_capable,
+                needed,
+            )?;
         }
         self.collect::<T>(dst, output_fmt, final_w, final_h, dst_stride)
     }
@@ -251,12 +279,18 @@ impl V4l2Context {
 
     /// Tear down any existing stream, then set up the OUTPUT + CAPTURE queues
     /// for a new geometry, leaving the first JPEG queued and both queues
-    /// streaming. Stores the resulting [`Stream`] for reuse.
+    /// streaming. Chooses DMABUF (zero-copy) CAPTURE when the destination is a
+    /// DMA tensor with a matching layout, else MMAP. Stores the [`Stream`].
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_stream(
         &mut self,
         data: &[u8],
+        output_fmt: PixelFormat,
         final_w: usize,
         final_h: usize,
+        dst_stride: usize,
+        dst_capacity: usize,
+        dma_capable: bool,
         needed: u32,
     ) -> Result<(), DecodeErr> {
         self.drop_stream();
@@ -292,7 +326,8 @@ impl V4l2Context {
         unsafe { ioctl::vidioc_s_fmt(fd, &mut ofmt) }
             .map_err(|e| DecodeErr::Reset(format!("S_FMT OUTPUT: {e}")))?;
 
-        reqbufs(fd, OUT, 1).map_err(|e| DecodeErr::Reset(format!("REQBUFS OUTPUT: {e}")))?;
+        reqbufs(fd, OUT, 1, ioctl::V4L2_MEMORY_MMAP)
+            .map_err(|e| DecodeErr::Reset(format!("REQBUFS OUTPUT: {e}")))?;
         let (olen, ooff) =
             querybuf(fd, OUT, 1).map_err(|e| DecodeErr::Reset(format!("QUERYBUF OUTPUT: {e}")))?;
         let mut out_map = Mmap::new(borrow(fd), olen, ooff)
@@ -317,7 +352,7 @@ impl V4l2Context {
         unsafe { ioctl::vidioc_g_fmt(fd, &mut cfmt) }
             .map_err(|e| DecodeErr::Reset(format!("G_FMT CAPTURE: {e}")))?;
         // SAFETY: type_ selects the multi-planar variant.
-        let cap = *unsafe { cfmt.pix_mp() };
+        let mut cap = *unsafe { cfmt.pix_mp() };
 
         let kind = format::classify(cap.pixelformat).ok_or_else(|| {
             DecodeErr::Unsupported(format!(
@@ -332,10 +367,114 @@ impl V4l2Context {
             )));
         }
 
-        let num_planes = cap.num_planes as usize;
+        // Save the driver's natural CAPTURE format so a failed zero-copy probe
+        // can restore it for the MMAP path.
+        let cap0 = cap;
 
-        // CAPTURE: allocate, map every plane, stream.
-        reqbufs(fd, CAP, 1).map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE: {e}")))?;
+        // Zero-copy eligibility: DMA destination, NV12/GREY output, and
+        // MCU(16)-aligned dims so the CAPTURE geometry equals the logical image
+        // (the decoded data lands exactly at the tensor's layout).
+        let want_zc = dma_capable
+            && matches!(output_fmt, PixelFormat::Nv12 | PixelFormat::Grey)
+            && matches!(kind, CapKind::Nv12 | CapKind::Grey)
+            && final_w.is_multiple_of(16)
+            && final_h.is_multiple_of(16);
+
+        let mut dmabuf = false;
+        if want_zc {
+            // Request a SINGLE-PLANE contiguous CAPTURE at the tensor pitch:
+            // the whole NV12 (Y+CbCr) / GREY image becomes one fd at offset 0.
+            // The driver's default NV12M is two *non-contiguous* planes, which
+            // do not compose into a single tensor buffer via data_offset.
+            let (target_fourcc, total_h) = match output_fmt {
+                PixelFormat::Nv12 => (ioctl::V4L2_PIX_FMT_NV12, cap0.height as usize * 3 / 2),
+                _ => (ioctl::V4L2_PIX_FMT_GREY, cap0.height as usize),
+            };
+            let mut sfmt = ioctl::v4l2_format {
+                type_: CAP,
+                ..Default::default()
+            };
+            // SAFETY: mplane variant.
+            {
+                let p = unsafe { sfmt.pix_mp() };
+                p.width = cap0.width;
+                p.height = cap0.height;
+                p.pixelformat = target_fourcc;
+                p.field = ioctl::V4L2_FIELD_NONE;
+                p.colorspace = cap0.colorspace;
+                p.ycbcr_enc = cap0.ycbcr_enc;
+                p.quantization = cap0.quantization;
+                p.xfer_func = cap0.xfer_func;
+                p.num_planes = 1;
+                p.plane_fmt[0].bytesperline = dst_stride as u32;
+                p.plane_fmt[0].sizeimage = (dst_stride * total_h) as u32;
+            }
+            // SAFETY: valid format. Best-effort; read back what the driver kept.
+            let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut sfmt) };
+            let mut gfmt = ioctl::v4l2_format {
+                type_: CAP,
+                ..Default::default()
+            };
+            // SAFETY: valid format for G_FMT.
+            unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }
+                .map_err(|e| DecodeErr::Reset(format!("G_FMT CAPTURE (zc): {e}")))?;
+            // SAFETY: mplane variant.
+            let cap_zc = *unsafe { gfmt.pix_mp() };
+            let ok = cap_zc.pixelformat == target_fourcc
+                && cap_zc.num_planes == 1
+                && cap_zc.plane_fmt[0].bytesperline as usize == dst_stride
+                && dst_capacity >= cap_zc.plane_fmt[0].sizeimage as usize;
+            if ok {
+                cap = cap_zc;
+                dmabuf = true;
+            } else {
+                // Driver refused single-plane contiguous output — restore its
+                // natural format for the MMAP copy path.
+                let mut rfmt = ioctl::v4l2_format {
+                    type_: CAP,
+                    ..Default::default()
+                };
+                // SAFETY: mplane variant.
+                {
+                    let p = unsafe { rfmt.pix_mp() };
+                    *p = cap0;
+                }
+                // SAFETY: valid format; best-effort restore.
+                let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut rfmt) };
+                cap = cap0;
+            }
+        }
+
+        let num_planes = cap.num_planes as usize;
+        let cap_struct = Capture {
+            kind,
+            num_planes,
+            cap_h: cap.height as usize,
+            luma_stride: cap.plane_fmt[0].bytesperline as usize,
+            chroma_stride: cap.plane_fmt[1].bytesperline as usize,
+            maps: Vec::new(),
+        };
+
+        if dmabuf {
+            // DMABUF (zero-copy): no driver buffers to map; the tensor fd is
+            // imported per-frame in `collect`.
+            reqbufs(fd, CAP, 1, ioctl::V4L2_MEMORY_DMABUF)
+                .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE (dmabuf): {e}")))?;
+            streamon(fd, CAP).map_err(|e| DecodeErr::Reset(format!("STREAMON CAPTURE: {e}")))?;
+            self.stream = Some(Stream {
+                jpeg_w: final_w as u32,
+                jpeg_h: final_h as u32,
+                out_sizeimage: needed,
+                out_map,
+                cap: cap_struct,
+                dmabuf: true,
+            });
+            return Ok(());
+        }
+
+        // MMAP: allocate, map every plane, stream.
+        reqbufs(fd, CAP, 1, ioctl::V4L2_MEMORY_MMAP)
+            .map_err(|e| DecodeErr::Reset(format!("REQBUFS CAPTURE: {e}")))?;
 
         let mut cplanes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
         let mut cqb = ioctl::v4l2_buffer {
@@ -367,14 +506,8 @@ impl V4l2Context {
             jpeg_h: final_h as u32,
             out_sizeimage: needed,
             out_map,
-            cap: Capture {
-                kind,
-                num_planes,
-                cap_h: cap.height as usize,
-                luma_stride: cap.plane_fmt[0].bytesperline as usize,
-                chroma_stride: cap.plane_fmt[1].bytesperline as usize,
-                maps,
-            },
+            cap: Capture { maps, ..cap_struct },
+            dmabuf: false,
         });
         Ok(())
     }
@@ -391,21 +524,55 @@ impl V4l2Context {
         dst_stride: usize,
     ) -> Result<ImageInfo, DecodeErr> {
         let fd = self.device.fd();
-        let num_planes = self
-            .stream
-            .as_ref()
-            .ok_or_else(|| DecodeErr::Reset("no stream".into()))?
-            .cap
-            .num_planes;
+        let (num_planes, dmabuf) = {
+            let s = self
+                .stream
+                .as_ref()
+                .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
+            (s.cap.num_planes, s.dmabuf)
+        };
 
-        // Queueing the CAPTURE buffer (both queues streaming) runs the job.
+        let info = ImageInfo {
+            width: final_w,
+            height: final_h,
+            format: output_fmt,
+            row_stride: dst_stride,
+            rotation_degrees: 0,
+            flip_horizontal: false,
+        };
+
+        if dmabuf {
+            // Zero-copy: import the tensor's dmabuf fd as the CAPTURE buffer so
+            // the hardware decodes straight into it — no plane copy. Planes
+            // share the one allocation: Y at offset 0, CbCr after the luma
+            // plane (NV12). Layout matches because dims are MCU-aligned and the
+            // CAPTURE stride was forced to the tensor pitch.
+            let dmabuf_fd = dst
+                .dmabuf()
+                .map_err(|e| DecodeErr::Fatal(e.into()))?
+                .as_raw_fd();
+            let capacity = dst.capacity_bytes();
+            let offsets = [0usize, final_h * dst_stride];
+            qbuf_capture_dmabuf(fd, dmabuf_fd, num_planes, &offsets, capacity)
+                .map_err(|e| DecodeErr::Reset(format!("QBUF CAPTURE (dmabuf): {e}")))?;
+            if !poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS) {
+                return Err(DecodeErr::Reset("CAPTURE decode timeout".into()));
+            }
+            dqbuf_capture(fd, num_planes, ioctl::V4L2_MEMORY_DMABUF)
+                .map_err(|e| DecodeErr::Reset(format!("DQBUF CAPTURE (dmabuf): {e}")))?;
+            dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
+            // Decoded pixels are in the tensor's DMA buffer; the consumer's
+            // `Tensor::map()` issues the cache sync on read.
+            return Ok(info);
+        }
+
+        // MMAP path: queue the driver buffer, decode, copy planes out.
         qbuf_capture(fd, num_planes).map_err(|e| DecodeErr::Reset(format!("QBUF CAPTURE: {e}")))?;
         if !poll_ready(fd, PollFlags::POLLIN, DECODE_TIMEOUT_MS) {
             return Err(DecodeErr::Reset("CAPTURE decode timeout".into()));
         }
-        dqbuf_capture(fd, num_planes)
+        dqbuf_capture(fd, num_planes, ioctl::V4L2_MEMORY_MMAP)
             .map_err(|e| DecodeErr::Reset(format!("DQBUF CAPTURE: {e}")))?;
-        // Recycle the consumed OUTPUT buffer so the next frame can re-queue it.
         dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
 
         // Resolve the decoded planes. Greyscale → Y only; NV12/NV12M → Y +
@@ -478,14 +645,7 @@ impl V4l2Context {
         }
         drop(map);
 
-        Ok(ImageInfo {
-            width: final_w,
-            height: final_h,
-            format: output_fmt,
-            row_stride: dst_stride,
-            rotation_degrees: 0,
-            flip_horizontal: false,
-        })
+        Ok(info)
     }
 
     /// Stop both queues and release their buffer pools, dropping the stream.
@@ -499,8 +659,18 @@ impl V4l2Context {
         let _ = streamoff(fd, ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
         // Drop the mappings (munmap) before REQBUFS 0 frees the driver buffers.
         self.stream = None;
-        let _ = reqbufs(fd, ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 0);
-        let _ = reqbufs(fd, ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0);
+        let _ = reqbufs(
+            fd,
+            ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            0,
+            ioctl::V4L2_MEMORY_MMAP,
+        );
+        let _ = reqbufs(
+            fd,
+            ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            0,
+            ioctl::V4L2_MEMORY_MMAP,
+        );
     }
 
     /// Record a hardware failure and reset the device for the next attempt.
@@ -538,11 +708,11 @@ fn borrow(fd: RawFd) -> BorrowedFd<'static> {
     unsafe { BorrowedFd::borrow_raw(fd) }
 }
 
-fn reqbufs(fd: RawFd, buf_type: u32, count: u32) -> nix::Result<()> {
+fn reqbufs(fd: RawFd, buf_type: u32, count: u32, memory: u32) -> nix::Result<()> {
     let mut rb = ioctl::v4l2_requestbuffers {
         count,
         type_: buf_type,
-        memory: ioctl::V4L2_MEMORY_MMAP,
+        memory,
         ..Default::default()
     };
     // SAFETY: valid requestbuffers struct.
@@ -607,7 +777,7 @@ fn dqbuf_output(fd: RawFd) -> nix::Result<()> {
     unsafe { ioctl::vidioc_dqbuf(fd, &mut b) }.map(|_| ())
 }
 
-/// `VIDIOC_QBUF` the CAPTURE (raw) buffer to run the decode.
+/// `VIDIOC_QBUF` the MMAP CAPTURE (raw) buffer to run the decode.
 fn qbuf_capture(fd: RawFd, num_planes: usize) -> nix::Result<()> {
     let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
     let mut b = ioctl::v4l2_buffer {
@@ -622,12 +792,41 @@ fn qbuf_capture(fd: RawFd, num_planes: usize) -> nix::Result<()> {
     unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
 }
 
-/// `VIDIOC_DQBUF` the decoded CAPTURE buffer.
-fn dqbuf_capture(fd: RawFd, num_planes: usize) -> nix::Result<()> {
+/// `VIDIOC_QBUF` the CAPTURE queue in DMABUF mode, importing `dmabuf_fd` as the
+/// backing for every plane. `plane_offsets[p]` places plane `p` within the
+/// (shared) buffer; `length` is the dmabuf size. Zero-copy: the hardware
+/// decodes straight into the imported tensor.
+fn qbuf_capture_dmabuf(
+    fd: RawFd,
+    dmabuf_fd: RawFd,
+    num_planes: usize,
+    plane_offsets: &[usize],
+    length: usize,
+) -> nix::Result<()> {
+    let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
+    for (p, plane) in planes.iter_mut().take(num_planes).enumerate() {
+        plane.set_fd(dmabuf_fd);
+        plane.length = length as u32;
+        plane.data_offset = plane_offsets.get(p).copied().unwrap_or(0) as u32;
+    }
+    let mut b = ioctl::v4l2_buffer {
+        type_: ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        memory: ioctl::V4L2_MEMORY_DMABUF,
+        index: 0,
+        length: num_planes as u32,
+        ..Default::default()
+    };
+    b.set_planes(planes.as_mut_ptr());
+    // SAFETY: valid buffer + plane array; `dmabuf_fd` outlives the call.
+    unsafe { ioctl::vidioc_qbuf(fd, &mut b) }.map(|_| ())
+}
+
+/// `VIDIOC_DQBUF` the decoded CAPTURE buffer (`memory` = MMAP or DMABUF).
+fn dqbuf_capture(fd: RawFd, num_planes: usize, memory: u32) -> nix::Result<()> {
     let mut planes = [ioctl::v4l2_plane::default(); ioctl::VIDEO_MAX_PLANES];
     let mut b = ioctl::v4l2_buffer {
         type_: ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-        memory: ioctl::V4L2_MEMORY_MMAP,
+        memory,
         length: num_planes as u32,
         ..Default::default()
     };
