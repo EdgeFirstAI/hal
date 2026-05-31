@@ -2048,6 +2048,31 @@ where
     }
 
     /// Fast-fail CUDA map: None (no GL routing) when no handle; else map (PBO routes to the GL worker).
+    ///
+    /// Returns a scoped [`CudaMap`](crate::cuda::CudaMap) guard holding the raw CUDA device pointer
+    /// for the duration of the mapping. For GL-buffer-backed tensors the unmap is deferred until the
+    /// guard drops, freeing the PBO for the next `convert()` call. When no CUDA handle is attached
+    /// (the common case for plain `Mem`/`DMA` tensors without CUDA registration), returns `None`
+    /// immediately — no GL routing, no allocation.
+    ///
+    /// # Example — zero-copy CUDA input with host fallback
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
+    /// # fn feed_tensorrt(_dptr: *mut std::ffi::c_void, _bytes: usize) {}
+    /// # fn demo(t: &Tensor<f32>) {
+    /// // Try the zero-copy CUDA device pointer first.
+    /// if let Some(cuda) = t.cuda_map() {
+    ///     feed_tensorrt(cuda.device_ptr(), cuda.len());
+    ///     // `cuda` (a CudaMap guard) unmaps when it goes out of scope, freeing
+    ///     // the GPU buffer for the next convert().
+    /// } else {
+    ///     // Fall back to the host mapping when no CUDA handle is attached.
+    ///     let _host = t.map().expect("host map fallback must succeed");
+    ///     // `_host` is a TensorMap<f32> that derefs to &[f32].
+    /// }
+    /// # }
+    /// ```
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         self.cuda.as_ref()?.map()
     }
@@ -3667,5 +3692,23 @@ mod tests {
         let t = Tensor::<f32>::new(&[2, 2], None, None).unwrap();
         assert!(t.cuda().is_none(), "no CUDA handle on a Mem tensor");
         assert!(t.cuda_map().is_none(), "fast-fail map → None");
+    }
+
+    #[test]
+    fn cuda_map_then_host_map_fallback() {
+        // The documented client pattern: try cuda_map() first; when it is None
+        // (no CUDA handle — the case for a plain Mem tensor), fall back to map().
+        let t = Tensor::<f32>::new(&[2, 2], None, None).unwrap();
+        // Bind to a named variable so the CudaMap guard (and its borrow of `t`)
+        // is dropped at the end of this statement, before the else branch borrows `t` again.
+        let cuda = t.cuda_map();
+        if let Some(_c) = cuda {
+            // On a CUDA-registered tensor we'd use the device ptr here.
+            unreachable!("a Mem tensor has no CUDA handle");
+        } else {
+            let host = t.map().expect("host map fallback must succeed");
+            // TensorMapTrait::len() returns the element count (not bytes).
+            assert_eq!(host.len(), 4); // 2*2 f32 elements
+        }
     }
 }

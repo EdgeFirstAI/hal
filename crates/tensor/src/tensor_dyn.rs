@@ -233,6 +233,26 @@ impl TensorDyn {
 
     /// Fast-fail CUDA map: `None` when no handle is attached; else maps the
     /// PBO through the GL worker and returns a scoped device-pointer guard.
+    ///
+    /// The same try-`cuda_map`-then-[`map`](crate::TensorTrait::map) fallback pattern that applies to
+    /// [`Tensor::cuda_map`](crate::Tensor::cuda_map) applies here: call `cuda_map()` first for a
+    /// zero-copy device pointer; when it returns `None` (no CUDA handle attached), fall back to the
+    /// typed host mapping via the inner tensor.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::TensorDyn;
+    /// # fn feed_tensorrt(_dptr: *mut std::ffi::c_void, _bytes: usize) {}
+    /// # fn demo(t: &TensorDyn) {
+    /// if let Some(cuda) = t.cuda_map() {
+    ///     feed_tensorrt(cuda.device_ptr(), cuda.len());
+    /// } else {
+    ///     // No CUDA handle — use the typed inner tensor for host access.
+    ///     // See Tensor::cuda_map for the full fallback example.
+    /// }
+    /// # }
+    /// ```
     pub fn cuda_map(&self) -> Option<crate::cuda::CudaMap<'_>> {
         dispatch!(self, cuda_map)
     }

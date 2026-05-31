@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Optional CUDA Runtime interop, loaded via dlopen (no link-time dependency).
-//! Absent libcudart ⇒ every CUDA path degrades to None.
+//! Absent libcudart ⇒ every CUDA path degrades to `None`.
+//!
+//! The intended client pattern is a fast-fail + host fallback: call
+//! [`Tensor::cuda_map`](crate::Tensor::cuda_map) (or [`TensorDyn::cuda_map`](crate::TensorDyn::cuda_map))
+//! first; if it returns `None` (no CUDA handle attached or libcudart absent),
+//! fall back to the host mapping via `Tensor::map`. This keeps hot paths
+//! zero-copy on CUDA-capable hardware while remaining correct on CPU-only targets.
 use libloading::Library;
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_uint};
