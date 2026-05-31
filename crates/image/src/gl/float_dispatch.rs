@@ -109,7 +109,10 @@ mod tests {
     use crate::RenderDtypeSupport;
     use edgefirst_tensor::{DType, PixelFormat, TensorMemory};
 
-    const YES: RenderDtypeSupport = RenderDtypeSupport { f32: true, f16: true };
+    const YES: RenderDtypeSupport = RenderDtypeSupport {
+        f32: true,
+        f16: true,
+    };
     const NO: RenderDtypeSupport = RenderDtypeSupport {
         f32: false,
         f16: false,

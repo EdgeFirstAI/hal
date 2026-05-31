@@ -81,7 +81,9 @@ pub use half::f16;
 // All call sites that need these dimensions must use `packed_rgba16f_layout`
 // so the rule lives in exactly one place. Currently consumed by:
 //  - `crates/tensor/src/iosurface.rs` `new_image` (macOS IOSurface alloc)
-//  - `crates/image/src/gl/processor.rs` — migrated in a subsequent task.
+//  - `crates/image/src/gl/iosurface_import.rs` (macOS GL IOSurface import)
+//  - `crates/image/src/gl/processor/float.rs` (Linux GL float render — PBO
+//    readback and DMA-BUF, also via the `dma_f16_packed_layout` wrapper)
 // =============================================================================
 
 /// Geometry of the RGBA16F-packed surface backing a planar F16 image tensor.

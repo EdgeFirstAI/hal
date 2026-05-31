@@ -3372,7 +3372,8 @@ mod cpu_tests {
     #[test]
     fn cpu_widen_scratch_reused_across_converts() -> Result<()> {
         fn rgba(w: usize, h: usize) -> Result<TensorDyn> {
-            let src = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+            let src =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
             {
                 let mut map = src.as_u8().unwrap().map()?;
                 let data = map.as_mut_slice();
@@ -3396,20 +3397,42 @@ mod cpu_tests {
             TensorDyn::image(4, 4, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
 
         // 1st convert: scratch is None → allocate + cache.
-        cv.convert(&src4, &mut dst_a, Rotation::None, Flip::None, Crop::default())?;
+        cv.convert(
+            &src4,
+            &mut dst_a,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
         // 2nd convert, same dst format+size → cache-hit branch (reuse scratch).
-        cv.convert(&src4, &mut dst_b, Rotation::None, Flip::None, Crop::default())?;
+        cv.convert(
+            &src4,
+            &mut dst_b,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
 
         // Both results must be identical and correctly normalized.
         let a = dst_a.as_f32().unwrap().map()?;
         let b = dst_b.as_f32().unwrap().map()?;
-        assert_eq!(a.as_slice(), b.as_slice(), "cache-hit produced different output");
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "cache-hit produced different output"
+        );
 
         // 3rd convert at a different size → scratch mismatch → realloc branch.
         let src8 = rgba(8, 8)?;
         let mut dst_c =
             TensorDyn::image(8, 8, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
-        cv.convert(&src8, &mut dst_c, Rotation::None, Flip::None, Crop::default())?;
+        cv.convert(
+            &src8,
+            &mut dst_c,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
         let c = dst_c.as_f32().unwrap().map()?;
         assert_eq!(c.as_slice().len(), 8 * 8 * 3);
         assert!(c.as_slice().iter().all(|v| (0.0..=1.0).contains(v)));
