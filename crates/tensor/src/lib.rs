@@ -3689,7 +3689,7 @@ mod tests {
     #[test]
     fn cuda_returns_none_without_handle() {
         // A plain Mem-backed tensor has no CUDA handle attached.
-        let t = Tensor::<f32>::new(&[2, 2], None, None).unwrap();
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
         assert!(t.cuda().is_none(), "no CUDA handle on a Mem tensor");
         assert!(t.cuda_map().is_none(), "fast-fail map → None");
     }
@@ -3698,7 +3698,7 @@ mod tests {
     fn cuda_map_then_host_map_fallback() {
         // The documented client pattern: try cuda_map() first; when it is None
         // (no CUDA handle — the case for a plain Mem tensor), fall back to map().
-        let t = Tensor::<f32>::new(&[2, 2], None, None).unwrap();
+        let t = Tensor::<f32>::new(&[2, 2], Some(TensorMemory::Mem), None).unwrap();
         // Bind to a named variable so the CudaMap guard (and its borrow of `t`)
         // is dropped at the end of this statement, before the else branch borrows `t` again.
         let cuda = t.cuda_map();

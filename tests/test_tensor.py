@@ -694,8 +694,10 @@ def test_is_cuda_available_returns_bool():
 
 def test_cuda_map_falls_back_to_map():
     """cuda_map() on a Mem tensor returns None; map() fallback still works."""
-    # Force a plain heap tensor so cuda_map() always returns None in CI
-    t = Tensor([4, 4], dtype="float32", mem=None)
+    # Force an explicit Mem tensor so cuda_map() always returns None regardless
+    # of platform (memory=None may select DMA on Linux, where a CUDA-capable host
+    # could attach a handle — making the "no CUDA handle" assertion flaky).
+    t = Tensor([4, 4], dtype="float32", mem=TensorMemory.MEM)
 
     cm = t.cuda_map()
     # A Mem tensor has no CUDA handle registered — must return None

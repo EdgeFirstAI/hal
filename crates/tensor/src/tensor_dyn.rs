@@ -1113,7 +1113,9 @@ mod tests {
     fn cuda_passthrough_none_for_mem_tensor() {
         // Build a Mem-backed dynamic tensor the same way the other tests here do,
         // then confirm the CUDA accessors pass through to None (no handle).
-        let t: TensorDyn = Tensor::<f32>::new(&[10], None, None).unwrap().into();
+        let t: TensorDyn = Tensor::<f32>::new(&[10], Some(TensorMemory::Mem), None)
+            .unwrap()
+            .into();
         assert!(t.cuda().is_none());
         assert!(t.cuda_map().is_none());
     }
