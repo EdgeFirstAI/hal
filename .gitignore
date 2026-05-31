@@ -49,6 +49,8 @@ env.sh
 # C API build artifacts
 crates/capi/build/
 
-# TFLite/ONNX models (large binaries); testdata/ has its own .gitignore
+# Large binary model artifacts kept outside the repo. Tracked fixtures
+# (testdata/decoder/*.safetensors) survive because gitignore only
+# affects untracked files; new vetted fixtures need `git add -f`.
 *.tflite
 *.onnx

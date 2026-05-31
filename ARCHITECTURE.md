@@ -71,6 +71,57 @@ zero-copy GPU-importable buffer?" The platform-specific probes
 to know *which* primitive is in use — e.g. to decide whether to call
 `hal_tensor_clone_fd` (Linux) vs `hal_tensor_iosurface_id` (macOS).
 
+### Float preprocessing capability
+
+`ImageProcessor::supported_render_dtypes()` returns a `RenderDtypeSupport
+{ f16, f32 }` struct after probing the GPU's float color-buffer extensions
+at construction time. Use it once at startup to decide which destination
+dtype to request; `convert()` always succeeds (GPU or CPU fallback).
+
+**Per-platform capability**
+
+| Platform / GPU | F16 | F32 |
+|----------------|-----|-----|
+| V3D / Broadcom (RPi 5) | PBO readback + zero-copy DMA-BUF (`DRM_FORMAT_ABGR16161616F`) | PBO readback |
+| Mali-G310 / Panfrost (i.MX 95) | PBO readback + zero-copy DMA-BUF (`DRM_FORMAT_ABGR16161616F`) | PBO readback |
+| Vivante GC7000UL (i.MX 8M Plus) | **Disabled → CPU fallback** (float readback 170–320 ms) | **Disabled → CPU fallback** |
+| Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer | PBO → host buffer (no dma_heap; CUDA–GL interop Phase 2) |
+| macOS ANGLE (RGBA16F IOSurface) | F16 `PlanarRgb` zero-copy IOSurface | Not supported (ANGLE rejects `(GL_FLOAT, *)`) |
+| CPU fallback | Always present — never errors | Always present — never errors |
+
+**Data layout produced by the GPU paths**
+
+| DType / layout | GL render target | Tensor shape |
+|----------------|-----------------|--------------|
+| F16 NCHW `PlanarRgb` | RGBA16F-packed `(W/4, 3H)` — four contiguous f16 planar elements per RGBA16F pixel | `[3, H, W]` f16 |
+| F32 NHWC `Rgb` | R32F-wide `(W×3, H)` — one f32 per R channel | `[H, W, 3]` f32 |
+
+**Key constraints**
+
+- Source must be `Rgba` for the GPU float path; other sources fall back to CPU.
+- F32 DMA-BUF is impossible (no 32-bit-float DRM fourcc); `create_image(memory: Some(Dma), dtype: F32)` returns `NotSupported`.
+- F16 packing requires `W % 4 == 0` (validated at allocation; non-multiples return `InvalidShape`).
+- Rotation or flip with a float destination falls back to CPU.
+- Normalization is `[0, 1]` only; per-channel mean/std is a future item.
+- CPU fallback widens after a u8-precision resize.
+
+**Consumer contract**
+
+```rust,no_run
+# use edgefirst_image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+# use edgefirst_tensor::{PixelFormat, DType};
+# fn main() -> Result<(), edgefirst_image::Error> {
+let proc = ImageProcessor::new()?;
+let support = proc.supported_render_dtypes();
+// Pick the best float dtype; fall back to U8 if the GPU cannot render floats.
+let dst_dtype = if support.f16 { DType::F16 } else if support.f32 { DType::F32 } else { DType::U8 };
+// memory: None → auto-selects float PBO when supported, else heap.
+// convert() always succeeds; GPU path used when available, CPU otherwise.
+let mut dst = proc.create_image(640, 640, PixelFormat::PlanarRgb, dst_dtype, None)?;
+# Ok(())
+# }
+```
+
 ---
 
 ## Design Patterns

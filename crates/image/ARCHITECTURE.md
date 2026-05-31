@@ -126,26 +126,44 @@ at `ImageProcessor::new()` time:
 ```mermaid
 flowchart TD
     Create["create_image(w, h, PixelFormat, DType, mem)"]
+    ExplicitDma{explicit Dma?}
+    F32Dma{dtype == F32?}
     DMA{DMA-buf roundtrip<br/>verified at init?}
-    PBO{OpenGL PBO<br/>available?}
+    FloatPBO{GL float capable<br/>for this dtype?}
+    BytePBO{OpenGL PBO<br/>available?}
     Mem[MemTensor<br/>heap fallback]
 
-    Create --> DMA
-    DMA -->|Yes| UseDMA["DmaTensor<br/>Zero-copy EGLImage import"]
-    DMA -->|No| PBO
-    PBO -->|Yes| UsePBO["PboTensor<br/>Zero-copy GL buffer binding"]
-    PBO -->|No| Mem
+    Create --> ExplicitDma
+    ExplicitDma -->|Yes| F32Dma
+    F32Dma -->|Yes| NotSupported["Error::NotSupported<br/>(no F32 DRM fourcc)"]
+    F32Dma -->|No| UseDMA["DmaTensor<br/>Zero-copy EGLImage import"]
+    ExplicitDma -->|No / auto| DMA
+    DMA -->|Yes| UseDMA
+    DMA -->|No| FloatPBO
+    FloatPBO -->|Yes, F16 or F32| UseFloatPBO["Float PboTensor<br/>(F16 NCHW or F32 NHWC)"]
+    FloatPBO -->|No| BytePBO
+    BytePBO -->|Yes, u8/i8| UsePBO["PboTensor<br/>Zero-copy GL buffer binding"]
+    BytePBO -->|No| Mem
 
     style UseDMA fill:#90ee90
+    style UseFloatPBO fill:#c8e6c9
     style UsePBO fill:#87ceeb
     style Mem fill:#ffeb9c
+    style NotSupported fill:#ffcccc
 ```
 
 | Backend | When selected | GPU transfer | Platforms |
 |---------|---------------|--------------|-----------|
-| DMA-buf | GPU supports `EGL_EXT_image_dma_buf_import` | Zero-copy: GPU reads/writes the DMA buffer directly | NXP i.MX 8M Plus (Vivante), i.MX 95 (Mali/Panfrost) |
-| PBO | GLES 3.0 available, DMA-buf roundtrip fails | Zero-copy GL: `GL_PIXEL_UNPACK_BUFFER` / `GL_PIXEL_PACK_BUFFER` | NVIDIA desktop, hosts without DMA-heap permissions |
-| Mem | No GPU or GL unavailable | CPU `memcpy` via `glTexImage2D` / `glReadnPixels` | Universal fallback |
+| DMA-buf | GPU supports `EGL_EXT_image_dma_buf_import`; dtype != F32 | Zero-copy: GPU reads/writes the DMA buffer directly | NXP i.MX 95 (Mali/Panfrost), RPi 5 (V3D) |
+| Float PBO | `supported_render_dtypes().f16/f32` true; dtype F16 or F32 | `GL_PIXEL_PACK_BUFFER` readback | V3D, Mali, Tegra; macOS F16 via IOSurface |
+| u8/i8 PBO | GLES 3.0 available, DMA-buf roundtrip fails; dtype U8/I8 | Zero-copy GL: `GL_PIXEL_UNPACK_BUFFER` / `GL_PIXEL_PACK_BUFFER` | NVIDIA desktop, hosts without DMA-heap permissions |
+| Mem | No GPU or GL unavailable; float GPU cap absent | CPU `memcpy` via `glTexImage2D` / `glReadnPixels` | Universal fallback; `convert()` uses CPU path |
+
+**Note:** when `memory: None` is passed with a float dtype and GPU float
+support is absent, allocation falls through to `Mem` without error.
+[`convert`](https://docs.rs/edgefirst-image/latest/edgefirst_image/trait.ImageProcessorTrait.html#tymethod.convert)
+then uses the CPU path — it never returns an error due to float
+capability.
 
 **Why PBO matters:** on desktop Linux with NVIDIA GPUs, DMA-buf allocation
 succeeds (`/dev/dma_heap/system`) but the NVIDIA EGL driver cannot import
@@ -808,15 +826,16 @@ in the project README for the user-facing rules and validation patterns.
 
 ## Platform-Specific Notes
 
-| Platform | Backends available | Notes |
-|----------|--------------------|-------|
-| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | NV12 → PlanarRgb requires the two-pass workaround |
-| Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
-| Linux desktop / NVIDIA | OpenGL (PBO path), CPU | DMA-buf import unsupported; PBO path provides zero-copy |
-| Linux desktop / Mesa x86_64 | OpenGL, CPU | DMA-heap permission required for DMA path |
-| macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | YUYV → RGBA implemented; other convert pairs fall back to CPU (see [`MacosGlProcessor::supports`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) and BENCHMARKS.md Known Gap #17). IOSurface zero-copy via `EGL_ANGLE_iosurface_client_buffer`. |
-| macOS (no ANGLE) | CPU | `MacosGlProcessor::new()` fails at `ImageProcessor::new()` time; the GPU dispatch is never attempted. |
-| Other Unix | CPU | No GPU/G2D |
+| Platform | Backends available | Float preprocessing | Notes |
+|----------|--------------------|---------------------|-------|
+| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12 → PlanarRgb requires the two-pass workaround; GPU float disabled (170–320 ms readback) |
+| Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
+| Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |
+| Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO (host buffers; CUDA–GL interop Phase 2) | DMA-buf import unsupported; PBO path provides zero-copy |
+| Linux desktop / Mesa x86_64 | OpenGL, CPU | GPU-dependent | DMA-heap permission required for DMA path |
+| macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA and RGBA → PlanarRgb F16 implemented; other convert pairs fall back to CPU. IOSurface zero-copy via `EGL_ANGLE_iosurface_client_buffer`. |
+| macOS (no ANGLE) | CPU | CPU only | `MacosGlProcessor::new()` fails at `ImageProcessor::new()` time; the GPU dispatch is never attempted. |
+| Other Unix | CPU | CPU only | No GPU/G2D |
 
 ## Cross-References
 

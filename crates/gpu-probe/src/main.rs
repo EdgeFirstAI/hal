@@ -14,6 +14,7 @@ mod bench_shader;
 mod bench_texture;
 mod egl_context;
 mod probe;
+mod probe_float_render;
 mod probe_int_textures;
 mod probe_min_sizes;
 mod probe_rgb_fbo;
@@ -50,6 +51,7 @@ fn main() {
         probe::run_probes(&ctx);
         probe_int_textures::run(&ctx);
         probe_min_sizes::run(&ctx);
+        probe_float_render::run(&ctx);
         probe_rgb_fbo::run(&ctx)
     } else {
         false

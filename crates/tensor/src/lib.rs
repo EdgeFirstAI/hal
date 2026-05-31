@@ -64,6 +64,110 @@ use std::{
 };
 pub use tensor_dyn::TensorDyn;
 
+/// Re-export of `half::f16` so downstream crates can write
+/// `Tensor::<edgefirst_tensor::f16>::from_iosurface(…)` without
+/// adding `half` to their own dependency list. The version stays in
+/// lockstep with the `half` workspace dep.
+pub use half::f16;
+
+// =============================================================================
+// RGBA16F packed-layout geometry — single source of truth
+//
+// A `PlanarRgb` [3,H,W] or `PlanarRgba` [4,H,W] f16 tensor is represented
+// on the GPU as an RGBA16F surface (the only float format accepted by the
+// ANGLE IOSurface extension). Four contiguous f16 elements are packed into
+// each 8-byte RGBA16F texel, yielding a `(W/4, C*H)` surface.
+//
+// All call sites that need these dimensions must use `packed_rgba16f_layout`
+// so the rule lives in exactly one place. Currently consumed by:
+//  - `crates/tensor/src/iosurface.rs` `new_image` (macOS IOSurface alloc)
+//  - `crates/image/src/gl/iosurface_import.rs` (macOS GL IOSurface import)
+//  - `crates/image/src/gl/processor/float.rs` (Linux GL float render — PBO
+//    readback and DMA-BUF, also via the `dma_f16_packed_layout` wrapper)
+// =============================================================================
+
+/// Geometry of the RGBA16F-packed surface backing a planar F16 image tensor.
+///
+/// ANGLE only supports one float `(type, internal_format)` pair for IOSurface
+/// import: `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F (8 bytes/texel). To map a
+/// `[C, H, W]` f16 planar tensor onto such a surface, 4 contiguous f16
+/// elements are packed into each RGBA16F texel, yielding a surface of
+/// `(W/4, C*H)` texels at 8 bytes/texel. The byte stream is identical to a
+/// (nonexistent) R16F `(W, C*H)` surface and can be consumed as `&[f16]`
+/// with shape `[1, C, H, W]` without rearrangement.
+///
+/// Obtain via [`packed_rgba16f_layout`] — never construct directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRgba16fLayout {
+    /// Surface width in texels (`width / 4`).
+    pub surface_w: usize,
+    /// Surface height in texels (`planes * height`).
+    pub surface_h: usize,
+    /// Bytes per RGBA16F texel (always 8).
+    pub bytes_per_texel: usize,
+    /// Row pitch in bytes (`surface_w * 8`).
+    pub pitch: usize,
+}
+
+/// Canonical geometry for the RGBA16F-packed surface backing a planar F16
+/// image tensor.
+///
+/// Returns `Some(layout)` only when **all** of the following hold:
+///
+/// - `dtype == DType::F16`
+/// - `format` is `PixelFormat::PlanarRgb` (3 planes) or
+///   `PixelFormat::PlanarRgba` (4 planes)
+/// - `width % 4 == 0`
+///
+/// Returns `None` for any other `(format, dtype)` combination, misaligned
+/// width, or when the surface geometry would overflow `usize` — callers
+/// must fall back to a non-packed path or return a context-appropriate
+/// error.
+///
+/// # Examples
+///
+/// ```rust
+/// use edgefirst_tensor::{packed_rgba16f_layout, PixelFormat, DType};
+///
+/// let layout = packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 640, 480).unwrap();
+/// assert_eq!(layout.surface_w, 160);
+/// assert_eq!(layout.surface_h, 1440);
+/// assert_eq!(layout.bytes_per_texel, 8);
+/// assert_eq!(layout.pitch, 1280);
+/// ```
+pub fn packed_rgba16f_layout(
+    format: PixelFormat,
+    dtype: DType,
+    width: usize,
+    height: usize,
+) -> Option<PackedRgba16fLayout> {
+    if dtype != DType::F16 {
+        return None;
+    }
+    let planes: usize = match format {
+        PixelFormat::PlanarRgb => 3,
+        PixelFormat::PlanarRgba => 4,
+        _ => return None,
+    };
+    if !width.is_multiple_of(4) {
+        return None;
+    }
+    let surface_w = width / 4;
+    // Checked arithmetic: a degenerate (height, width) could otherwise wrap
+    // and yield an under-sized layout, which downstream allocators trust for
+    // GPU/CPU buffer sizing. Overflow → None (handled like any other
+    // unsupported geometry).
+    let surface_h = planes.checked_mul(height)?;
+    let bytes_per_texel = 8;
+    let pitch = surface_w.checked_mul(bytes_per_texel)?;
+    Some(PackedRgba16fLayout {
+        surface_w,
+        surface_h,
+        bytes_per_texel,
+        pitch,
+    })
+}
+
 /// Per-plane DMA-BUF descriptor for external buffer import.
 ///
 /// Owns a duplicated file descriptor plus optional stride and offset metadata.
@@ -188,6 +292,51 @@ impl DType {
 impl fmt::Display for DType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Map a static numeric type `T` to its `DType` discriminant, returning
+/// `None` for types that do not have a `DType` representation (e.g.
+/// user-defined wrappers in tests).
+///
+/// Used by image-tensor constructors that need the runtime dtype to
+/// look up FourCC / pixel-format mappings on the macOS IOSurface path,
+/// where the GPU backend cares about whether the bytes are u8 / f16 /
+/// f32 even though the static `Tensor<T>` carries the same information
+/// at the type level.
+///
+/// macOS-only: the sole caller is the IOSurface DMA branch in
+/// `Tensor::<T>::image()`, which is itself `cfg(target_os = "macos")`.
+/// Leaving this ungated makes it dead code on every other target, which
+/// fails CI under `-D warnings`.
+#[cfg(target_os = "macos")]
+pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
+    use std::any::TypeId;
+    let id = TypeId::of::<T>();
+    if id == TypeId::of::<u8>() {
+        Some(DType::U8)
+    } else if id == TypeId::of::<i8>() {
+        Some(DType::I8)
+    } else if id == TypeId::of::<u16>() {
+        Some(DType::U16)
+    } else if id == TypeId::of::<i16>() {
+        Some(DType::I16)
+    } else if id == TypeId::of::<u32>() {
+        Some(DType::U32)
+    } else if id == TypeId::of::<i32>() {
+        Some(DType::I32)
+    } else if id == TypeId::of::<u64>() {
+        Some(DType::U64)
+    } else if id == TypeId::of::<i64>() {
+        Some(DType::I64)
+    } else if id == TypeId::of::<half::f16>() {
+        Some(DType::F16)
+    } else if id == TypeId::of::<f32>() {
+        Some(DType::F32)
+    } else if id == TypeId::of::<f64>() {
+        Some(DType::F64)
+    } else {
+        None
     }
 }
 
@@ -993,10 +1142,12 @@ where
         width: usize,
         height: usize,
         format: PixelFormat,
+        dtype: DType,
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
-        IoSurfaceTensor::<T>::new_image(width, height, format, shape, name).map(TensorStorage::Dma)
+        IoSurfaceTensor::<T>::new_image(width, height, format, dtype, shape, name)
+            .map(TensorStorage::Dma)
     }
 
     /// Create a new tensor storage using the given file descriptor, shape,
@@ -1283,7 +1434,13 @@ where
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
+        // Shape comes from the shared `PixelFormat::image_shape` helper (packed /
+        // planar / semi-planar NV12·NV16, including the NV12 even-height check).
+        // The `T: 'static` bound is required by the macOS IOSurface path below.
         let shape = format.image_shape(width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
                 "invalid dimensions {width}x{height} for format {format:?}"
@@ -1300,23 +1457,92 @@ where
         // If the natural row pitch (`width * channels * sizeof(T)`) is not
         // already 64-byte aligned, the padded allocation cannot be mapped
         // as a contiguous packed tensor — CPU reads/writes would use the
-        // wrong stride. Only proceed when alignment is natural; otherwise
-        // fall through to SHM/Mem where no per-row padding exists.
+        // wrong stride.
+        //
+        // Explicit-Dma contract: when the caller passes
+        // `Some(TensorMemory::Dma)` they have asked for an
+        // **image-formatted IOSurface**. Silently downgrading to the
+        // generic 'L008' byte-bag when alignment fails buries the
+        // mismatch — the caller only finds out hours later when ANGLE
+        // (or any GL importer) rejects the bind with
+        // `EGL_BAD_ATTRIBUTE`. Same anti-pattern bit us previously on
+        // Mali GPUs with DMA-BUF padding. The right behaviour is to
+        // fail loudly here with the alignment requirement spelled out
+        // so the caller can either pick aligned dimensions, request
+        // SHM/Mem explicitly, or pass `memory=None` for auto-select.
         #[cfg(target_os = "macos")]
         if matches!(memory, Some(TensorMemory::Dma)) {
-            let natural_row_bytes = width * format.channels() * std::mem::size_of::<T>();
-            if natural_row_bytes.is_multiple_of(64) {
-                if let Ok(storage) =
-                    TensorStorage::<T>::new_image_iosurface(width, height, format, &shape, None)
-                {
+            // For planar formats the IOSurface stacks channels
+            // vertically (channels * height rows), so the row stride is
+            // single-channel width * sizeof(T). Packed formats keep the
+            // natural width * channels * sizeof(T) stride.
+            let natural_row_bytes = match format.layout() {
+                PixelLayout::Planar => width * std::mem::size_of::<T>(),
+                _ => width * format.channels() * std::mem::size_of::<T>(),
+            };
+            if !natural_row_bytes.is_multiple_of(64) {
+                let elem_size = std::mem::size_of::<T>();
+                let per_pixel_bytes = match format.layout() {
+                    PixelLayout::Planar => elem_size.max(1),
+                    _ => format.channels().max(1) * elem_size.max(1),
+                };
+                // Compute the next 64-byte-aligned width by rounding the
+                // natural row pitch up to the next multiple of 64 and
+                // dividing back by per-pixel bytes. This handles every
+                // `per_pixel_bytes` value correctly:
+                //
+                //   * Divisors of 64 (1/2/4/8/16/32/64) → the suggestion
+                //     is always 64-byte aligned.
+                //   * Non-divisors of 64 (e.g. RGB u8 with 3 B/pixel) →
+                //     the next aligned row pitch may not be an integer
+                //     multiple of per_pixel_bytes (3 doesn't divide 64
+                //     in any way), so a "pad width to N" suggestion is
+                //     structurally impossible — omit the suggestion
+                //     instead of printing a wrong number.
+                //   * per_pixel_bytes > 64 → same situation, also
+                //     omitted; the previous formula divided by zero.
+                //
+                // The error always names the alignment requirement
+                // verbatim and lists the two non-DMA alternatives so
+                // the caller has at least one always-applicable fix.
+                let aligned_row_bytes = natural_row_bytes.next_multiple_of(64);
+                let pad_hint =
+                    if per_pixel_bytes > 0 && aligned_row_bytes.is_multiple_of(per_pixel_bytes) {
+                        let w = aligned_row_bytes / per_pixel_bytes;
+                        format!("Pad width to {w} (the next 64-byte-aligned stride), ")
+                    } else {
+                        String::new()
+                    };
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: {format:?} {width}x{height} with element \
+                     size {elem_size} produces a {natural_row_bytes}-byte natural \
+                     row pitch, which is not 64-byte aligned. \
+                     IOSurface rounds bytes_per_row up to 64 bytes, so a \
+                     contiguous CPU map of this tensor would read garbage. \
+                     {pad_hint}pass memory=None to auto-fall-back to SHM, or \
+                     pass memory=Some(TensorMemory::Shm) or \
+                     Some(TensorMemory::Mem) explicitly."
+                )));
+            }
+            // Alignment OK. Try image-formatted IOSurface; on any
+            // structural failure (unsupported (format, dtype) combo,
+            // out-of-memory, etc.) fall through to SHM. dtype_of
+            // returns None for non-standard numeric T used in tests —
+            // those legitimately have no IOSurface FourCC mapping.
+            if let Some(dtype) = dtype_of::<T>() {
+                if let Ok(storage) = TensorStorage::<T>::new_image_iosurface(
+                    width, height, format, dtype, &shape, None,
+                ) {
                     let mut t = Self::wrap(storage);
                     t.format = Some(format);
                     return Ok(t);
                 }
             }
-            // If row pitch is not 64-byte aligned or new_image_iosurface
-            // fails (unsupported format), fall through to the generic
-            // Tensor::new path which picks up SHM/Mem instead.
+            // Unsupported (format, dtype) on the IOSurface path —
+            // e.g. PlanarRgb u8 has no IOSurface FourCC mapping today
+            // (only F16 PlanarRgb is wired). Fall through to SHM/Mem
+            // since the caller asked for Dma but no image-formatted DMA
+            // storage exists for this combination.
         }
 
         let mut t = Self::new(&shape, memory, None)?;
@@ -1533,7 +1759,10 @@ where
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
         Self::image(width, height, format, memory)
     }
 
@@ -2316,6 +2545,88 @@ mod image_tests {
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
         assert_eq!(t.shape(), &[3, 480, 640]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn image_tensor_dma_rejects_non_aligned_width() {
+        // RGBA u8 at width=4 → 4*4*1 = 16 bytes/row, not 64-byte
+        // aligned. An explicit `Some(TensorMemory::Dma)` request must
+        // fail loudly with the alignment requirement spelled out
+        // rather than silently downgrading to a generic 'L008'
+        // byte-bag IOSurface (which would then fail at GL bind time
+        // with an opaque EGL_BAD_ATTRIBUTE). Same anti-pattern bit us
+        // previously on Mali GPUs with DMA-BUF padding.
+        let err = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
+            .expect_err("misaligned Dma request must be rejected");
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("64-byte aligned") && msg.contains("Pad width"),
+                    "error must spell out the alignment requirement: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        // Same misaligned dimensions with `memory=None` should
+        // auto-fall-back to SHM/Mem (no error).
+        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, None)
+            .expect("auto-select must fall back gracefully");
+        assert_eq!(t.format(), Some(PixelFormat::Rgba));
+    }
+
+    /// `per_pixel_bytes` that doesn't divide 64 evenly (e.g. RGB u8 with
+    /// 3 B/pixel) makes a "Pad width to N" suggestion structurally
+    /// impossible — there is no integer width whose `width * 3` is a
+    /// multiple of 64. The error must still fire (no silent SHM
+    /// fallback for explicit-DMA requests) and must spell out the
+    /// alignment requirement; it just omits the misleading "pad to N"
+    /// hint instead of printing a number whose row pitch still won't
+    /// align.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn image_tensor_dma_rejects_indivisible_pixel_pitch_without_pad_hint() {
+        // Width=10 RGB u8 → 30 B/row, not 64-byte aligned. The next
+        // 64-multiple (64 B) isn't an integer multiple of 3 B/pixel,
+        // so the "pad width to N" hint can't produce a valid number
+        // and must be omitted. (Width=640 happens to align — 640*3 =
+        // 1920 = 30*64 — so don't pick that for this regression
+        // guard.)
+        let err = Tensor::<u8>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect_err("RGB u8 with 3 B/pixel and non-aligned width must be rejected");
+        match err {
+            Error::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("64-byte aligned"),
+                    "error must still name the alignment requirement: {msg}"
+                );
+                assert!(
+                    !msg.contains("Pad width"),
+                    "indivisible per-pixel pitch makes a width suggestion impossible; \
+                     hint must be omitted, got: {msg}"
+                );
+                assert!(
+                    msg.contains("memory=None") && msg.contains("TensorMemory::Mem"),
+                    "error must still list the always-applicable alternatives: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn image_tensor_dma_planar_f16_alignment() {
+        // PlanarRgb F16 uses single-channel row pitch (width * 2 bytes).
+        // Width=16 → 32 bytes/row (not aligned); width=32 → 64 bytes/row (aligned).
+        let err =
+            Tensor::<half::f16>::image(16, 16, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
+                .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+        // 32 wide should work.
+        let t = Tensor::<half::f16>::image(32, 8, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
+            .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
+        assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
     }
 
     #[test]
@@ -3305,5 +3616,44 @@ mod tests {
             map.as_slice().iter().all(|&b| b == 0xAB),
             "SHM tensor data should be writable and readable"
         );
+    }
+
+    // =========================================================================
+    // packed_rgba16f_layout — host-runnable geometry unit tests (TDD)
+    // =========================================================================
+
+    #[test]
+    fn packed_rgba16f_layout_planar_rgb_f16() {
+        let layout =
+            packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 640, 640).expect("Some");
+        assert_eq!(layout.surface_w, 160);
+        assert_eq!(layout.surface_h, 1920);
+        assert_eq!(layout.bytes_per_texel, 8);
+        assert_eq!(layout.pitch, 1280);
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_planar_rgba_f16() {
+        let layout =
+            packed_rgba16f_layout(PixelFormat::PlanarRgba, DType::F16, 640, 640).expect("Some");
+        assert_eq!(layout.surface_w, 160);
+        assert_eq!(layout.surface_h, 2560); // 4 planes
+        assert_eq!(layout.bytes_per_texel, 8);
+        assert_eq!(layout.pitch, 1280);
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_rejects_misaligned() {
+        assert!(packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::F16, 642, 640).is_none());
+    }
+
+    #[test]
+    fn packed_rgba16f_layout_rejects_non_f16() {
+        // Non-F16 dtype with planar RGB
+        assert!(packed_rgba16f_layout(PixelFormat::PlanarRgb, DType::U8, 640, 640).is_none());
+        // Non-planar format with F32
+        assert!(packed_rgba16f_layout(PixelFormat::Rgb, DType::F32, 640, 640).is_none());
+        // Packed Rgba with F16 is not a planar format → None
+        assert!(packed_rgba16f_layout(PixelFormat::Rgba, DType::F16, 640, 640).is_none());
     }
 }

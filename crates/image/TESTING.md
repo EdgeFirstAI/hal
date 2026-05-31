@@ -192,6 +192,34 @@ soft-float `__extendhfsf2` helper) via
 [`scripts/audit_f16_codegen.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/audit_f16_codegen.sh)
 `<target-triple>`. Requires `cargo install cargo-show-asm`.
 
+## Float Render Tests
+
+GPU float preprocessing (F16/F32) is covered by gated integration and unit
+tests. All skip gracefully when the required hardware or capability is absent.
+
+| Test name | Gate | What it covers |
+|-----------|------|----------------|
+| `convert_f16_nchw_pbo_roundtrip` | GL available + `supported_render_dtypes().f16` | F16 `PlanarRgb` NCHW PBO: encode, render, readback, value check |
+| `convert_f32_nhwc_pbo_roundtrip` | GL available + `supported_render_dtypes().f32` | F32 `Rgb` NHWC PBO: render, readback, value check |
+| `convert_f32_nhwc_pbo_resize_bilinear` | GL available + `supported_render_dtypes().f32` | F32 PBO readback after bilinear resize |
+| `convert_f16_nchw_dma_roundtrip` | V3D/Mali DMA-BUF + `supported_render_dtypes().f16` | F16 zero-copy DMA-BUF render path |
+| `cpu_convert_u8_to_f16_planar_rgb` | none (CPU) | CPU widen: u8 resize then f16 NCHW planar layout |
+| `cpu_convert_u8_to_f32_rgb` | none (CPU) | CPU widen: u8 resize then f32 NHWC layout |
+| `convert_rgba_to_f16_cpu` / `*_falls_back` | GL absent or Vivante | CPU fallback engaged when GPU float unavailable |
+| `supported_render_dtypes_linux_smoke` | GL available (Linux) | `supported_render_dtypes()` reports real values on Linux |
+| `create_image_f32_dma_rejected` | Linux | `create_image(F32, Some(Dma))` → `NotSupported` |
+
+**Capability probe tool:** `crates/gpu-probe` (`cargo run -p gpu-probe --
+--probe-only`) measures per-target float render capability (texture FBO
+renderability, F16 DMA-BUF render, PBO readback timing) and prints a
+`RenderDtypeSupport` summary. Run it on each board before enabling float
+paths in production pipelines.
+
+**Vivante skip:** tests that require GPU float are automatically skipped on
+Vivante GC7000UL targets where `supported_render_dtypes()` returns
+`{ f16: false, f32: false }`. The CPU fallback tests (`*_cpu`, `*_falls_back`)
+verify the fallback produces correct `[0, 1]` normalized output on those hosts.
+
 ## Coverage Notes
 
 - Participates in workspace `cargo llvm-cov`; lcov output appears under
@@ -205,6 +233,65 @@ soft-float `__extendhfsf2` helper) via
   `cargo test`. CI does not currently include this configuration in the
   matrix; downstream contributors covering specific fallback regressions
   may want to enable it on a per-PR basis.
+
+### Coverage lanes and the float-render surface
+
+SonarCloud aggregates LCOV from five lanes: **x86_64**, **aarch64**,
+**macOS (Apple Silicon)**, **software-gl (Mesa llvmpipe)**, and
+**i.MX 8M Plus**. A new-code line counts as covered if *any* lane hits it.
+The float (F16/F32) preprocessing surface splits across lanes by where its
+code can actually execute:
+
+| Surface | Where it runs in CI coverage | Lane |
+|---------|------------------------------|------|
+| `classify_float_render`, `packed_rgba16f_layout`, `float_render_support`, `dma_f16_packed_layout`, `pbo_elem_count`/`pbo_shape`, `float_crop_uniforms`, `float_pbo_buffer_id` | Pure logic — runs everywhere | all |
+| CPU U8→F16/F32 widen + `[0,1]` normalize fallback (`cpu/mod.rs`) | CPU — runs everywhere | all |
+| **IOSurface F16 zero-copy GL render** (`macos_processor.rs`, `iosurface_import.rs`) | ANGLE → Metal on the macOS runner's GPU | **macOS** |
+| **Linux GL float PBO render** (`gl/processor/float.rs` `upload_float_src` / `draw_float_quad` / `convert_float_to_pbo`, `threaded.rs` PBO send/recv) | Mesa **llvmpipe** — software GL, no GPU needed, same GLSL | **software-gl** |
+| **Linux GL float DMA-BUF render** (`gl/processor/float.rs` `convert_float_to_dma`) | Needs a real **V3D/Mali** GPU | *none — see ceiling below* |
+
+The **macOS coverage lane** ([`scripts/test-macos.sh`](https://github.com/EdgeFirstAI/hal/blob/main/scripts/test-macos.sh)
+`COVERAGE=1`) is what makes the IOSurface F16 render path count: macOS runs
+OpenGL ES on ANGLE-over-Metal, so `test_macos_gl_pbuffer_cache_reuses_surfaces`
+and the F16 IOSurface convert tests exercise the real GPU. Because the test
+binaries must be codesigned with the library-validation entitlement before
+they can `dlopen` ANGLE, the coverage build is **two-pass**: build+run
+instrumented (GL tests self-skip), codesign, then re-run with
+`HAL_TEST_ALLOW_DLOPEN_ANGLE=1` so the GL path executes under instrumentation.
+
+The **software-gl coverage lane** runs the Linux GL backend on **Mesa
+llvmpipe**. HAL normally *rejects* software renderers (they are slower than
+the native CPU backend — see `GLProcessorST::new`), so this lane sets
+`EDGEFIRST_ALLOW_SOFTWARE_GL=1` to opt past that rejection plus
+`LIBGL_ALWAYS_SOFTWARE=1` / `EGL_PLATFORM=surfaceless` to bring up a headless
+llvmpipe EGL display. llvmpipe executes the *same* RGBA16F/R32F fragment
+shader the GPU would, so the `convert_f16_nchw_pbo_roundtrip` /
+`convert_f32_nhwc_pbo_roundtrip` value-checks are numerically valid — this
+lane genuinely covers the PBO render path (`upload_float_src`,
+`draw_float_quad`, `convert_float_to_pbo`) without any GPU. The lane is
+**bonus-coverage only** (best-effort steps); the x86/macOS/hardware lanes are
+the authoritative test gates. To reproduce locally on a Linux host with Mesa:
+
+```bash
+LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless EDGEFIRST_ALLOW_SOFTWARE_GL=1 \
+  cargo test -p edgefirst-image --lib -- --test-threads=1
+```
+
+### Known ceiling: Linux GL float DMA-BUF render path
+
+After the software-gl lane, the only float-render code with no CI coverage is
+the **DMA-BUF zero-copy** path — `gl/processor/float.rs::convert_float_to_dma`
+and its EGLImage/DMA-BUF import. It binds a `DRM_FORMAT_ABGR16161616F`
+dma-buf as the render target, which only works on a real **V3D** (Raspberry
+Pi 5) or **Mali** (i.MX 95) GPU. The CI coverage matrix has no such runner
+(x86_64/aarch64 are headless, the i.MX 8M Plus lane is **Vivante** where float
+GL is *disabled*, `supported_render_dtypes()` → `{ f16: false, f32: false }`).
+That path is therefore covered **on-target, manually** — the
+`convert_f16_nchw_dma_roundtrip` test passes on rpi5-hailo and imx95-frdm —
+but does not contribute to the CI coverage number until a V3D/Mali board joins
+the coverage matrix. It is the only remaining float-render gap; everything
+else (pure logic, CPU fallback, IOSurface F16, and the Linux PBO render path)
+is covered in CI.
 
 ## Cross-References
 

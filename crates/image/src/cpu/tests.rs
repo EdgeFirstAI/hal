@@ -3237,4 +3237,351 @@ mod cpu_tests {
         }
         Ok(())
     }
+
+    // =========================================================================
+    // CPU F16/F32 float destination tests
+    // =========================================================================
+
+    /// RGBA8 → Rgb F32 identity (same dims, no resize): every output element
+    /// must equal `src_byte as f32 / 255.0` exactly.
+    #[test]
+    fn cpu_convert_rgba_to_rgb_f32_identity() -> Result<()> {
+        const W: usize = 4;
+        const H: usize = 4;
+
+        // Build a 4x4 RGBA source with a known per-pixel pattern.
+        let src = TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+        {
+            let mut map = src.as_u8().unwrap().map()?;
+            let data = map.as_mut_slice();
+            for i in 0..W * H {
+                data[i * 4] = (i * 10) as u8; // R
+                data[i * 4 + 1] = (i * 10 + 3) as u8; // G
+                data[i * 4 + 2] = (i * 10 + 7) as u8; // B
+                data[i * 4 + 3] = 255; // A
+            }
+        }
+
+        // Destination: Rgb F32 same size.
+        let mut dst =
+            TensorDyn::image(W, H, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+        {
+            let mut cv = CPUProcessor::default();
+            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+        }
+
+        // Verify: dst[i*3+c] == src_u8[i*4+c] as f32 / 255.0 exactly.
+        let src_map = src.as_u8().unwrap().map()?;
+        let src_bytes = src_map.as_slice();
+        let dst_map = dst.as_f32().unwrap().map()?;
+        let dst_floats = dst_map.as_slice();
+
+        assert_eq!(dst_floats.len(), W * H * 3, "wrong output element count");
+        for i in 0..W * H {
+            for c in 0..3 {
+                let expected = src_bytes[i * 4 + c] as f32 / 255.0;
+                let actual = dst_floats[i * 3 + c];
+                assert_eq!(
+                    actual, expected,
+                    "pixel {i} channel {c}: got {actual}, expected {expected}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// RGBA8 → PlanarRgb F16 identity: verify [0,1] normalization within F16
+    /// rounding tolerance (2^-9 ≈ 1/512), and verify planar (channel-major)
+    /// layout — distinct R/G/B values land in the correct plane.
+    #[test]
+    fn cpu_convert_rgba_to_planar_rgb_f16_identity() -> Result<()> {
+        const W: usize = 4;
+        const H: usize = 4;
+
+        // Use clearly distinct per-channel values to catch plane-swap bugs.
+        // pixel (y,x): R = 50+x, G = 100+y*10, B = 200
+        let src = TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+        {
+            let mut map = src.as_u8().unwrap().map()?;
+            let data = map.as_mut_slice();
+            for y in 0..H {
+                for x in 0..W {
+                    let i = y * W + x;
+                    data[i * 4] = (50 + x) as u8; // R
+                    data[i * 4 + 1] = (100 + y * 10) as u8; // G
+                    data[i * 4 + 2] = 200; // B
+                    data[i * 4 + 3] = 255; // A
+                }
+            }
+        }
+
+        // Destination: PlanarRgb F16 same size.
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )?;
+        {
+            let mut cv = CPUProcessor::default();
+            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+        }
+
+        // F16 tolerance: 2^-9 ≈ 0.00195 (one ULP at 0.5 for f16 with 10-bit mantissa)
+        let tol = 2.0_f32.powi(-9);
+
+        let src_map = src.as_u8().unwrap().map()?;
+        let src_bytes = src_map.as_slice();
+        let dst_map = dst.as_f16().unwrap().map()?;
+        let dst_halfs = dst_map.as_slice();
+
+        // PlanarRgb layout: [R_plane W*H, G_plane W*H, B_plane W*H]
+        let plane = W * H;
+        assert_eq!(dst_halfs.len(), plane * 3, "wrong output element count");
+
+        for y in 0..H {
+            for x in 0..W {
+                let i = y * W + x;
+                let r_expected = src_bytes[i * 4] as f32 / 255.0;
+                let g_expected = src_bytes[i * 4 + 1] as f32 / 255.0;
+                let b_expected = src_bytes[i * 4 + 2] as f32 / 255.0;
+
+                let r_actual = dst_halfs[i].to_f32(); // R plane
+                let g_actual = dst_halfs[plane + i].to_f32(); // G plane
+                let b_actual = dst_halfs[2 * plane + i].to_f32(); // B plane
+
+                assert!(
+                    (r_actual - r_expected).abs() <= tol,
+                    "R plane pixel ({x},{y}): got {r_actual}, expected {r_expected}"
+                );
+                assert!(
+                    (g_actual - g_expected).abs() <= tol,
+                    "G plane pixel ({x},{y}): got {g_actual}, expected {g_expected}"
+                );
+                assert!(
+                    (b_actual - b_expected).abs() <= tol,
+                    "B plane pixel ({x},{y}): got {b_actual}, expected {b_expected}"
+                );
+
+                // Verify planar layout: R/G/B must be distinct (not the same value
+                // copied to all planes).
+                let r_byte = src_bytes[i * 4];
+                let g_byte = src_bytes[i * 4 + 1];
+                let b_byte = src_bytes[i * 4 + 2];
+                if r_byte != g_byte {
+                    assert_ne!(
+                        r_actual, g_actual,
+                        "R and G planes must differ at ({x},{y})"
+                    );
+                }
+                if g_byte != b_byte {
+                    assert_ne!(
+                        g_actual, b_actual,
+                        "G and B planes must differ at ({x},{y})"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Exercises the `widen_scratch` cache in `convert_dtype`'s U8→float arm:
+    /// the first convert allocates+stores the scratch, a second convert at the
+    /// same dst format/size takes the cache-hit branch, and a third at a
+    /// different size takes the reallocate branch. A single-convert test (as
+    /// all the others are) never reaches the cache-hit/realloc paths.
+    #[test]
+    fn cpu_widen_scratch_reused_across_converts() -> Result<()> {
+        fn rgba(w: usize, h: usize) -> Result<TensorDyn> {
+            let src =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+            {
+                let mut map = src.as_u8().unwrap().map()?;
+                let data = map.as_mut_slice();
+                for (i, px) in data.chunks_exact_mut(4).enumerate() {
+                    px[0] = (i * 7) as u8;
+                    px[1] = (i * 7 + 1) as u8;
+                    px[2] = (i * 7 + 2) as u8;
+                    px[3] = 255;
+                }
+            }
+            Ok(src)
+        }
+
+        // One processor instance so the scratch cache persists across calls.
+        let mut cv = CPUProcessor::default();
+
+        let src4 = rgba(4, 4)?;
+        let mut dst_a =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+        let mut dst_b =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+
+        // 1st convert: scratch is None → allocate + cache.
+        cv.convert(
+            &src4,
+            &mut dst_a,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+        // 2nd convert, same dst format+size → cache-hit branch (reuse scratch).
+        cv.convert(
+            &src4,
+            &mut dst_b,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+
+        // Both results must be identical and correctly normalized.
+        let a = dst_a.as_f32().unwrap().map()?;
+        let b = dst_b.as_f32().unwrap().map()?;
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "cache-hit produced different output"
+        );
+
+        // 3rd convert at a different size → scratch mismatch → realloc branch.
+        let src8 = rgba(8, 8)?;
+        let mut dst_c =
+            TensorDyn::image(8, 8, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem))?;
+        cv.convert(
+            &src8,
+            &mut dst_c,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )?;
+        let c = dst_c.as_f32().unwrap().map()?;
+        assert_eq!(c.as_slice().len(), 8 * 8 * 3);
+        assert!(c.as_slice().iter().all(|v| (0.0..=1.0).contains(v)));
+        Ok(())
+    }
+
+    /// `convert_dtype` returns `NotAnImage` when the destination tensor has no
+    /// pixel format (a bare, non-image tensor), rather than panicking.
+    #[test]
+    fn cpu_convert_dst_without_format_errors() -> Result<()> {
+        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))?;
+        // A plain tensor with no image format set.
+        let mut dst = TensorDyn::new(&[4, 4, 3], DType::F32, Some(TensorMemory::Mem), None)?;
+        let mut cv = CPUProcessor::default();
+        let err = cv
+            .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotAnImage),
+            "expected NotAnImage, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// RGBA8 → Rgb F32 with downscale (8x8 → 4x4): output must be in [0,1]
+    /// and finite; a flat-color region survives resize exactly.
+    #[test]
+    fn cpu_convert_rgba_to_rgb_f32_resize() -> Result<()> {
+        const SW: usize = 8;
+        const SH: usize = 8;
+        const DW: usize = 4;
+        const DH: usize = 4;
+
+        // Build an 8x8 source: right half (x >= 4) is solid blue [0,0,255,255].
+        let src = TensorDyn::image(
+            SW,
+            SH,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )?;
+        {
+            let mut map = src.as_u8().unwrap().map()?;
+            let data = map.as_mut_slice();
+            for y in 0..SH {
+                for x in 0..SW {
+                    let i = y * SW + x;
+                    if x >= 4 {
+                        // Solid blue in the right half
+                        data[i * 4] = 0;
+                        data[i * 4 + 1] = 0;
+                        data[i * 4 + 2] = 255;
+                        data[i * 4 + 3] = 255;
+                    } else {
+                        data[i * 4] = 128;
+                        data[i * 4 + 1] = 64;
+                        data[i * 4 + 2] = 32;
+                        data[i * 4 + 3] = 255;
+                    }
+                }
+            }
+        }
+
+        let mut dst = TensorDyn::image(
+            DW,
+            DH,
+            PixelFormat::Rgb,
+            DType::F32,
+            Some(TensorMemory::Mem),
+        )?;
+        {
+            let mut cv = CPUProcessor::default();
+            cv.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())?;
+        }
+
+        let dst_map = dst.as_f32().unwrap().map()?;
+        let dst_floats = dst_map.as_slice();
+
+        assert_eq!(dst_floats.len(), DW * DH * 3, "wrong output element count");
+
+        // All values must be in [0, 1] and finite.
+        for (i, &v) in dst_floats.iter().enumerate() {
+            assert!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "dst[{i}] = {v} is out of [0,1] or non-finite"
+            );
+        }
+
+        // The rightmost column (x=3 in 4x4) maps to src pixels x=6..7 which
+        // are entirely inside the solid-blue right half — bilinear resize of a
+        // flat region is exact.
+        for y in 0..DH {
+            let x = DW - 1; // x=3
+            let i = y * DW + x;
+            let r = dst_floats[i * 3];
+            let g = dst_floats[i * 3 + 1];
+            let b = dst_floats[i * 3 + 2];
+            assert_eq!(r, 0.0, "rightmost R must be 0.0 at ({x},{y})");
+            assert_eq!(g, 0.0, "rightmost G must be 0.0 at ({x},{y})");
+            assert_eq!(b, 1.0, "rightmost B must be 1.0 at ({x},{y})");
+        }
+
+        // The left src half is [128, 64, 32] -> normalised [~0.502, ~0.251, ~0.125].
+        // x=0 in the 4x4 output maps to src x=0 whose bilinear kernel sits
+        // entirely within the left half — bilinear resize of a flat region is
+        // exact, so the tolerance just absorbs the f32 /255 rounding.  A zero-
+        // filled or miscopied left region would produce 0.0 here and be caught.
+        // (x=1 already blends with right-half blue due to the resampler's broad
+        // kernel reaching across the seam at src x=4.)
+        for y in 0..DH {
+            let i = (y * DW) * 3; // x=0
+            assert!(
+                (dst_floats[i] - 128.0 / 255.0).abs() < 0.02,
+                "left R y={y}: {}",
+                dst_floats[i]
+            );
+            assert!(
+                (dst_floats[i + 1] - 64.0 / 255.0).abs() < 0.02,
+                "left G y={y}: {}",
+                dst_floats[i + 1]
+            );
+            assert!(
+                (dst_floats[i + 2] - 32.0 / 255.0).abs() < 0.02,
+                "left B y={y}: {}",
+                dst_floats[i + 2]
+            );
+        }
+        Ok(())
+    }
 }

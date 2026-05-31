@@ -43,28 +43,74 @@ PROFILE_FLAG=()
 if [[ "$PROFILE" == "release" ]]; then
     PROFILE_FLAG=(--release)
 fi
-DEPS_DIR="target/$PROFILE/deps"
 
-echo "→ Building workspace tests ($PROFILE)…"
-cargo build --tests ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
-    --workspace --exclude gpu-probe --exclude edgefirst-bench
+COVERAGE="${COVERAGE:-0}"
+COV_LCOV="${COV_LCOV:-target/coverage_rust.lcov}"
 
-echo "→ Codesigning test binaries with library-validation disabled…"
-# Sign every executable file in target/<profile>/deps that looks like a
-# test binary. Skip .d files (cargo dep manifests) and anything that's
-# already a script.
-find "$DEPS_DIR" -maxdepth 1 -type f -perm -u+x \
-    \( -name "edgefirst*-*" -o -name "hal*-*" \) \
-    ! -name "*.d" ! -name "*.dSYM" \
-    -exec codesign --force --sign - --entitlements "$ENTITLEMENTS" {} \; \
-    > /dev/null 2>&1
+WS_EXCLUDES=(--workspace --exclude gpu-probe --exclude edgefirst-bench)
 
-echo "→ Running nextest…"
-# We've just signed every test binary with the library-validation
-# entitlement, so dlopen()-based tests are safe to run here. Unit tests
-# that probe ANGLE via dlopen gate themselves on this env var so that a
-# plain `cargo test` (no codesign) does not SIGKILL on Tahoe.
-export HAL_TEST_ALLOW_DLOPEN_ANGLE=1
-exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
-    --workspace --exclude gpu-probe --exclude edgefirst-bench \
-    "$@"
+sign_test_binaries() {
+    # Sign every test binary in the given deps dir with the library-
+    # validation-disabled entitlement so dlopen() of ad-hoc-signed ANGLE
+    # works on Tahoe. Skips .d manifests and dSYM bundles.
+    local deps_dir="$1"
+    find "$deps_dir" -maxdepth 1 -type f -perm -u+x \
+        \( -name "edgefirst*-*" -o -name "hal*-*" \) \
+        ! -name "*.d" ! -name "*.dSYM" \
+        -exec codesign --force --sign - --entitlements "$ENTITLEMENTS" {} \; \
+        > /dev/null 2>&1
+}
+
+if [[ "$COVERAGE" != "1" ]]; then
+    # ----- Normal path: build → sign → run -----
+    DEPS_DIR="target/$PROFILE/deps"
+    echo "→ Building workspace tests ($PROFILE)…"
+    cargo build --tests ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}"
+    echo "→ Codesigning test binaries with library-validation disabled…"
+    sign_test_binaries "$DEPS_DIR"
+    echo "→ Running nextest…"
+    export HAL_TEST_ALLOW_DLOPEN_ANGLE=1
+    exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "$@"
+fi
+
+# ----- Coverage path: two-pass so the codesign seam survives -----
+#
+# `cargo llvm-cov nextest` builds instrumented binaries and runs them in one
+# shot, with no seam to re-sign between. ANGLE dlopen needs the binaries
+# signed with the library-validation entitlement, and that sign step MUST sit
+# between the build and the run. So:
+#
+#   Pass 1  build (instrumented) + run — the GL/ANGLE-dlopen tests gate on
+#           HAL_TEST_ALLOW_DLOPEN_ANGLE and self-skip here (unset), so they do
+#           not SIGKILL on the unsigned binaries; every non-GL test runs and
+#           emits profraw.
+#   sign    the instrumented binaries cargo-llvm-cov just built.
+#   Pass 2  re-run with HAL_TEST_ALLOW_DLOPEN_ANGLE=1; the binaries are signed
+#           and up-to-date (no rebuild), so the IOSurface F16 GL tests now
+#           execute under instrumentation and emit their profraw too.
+#   report  merge all accumulated profraw into LCOV.
+#
+# This is the only way the macOS lane covers the ANGLE/IOSurface F16 render
+# path — no other coverage lane has a GPU that runs it.
+echo "→ Coverage: cleaning previous profraw…"
+cargo llvm-cov clean --workspace
+
+# cargo-llvm-cov builds into its own target dir; this is where the instrumented
+# test binaries to sign live.
+COV_DEPS_DIR="target/llvm-cov-target/$PROFILE/deps"
+
+echo "→ Coverage pass 1/2: build + run (GL dlopen tests self-skip)…"
+cargo llvm-cov nextest --no-report ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
+    "${WS_EXCLUDES[@]}" "$@"
+
+echo "→ Codesigning instrumented test binaries…"
+sign_test_binaries "$COV_DEPS_DIR"
+
+echo "→ Coverage pass 2/2: re-run with ANGLE dlopen enabled…"
+HAL_TEST_ALLOW_DLOPEN_ANGLE=1 cargo llvm-cov nextest --no-report \
+    ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "$@"
+
+echo "-> Generating LCOV report -> ${COV_LCOV}"
+cargo llvm-cov report --lcov --output-path "${COV_LCOV}" \
+    --ignore-filename-regex '(\.cargo|/rustc/|/target/)'
+echo "-> Coverage report written to ${COV_LCOV}"

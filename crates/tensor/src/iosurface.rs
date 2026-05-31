@@ -36,7 +36,8 @@
 
 use crate::{
     error::{Error, Result},
-    BufferIdentity, PixelFormat, TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
+    packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait,
+    TensorMemory, TensorTrait,
 };
 use log::trace;
 use num_traits::Num;
@@ -327,10 +328,17 @@ where
     /// format ANGLE expects when the GL backend later wraps it in a
     /// pbuffer. Used by `Tensor::image()` on macOS when the caller
     /// requests `TensorMemory::Dma`.
+    ///
+    /// For planar pixel formats (`PlanarRgb`, `PlanarRgba`) the
+    /// IOSurface is allocated as a single-channel float surface sized
+    /// `(width, channels * height)` — the channel planes stack
+    /// vertically and the byte layout matches the tensor's
+    /// `[channels, H, W]` shape.
     pub(crate) fn new_image(
         width: usize,
         height: usize,
         format: PixelFormat,
+        dtype: DType,
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
@@ -338,12 +346,60 @@ where
             tracing::trace_span!("tensor.alloc", memory = "iosurface", width, height, ?format,)
                 .entered();
 
-        let (fourcc, bpe) = image_fourcc_and_bpe(format).ok_or_else(|| {
+        let (fourcc, bpe) = image_fourcc_and_bpe(format, dtype).ok_or_else(|| {
             Error::NotImplemented(format!(
-                "IoSurfaceTensor::new_image: format {format:?} has no IOSurface FourCC mapping"
+                "IoSurfaceTensor::new_image: ({format:?}, {dtype:?}) has no IOSurface FourCC mapping"
             ))
         })?;
-        let dict = unsafe { build_props(width, height, bpe, fourcc) }?;
+
+        // IOSurface geometry per (format, dtype):
+        //
+        //   * Packed formats (Rgba/Bgra/Yuyv, any supported dtype):
+        //     surface dimensions = (width, height).
+        //
+        //   * PlanarRgb[a] u8: not currently supported (no FourCC).
+        //
+        //   * PlanarRgb[a] F16: ANGLE only accepts RGBA16F (FourCC
+        //     'RGhA') for float IOSurfaces. We pack 4 contiguous f16
+        //     elements of the planar `[C, H, W]` byte stream into
+        //     each RGBA16F pixel — surface dimensions become
+        //     `(W/4, C*H)` via `packed_rgba16f_layout`. The byte
+        //     layout is identical to a (nonexistent) R16F `(W, C*H)`
+        //     surface and ORT consumes the locked base address as
+        //     `&[f16]` with shape `[1, C, H, W]` without
+        //     rearrangement. W must be a multiple of 4 for the
+        //     packing to align — validated by `packed_rgba16f_layout`.
+        let (surface_width, surface_height) = match (format, dtype) {
+            (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
+                // Delegate W%4 check and (W/4, C*H) computation to the
+                // canonical single source of truth. The only failure mode
+                // here is misaligned width (packed_rgba16f_layout returns
+                // None); overflow is not possible at these dimensions.
+                let layout =
+                    packed_rgba16f_layout(format, dtype, width, height).ok_or_else(|| {
+                        Error::InvalidShape(format!(
+                            "{format:?} F16 IOSurface requires width%4==0 for RGBA16F packing \
+                             (got width={width})"
+                        ))
+                    })?;
+                (layout.surface_w, layout.surface_h)
+            }
+            (PixelFormat::PlanarRgb, _) => {
+                let sh = height.checked_mul(3).ok_or_else(|| {
+                    Error::InvalidShape(format!("PlanarRgb height overflow (height={height})"))
+                })?;
+                (width, sh)
+            }
+            (PixelFormat::PlanarRgba, _) => {
+                let sh = height.checked_mul(4).ok_or_else(|| {
+                    Error::InvalidShape(format!("PlanarRgba height overflow (height={height})"))
+                })?;
+                (width, sh)
+            }
+            _ => (width, height),
+        };
+
+        let dict = unsafe { build_props(surface_width, surface_height, bpe, fourcc) }?;
         let ptr = unsafe { IOSurfaceCreate(dict) };
         unsafe { CFRelease(dict) };
         let surface = OwnedIoSurface::from_created(ptr)?;
@@ -355,7 +411,8 @@ where
         };
 
         trace!(
-            "IoSurfaceTensor::new_image: name={name} {width}x{height} {format:?} fourcc=0x{fourcc:08x} bytes={alloc}",
+            "IoSurfaceTensor::new_image: name={name} surface={surface_width}x{surface_height} \
+             logical={width}x{height} {format:?}/{dtype:?} fourcc=0x{fourcc:08x} bytes={alloc}",
         );
 
         Ok(Self {
@@ -662,51 +719,84 @@ where
 const FOURCC_L008: u32 = u32::from_be_bytes(*b"L008");
 
 /// IOSurface FourCC + bytes-per-element mapping for image-formatted
-/// IOSurfaces. The GL backend's
+/// IOSurfaces, keyed on `(PixelFormat, DType)`. The GL backend's
 /// `EGL_ANGLE_iosurface_client_buffer` import requires the IOSurface
 /// pixel format to match the GL internal format / type combination —
 /// ANGLE validates `IOSurfaceGetBytesPerElement` against the requested
 /// `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` and rejects mismatches with
 /// `EGL_BAD_ATTRIBUTE`. **This function is the single source of truth
-/// for the `PixelFormat → (FourCC, bpe)` mapping** — the image crate's
-/// macOS GL backend reads it via [`image_iosurface_layout`] when
-/// constructing the EGL pbuffer attribute list. Keep the two layers in
-/// sync by not duplicating this table.
+/// for the `(PixelFormat, DType) → (FourCC, bpe)` mapping** — the image
+/// crate's macOS GL backend reads it via [`image_iosurface_layout`]
+/// when constructing the EGL pbuffer attribute list. Keep the two
+/// layers in sync by not duplicating this table.
 ///
-/// Formats not listed are not supported by the GL backend on macOS;
-/// callers fall back to SHM/Mem and a CPU code path.
-fn image_fourcc_and_bpe(format: PixelFormat) -> Option<(u32, usize)> {
-    match format {
+/// FourCC codes follow Apple's CoreVideo `kCVPixelFormatType_*`
+/// constants because ANGLE's Metal backend recognizes those for
+/// `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` mapping.
+///
+/// **ANGLE float-format constraint** (verified against
+/// `EGL_ANGLE_iosurface_client_buffer.txt`): the extension's accepted
+/// `(type, internal_format)` allowlist contains exactly **one** float
+/// entry — `GL_HALF_FLOAT + GL_RGBA` (RGBA16F). There is no
+/// `GL_FLOAT` entry, no single-channel float, no RGBA32F. R32F and
+/// R16F single-channel bindings produce `EGL_BAD_ATTRIBUTE` at
+/// `eglCreatePbufferFromClientBuffer` time even though the
+/// extension-presence query (`GL_EXT_color_buffer_float` /
+/// `_half_float`) reports them as available. Until the spec changes
+/// our only viable float path is RGBA16F + 4-element pixel packing.
+///
+/// Combinations not listed are not supported by the GL backend on
+/// macOS; callers fall back to SHM/Mem and a CPU code path.
+fn image_fourcc_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
+    match (format, dtype) {
         // YUYV is 4:2:2 packed (2 bytes/pixel); sampled as GL_RG via
         // FourCC '2C08' (kCVPixelFormatType_TwoComponent8).
-        PixelFormat::Yuyv => Some((u32::from_be_bytes(*b"2C08"), 2)),
+        (PixelFormat::Yuyv, DType::U8) => Some((u32::from_be_bytes(*b"2C08"), 2)),
         // The FourCC matches the in-memory byte order: 'RGBA' for Rgba
         // tensors, 'BGRA' for Bgra. ANGLE supports both via
         // `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE = GL_RGBA` / `GL_BGRA_EXT`
         // and produces the matching shader output. Mapping both to
         // 'BGRA' would put the IOSurface bytes in BGRA order, which is
         // wrong for the Rgba contract.
-        PixelFormat::Rgba => Some((u32::from_be_bytes(*b"RGBA"), 4)),
-        PixelFormat::Bgra => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        (PixelFormat::Rgba, DType::U8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
+        (PixelFormat::Bgra, DType::U8) => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        // ── F16 IOSurface for zero-copy preprocessing (CoreML / ANE) ──
+        // The only ANGLE-supported float (type, internal_format) pair
+        // is `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F, FourCC 'RGhA'
+        // (kCVPixelFormatType_64RGBAHalf), 8 bytes per pixel.
+        //
+        // For Rgba destinations: 1 RGBA16F pixel = 1 image pixel of 4
+        // half-floats.
+        //
+        // For PlanarRgb / PlanarRgba destinations: we pack 4 contiguous
+        // half-floats of the planar `[C, H, W]` byte stream into each
+        // RGBA16F pixel. The IOSurface is then sized `(W/4, C*H)` —
+        // see `new_image` for the geometry. The byte layout is
+        // identical to a (nonexistent) R16F `(W, C*H)` surface so ORT
+        // can consume the locked base address as `&[f16]` with shape
+        // `[1, C, H, W]` without any rearrangement.
+        (PixelFormat::Rgba | PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
+            Some((u32::from_be_bytes(*b"RGhA"), 8))
+        }
         _ => None,
     }
 }
 
-/// Public re-export of the `PixelFormat → (FourCC, bytes-per-element)`
-/// mapping for callers in other crates (specifically the `edgefirst-image`
-/// macOS GL backend). The FourCC is the cross-crate identifier — the GL
-/// backend maps it to the matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE`
-/// internally.
+/// Public re-export of the `(PixelFormat, DType) → (FourCC,
+/// bytes-per-element)` mapping for callers in other crates
+/// (specifically the `edgefirst-image` macOS GL backend). The FourCC
+/// is the cross-crate identifier — the GL backend maps it to the
+/// matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` internally.
 ///
 /// The image crate must use this function rather than duplicating the
 /// table; a drift between the allocation and import sides produced a
 /// silent R↔B swap during macOS bring-up (mapping Rgba to `'BGRA'`),
 /// which is why the table now lives in one place.
 ///
-/// Returns `None` when the format does not have a defined IOSurface
-/// FourCC mapping in HAL (NV12, planar layouts, etc).
-pub fn image_iosurface_layout(format: PixelFormat) -> Option<(u32, usize)> {
-    image_fourcc_and_bpe(format)
+/// Returns `None` when the (format, dtype) pair does not have a
+/// defined IOSurface FourCC mapping in HAL (NV12, U8 planar, etc).
+pub fn image_iosurface_layout(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
+    image_fourcc_and_bpe(format, dtype)
 }
 
 unsafe fn build_props(
@@ -822,6 +912,135 @@ mod tests {
         assert_eq!(t.shape(), &[256]);
         // Element count mismatch rejected
         assert!(t.reshape(&[100]).is_err());
+    }
+
+    #[test]
+    fn fourcc_layout_u8_packed_unchanged() {
+        // U8 packed formats keep the legacy mappings (regression
+        // guard for the refactor that added dtype to the lookup).
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Rgba, DType::U8),
+            Some((u32::from_be_bytes(*b"RGBA"), 4))
+        );
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Bgra, DType::U8),
+            Some((u32::from_be_bytes(*b"BGRA"), 4))
+        );
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Yuyv, DType::U8),
+            Some((u32::from_be_bytes(*b"2C08"), 2))
+        );
+    }
+
+    #[test]
+    fn fourcc_layout_f16_packed_rgba16f() {
+        // ANGLE's iosurface_client_buffer extension supports exactly
+        // one float (type, internal_format) pair: (GL_HALF_FLOAT,
+        // GL_RGBA) = RGBA16F, FourCC 'RGhA'. All HAL F16 IOSurface
+        // destinations (packed Rgba or planar) use this mapping.
+        let expected = (u32::from_be_bytes(*b"RGhA"), 8);
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Rgba, DType::F16),
+            Some(expected)
+        );
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::PlanarRgb, DType::F16),
+            Some(expected)
+        );
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::PlanarRgba, DType::F16),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn fourcc_layout_unsupported_combinations_return_none() {
+        // PlanarRgb / PlanarRgba u8 not supported on the IOSurface
+        // path — those tensors stay on SHM/Mem storage.
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::PlanarRgb, DType::U8),
+            None
+        );
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::PlanarRgba, DType::U8),
+            None
+        );
+        // F32 isn't accepted by ANGLE's IOSurface extension at all —
+        // no GL_FLOAT entry on the allowlist. Any F32 combination
+        // must return None so consumers fall back to staging.
+        assert_eq!(image_fourcc_and_bpe(PixelFormat::Rgba, DType::F32), None);
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::PlanarRgb, DType::F32),
+            None
+        );
+        // NV12 / Nv16 have no IOSurface FourCC mapping in HAL today.
+        assert_eq!(image_fourcc_and_bpe(PixelFormat::Nv12, DType::U8), None);
+        // Float for YUYV / Grey isn't a meaningful combination.
+        assert_eq!(image_fourcc_and_bpe(PixelFormat::Yuyv, DType::F16), None);
+        assert_eq!(image_fourcc_and_bpe(PixelFormat::Grey, DType::F16), None);
+    }
+
+    #[test]
+    fn new_image_planar_f16_packs_into_rgba16f() {
+        // PlanarRgb F16: logical 64×32 image gets a packed RGBA16F
+        // IOSurface sized (64/4, 3*32) = (16, 96). 8 B/pixel,
+        // bytes_per_row rounded to 64-byte alignment (16*8 = 128,
+        // already aligned) = 128, * 96 rows = 12288 bytes total. The
+        // byte payload exactly matches an [3, 32, 64] f16 tensor
+        // (3*32*64*2 = 12288 bytes).
+        let shape = [3, 32, 64];
+        let t = IoSurfaceTensor::<half::f16>::new_image(
+            64,
+            32,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            &shape,
+            None,
+        )
+        .expect("PlanarRgb F16 IOSurface allocation");
+        assert!(t.buf_size >= 3 * 32 * 64 * 2);
+    }
+
+    #[test]
+    fn new_image_planar_f16_rejects_misaligned_width() {
+        // W=63 isn't divisible by 4 — packing would mis-align the
+        // last column. HAL must reject at allocation time rather than
+        // silently truncate.
+        let shape = [3, 32, 63];
+        let err = IoSurfaceTensor::<half::f16>::new_image(
+            63,
+            32,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            &shape,
+            None,
+        )
+        .expect_err("misaligned width must be rejected");
+        match err {
+            Error::InvalidShape(msg) => assert!(
+                msg.contains("width%4==0") || msg.contains("RGBA16F"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected InvalidShape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_image_packed_rgba_f16_alloc_size_matches_dtype() {
+        // Packed Rgba F16 at 64×32 → 64 pixels × 8 bytes/pixel = 512 B/row
+        // (8-byte aligned, padded up to 64-byte stride), × 32 rows
+        // ≥ 16384 bytes. (Equals 32*64*8 = 16384 bytes.)
+        let shape = [32, 64, 4];
+        let t = IoSurfaceTensor::<half::f16>::new_image(
+            64,
+            32,
+            PixelFormat::Rgba,
+            DType::F16,
+            &shape,
+            None,
+        )
+        .expect("Rgba F16 IOSurface allocation");
+        assert!(t.buf_size >= 32 * 64 * 8);
     }
 
     #[test]
