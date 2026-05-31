@@ -1625,6 +1625,9 @@ impl ImageProcessor {
     /// let src = proc.import_image(y_pd, Some(uv_pd), 1920, 1080,
     ///                             PixelFormat::Nv12, DType::U8, None)?;
     /// ```
+    // Import inherently needs plane(s) + geometry + format + dtype + colorimetry;
+    // a params struct would obscure more than it clarifies here.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(target_os = "linux")]
     pub fn import_image(
         &self,
