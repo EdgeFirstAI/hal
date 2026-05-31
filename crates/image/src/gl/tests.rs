@@ -1667,6 +1667,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
         assert!(src.is_multiplane(), "must be multiplane after import");
@@ -2078,7 +2079,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         // Source: NV12 camera frame
@@ -2178,7 +2187,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(0);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst_imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
         gl.convert(
             &src_dyn,
@@ -2227,7 +2244,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgb, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgb,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         // Source: NV12 camera frame
@@ -2327,7 +2352,7 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let src = load_raw_image(
@@ -2411,7 +2436,7 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst_rgba = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgba, DType::U8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
@@ -2444,7 +2469,7 @@ mod gl_tests {
         let fd = rgb_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_rgb = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let rgb_result = gl.convert(
@@ -2514,7 +2539,7 @@ mod gl_tests {
         let fd = u8_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_u8 = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8, None)
             .unwrap();
 
         let u8_result = gl.convert(
@@ -2546,7 +2571,7 @@ mod gl_tests {
         let fd = i8_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_i8 = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let i8_result = gl.convert(
@@ -2619,7 +2644,7 @@ mod gl_tests {
             .unwrap()
             .with_offset(page_aligned_offset);
         let mut dst_aligned = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let aligned_result = gl.convert(
@@ -2654,7 +2679,7 @@ mod gl_tests {
             .unwrap()
             .with_offset(neutron_offset);
         let mut dst_unaligned = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let unaligned_result = gl.convert(
@@ -2714,7 +2739,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         assert_eq!(imported.width(), Some(width));
@@ -2741,7 +2774,7 @@ mod gl_tests {
         let bpp: usize = 4;
         // 64-byte aligned stride: ceil(640*4 / 64) * 64 = 2560 (already aligned)
         // Use 128-byte alignment to get a genuinely padded stride.
-        let stride: usize = ((width * bpp + 127) / 128) * 128; // 2560 -> 2560 (already 128-aligned)
+        let stride: usize = (width * bpp).div_ceil(128) * 128; // 2560 -> 2560 (already 128-aligned)
                                                                // Force a wider stride to be sure it's padded
         let stride = stride + 128; // 2688
 
@@ -2765,7 +2798,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         assert_eq!(imported.width(), Some(width));
@@ -2829,6 +2870,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
 
@@ -2900,6 +2942,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
         assert!(src.is_multiplane(), "must be multiplane after import");
@@ -3002,7 +3045,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let src = proc
-            .import_image(plane, None, width, height, PixelFormat::Nv12, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Nv12,
+                DType::U8,
+                None,
+            )
             .unwrap();
         assert!(
             !src.is_multiplane(),
@@ -3097,7 +3148,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_stride(bad_stride);
 
         let proc = crate::ImageProcessor::new().unwrap();
-        let result = proc.import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8);
+        let result = proc.import_image(
+            plane,
+            None,
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+        );
 
         assert!(
             result.is_err(),

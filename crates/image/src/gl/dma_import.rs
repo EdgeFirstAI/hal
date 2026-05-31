@@ -341,6 +341,7 @@ mod tests {
             height,
             PixelFormat::Nv12,
             edgefirst_tensor::DType::U8,
+            None,
         )
     }
 

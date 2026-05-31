@@ -1302,7 +1302,7 @@ impl PyImageProcessor {
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
-        let dyn_tensor = proc.import_image(image_pd, chroma_pd, width, height, fmt, dt)?;
+        let dyn_tensor = proc.import_image(image_pd, chroma_pd, width, height, fmt, dt, None)?;
         Ok(PyTensor(dyn_tensor))
     }
 

@@ -1729,6 +1729,7 @@ pub unsafe extern "C" fn hal_import_image(
         height,
         format.to_pixel_format(),
         dtype.into(),
+        None,
     ) {
         Ok(t) => t,
         Err(e) => {

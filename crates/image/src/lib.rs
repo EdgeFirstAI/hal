@@ -1617,13 +1617,13 @@ impl ImageProcessor {
     ///
     /// // Single-plane RGBA
     /// let pd = PlaneDescriptor::new(fd.as_fd())?;
-    /// let src = proc.import_image(pd, None, 1920, 1080, PixelFormat::Rgba, DType::U8)?;
+    /// let src = proc.import_image(pd, None, 1920, 1080, PixelFormat::Rgba, DType::U8, None)?;
     ///
     /// // Multi-plane NV12 with stride
     /// let y_pd = PlaneDescriptor::new(y_fd.as_fd())?.with_stride(2048);
     /// let uv_pd = PlaneDescriptor::new(uv_fd.as_fd())?.with_stride(2048);
     /// let src = proc.import_image(y_pd, Some(uv_pd), 1920, 1080,
-    ///                             PixelFormat::Nv12, DType::U8)?;
+    ///                             PixelFormat::Nv12, DType::U8, None)?;
     /// ```
     #[cfg(target_os = "linux")]
     pub fn import_image(
@@ -1634,6 +1634,7 @@ impl ImageProcessor {
         height: usize,
         format: PixelFormat,
         dtype: DType,
+        colorimetry: Option<edgefirst_tensor::Colorimetry>,
     ) -> Result<TensorDyn> {
         use edgefirst_tensor::{Tensor, TensorMemory};
 
@@ -1740,9 +1741,13 @@ impl ImageProcessor {
                     );
                 }
                 let tensor_i8: Tensor<i8> = unsafe { std::mem::transmute(tensor) };
-                return Ok(TensorDyn::from(tensor_i8));
+                let mut dyn_tensor = TensorDyn::from(tensor_i8);
+                dyn_tensor.set_colorimetry(colorimetry);
+                return Ok(dyn_tensor);
             }
-            Ok(TensorDyn::from(tensor))
+            let mut dyn_tensor = TensorDyn::from(tensor);
+            dyn_tensor.set_colorimetry(colorimetry);
+            Ok(dyn_tensor)
         } else {
             // ── Single-plane path ────────────────────────────────────
             let shape = match format.layout() {
@@ -1788,6 +1793,7 @@ impl ImageProcessor {
             if let Some(o) = image_offset {
                 tensor.set_plane_offset(o);
             }
+            tensor.set_colorimetry(colorimetry);
             Ok(tensor)
         }
     }
@@ -7908,6 +7914,69 @@ mod image_tests {
         assert!(
             result.is_err(),
             "create_image(F32, Dma) must fail — no DRM fourcc for f32"
+        );
+    }
+
+    /// Verify that `import_image` stores the supplied `Option<Colorimetry>` on
+    /// the returned `TensorDyn`.
+    ///
+    /// `import_image` requires a DMA-backed fd on Linux.  When DMA is
+    /// unavailable we skip the DMA call but still verify the storage contract
+    /// by inspecting `set_colorimetry` / `colorimetry` on a plain `TensorDyn`
+    /// constructed the same way the function body does it — and we confirm via
+    /// code-read that the new parameter is unconditionally stored.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn import_image_carries_colorimetry() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry, TensorMemory};
+
+        let expected = Colorimetry::default()
+            .with_encoding(ColorEncoding::Bt709)
+            .with_range(ColorRange::Limited);
+
+        if !is_dma_available() {
+            // DMA unavailable on this host: exercise the storage path via
+            // TensorDyn directly (mirrors what import_image does internally).
+            let mut t =
+                TensorDyn::image(8, 8, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
+                    .expect("alloc");
+            assert_eq!(t.colorimetry(), None, "colorimetry must start as None");
+            t.set_colorimetry(Some(expected));
+            assert_eq!(
+                t.colorimetry(),
+                Some(expected),
+                "set_colorimetry must round-trip"
+            );
+            eprintln!("SKIPPED import_image_carries_colorimetry (DMA unavailable); storage contract verified via TensorDyn");
+            return;
+        }
+
+        // DMA is available: allocate a real DMA tensor, extract its fd, and
+        // call import_image with an explicit Colorimetry.
+        use edgefirst_tensor::{PlaneDescriptor, Tensor};
+
+        let rgba_bytes = 64 * 64 * 4; // 64×64 RGBA8
+        let dma_tensor =
+            Tensor::<u8>::new(&[rgba_bytes], Some(TensorMemory::Dma), Some("import_test"))
+                .expect("dma alloc");
+        let pd =
+            PlaneDescriptor::new(dma_tensor.dmabuf().expect("dma fd")).expect("PlaneDescriptor");
+
+        let proc = ImageProcessor::new().expect("ImageProcessor");
+        let result = proc.import_image(
+            pd,
+            None,
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(expected),
+        );
+        let tensor = result.expect("import_image must succeed on DMA fd");
+        assert_eq!(
+            tensor.colorimetry(),
+            Some(expected),
+            "import_image must store the supplied colorimetry on the returned TensorDyn"
         );
     }
 }
