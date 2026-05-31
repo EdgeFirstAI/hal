@@ -3612,4 +3612,39 @@ mod cpu_tests {
         };
         assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
     }
+
+    #[test]
+    fn cpu_convert_tagged_jfif_differs_from_untagged_heuristic_nv12() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        // Same 2x2 NV12 bytes — saturated chroma so matrix/range choice matters.
+        // NV12 2x2 = 4 Y-plane bytes + 2 UV-plane bytes = 6 total.
+        let bytes = [180u8, 180, 180, 180, 200, 40];
+        let convert = |cm: Option<Colorimetry>| {
+            let mut src =
+                load_bytes_to_tensor(2, 2, PixelFormat::Nv12, None, &bytes).unwrap();
+            src.set_colorimetry(cm);
+            let mut dst =
+                TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        // Tagged JFIF (BT.601 full-range) — what the codec sets for JPEG.
+        let jfif = convert(Some(Colorimetry::jfif()));
+        // Untagged: 2x2 height is below HD_THRESHOLD (720) → heuristic resolves
+        // to BT.601 LIMITED.  JFIF is BT.601 FULL, so the two must differ.
+        let untagged = convert(None);
+        assert_ne!(
+            jfif, untagged,
+            "JFIF (BT.601 full-range) must differ from heuristic (BT.601 limited)"
+        );
+        // An explicitly-tagged BT.709-limited must also differ from BT.601 JFIF.
+        let bt709 = convert(Some(
+            Colorimetry::default()
+                .with_encoding(ColorEncoding::Bt709)
+                .with_range(ColorRange::Limited),
+        ));
+        assert_ne!(jfif, bt709, "BT.601-full must differ from BT.709-limited");
+    }
 }
