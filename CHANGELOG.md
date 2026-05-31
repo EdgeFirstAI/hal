@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     RAII guard exposing `device_ptr()` / `len()`; dropping it releases the
     PBO for the next `convert()`.
   - **C API**: `hal_is_cuda_available()`, `hal_tensor_cuda_map()`,
-    `hal_tensor_cuda_device_ptr()`, `hal_tensor_cuda_len()`,
+    `hal_tensor_cuda_device_ptr()` (size via `out_size` out-param),
     `hal_tensor_cuda_unmap()`.
   - **Python**: `edgefirst_hal.is_cuda_available()`,
     `Tensor.cuda_map() -> CudaMap | None` — a `with`-block context manager

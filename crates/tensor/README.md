@@ -212,12 +212,12 @@ for the full aliasing rules, DMA-BUF import path, and drop-order contract.
 
 ```c
 if (hal_is_cuda_available()) {
-    struct hal_cuda_map *cm = hal_tensor_cuda_map(tensor);
-    if (cm) {
-        void *dev_ptr = hal_tensor_cuda_device_ptr(cm);
-        size_t len    = hal_tensor_cuda_len(cm);
-        trt_enqueue(dev_ptr, len);
-        hal_tensor_cuda_unmap(cm);  // must call before next convert()
+    void *map = hal_tensor_cuda_map(tensor);
+    if (map) {
+        size_t size   = 0;
+        void *dev_ptr = hal_tensor_cuda_device_ptr(map, &size);
+        trt_enqueue(dev_ptr, size);
+        hal_tensor_cuda_unmap(map);  // must call before next convert()
     }
 }
 ```

@@ -174,12 +174,13 @@ inference thread can hold it while the GL thread proceeds with other work.
 
 ### Aliasing rule
 
-GL must not write into a PBO while CUDA has it mapped. The scoped `CudaMap`
-guard enforces this: `cuda_map()` returns `None` if a map is already active,
-and the guard must be dropped before the next `convert()` call writes into the
-same PBO. Violating this rule is the standard undefined-behavior hazard in
-CUDA–GL interop; the guard makes it impossible to do so accidentally via safe
-Rust.
+GL must not write into a PBO while CUDA has it mapped. The aliasing rule is a
+caller convention enforced by the scoped `CudaMap` guard lifetime: the caller
+maps per inference and must drop the guard before the next `convert()` call
+writes into the same PBO. `cuda_map()` fast-fails to `None` when CUDA is
+unavailable for the tensor (no handle attached or `libcudart` absent); it does
+not track currently-active maps. Violating the drop-before-convert ordering is
+the standard undefined-behavior hazard in CUDA–GL interop.
 
 ### DMA-BUF import path
 

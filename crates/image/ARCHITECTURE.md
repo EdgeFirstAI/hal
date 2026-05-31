@@ -364,11 +364,11 @@ registered with CUDA and accessed as a device pointer — no host copy.
 of the `PboTensor` and is shared across all `cuda_map()` calls on that tensor.
 
 **Aliasing rule**: while `CudaMap` is alive, GL must not write into the PBO.
-The `CudaMap` RAII guard enforces this: the PBO is not given back to the
-GL pipeline (for the next `convert()` call) until the guard is dropped. The
-GL worker thread checks for an active CUDA map before accepting a new
-`ImageConvert` message targeting that tensor and returns an error if one is
-detected rather than silently aliasing.
+The aliasing rule is a caller convention enforced by the scoped `CudaMap`
+guard lifetime: the caller maps per inference and drops the guard before
+the next `convert()` call. The guard's `Drop` impl returns the PBO to GL
+(via `cudaGraphicsUnmapResources`) so the next `convert()` can write into
+it. No runtime check in the GL worker tracks active CUDA maps.
 
 **Thread constraints**: `cudaGraphicsMapResources` (called on each
 `cuda_map()`) must run on the GL-context thread. The resulting device
