@@ -85,7 +85,7 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 | V3D / Broadcom (RPi 5) | PBO readback + zero-copy DMA-BUF (`DRM_FORMAT_ABGR16161616F`) | PBO readback |
 | Mali-G310 / Panfrost (i.MX 95) | PBO readback + zero-copy DMA-BUF (`DRM_FORMAT_ABGR16161616F`) | PBO readback |
 | Vivante GC7000UL (i.MX 8M Plus) | **Disabled → CPU fallback** (float readback 170–320 ms) | **Disabled → CPU fallback** |
-| Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer | PBO → host buffer (no dma_heap; CUDA–GL interop Phase 2) |
+| Tegra Orin / NVIDIA (orin-nano) | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** | PBO → host buffer; **PBO → CUDA device ptr (zero-copy, implemented)** — `cuda_map()` registers the PBO with CUDA on the GL worker thread; the device pointer is usable from any thread via the per-device CUDA primary context |
 | macOS ANGLE (RGBA16F IOSurface) | F16 `PlanarRgb` zero-copy IOSurface | Not supported (ANGLE rejects `(GL_FLOAT, *)`) |
 | CPU fallback | Always present — never errors | Always present — never errors |
 
@@ -121,6 +121,106 @@ let mut dst = proc.create_image(640, 640, PixelFormat::PlanarRgb, dst_dtype, Non
 # Ok(())
 # }
 ```
+
+---
+
+## Zero-copy CUDA Tensor Mapping
+
+This section describes the cross-crate mechanism that lets the float PBO
+produced by `ImageProcessor::convert()` reach a CUDA/TensorRT consumer
+with no host round-trip. The per-crate detail (type model, handle lifetimes,
+drop order) lives in
+[`crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping);
+this section covers the cross-crate data flow and the platform constraints.
+
+### Data flow: FBO → PBO → CUDA → TensorRT
+
+```
+ImageProcessor::convert()
+│
+│  GL worker thread
+│  ┌──────────────────────────────────────────────────────────┐
+│  │  FBO render (resize / letterbox / colorspace / dtype)    │
+│  │       ↓ glReadnPixels into GL_PIXEL_PACK_BUFFER          │
+│  │  PBO (linear f16 NCHW or f32 NHWC in GPU memory)         │
+│  │       ↓ cudaGraphicsGLRegisterBuffer (once at alloc)     │
+│  │       ↓ cudaGraphicsMapResources (per cuda_map() call)   │
+│  │  CUDA device pointer (primary context, thread-usable)    │
+│  └──────────────────────────────────────────────────────────┘
+│
+│  Caller thread (any thread)
+│  ┌────────────────────────────────────────────┐
+│  │  CudaMap guard exposes device_ptr() / len() │
+│  │  TensorRT enqueue_v3() reads device memory  │
+│  │  Drop CudaMap → cudaGraphicsUnmapResources  │
+│  │    (PBO released; next convert() can write) │
+│  └────────────────────────────────────────────┘
+```
+
+`convert()` renders into an FBO and reads out via `glReadnPixels` into a
+`GL_PIXEL_PACK_BUFFER` (PBO). Because the PBO is registered with CUDA via
+`cudaGraphicsGLRegisterBuffer`, mapping it with `cudaGraphicsMapResources`
+yields a contiguous linear device pointer that TensorRT's
+`IExecutionContext::enqueue_v3` (or equivalent) can consume directly.
+
+### GL-thread constraint
+
+`cudaGraphicsGLRegisterBuffer` and `cudaGraphicsMapResources` must be called
+from the **same thread that owns the OpenGL context** — the GL worker thread
+inside `GLProcessorThreaded`. The resulting device pointer is, however,
+usable from any thread via the per-device CUDA primary context (CUDA's
+cross-thread sharing model). The RAII `CudaMap` guard is `Send`, so the
+inference thread can hold it while the GL thread proceeds with other work.
+
+### Aliasing rule
+
+GL must not write into a PBO while CUDA has it mapped. The scoped `CudaMap`
+guard enforces this: `cuda_map()` returns `None` if a map is already active,
+and the guard must be dropped before the next `convert()` call writes into the
+same PBO. Violating this rule is the standard undefined-behavior hazard in
+CUDA–GL interop; the guard makes it impossible to do so accidentally via safe
+Rust.
+
+### DMA-BUF import path
+
+For tensors backed by a DMA-BUF fd (e.g. from a V4L2 capture buffer),
+CUDA can import the buffer directly via `cudaImportExternalMemory` with
+`cudaExternalMemoryHandleTypeOpaqueFd`. This path is independent of the
+GL thread: the DMA-BUF fd is `dup`'d before being handed to CUDA (CUDA
+takes ownership of the dup'd fd on success), and the resulting
+`CudaExternalMemory` handle yields a persistent device pointer without
+a per-map round-trip.
+
+### Runtime loading (dlopen)
+
+CUDA support is loaded at runtime via `dlopen("libcudart.so")` using a
+per-process `OnceLock` symbol table. There is no link-time dependency on
+`libcudart` and no compile-time feature gate — consistent with the HAL's
+dlopen/ioctl approach for other optional platform capabilities. On a host
+without `libcudart`, `is_cuda_available()` returns `false` and all
+`cuda_map()` calls return `None` immediately.
+
+### Drop order
+
+Within a `PboTensor`'s lifetime, the CUDA handle is dropped before the
+PBO storage: `cudaGraphicsUnregisterResource` fires in the handle's
+`Drop` impl, and `glDeleteBuffers` fires in the PBO's `Drop` impl.
+Reversing this order would dereference freed GL state from the CUDA
+driver and is prevented by the ownership structure in
+[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping).
+
+### API surfaces
+
+| Language | Probe | Map | Handle |
+|----------|-------|-----|--------|
+| Rust | `is_cuda_available() -> bool` | `Tensor::cuda_map() -> Option<CudaMap>` | `CudaMap` — `device_ptr()`, `len()` |
+| C | `hal_is_cuda_available()` | `hal_tensor_cuda_map()` → `hal_tensor_cuda_device_ptr()` → `hal_tensor_cuda_unmap()` | opaque handle |
+| Python | `edgefirst_hal.is_cuda_available()` | `Tensor.cuda_map() -> CudaMap | None` | context manager — `.device_ptr`, `.size` |
+
+See [`crates/tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md#cuda-tensor-mapping)
+for usage snippets and
+[`TESTING.md § CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#cuda-tensor-mapping)
+for the validation approach.
 
 ---
 

@@ -90,6 +90,70 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
   baseline after DMA / SHM tensors are dropped. The check is fd-count
   based, not a `/proc/self/maps` parse.
 
+## CUDA Surface
+
+The CUDA zero-copy surface (`cuda_map()`, `is_cuda_available()`, `CudaMap`,
+`CudaHandle`) is fully testable without a GPU or `libcudart`.
+
+### GPU-independent tests (run anywhere)
+
+| Test | Location | What it verifies |
+|------|----------|------------------|
+| Mock `CudaGlOps` — map/unmap/unregister call sequence | `crates/tensor/src/cuda.rs` `#[cfg(test)]` | `CudaMap` construction calls `map`; `Drop` calls `unmap`; handle drop calls `unregister` in the correct order (before PBO storage drops) |
+| `Debug` impl on `CudaMap` / `CudaHandle` | Same | No panics, no format-string UB |
+| Primitive degradation — absent `libcudart` | Same | `is_cuda_available()` returns `false`; `cuda_map()` returns `None`; no crash |
+| ABI layout asserts | `crates/tensor/src/cuda_abi.rs` | `sizeof` / `alignof` of HAL's CUDA type wrappers match CUDA 12.6 `driver_types.h` — verified as static compile-time assertions |
+
+Run all CUDA tests on the host (no hardware required):
+
+```bash
+cargo test -p edgefirst-tensor -- --test-threads=1
+```
+
+To exercise just the CUDA tests by name:
+
+```bash
+cargo test -p edgefirst-tensor cuda -- --test-threads=1
+```
+
+### On-target validation
+
+On-target tests require a CUDA-capable device with `libcudart.so` present.
+Validated platforms: Jetson Orin-nano (O5/O6/O8) on L4T R36.4 / CUDA 12.6 /
+TRT 10.3; desktop RTX 3090 on CUDA 12.6.
+
+Cross-compile and deploy:
+
+```bash
+cargo-zigbuild test --target aarch64-unknown-linux-gnu --release --no-run \
+  -p edgefirst-tensor
+
+scp target/aarch64-unknown-linux-gnu/release/deps/edgefirst_tensor-* \
+  jetson-orin-nano:/tmp/hal-tests/
+ssh jetson-orin-nano '/tmp/hal-tests/edgefirst_tensor-<hash> --test-threads=1'
+```
+
+The on-target suite includes an end-to-end test that:
+1. Creates a float PBO tensor via `ImageProcessor::create_image()`.
+2. Runs `convert()` on a synthetic frame.
+3. Calls `cuda_map()` and asserts `device_ptr()` is non-null.
+4. Validates numeric max-error against a host-side reference: observed
+   max\_err 0.00024 on Orin-nano at F16 precision.
+5. Drops the `CudaMap` guard and asserts the PBO is usable by a subsequent
+   `convert()` call (aliasing rule enforcement).
+
+### covguard (imx8mp coverage flush)
+
+On the imx8mp lane the Vivante EGL driver may call `abort()` during shutdown.
+The `edgefirst_tensor::covguard` module — compiled only under
+`-Cinstrument-coverage` — installs a `SIGABRT` handler that flushes the LLVM
+profile to disk before re-raising the signal. This is transparent to normal
+builds; contributors do not need to do anything special to benefit from it.
+
+See [`TESTING.md § CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#cuda-tensor-mapping)
+for the cross-workspace view, including the fallback-contract test and the
+CI matrix notes.
+
 ## Cross-References
 
 - Project testing patterns: [../../TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)

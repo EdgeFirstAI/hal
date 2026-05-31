@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Zero-copy CUDA tensor mapping** — `ImageProcessor::convert()` float PBO
+  output is now directly consumable by CUDA/TensorRT consumers with no host
+  round-trip on CUDA-capable devices (Jetson Orin-series, desktop CUDA GPUs).
+  The PBO produced by the GL render path is registered with CUDA via
+  `cudaGraphicsGLRegisterBuffer` on the GL worker thread; the resulting device
+  pointer is valid from any thread via the per-device CUDA primary context.
+  A DMA-BUF import path (`cudaImportExternalMemory(OpaqueFd)`) is also
+  provided for externally allocated DMA-BUF-backed tensors.
+  CUDA support is loaded at runtime via `dlopen("libcudart.so")` — no
+  link-time dependency, no compile-time feature gate.
+  - **Rust**: `Tensor::cuda_map() -> Option<CudaMap>`, `TensorDyn::cuda_map()`,
+    `is_cuda_available() -> bool`, `Tensor::cuda()`. `CudaMap` is a scoped
+    RAII guard exposing `device_ptr()` / `len()`; dropping it releases the
+    PBO for the next `convert()`.
+  - **C API**: `hal_is_cuda_available()`, `hal_tensor_cuda_map()`,
+    `hal_tensor_cuda_device_ptr()`, `hal_tensor_cuda_len()`,
+    `hal_tensor_cuda_unmap()`.
+  - **Python**: `edgefirst_hal.is_cuda_available()`,
+    `Tensor.cuda_map() -> CudaMap | None` — a `with`-block context manager
+    exposing `.device_ptr` and `.size`.
+  Validated on Jetson Orin-nano (O5/O6/O8) on L4T R36.4 / CUDA 12.6 / TRT 10.3
+  (numeric max\_err 0.00024 vs CPU reference) and desktop RTX 3090.
+
+- **imx8mp coverage flush-guard** (`edgefirst_tensor::covguard`) — a
+  `SIGABRT` handler compiled in under `-Cinstrument-coverage` that flushes
+  the LLVM profile to disk before re-raising the signal. Prevents coverage
+  loss on the i.MX 8M Plus CI lane where the Vivante EGL driver calls
+  `abort()` during process shutdown.
+
 - **F16 zero-copy preprocessing on macOS via ANGLE + RGBA16F-packed
   IOSurface.** RGBA8 input → PlanarRgb F16 output runs end-to-end on
   the GPU and writes directly into an IOSurface that ORT consumes as
