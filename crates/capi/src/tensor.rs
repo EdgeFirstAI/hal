@@ -263,6 +263,18 @@ pub extern "C" fn hal_is_shm_available() -> bool {
     edgefirst_tensor::is_shm_available()
 }
 
+/// Check if zero-copy CUDA tensor mapping is available.
+///
+/// True when libcudart is loaded and all CUDA interop symbols resolved.
+/// Gate CUDA-specific paths (hal_tensor_cuda_map) on this; the result is
+/// cached after the first call. Returns false on systems without CUDA.
+///
+/// @return true if CUDA tensor mapping is available, false otherwise
+#[no_mangle]
+pub extern "C" fn hal_is_cuda_available() -> bool {
+    edgefirst_tensor::is_cuda_available()
+}
+
 // ============================================================================
 // Tensor Lifecycle Functions
 // ============================================================================
@@ -1774,6 +1786,10 @@ mod tests {
     }
 
     /// A Mem tensor has no CUDA handle — map returns NULL, unmap is a no-op.
+    /// Also exercises hal_is_cuda_available() and the try-cuda_map / fallback
+    /// pattern: when cuda_map returns NULL (always the case for a Mem tensor),
+    /// hal_tensor_map_create + hal_tensor_map_data must yield a valid host
+    /// buffer — this is the contract downstream callers depend on in CI.
     #[test]
     fn cuda_map_null_for_mem_tensor() {
         unsafe {
@@ -1787,6 +1803,9 @@ mod tests {
             );
             assert!(!t.is_null());
 
+            // hal_is_cuda_available() must be callable and return a bool.
+            let _cuda_avail: bool = hal_is_cuda_available();
+
             // No CUDA handle on a Mem tensor → map must return NULL, no crash.
             let m = hal_tensor_cuda_map(t);
             assert!(m.is_null(), "Mem tensor should yield a null CUDA map");
@@ -1798,6 +1817,17 @@ mod tests {
             let mut sz: size_t = 1;
             let dp = hal_tensor_cuda_device_ptr(m, &mut sz);
             assert!(dp.is_null());
+
+            // Fallback contract: when cuda_map returns NULL, hal_tensor_map_create
+            // must succeed and hal_tensor_map_data must yield a non-NULL host ptr.
+            let host_map = hal_tensor_map_create(t);
+            assert!(!host_map.is_null(), "fallback host map must succeed");
+            let host_data = hal_tensor_map_data(host_map);
+            assert!(
+                !host_data.is_null(),
+                "fallback host map data must be non-NULL"
+            );
+            hal_tensor_map_unmap(host_map);
 
             hal_tensor_free(t);
         }

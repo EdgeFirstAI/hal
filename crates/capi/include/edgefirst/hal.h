@@ -2438,6 +2438,17 @@ bool hal_is_gpu_buffer_available(void);
 bool hal_is_shm_available(void);
 
 /**
+ * Check if zero-copy CUDA tensor mapping is available.
+ *
+ * True when libcudart is loaded and all CUDA interop symbols resolved.
+ * Gate CUDA-specific paths (hal_tensor_cuda_map) on this; the result is
+ * cached after the first call. Returns false on systems without CUDA.
+ *
+ * @return true if CUDA tensor mapping is available, false otherwise
+ */
+bool hal_is_cuda_available(void);
+
+/**
  * Create a new tensor with the given data type, shape, and memory type.
  *
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
