@@ -662,6 +662,21 @@ typedef struct HalTensorQuant HalTensorQuant;
 typedef struct hal_track_info_list hal_track_info_list;
 
 /**
+ * Colorimetry as four independent axes. 0 = unknown/unspecified on each axis.
+ * Values are stable HAL constants (NOT raw V4L2):
+ *   space:    1=bt709 2=bt2020 3=srgb 4=smpte170m
+ *   transfer: 1=bt709 2=srgb 3=pq 4=hlg 5=linear
+ *   encoding: 1=bt601 2=bt709 3=bt2020
+ *   range:    1=full 2=limited
+ */
+typedef struct hal_colorimetry {
+  int space;
+  int transfer;
+  int encoding;
+  int range;
+} hal_colorimetry;
+
+/**
  * Quantization parameters for dequantizing tensor data.
  */
 typedef struct hal_quantization {
@@ -870,6 +885,28 @@ typedef struct hal_camera_adaptor_format_info {
    */
   char fourcc[HAL_FOURCC_MAX_LEN];
 } hal_camera_adaptor_format_info;
+
+/**
+ * Build a hal_colorimetry from the four raw V4L2 colorimetry ints (each
+ * 0/unknown -> 0).
+ *
+ * This is the only bridge from raw V4L2 integer values into the stable HAL
+ * colorimetry representation. Each axis is mapped via
+ * `edgefirst_tensor::Colorimetry::from_v4l2`, then re-encoded as stable HAL
+ * constants (see `hal_colorimetry`).
+ *
+ * @param colorspace Raw V4L2 `colorspace` field
+ * @param xfer       Raw V4L2 `xfer_func` field
+ * @param ycbcr_enc  Raw V4L2 `ycbcr_enc` field
+ * @param quant      Raw V4L2 `quantization` field
+ * @param out        Output colorimetry (must not be NULL)
+ * @return 0 on success, -1 if `out` is NULL
+ */
+int hal_colorimetry_from_v4l2(uint32_t colorspace,
+                              uint32_t xfer,
+                              uint32_t ycbcr_enc,
+                              uint32_t quant,
+                              struct hal_colorimetry *out);
 
 /**
  * Create new decoder parameters.
@@ -2353,7 +2390,8 @@ struct hal_tensor *hal_import_image(struct hal_image_processor *processor,
                                     size_t width,
                                     size_t height,
                                     enum hal_pixel_format format,
-                                    enum hal_dtype dtype);
+                                    enum hal_dtype dtype,
+                                    const struct hal_colorimetry *colorimetry);
 
 /**
  * Free an image processor.
@@ -2948,6 +2986,29 @@ bool hal_quantization_is_symmetric(const struct HalTensorQuant *q);
  * `true` when per-channel; returns `false` for per-tensor (axis unused).
  */
 bool hal_quantization_axis(const struct HalTensorQuant *q, size_t *axis_out);
+
+/**
+ * Set the tensor's colorimetry (each axis 0=unknown). Pass NULL to clear.
+ *
+ * The four axes use stable HAL integer constants (see `hal_colorimetry`),
+ * not raw V4L2 values. A NULL `c` clears any colorimetry on the tensor.
+ *
+ * @param tensor Tensor handle (no-op if NULL)
+ * @param c      Colorimetry to set, or NULL to clear
+ */
+void hal_tensor_set_colorimetry(struct hal_tensor *tensor, const struct hal_colorimetry *c);
+
+/**
+ * Read the tensor's colorimetry into `*out` (axes 0 when unknown/unset).
+ *
+ * When the tensor has no colorimetry set, all axes are written as 0
+ * (unknown) and the call still succeeds.
+ *
+ * @param tensor Tensor handle
+ * @param out    Output colorimetry (must not be NULL)
+ * @return 0 on success, -1 on bad args (NULL tensor or NULL out)
+ */
+int hal_tensor_colorimetry(const struct hal_tensor *tensor, struct hal_colorimetry *out);
 
 /**
  * Start trace capture, writing Chrome JSON to the file at `path`.

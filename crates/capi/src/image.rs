@@ -1679,6 +1679,7 @@ pub unsafe extern "C" fn hal_import_image(
     height: size_t,
     format: HalPixelFormat,
     dtype: HalDtype,
+    colorimetry: *const crate::colorimetry::hal_colorimetry,
 ) -> *mut HalTensor {
     // Guard against double-free: if the caller passes the same pointer for
     // both image and chroma, a second Box::from_raw would free already-freed
@@ -1721,6 +1722,12 @@ pub unsafe extern "C" fn hal_import_image(
         },
     };
 
+    let colorimetry_opt = if colorimetry.is_null() {
+        None
+    } else {
+        Some(edgefirst_tensor::Colorimetry::from(unsafe { *colorimetry }))
+    };
+
     let proc_inner = &unsafe { &(*processor) }.inner;
     let dyn_tensor = match proc_inner.import_image(
         image_pd,
@@ -1729,7 +1736,7 @@ pub unsafe extern "C" fn hal_import_image(
         height,
         format.to_pixel_format(),
         dtype.into(),
-        None,
+        colorimetry_opt,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1768,6 +1775,7 @@ pub unsafe extern "C" fn hal_import_image(
     _height: size_t,
     _format: HalPixelFormat,
     _dtype: HalDtype,
+    _colorimetry: *const crate::colorimetry::hal_colorimetry,
 ) -> *mut HalTensor {
     let same_ptr = !_chroma.is_null() && std::ptr::eq(_chroma, _image);
     // Consume descriptors to uphold the "always consumed" contract.
@@ -2709,6 +2717,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                std::ptr::null(),
             );
             assert!(result.is_null());
             // pd is consumed — do NOT free
@@ -2732,6 +2741,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                std::ptr::null(),
             );
             assert!(result.is_null());
 
@@ -2763,6 +2773,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                std::ptr::null(),
             );
             assert!(result.is_null());
 
@@ -2794,6 +2805,7 @@ mod tests {
                 0,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                std::ptr::null(),
             );
             assert!(result.is_null());
 
@@ -2831,6 +2843,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                std::ptr::null(),
             );
             assert!(result.is_null());
 
