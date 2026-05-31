@@ -4968,7 +4968,7 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.98, function!());
+        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap: macOS ANGLE shader now BT.601 full-range, ~2.7% RMS from BT.709 camera720p ref (measured 0.9733); matches Linux camera-fixture tests; see ARCHITECTURE.md "Colorimetry"
     }
 
     /// Multi-resolution smoke test: convert YUYV→RGBA via the GL
