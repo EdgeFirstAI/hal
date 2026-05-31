@@ -523,14 +523,26 @@ static void test_tensor_decode_image_native_format(void) {
 
 // Resolve an EXIF-oriented test JPEG (zidane_exif_<tag>.jpg) from either the
 // repo root or the crate-relative testdata directory. Returns NULL if absent.
+// Probes with fopen() rather than access(): access() tests the real (not
+// effective) uid and is a TOCTOU/privilege footgun (flagged by static
+// analysis), whereas opening the file is the race-free readability check.
+static int file_readable(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f != NULL) {
+        fclose(f);
+        return 1;
+    }
+    return 0;
+}
+
 static const char* test_image_exif_jpeg_path(const char* name) {
     static char buf[256];
     snprintf(buf, sizeof(buf), "testdata/%s", name);
-    if (access(buf, R_OK) == 0) {
+    if (file_readable(buf)) {
         return buf;
     }
     snprintf(buf, sizeof(buf), "../../../testdata/%s", name);
-    if (access(buf, R_OK) == 0) {
+    if (file_readable(buf)) {
         return buf;
     }
     return NULL;
