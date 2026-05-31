@@ -194,16 +194,14 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 
 /// Import a DMA-BUF fd as CUDA external memory and map it to a device pointer.
 ///
-/// Thread-independent — no GL context is required. CUDA dups the fd internally,
-/// so the caller's `fd` remains valid after this call returns. Returns
-/// `(ext_mem_handle, device_ptr)` on success, or `None` on any failure (missing
-/// libcudart, unsupported platform, or driver error).
-///
-/// # Safety contract (caller)
-/// - `fd` must be a valid, open DMA-BUF file descriptor for the lifetime of the
-///   returned `ExternalMemory` handle.
-/// - The caller must call `cudaDestroyExternalMemory` (via [`CudaHandle`] drop)
-///   before closing `fd`.
+/// Thread-independent — no GL context is required. `cudaImportExternalMemory`
+/// with OpaqueFd takes ownership of the fd it is given, so this function dups
+/// the caller's `fd` and hands CUDA the dup; the caller's `fd` is therefore
+/// untouched and remains owned by the caller. Returns `(ext_mem_handle,
+/// device_ptr)` on success, or `None` on any failure (missing libcudart,
+/// unsupported platform, dup failure, or driver error). The returned handle
+/// must be destroyed via `cudaDestroyExternalMemory` (done by [`CudaHandle`]
+/// drop), which also closes the dup'd fd.
 ///
 /// # RUNTIME-UNVALIDATED
 /// No test platform has both `/dev/dma_heap` and a CUDA device. ABI is
@@ -211,15 +209,27 @@ pub(crate) struct CudaExternalMemoryBufferDesc {
 /// by gpu-probe O5 on Orin. Best-effort: returns `None` on failure.
 #[allow(dead_code)] // only reached on Linux DMA tensors; kept cross-platform + ABI-tested
 pub(crate) fn import_dma_fd(fd: i32, size: usize) -> Option<(ExternalMemory, *mut c_void)> {
+    use std::os::fd::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
     let t = table()?;
+    // cudaExternalMemoryHandleTypeOpaqueFd TAKES OWNERSHIP of the fd on a
+    // successful import (CUDA closes it at cudaDestroyExternalMemory). The
+    // caller's fd is owned by TensorStorage::Dma and closed on tensor drop,
+    // so hand CUDA a dup to avoid a double-close.
+    let dup_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .ok()?
+        .into_raw_fd();
     let mut desc: CudaExternalMemoryHandleDesc = unsafe { std::mem::zeroed() };
     desc.type_ = CUDA_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD as c_int;
-    desc.handle_fd = fd;
+    desc.handle_fd = dup_fd;
     desc.size = size as u64;
     let mut ext: ExternalMemory = std::ptr::null_mut();
     if unsafe { (t.import_external_memory)(&mut ext, &desc as *const _ as *const c_void) } != 0 {
+        // Import failed → CUDA did NOT take ownership; reclaim and close the dup.
+        drop(unsafe { OwnedFd::from_raw_fd(dup_fd) });
         return None;
     }
+    // Success: CUDA now owns dup_fd; it is closed by cudaDestroyExternalMemory.
     let bdesc = CudaExternalMemoryBufferDesc {
         offset: 0,
         size: size as u64,
