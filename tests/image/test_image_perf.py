@@ -77,14 +77,11 @@ def calculate_similarity_rms_u8(imageA, imageB) -> float:
     return 1.0 - rms
 
 
-# JPEG sources decode to native NV12, then convert() does a BT.601 full-range
-# (JFIF) NV12->RGB(A) conversion before resize/rotate. The CPU and ANGLE/Mesa
-# GL paths match PIL's full-range decode at ~0.98, but Vivante GL (i.MX8MP)
-# ignores the EGL SAMPLE_RANGE_HINT and samples limited-range, so a GL-backend
-# run drops ~3.5% RMS. Hold 0.95 to stay honest across CPU + every GL driver;
-# the colorimetry PR restores the tighter bound via in-shader conversion.
-# (Interim BT.601 full-range stop-gap; see crates/image/ARCHITECTURE.md.)
-JPEG_NV12_RMS = 0.95
+# JPEG sources decode to native NV12 tagged with JFIF colorimetry (BT.601
+# full-range); convert() honors it, so the NV12->RGB(A) conversion matches PIL's
+# direct JPEG RGB decode. Only the codec's 4:2:0 chroma downsampling differs, so
+# these JPEG-sourced comparisons hold the same 0.98 threshold as the YUYV paths.
+JPEG_NV12_RMS = 0.98
 
 
 original_env = os.environ.copy()
