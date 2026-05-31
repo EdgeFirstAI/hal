@@ -48,4 +48,13 @@ fn main() {
     // Tell cargo to re-run if source files change
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
+
+    // Coverage-capture resilience: detect -Cinstrument-coverage and set
+    // the `coverage` cfg so the SIGABRT handler ctor is compiled in.
+    println!("cargo::rustc-check-cfg=cfg(coverage)");
+    let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if rustflags.contains("instrument-coverage") {
+        println!("cargo::rustc-cfg=coverage");
+    }
+    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
 }

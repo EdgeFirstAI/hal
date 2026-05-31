@@ -67,6 +67,18 @@ and hardware acceleration. However, this will increase the performance of the CP
 */
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented test binary. See `edgefirst_tensor::covguard`. Only present under coverage.
+#[cfg(coverage)]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        edgefirst_tensor::covguard::install();
+    }
+    ctor
+};
+
 /// Pitch alignment requirement for DMA-BUF tensors that may be imported as
 /// EGLImages by the GL backend. Mali Valhall (i.MX 95 / G310) rejects
 /// `eglCreateImageKHR` with `EGL_BAD_ALLOC` for any DMA-BUF whose row pitch

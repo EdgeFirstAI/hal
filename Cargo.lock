@@ -758,6 +758,7 @@ version = "0.24.2"
 dependencies = [
  "approx",
  "edgefirst-hal",
+ "edgefirst-tensor",
  "env_logger",
  "four-char-code",
  "half",

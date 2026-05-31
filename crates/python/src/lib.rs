@@ -3,6 +3,18 @@
 
 #![cfg_attr(nightly, feature(f16))]
 
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented cdylib. See `edgefirst_tensor::covguard`. Only present under coverage.
+#[cfg(coverage)]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        edgefirst_tensor::covguard::install();
+    }
+    ctor
+};
+
 use pyo3::prelude::*;
 
 pub mod decoder;

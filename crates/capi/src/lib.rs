@@ -10,6 +10,18 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented shared library. See `edgefirst_tensor::covguard`. Only present under coverage.
+#[cfg(coverage)]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        edgefirst_tensor::covguard::install();
+    }
+    ctor
+};
+
 mod decoder;
 mod delegate;
 mod error;

@@ -26,6 +26,7 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
+pub mod covguard;
 mod cuda;
 #[cfg(target_os = "linux")]
 mod dma;
@@ -40,6 +41,18 @@ mod pbo;
 #[cfg(unix)]
 mod shm;
 mod tensor_dyn;
+
+/// Retained constructor: installs the coverage flush-on-abort handler for this
+/// crate's instrumented test binary. See `covguard`. Only present under coverage.
+#[cfg(coverage)]
+#[used]
+#[link_section = ".init_array"]
+static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
+    extern "C" fn ctor() {
+        crate::covguard::install();
+    }
+    ctor
+};
 
 #[cfg(target_os = "linux")]
 pub use crate::dma::{DmaMap, DmaTensor};
