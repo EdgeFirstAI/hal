@@ -1517,21 +1517,22 @@ where
                 PixelLayout::Planar => width * std::mem::size_of::<T>(),
                 _ => width * format.channels() * std::mem::size_of::<T>(),
             };
-            // A packed format that has a real IOSurface FourCC (RGBA/BGRA/YUYV,
-            // and packed F16) tolerates a non-64-aligned natural pitch: the
-            // surface is allocated with its own 64-aligned `bytes_per_row`, the
-            // tensor records that stride below, and a CPU map iterates rows
-            // correctly via the strided-map path while the GL import uses the
-            // surface's pitch directly — fully zero-copy. Formats without a
-            // FourCC (Rgb/Grey u8) would fall through to a generic 'L008'
-            // byte-bag that GL can't bind, and planar F16 is consumed flat
-            // (`[1, C, H, W]`, no stride) — both still require an aligned pitch
-            // and fail loudly rather than silently downgrade.
+            // A format with a real IOSurface FourCC (RGBA/BGRA/YUYV packed,
+            // GREY/NV12/NV16/NV24 as R8) tolerates a non-64-aligned natural
+            // pitch: the surface is allocated with its own 64-aligned
+            // `bytes_per_row`, the tensor records that stride below, and a CPU
+            // map iterates rows correctly via the strided-map path while the GL
+            // import uses the surface's pitch directly — fully zero-copy.
+            // Planar (the F16 RGBA16F packing) is consumed flat as
+            // `[1, C, H, W]` with no stride, so it still requires an aligned
+            // pitch; and formats without a FourCC would fall through to a
+            // generic byte-bag GL can't bind. Both fail loudly rather than
+            // silently downgrade.
             let has_image_fourcc = dtype_of::<T>()
                 .and_then(|dt| crate::iosurface::image_iosurface_layout(format, dt))
                 .is_some();
-            let padded_packed_ok = format.layout() == PixelLayout::Packed && has_image_fourcc;
-            if !natural_row_bytes.is_multiple_of(64) && !padded_packed_ok {
+            let padded_ok = has_image_fourcc && format.layout() != PixelLayout::Planar;
+            if !natural_row_bytes.is_multiple_of(64) && !padded_ok {
                 let elem_size = std::mem::size_of::<T>();
                 let per_pixel_bytes = match format.layout() {
                     PixelLayout::Planar => elem_size.max(1),

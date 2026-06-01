@@ -143,6 +143,60 @@ void main() {
 }
 "#;
 
+// Semi-planar YUV (NV12/NV16/NV24) → RGBA, sampling the contiguous combined-
+// plane buffer as ONE R8 (`L008`/GL_RED) texture of `[total_h, even_width]`.
+// The shader computes the Y and interleaved-UV texel positions itself via
+// `texelFetch`, parameterised by uniforms so one program serves all three
+// subsamplings (and is portable to Linux DMA-BUF / embedded GLES — no
+// platform-specific multi-plane sampler):
+//   * `img_size`      logical (W, H); Y plane occupies rows [0, H).
+//   * `tex_width`     R8 texture width (= even buffer width).
+//   * `chroma_shift`  (cx, cy) right-shifts on (x, y): NV12 (1,1), NV16 (1,0),
+//                     NV24 (0,0).
+//   * `uv_row_bytes`  bytes per chroma row in the UV plane: even_width for
+//                     NV12/NV16 (W/2 pairs), 2*even_width for NV24 (W pairs).
+// A linear UV byte offset is converted to a 2D texel so NV24's 2-row-per-
+// chroma-line wrap is handled with no special case. BT.601 full-range matches
+// the codec + CPU kernels (interim colorimetry stop-gap).
+const NV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int uv_row_bytes;
+in vec2 v_uv;
+out vec4 frag;
+
+float fetch_r(int b) {
+    return texelFetch(src, ivec2(b % tex_width, b / tex_width), 0).r;
+}
+
+void main() {
+    int w = img_size.x;
+    int h = img_size.y;
+    int x = clamp(int(v_uv.x * float(w)), 0, w - 1);
+    int y = clamp(int(v_uv.y * float(h)), 0, h - 1);
+
+    float yv = fetch_r(y * tex_width + x); // Y plane, rows [0, H)
+
+    int ccol = x >> chroma_shift.x;
+    int crow = y >> chroma_shift.y;
+    int uv_base = h * tex_width;           // UV plane byte offset
+    int cb = uv_base + crow * uv_row_bytes + ccol * 2;
+    float u = fetch_r(cb);
+    float v = fetch_r(cb + 1);
+
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
+    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
+    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    frag = vec4(r, g, b, 1.0);
+}
+"#;
+
 /// RGBA8 source → packed RGBA16F PlanarRgb F16 destination, one draw
 /// call. F32 destinations are intentionally not supported — see the
 /// crate-level docs and `image_iosurface_layout` for the ANGLE
@@ -419,6 +473,14 @@ pub struct MacosGlProcessor {
     /// R8 IOSurface binding works on ANGLE.
     program_grey_to_rgba: u32,
     uniform_grey_src: i32,
+    /// Program: semi-planar YUV (NV12/NV16/NV24, R8 `L008` IOSurface) → RGBA.
+    /// One program for all three subsamplings (uniforms select the layout).
+    program_nv_to_rgba: u32,
+    uniform_nv_src: i32,
+    uniform_nv_img_size: i32,
+    uniform_nv_tex_width: i32,
+    uniform_nv_chroma_shift: i32,
+    uniform_nv_uv_row_bytes: i32,
     /// Program: RGBA8 source IOSurface → PlanarRgb F16 destination
     /// IOSurface — zero-copy preprocessing for ONNX+CoreML. The shader
     /// writes RGBA16F-packed half-floats; GL handles the implicit
@@ -718,12 +780,30 @@ impl MacosGlProcessor {
             let uniform_grey_src =
                 gls::gl::GetUniformLocation(program_grey, c"src".as_ptr() as *const _);
 
+            // Semi-planar YUV (NV12/NV16/NV24, R8) → RGBA program.
+            let program_nv = compile_program(VERTEX_SHADER, NV_TO_RGBA_FRAGMENT)?;
+            let uniform_nv_src = gls::gl::GetUniformLocation(program_nv, c"src".as_ptr());
+            let uniform_nv_img_size =
+                gls::gl::GetUniformLocation(program_nv, c"img_size".as_ptr());
+            let uniform_nv_tex_width =
+                gls::gl::GetUniformLocation(program_nv, c"tex_width".as_ptr());
+            let uniform_nv_chroma_shift =
+                gls::gl::GetUniformLocation(program_nv, c"chroma_shift".as_ptr());
+            let uniform_nv_uv_row_bytes =
+                gls::gl::GetUniformLocation(program_nv, c"uv_row_bytes".as_ptr());
+
             Ok(Self {
                 program_yuyv_to_rgba: program,
                 uniform_src,
                 uniform_src_size,
                 program_grey_to_rgba: program_grey,
                 uniform_grey_src,
+                program_nv_to_rgba: program_nv,
+                uniform_nv_src,
+                uniform_nv_img_size,
+                uniform_nv_tex_width,
+                uniform_nv_chroma_shift,
+                uniform_nv_uv_row_bytes,
                 program_rgba8_to_planar_f16: program_rgba8_planar_f16,
                 uniform_rgba8_to_planar_f16_src,
                 uniform_rgba8_to_planar_f16_dst_size,
@@ -1018,6 +1098,9 @@ impl MacosGlProcessor {
             (src_fmt, dst_fmt),
             (PixelFormat::Yuyv, PixelFormat::Rgba)
                 | (PixelFormat::Grey, PixelFormat::Rgba)
+                | (PixelFormat::Nv12, PixelFormat::Rgba)
+                | (PixelFormat::Nv16, PixelFormat::Rgba)
+                | (PixelFormat::Nv24, PixelFormat::Rgba)
                 | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
         )
     }
@@ -1119,20 +1202,44 @@ impl MacosGlProcessor {
                 ))));
             }
 
-            // Render. Select the source-sampling program by source format.
-            // GREY samples a GL_RED (R8 `L008`) texture and needs no `src_size`
-            // (Uniform2f on location -1 is a defined no-op); YUYV samples GL_RG.
-            let (program, uniform_src) = match src_fmt {
-                PixelFormat::Grey => (self.program_grey_to_rgba, self.uniform_grey_src),
-                _ => (self.program_yuyv_to_rgba, self.uniform_src),
-            };
+            // Render. Select the source-sampling program by source format:
+            //   YUYV  → GL_RG packed sampler;
+            //   GREY  → GL_RED, identity luma;
+            //   NV12/16/24 → GL_RED single-plane sampler with in-shader
+            //     semi-planar addressing (uniforms select the layout).
             gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-            gls::gl::UseProgram(program);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
-            gls::gl::Uniform1i(uniform_src, 0);
-            if matches!(src_fmt, PixelFormat::Yuyv) {
-                gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+            match src_fmt {
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
+                    // `src_w` is the (even) buffer width = the R8 texture width;
+                    // the Y plane is `src_h` rows of it, UV follows.
+                    let (cx, cy) = match src_fmt {
+                        PixelFormat::Nv12 => (1, 1),
+                        PixelFormat::Nv16 => (1, 0),
+                        _ => (0, 0), // Nv24
+                    };
+                    let uv_row_bytes = if matches!(src_fmt, PixelFormat::Nv24) {
+                        (src_w * 2) as i32
+                    } else {
+                        src_w as i32
+                    };
+                    gls::gl::UseProgram(self.program_nv_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_nv_src, 0);
+                    gls::gl::Uniform2i(self.uniform_nv_img_size, src_w as i32, src_h as i32);
+                    gls::gl::Uniform1i(self.uniform_nv_tex_width, src_w as i32);
+                    gls::gl::Uniform2i(self.uniform_nv_chroma_shift, cx, cy);
+                    gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
+                }
+                PixelFormat::Grey => {
+                    gls::gl::UseProgram(self.program_grey_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_grey_src, 0);
+                }
+                _ => {
+                    gls::gl::UseProgram(self.program_yuyv_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_src, 0);
+                    gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+                }
             }
             gls::gl::BindVertexArray(self.vao);
             gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);

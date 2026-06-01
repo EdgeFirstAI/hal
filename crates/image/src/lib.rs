@@ -4977,6 +4977,99 @@ mod image_tests {
         }
     }
 
+    /// Step-2 verification: NV12/NV16/NV24 (R8 IOSurface) → RGBA on the GPU
+    /// must match the CPU `yuv` kernels within shader rounding. Fills an
+    /// IOSurface source and a Mem source from the same logical YUV pattern
+    /// (each at its own row stride), converts the IOSurface on the GPU and the
+    /// Mem one on the CPU, and compares. Exercises the in-shader semi-planar
+    /// addressing for all three subsamplings (incl. NV24's 2×-wide UV rows).
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_nv16_nv24_to_rgba_opengl_macos() {
+        let mut gpu = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let mut cpu = CPUProcessor::new();
+        let (w, h) = (16usize, 16usize);
+
+        // Fill Y plus the interleaved UV plane using the [total_h, even_width]
+        // grid layout (even_width == w here): a chroma row occupies one grid
+        // row for NV12/NV16 and two for NV24 (2W bytes). Map each linear UV
+        // byte to (row, col) so it lands at the correct grid cell regardless of
+        // the buffer's row stride (padded for IOSurface, tight for Mem).
+        let ew = w; // even width (w is even)
+        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
+            for y in 0..h {
+                for x in 0..w {
+                    buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
+                }
+            }
+            let (cw, ch, bytes_per_crow) = match fmt {
+                PixelFormat::Nv12 => (w / 2, h / 2, ew),
+                PixelFormat::Nv16 => (w / 2, h, ew),
+                _ => (w, h, ew * 2), // Nv24
+            };
+            let mut put = |lb: usize, val: u8| {
+                let row = h + lb / ew;
+                buf[row * stride + (lb % ew)] = val;
+            };
+            for cy in 0..ch {
+                for cx in 0..cw {
+                    let lb = cy * bytes_per_crow + cx * 2;
+                    put(lb, ((cx * 11 + 30) & 0xff) as u8);
+                    put(lb + 1, ((cy * 7 + 200) & 0xff) as u8);
+                }
+            }
+        };
+
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+            let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
+            fill(mem.as_u8().unwrap().map().unwrap().as_mut_slice(), mem_stride, fmt);
+            let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+            let (r, _s, cpu_dst) =
+                convert_img(&mut cpu, mem, cpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
+
+            let ios = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
+                .unwrap_or_else(|e| panic!("{fmt:?} IOSurface alloc: {e}"));
+            let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
+            fill(ios.as_u8().unwrap().map().unwrap().as_mut_slice(), ios_stride, fmt);
+            let gpu_dst =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            let (r, _s, gpu_dst) =
+                convert_img(&mut gpu, ios, gpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA on ANGLE: {e}"));
+
+            let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+            let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
+            let cb = cmap.as_slice();
+            let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+            let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
+            let gb = gmap.as_slice();
+            let mut max_d = 0i16;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let cv = cb[y * cs + x * 4 + c] as i16;
+                        let gv = gb[y * gs + x * 4 + c] as i16;
+                        max_d = max_d.max((cv - gv).abs());
+                    }
+                }
+            }
+            assert!(
+                max_d <= 3,
+                "{fmt:?}: GPU vs CPU RGBA max channel diff {max_d} > 3"
+            );
+        }
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
