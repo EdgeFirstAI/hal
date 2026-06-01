@@ -1475,7 +1475,8 @@ where
         T: 'static,
     {
         // Shape comes from the shared `PixelFormat::image_shape` helper (packed /
-        // planar / semi-planar NV12·NV16, including the NV12 even-height check).
+        // planar / semi-planar NV12·NV16). NV12 supports odd dimensions via the
+        // `H + ceil(H/2)` combined-plane height.
         // The `T: 'static` bound is required by the macOS IOSurface path below.
         let shape = format.image_shape(width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
@@ -1742,9 +1743,15 @@ where
                     )));
                 }
                 match format {
-                    PixelFormat::Nv12 if !shape[0].is_multiple_of(3) => {
+                    // Combined-plane height is `H + ceil(H/2)` (luma + chroma
+                    // rows). For even H that is `3H/2` (≡ 0 mod 3); for odd H it
+                    // is `(3H+1)/2` (≡ 2 mod 3). Only totals ≡ 1 mod 3 are
+                    // unreachable, so reject just those — odd-height NV12 is
+                    // valid (e.g. 725 rows for a 483-tall image).
+                    PixelFormat::Nv12 if shape[0] % 3 == 1 => {
                         return Err(Error::InvalidShape(format!(
-                            "NV12 contiguous shape[0] must be divisible by 3, got {}",
+                            "NV12 contiguous shape[0] must be H + ceil(H/2) for some height; \
+                             {} is unreachable (≡ 1 mod 3)",
                             shape[0]
                         )));
                     }
@@ -2632,7 +2639,18 @@ mod image_tests {
             PixelFormat::Nv12.image_shape(640, 480),
             Some(vec![720, 640])
         );
-        assert_eq!(PixelFormat::Nv12.image_shape(640, 481), None);
+        // Odd height: combined-plane height is `481 + ceil(481/2)` = 481 + 241
+        // = 722 rows. Logical height is recovered as `722 * 2 / 3` = 481.
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(640, 481),
+            Some(vec![722, 640])
+        );
+        // Odd width is carried in the logical shape (chroma padding is a stride
+        // concern handled at allocation, not here).
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(641, 480),
+            Some(vec![720, 641])
+        );
         assert_eq!(
             PixelFormat::PlanarRgb.image_shape(640, 480),
             Some(vec![3, 480, 640])

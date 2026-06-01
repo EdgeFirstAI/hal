@@ -174,7 +174,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SIMD type-conversion path (these moved to `ImageProcessor::convert()`); the
   JPEG CPU path now writes native `NV12`/`GREY` directly.
 
-### Notes
+### Fixed
+
+- **NV12 odd-height support.** `PixelFormat::Nv12` images may now have an odd
+  height: the combined-plane shape is `H + ceil(H/2)` rows (luma + chroma),
+  which equals the classic `3H/2` for even heights and stays exact for odd ones
+  (e.g. 483 → 725 rows). Previously the JPEG decoder rejected any colour JPEG
+  whose width *or* height was odd with `NV12 requires even dimensions`, which
+  broke common photo/COCO images such as 640×483. The contiguous NV12
+  `convert()` CPU kernels (`Nv12`→`Rgb`/`Rgba`/`Grey`) are now stride- and
+  logical-height-aware, so externally-allocated padded NV12 buffers convert
+  correctly too. Odd *width* still needs an even-padded chroma row stride and is
+  rejected at decode with a specific message (`NV12 odd width not yet
+  supported`) until that allocation path lands.
 
 - **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
   returns the GPU's actual `GL_EXT_color_buffer_half_float` /

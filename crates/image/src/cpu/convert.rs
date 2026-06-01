@@ -30,32 +30,54 @@ pub(super) fn full_to_limit(l: u8) -> u8 {
 impl CPUProcessor {
     pub(super) fn convert_nv12_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
-            let src_h = src.shape()[0]; // multiplane: luma shape is [H, W]
-            Self::nv12_to_rgb_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            // The chroma plane is a raw tensor (no format), so its
+            // `effective_row_stride()` has no width-based fallback — default to
+            // the luma width when no explicit stride was stored.
+            let y_stride = src.effective_row_stride().unwrap_or(src_w);
+            let uv_stride = src
+                .chroma()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(src_w);
+            Self::nv12_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                y_stride,
+                uv_stride,
+                dst,
+            )
         } else {
+            // Contiguous NV12: `src_h` luma rows then `ceil(src_h/2)` chroma
+            // rows, every row `stride` bytes (>= width for padded buffers). The
+            // chroma plane starts after the luma rows: `stride * src_h`.
             let map = src.map()?;
-            // contiguous NV12: shape is [H*3/2, W], so height = shape[0] * 2 / 3
-            let src_h = src.shape()[0] * 2 / 3;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let stride = src.effective_row_stride().unwrap_or(src_w);
+            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv12_to_rgb_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        y_stride: usize,
+        uv_stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: y_stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: uv_stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -75,31 +97,48 @@ impl CPUProcessor {
     // caller applies an R<->B swizzle afterwards via `swizzle_rb_4chan`.
     pub(super) fn convert_nv12_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
-            let src_h = src.shape()[0];
-            Self::nv12_to_rgba_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            let y_stride = src.effective_row_stride().unwrap_or(src_w);
+            let uv_stride = src
+                .chroma()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(src_w);
+            Self::nv12_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                y_stride,
+                uv_stride,
+                dst,
+            )
         } else {
             let map = src.map()?;
-            let src_h = src.shape()[0] * 2 / 3;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let stride = src.effective_row_stride().unwrap_or(src_w);
+            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv12_to_rgba_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        y_stride: usize,
+        uv_stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: y_stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: uv_stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -115,26 +154,31 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_nv12_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        // NV12→GREY drops chroma and copies the luma plane (the first `src_h`
+        // rows). Honour the source row stride so padded buffers and odd widths
+        // are handled correctly, and the destination grey stride so we write a
+        // tightly-packed [H, W] output.
         let src_w = src.width().unwrap();
-        let src_h = if src.is_multiplane() {
-            src.shape()[0]
-        } else {
-            src.shape()[0] * 2 / 3
-        };
+        let src_h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
 
         let src_map = src.map()?;
-        let y_len = src_w * src_h;
-        let y_slice = &src_map.as_slice()[..y_len];
-
+        let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        let src_chunks = y_slice.as_chunks::<8>();
-        let dst_chunks = dst_map.as_chunks_mut::<8>();
-        for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
-            s.iter().zip(d).for_each(|(s, d)| *d = limit_to_full(*s));
-        }
+        let dst_bytes = dst_map.as_mut_slice();
 
-        for (s, d) in src_chunks.1.iter().zip(dst_chunks.1) {
-            *d = limit_to_full(*s);
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            let (s_chunks, s_rem) = s.as_chunks::<8>();
+            let (d_chunks, d_rem) = d.as_chunks_mut::<8>();
+            for (sc, dc) in s_chunks.iter().zip(d_chunks) {
+                sc.iter().zip(dc).for_each(|(s, d)| *d = limit_to_full(*s));
+            }
+            for (s, d) in s_rem.iter().zip(d_rem) {
+                *d = limit_to_full(*s);
+            }
         }
 
         Ok(())

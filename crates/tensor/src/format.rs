@@ -80,21 +80,23 @@ impl PixelFormat {
     }
 
     /// The tensor shape for this format at `width`×`height`, or `None` if the
-    /// dimensions are invalid for the format (e.g. NV12 with odd height) or the
-    /// format is an unsupported semi-planar variant (any `SemiPlanar` variant
-    /// other than `Nv12` and `Nv16`).
+    /// dimensions are invalid for the format, or the format is an unsupported
+    /// semi-planar variant (any `SemiPlanar` variant other than `Nv12` and
+    /// `Nv16`).
+    ///
+    /// Odd dimensions are supported. The combined-plane height for NV12 is
+    /// `height + ceil(height / 2)` (luma rows + chroma rows), which equals the
+    /// classic `height * 3 / 2` for even heights and stays exact for odd ones —
+    /// e.g. 483 → 725 rows (483 luma + 242 chroma). Odd *width* is carried in
+    /// the logical shape; the per-row padding chroma interleaving needs is
+    /// expressed separately via the tensor's row stride.
     pub fn image_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
         match self.layout() {
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
             PixelLayout::SemiPlanar => {
                 let total_h = match self {
-                    PixelFormat::Nv12 => {
-                        if !height.is_multiple_of(2) {
-                            return None;
-                        }
-                        height * 3 / 2
-                    }
+                    PixelFormat::Nv12 => height + height.div_ceil(2),
                     PixelFormat::Nv16 => height * 2,
                     _ => return None,
                 };

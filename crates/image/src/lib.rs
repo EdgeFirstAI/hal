@@ -3042,20 +3042,18 @@ mod image_tests {
         assert_eq!(grey_img.height(), Some(681));
 
         // `grey-rgb.jpg` holds the same grey content but is encoded as a
-        // 3-component (colour) JPEG. The migrated codec decodes colour JPEGs
-        // to their native NV12 layout, which requires even dimensions. With an
-        // odd height (681) the decode is rejected rather than silently padded
-        // or colour-converted, so the load now fails.
+        // 3-component (colour) JPEG, so the codec decodes it to native NV12.
+        // Its 1024×681 dimensions have an odd height; NV12 now represents odd
+        // dimensions via the `H + ceil(H/2)` combined-plane height, so the
+        // decode succeeds and converts to RGBA at the true dimensions.
         let grey_but_rgb = crate::load_image_test_helper(
             &edgefirst_bench::testdata::read("grey-rgb.jpg"),
             Some(PixelFormat::Rgba),
             None,
-        );
-        assert!(
-            grey_but_rgb.is_err(),
-            "odd-height colour JPEG must fail to decode under native-NV12 codec, \
-             got {grey_but_rgb:?}"
-        );
+        )
+        .expect("odd-height colour JPEG should decode to NV12 and convert to RGBA");
+        assert_eq!(grey_but_rgb.width(), Some(1024));
+        assert_eq!(grey_but_rgb.height(), Some(681));
     }
 
     #[test]
@@ -5759,6 +5757,40 @@ mod image_tests {
         // decode), so it differs slightly from the RGBA derived from the
         // separate `zidane.nv12` fixture.
         compare_images(&dst, &target_image, 0.95, function!());
+    }
+
+    #[test]
+    fn test_nv12_odd_height_to_rgb_cpu() {
+        // Even width, odd height (8×5) — the reported failure class (e.g.
+        // 640×483). The contiguous NV12 buffer is `[5 + ceil(5/2), 8]` = `[8, 8]`
+        // (5 luma rows + 3 chroma rows). A neutral-grey fill (Y=U=V=128, BT.601
+        // full-range) must convert to a uniform grey RGB, exercising the
+        // odd-height row-count and the logical-height derivation in convert.
+        let src = TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, None).unwrap();
+        assert_eq!(src.shape(), &[8, 8]);
+        assert_eq!((src.width(), src.height()), (Some(8), Some(5)));
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+
+        let dst = TensorDyn::image(8, 5, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut cpu_converter = CPUProcessor::new();
+        let (result, _src, dst) = convert_img(
+            &mut cpu_converter,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        result.unwrap();
+
+        assert_eq!((dst.width(), dst.height()), (Some(8), Some(5)));
+        let map = dst.as_u8().unwrap().map().unwrap();
+        for (i, &b) in map.as_slice().iter().enumerate() {
+            assert!(
+                (b as i16 - 128).abs() <= 2,
+                "pixel byte {i} = {b}, expected ~128 for neutral-grey NV12"
+            );
+        }
     }
 
     #[test]

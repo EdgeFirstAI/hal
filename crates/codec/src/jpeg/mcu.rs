@@ -225,8 +225,9 @@ fn avg_block(plane: &[u8], stride: usize, x0: usize, y0: usize, xs: usize, ys: u
 /// to 4:2:0. Correct for any source subsampling (4:2:0 → passthrough, 4:2:2 →
 /// vertical average, 4:4:4 → 2×2 average).
 ///
-/// NV12 layout: `img_h` rows of `img_w` luma bytes at offset 0, then `img_h/2`
-/// rows of `img_w` interleaved Cb/Cr bytes at offset `img_h * dst_stride`.
+/// NV12 layout: `img_h` rows of `img_w` luma bytes at offset 0, then
+/// `ceil(img_h/2)` rows of interleaved Cb/Cr bytes at offset
+/// `img_h * dst_stride`.
 #[allow(clippy::too_many_arguments)]
 fn write_nv12_rows(
     hdr: &crate::jpeg::types::ImageHeader,
@@ -264,7 +265,11 @@ fn write_nv12_rows(
     let chroma_w = img_w / 2;
     let band_src0 = (y_start * cb.sampling.v as usize) / max_v;
     let out_cy_start = y_start / 2;
-    let out_cy_end = (y_start + num_rows) / 2;
+    // Round up so an odd `img_h` keeps its final chroma row (e.g. a 483-tall
+    // image needs ceil(483/2) = 242 chroma rows, not 241). Only the last band
+    // reaches an odd boundary; intermediate bands end on even MCU heights where
+    // `div_ceil(2)` equals `/2`, so this never overlaps the next band.
+    let out_cy_end = (y_start + num_rows).div_ceil(2);
 
     for ocy in out_cy_start..out_cy_end {
         let uv_off = uv_plane_offset + ocy * dst_stride;

@@ -355,10 +355,11 @@ fn unsupported_progressive_jpeg_returns_typed_variant() {
 }
 
 #[test]
-fn partial_mcu_at_image_edge_decodes_full_width() {
-    // jaguar.jpg is 789×384 — odd width, so NV12 is rejected. Instead verify
-    // peek_info reports the true dims and that the odd-width NV12 decode is
-    // refused up front rather than silently truncating.
+fn odd_width_nv12_jpeg_is_rejected() {
+    // jaguar.jpg is 789×384 — odd width. NV12 supports odd *height* (via the
+    // `H + ceil(H/2)` combined-plane height) but not odd width yet: the chroma
+    // plane would need an even-padded row stride. `peek_info` still reports the
+    // true dims, and the decode is refused up front with a specific message.
     let jpeg = testdata("jaguar.jpg");
     let info = peek_info(&jpeg).unwrap();
     assert_eq!((info.width, info.height), (789, 384));
@@ -368,14 +369,13 @@ fn partial_mcu_at_image_edge_decodes_full_width() {
         "colour JPEG should report native NV12 format"
     );
 
-    // Odd-width NV12 allocation: even if we round width up, the decode must
-    // reject odd-width NV12 rather than produce a chroma artefact.
     let mut tensor =
         Tensor::<u8>::image(790, 384, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &jpeg);
+    let err = result.expect_err("odd-width NV12 JPEG decode should be rejected");
     assert!(
-        result.is_err(),
-        "odd-width NV12 JPEG decode should be rejected, got {result:?}"
+        err.to_string().contains("odd width"),
+        "error should name the odd-width limitation, got: {err}"
     );
 }

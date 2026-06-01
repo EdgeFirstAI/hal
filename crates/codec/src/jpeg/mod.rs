@@ -130,10 +130,18 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let img_h = headers.header.height as usize;
     let output_fmt = native_format(&headers)?;
 
-    // NV12 needs even dimensions (one Cb/Cr pair per 2×2 luma block).
-    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
+    // NV12 supports odd *height*: the combined-plane height is `H + ceil(H/2)`
+    // (handled by `PixelFormat::image_shape`), giving a valid chroma-row count.
+    //
+    // Odd *width* is not yet supported. The chroma plane needs `ceil(W/2)`
+    // interleaved UV pairs per row — `W + 1` bytes for odd `W` — so it requires
+    // an even-padded row stride, which the contiguous NV12 allocation does not
+    // yet provide. Reject it up front with a specific message rather than let it
+    // surface as an opaque chroma-size mismatch inside the YUV convert kernel.
+    if output_fmt == PixelFormat::Nv12 && !img_w.is_multiple_of(2) {
         return Err(CodecError::InvalidData(format!(
-            "NV12 requires even dimensions; got {img_w}×{img_h}"
+            "NV12 odd width not yet supported (needs even-stride chroma padding); \
+             got {img_w}×{img_h}"
         )));
     }
 
