@@ -195,15 +195,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now stride- and logical-height-aware, so externally-allocated padded NV12
   buffers convert correctly too.
 
-- **Strided CPU mapping for Mem/Shm tensors (all platforms).** `Tensor::map()`
+- **Strided CPU mapping for Mem/Shm/IOSurface tensors.** `Tensor::map()`
   previously rejected any strided tensor on non-Linux with "CPU mapping of
   strided tensors is not supported on this platform (DMA backing is
-  Linux-only)". That was an unimplemented path, not a platform limit: HAL-owned
-  `Mem` and `Shm` allocations can expose the full padded buffer for row-stride
-  iteration just like self-allocated Linux DMA tensors. `map()` now does so for
-  `Mem`/`Shm` on every platform, validating `row_stride × rows` against the
-  allocation capacity. Imported DMA-BUFs, IOSurface, and PBO storages remain
-  GPU-path only (their layout is owned by an external allocator/driver).
+  Linux-only)". That was an unimplemented path, not a platform limit. `map()`
+  now exposes the full row-padded buffer for row-stride iteration across every
+  HAL-owned storage, mirroring the self-allocated Linux DMA path:
+  - **Mem / Shm** (all platforms): validates `row_stride × rows` against the
+    allocation capacity.
+  - **IOSurface** (macOS): plumbs `IOSurfaceGetBytesPerRow`; the
+    `IOSurfaceLock` already yields the surface base address, so the strided
+    view is genuinely zero-copy (no staging buffer). Image-formatted surfaces
+    carry their 64-aligned `bytes_per_row` as the tensor's row stride, and
+    `Tensor::image()` now allocates a **padded zero-copy IOSurface** for packed
+    formats whose width isn't 64-aligned (RGBA/BGRA/YUYV and packed F16) instead
+    of falling back to SHM — GL imports via the surface pitch and the CPU maps
+    via the strided path. Formats without an IOSurface FourCC (Rgb/Grey u8) and
+    the flat-consumed planar-F16 packing still require an aligned pitch.
+
+  Imported DMA-BUFs (external allocator layout) and PBO storages remain
+  GPU-path only.
 
 - **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
   returns the GPU's actual `GL_EXT_color_buffer_half_float` /

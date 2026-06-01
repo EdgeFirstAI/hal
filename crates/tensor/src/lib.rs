@@ -1517,7 +1517,21 @@ where
                 PixelLayout::Planar => width * std::mem::size_of::<T>(),
                 _ => width * format.channels() * std::mem::size_of::<T>(),
             };
-            if !natural_row_bytes.is_multiple_of(64) {
+            // A packed format that has a real IOSurface FourCC (RGBA/BGRA/YUYV,
+            // and packed F16) tolerates a non-64-aligned natural pitch: the
+            // surface is allocated with its own 64-aligned `bytes_per_row`, the
+            // tensor records that stride below, and a CPU map iterates rows
+            // correctly via the strided-map path while the GL import uses the
+            // surface's pitch directly — fully zero-copy. Formats without a
+            // FourCC (Rgb/Grey u8) would fall through to a generic 'L008'
+            // byte-bag that GL can't bind, and planar F16 is consumed flat
+            // (`[1, C, H, W]`, no stride) — both still require an aligned pitch
+            // and fail loudly rather than silently downgrade.
+            let has_image_fourcc = dtype_of::<T>()
+                .and_then(|dt| crate::iosurface::image_iosurface_layout(format, dt))
+                .is_some();
+            let padded_packed_ok = format.layout() == PixelLayout::Packed && has_image_fourcc;
+            if !natural_row_bytes.is_multiple_of(64) && !padded_packed_ok {
                 let elem_size = std::mem::size_of::<T>();
                 let per_pixel_bytes = match format.layout() {
                     PixelLayout::Planar => elem_size.max(1),
@@ -1572,6 +1586,20 @@ where
                 ) {
                     let mut t = Self::wrap(storage);
                     t.format = Some(format);
+                    // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
+                    // pitch exceeds the natural packed/planar row stride, record
+                    // it so CPU consumers iterate rows correctly (the GL import
+                    // already uses the surface's own pitch). For 64-aligned rows
+                    // — the common model-input case — the two match and no stride
+                    // is stored, leaving the flat mapping unchanged.
+                    if let TensorStorage::Dma(ref io) = t.storage {
+                        let bpr = io.bytes_per_row();
+                        if let Some(natural) = t.effective_row_stride() {
+                            if bpr > natural {
+                                t.set_row_stride_unchecked(bpr);
+                            }
+                        }
+                    }
                     return Ok(t);
                 }
             }
@@ -2353,11 +2381,26 @@ where
                     }
                     return shm.map_with_byte_size(total_bytes);
                 }
+                // macOS: `TensorStorage::Dma` is the IOSurface. The lock yields
+                // the full surface base address, and the row pitch
+                // (`IOSurfaceGetBytesPerRow`) is known from the API for both
+                // self-allocated and imported surfaces — unlike a foreign
+                // DMA-BUF — so a strided CPU view is sound and zero-copy.
+                #[cfg(target_os = "macos")]
+                TensorStorage::Dma(io) => {
+                    if total_bytes > io.buf_size {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity: io.buf_size,
+                        });
+                    }
+                    return io.map_with_byte_size(total_bytes);
+                }
                 _ => {
                     return Err(Error::InvalidOperation(
                         "CPU mapping of strided tensors is supported only for HAL-allocated \
-                         Mem/Shm (any platform) and self-allocated DMA (Linux); imported \
-                         DMA-BUF, IOSurface, and PBO storages are GPU-path only"
+                         Mem/Shm (any platform), self-allocated DMA (Linux), and IOSurface \
+                         (macOS); imported DMA-BUF and PBO storages are GPU-path only"
                             .into(),
                     ));
                 }
@@ -2702,30 +2745,25 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn image_tensor_dma_rejects_non_aligned_width() {
-        // RGBA u8 at width=4 → 4*4*1 = 16 bytes/row, not 64-byte
-        // aligned. An explicit `Some(TensorMemory::Dma)` request must
-        // fail loudly with the alignment requirement spelled out
-        // rather than silently downgrading to a generic 'L008'
-        // byte-bag IOSurface (which would then fail at GL bind time
-        // with an opaque EGL_BAD_ATTRIBUTE). Same anti-pattern bit us
-        // previously on Mali GPUs with DMA-BUF padding.
-        let err = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect_err("misaligned Dma request must be rejected");
-        match err {
-            Error::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("64-byte aligned") && msg.contains("Pad width"),
-                    "error must spell out the alignment requirement: {msg}"
-                );
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
-        // Same misaligned dimensions with `memory=None` should
-        // auto-fall-back to SHM/Mem (no error).
-        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, None)
-            .expect("auto-select must fall back gracefully");
+    fn image_tensor_dma_non_aligned_packed_width_pads_zero_copy() {
+        // RGBA u8 at width=4 → 4*4 = 16 bytes/row, not 64-byte aligned. RGBA has
+        // a real IOSurface FourCC, so an explicit `Some(TensorMemory::Dma)`
+        // request now allocates a padded image IOSurface (64-aligned
+        // `bytes_per_row`) and records the stride — a fully zero-copy buffer GL
+        // can bind and the CPU can map via the strided path. (Previously this
+        // failed loudly to avoid an 'L008' byte-bag downgrade; with a real
+        // FourCC surface that concern no longer applies.)
+        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
+            .expect("padded RGBA IOSurface should allocate");
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
+        assert_eq!(t.width(), Some(4));
+        assert_eq!(t.height(), Some(4));
+        let stride = t.effective_row_stride().expect("stride");
+        assert_eq!(stride % 64, 0, "padded to 64-byte row alignment");
+        assert!(stride >= 16);
+        // A CPU map exposes the full padded surface for strided iteration.
+        let m = t.map().expect("strided IOSurface map");
+        assert_eq!(m.as_slice().len(), stride * 4);
     }
 
     /// `per_pixel_bytes` that doesn't divide 64 evenly (e.g. RGB u8 with
