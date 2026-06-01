@@ -103,42 +103,11 @@ void main() {
 //   * `c_vr` / `c_ug` / `c_vg` / `c_ub` are the chroma cross-terms for
 //     the encoding matrix (BT.601 / BT.709 / BT.2020), already folded
 //     with the range's chroma scaling.
-const YUYV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
-precision mediump float;
-uniform sampler2D src;
-uniform vec2 src_size;
-uniform float y_offset;   // luma black level, normalised (e.g. 16/255)
-uniform float y_scale;    // luma gain (e.g. 1.164 limited, 1.0 full)
-uniform float c_vr;       // V→R coefficient
-uniform float c_ug;       // U→G coefficient
-uniform float c_vg;       // V→G coefficient
-uniform float c_ub;       // U→B coefficient
-in vec2 v_uv;
-out vec4 frag;
-
-void main() {
-    vec2 texel = vec2(1.0) / src_size;
-    vec2 col = floor(v_uv * src_size);
-    bool even = mod(col.x, 2.0) < 0.5;
-    vec2 self_uv = (col + vec2(0.5)) * texel;
-    vec2 pair_uv = (col + vec2(even ? 1.5 : -0.5, 0.5)) * texel;
-
-    vec4 self_rg = texture(src, self_uv);
-    vec4 pair_rg = texture(src, pair_uv);
-    float y = self_rg.r;
-    float u, v;
-    if (even) { u = self_rg.g; v = pair_rg.g; }
-    else      { v = self_rg.g; u = pair_rg.g; }
-
-    float yp = (y - y_offset) * y_scale;
-    float up = u - 128.0/255.0;
-    float vp = v - 128.0/255.0;
-    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
-    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
-    float b = clamp(yp + c_ub * up, 0.0, 1.0);
-    frag = vec4(r, g, b, 1.0);
-}
-"#;
+// Single source of truth lives in
+// [`super::shaders_common::YUYV_TO_RGBA_FRAGMENT`], shared with the Linux
+// GLES per-plane DMA-BUF path. The macOS vertex shader emits the `v_uv`
+// varying the shared fragment shader consumes.
+const YUYV_TO_RGBA_FRAGMENT: &str = super::shaders_common::YUYV_TO_RGBA_FRAGMENT;
 
 /// RGBA8 source → packed RGBA16F PlanarRgb F16 destination, one draw
 /// call. F32 destinations are intentionally not supported — see the
@@ -172,57 +141,12 @@ void main() {
 const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str =
     super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT;
 
-/// YUV→RGB shader coefficients resolved from the per-tensor colorimetry.
-///
-/// `y_offset` / `y_scale` normalise the luma for the sample range; the
-/// four chroma cross-terms (`c_vr`, `c_ug`, `c_vg`, `c_ub`) encode the
-/// `ColorEncoding` matrix folded with the range's chroma scaling. The
-/// coefficients are derived from the BT matrix luma weights `(kr, kb)`:
-///   c_vr = 2*(1-kr) * c_scale
-///   c_ub = 2*(1-kb) * c_scale
-///   c_ug = (2*(1-kb)*kb / kg) * c_scale,  kg = 1-kr-kb
-///   c_vg = (2*(1-kr)*kr / kg) * c_scale
-/// For limited range the luma gain is 255/219 and chroma scale 255/224;
-/// for full range both are 1.0.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct YuvToRgbCoeffs {
-    y_offset: f32,
-    y_scale: f32,
-    c_vr: f32,
-    c_ug: f32,
-    c_vg: f32,
-    c_ub: f32,
-}
-
-fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
-    // Luma weights (kr, kb) per encoding matrix.
-    let (kr, kb) = match encoding {
-        ColorEncoding::Bt601 => (0.299_f32, 0.114_f32),
-        ColorEncoding::Bt709 => (0.2126_f32, 0.0722_f32),
-        ColorEncoding::Bt2020 => (0.2627_f32, 0.0593_f32),
-        // Future encodings default to BT.709 (HD broadcast).
-        _ => (0.2126_f32, 0.0722_f32),
-    };
-    let kg = 1.0 - kr - kb;
-
-    // Range scaling. Limited: luma spans 16..235 (gain 255/219), chroma
-    // spans 16..240 (gain 255/224). Full: both unity.
-    let (y_offset, y_scale, c_scale) = match range {
-        ColorRange::Full => (0.0, 1.0, 1.0),
-        ColorRange::Limited => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
-        // Future ranges default to limited (broadcast convention).
-        _ => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
-    };
-
-    YuvToRgbCoeffs {
-        y_offset,
-        y_scale,
-        c_vr: 2.0 * (1.0 - kr) * c_scale,
-        c_ub: 2.0 * (1.0 - kb) * c_scale,
-        c_ug: (2.0 * (1.0 - kb) * kb / kg) * c_scale,
-        c_vg: (2.0 * (1.0 - kr) * kr / kg) * c_scale,
-    }
-}
+// YUV→RGB shader coefficients (`yuv_to_rgb_coeffs` returning `YuvToRgbCoeffs`)
+// live in the platform-neutral `crate::colorimetry` module and are shared with
+// the Linux GLES backend — the GLSL math is identical; only texture import
+// differs. macOS uses the returned coeffs by field access, so it imports only
+// the function (the `YuvToRgbCoeffs` type name is referenced on the Linux side).
+use crate::colorimetry::yuv_to_rgb_coeffs;
 
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
@@ -474,7 +398,7 @@ pub struct MacosGlProcessor {
     uniform_rgba8_to_planar_f16_dst_rect_px: i32,
     uniform_rgba8_to_planar_f16_pad_color: i32,
     /// YUV→RGB conversion coefficient uniforms, set per-convert from the
-    /// resolved colorimetry. See [`YuvToRgbCoeffs`].
+    /// resolved colorimetry. See [`crate::colorimetry::YuvToRgbCoeffs`].
     uniform_y_offset: i32,
     uniform_y_scale: i32,
     uniform_c_vr: i32,

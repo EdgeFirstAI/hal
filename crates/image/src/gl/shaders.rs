@@ -93,6 +93,54 @@ void main() {
 "
 }
 
+/// Vertex shader for the in-shader YUV→RGB programs.
+///
+/// Identical vertex-attribute layout to [`generate_vertex_shader`]
+/// (location 0 = `vec3 pos`, location 1 = `vec2 texCoord`) so the existing
+/// `vertex_buffer` / `texture_buffer` plumbing and ROI/rotation/flip vertex
+/// math drive it unchanged. It emits the `v_uv` varying consumed by the
+/// shared [`super::shaders_common::YUYV_TO_RGBA_FRAGMENT`] and
+/// [`super::shaders_common::NV12_TO_RGBA_FRAGMENT`] fragment shaders.
+pub(super) fn generate_vertex_shader_yuv() -> &'static str {
+    "\
+#version 300 es
+precision mediump float;
+layout(location = 0) in vec3 pos;
+layout(location = 1) in vec2 texCoord;
+
+out vec2 v_uv;
+
+void main() {
+    v_uv = texCoord;
+    gl_Position = vec4(pos, 1.0);
+}
+"
+}
+
+/// Packed YUYV/VYUY → RGBA, in-shader colorimetry. Single source of truth in
+/// [`super::shaders_common::YUYV_TO_RGBA_FRAGMENT`] (shared with macOS).
+pub(super) fn generate_yuyv_to_rgba_shader() -> &'static str {
+    super::shaders_common::YUYV_TO_RGBA_FRAGMENT
+}
+
+/// Semi-planar NV12/NV16 → RGBA, in-shader colorimetry. Single source of
+/// truth in [`super::shaders_common::NV12_TO_RGBA_FRAGMENT`] (shared with
+/// macOS).
+pub(super) fn generate_nv12_to_rgba_shader() -> &'static str {
+    super::shaders_common::NV12_TO_RGBA_FRAGMENT
+}
+
+/// Int8 (XOR 0x80) variant of [`generate_yuyv_to_rgba_shader`] for the
+/// single-pass YUV→RGBA int8 DMA destination path.
+pub(super) fn generate_yuyv_to_rgba_int8_shader() -> &'static str {
+    super::shaders_common::YUYV_TO_RGBA_INT8_FRAGMENT
+}
+
+/// Int8 (XOR 0x80) variant of [`generate_nv12_to_rgba_shader`].
+pub(super) fn generate_nv12_to_rgba_int8_shader() -> &'static str {
+    super::shaders_common::NV12_TO_RGBA_INT8_FRAGMENT
+}
+
 pub(super) fn generate_texture_fragment_shader() -> &'static str {
     "\
 #version 300 es

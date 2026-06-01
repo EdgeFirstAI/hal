@@ -22,8 +22,9 @@ use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
+use crate::colorimetry::{resolve_colorimetry, yuv_to_rgb_coeffs, YuvToRgbCoeffs};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, DEFAULT_COLORS};
-use edgefirst_tensor::TensorDyn;
+use edgefirst_tensor::{ColorEncoding, ColorRange, TensorDyn};
 
 /// Linux GL float (F16/F32) preprocessing paths. Declared as a child of
 /// `processor` so its `impl GLProcessorST` block can reach this module's
@@ -40,9 +41,69 @@ pub(super) use float::{classify_float_render, float_render_support, FloatRenderP
 #[allow(unused_imports)]
 pub(super) use float::dma_f16_packed_layout;
 
+/// Cached uniform locations for an in-shader YUV→RGB program (the shared
+/// `YUYV_TO_RGBA_FRAGMENT` / `NV12_TO_RGBA_FRAGMENT` shaders). Looked up once
+/// at construction; the six colorimetry coefficients are set per-convert from
+/// the resolved per-tensor colorimetry (see [`YuvToRgbCoeffs`]).
+#[derive(Clone, Copy)]
+struct YuvShaderUniforms {
+    /// `vec2 src_size` — source texture size in texels (drives the YUYV
+    /// chroma-pairing math; ignored by the NV12 shader which has none).
+    src_size: i32,
+    y_offset: i32,
+    y_scale: i32,
+    c_vr: i32,
+    c_ug: i32,
+    c_vg: i32,
+    c_ub: i32,
+}
+
+impl YuvShaderUniforms {
+    /// Look up the colorimetry + `src_size` uniform locations for `program`.
+    /// Sampler uniforms (`y_tex`/`uv_tex` or `src`) are bound to fixed texture
+    /// units separately by the caller.
+    fn locate(program: u32) -> Self {
+        unsafe {
+            Self {
+                src_size: gls::gl::GetUniformLocation(program, c"src_size".as_ptr()),
+                y_offset: gls::gl::GetUniformLocation(program, c"y_offset".as_ptr()),
+                y_scale: gls::gl::GetUniformLocation(program, c"y_scale".as_ptr()),
+                c_vr: gls::gl::GetUniformLocation(program, c"c_vr".as_ptr()),
+                c_ug: gls::gl::GetUniformLocation(program, c"c_ug".as_ptr()),
+                c_vg: gls::gl::GetUniformLocation(program, c"c_vg".as_ptr()),
+                c_ub: gls::gl::GetUniformLocation(program, c"c_ub".as_ptr()),
+            }
+        }
+    }
+
+    /// Upload the six colorimetry coefficients. The caller must have already
+    /// `glUseProgram`'d the owning program.
+    ///
+    /// # Safety
+    /// The owning program must be the currently-bound GL program.
+    unsafe fn set_coeffs(&self, coeffs: &YuvToRgbCoeffs) {
+        gls::gl::Uniform1f(self.y_offset, coeffs.y_offset);
+        gls::gl::Uniform1f(self.y_scale, coeffs.y_scale);
+        gls::gl::Uniform1f(self.c_vr, coeffs.c_vr);
+        gls::gl::Uniform1f(self.c_ug, coeffs.c_ug);
+        gls::gl::Uniform1f(self.c_vg, coeffs.c_vg);
+        gls::gl::Uniform1f(self.c_ub, coeffs.c_ub);
+    }
+}
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
+    /// `GL_TEXTURE_2D` for the luma (`R8`) / packed (`GR88`) plane of a YUV
+    /// source in the in-shader YUV→RGB path, bound to texture unit 0. Kept
+    /// distinct from `camera_eglimage_texture` because a GL texture object's
+    /// target is fixed on first use — `camera_eglimage_texture` is dedicated
+    /// to `GL_TEXTURE_EXTERNAL_OES` (non-YUV passthrough) and must not be
+    /// rebound as `GL_TEXTURE_2D`.
+    camera_luma_texture: Texture,
+    /// `GL_TEXTURE_2D` for the interleaved chroma (UV `GR88`) plane of a
+    /// semi-planar YUV source, bound to texture unit 1.
+    camera_chroma_texture: Texture,
     camera_normal_texture: Texture,
     render_texture: Texture,
     segmentation_texture: Texture,
@@ -128,6 +189,26 @@ pub struct GLProcessorST {
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
     texture_program_yuv: GlProgram,
+    /// In-shader semi-planar NV12/NV16 → RGBA program. Samples the raw Y
+    /// (`R8`, unit 0) and interleaved UV (`GR88`, unit 1) planes and applies
+    /// the YUV→RGB matrix from the per-tensor colorimetry uniforms. Replaces
+    /// the driver-converting `samplerExternalOES` path for NV12/NV16.
+    texture_program_nv12_to_rgba: GlProgram,
+    /// In-shader packed YUYV/VYUY → RGBA program (single `GR88` sampler on
+    /// unit 0) with the same colorimetry uniforms.
+    texture_program_yuyv_to_rgba: GlProgram,
+    /// Int8 (XOR 0x80) variants of the in-shader YUV→RGB programs, for the
+    /// single-pass YUV→RGBA int8 DMA destination path. Swapped in over the
+    /// non-int8 fields (same mechanism as `texture_int8_program*`) so the YUV
+    /// draw transparently picks up the biased shader.
+    texture_int8_program_nv12_to_rgba: GlProgram,
+    texture_int8_program_yuyv_to_rgba: GlProgram,
+    /// Cached uniform locations for the in-shader YUV→RGB programs. Swapped
+    /// alongside the program fields under int8.
+    yuv_uniforms_nv12: YuvShaderUniforms,
+    yuv_uniforms_yuyv: YuvShaderUniforms,
+    yuv_uniforms_nv12_int8: YuvShaderUniforms,
+    yuv_uniforms_yuyv_int8: YuvShaderUniforms,
     /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
     texture_int8_program: GlProgram,
     /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
@@ -476,6 +557,39 @@ impl GLProcessorST {
             generate_texture_fragment_shader_yuv(),
         )?;
 
+        // In-shader YUV→RGB programs (replace the driver-converting external-OES
+        // path for raw per-plane DMA-BUF imports). Both use the `v_uv`-emitting
+        // YUV vertex shader and the shared colorimetry fragment shaders.
+        let texture_program_nv12_to_rgba =
+            GlProgram::new(generate_vertex_shader_yuv(), generate_nv12_to_rgba_shader())?;
+        // Bind the Y plane sampler to unit 0 and the UV plane sampler to unit 1.
+        texture_program_nv12_to_rgba.load_uniform_1i(c"y_tex", 0)?;
+        texture_program_nv12_to_rgba.load_uniform_1i(c"uv_tex", 1)?;
+        let yuv_uniforms_nv12 = YuvShaderUniforms::locate(texture_program_nv12_to_rgba.id);
+
+        let texture_program_yuyv_to_rgba =
+            GlProgram::new(generate_vertex_shader_yuv(), generate_yuyv_to_rgba_shader())?;
+        texture_program_yuyv_to_rgba.load_uniform_1i(c"src", 0)?;
+        let yuv_uniforms_yuyv = YuvShaderUniforms::locate(texture_program_yuyv_to_rgba.id);
+
+        // Int8 (XOR 0x80) variants for the single-pass YUV→RGBA int8 path.
+        let texture_int8_program_nv12_to_rgba = GlProgram::new(
+            generate_vertex_shader_yuv(),
+            generate_nv12_to_rgba_int8_shader(),
+        )?;
+        texture_int8_program_nv12_to_rgba.load_uniform_1i(c"y_tex", 0)?;
+        texture_int8_program_nv12_to_rgba.load_uniform_1i(c"uv_tex", 1)?;
+        let yuv_uniforms_nv12_int8 =
+            YuvShaderUniforms::locate(texture_int8_program_nv12_to_rgba.id);
+
+        let texture_int8_program_yuyv_to_rgba = GlProgram::new(
+            generate_vertex_shader_yuv(),
+            generate_yuyv_to_rgba_int8_shader(),
+        )?;
+        texture_int8_program_yuyv_to_rgba.load_uniform_1i(c"src", 0)?;
+        let yuv_uniforms_yuyv_int8 =
+            YuvShaderUniforms::locate(texture_int8_program_yuyv_to_rgba.id);
+
         let texture_int8_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
         let texture_int8_program_yuv =
@@ -558,6 +672,8 @@ impl GLProcessorST {
         )?;
 
         let camera_eglimage_texture = Texture::new();
+        let camera_luma_texture = Texture::new();
+        let camera_chroma_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
         let draw_render_texture = Texture::new();
@@ -571,6 +687,14 @@ impl GLProcessorST {
             gl_context,
             texture_program,
             texture_program_yuv,
+            texture_program_nv12_to_rgba,
+            texture_program_yuyv_to_rgba,
+            texture_int8_program_nv12_to_rgba,
+            texture_int8_program_yuyv_to_rgba,
+            yuv_uniforms_nv12,
+            yuv_uniforms_yuyv,
+            yuv_uniforms_nv12_int8,
+            yuv_uniforms_yuyv_int8,
             texture_int8_program,
             texture_int8_program_yuv,
             texture_program_planar,
@@ -584,6 +708,8 @@ impl GLProcessorST {
             float_render_texture: Texture::new(),
             float_render_tex_dims: (0, 0, 0),
             camera_eglimage_texture,
+            camera_luma_texture,
+            camera_chroma_texture,
             camera_normal_texture,
             segmentation_texture,
             proto_texture,
@@ -1454,6 +1580,8 @@ impl GLProcessorST {
     /// Called when the src EGLImage cache evicts or sweeps entries.
     fn invalidate_src_textures(&mut self) {
         self.camera_eglimage_texture.invalidate_egl_binding();
+        self.camera_luma_texture.invalidate_egl_binding();
+        self.camera_chroma_texture.invalidate_egl_binding();
     }
 
     fn setup_renderbuffer_dma(
@@ -1632,13 +1760,21 @@ impl GLProcessorST {
             );
             self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else if dst_fmt.layout() == PixelLayout::Planar {
-            if self.is_vivante && src_fmt == PixelFormat::Nv12 {
-                // Two-pass workaround: NV12→RGBA intermediate → RGBA→PlanarRgb.
-                // Single-pass NV12+planar causes an unrecoverable GPU hang on
-                // Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11).
+            if src_fmt.is_yuv() {
+                // Two-pass: YUV→RGBA intermediate → RGBA→PlanarRgb. Pass 1
+                // (`convert_to`) does the in-shader YUV→RGB on raw per-plane
+                // textures, so this works for NV12/NV16/YUYV/VYUY uniformly.
+                //
+                // All YUV planar conversions take the two-pass path because the
+                // single-pass `draw_camera_texture_to_rgb_planar` only sources
+                // a `samplerExternalOES` (driver conversion), which the
+                // raw-plane import no longer provides. Vivante GC7000UL
+                // (i.MX 8M Plus, galcore 6.4.11) additionally *requires* the
+                // split for NV12 — a single-pass NV12+planar render hangs the
+                // GPU — so this also subsumes that workaround.
                 log::trace!(
                     "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass planar \
-                     (Vivante NV12 workaround: RGBA intermediate + planar_2d{}shader)",
+                     (YUV in-shader RGBA intermediate + planar_2d{}shader)",
                     if is_int8 { "_int8_" } else { "_" }
                 );
                 self.convert_nv12_to_planar_two_pass(
@@ -1675,11 +1811,7 @@ impl GLProcessorST {
             // For int8 output, swap to int8 shader programs that apply XOR 0x80
             // in the fragment shader — zero CPU readback.
             if is_int8 {
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
+                self.swap_int8_programs();
                 // Bias the letterbox clear color since glClear bypasses the shader.
                 let mut crop = crop;
                 if let Some(ref mut color) = crop.dst_color {
@@ -1688,16 +1820,40 @@ impl GLProcessorST {
                     color[2] ^= 0x80;
                 }
                 let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
+                self.swap_int8_programs();
                 result
             } else {
                 self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
             }
         }
+    }
+
+    /// Swap the int8 (XOR 0x80) shader programs in over the standard ones (and
+    /// back). Called as a matched pair around an int8 single-pass convert so
+    /// the draw paths transparently pick up the biased shaders — including the
+    /// raw-plane in-shader YUV→RGB programs and their uniform locations.
+    fn swap_int8_programs(&mut self) {
+        std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+        std::mem::swap(
+            &mut self.texture_program_yuv,
+            &mut self.texture_int8_program_yuv,
+        );
+        std::mem::swap(
+            &mut self.texture_program_nv12_to_rgba,
+            &mut self.texture_int8_program_nv12_to_rgba,
+        );
+        std::mem::swap(
+            &mut self.texture_program_yuyv_to_rgba,
+            &mut self.texture_int8_program_yuyv_to_rgba,
+        );
+        std::mem::swap(
+            &mut self.yuv_uniforms_nv12,
+            &mut self.yuv_uniforms_nv12_int8,
+        );
+        std::mem::swap(
+            &mut self.yuv_uniforms_yuyv,
+            &mut self.yuv_uniforms_yuyv_int8,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1731,11 +1887,7 @@ impl GLProcessorST {
 
         // For int8 non-planar output, swap to int8 shader programs.
         if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
 
         let start = Instant::now();
@@ -1746,11 +1898,7 @@ impl GLProcessorST {
         };
 
         if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
         render_result?;
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
@@ -2142,11 +2290,7 @@ impl GLProcessorST {
         // For int8 output, swap to int8 shader programs so the GPU applies
         // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
         if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
 
         // Bias letterbox clear color for int8 — glClear bypasses the shader.
@@ -2181,11 +2325,7 @@ impl GLProcessorST {
         );
         // Swap shaders back before checking result
         if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
         render_result?;
         log::debug!("PBO render takes {:?}", start.elapsed());
@@ -2542,11 +2682,7 @@ impl GLProcessorST {
         // For int8 non-planar output, swap to int8 shader programs.
         // Planar path handles int8 internally via its own int8 shader.
         if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
 
         let start = Instant::now();
@@ -2557,11 +2693,7 @@ impl GLProcessorST {
         };
 
         if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
         render_result?;
         log::debug!("any-to-PBO render takes {:?}", start.elapsed());
@@ -2658,11 +2790,7 @@ impl GLProcessorST {
         // For int8 output, swap to int8 shader programs so the GPU renders
         // XOR'd values — ReadnPixels then reads already-biased data.
         if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
 
         let start = Instant::now();
@@ -2678,11 +2806,7 @@ impl GLProcessorST {
         );
 
         if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.swap_int8_programs();
         }
         render_result?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
@@ -3671,6 +3795,14 @@ impl GLProcessorST {
             PixelFormat::Rgba => gls::gl::RGBA,
             PixelFormat::Grey => gls::gl::RED,
             _ => {
+                // TODO(colorimetry): the non-DMA CPU-upload path does not yet
+                // do in-shader YUV→RGB. For consistency with the DMA path it
+                // could upload Y as R8 / UV as RG88 (or packed YUYV as RG88)
+                // and dispatch the same `texture_program_{nv12,yuyv}_to_rgba`
+                // programs. Until then, YUV sources without DMA backing fall
+                // back to the CPU converter (correct, just slower) — the
+                // behaviour predates this re-architecture, so nothing
+                // regresses here.
                 return Err(Error::NotSupported(format!(
                     "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
                 )));
@@ -3802,13 +3934,29 @@ impl GLProcessorST {
     fn draw_camera_texture_eglimage(
         &mut self,
         src: &Tensor<u8>,
-        _src_fmt: PixelFormat,
+        src_fmt: PixelFormat,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
-        mut dst_roi: RegionOfInterest,
+        dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
+        // YUV sources are imported as raw per-plane `sampler2D` textures and
+        // converted in the fragment shader (see `create_image_from_dma2`). The
+        // legacy `samplerExternalOES` driver-conversion path is kept for
+        // non-YUV sources (RGBA/BGRA/Grey backgrounds, planar RGB).
+        if src_fmt.is_yuv() {
+            return self.draw_camera_yuv_in_shader(
+                src,
+                src_fmt,
+                egl_img,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+            );
+        }
+
         let luma_id = src.buffer_identity().id();
         let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
         let src_key = (luma_id, chroma_id);
@@ -3840,10 +3988,8 @@ impl GLProcessorST {
             );
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for
-            // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
-            // handled by the driver when sampling from an external texture,
-            // and greyscale EGLImages replicate luma to all channels
-            // automatically via the YUV shader.
+            // GL_TEXTURE_EXTERNAL_OES in GLES. Greyscale EGLImages replicate
+            // luma to all channels automatically via the YUV shader.
 
             if self
                 .camera_eglimage_texture
@@ -3854,88 +4000,281 @@ impl GLProcessorST {
             } else {
                 log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
             }
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
-            match flip {
-                Flip::None => {}
-                Flip::Vertical => {
-                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
-                }
-                Flip::Horizontal => {
-                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
-                }
-            }
-
-            let camera_vertices: [f32; 12] = [
-                dst_roi.left,
-                dst_roi.top,
-                0., // left top
-                dst_roi.right,
-                dst_roi.top,
-                0., // right top
-                dst_roi.right,
-                dst_roi.bottom,
-                0., // right bottom
-                dst_roi.left,
-                dst_roi.bottom,
-                0., // left bottom
-            ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
-                0,
-                (size_of::<f32>() * camera_vertices.len()) as isize,
-                camera_vertices.as_ptr() as *const c_void,
-            );
-
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-
-            let texture_vertices: [f32; 16] = [
-                src_roi.left,
-                src_roi.top,
-                src_roi.right,
-                src_roi.top,
-                src_roi.right,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.top,
-                src_roi.right,
-                src_roi.top,
-                src_roi.right,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.bottom,
-            ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
-                0,
-                (size_of::<f32>() * 8) as isize,
-                (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
-            );
-
-            let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
-                vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
-                vertices_index.as_ptr() as *const c_void,
-            );
+            self.emit_camera_quad(src_roi, dst_roi, rotation_offset, flip);
         }
         check_gl_error(function!(), line!())?;
         Ok(())
     }
 
+    /// Raw per-plane in-shader YUV→RGB draw (replaces the driver-converting
+    /// `samplerExternalOES` path for YUV sources).
+    ///
+    /// * NV12/NV16: binds the Y plane (`R8`) on unit 0 and the interleaved UV
+    ///   plane (`GR88`) on unit 1, then runs `texture_program_nv12_to_rgba`.
+    /// * YUYV/VYUY: binds the packed plane (`GR88`) on unit 0 and runs
+    ///   `texture_program_yuyv_to_rgba`.
+    ///
+    /// The six colorimetry coefficients are computed from the source tensor's
+    /// resolved colorimetry (HD/SD height heuristic fills missing axes) and
+    /// uploaded as uniforms before drawing — so the math no longer depends on
+    /// the (buggy on Vivante) EGL range hint.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_camera_yuv_in_shader(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        y_egl_img: egl::Image,
+        src_roi: RegionOfInterest,
+        dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+    ) -> Result<(), Error> {
+        let luma_id = src.buffer_identity().id();
+        let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
+        let src_key = (luma_id, chroma_id);
+
+        let src_w = src.width().ok_or(Error::NotAnImage)? as f32;
+        let src_h = src.height().ok_or(Error::NotAnImage)? as f32;
+
+        // Resolve colorimetry from the `Tensor<u8>` metadata (the processor
+        // holds a typed tensor, not a `TensorDyn`) and fold it into the
+        // shader matrix coefficients. Missing axes fall back to the HD/SD
+        // height heuristic, pure — never mutates the tensor.
+        let cm = resolve_colorimetry(src.colorimetry(), src.height());
+        let coeffs = yuv_to_rgb_coeffs(
+            cm.encoding.unwrap_or(ColorEncoding::Bt709),
+            cm.range.unwrap_or(ColorRange::Limited),
+        );
+
+        let is_semi_planar = src_fmt == PixelFormat::Nv12;
+        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        if !is_semi_planar && !is_packed {
+            // is_yuv() also covers NV16, which is not wired through the raw
+            // per-plane DMA import yet (full-height chroma). Surface a clear
+            // error so the caller can fall back rather than mis-sampling the
+            // generic single-plane import as packed YUYV.
+            return Err(Error::NotSupported(format!(
+                "GL in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV, VYUY)"
+            )));
+        }
+        let uv_egl_img = if is_semi_planar {
+            Some(self.cached_src_chroma_image(src).ok_or_else(|| {
+                Error::OpenGl(format!(
+                    "{src_fmt:?} source has no cached chroma EGLImage (import out of sync)"
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        let target = gls::gl::TEXTURE_2D;
+        unsafe {
+            let (program, uniforms) = if is_semi_planar {
+                (self.texture_program_nv12_to_rgba.id, self.yuv_uniforms_nv12)
+            } else {
+                (self.texture_program_yuyv_to_rgba.id, self.yuv_uniforms_yuyv)
+            };
+            gls::gl::UseProgram(program);
+
+            // Y plane (NV12) or the packed YUYV/VYUY plane → texture unit 0.
+            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(target, self.camera_luma_texture.id);
+            Self::set_yuv_sampler_params(target);
+            if self
+                .camera_luma_texture
+                .bind_egl_image(src_key, y_egl_img.as_ptr())
+            {
+                check_gl_error(function!(), line!())?;
+            }
+
+            // Interleaved UV plane → texture unit 1 (NV12 only).
+            if let Some(uv_img) = uv_egl_img {
+                gls::gl::ActiveTexture(gls::gl::TEXTURE1);
+                gls::gl::BindTexture(target, self.camera_chroma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                if self
+                    .camera_chroma_texture
+                    .bind_egl_image(src_key, uv_img.as_ptr())
+                {
+                    check_gl_error(function!(), line!())?;
+                }
+                // Restore unit 0 as the active unit for the draw-state calls.
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            }
+
+            // Colorimetry coefficients + (YUYV only) the source size.
+            uniforms.set_coeffs(&coeffs);
+            if uniforms.src_size != -1 {
+                gls::gl::Uniform2f(uniforms.src_size, src_w, src_h);
+            }
+
+            self.emit_camera_quad(src_roi, dst_roi, rotation_offset, flip);
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
+
+    /// Apply the standard sampler parameters for a raw YUV-plane `sampler2D`
+    /// texture: bilinear min/mag (chroma upsample + resize) and clamp-to-edge.
+    ///
+    /// # Safety
+    /// `target` must be the currently-bound texture's target on the active
+    /// texture unit.
+    unsafe fn set_yuv_sampler_params(target: gls::gl::types::GLenum) {
+        gls::gl::TexParameteri(target, gls::gl::TEXTURE_MIN_FILTER, gls::gl::LINEAR as i32);
+        gls::gl::TexParameteri(target, gls::gl::TEXTURE_MAG_FILTER, gls::gl::LINEAR as i32);
+        gls::gl::TexParameteri(
+            target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::gl::TexParameteri(
+            target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+    }
+
+    /// Upload the destination/source ROI quad (with rotation + flip) into the
+    /// shared vertex/texcoord buffers and issue the `TRIANGLE_FAN` draw.
+    ///
+    /// Shared by the external-OES and in-shader camera draw paths. Assumes the
+    /// program + textures are already bound.
+    ///
+    /// # Safety
+    /// A GL program must be current and the source texture(s) bound.
+    unsafe fn emit_camera_quad(
+        &self,
+        src_roi: RegionOfInterest,
+        mut dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+    ) {
+        gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+        gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+
+        match flip {
+            Flip::None => {}
+            Flip::Vertical => {
+                std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
+            }
+            Flip::Horizontal => {
+                std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
+            }
+        }
+
+        let camera_vertices: [f32; 12] = [
+            dst_roi.left,
+            dst_roi.top,
+            0., // left top
+            dst_roi.right,
+            dst_roi.top,
+            0., // right top
+            dst_roi.right,
+            dst_roi.bottom,
+            0., // right bottom
+            dst_roi.left,
+            dst_roi.bottom,
+            0., // left bottom
+        ];
+        gls::gl::BufferSubData(
+            gls::gl::ARRAY_BUFFER,
+            0,
+            (size_of::<f32>() * camera_vertices.len()) as isize,
+            camera_vertices.as_ptr() as *const c_void,
+        );
+
+        gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
+        gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+
+        let texture_vertices: [f32; 16] = [
+            src_roi.left,
+            src_roi.top,
+            src_roi.right,
+            src_roi.top,
+            src_roi.right,
+            src_roi.bottom,
+            src_roi.left,
+            src_roi.bottom,
+            src_roi.left,
+            src_roi.top,
+            src_roi.right,
+            src_roi.top,
+            src_roi.right,
+            src_roi.bottom,
+            src_roi.left,
+            src_roi.bottom,
+        ];
+        gls::gl::BufferSubData(
+            gls::gl::ARRAY_BUFFER,
+            0,
+            (size_of::<f32>() * 8) as isize,
+            (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
+        );
+
+        let vertices_index: [u32; 4] = [0, 1, 2, 3];
+        gls::gl::DrawElements(
+            gls::gl::TRIANGLE_FAN,
+            vertices_index.len() as i32,
+            gls::gl::UNSIGNED_INT,
+            vertices_index.as_ptr() as *const c_void,
+        );
+    }
+
+    /// Create the EGLImage(s) backing a DMA source.
+    ///
+    /// For non-YUV sources (RGBA/BGRA/Grey/PlanarRgb) this returns a single
+    /// EGLImage imported with the format's natural DRM fourcc, consumed as a
+    /// `samplerExternalOES` (driver-converting) or `sampler2D` texture
+    /// downstream — the legacy behaviour.
+    ///
+    /// For YUV sources this returns **raw per-plane** EGLImages for the
+    /// in-shader YUV→RGB path (no driver colorimetry):
+    ///   * NV12/NV16 → `(Y plane R8, Some(UV plane GR88))`.
+    ///   * YUYV/VYUY → `(packed GR88, None)`.
+    ///
+    /// The raw-plane import drops the EGL `YUV_COLOR_SPACE_HINT` /
+    /// `SAMPLE_RANGE_HINT` attributes — they are irrelevant once the shader
+    /// owns the conversion, and the Vivante GC7000 driver silently ignores the
+    /// range hint anyway (the bug this re-architecture fixes).
     fn create_image_from_dma2(
         &self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-    ) -> Result<EglImage, crate::Error> {
+    ) -> Result<(EglImage, Option<EglImage>), crate::Error> {
         let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
+        match src_fmt {
+            // NV12 only: `DmaImportAttrs::from_tensor` resolves the chroma
+            // plane (half-width, half-height) for NV12. NV16 (full-height
+            // chroma) is not wired through the DMA YUV import today and falls
+            // through to the generic branch below.
+            PixelFormat::Nv12 => {
+                let y_img = self
+                    .new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &attrs.to_egl_attribs_y_plane())?;
+                let uv_attrs = attrs.to_egl_attribs_uv_plane().ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "{src_fmt:?} source is missing its chroma plane descriptor"
+                    ))
+                })?;
+                let uv_img = self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &uv_attrs)?;
+                Ok((y_img, Some(uv_img)))
+            }
+            PixelFormat::Yuyv | PixelFormat::Vyuy => {
+                let packed = self.new_egl_image_owned(
+                    egl_ext::LINUX_DMA_BUF,
+                    &attrs.to_egl_attribs_packed_gr88(),
+                )?;
+                Ok((packed, None))
+            }
+            _ => {
+                let egl_img_attr = attrs.to_egl_attribs();
+                Ok((
+                    self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)?,
+                    None,
+                ))
+            }
+        }
     }
 
     fn new_egl_image_owned(
@@ -4005,8 +4344,9 @@ impl GLProcessorST {
         }
 
         // Create the EGL image BEFORE evicting — if creation fails, we don't
-        // want to have destroyed a valid cache entry for nothing.
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
+        // want to have destroyed a valid cache entry for nothing. YUV sources
+        // return a second EGLImage for the interleaved chroma plane.
+        let (egl_image_obj, chroma_image_obj) = self.create_image_from_dma2(img, img_fmt)?;
 
         // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
         // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
@@ -4053,12 +4393,32 @@ impl GLProcessorST {
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
+                chroma_image: chroma_image_obj,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,
             },
         );
         Ok(handle)
+    }
+
+    /// Fetch the cached interleaved-chroma (UV) EGLImage handle for a
+    /// semi-planar YUV source previously imported by
+    /// [`Self::get_or_create_egl_image`]. Returns `None` if the source is
+    /// single-plane (packed YUYV, RGBA) or no entry is cached.
+    ///
+    /// The handle aliases the cache-owned `EglImage`; it stays valid as long as
+    /// the entry lives in the cache (same contract as the luma handle returned
+    /// by `get_or_create_egl_image`).
+    fn cached_src_chroma_image(&self, img: &Tensor<u8>) -> Option<egl::Image> {
+        let luma_id = img.buffer_identity().id();
+        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
+        let id = (luma_id, chroma_id);
+        self.src_egl_cache
+            .entries
+            .get(&id)
+            .and_then(|e| e.chroma_image.as_ref())
+            .map(|c| c.egl_image)
     }
 
     /// Look up the renderbuffer ID for a cached destination EGLImage.
@@ -4192,6 +4552,7 @@ impl GLProcessorST {
             id,
             CachedEglImage {
                 egl_image: egl_image_obj,
+                chroma_image: None,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,

@@ -13,6 +13,10 @@ pub(super) enum CacheKind {
 /// A cached EGLImage with a weak reference to the source tensor's guard.
 pub(super) struct CachedEglImage {
     pub(super) egl_image: EglImage,
+    /// Second EGLImage for the interleaved chroma (UV) plane of a semi-planar
+    /// YUV source imported as raw per-plane `sampler2D` textures (NV12/NV16).
+    /// `None` for single-plane imports (RGBA, packed YUYV, the Y plane alone).
+    pub(super) chroma_image: Option<EglImage>,
     /// Weak reference to the source Tensor's BufferIdentity guard.
     pub(super) guard: std::sync::Weak<()>,
     /// Optional GL renderbuffer backed by this EGLImage (used by direct RGB path).

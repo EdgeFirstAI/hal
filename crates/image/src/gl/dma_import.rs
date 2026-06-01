@@ -230,6 +230,66 @@ impl DmaImportAttrs {
         })
     }
 
+    /// Build the EGL attribute list to import the luma plane of a YUV source
+    /// as a raw single-channel `R8` `sampler2D` texture (full resolution).
+    ///
+    /// Used by the in-shader YUV→RGB path (NV12 / NV16): the driver does **no**
+    /// colorimetry conversion — the fragment shader applies the matrix from the
+    /// per-tensor coefficients — so the EGL `YUV_COLOR_SPACE_HINT` /
+    /// `SAMPLE_RANGE_HINT` attributes are intentionally omitted here.
+    pub fn to_egl_attribs_y_plane(&self) -> Vec<Attrib> {
+        raw_plane_attribs(
+            DrmFourcc::R8,
+            self.width,
+            self.height,
+            self.plane0_pitch,
+            self.plane0_offset,
+            self.plane0_fd,
+        )
+    }
+
+    /// Build the EGL attribute list to import the interleaved chroma plane of a
+    /// semi-planar YUV source as a raw two-channel `GR88` `sampler2D` texture.
+    ///
+    /// `GR88` exposes the first interleaved byte (`U`/`Cb`) in `.r` and the
+    /// second (`V`/`Cr`) in `.g`. For NV12 the chroma plane is half resolution
+    /// in both axes; the half-width is expressed in `GR88` texels. Returns
+    /// `None` for non-semi-planar sources (e.g. packed YUYV).
+    pub fn to_egl_attribs_uv_plane(&self) -> Option<Vec<Attrib>> {
+        let p1 = self.plane1.as_ref()?;
+        // NV12 chroma plane: half the luma width/height. Each GR88 texel is
+        // two interleaved bytes (one chroma pair), so the texel width is
+        // width/2 and the pitch is the chroma plane's byte pitch.
+        let chroma_w = self.width / 2;
+        let chroma_h = self.height / 2;
+        Some(raw_plane_attribs(
+            DrmFourcc::Gr88,
+            chroma_w,
+            chroma_h,
+            p1.pitch,
+            p1.offset,
+            p1.fd,
+        ))
+    }
+
+    /// Build the EGL attribute list to import a packed YUYV/VYUY source as a
+    /// single `GR88` `sampler2D` texture at full image width.
+    ///
+    /// Each `GR88` texel is two bytes: `Y` in `.r` and the alternating chroma
+    /// byte (`U`/`V`) in `.g`. The texel width equals the image width (so the
+    /// byte width is `2 * width`, matching the packed YUYV row). No driver YUV
+    /// conversion hints — the shader does the matrix.
+    pub fn to_egl_attribs_packed_gr88(&self) -> Vec<Attrib> {
+        raw_plane_attribs(
+            DrmFourcc::Gr88,
+            self.width,
+            self.height,
+            self.plane0_pitch,
+            self.plane0_offset,
+            self.plane0_fd,
+        )
+    }
+
     /// Build the EGL attribute list for `eglCreateImage`.
     pub fn to_egl_attribs(&self) -> Vec<Attrib> {
         let mut attrs = vec![
@@ -287,6 +347,39 @@ impl DmaImportAttrs {
         attrs.push(khronos_egl::NONE as Attrib);
         attrs
     }
+}
+
+/// Build a single-plane `eglCreateImage` attribute list for a raw
+/// (non-converting) DMA-BUF import bound as a `GL_TEXTURE_2D` `sampler2D`.
+///
+/// Shared by the raw YUV-plane importers. No YUV color-space / sample-range
+/// hints are emitted — the importer treats the bytes verbatim and the
+/// fragment shader performs the YUV→RGB matrix.
+fn raw_plane_attribs(
+    drm_fourcc: DrmFourcc,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    offset: usize,
+    fd: RawFd,
+) -> Vec<Attrib> {
+    vec![
+        egl_ext::LINUX_DRM_FOURCC as Attrib,
+        drm_fourcc as Attrib,
+        khronos_egl::WIDTH as Attrib,
+        width as Attrib,
+        khronos_egl::HEIGHT as Attrib,
+        height as Attrib,
+        egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
+        pitch as Attrib,
+        egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
+        offset as Attrib,
+        egl_ext::DMA_BUF_PLANE0_FD as Attrib,
+        fd as Attrib,
+        egl::IMAGE_PRESERVED as Attrib,
+        egl::TRUE as Attrib,
+        khronos_egl::NONE as Attrib,
+    ]
 }
 
 /// Helper to extract the value for a given EGL attribute key from an attribute list.
@@ -901,6 +994,115 @@ mod tests {
             stride * height,
             width * height,
         );
+    }
+
+    // ─── Raw per-plane (in-shader YUV→RGB) attribute tests ──────────────
+    // The raw-plane importers build single-plane attr lists with R8/GR88
+    // fourccs and NO YUV color-space / sample-range hints — the shader owns
+    // the conversion. Synthetic structs, no GPU.
+
+    /// NV12 luma plane → R8 at full resolution; plane0 fd/pitch/offset; no
+    /// YUV hints; no PLANE1 attributes.
+    #[test]
+    fn test_y_plane_attribs_r8_no_yuv_hints() {
+        let attrs = nv12_attrs_with(ColorEncoding::Bt601, ColorRange::Full);
+        let egl = attrs.to_egl_attribs_y_plane();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::LINUX_DRM_FOURCC),
+            Some(DrmFourcc::R8 as Attrib),
+            "Y plane must import as R8"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::WIDTH as u32),
+            Some(1920)
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::HEIGHT as u32),
+            Some(1080)
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE0_FD),
+            Some(attrs.plane0_fd as Attrib)
+        );
+        // Raw import: NO driver YUV conversion hints, NO chroma plane.
+        assert_eq!(egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT), None);
+        assert_eq!(egl_attrib_value(&egl, egl_ext::SAMPLE_RANGE_HINT), None);
+        assert_eq!(egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE1_FD), None);
+        assert_eq!(*egl.last().unwrap(), khronos_egl::NONE as Attrib);
+    }
+
+    /// NV12 chroma plane → GR88 at half resolution; plane1 fd/pitch/offset;
+    /// no YUV hints.
+    #[test]
+    fn test_uv_plane_attribs_gr88_half_res() {
+        let attrs = nv12_attrs_with(ColorEncoding::Bt709, ColorRange::Limited);
+        let egl = attrs
+            .to_egl_attribs_uv_plane()
+            .expect("NV12 has a chroma plane");
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::LINUX_DRM_FOURCC),
+            Some(DrmFourcc::Gr88 as Attrib),
+            "UV plane must import as GR88"
+        );
+        // Half resolution in both axes for NV12.
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::WIDTH as u32),
+            Some(1920 / 2)
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::HEIGHT as u32),
+            Some(1080 / 2)
+        );
+        let p1 = attrs.plane1.as_ref().unwrap();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE0_FD),
+            Some(p1.fd as Attrib),
+            "UV import uses the chroma plane's fd as its plane0"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE0_OFFSET),
+            Some(p1.offset as Attrib)
+        );
+        assert_eq!(egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT), None);
+        assert_eq!(*egl.last().unwrap(), khronos_egl::NONE as Attrib);
+    }
+
+    /// Packed YUYV → single GR88 at full image width; no YUV hints.
+    #[test]
+    fn test_packed_gr88_attribs() {
+        let attrs = DmaImportAttrs {
+            width: 1280,
+            height: 720,
+            drm_fourcc: DrmFourcc::Yuyv,
+            plane0_fd: 7,
+            plane0_pitch: 1280 * 2,
+            plane0_offset: 0,
+            plane1: None,
+            is_yuv: true,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
+        };
+        let egl = attrs.to_egl_attribs_packed_gr88();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::LINUX_DRM_FOURCC),
+            Some(DrmFourcc::Gr88 as Attrib),
+            "packed YUYV must import as GR88 (Y in .r, chroma in .g)"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::WIDTH as u32),
+            Some(1280),
+            "GR88 texel width equals the image width (2 bytes/texel = packed row)"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, khronos_egl::HEIGHT as u32),
+            Some(720)
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE0_PITCH),
+            Some((1280 * 2) as Attrib)
+        );
+        assert_eq!(egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT), None);
+        assert_eq!(egl_attrib_value(&egl, egl_ext::DMA_BUF_PLANE1_FD), None);
     }
 
     // ─── Colorimetry-driven YUV hint tests ──────────────────────────────

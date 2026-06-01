@@ -67,6 +67,66 @@ pub(crate) fn yuv_range(r: ColorRange) -> yuv::YuvRange {
     }
 }
 
+/// YUV→RGB shader coefficients resolved from a tensor's colorimetry.
+///
+/// `y_offset` / `y_scale` normalise the luma for the sample range; the four
+/// chroma cross-terms (`c_vr`, `c_ug`, `c_vg`, `c_ub`) encode the
+/// `ColorEncoding` matrix folded with the range's chroma scaling. These feed
+/// the shared GLSL YUV→RGB fragment shaders (see `gl::shaders_common`) as
+/// `float` uniforms — identical on every GL backend (macOS ANGLE + Linux
+/// GLES); only the texture import differs by platform.
+///
+/// The coefficients derive from the BT matrix luma weights `(kr, kb)`:
+/// ```text
+///   c_vr = 2*(1-kr) * c_scale
+///   c_ub = 2*(1-kb) * c_scale
+///   c_ug = (2*(1-kb)*kb / kg) * c_scale,  kg = 1-kr-kb
+///   c_vg = (2*(1-kr)*kr / kg) * c_scale
+/// ```
+/// For limited range the luma gain is 255/219 and chroma scale 255/224; for
+/// full range both are 1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct YuvToRgbCoeffs {
+    pub y_offset: f32,
+    pub y_scale: f32,
+    pub c_vr: f32,
+    pub c_ug: f32,
+    pub c_vg: f32,
+    pub c_ub: f32,
+}
+
+/// Compute the in-shader YUV→RGB coefficients for a resolved
+/// `(ColorEncoding, ColorRange)`. Pure; platform-neutral.
+pub(crate) fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
+    // Luma weights (kr, kb) per encoding matrix.
+    let (kr, kb) = match encoding {
+        ColorEncoding::Bt601 => (0.299_f32, 0.114_f32),
+        ColorEncoding::Bt709 => (0.2126_f32, 0.0722_f32),
+        ColorEncoding::Bt2020 => (0.2627_f32, 0.0593_f32),
+        // Future encodings default to BT.709 (HD broadcast).
+        _ => (0.2126_f32, 0.0722_f32),
+    };
+    let kg = 1.0 - kr - kb;
+
+    // Range scaling. Limited: luma spans 16..235 (gain 255/219), chroma
+    // spans 16..240 (gain 255/224). Full: both unity.
+    let (y_offset, y_scale, c_scale) = match range {
+        ColorRange::Full => (0.0, 1.0, 1.0),
+        ColorRange::Limited => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
+        // Future ranges default to limited (broadcast convention).
+        _ => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
+    };
+
+    YuvToRgbCoeffs {
+        y_offset,
+        y_scale,
+        c_vr: 2.0 * (1.0 - kr) * c_scale,
+        c_ub: 2.0 * (1.0 - kb) * c_scale,
+        c_ug: (2.0 * (1.0 - kb) * kb / kg) * c_scale,
+        c_vg: (2.0 * (1.0 - kr) * kr / kg) * c_scale,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
