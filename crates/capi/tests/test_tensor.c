@@ -251,6 +251,92 @@ static void test_tensor_reshape_invalid(void) {
     TEST_PASS();
 }
 
+static void test_tensor_subview(void) {
+    TEST("tensor_subview");
+
+    // 16-byte uint8 parent; two 8-byte windows at offsets 0 and 8 partition it.
+    size_t pshape[] = {16};
+    struct hal_tensor* parent =
+        hal_tensor_new(HAL_DTYPE_U8, pshape, 1, HAL_TENSOR_MEMORY_MEM, "parent");
+    ASSERT_NOT_NULL(parent);
+
+    size_t vshape[] = {8};
+    struct hal_tensor* v0 = hal_tensor_subview(parent, 0, vshape, 1);
+    struct hal_tensor* v1 = hal_tensor_subview(parent, 8, vshape, 1);
+    ASSERT_NOT_NULL(v0);
+    ASSERT_NOT_NULL(v1);
+    ASSERT_EQ(8, hal_tensor_len(v1));
+
+    // plane_offset: v1 reports byte offset 8; v0 reports 0 (or "unset" -> 0).
+    size_t off = 12345;
+    bool has1 = hal_tensor_plane_offset(v1, &off);
+    ASSERT_TRUE(has1);
+    ASSERT_EQ(8, off);
+    off = 12345;
+    hal_tensor_plane_offset(v0, &off);
+    ASSERT_EQ(0, off);
+
+    // Write each window through its own map; they must not alias.
+    struct hal_tensor_map* m0 = hal_tensor_map_create(v0);
+    struct hal_tensor_map* m1 = hal_tensor_map_create(v1);
+    ASSERT_NOT_NULL(m0);
+    ASSERT_NOT_NULL(m1);
+    unsigned char* d0 = (unsigned char*)hal_tensor_map_data(m0);
+    unsigned char* d1 = (unsigned char*)hal_tensor_map_data(m1);
+    ASSERT_NOT_NULL(d0);
+    ASSERT_NOT_NULL(d1);
+    for (size_t i = 0; i < 8; i++) {
+        d0[i] = (unsigned char)(i + 1);    // 1..8
+        d1[i] = (unsigned char)(i + 11);   // 11..18
+    }
+    hal_tensor_map_unmap(m0);
+    hal_tensor_map_unmap(m1);
+
+    // The parent buffer is correctly partitioned (shared, zero-copy).
+    struct hal_tensor_map* mp = hal_tensor_map_create(parent);
+    ASSERT_NOT_NULL(mp);
+    const unsigned char* dp = (const unsigned char*)hal_tensor_map_data_const(mp);
+    ASSERT_NOT_NULL(dp);
+    for (size_t i = 0; i < 8; i++) {
+        ASSERT_EQ((int)(i + 1), dp[i]);
+        ASSERT_EQ((int)(i + 11), dp[i + 8]);
+    }
+    hal_tensor_map_unmap(mp);
+
+    // Error cases: misaligned offset (f32 align 4) and out-of-bounds window.
+    size_t fshape[] = {8};
+    struct hal_tensor* fparent =
+        hal_tensor_new(HAL_DTYPE_F32, fshape, 1, HAL_TENSOR_MEMORY_MEM, NULL);
+    ASSERT_NOT_NULL(fparent);
+    size_t one[] = {1};
+    errno = 0;
+    ASSERT_NULL(hal_tensor_subview(fparent, 2, one, 1)); // 2 not 4-aligned
+    ASSERT_ERRNO(EINVAL);
+    errno = 0;
+    size_t big[] = {16};
+    ASSERT_NULL(hal_tensor_subview(parent, 4, big, 1)); // 4+16 > 16 bytes
+    ASSERT_ERRNO(EINVAL);
+    // NULL tensor / NULL shape.
+    errno = 0;
+    ASSERT_NULL(hal_tensor_subview(NULL, 0, vshape, 1));
+    ASSERT_ERRNO(EINVAL);
+    errno = 0;
+    ASSERT_NULL(hal_tensor_subview(parent, 0, NULL, 1));
+    ASSERT_ERRNO(EINVAL);
+
+    // set_plane_offset round-trip.
+    hal_tensor_set_plane_offset(v0, 4);
+    off = 0;
+    ASSERT_TRUE(hal_tensor_plane_offset(v0, &off));
+    ASSERT_EQ(4, off);
+
+    hal_tensor_free(fparent);
+    hal_tensor_free(v0);
+    hal_tensor_free(v1);
+    hal_tensor_free(parent);
+    TEST_PASS();
+}
+
 // =============================================================================
 // DMA Memory Tests (Linux-specific)
 // =============================================================================
@@ -446,6 +532,7 @@ void run_tensor_tests(void) {
     // Reshape tests
     test_tensor_reshape();
     test_tensor_reshape_invalid();
+    test_tensor_subview();
 
     // DMA tests (Linux DMA-BUF + macOS IOSurface)
     test_tensor_dma_memory();

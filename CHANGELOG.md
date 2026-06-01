@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fd) and map at a byte offset, for assembling a batch into one buffer. N views
   into one parent share the buffer (no copy) and write independently;
   disjointness of simultaneously-mapped mutable windows is the caller's contract.
+  Wired through the Python bindings (`Tensor.subview()`, the `plane_offset`
+  property, `set_plane_offset()` — a view exposes the full NumPy buffer-protocol
+  surface via `map()`/`from_numpy()` like any tensor) and the C API
+  (`hal_tensor_subview`, `hal_tensor_plane_offset`, `hal_tensor_set_plane_offset`).
 - V4L2 hardware JPEG decode backend (`edgefirst-codec`, Linux, default-on
   `v4l2` feature). Capability-based probe drives any device exposing a JPEG
   decoder through the standard V4L2 mem2mem API (lead target i.MX `mxc-jpeg`),

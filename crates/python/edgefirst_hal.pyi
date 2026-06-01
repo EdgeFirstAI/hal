@@ -873,6 +873,43 @@ class Tensor:
     def reshape(self, shape: list[int]) -> None: ...
     """Reshape the tensor to the given shape. The total number of elements must remain the same."""
 
+    def subview(self, offset_bytes: int, shape: list[int]) -> Tensor:
+        """Create a zero-copy sub-region view sharing this tensor's allocation.
+
+        The view maps the window ``[offset_bytes, offset_bytes + size)`` where
+        ``size = prod(shape) * element_size``, sharing the parent buffer (``Mem``
+        heap or ``Dma`` fd) with no copy. N views into one parent can be mapped
+        and written independently — the basis for assembling a batch into one
+        buffer. ``offset_bytes`` must be aligned to the element size and the
+        window must fit the parent allocation.
+
+        The returned tensor exposes the full tensor surface (``map()`` with the
+        NumPy buffer protocol, ``from_numpy()``, ``fd``); its byte offset is
+        reported by :attr:`plane_offset`.
+
+        Args:
+            offset_bytes: Byte offset of the window into the parent allocation.
+            shape: Logical shape of the view.
+
+        Returns:
+            A new ``Tensor`` viewing the requested window.
+        """
+
+    @property
+    def plane_offset(self) -> int | None:
+        """Byte offset of this tensor's window into its backing allocation.
+
+        ``None`` for a whole-buffer tensor; the sub-region start for a view
+        created via :meth:`subview` (or after :meth:`set_plane_offset`).
+        """
+
+    def set_plane_offset(self, offset: int) -> None:
+        """Set the byte offset of this tensor's window into its backing allocation.
+
+        Validated against the allocation when the tensor is mapped. Prefer
+        :meth:`subview` for sharing one buffer across independent windows.
+        """
+
     def set_format(self, format: PixelFormat) -> None:
         """Attach pixel format metadata to this tensor.
 
