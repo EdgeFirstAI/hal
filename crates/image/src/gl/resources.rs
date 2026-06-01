@@ -113,6 +113,116 @@ impl Texture {
         }
     }
 
+    /// Upload a single image plane from CPU memory with an explicit byte row
+    /// stride, distinct internal/external formats, and a starting byte offset.
+    ///
+    /// Used by the in-shader YUV→RGB CPU-upload path: the Y plane (`R8`/`RED`),
+    /// the interleaved UV plane (`RG8`/`RG`), and the packed YUYV/VYUY plane
+    /// (`RG8`/`RG`) each need a (possibly padded) row stride and a non-`RED`
+    /// internal format, neither of which [`update_texture`](Self::update_texture)
+    /// handles. The `width`/`height` are in texels; `row_stride_bytes` is the
+    /// distance between rows in `plane` and is converted to a texel count for
+    /// `GL_UNPACK_ROW_LENGTH`. `plane[offset..]` is the first row.
+    ///
+    /// Always allocates fresh storage with `TexImage2D` (the YUV planes change
+    /// target/format/size relative to the RGB `camera_normal_texture` use of
+    /// these objects, and the source dimensions are fixed across a video
+    /// stream so the reallocation cost is paid once per geometry change).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn upload_plane_strided(
+        &mut self,
+        target: gls::gl::types::GLenum,
+        width: usize,
+        height: usize,
+        internal_format: gls::gl::types::GLenum,
+        format: gls::gl::types::GLenum,
+        texel_bytes: usize,
+        row_stride_bytes: usize,
+        plane: &[u8],
+        offset: usize,
+    ) {
+        // GL_UNPACK_ROW_LENGTH is in pixels, not bytes; padded strides must be
+        // an exact multiple of the texel size for this to be expressible.
+        let row_length_texels = if texel_bytes != 0 && row_stride_bytes.is_multiple_of(texel_bytes)
+        {
+            row_stride_bytes / texel_bytes
+        } else {
+            width
+        };
+        unsafe {
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_length_texels as i32);
+            gls::gl::TexImage2D(
+                target,
+                0,
+                internal_format as i32,
+                width as i32,
+                height as i32,
+                0,
+                format,
+                gls::gl::UNSIGNED_BYTE,
+                plane[offset..].as_ptr() as *const c_void,
+            );
+            // Restore the default so other upload paths (which assume tightly
+            // packed rows) are unaffected.
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+        }
+        self.target = target;
+        self.format = format;
+        self.width = width;
+        self.height = height;
+        // TexImage2D reallocates the texture, invalidating any EGLImage binding.
+        self.bound_egl_key = None;
+    }
+
+    /// Upload a single image plane from the currently-bound `PIXEL_UNPACK_BUFFER`
+    /// (a PBO), at byte `offset` into that buffer. The PBO equivalent of
+    /// [`upload_plane_strided`](Self::upload_plane_strided): GL reads the texel
+    /// data directly from the bound buffer (zero CPU copy) instead of a host
+    /// pointer. The caller must have bound the source PBO as
+    /// `GL_PIXEL_UNPACK_BUFFER` before calling.
+    ///
+    /// # Safety
+    /// A PBO must be bound to `GL_PIXEL_UNPACK_BUFFER` large enough to cover
+    /// `offset + height * row_stride_bytes` and the texture bound to the active
+    /// unit.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn upload_plane_strided_pbo(
+        &mut self,
+        target: gls::gl::types::GLenum,
+        width: usize,
+        height: usize,
+        internal_format: gls::gl::types::GLenum,
+        format: gls::gl::types::GLenum,
+        texel_bytes: usize,
+        row_stride_bytes: usize,
+        offset: usize,
+    ) {
+        let row_length_texels = if texel_bytes != 0 && row_stride_bytes.is_multiple_of(texel_bytes)
+        {
+            row_stride_bytes / texel_bytes
+        } else {
+            width
+        };
+        gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_length_texels as i32);
+        gls::gl::TexImage2D(
+            target,
+            0,
+            internal_format as i32,
+            width as i32,
+            height as i32,
+            0,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+            offset as *const c_void,
+        );
+        gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+        self.target = target;
+        self.format = format;
+        self.width = width;
+        self.height = height;
+        self.bound_egl_key = None;
+    }
+
     /// Bind an EGLImage to this GL_TEXTURE_2D texture if the key differs from
     /// what's already bound. Returns `true` if the bind was performed, `false`
     /// if skipped (already bound).

@@ -1442,9 +1442,18 @@ impl GLProcessorST {
                 PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Yuyv | PixelFormat::Nv12
             )
         } else {
+            // Non-DMA (CPU-upload / PBO) path. RGB/RGBA/Grey are uploaded
+            // directly; NV12/YUYV/VYUY are uploaded as raw planes and converted
+            // in-shader (`draw_src_yuv_in_shader` / `draw_src_yuv_from_pbo`).
+            // NV16 is not handled by the raw-plane shaders → CPU fallback.
             matches!(
                 fmt,
-                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey
+                PixelFormat::Rgb
+                    | PixelFormat::Rgba
+                    | PixelFormat::Grey
+                    | PixelFormat::Nv12
+                    | PixelFormat::Yuyv
+                    | PixelFormat::Vyuy
             )
         }
     }
@@ -2416,6 +2425,22 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let texture_target = gls::gl::TEXTURE_2D;
+        // YUV sources convert in-shader: the planes are uploaded from the bound
+        // PBO (UNPACK buffer) into raw `R8`/`RG8` textures and converted by the
+        // shared colorimetry shaders, mirroring `draw_src_yuv_in_shader` but
+        // sourcing bytes from the PBO instead of a CPU map (mapping a PBO on the
+        // GL thread would deadlock).
+        if src_fmt.is_yuv() {
+            return self.draw_src_yuv_from_pbo(
+                src,
+                src_fmt,
+                src_buffer_id,
+                dst,
+                rotation,
+                flip,
+                crop,
+            );
+        }
         let texture_format = match src_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
             PixelFormat::Rgba => gls::gl::RGBA,
@@ -3789,22 +3814,27 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
+        // YUV sources take the in-shader CPU-upload path: the planes are
+        // uploaded with `glTexImage2D` (no EGLImage import) and converted in
+        // the fragment shader, mirroring the DMA `draw_camera_yuv_in_shader`.
+        if src_fmt.is_yuv() {
+            return self.draw_src_yuv_in_shader(
+                src,
+                src_fmt,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+            );
+        }
         let texture_target = gls::gl::TEXTURE_2D;
         let texture_format = match src_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
             PixelFormat::Rgba => gls::gl::RGBA,
             PixelFormat::Grey => gls::gl::RED,
             _ => {
-                // TODO(colorimetry): the non-DMA CPU-upload path does not yet
-                // do in-shader YUV→RGB. For consistency with the DMA path it
-                // could upload Y as R8 / UV as RG88 (or packed YUYV as RG88)
-                // and dispatch the same `texture_program_{nv12,yuyv}_to_rgba`
-                // programs. Until then, YUV sources without DMA backing fall
-                // back to the CPU converter (correct, just slower) — the
-                // behaviour predates this re-architecture, so nothing
-                // regresses here.
                 return Err(Error::NotSupported(format!(
-                    "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
+                    "draw_src_texture does not support {src_fmt:?}",
                 )));
             }
         };
@@ -3928,6 +3958,325 @@ impl GLProcessorST {
 
             Ok(())
         }
+    }
+
+    /// In-shader YUV→RGB for the **non-DMA** (CPU-upload) path. The
+    /// CPU-mirror of [`draw_camera_yuv_in_shader`]: instead of importing the
+    /// planes as EGLImages it uploads them with `glTexImage2D`, then runs the
+    /// identical shared shaders + colorimetry uniforms.
+    ///
+    /// * NV12: Y plane → `R8`/`RED` (unit 0), interleaved UV plane → `RG8`/`RG`
+    ///   at half resolution (unit 1). The UV bytes come from the `chroma()`
+    ///   sub-tensor when multiplane, else the contiguous offset
+    ///   `plane_offset + y_stride * height` — exactly how the CPU converter
+    ///   locates them.
+    /// * YUYV/VYUY: the packed plane → `RG8`/`RG` at full width (2 bytes/texel,
+    ///   Y in `.r`, chroma in `.g`) on unit 0, with the `src_size` uniform.
+    ///
+    /// The six colorimetry coefficients are resolved from the source tensor's
+    /// metadata (HD/SD height heuristic for missing axes), identical to the DMA
+    /// path. Int8 destinations are handled transparently: the callers
+    /// (`convert_to`'s callers) swap the `_int8` programs/uniforms in over the
+    /// non-int8 fields via `swap_int8_programs`, so reading
+    /// `self.texture_program_{nv12,yuyv}_to_rgba` / `self.yuv_uniforms_*` picks
+    /// up the biased shader automatically.
+    fn draw_src_yuv_in_shader(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        src_roi: RegionOfInterest,
+        dst_roi: RegionOfInterest,
+        rotation_offset: usize,
+        flip: Flip,
+    ) -> Result<(), Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+
+        let is_semi_planar = src_fmt == PixelFormat::Nv12;
+        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        if !is_semi_planar && !is_packed {
+            // is_yuv() also covers NV16 (full-height chroma), which the
+            // raw-plane shaders do not handle — reject so the chain falls back
+            // to the CPU converter rather than mis-sampling.
+            return Err(Error::NotSupported(format!(
+                "GL non-DMA in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV, VYUY)"
+            )));
+        }
+
+        // Resolve colorimetry → matrix coefficients, identical to the DMA path.
+        let cm = resolve_colorimetry(src.colorimetry(), src.height());
+        let coeffs = yuv_to_rgb_coeffs(
+            cm.encoding.unwrap_or(ColorEncoding::Bt709),
+            cm.range.unwrap_or(ColorRange::Limited),
+        );
+
+        // Y-plane (or packed-plane) byte stride. `effective_row_stride` returns
+        // `width * sizeof(T)` for semi-planar luma and `width * channels` for
+        // packed; both are what the upload needs.
+        let y_stride = src.effective_row_stride().unwrap_or(src_w);
+        let y_offset = src.plane_offset().unwrap_or(0);
+
+        let target = gls::gl::TEXTURE_2D;
+        unsafe {
+            let (program, uniforms) = if is_semi_planar {
+                (self.texture_program_nv12_to_rgba.id, self.yuv_uniforms_nv12)
+            } else {
+                (self.texture_program_yuyv_to_rgba.id, self.yuv_uniforms_yuyv)
+            };
+            gls::gl::UseProgram(program);
+
+            if is_semi_planar {
+                // Y plane → R8 on unit 0.
+                let y_map = src.map()?;
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(target, self.camera_luma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                self.camera_luma_texture.upload_plane_strided(
+                    target,
+                    src_w,
+                    src_h,
+                    gls::gl::R8,
+                    gls::gl::RED,
+                    1,
+                    y_stride,
+                    y_map.as_slice(),
+                    y_offset,
+                );
+
+                // Interleaved UV plane → RG8 on unit 1 at half resolution.
+                let uv_w = src_w / 2;
+                let uv_h = src_h / 2;
+                gls::gl::ActiveTexture(gls::gl::TEXTURE1);
+                gls::gl::BindTexture(target, self.camera_chroma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                // Two-byte UV texels: stride in bytes is `uv_w * 2` (or the
+                // chroma sub-tensor's own stride for multiplane sources).
+                if let Some(chroma) = src.chroma() {
+                    let uv_map = chroma.map()?;
+                    let uv_stride = chroma.effective_row_stride().unwrap_or(uv_w * 2);
+                    let uv_offset = chroma.plane_offset().unwrap_or(0);
+                    self.camera_chroma_texture.upload_plane_strided(
+                        target,
+                        uv_w,
+                        uv_h,
+                        gls::gl::RG8,
+                        gls::gl::RG,
+                        2,
+                        uv_stride,
+                        uv_map.as_slice(),
+                        uv_offset,
+                    );
+                } else {
+                    // Contiguous NV12: UV follows Y at `offset + y_stride*H`.
+                    let uv_plane_offset = y_offset + y_stride * src_h;
+                    self.camera_chroma_texture.upload_plane_strided(
+                        target,
+                        uv_w,
+                        uv_h,
+                        gls::gl::RG8,
+                        gls::gl::RG,
+                        2,
+                        uv_w * 2,
+                        y_map.as_slice(),
+                        uv_plane_offset,
+                    );
+                }
+
+                // Restore unit 0 as the active unit for the draw-state calls.
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            } else {
+                // Packed YUYV/VYUY → RG8 on unit 0 (2 bytes/texel, full width).
+                let packed_map = src.map()?;
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(target, self.camera_luma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                self.camera_luma_texture.upload_plane_strided(
+                    target,
+                    src_w,
+                    src_h,
+                    gls::gl::RG8,
+                    gls::gl::RG,
+                    2,
+                    y_stride,
+                    packed_map.as_slice(),
+                    y_offset,
+                );
+            }
+
+            // Colorimetry coefficients + (YUYV only) the source size.
+            uniforms.set_coeffs(&coeffs);
+            if uniforms.src_size != -1 {
+                gls::gl::Uniform2f(uniforms.src_size, src_w as f32, src_h as f32);
+            }
+
+            self.emit_camera_quad(src_roi, dst_roi, rotation_offset, flip);
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
+
+    /// PBO-source variant of [`draw_src_yuv_in_shader`]: the planes are read
+    /// from the bound source PBO (`src_buffer_id`) via `GL_PIXEL_UNPACK_BUFFER`
+    /// at byte offsets, rather than from a CPU map (which would deadlock on the
+    /// GL thread for a PBO tensor). Same shaders, colorimetry and plane layout.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_src_yuv_from_pbo(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        src_buffer_id: u32,
+        dst: &Tensor<u8>,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<(), Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+
+        let is_semi_planar = src_fmt == PixelFormat::Nv12;
+        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        if !is_semi_planar && !is_packed {
+            return Err(Error::NotSupported(format!(
+                "GL non-DMA PBO in-shader YUV→RGB does not support {src_fmt:?} \
+                 (only NV12, YUYV, VYUY)"
+            )));
+        }
+
+        let cm = resolve_colorimetry(src.colorimetry(), src.height());
+        let coeffs = yuv_to_rgb_coeffs(
+            cm.encoding.unwrap_or(ColorEncoding::Bt709),
+            cm.range.unwrap_or(ColorRange::Limited),
+        );
+
+        let y_stride = src.effective_row_stride().unwrap_or(src_w);
+        let y_offset = src.plane_offset().unwrap_or(0);
+
+        let has_crop = crop
+            .dst_rect
+            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
+
+        let src_roi = if let Some(crop) = crop.src_rect {
+            RegionOfInterest::from_crop_clamped(&crop, src_w, src_h)
+        } else {
+            RegionOfInterest {
+                left: 0.,
+                top: 1.,
+                right: 1.,
+                bottom: 0.,
+            }
+        };
+        let cvt_screen_coord = |normalized| normalized * 2.0 - 1.0;
+        let dst_roi = if let Some(crop) = crop.dst_rect {
+            RegionOfInterest {
+                left: cvt_screen_coord(crop.left as f32 / dst_w as f32),
+                top: cvt_screen_coord((crop.top + crop.height) as f32 / dst_h as f32),
+                right: cvt_screen_coord((crop.left + crop.width) as f32 / dst_w as f32),
+                bottom: cvt_screen_coord(crop.top as f32 / dst_h as f32),
+            }
+        } else {
+            RegionOfInterest {
+                left: -1.,
+                top: 1.,
+                right: 1.,
+                bottom: -1.,
+            }
+        };
+        let rotation_offset = match rotation {
+            crate::Rotation::None => 0,
+            crate::Rotation::Clockwise90 => 1,
+            crate::Rotation::Rotate180 => 2,
+            crate::Rotation::CounterClockwise90 => 3,
+        };
+
+        let target = gls::gl::TEXTURE_2D;
+        unsafe {
+            if has_crop {
+                if let Some(dst_color) = crop.dst_color {
+                    gls::gl::ClearColor(
+                        dst_color[0] as f32 / 255.0,
+                        dst_color[1] as f32 / 255.0,
+                        dst_color[2] as f32 / 255.0,
+                        dst_color[3] as f32 / 255.0,
+                    );
+                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                }
+            }
+
+            let (program, uniforms) = if is_semi_planar {
+                (self.texture_program_nv12_to_rgba.id, self.yuv_uniforms_nv12)
+            } else {
+                (self.texture_program_yuyv_to_rgba.id, self.yuv_uniforms_yuyv)
+            };
+            gls::gl::UseProgram(program);
+
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
+            if is_semi_planar {
+                // Y plane → R8 on unit 0.
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(target, self.camera_luma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                self.camera_luma_texture.upload_plane_strided_pbo(
+                    target,
+                    src_w,
+                    src_h,
+                    gls::gl::R8,
+                    gls::gl::RED,
+                    1,
+                    y_stride,
+                    y_offset,
+                );
+
+                // Interleaved UV plane → RG8 on unit 1 (half resolution). A PBO
+                // source is single-buffer, so the UV plane always follows Y at
+                // `offset + y_stride*H` (the multiplane chroma sub-tensor is not
+                // PBO-backed).
+                let uv_w = src_w / 2;
+                let uv_h = src_h / 2;
+                let uv_plane_offset = y_offset + y_stride * src_h;
+                gls::gl::ActiveTexture(gls::gl::TEXTURE1);
+                gls::gl::BindTexture(target, self.camera_chroma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                self.camera_chroma_texture.upload_plane_strided_pbo(
+                    target,
+                    uv_w,
+                    uv_h,
+                    gls::gl::RG8,
+                    gls::gl::RG,
+                    2,
+                    uv_w * 2,
+                    uv_plane_offset,
+                );
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            } else {
+                // Packed YUYV/VYUY → RG8 on unit 0 (2 bytes/texel, full width).
+                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+                gls::gl::BindTexture(target, self.camera_luma_texture.id);
+                Self::set_yuv_sampler_params(target);
+                self.camera_luma_texture.upload_plane_strided_pbo(
+                    target,
+                    src_w,
+                    src_h,
+                    gls::gl::RG8,
+                    gls::gl::RG,
+                    2,
+                    y_stride,
+                    y_offset,
+                );
+            }
+            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+
+            uniforms.set_coeffs(&coeffs);
+            if uniforms.src_size != -1 {
+                gls::gl::Uniform2f(uniforms.src_size, src_w as f32, src_h as f32);
+            }
+
+            self.emit_camera_quad(src_roi, dst_roi, rotation_offset, flip);
+            gls::gl::Finish();
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
