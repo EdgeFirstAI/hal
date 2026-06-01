@@ -32,17 +32,25 @@ neighbours:
 ## Quick Start
 
 ```rust
-use edgefirst_image::{load_image, save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{PixelFormat, DType, TensorDyn};
+use edgefirst_image::{save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
+use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
+use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorDyn, TensorMemory};
 
-// Load an image
+// Decode an image into its native format. The codec reports the source's
+// native pixel format (JPEG -> NV12/GREY, PNG -> RGB/RGBA/GREY) and sizes,
+// then configures the destination tensor during the decode.
 let bytes = std::fs::read("input.jpg")?;
-let src = load_image(&bytes, Some(PixelFormat::Rgba), None)?;
+let info = peek_info(&bytes)?;
+let mut decoder = ImageDecoder::new();
+let mut src = Tensor::<u8>::image(info.width, info.height, info.format, Some(TensorMemory::Mem))?;
+src.load_image(&mut decoder, &bytes)?;
+let src = TensorDyn::from(src);
 
 // Create processor (auto-selects best backend)
 let mut processor = ImageProcessor::new()?;
 
-// Create destination with desired size
+// Create destination with desired size and format (the convert below
+// handles NV12 -> RGBA color conversion, resize, and letterboxing)
 let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None)?;
 
 // Convert with resize, rotation, letterboxing

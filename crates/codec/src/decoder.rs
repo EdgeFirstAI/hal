@@ -4,7 +4,7 @@
 //! [`ImageDecoder`] — reusable decoder state for zero-allocation hot loops.
 
 use crate::error::CodecError;
-use crate::options::{DecodeOptions, ImageInfo};
+use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
 use edgefirst_tensor::{Tensor, TensorDyn};
 use std::io::Read;
@@ -13,22 +13,28 @@ use std::io::Read;
 ///
 /// Create one `ImageDecoder` at program initialisation and pass it to
 /// [`ImageLoad::load_image`](crate::ImageLoad::load_image) in the hot loop.
-/// The scratch buffers grow to the high-water mark and are reused across
-/// calls — no per-frame allocations after the first few frames.
+/// The scratch buffers grow to the high-water mark and are reused across calls
+/// — no per-frame allocations after the first few frames.
+///
+/// The decoder always produces the source's native format and configures the
+/// destination tensor's dimensions + pixel format accordingly (JPEG →
+/// `Nv12`/`Grey`, PNG → `Rgb`/`Rgba`/`Grey`). It never colour-converts or
+/// rotates; use `ImageProcessor::convert()` for that.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use edgefirst_codec::{ImageDecoder, ImageLoad, DecodeOptions};
+/// use edgefirst_codec::{ImageDecoder, ImageLoad};
 /// use edgefirst_tensor::{Tensor, TensorTrait, TensorMemory, PixelFormat};
 ///
 /// let mut decoder = ImageDecoder::new();
-/// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem))
+/// // Allocate a buffer large enough for the biggest expected image.
+/// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem))
 ///     .expect("alloc");
 ///
 /// for _ in 0..100 {
 ///     let frame = std::fs::read("frame.jpg").unwrap();
-///     let _info = tensor.load_image(&mut decoder, &frame, &DecodeOptions::default());
+///     let _info = tensor.load_image(&mut decoder, &frame);
 /// }
 /// ```
 pub struct ImageDecoder {
@@ -36,10 +42,6 @@ pub struct ImageDecoder {
     pub(crate) jpeg_state: crate::jpeg::JpegDecoderState,
     /// Scratch buffer for PNG decode output.
     pub(crate) scratch: Vec<u8>,
-    /// Reusable PNG EXIF rotation scratch (used by `apply_exif_u8` for the
-    /// 90°/270° paths). Kept across decodes so EXIF-rotated PNG workloads
-    /// don't re-allocate a multi-megabyte buffer per frame.
-    pub(crate) png_rot_scratch: Vec<u8>,
     /// Buffer for `Read` → `&[u8]` conversion.
     pub(crate) input_buffer: Vec<u8>,
 }
@@ -50,38 +52,31 @@ impl ImageDecoder {
         Self {
             jpeg_state: crate::jpeg::JpegDecoderState::new(),
             scratch: Vec::new(),
-            png_rot_scratch: Vec::new(),
             input_buffer: Vec::new(),
         }
     }
 
-    /// Decode image data into a typed tensor.
+    /// Decode image data into a typed tensor, configuring its dimensions and
+    /// pixel format to the decoded native format.
     ///
-    /// Detects the image format (JPEG or PNG) from magic bytes and decodes
-    /// into `dst`. The tensor must have sufficient capacity for the decoded
-    /// image dimensions.
+    /// Detects the image format (JPEG or PNG) from magic bytes.
     ///
     /// # Errors
     ///
-    /// - [`CodecError::InsufficientCapacity`] if image dimensions exceed tensor
-    /// - [`CodecError::UnsupportedDtype`] if `T` is not a supported pixel type
+    /// - [`CodecError::InsufficientCapacity`] if the image is larger than the
+    ///   tensor's allocation
+    /// - [`CodecError::UnsupportedDtype`] if `T` is not valid for the native
+    ///   format (JPEG NV12/GREY require `u8`)
     /// - [`CodecError::InvalidData`] if the data is not a valid JPEG or PNG
     pub fn decode_into<T: ImagePixel>(
         &mut self,
         data: &[u8],
         dst: &mut Tensor<T>,
-        opts: &DecodeOptions,
     ) -> crate::Result<ImageInfo> {
         if is_jpeg(data) {
-            crate::jpeg::decode_jpeg_into(data, dst, opts, &mut self.jpeg_state)
+            crate::jpeg::decode_jpeg_into(data, dst, &mut self.jpeg_state)
         } else if is_png(data) {
-            crate::png::decode_png_into(
-                data,
-                dst,
-                opts,
-                &mut self.scratch,
-                &mut self.png_rot_scratch,
-            )
+            crate::png::decode_png_into(data, dst, &mut self.scratch)
         } else {
             Err(CodecError::InvalidData(
                 "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -90,86 +85,69 @@ impl ImageDecoder {
     }
 
     /// Decode image data into a type-erased tensor.
-    ///
-    /// Dispatches to the appropriate typed decode path based on the tensor's
-    /// [`DType`](edgefirst_tensor::DType).
     pub fn decode_into_dyn(
         &mut self,
         data: &[u8],
         dst: &mut TensorDyn,
-        opts: &DecodeOptions,
     ) -> crate::Result<ImageInfo> {
         match dst {
-            TensorDyn::U8(t) => self.decode_into(data, t, opts),
-            TensorDyn::I8(t) => self.decode_into(data, t, opts),
-            TensorDyn::U16(t) => self.decode_into(data, t, opts),
-            TensorDyn::I16(t) => self.decode_into(data, t, opts),
-            TensorDyn::F32(t) => self.decode_into(data, t, opts),
+            TensorDyn::U8(t) => self.decode_into(data, t),
+            TensorDyn::I8(t) => self.decode_into(data, t),
+            TensorDyn::U16(t) => self.decode_into(data, t),
+            TensorDyn::I16(t) => self.decode_into(data, t),
+            TensorDyn::F32(t) => self.decode_into(data, t),
             other => Err(CodecError::UnsupportedDtype(other.dtype())),
         }
     }
 
-    /// Read all bytes from a `Read` source into the internal input buffer,
-    /// then decode. The input buffer is reused across calls — no per-call
-    /// heap copy of the encoded bytes.
+    /// Read all bytes from a `Read` source into the internal input buffer, then
+    /// decode. The input buffer is reused across calls.
     pub fn decode_from_reader<T: ImagePixel, R: Read>(
         &mut self,
         mut reader: R,
         dst: &mut Tensor<T>,
-        opts: &DecodeOptions,
     ) -> crate::Result<ImageInfo> {
         self.input_buffer.clear();
         reader.read_to_end(&mut self.input_buffer)?;
-        // Split-borrow: decode_into_inner reads `input_buffer` while
-        // separately holding `&mut jpeg_state` and `&mut scratch`, which
-        // `decode_into(&mut self, &self.input_buffer)` cannot do without
-        // cloning the bytes.
         decode_into_inner(
             &mut self.jpeg_state,
             &mut self.scratch,
-            &mut self.png_rot_scratch,
             &self.input_buffer,
             dst,
-            opts,
         )
     }
 
-    /// Read all bytes from a `Read` source into the internal input buffer,
-    /// then decode into a type-erased tensor.
+    /// Read all bytes from a `Read` source, then decode into a type-erased
+    /// tensor.
     pub fn decode_from_reader_dyn<R: Read>(
         &mut self,
         mut reader: R,
         dst: &mut TensorDyn,
-        opts: &DecodeOptions,
     ) -> crate::Result<ImageInfo> {
         self.input_buffer.clear();
         reader.read_to_end(&mut self.input_buffer)?;
         decode_into_inner_dyn(
             &mut self.jpeg_state,
             &mut self.scratch,
-            &mut self.png_rot_scratch,
             &self.input_buffer,
             dst,
-            opts,
         )
     }
 }
 
-/// Internal decode entry point parameterised over disjoint `&mut` borrows
-/// so callers can read from a `&[u8]` borrowed from one field of
-/// [`ImageDecoder`] while mutably borrowing the others.
+/// Internal decode entry point parameterised over disjoint `&mut` borrows so
+/// callers can read from a `&[u8]` borrowed from one field of [`ImageDecoder`]
+/// while mutably borrowing the others.
 pub(crate) fn decode_into_inner<T: ImagePixel>(
     jpeg_state: &mut crate::jpeg::JpegDecoderState,
     scratch: &mut Vec<u8>,
-    png_rot_scratch: &mut Vec<u8>,
     data: &[u8],
     dst: &mut Tensor<T>,
-    opts: &DecodeOptions,
 ) -> crate::Result<ImageInfo> {
     if is_jpeg(data) {
-        crate::jpeg::decode_jpeg_into(data, dst, opts, jpeg_state)
+        crate::jpeg::decode_jpeg_into(data, dst, jpeg_state)
     } else if is_png(data) {
-        crate::png::decode_png_into(data, dst, opts, scratch, png_rot_scratch)
+        crate::png::decode_png_into(data, dst, scratch)
     } else {
         Err(CodecError::InvalidData(
             "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -180,17 +158,15 @@ pub(crate) fn decode_into_inner<T: ImagePixel>(
 pub(crate) fn decode_into_inner_dyn(
     jpeg_state: &mut crate::jpeg::JpegDecoderState,
     scratch: &mut Vec<u8>,
-    png_rot_scratch: &mut Vec<u8>,
     data: &[u8],
     dst: &mut TensorDyn,
-    opts: &DecodeOptions,
 ) -> crate::Result<ImageInfo> {
     match dst {
-        TensorDyn::U8(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
-        TensorDyn::I8(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
-        TensorDyn::U16(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
-        TensorDyn::I16(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
-        TensorDyn::F32(t) => decode_into_inner(jpeg_state, scratch, png_rot_scratch, data, t, opts),
+        TensorDyn::U8(t) => decode_into_inner(jpeg_state, scratch, data, t),
+        TensorDyn::I8(t) => decode_into_inner(jpeg_state, scratch, data, t),
+        TensorDyn::U16(t) => decode_into_inner(jpeg_state, scratch, data, t),
+        TensorDyn::I16(t) => decode_into_inner(jpeg_state, scratch, data, t),
+        TensorDyn::F32(t) => decode_into_inner(jpeg_state, scratch, data, t),
         other => Err(CodecError::UnsupportedDtype(other.dtype())),
     }
 }
@@ -201,34 +177,27 @@ impl Default for ImageDecoder {
     }
 }
 
-/// Parse image headers and return image dimensions/format without decoding pixels.
+/// Parse image headers and return the native dimensions, format, and EXIF
+/// orientation without decoding pixels.
 ///
-/// Detects the image format (JPEG or PNG) from magic bytes and returns an
-/// [`ImageInfo`] describing the post-decode layout. For images with an EXIF
-/// 90°/270° orientation tag and `opts.apply_exif == true`, `width` and
-/// `height` reflect the **post-rotation** dimensions — matching exactly what
-/// a subsequent [`ImageDecoder::decode_into`] call would write to the tensor.
-///
-/// This is the recommended entry point for one-shot decode flows that need
-/// to allocate a tensor sized to the image:
+/// Recommended for one-shot flows that allocate a tensor sized to the image:
 ///
 /// ```rust,no_run
-/// use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad, DecodeOptions};
-/// use edgefirst_tensor::{Tensor, TensorMemory, PixelFormat};
+/// use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
+/// use edgefirst_tensor::{Tensor, TensorMemory};
 ///
 /// let data = std::fs::read("image.jpg").unwrap();
-/// let opts = DecodeOptions::default().with_format(PixelFormat::Rgba);
-/// let info = peek_info(&data, &opts).unwrap();
+/// let info = peek_info(&data).unwrap();
 /// let mut tensor = Tensor::<u8>::image(info.width, info.height, info.format,
 ///                                       Some(TensorMemory::Mem)).unwrap();
 /// let mut decoder = ImageDecoder::new();
-/// tensor.load_image(&mut decoder, &data, &opts).unwrap();
+/// tensor.load_image(&mut decoder, &data).unwrap();
 /// ```
-pub fn peek_info(data: &[u8], opts: &DecodeOptions) -> crate::Result<ImageInfo> {
+pub fn peek_info(data: &[u8]) -> crate::Result<ImageInfo> {
     if is_jpeg(data) {
-        crate::jpeg::peek_jpeg_info(data, opts)
+        crate::jpeg::peek_jpeg_info(data)
     } else if is_png(data) {
-        crate::png::peek_png_info(data, opts)
+        crate::png::peek_png_info(data)
     } else {
         Err(CodecError::InvalidData(
             "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -271,11 +240,11 @@ mod tests {
         let mut tensor = Tensor::<u8>::image(
             100,
             100,
-            edgefirst_tensor::PixelFormat::Rgb,
+            edgefirst_tensor::PixelFormat::Nv12,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
-        let result = decoder.decode_into(b"not an image", &mut tensor, &DecodeOptions::default());
+        let result = decoder.decode_into(b"not an image", &mut tensor);
         assert!(matches!(result, Err(CodecError::InvalidData(_))));
     }
 }

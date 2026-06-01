@@ -16,7 +16,7 @@
 //! ```
 
 use edgefirst_bench::{run_bench, BenchSuite};
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMemory};
 use std::sync::LazyLock;
 
@@ -39,75 +39,32 @@ static ZIDANE_PNG: LazyLock<Vec<u8>> =
 fn bench_codec_decode(suite: &mut BenchSuite) {
     println!("\n== edgefirst-codec: decode into pre-allocated Tensor<u8> ==\n");
 
-    let opts = DecodeOptions::default()
-        .with_format(PixelFormat::Rgb)
-        .with_exif(false);
-    let opts_rgba = DecodeOptions::default()
-        .with_format(PixelFormat::Rgba)
-        .with_exif(false);
+    // Colour JPEGs decode to NV12; PNG decodes to its native RGB.
 
-    // JPEG: zidane.jpg (1280×720) → RGB
+    // JPEG: zidane.jpg (1280×720) → NV12
     {
         let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
         let mut decoder = ImageDecoder::new();
-        tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
+        tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
 
-        let r = run_bench("codec/jpeg/rgb/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
+        let r = run_bench("codec/jpeg/nv12/zidane_720p", WARMUP, ITERATIONS, || {
+            tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
             std::hint::black_box(&tensor);
         });
         r.print_summary();
         suite.record(&r);
     }
 
-    // JPEG: zidane.jpg → RGBA
+    // JPEG: giraffe.jpg (640×640) — smaller baseline image → NV12
     {
         let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+            Tensor::<u8>::image(640, 640, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
         let mut decoder = ImageDecoder::new();
-        tensor
-            .load_image(&mut decoder, &ZIDANE_JPG, &opts_rgba)
-            .unwrap();
+        tensor.load_image(&mut decoder, &GIRAFFE_JPG).unwrap();
 
-        let r = run_bench("codec/jpeg/rgba/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor
-                .load_image(&mut decoder, &ZIDANE_JPG, &opts_rgba)
-                .unwrap();
-            std::hint::black_box(&tensor);
-        });
-        r.print_summary();
-        suite.record(&r);
-    }
-
-    // JPEG: giraffe.jpg (640×640) — smaller baseline image
-    {
-        let mut tensor =
-            Tensor::<u8>::image(640, 640, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
-        let mut decoder = ImageDecoder::new();
-        tensor
-            .load_image(&mut decoder, &GIRAFFE_JPG, &opts)
-            .unwrap();
-
-        let r = run_bench("codec/jpeg/rgb/giraffe_640", WARMUP, ITERATIONS, || {
-            tensor
-                .load_image(&mut decoder, &GIRAFFE_JPG, &opts)
-                .unwrap();
-            std::hint::black_box(&tensor);
-        });
-        r.print_summary();
-        suite.record(&r);
-    }
-
-    // JPEG: f32 decode
-    {
-        let mut tensor =
-            Tensor::<f32>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
-        let mut decoder = ImageDecoder::new();
-        tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
-
-        let r = run_bench("codec/jpeg/rgb_f32/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
+        let r = run_bench("codec/jpeg/nv12/giraffe_640", WARMUP, ITERATIONS, || {
+            tensor.load_image(&mut decoder, &GIRAFFE_JPG).unwrap();
             std::hint::black_box(&tensor);
         });
         r.print_summary();
@@ -119,81 +76,32 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
         let mut tensor =
             Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
         let mut decoder = ImageDecoder::new();
-        tensor.load_image(&mut decoder, &ZIDANE_PNG, &opts).unwrap();
+        tensor.load_image(&mut decoder, &ZIDANE_PNG).unwrap();
 
         let r = run_bench("codec/png/rgb/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor.load_image(&mut decoder, &ZIDANE_PNG, &opts).unwrap();
+            tensor.load_image(&mut decoder, &ZIDANE_PNG).unwrap();
             std::hint::black_box(&tensor);
         });
         r.print_summary();
         suite.record(&r);
     }
 
-    // Strided decode: decode 1280×720 into a 1920×1080 tensor
+    // Strided decode: decode 1280×720 JPEG into a 1920×1080 NV12 tensor
     {
         let mut tensor =
-            Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+            Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
         let mut decoder = ImageDecoder::new();
-        tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
+        tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
 
         let r = run_bench(
-            "codec/jpeg/rgb/zidane_into_1080p",
+            "codec/jpeg/nv12/zidane_into_1080p",
             WARMUP,
             ITERATIONS,
             || {
-                tensor.load_image(&mut decoder, &ZIDANE_JPG, &opts).unwrap();
+                tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
                 std::hint::black_box(&tensor);
             },
         );
-        r.print_summary();
-        suite.record(&r);
-    }
-
-    // JPEG: BGRA decode
-    {
-        let opts_bgra = DecodeOptions::default()
-            .with_format(PixelFormat::Bgra)
-            .with_exif(false);
-        let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Bgra, Some(TensorMemory::Mem)).unwrap();
-        let mut decoder = ImageDecoder::new();
-        tensor
-            .load_image(&mut decoder, &ZIDANE_JPG, &opts_bgra)
-            .unwrap();
-
-        let r = run_bench("codec/jpeg/bgra/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor
-                .load_image(&mut decoder, &ZIDANE_JPG, &opts_bgra)
-                .unwrap();
-            std::hint::black_box(&tensor);
-        });
-        r.print_summary();
-        suite.record(&r);
-    }
-
-    // JPEG: NV12 decode (skip color conversion)
-    {
-        let opts_nv12 = DecodeOptions::default()
-            .with_format(PixelFormat::Nv12)
-            .with_exif(false);
-        let mut tensor = Tensor::<u8>::image(
-            1280,
-            720 * 3 / 2,
-            PixelFormat::Grey,
-            Some(TensorMemory::Mem),
-        )
-        .unwrap();
-        let mut decoder = ImageDecoder::new();
-        tensor
-            .load_image(&mut decoder, &ZIDANE_JPG, &opts_nv12)
-            .unwrap();
-
-        let r = run_bench("codec/jpeg/nv12/zidane_720p", WARMUP, ITERATIONS, || {
-            tensor
-                .load_image(&mut decoder, &ZIDANE_JPG, &opts_nv12)
-                .unwrap();
-            std::hint::black_box(&tensor);
-        });
         r.print_summary();
         suite.record(&r);
     }
@@ -283,79 +191,54 @@ fn bench_image_crate(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
-// 4. EXIF orientation overhead — measure the cost of apply_exif=true on
-//    each of the 8 spec-defined EXIF orientations. Uses fixtures generated
-//    by `scripts/generate_exif_fixtures.py` which carry identical pixel
-//    data and differ only in the EXIF/eXIf orientation tag.
+// 4. EXIF orientation fixtures — decode throughput per spec-defined EXIF
+//    orientation. The codec reports orientation but never rotates pixels, so
+//    these should be constant across all 8 variants (they share scan/IDAT
+//    content and differ only in the EXIF/eXIf orientation tag). The benchmark
+//    confirms there is no per-orientation decode cost.
 //
 //    Reported names:
-//      exif/jpeg/orient_<N>/apply_<bool>  — decode time for orientation N
-//      exif/png /orient_<N>/apply_<bool>
-//
-//    Compare:
-//      - apply_false across all 8 → should be constant (sanity check;
-//        all variants share scan/IDAT content).
-//      - apply_true on orient_1   → "decided not to rotate" cost.
-//      - apply_true on orient_3   → in-place 180° (no dim swap, no scratch).
-//      - apply_true on orient_6/8 → 90°/270° rotation with scratch alloc + copy.
-//      - apply_true on orient_5/7 → rotation + horizontal flip.
-//    The 6/8 vs 1 delta is the headline number for "how much does EXIF
-//    rotation cost on this platform".
+//      codec/exif/jpeg/orient_<N>  — NV12 decode time for orientation N
+//      codec/exif/png /orient_<N>  — RGB  decode time for orientation N
 // =============================================================================
 
 fn bench_exif_overhead(suite: &mut BenchSuite) {
-    println!("\n== edgefirst-codec: EXIF orientation overhead (JPEG + PNG) ==\n");
+    println!("\n== edgefirst-codec: EXIF orientation fixtures (JPEG + PNG) ==\n");
 
-    // Source dims are 1280×720; orientations 5/6/7/8 produce 720×1280
-    // output. Allocate at max(w,h) on both axes so a single tensor
-    // serves every variant without reallocating between bench rounds.
-    let max_dim = 1280;
     let exif_iters = ITERATIONS;
     let exif_warmup = WARMUP;
 
-    // ---- JPEG ----
-    for apply in [false, true] {
-        let opts = DecodeOptions::default()
-            .with_format(PixelFormat::Rgb)
-            .with_exif(apply);
-        for o in 1..=8u32 {
-            let name = format!("codec/exif/jpeg/orient_{o}/apply_{apply}");
-            let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.jpg"));
-            let mut tensor =
-                Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem))
-                    .unwrap();
-            let mut decoder = ImageDecoder::new();
-            // Warm scratch with one decode before timing.
-            tensor.load_image(&mut decoder, &data, &opts).unwrap();
-            let r = run_bench(&name, exif_warmup, exif_iters, || {
-                tensor.load_image(&mut decoder, &data, &opts).unwrap();
-                std::hint::black_box(&tensor);
-            });
-            r.print_summary();
-            suite.record(&r);
-        }
+    // ---- JPEG (colour → NV12, 1280×720) ----
+    for o in 1..=8u32 {
+        let name = format!("codec/exif/jpeg/orient_{o}");
+        let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.jpg"));
+        let mut tensor =
+            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut decoder = ImageDecoder::new();
+        // Warm scratch with one decode before timing.
+        tensor.load_image(&mut decoder, &data).unwrap();
+        let r = run_bench(&name, exif_warmup, exif_iters, || {
+            tensor.load_image(&mut decoder, &data).unwrap();
+            std::hint::black_box(&tensor);
+        });
+        r.print_summary();
+        suite.record(&r);
     }
 
-    // ---- PNG ----
-    for apply in [false, true] {
-        let opts = DecodeOptions::default()
-            .with_format(PixelFormat::Rgb)
-            .with_exif(apply);
-        for o in 1..=8u32 {
-            let name = format!("codec/exif/png/orient_{o}/apply_{apply}");
-            let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.png"));
-            let mut tensor =
-                Tensor::<u8>::image(max_dim, max_dim, PixelFormat::Rgb, Some(TensorMemory::Mem))
-                    .unwrap();
-            let mut decoder = ImageDecoder::new();
-            tensor.load_image(&mut decoder, &data, &opts).unwrap();
-            let r = run_bench(&name, exif_warmup, exif_iters, || {
-                tensor.load_image(&mut decoder, &data, &opts).unwrap();
-                std::hint::black_box(&tensor);
-            });
-            r.print_summary();
-            suite.record(&r);
-        }
+    // ---- PNG (native RGB, 1280×720) ----
+    for o in 1..=8u32 {
+        let name = format!("codec/exif/png/orient_{o}");
+        let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.png"));
+        let mut tensor =
+            Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+        let mut decoder = ImageDecoder::new();
+        tensor.load_image(&mut decoder, &data).unwrap();
+        let r = run_bench(&name, exif_warmup, exif_iters, || {
+            tensor.load_image(&mut decoder, &data).unwrap();
+            std::hint::black_box(&tensor);
+        });
+        r.print_summary();
+        suite.record(&r);
     }
 }
 

@@ -885,6 +885,18 @@ where
     /// must remain the same.
     fn reshape(&mut self, shape: &[usize]) -> Result<()>;
 
+    /// Bytes of the underlying allocation (>= the current logical `size()`).
+    /// Defaults to the logical size for storages without spare capacity.
+    fn capacity_bytes(&self) -> usize {
+        self.size()
+    }
+
+    /// Set the logical shape to any shape whose byte size fits the allocation
+    /// capacity, without the equal-size constraint of `reshape`.
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        self.reshape(shape)
+    }
+
     /// Map the tensor into memory and return a TensorMap for accessing the
     /// data.
     fn map(&self) -> Result<TensorMap<T>>;
@@ -1262,6 +1274,28 @@ where
         }
     }
 
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.capacity_bytes(),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.capacity_bytes(),
+            TensorStorage::Mem(t) => t.capacity_bytes(),
+            TensorStorage::Pbo(t) => t.capacity_bytes(),
+        }
+    }
+
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.set_logical_shape(shape),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.set_logical_shape(shape),
+            TensorStorage::Mem(t) => t.set_logical_shape(shape),
+            TensorStorage::Pbo(t) => t.set_logical_shape(shape),
+        }
+    }
+
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1440,32 +1474,14 @@ where
     where
         T: 'static,
     {
-        let shape = match format.layout() {
-            PixelLayout::Packed => vec![height, width, format.channels()],
-            PixelLayout::Planar => vec![format.channels(), height, width],
-            PixelLayout::SemiPlanar => {
-                // Contiguous semi-planar: luma + interleaved chroma in one allocation.
-                // NV12 (4:2:0): H lines luma + H/2 lines chroma = H * 3/2 total
-                // NV16 (4:2:2): H lines luma + H lines chroma = H * 2 total
-                let total_h = match format {
-                    PixelFormat::Nv12 => {
-                        if !height.is_multiple_of(2) {
-                            return Err(Error::InvalidArgument(format!(
-                                "NV12 requires even height, got {height}"
-                            )));
-                        }
-                        height * 3 / 2
-                    }
-                    PixelFormat::Nv16 => height * 2,
-                    _ => {
-                        return Err(Error::InvalidArgument(format!(
-                            "unknown semi-planar height multiplier for {format:?}"
-                        )))
-                    }
-                };
-                vec![total_h, width]
-            }
-        };
+        // Shape comes from the shared `PixelFormat::image_shape` helper (packed /
+        // planar / semi-planar NV12·NV16, including the NV12 even-height check).
+        // The `T: 'static` bound is required by the macOS IOSurface path below.
+        let shape = format.image_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
 
         // macOS Dma path: allocate a format-aware IOSurface (FourCC +
         // 2D dimensions) so the GL backend can bind it via
@@ -1676,6 +1692,10 @@ where
             let mut t = Self::wrap(storage);
             t.format = Some(format);
             t.row_stride = Some(row_stride_bytes);
+            // Match new()/from_fd(): a DMA tensor must attempt CUDA external-
+            // memory import so a strided DMA buffer is also zero-copy
+            // CUDA-mappable (no-op when libcudart is absent).
+            t.try_init_dma_cuda();
             Ok(t)
         }
     }
@@ -1750,6 +1770,40 @@ where
         }
         self.format = Some(format);
         Ok(())
+    }
+
+    /// Set this tensor's logical dimensions and pixel format to a decoded
+    /// image, reusing the existing allocation. The shape is derived from the
+    /// format layout; fails with `Error::InsufficientCapacity` if the
+    /// allocation cannot hold `width`×`height` in `format`, or
+    /// `Error::InvalidArgument` if the dimensions are invalid for the format.
+    pub fn configure_image(
+        &mut self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+    ) -> Result<()> {
+        let shape = format.image_shape(width, height).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "invalid dimensions {width}x{height} for format {format:?}"
+            ))
+        })?;
+        self.storage.set_logical_shape(&shape)?;
+        self.set_format(format)
+    }
+
+    /// Allocate an image tensor sized to hold up to `width`×`height` in
+    /// `format`, reusable for any smaller image via `configure_image`.
+    pub fn image_with_capacity(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        memory: Option<TensorMemory>,
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
+        Self::image(width, height, format, memory)
     }
 
     /// Pixel format (None if not an image).
@@ -1852,6 +1906,11 @@ where
             row_stride: luma.row_stride,
             plane_offset: luma.plane_offset,
             quantization: luma.quantization,
+            // A multiplane tensor spans two DMA-BUFs (luma + chroma); CUDA
+            // external-memory import is per-fd, so there is no single device
+            // pointer for the composite. Any CUDA handle the luma plane carried
+            // is intentionally dropped — consumers needing CUDA access to
+            // multiplane data must import each plane independently.
             cuda: None,
         })
     }
@@ -2558,6 +2617,31 @@ mod dtype_tests {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    #[test]
+    fn image_shape_per_layout() {
+        assert_eq!(
+            PixelFormat::Rgb.image_shape(640, 480),
+            Some(vec![480, 640, 3])
+        );
+        assert_eq!(
+            PixelFormat::Grey.image_shape(640, 480),
+            Some(vec![480, 640, 1])
+        );
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(640, 480),
+            Some(vec![720, 640])
+        );
+        assert_eq!(PixelFormat::Nv12.image_shape(640, 481), None);
+        assert_eq!(
+            PixelFormat::PlanarRgb.image_shape(640, 480),
+            Some(vec![3, 480, 640])
+        );
+        assert_eq!(
+            PixelFormat::Nv16.image_shape(640, 480),
+            Some(vec![960, 640])
+        );
+    }
 
     #[test]
     fn raw_tensor_has_no_format() {
@@ -3613,6 +3697,25 @@ mod tests {
             !is_dma_available(),
             "DMA memory allocation should NOT be available on non-Linux platforms"
         );
+    }
+
+    #[test]
+    fn configure_image_within_capacity() {
+        let mut t = Tensor::<u8>::image_with_capacity(640, 480, PixelFormat::Rgb, None).unwrap();
+        t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv12));
+        assert_eq!(t.width(), Some(320));
+        assert_eq!(t.height(), Some(240));
+        assert_eq!(t.shape(), &[360, 320]); // 240*3/2
+    }
+
+    #[test]
+    fn configure_image_too_large_errors() {
+        let mut t = Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Grey, None).unwrap();
+        let err = t
+            .configure_image(1920, 1080, PixelFormat::Nv12)
+            .unwrap_err();
+        assert!(matches!(err, Error::InsufficientCapacity { .. }));
     }
 
     /// Test that SHM memory allocation is available and usable on Unix systems.

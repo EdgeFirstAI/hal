@@ -192,6 +192,17 @@ impl TensorDyn {
         dispatch!(self, effective_row_stride)
     }
 
+    /// Set logical dimensions + format to a decoded image, reusing the
+    /// allocation. See [`Tensor::configure_image`].
+    pub fn configure_image(
+        &mut self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+    ) -> crate::Result<()> {
+        dispatch!(self, configure_image, width, height, format)
+    }
+
     /// Set the row stride in bytes for externally allocated buffers with
     /// row padding.
     ///
@@ -1096,6 +1107,14 @@ mod tests {
         t.set_plane_offset(0);
         // Zero offset is fine for CPU mapping
         assert!(t.map().is_ok());
+    }
+
+    #[test]
+    fn dyn_configure_image_nv12() {
+        let mut t = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None).unwrap();
+        t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
+        assert_eq!(t.format(), Some(PixelFormat::Nv12));
+        assert_eq!((t.width(), t.height()), (Some(320), Some(240)));
     }
 
     #[test]

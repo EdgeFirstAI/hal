@@ -13,7 +13,11 @@ categories = ["multimedia::images", "embedded"]
 documentation = "https://docs.rs/edgefirst-codec"
 
 [features]
-default = []
+# v4l2 is on by default but its deps are Linux-target-only and all backend
+# code is gated `#[cfg(all(target_os = "linux", feature = "v4l2"))]`, so off
+# Linux it compiles to nothing and pulls no extra dependencies.
+default = ["v4l2"]
+v4l2 = ["dep:nix", "dep:libc"]
 opencv = ["dep:opencv"]
 turbojpeg = ["dep:turbojpeg"]
 
@@ -26,6 +30,13 @@ opencv = { workspace = true, optional = true }
 tracing = { workspace = true }
 turbojpeg = { version = "0.5", optional = true }
 zune-png = { workspace = true }
+
+# Hardware JPEG decode (v4l2 feature). Linux-only: nix provides the ioctl
+# macros (matching crates/tensor/src/dmabuf.rs), libc the open flags / mmap.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `poll` adds to the workspace-declared nix features (fs/ioctl/mman).
+nix = { workspace = true, optional = true, features = ["poll"] }
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgefirst-bench = { workspace = true }

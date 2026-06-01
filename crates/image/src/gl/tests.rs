@@ -172,9 +172,13 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Threshold 0.97: GPU-specific smoothstep anti-aliasing at mask edges
-        // produces small differences across platforms (x86 Mesa vs Vivante).
-        compare_images(&image, &expected, 0.97, function!());
+        // Threshold 0.95 (was 0.97): GPU-specific smoothstep anti-aliasing at
+        // mask edges produces small cross-platform differences (x86 Mesa vs
+        // Vivante), and the codec now decodes the `giraffe.jpg` background to
+        // native NV12 (chroma subsampling) before the RGBA conversion, so the
+        // NV12-sourced background diverges further from the golden captured
+        // under the old direct-RGB JPEG decode.
+        compare_images(&image, &expected, 0.95, function!());
     }
 
     #[test]

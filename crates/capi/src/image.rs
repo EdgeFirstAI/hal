@@ -10,7 +10,7 @@ use crate::decoder::{HalDecoder, HalDetectBoxList, HalProtoData, HalSegmentation
 use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
 use crate::{check_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList};
-use edgefirst_codec::{CodecError, DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{CodecError, ImageDecoder, ImageLoad};
 use edgefirst_decoder::{DetectBox, Segmentation};
 #[allow(deprecated)]
 use edgefirst_image::{
@@ -124,22 +124,6 @@ impl HalPixelFormat {
             HalPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
             HalPixelFormat::Bgra => PixelFormat::Bgra,
             HalPixelFormat::Vyuy => PixelFormat::Vyuy,
-        }
-    }
-
-    fn from_raw(value: c_int) -> Option<Self> {
-        match value {
-            x if x == Self::Yuyv as c_int => Some(Self::Yuyv),
-            x if x == Self::Nv12 as c_int => Some(Self::Nv12),
-            x if x == Self::Nv16 as c_int => Some(Self::Nv16),
-            x if x == Self::Rgba as c_int => Some(Self::Rgba),
-            x if x == Self::Rgb as c_int => Some(Self::Rgb),
-            x if x == Self::Grey as c_int => Some(Self::Grey),
-            x if x == Self::PlanarRgb as c_int => Some(Self::PlanarRgb),
-            x if x == Self::PlanarRgba as c_int => Some(Self::PlanarRgba),
-            x if x == Self::Bgra as c_int => Some(Self::Bgra),
-            x if x == Self::Vyuy as c_int => Some(Self::Vyuy),
-            _ => None,
         }
     }
 
@@ -452,16 +436,33 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 /// The tensor must have sufficient capacity for the decoded image.
 /// Returns 0 on success, -1 on error (errno set).
 ///
+/// The image is decoded to its native pixel format (JPEG → NV12 for colour
+/// or GREY for greyscale; PNG → RGB/RGBA/GREY) and the tensor is configured
+/// with that format and the decoded dimensions. Use the tensor's pixel format
+/// accessor (`hal_tensor_pixel_format()`) to inspect the result, and the image
+/// processor convert API (`hal_image_processor_convert()`) if a different
+/// format such as RGB is required.
+///
+/// @note EXIF orientation is reported but never applied. The decoder writes
+/// the source's native (unrotated) pixels and dimensions; callers that need an
+/// upright image must apply the reported orientation themselves downstream
+/// (e.g. via `hal_image_processor_convert()`). `out_rotation_degrees` and
+/// `out_flip_horizontal` describe the transform the caller should apply: rotate
+/// clockwise by the given degrees (0/90/180/270), then flip horizontally if
+/// requested. Both are `0`/`false` when the image has no EXIF orientation.
+///
 /// @param tensor Pre-allocated tensor to decode into
 /// @param data Pointer to encoded image data (JPEG or PNG)
 /// @param len Length of image data in bytes
-/// @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, HAL_PIXEL_FORMAT_GREY),
-///               or -1 to use the native format from the file
 /// @param out_width If non-NULL, receives the decoded image width
 /// @param out_height If non-NULL, receives the decoded image height
+/// @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+///        rotation in degrees the caller should apply (0/90/180/270)
+/// @param out_flip_horizontal If non-NULL, receives whether the caller should
+///        also flip the image horizontally
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL tensor/data, zero length, invalid format)
+/// - EINVAL: Invalid argument (NULL tensor/data, zero length)
 /// - EBADMSG: Failed to decode image
 /// - ENOSPC: Tensor capacity insufficient for decoded image
 #[no_mangle]
@@ -469,9 +470,10 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
     tensor: *mut HalTensor,
     data: *const u8,
     len: size_t,
-    format: c_int,
     out_width: *mut size_t,
     out_height: *mut size_t,
+    out_rotation_degrees: *mut u16,
+    out_flip_horizontal: *mut bool,
 ) -> c_int {
     check_null!(tensor);
     check_null!(data);
@@ -482,18 +484,9 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
     let tensor = unsafe { &mut *tensor };
     let data_slice = unsafe { std::slice::from_raw_parts(data, len) };
 
-    let mut opts = DecodeOptions::default().with_exif(false);
-    if format != -1 {
-        let hal_fmt = match HalPixelFormat::from_raw(format) {
-            Some(fmt) => fmt,
-            None => return set_error(libc::EINVAL),
-        };
-        opts = opts.with_format(hal_fmt.to_pixel_format());
-    }
-
     let info = CODEC_DECODER.with(|cell| {
         let mut decoder = cell.borrow_mut();
-        tensor.inner.load_image(&mut decoder, data_slice, &opts)
+        tensor.inner.load_image(&mut decoder, data_slice)
     });
 
     let info = match info {
@@ -507,20 +500,32 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
     if !out_height.is_null() {
         unsafe { *out_height = info.height };
     }
+    if !out_rotation_degrees.is_null() {
+        unsafe { *out_rotation_degrees = info.rotation_degrees };
+    }
+    if !out_flip_horizontal.is_null() {
+        unsafe { *out_flip_horizontal = info.flip_horizontal };
+    }
 
     0
 }
 
 /// Decode an image file (JPEG/PNG) into a pre-allocated tensor.
 ///
+/// The image is decoded to its native pixel format and the tensor is
+/// configured accordingly; see `hal_tensor_decode_image()` for details.
+///
 /// @param tensor Pre-allocated tensor to decode into
 /// @param path Path to the image file
-/// @param format Output pixel format, or -1 for native format
 /// @param out_width If non-NULL, receives the decoded image width
 /// @param out_height If non-NULL, receives the decoded image height
+/// @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+///        rotation in degrees the caller should apply (0/90/180/270)
+/// @param out_flip_horizontal If non-NULL, receives whether the caller should
+///        also flip the image horizontally
 /// @return 0 on success, -1 on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8, invalid format)
+/// - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8)
 /// - ENOENT: File not found
 /// - EIO: Failed to read file
 /// - EBADMSG: Failed to decode image
@@ -529,9 +534,10 @@ pub unsafe extern "C" fn hal_tensor_decode_image(
 pub unsafe extern "C" fn hal_tensor_decode_image_file(
     tensor: *mut HalTensor,
     path: *const c_char,
-    format: c_int,
     out_width: *mut size_t,
     out_height: *mut size_t,
+    out_rotation_degrees: *mut u16,
+    out_flip_horizontal: *mut bool,
 ) -> c_int {
     check_null!(tensor);
     check_null!(path);
@@ -557,9 +563,10 @@ pub unsafe extern "C" fn hal_tensor_decode_image_file(
             tensor,
             data.as_ptr(),
             data.len(),
-            format,
             out_width,
             out_height,
+            out_rotation_degrees,
+            out_flip_horizontal,
         )
     }
 }

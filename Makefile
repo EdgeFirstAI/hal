@@ -256,6 +256,16 @@ test-python:
 .PHONY: test-capi
 test-capi:
 	@echo "Running C API tests..."
+	@# The capi cdylib ([lib] name = "edgefirst_hal") and the Python crate
+	@# ([package] name = "edgefirst_hal") both emit target/release/libedgefirst_hal.so
+	@# (and deps/libedgefirst_hal.so). `make test` builds the Python bindings
+	@# first, overwriting those with a pyo3 build (undefined PyModuleDef_Init
+	@# outside an interpreter). Cargo's per-crate fingerprint then treats the capi
+	@# lib as up-to-date — even if the output file is deleted — so it would not
+	@# regenerate it and the C tests would link the wrong .so. Touch the capi lib
+	@# source to invalidate the fingerprint and force a clean rebuild before
+	@# linking the C tests.
+	@touch crates/capi/src/lib.rs
 	@cargo build --release -p edgefirst-hal-capi
 	@$(MAKE) -C crates/capi/tests test
 	@echo "✓ C API tests passed"

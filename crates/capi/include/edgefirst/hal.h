@@ -1689,37 +1689,61 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
  * The tensor must have sufficient capacity for the decoded image.
  * Returns 0 on success, -1 on error (errno set).
  *
+ * The image is decoded to its native pixel format (JPEG → NV12 for colour
+ * or GREY for greyscale; PNG → RGB/RGBA/GREY) and the tensor is configured
+ * with that format and the decoded dimensions. Use the tensor's pixel format
+ * accessor (`hal_tensor_pixel_format()`) to inspect the result, and the image
+ * processor convert API (`hal_image_processor_convert()`) if a different
+ * format such as RGB is required.
+ *
+ * @note EXIF orientation is reported but never applied. The decoder writes
+ * the source's native (unrotated) pixels and dimensions; callers that need an
+ * upright image must apply the reported orientation themselves downstream
+ * (e.g. via `hal_image_processor_convert()`). `out_rotation_degrees` and
+ * `out_flip_horizontal` describe the transform the caller should apply: rotate
+ * clockwise by the given degrees (0/90/180/270), then flip horizontally if
+ * requested. Both are `0`/`false` when the image has no EXIF orientation.
+ *
  * @param tensor Pre-allocated tensor to decode into
  * @param data Pointer to encoded image data (JPEG or PNG)
  * @param len Length of image data in bytes
- * @param format Output pixel format (HAL_PIXEL_FORMAT_RGB, HAL_PIXEL_FORMAT_RGBA, HAL_PIXEL_FORMAT_GREY),
- *               or -1 to use the native format from the file
  * @param out_width If non-NULL, receives the decoded image width
  * @param out_height If non-NULL, receives the decoded image height
+ * @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+ *        rotation in degrees the caller should apply (0/90/180/270)
+ * @param out_flip_horizontal If non-NULL, receives whether the caller should
+ *        also flip the image horizontally
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL tensor/data, zero length, invalid format)
+ * - EINVAL: Invalid argument (NULL tensor/data, zero length)
  * - EBADMSG: Failed to decode image
  * - ENOSPC: Tensor capacity insufficient for decoded image
  */
 int hal_tensor_decode_image(struct hal_tensor *tensor,
                             const uint8_t *data,
                             size_t len,
-                            int format,
                             size_t *out_width,
-                            size_t *out_height);
+                            size_t *out_height,
+                            uint16_t *out_rotation_degrees,
+                            bool *out_flip_horizontal);
 
 /**
  * Decode an image file (JPEG/PNG) into a pre-allocated tensor.
  *
+ * The image is decoded to its native pixel format and the tensor is
+ * configured accordingly; see `hal_tensor_decode_image()` for details.
+ *
  * @param tensor Pre-allocated tensor to decode into
  * @param path Path to the image file
- * @param format Output pixel format, or -1 for native format
  * @param out_width If non-NULL, receives the decoded image width
  * @param out_height If non-NULL, receives the decoded image height
+ * @param out_rotation_degrees If non-NULL, receives the EXIF clockwise
+ *        rotation in degrees the caller should apply (0/90/180/270)
+ * @param out_flip_horizontal If non-NULL, receives whether the caller should
+ *        also flip the image horizontally
  * @return 0 on success, -1 on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8, invalid format)
+ * - EINVAL: Invalid argument (NULL tensor/path, invalid UTF-8)
  * - ENOENT: File not found
  * - EIO: Failed to read file
  * - EBADMSG: Failed to decode image
@@ -1727,9 +1751,10 @@ int hal_tensor_decode_image(struct hal_tensor *tensor,
  */
 int hal_tensor_decode_image_file(struct hal_tensor *tensor,
                                  const char *path,
-                                 int format,
                                  size_t *out_width,
-                                 size_t *out_height);
+                                 size_t *out_height,
+                                 uint16_t *out_rotation_degrees,
+                                 bool *out_flip_horizontal);
 
 /**
  * Save an image tensor as JPEG.

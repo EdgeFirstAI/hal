@@ -725,9 +725,15 @@ class ImageInfo:
     height: int
     """Decoded image height in pixels."""
     format: PixelFormat
-    """Pixel format of the decoded data."""
+    """Native pixel format of the decoded data."""
     row_stride: int
     """Row stride in bytes used for writing."""
+    rotation_degrees: int
+    """Clockwise rotation in degrees from EXIF orientation (0/90/180/270).
+
+    The decode itself never rotates; the reported dimensions are unrotated."""
+    flip_horizontal: bool
+    """Horizontal flip from EXIF orientation. The decode never flips."""
 
 class Tensor:
     if sys.platform == "linux":
@@ -1071,31 +1077,32 @@ class Tensor:
         ...
 
     @staticmethod
-    def peek_image_info(
-        data: bytes,
-        format: PixelFormat | None = None,
-    ) -> ImageInfo:
+    def peek_image_info(data: bytes) -> ImageInfo:
         """Parse the header of JPEG/PNG bytes without decoding pixels.
 
-        Returns image dimensions and pixel format. Use this to allocate a
-        tensor at the right size before calling ``decode_image``.
+        Returns the native image dimensions, pixel format, and EXIF
+        orientation. Use this to allocate a tensor at the right size before
+        calling ``decode_image``. The reported dimensions are unrotated.
 
         Args:
             data: Raw JPEG or PNG bytes.
-            format: Desired output pixel format (default: native).
+
+        Returns:
+            ImageInfo with native width, height, format, row_stride, and the
+            EXIF rotation_degrees / flip_horizontal.
         """
         ...
 
     @staticmethod
-    def peek_image_info_file(
-        filename: str,
-        format: PixelFormat | None = None,
-    ) -> ImageInfo:
+    def peek_image_info_file(filename: str) -> ImageInfo:
         """Parse the header of an image file without decoding pixels.
 
         Args:
             filename: Path to the image file.
-            format: Desired output pixel format (default: native).
+
+        Returns:
+            ImageInfo with native width, height, format, row_stride, and the
+            EXIF rotation_degrees / flip_horizontal.
         """
         ...
 
@@ -1110,47 +1117,47 @@ class Tensor:
         """
         ...
 
-    def decode_image(
-        self,
-        data: bytes,
-        format: PixelFormat | None = None,
-    ) -> ImageInfo:
+    def decode_image(self, data: bytes) -> ImageInfo:
         """Decode image bytes (JPEG/PNG) directly into this pre-allocated tensor.
+
+        The image is decoded in its native pixel format (JPEG -> ``Nv12`` for
+        colour / ``Grey`` for greyscale; PNG -> ``Rgb`` / ``Rgba`` / ``Grey``)
+        and the tensor's dimensions and format are configured by the decoder
+        to match. The decode never rotates or flips; if you need RGB, decode
+        then call ``ImageProcessor.convert(...)``.
 
         This is the preferred API for real-time pipelines: allocate a tensor
         once via ``ImageProcessor.create_image()``, then call ``decode_image()``
         in the main loop to avoid per-frame allocations.
 
-        The tensor must have sufficient capacity (width × height) for the
-        decoded image. Smaller images decode into the top-left region.
+        The tensor must have sufficient capacity for the decoded image; it is
+        reconfigured (dims + format) within that capacity.
 
         Args:
             data: Raw JPEG or PNG bytes.
-            format: Desired output pixel format (default: native from file).
 
         Returns:
-            ImageInfo with decoded width, height, format, and row_stride.
+            ImageInfo with native width, height, format, row_stride, and the
+            EXIF rotation_degrees / flip_horizontal.
 
         Raises:
             RuntimeError: If the tensor is too small or the dtype is unsupported.
         """
         ...
 
-    def decode_image_file(
-        self,
-        filename: str,
-        format: PixelFormat | None = None,
-    ) -> ImageInfo:
+    def decode_image_file(self, filename: str) -> ImageInfo:
         """Decode an image file (JPEG/PNG) directly into this pre-allocated tensor.
 
-        Convenience wrapper around ``decode_image()`` that reads from a file path.
+        Convenience wrapper around ``decode_image()`` that reads from a file
+        path. Decodes in the source's native pixel format and configures the
+        tensor's dimensions and format to match.
 
         Args:
             filename: Path to the image file.
-            format: Desired output pixel format (default: native from file).
 
         Returns:
-            ImageInfo with decoded width, height, format, and row_stride.
+            ImageInfo with native width, height, format, row_stride, and the
+            EXIF rotation_degrees / flip_horizontal.
 
         Raises:
             RuntimeError: If the tensor is too small or the dtype is unsupported.

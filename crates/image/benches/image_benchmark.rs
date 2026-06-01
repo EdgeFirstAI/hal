@@ -22,29 +22,58 @@ mod common;
 
 use common::{find_testdata_path, format_name, get_test_data, run_bench, BenchConfig};
 use edgefirst_bench::BenchSuite;
-use edgefirst_codec::{peek_info, DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_image::{
+    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rotation,
+};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use std::sync::LazyLock;
 
-/// One-shot helper: peek header, allocate sized to image, decode.
+/// One-shot helper: peek header, allocate sized to image, decode into the
+/// source's native format, then convert to `format` (if different) via a
+/// headless CPU-backed processor. The codec emits the native format (JPEG →
+/// NV12/GREY, PNG → RGB/RGBA/GREY) and configures the tensor during decode.
 fn load_image_bench(
     data: &[u8],
     format: Option<PixelFormat>,
     memory: Option<TensorMemory>,
 ) -> Result<TensorDyn, Box<dyn std::error::Error>> {
-    let opts = match format {
-        Some(f) => DecodeOptions::default().with_format(f),
-        None => DecodeOptions::default(),
-    };
-    let info = peek_info(data, &opts)?;
-    let mut t = Tensor::<u8>::image(info.width, info.height, info.format, memory)?;
+    let info = peek_info(data)?;
+    let native_fmt = info.format;
+    let w = info.width;
+    let h = info.height;
+
+    let mut t = Tensor::<u8>::image(w, h, native_fmt, memory)?;
     let mut decoder = ImageDecoder::new();
-    t.load_image(&mut decoder, data, &opts)?;
-    Ok(TensorDyn::from(t))
+    t.load_image(&mut decoder, data)?;
+    let native_src = TensorDyn::from(t);
+
+    match format {
+        Some(f) if f != native_fmt => {
+            let mut dst = TensorDyn::image(w, h, f, DType::U8, memory)?;
+            // `..Default::default()` is a real update on Linux (extra GL/G2D
+            // fields) but covers no remaining fields on macOS where `backend`
+            // is the only field — allow needless_update for cross-platform
+            // parity (matches sanity_check.rs and load_image_test_helper).
+            #[allow(clippy::needless_update)]
+            let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
+                backend: ComputeBackend::Cpu,
+                ..Default::default()
+            })?;
+            proc.convert(
+                &native_src,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )?;
+            Ok(dst)
+        }
+        _ => Ok(native_src),
+    }
 }
 
 const WARMUP: usize = 10;

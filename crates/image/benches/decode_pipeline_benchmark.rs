@@ -20,7 +20,7 @@ mod common;
 
 use common::{calculate_letterbox, run_bench, BenchSuite};
 
-use edgefirst_codec::{DecodeOptions, ImageDecoder, ImageLoad};
+use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
 
@@ -56,18 +56,18 @@ fn load_image_data(filename: &str) -> Vec<u8> {
 }
 
 /// Benchmark: JPEG decode into strided tensor (decode only).
+///
+/// Colour JPEGs decode to their native NV12 layout; the decoder configures
+/// the destination tensor's dims+format during the decode.
 fn bench_decode_strided(suite: &mut BenchSuite) {
-    println!("\n== Decode: JPEG → strided RGB tensor ==\n");
+    println!("\n== Decode: JPEG → strided NV12 tensor ==\n");
 
     let mut decoder = ImageDecoder::new();
-    let opts = DecodeOptions::default()
-        .with_format(PixelFormat::Rgb)
-        .with_exif(false);
 
     // Use an oversized tensor to demonstrate strided decode
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
-    let mut input = TensorDyn::image(max_w, max_h, PixelFormat::Rgb, DType::U8, None).unwrap();
+    let mut input = TensorDyn::image(max_w, max_h, PixelFormat::Nv12, DType::U8, None).unwrap();
     let stride = input.effective_row_stride().unwrap_or(0);
 
     for img in TEST_IMAGES {
@@ -76,10 +76,10 @@ fn bench_decode_strided(suite: &mut BenchSuite) {
         let throughput = (img.width * img.height * 3) as u64;
 
         // Warmup
-        input.load_image(&mut decoder, &data, &opts).unwrap();
+        input.load_image(&mut decoder, &data).unwrap();
 
         let result = run_bench(&name, WARMUP, ITERATIONS, || {
-            input.load_image(&mut decoder, &data, &opts).unwrap();
+            input.load_image(&mut decoder, &data).unwrap();
         });
         result.print_summary_with_throughput(throughput);
         suite.record(&result);
@@ -99,16 +99,15 @@ fn bench_decode_convert(
     );
 
     let mut decoder = ImageDecoder::new();
-    let opts = DecodeOptions::default()
-        .with_format(PixelFormat::Rgb)
-        .with_exif(false);
 
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
 
-    // Auto-select memory type: DMA if available, else Mem
+    // Auto-select memory type: DMA if available, else Mem. Colour JPEGs decode
+    // to native NV12; the convert step below handles the NV12 -> RGB/RGBA
+    // colour conversion as part of the realistic decode + letterbox pipeline.
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Rgb, DType::U8, None)
+        .create_image(max_w, max_h, PixelFormat::Nv12, DType::U8, None)
         .expect("Failed to create input tensor");
     let mut output = proc
         .create_image(MODEL_W, MODEL_H, output_fmt, DType::U8, None)
@@ -125,7 +124,7 @@ fn bench_decode_convert(
 
         // Warmup all paths
         for _ in 0..WARMUP {
-            input.load_image(&mut decoder, &data, &opts).unwrap();
+            input.load_image(&mut decoder, &data).unwrap();
             proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
                 .unwrap();
         }
@@ -133,11 +132,11 @@ fn bench_decode_convert(
         // Decode only
         let decode_name = format!("pipeline_decode/{}/{}", layout_name, img.name);
         let decode_result = run_bench(&decode_name, 0, ITERATIONS, || {
-            input.load_image(&mut decoder, &data, &opts).unwrap();
+            input.load_image(&mut decoder, &data).unwrap();
         });
 
         // Convert only (from last decoded image)
-        input.load_image(&mut decoder, &data, &opts).unwrap();
+        input.load_image(&mut decoder, &data).unwrap();
         let convert_name = format!("pipeline_convert/{}/{}", layout_name, img.name);
         let convert_result = run_bench(&convert_name, 0, ITERATIONS, || {
             proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
@@ -148,7 +147,7 @@ fn bench_decode_convert(
         let pipeline_name = format!("pipeline_full/{}/{}", layout_name, img.name);
         let throughput = (img.width * img.height * 3) as u64;
         let pipeline_result = run_bench(&pipeline_name, 0, ITERATIONS, || {
-            input.load_image(&mut decoder, &data, &opts).unwrap();
+            input.load_image(&mut decoder, &data).unwrap();
             proc.convert(&input, &mut output, Rotation::None, Flip::None, crop)
                 .unwrap();
         });

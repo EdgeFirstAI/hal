@@ -245,11 +245,15 @@ impl DmaImportAttrs {
         }
 
         if self.is_yuv {
+            // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
+            // "Colorimetry"): the HAL hardcodes BT.601 full-range (JFIF) for all
+            // YUV until per-source colorimetry tagging lands on the
+            // `feature/colorimetry` branch.
             attrs.extend_from_slice(&[
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
-                egl_ext::ITU_REC709 as Attrib,
+                egl_ext::ITU_REC601 as Attrib,
                 egl_ext::SAMPLE_RANGE_HINT as Attrib,
-                egl_ext::YUV_NARROW_RANGE as Attrib,
+                egl_ext::YUV_FULL_RANGE as Attrib,
             ]);
         }
 
@@ -716,14 +720,14 @@ mod tests {
             Some(0)
         );
 
-        // YUV hints present
+        // YUV hints present (interim BT.601 full-range stop-gap)
         assert_eq!(
             egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT),
-            Some(egl_ext::ITU_REC709 as Attrib)
+            Some(egl_ext::ITU_REC601 as Attrib)
         );
         assert_eq!(
             egl_attrib_value(&egl, egl_ext::SAMPLE_RANGE_HINT),
-            Some(egl_ext::YUV_NARROW_RANGE as Attrib)
+            Some(egl_ext::YUV_FULL_RANGE as Attrib)
         );
 
         // Terminated with NONE
