@@ -3400,6 +3400,37 @@ mod tests {
     }
 
     #[test]
+    fn mem_subview_inherits_format_and_row_stride() {
+        // A sub-view is a ready-to-use sub-image: it inherits the parent's
+        // pixel format and (crucially) its padded row stride, so a strided
+        // parent yields strided windows. Set a stride wider than the tight row
+        // to exercise the row_stride inheritance path specifically.
+        let mut parent =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        parent.set_row_stride_unchecked(512); // padded stride (> 100*4)
+        let view = parent.subview(4096, &[10, 10, 4]).unwrap();
+        assert_eq!(view.format(), Some(PixelFormat::Rgba), "format inherited");
+        assert_eq!(view.row_stride(), Some(512), "row_stride inherited");
+    }
+
+    #[test]
+    fn subview_rejects_unsupported_storage() {
+        // subview shares either a heap `Arc` (Mem) or a dma-buf fd (Dma); any
+        // other backing (here Shm) must be refused with InvalidOperation rather
+        // than silently mishandled.
+        if !crate::is_shm_available() {
+            eprintln!("SKIPPED: shm not available");
+            return;
+        }
+        let shm = Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).unwrap();
+        match shm.subview(0, &[4]) {
+            Err(Error::InvalidOperation(_)) => {}
+            Err(other) => panic!("expected InvalidOperation, got {other:?}"),
+            Ok(_) => panic!("subview must reject Shm storage"),
+        }
+    }
+
+    #[test]
     #[cfg(target_os = "linux")]
     fn dma_subview_matches_mem_subview() {
         // Serialize against the fd-leak tests: this test opens DMA fds (alloc +

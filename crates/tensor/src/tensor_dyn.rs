@@ -1137,6 +1137,22 @@ mod tests {
     }
 
     #[test]
+    fn dyn_subview_dispatches_every_dtype() {
+        // `TensorDyn::subview` fans out across all 11 dtype arms; exercise each
+        // so the window maps at its offset and preserves the element type.
+        // Byte offset 8 is aligned for every element type (max align is 8) and
+        // a 4-element window stays in-bounds of the 16-element parent.
+        use DType::*;
+        for dt in [U8, I8, U16, I16, U32, I32, U64, I64, F16, F32, F64] {
+            let parent = TensorDyn::new(&[16], dt, Some(TensorMemory::Mem), None).unwrap();
+            let view = parent.subview(8, &[4]).unwrap();
+            assert_eq!(view.dtype(), dt, "subview must preserve dtype {dt:?}");
+            assert_eq!(view.plane_offset(), Some(8), "{dt:?}");
+            assert_eq!(view.shape(), &[4], "{dt:?}");
+        }
+    }
+
+    #[test]
     fn map_accepts_zero_offset_tensor() {
         let mut t =
             Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();

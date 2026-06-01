@@ -381,7 +381,9 @@ where
     #[cfg(target_os = "linux")]
     pub(crate) fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         let elem = std::mem::size_of::<T>();
-        if elem > 1 && !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+        // Alignment depends on `align_of::<T>()`, not element size (a
+        // `size_of == 1`, `align_of > 1` type would otherwise skip the check).
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
             return Err(Error::InvalidOperation(format!(
                 "DmaTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
                 std::mem::align_of::<T>()
