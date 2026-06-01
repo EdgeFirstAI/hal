@@ -56,6 +56,7 @@ const EGL_TEXTURE_2D: i32 = 0x305F;
 // `gles` crate isn't directly available here, so hardcode the values
 // from the spike. These have been part of OpenGL ES since 3.0 / the
 // GL_EXT_texture_format_BGRA8888 extension.
+const GL_RED: i32 = 0x1903;
 const GL_RG: i32 = 0x8227;
 const GL_RGBA: i32 = 0x1908;
 const GL_BGRA_EXT: i32 = 0x80E1;
@@ -68,6 +69,7 @@ const GL_HALF_FLOAT: i32 = 0x140B;
 // GL_RGBA)` = RGBA16F, mapped from FourCC `'RGhA'`
 // (kCVPixelFormatType_64RGBAHalf). No R32F, R16F, or RGBA32F binding
 // is accepted by the spec — calls return `EGL_BAD_ATTRIBUTE`.
+const FOURCC_L008: u32 = u32::from_be_bytes(*b"L008"); // 1-channel 8-bit (GREY / semi-planar YUV byte plane, GL_RED)
 const FOURCC_2C08: u32 = u32::from_be_bytes(*b"2C08"); // 2-channel 8-bit (YUYV-as-GL_RG)
 const FOURCC_RGBA: u32 = u32::from_be_bytes(*b"RGBA"); // 32-bit RGBA8888
 const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA"); // 32-bit BGRA8888
@@ -192,6 +194,15 @@ impl ImageLayout {
                 })?;
                 (width, sh)
             }
+            // Semi-planar YUV bound as a single R8 plane: the surface is the
+            // combined-plane `[total_h, even_width]` shape (matches the tensor
+            // allocation in `iosurface::new_image`).
+            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
+                let shape = fmt.image_shape(width, height).ok_or_else(|| {
+                    Error::Internal(format!("{fmt:?} has no image_shape for {width}x{height}"))
+                })?;
+                (shape[1], shape[0]) // (even_width, total_h)
+            }
             _ => (width, height),
         };
         Ok(Self {
@@ -228,6 +239,7 @@ impl ImageLayout {
         // and this side owns the GL pairing. Adding a new shader requires
         // both sides to agree.
         match self.fourcc {
+            FOURCC_L008 => GL_RED,
             FOURCC_2C08 => GL_RG,
             FOURCC_RGBA => GL_RGBA,
             FOURCC_BGRA => GL_BGRA_EXT,

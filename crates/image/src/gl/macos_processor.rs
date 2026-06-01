@@ -128,6 +128,21 @@ void main() {
 }
 "#;
 
+// GREY (single-channel R8 / `L008` IOSurface) → RGBA. This is also the probe
+// that proves ANGLE's Metal IOSurface-client-buffer path accepts an
+// `L008`→`GL_RED` binding; the semi-planar YUV shaders below build on the same
+// R8 source binding. Portable GLES 3.0 (`sampler2D` over a GL_RED texture).
+const GREY_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
+precision mediump float;
+uniform sampler2D src;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    float y = texture(src, v_uv).r;
+    frag = vec4(y, y, y, 1.0);
+}
+"#;
+
 /// RGBA8 source → packed RGBA16F PlanarRgb F16 destination, one draw
 /// call. F32 destinations are intentionally not supported — see the
 /// crate-level docs and `image_iosurface_layout` for the ANGLE
@@ -399,6 +414,11 @@ pub struct MacosGlProcessor {
     program_yuyv_to_rgba: u32,
     uniform_src: i32,
     uniform_src_size: i32,
+    /// Program: GREY (R8 `L008` IOSurface) → RGBA. Shares the `src` sampler
+    /// uniform; needs no `src_size`. Also the building block that proves the
+    /// R8 IOSurface binding works on ANGLE.
+    program_grey_to_rgba: u32,
+    uniform_grey_src: i32,
     /// Program: RGBA8 source IOSurface → PlanarRgb F16 destination
     /// IOSurface — zero-copy preprocessing for ONNX+CoreML. The shader
     /// writes RGBA16F-packed half-floats; GL handles the implicit
@@ -693,10 +713,17 @@ impl MacosGlProcessor {
             let uniform_rgba8_to_planar_f16_pad_color =
                 gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"pad_color".as_ptr());
 
+            // GREY (R8) → RGBA program — also the R8-binding probe.
+            let program_grey = compile_program(VERTEX_SHADER, GREY_TO_RGBA_FRAGMENT)?;
+            let uniform_grey_src =
+                gls::gl::GetUniformLocation(program_grey, c"src".as_ptr() as *const _);
+
             Ok(Self {
                 program_yuyv_to_rgba: program,
                 uniform_src,
                 uniform_src_size,
+                program_grey_to_rgba: program_grey,
+                uniform_grey_src,
                 program_rgba8_to_planar_f16: program_rgba8_planar_f16,
                 uniform_rgba8_to_planar_f16_src,
                 uniform_rgba8_to_planar_f16_dst_size,
@@ -989,7 +1016,9 @@ impl MacosGlProcessor {
     pub fn supports(src_fmt: PixelFormat, dst_fmt: PixelFormat) -> bool {
         matches!(
             (src_fmt, dst_fmt),
-            (PixelFormat::Yuyv, PixelFormat::Rgba) | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
+            (PixelFormat::Yuyv, PixelFormat::Rgba)
+                | (PixelFormat::Grey, PixelFormat::Rgba)
+                | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
         )
     }
 
@@ -1090,13 +1119,21 @@ impl MacosGlProcessor {
                 ))));
             }
 
-            // Render.
+            // Render. Select the source-sampling program by source format.
+            // GREY samples a GL_RED (R8 `L008`) texture and needs no `src_size`
+            // (Uniform2f on location -1 is a defined no-op); YUYV samples GL_RG.
+            let (program, uniform_src) = match src_fmt {
+                PixelFormat::Grey => (self.program_grey_to_rgba, self.uniform_grey_src),
+                _ => (self.program_yuyv_to_rgba, self.uniform_src),
+            };
             gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-            gls::gl::UseProgram(self.program_yuyv_to_rgba);
+            gls::gl::UseProgram(program);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
-            gls::gl::Uniform1i(self.uniform_src, 0);
-            gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+            gls::gl::Uniform1i(uniform_src, 0);
+            if matches!(src_fmt, PixelFormat::Yuyv) {
+                gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+            }
             gls::gl::BindVertexArray(self.vao);
             gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
             gls::gl::Finish();

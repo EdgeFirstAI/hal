@@ -406,6 +406,18 @@ where
                 })?;
                 (width, sh)
             }
+            // Semi-planar YUV (NV12/NV16/NV24): bind the whole contiguous
+            // combined-plane buffer as one R8 texture. The surface is the
+            // `[total_h, even_width]` shape laid out 2D — the YUV→RGB shader
+            // addresses the Y and interleaved-UV regions within it.
+            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
+                let shape = format.image_shape(width, height).ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "{format:?} has no image_shape for {width}x{height}"
+                    ))
+                })?;
+                (shape[1], shape[0]) // (even_width, total_h)
+            }
             _ => (width, height),
         };
 
@@ -834,6 +846,16 @@ fn image_fourcc_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize
         // wrong for the Rgba contract.
         (PixelFormat::Rgba, DType::U8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         (PixelFormat::Bgra, DType::U8) => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        // Single-channel 8-bit (`L008` = kCVPixelFormatType_OneComponent8),
+        // sampled as `GL_RED`. Used for GREY images and as the raw byte plane
+        // for the semi-planar YUV formats (NV12/NV16/NV24): the GPU binds the
+        // whole contiguous `[total_h, W]` buffer as one R8 texture and the
+        // YUV→RGB shader computes the luma/chroma texel positions itself
+        // (portable across ANGLE/Metal, Mali/EGL, and embedded GLES).
+        (
+            PixelFormat::Grey | PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24,
+            DType::U8,
+        ) => Some((u32::from_be_bytes(*b"L008"), 1)),
         // ── F16 IOSurface for zero-copy preprocessing (CoreML / ANE) ──
         // The only ANGLE-supported float (type, internal_format) pair
         // is `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F, FourCC 'RGhA'

@@ -4911,6 +4911,72 @@ mod image_tests {
     /// IOSurface backend end-to-end and compares against the same
     /// reference image. Skips silently if ANGLE isn't installed so the
     /// test suite still passes on CI hosts without the Homebrew tap.
+    /// Step-1 probe: proves ANGLE's Metal IOSurface-client-buffer path accepts
+    /// an `L008`→`GL_RED` (R8) binding — the foundation for sampling the
+    /// contiguous semi-planar YUV buffer as a single R8 texture. Renders a
+    /// GREY (R8 IOSurface) source through the GL backend to RGBA and checks the
+    /// luma round-trips to R=G=B (identity GREY→RGB).
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_grey_r8_iosurface_to_rgba_opengl_macos() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                return;
+            }
+        };
+
+        let (w, h) = (16usize, 16usize);
+        let src = TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma))
+            .expect("GREY IOSurface (R8/L008) should allocate — proves the FourCC mapping");
+        // Known luma ramp: value = (x * 13 + y * 7) & 0xff.
+        {
+            let su8 = src.as_u8().unwrap();
+            let stride = src.as_u8().unwrap().effective_row_stride().unwrap();
+            let mut m = su8.map().unwrap();
+            let buf = m.as_mut_slice();
+            for y in 0..h {
+                for x in 0..w {
+                    buf[y * stride + x] = ((x * 13 + y * 7) & 0xff) as u8;
+                }
+            }
+        }
+
+        let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+            .unwrap();
+        let (result, src_back, dst) = convert_img(
+            &mut proc,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        result.expect("GREY(R8 IOSurface) → RGBA must convert on ANGLE (R8 binding works)");
+
+        let src_stride = src_back.as_u8().unwrap().effective_row_stride().unwrap();
+        let src_map = src_back.as_u8().unwrap().map().unwrap();
+        let sbytes = src_map.as_slice();
+        let dst_stride = dst.as_u8().unwrap().effective_row_stride().unwrap();
+        let dst_map = dst.as_u8().unwrap().map().unwrap();
+        let dbytes = dst_map.as_slice();
+        for y in 0..h {
+            for x in 0..w {
+                let yv = sbytes[y * src_stride + x] as i16;
+                let p = y * dst_stride + x * 4;
+                for c in 0..3 {
+                    assert!(
+                        (dbytes[p + c] as i16 - yv).abs() <= 2,
+                        "pixel ({x},{y}) ch{c} = {} expected ~{yv} (GREY→RGB identity)",
+                        dbytes[p + c]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
