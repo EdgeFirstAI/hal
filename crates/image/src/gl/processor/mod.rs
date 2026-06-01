@@ -1443,8 +1443,11 @@ impl GLProcessorST {
             )
         } else {
             // Non-DMA (CPU-upload / PBO) path. RGB/RGBA/Grey are uploaded
-            // directly; NV12/YUYV/VYUY are uploaded as raw planes and converted
+            // directly; NV12/YUYV are uploaded as raw planes and converted
             // in-shader (`draw_src_yuv_in_shader` / `draw_src_yuv_from_pbo`).
+            // VYUY excluded: its `[V, Y0, U, Y1]` byte order differs from YUYV
+            // `[Y0, U, Y1, V]`, so a GR88 upload would feed the YUYV shader
+            // chroma-as-luma — decline so G2D/CPU (byte-order-aware) handle it.
             // NV16 is not handled by the raw-plane shaders → CPU fallback.
             matches!(
                 fmt,
@@ -1453,7 +1456,6 @@ impl GLProcessorST {
                     | PixelFormat::Grey
                     | PixelFormat::Nv12
                     | PixelFormat::Yuyv
-                    | PixelFormat::Vyuy
             )
         }
     }
@@ -3993,13 +3995,13 @@ impl GLProcessorST {
         let src_h = src.height().ok_or(Error::NotAnImage)?;
 
         let is_semi_planar = src_fmt == PixelFormat::Nv12;
-        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        let is_packed = src_fmt == PixelFormat::Yuyv;
         if !is_semi_planar && !is_packed {
             // is_yuv() also covers NV16 (full-height chroma), which the
             // raw-plane shaders do not handle — reject so the chain falls back
             // to the CPU converter rather than mis-sampling.
             return Err(Error::NotSupported(format!(
-                "GL non-DMA in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV, VYUY)"
+                "GL non-DMA in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV)"
             )));
         }
 
@@ -4136,11 +4138,11 @@ impl GLProcessorST {
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
         let is_semi_planar = src_fmt == PixelFormat::Nv12;
-        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        let is_packed = src_fmt == PixelFormat::Yuyv;
         if !is_semi_planar && !is_packed {
             return Err(Error::NotSupported(format!(
                 "GL non-DMA PBO in-shader YUV→RGB does not support {src_fmt:?} \
-                 (only NV12, YUYV, VYUY)"
+                 (only NV12, YUYV)"
             )));
         }
 
@@ -4397,14 +4399,14 @@ impl GLProcessorST {
         );
 
         let is_semi_planar = src_fmt == PixelFormat::Nv12;
-        let is_packed = matches!(src_fmt, PixelFormat::Yuyv | PixelFormat::Vyuy);
+        let is_packed = src_fmt == PixelFormat::Yuyv;
         if !is_semi_planar && !is_packed {
             // is_yuv() also covers NV16, which is not wired through the raw
             // per-plane DMA import yet (full-height chroma). Surface a clear
             // error so the caller can fall back rather than mis-sampling the
             // generic single-plane import as packed YUYV.
             return Err(Error::NotSupported(format!(
-                "GL in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV, VYUY)"
+                "GL in-shader YUV→RGB does not support {src_fmt:?} (only NV12, YUYV)"
             )));
         }
         let uv_egl_img = if is_semi_planar {
@@ -4609,7 +4611,7 @@ impl GLProcessorST {
                 let uv_img = self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &uv_attrs)?;
                 Ok((y_img, Some(uv_img)))
             }
-            PixelFormat::Yuyv | PixelFormat::Vyuy => {
+            PixelFormat::Yuyv => {
                 let packed = self.new_egl_image_owned(
                     egl_ext::LINUX_DMA_BUF,
                     &attrs.to_egl_attribs_packed_gr88(),

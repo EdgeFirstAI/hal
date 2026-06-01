@@ -848,7 +848,7 @@ independent properties, and a mismatch on any of them corrupts the result:
    tinting saturated colours (greens↔magentas) while greys stay correct.
 2. **Range / quantization** — **full** (a.k.a. JFIF / "PC" / extended, luma
    0–255) vs **limited** (a.k.a. studio / "video", luma 16–235). A wrong range
-   crushes blacks and clips/!washes highlights and shifts overall contrast.
+   crushes blacks and clips/washes highlights and shifts overall contrast.
 3. **Transfer function / primaries** — gamma and gamut. These matter for display
    and tone-mapping but are *not* used by the YCbCr→RGB matrix itself, so the HAL
    can ignore them for conversion (they would matter for an HDR pipeline).
@@ -894,8 +894,11 @@ tensor layer — that invariant is strict.
 Helper constructors:
 - `Colorimetry::jfif()` — sRGB primaries + sRGB transfer + BT.601 encoding +
   full range (standard JPEG/JFIF).
-- `Colorimetry::from_v4l2(colorspace, ycbcr_enc, quantization)` — converts V4L2
-  kernel constants to the HAL's decoupled enum values.
+- `Colorimetry::from_v4l2(colorspace, xfer, ycbcr_enc, quantization)` — converts
+  the four V4L2 kernel constants to the HAL's decoupled enum values. A V4L2
+  `DEFAULT` (0) `ycbcr_enc`/`quantization` is resolved from the colorspace
+  (e.g. `V4L2_COLORSPACE_JPEG` → BT.601 full-range), matching the kernel's
+  `V4L2_MAP_*_DEFAULT` rules, rather than being left undefined.
 
 #### Producers
 
@@ -927,7 +930,7 @@ single call and discarded.
 | Backend | Matrix | Range | Notes |
 |---------|--------|-------|-------|
 | CPU (`cpu/convert.rs`) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — passes resolved matrix + range to the `yuv` crate |
-| GL (`gl/dma_import.rs` / macOS shader) | BT.601 / BT.709 | Full / Limited | Fully correct — selects `ITU_REC601`/`ITU_REC709` + `YUV_FULL_RANGE`/`YUV_NARROW_RANGE` EGL hints per buffer |
+| GL (shared shaders, Linux + macOS) | BT.601 / BT.709 / BT.2020 | Full / Limited | Fully correct — YUV→RGB is computed **in the fragment shader** from per-tensor colorimetry uniforms (`yuv_to_rgb_coeffs`), with YUV planes imported as raw `sampler2D` textures (NV12 Y=R8 + UV=GR88; YUYV packed=GR88). This supersedes the earlier EGL `YUV_COLOR_SPACE_HINT`/`SAMPLE_RANGE_HINT` approach, which the Vivante GC7000 driver silently ignores (sampling limited-range regardless). VYUY is not handled in-shader (byte order differs from YUYV) and falls back to G2D/CPU. |
 | G2D (`g2d.rs`) | BT.601 / BT.709 | — | **Limitation:** `g2d-sys` exposes only `set_bt601_colorspace()` / `set_bt709_colorspace()` (matrix only). Full-range and BT.2020 YUV cannot be expressed. G2D **declines** full-range or BT.2020 YUV conversions; the dispatch falls through to GL or CPU. |
 
 #### C and Python surfaces

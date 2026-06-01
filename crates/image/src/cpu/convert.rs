@@ -12,21 +12,25 @@ use super::{CPUProcessor, ColorParams};
 
 #[inline(always)]
 pub(super) fn limit_to_full(l: u8) -> u8 {
-    // Expand limited-range luma (16..=240) to full-range (0..=255). Real
-    // decoded YUV (e.g. JPEG → NV12) can carry luma below 16 or above 240, so
-    // clamp into the valid limited range first to avoid u16 underflow on the
-    // `l - 16` term (and keep the result within 0..=255).
-    let l = (l as u16).clamp(16, 240);
-    (((l - 16) * 255 + (240 - 16) / 2) / (240 - 16)) as u8
+    // Expand limited-range luma (16..=235, a 219-step swing) to full-range
+    // (0..=255). Luma uses the 219 swing, NOT the 224 chroma swing — this must
+    // match `colorimetry::yuv_to_rgb_coeffs` (255/219). Real decoded YUV (e.g.
+    // JPEG → NV12) can carry luma below 16 or above 235, so clamp into the valid
+    // limited range first to avoid u16 underflow on the `l - 16` term (and keep
+    // the result within 0..=255).
+    let l = (l as u16).clamp(16, 235);
+    (((l - 16) * 255 + (235 - 16) / 2) / (235 - 16)) as u8
 }
 
 #[inline(always)]
 pub(super) fn full_to_limit(l: u8) -> u8 {
-    ((l as u16 * (240 - 16) + 255 / 2) / 255 + 16) as u8
+    // Compress full-range luma (0..=255) into limited-range luma (16..=235,
+    // the 219-step swing — luma max is 235, not the 240 chroma max).
+    ((l as u16 * (235 - 16) + 255 / 2) / 255 + 16) as u8
 }
 
 /// Select the luma-decode mapping for grey/luma extraction. Limited-range
-/// sources expand 16..=240 → 0..=255; full-range sources copy the byte as-is
+/// sources expand 16..=235 → 0..=255; full-range sources copy the byte as-is
 /// (the luma channel is already the grey value).
 #[inline(always)]
 fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {

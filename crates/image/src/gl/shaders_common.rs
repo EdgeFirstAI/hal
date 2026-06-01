@@ -117,14 +117,18 @@ void main() {
 }
 "#;
 
-/// Semi-planar NV12 / NV16 → RGBA fragment shader.
+/// Semi-planar NV12 → RGBA fragment shader.
 ///
 /// Two `sampler2D` inputs:
 ///   * `y_tex` — the luma plane, `R8`, full resolution. `Y` is in `.r`.
-///   * `uv_tex` — the interleaved chroma plane, `GR88`/`RG88`. For NV12 this
-///     is half resolution in both axes; for NV16 half resolution in x only.
-///     The DRM `GR88` import exposes the first interleaved byte (`U`/`Cb`) in
-///     `.r` and the second (`V`/`Cr`) in `.g`, matching NV12 byte order.
+///   * `uv_tex` — the interleaved chroma plane, `GR88`/`RG88`, half resolution
+///     in both axes (NV12 4:2:0). The DRM `GR88` import exposes the first
+///     interleaved byte (`U`/`Cb`) in `.r` and the second (`V`/`Cr`) in `.g`,
+///     matching NV12 byte order.
+///
+/// NOTE: this shader is wired only for NV12 today. NV16 (4:2:2, full-height
+/// chroma) is NOT routed through the raw per-plane in-shader path — it falls
+/// back to the CPU converter — so its chroma upsampling is not handled here.
 ///
 /// Both samplers are addressed with the same normalised `v_uv`; the GPU's
 /// bilinear filter upsamples the chroma plane for free.

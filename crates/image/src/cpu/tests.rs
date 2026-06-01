@@ -917,12 +917,12 @@ mod cpu_tests {
 
         // The untagged 2x2 Grey source is below the HD threshold, so the
         // colorimetry heuristic resolves it to BT.601 limited range: grey luma
-        // is mapped into the 16..235 limited range, so the row-averaged grey
-        // [4, 6] yields Y = 20, 21. The second dst row is outside the crop and
-        // keeps its pre-fill value.
+        // is mapped into the 16..235 limited range (219-step), so the
+        // row-averaged grey [4, 6] yields Y = 19, 21. The second dst row is
+        // outside the crop and keeps its pre-fill value.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
-            &[20, 128, 21, 128, 200, 128, 200, 128]
+            &[19, 128, 21, 128, 200, 128, 200, 128]
         );
         Ok(())
     }
