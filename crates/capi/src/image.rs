@@ -109,6 +109,11 @@ pub enum HalPixelFormat {
     /// but may differ slightly from the external-texture path used on other
     /// GPUs.
     Vyuy = 9,
+    /// 8-bit planar YUV444, full chroma (NV24)
+    ///
+    /// Y plane (`H` rows) followed by an interleaved Cb/Cr plane at full
+    /// resolution. Emitted by the JPEG decoder for 4:4:4 sources.
+    Nv24 = 10,
 }
 
 impl HalPixelFormat {
@@ -124,6 +129,7 @@ impl HalPixelFormat {
             HalPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
             HalPixelFormat::Bgra => PixelFormat::Bgra,
             HalPixelFormat::Vyuy => PixelFormat::Vyuy,
+            HalPixelFormat::Nv24 => PixelFormat::Nv24,
         }
     }
 
@@ -139,6 +145,7 @@ impl HalPixelFormat {
             PixelFormat::PlanarRgba => HalPixelFormat::PlanarRgba,
             PixelFormat::Bgra => HalPixelFormat::Bgra,
             PixelFormat::Vyuy => HalPixelFormat::Vyuy,
+            PixelFormat::Nv24 => HalPixelFormat::Nv24,
             // TODO: make this a compile error when new PixelFormat variants are added
             other => {
                 log::warn!("PixelFormat {other:?} has no C API mapping, defaulting to Rgb");
@@ -2388,12 +2395,37 @@ mod tests {
             HalPixelFormat::PlanarRgba,
             HalPixelFormat::Bgra,
             HalPixelFormat::Vyuy,
+            HalPixelFormat::Nv24,
         ];
 
         for format in formats {
             let pf = format.to_pixel_format();
             let back = HalPixelFormat::from_pixel_format(pf);
             assert_eq!(back, format, "Roundtrip failed for {:?}", format);
+        }
+        // Every core PixelFormat must have a distinct C-API mapping (no silent
+        // fallback to Rgb). Add new core variants here so a missing
+        // HalPixelFormat counterpart is caught instead of silently mis-mapping.
+        let core = [
+            PixelFormat::Rgb,
+            PixelFormat::Rgba,
+            PixelFormat::Bgra,
+            PixelFormat::Grey,
+            PixelFormat::Yuyv,
+            PixelFormat::Vyuy,
+            PixelFormat::Nv12,
+            PixelFormat::Nv16,
+            PixelFormat::Nv24,
+            PixelFormat::PlanarRgb,
+            PixelFormat::PlanarRgba,
+        ];
+        for pf in core {
+            let hal = HalPixelFormat::from_pixel_format(pf);
+            assert_eq!(
+                hal.to_pixel_format(),
+                pf,
+                "PixelFormat {pf:?} has no distinct C-API mapping (fell back to Rgb?)"
+            );
         }
     }
 

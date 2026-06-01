@@ -136,6 +136,7 @@ pub enum PyPixelFormat {
     Vyuy = 6,
     Nv12 = 7,
     Nv16 = 8,
+    Nv24 = 11,
     PlanarRgb = 9,
     PlanarRgba = 10,
 }
@@ -160,6 +161,7 @@ impl TryFrom<&str> for PyPixelFormat {
             "RGB" | "RGB " => Ok(PyPixelFormat::Rgb),
             "NV12" => Ok(PyPixelFormat::Nv12),
             "NV16" => Ok(PyPixelFormat::Nv16),
+            "NV24" => Ok(PyPixelFormat::Nv24),
             "Y800" | "GREY" | "GRAY" => Ok(PyPixelFormat::Grey),
             "8BPS" | "PLANAR_RGB" | "PLANARRGB" => Ok(PyPixelFormat::PlanarRgb),
             "PLANAR_RGBA" | "PLANARRGBA" => Ok(PyPixelFormat::PlanarRgba),
@@ -179,6 +181,7 @@ impl From<PyPixelFormat> for PixelFormat {
             PyPixelFormat::Vyuy => PixelFormat::Vyuy,
             PyPixelFormat::Nv12 => PixelFormat::Nv12,
             PyPixelFormat::Nv16 => PixelFormat::Nv16,
+            PyPixelFormat::Nv24 => PixelFormat::Nv24,
             PyPixelFormat::PlanarRgb => PixelFormat::PlanarRgb,
             PyPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
         }
@@ -198,6 +201,7 @@ impl TryFrom<PixelFormat> for PyPixelFormat {
             PixelFormat::Vyuy => Ok(PyPixelFormat::Vyuy),
             PixelFormat::Nv12 => Ok(PyPixelFormat::Nv12),
             PixelFormat::Nv16 => Ok(PyPixelFormat::Nv16),
+            PixelFormat::Nv24 => Ok(PyPixelFormat::Nv24),
             PixelFormat::PlanarRgb => Ok(PyPixelFormat::PlanarRgb),
             PixelFormat::PlanarRgba => Ok(PyPixelFormat::PlanarRgba),
             _ => Err(Error::Format(format!("unsupported pixel format: {val:?}"))),

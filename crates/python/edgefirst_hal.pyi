@@ -1365,6 +1365,10 @@ class PixelFormat(enum.Enum):
     Nv16: PixelFormat
     """Semi-planar YUV 4:2:2 [H*2, W]"""
 
+    Nv24: PixelFormat
+    """Semi-planar YUV 4:4:4 [H*3, W] (full chroma). Emitted by the JPEG
+    decoder for 4:4:4 sources."""
+
     PlanarRgb: PixelFormat
     """Planar RGB, channels-first [3, H, W]"""
 

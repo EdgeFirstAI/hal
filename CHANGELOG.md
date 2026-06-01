@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`edgefirst-tensor`): capacity-aware reconfiguration of an existing allocation
   to a decoded image's dimensions and pixel format, erroring with
   `InsufficientCapacity` when the image exceeds the allocation.
+- `PixelFormat::Nv24` (semi-planar YUV 4:4:4) is now exposed in the **C** and
+  **Python** bindings (`HAL_PIXEL_FORMAT_NV24` / `PixelFormat.Nv24`), reaching
+  parity with the core enum. Previously a 4:4:4 JPEG decoded to the core's
+  `Nv24` but the Python binding raised `unsupported pixel format: Nv24` on
+  peek/decode and the C binding silently mis-reported it as `RGB`. Clients can
+  now peek, decode, and convert 4:4:4 (and 4:2:2 `Nv16`) sources through both
+  APIs. A C-API round-trip test now asserts every core `PixelFormat` has a
+  distinct `HalPixelFormat` mapping (no silent fallback).
 - EXIF orientation reporting in `ImageInfo` (`rotation_degrees`,
   `flip_horizontal`) for both JPEG and PNG, plus `peek_info()` to read it
   without decoding pixels.

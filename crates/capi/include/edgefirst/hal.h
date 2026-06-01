@@ -306,6 +306,13 @@ typedef enum hal_pixel_format {
    * GPUs.
    */
   HAL_PIXEL_FORMAT_VYUY = 9,
+  /**
+   * 8-bit planar YUV444, full chroma (NV24)
+   *
+   * Y plane (`H` rows) followed by an interleaved Cb/Cr plane at full
+   * resolution. Emitted by the JPEG decoder for 4:4:4 sources.
+   */
+  HAL_PIXEL_FORMAT_NV24 = 10,
 } hal_pixel_format;
 
 /**
