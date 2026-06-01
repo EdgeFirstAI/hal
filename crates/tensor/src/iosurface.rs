@@ -81,6 +81,8 @@ extern "C" {
     fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: IOSurfaceRef) -> usize;
     fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
+    fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
+    fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
     fn IOSurfaceGetID(surface: IOSurfaceRef) -> u32;
 
     fn CFRetain(cf: *const c_void) -> *const c_void;
@@ -524,6 +526,35 @@ where
         self.bytes_per_row
     }
 
+    /// Physical IOSurface dimensions in *texels* (`IOSurfaceGetWidth` /
+    /// `IOSurfaceGetHeight`), independent of the tensor's current logical shape.
+    ///
+    /// A reused pool surface keeps these fixed for its whole life while
+    /// `configure_image` changes the logical frame shape per decode. The GL
+    /// backend binds the EGL pbuffer at these physical dims so one cached
+    /// pbuffer serves every frame, and `texelFetch(col, row)` resolves to memory
+    /// `row * bytes_per_row + col` (the row pitch is carried by the surface, not
+    /// the declared texel width) — matching the codec's fixed-grid byte layout.
+    pub(crate) fn physical_surface_dims(&self) -> (usize, usize) {
+        let w = unsafe { IOSurfaceGetWidth(self.surface.as_ptr()) };
+        let h = unsafe { IOSurfaceGetHeight(self.surface.as_ptr()) };
+        (w, h)
+    }
+
+    /// Row pitch to honour as an *image* stride when a tensor is reconfigured
+    /// to a smaller image (`Tensor::configure_image`), or `None` for a generic
+    /// byte-bag surface.
+    ///
+    /// A byte-bag (`new_with_byte_size`) is a single `height == 1` row whose
+    /// `bytes_per_row` equals the entire allocation — meaningless as a per-row
+    /// image pitch. Adopting it would set a row stride spanning the whole buffer
+    /// and blow up the strided map's size check. Only genuine 2D image-formatted
+    /// surfaces (`new_image`, height > 1) carry a real row pitch to preserve.
+    pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
+        let (_w, h) = self.physical_surface_dims();
+        (h > 1).then_some(self.bytes_per_row)
+    }
+
     /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided
     /// row iteration. The caller (`Tensor::map`) validates
     /// `byte_size <= buf_size` first. The IOSurface lock yields the full
@@ -585,6 +616,20 @@ where
     pub fn iosurface_id(&self) -> Option<u32> {
         match &self.storage {
             crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.surface_id()),
+            _ => None,
+        }
+    }
+
+    /// Physical IOSurface dimensions in texels (`IOSurfaceGetWidth` /
+    /// `IOSurfaceGetHeight`), independent of the logical shape. `None` when not
+    /// IOSurface-backed.
+    ///
+    /// The GL backend binds the EGL pbuffer at these dims so one cached pbuffer
+    /// serves every frame a reused pool surface holds; `texelFetch` then
+    /// resolves to `row * bytesPerRow + col` against the surface's real pitch.
+    pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
+        match &self.storage {
+            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.physical_surface_dims()),
             _ => None,
         }
     }
@@ -1116,8 +1161,12 @@ mod tests {
             image_fourcc_and_bpe(PixelFormat::PlanarRgb, DType::F32),
             None
         );
-        // NV12 / Nv16 have no IOSurface FourCC mapping in HAL today.
-        assert_eq!(image_fourcc_and_bpe(PixelFormat::Nv12, DType::U8), None);
+        // NV12/NV16/NV24/GREY (u8) now map to 'L008' (R8) so the GPU can sample
+        // the contiguous semi-planar buffer as a single-channel texture.
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Nv12, DType::U8),
+            Some((u32::from_be_bytes(*b"L008"), 1))
+        );
         // Float for YUYV / Grey isn't a meaningful combination.
         assert_eq!(image_fourcc_and_bpe(PixelFormat::Yuyv, DType::F16), None);
         assert_eq!(image_fourcc_and_bpe(PixelFormat::Grey, DType::F16), None);

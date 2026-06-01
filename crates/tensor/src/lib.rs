@@ -1039,6 +1039,26 @@ impl<T> TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// The backing allocation's intrinsic physical row pitch in bytes, if it
+    /// has one that is fixed independent of the logical shape. macOS IOSurface
+    /// reports its 64-aligned `bytesPerRow`; other backings (Linux DMA, SHM,
+    /// Mem, PBO) have no fixed pitch beyond the logical shape and return `None`.
+    ///
+    /// Used by `configure_image` to preserve the physical pitch when a reused
+    /// pool tensor is reconfigured to a smaller logical image — so the decode
+    /// writes rows at the surface's real stride and the GPU samples them with
+    /// the same stride (the physical-grid / logical-ROI decoupling).
+    pub(crate) fn backing_row_stride(&self) -> Option<usize> {
+        match self {
+            // Only genuine image-formatted IOSurfaces (height > 1) carry a real
+            // per-row pitch; a generic byte-bag (height == 1) returns `None` so
+            // `configure_image` does not adopt its whole-buffer "row" as a stride.
+            #[cfg(target_os = "macos")]
+            TensorStorage::Dma(t) => t.image_backing_row_stride(),
+            _ => None,
+        }
+    }
+
     /// Create a new tensor storage with the given shape, memory type, and
     /// optional name. If no name is given, a random name will be generated.
     /// If no memory type is given, the best available memory type will be
@@ -1825,6 +1845,15 @@ where
     /// interleaving requirement); the true odd width is reported by the decoder
     /// in `ImageInfo` and trimmed by a `convert()` crop. See
     /// [`PixelFormat::image_shape`].
+    ///
+    /// When the backing has a fixed physical row pitch (an IOSurface's
+    /// 64-aligned `bytesPerRow`) that exceeds the new format's natural row
+    /// stride — i.e. a reused max-sized pool tensor reconfigured to a smaller
+    /// image — the physical pitch is preserved as the tensor's `row_stride`.
+    /// This keeps the **physical grid** (allocation stride/surface) fixed while
+    /// the **logical ROI** (this image's W×H) changes, so the decode writes rows
+    /// at the surface's real stride and the GPU samples them at the same stride.
+    /// Exact-sized buffers (pitch == natural) stay tightly packed unchanged.
     pub fn configure_image(
         &mut self,
         width: usize,
@@ -1837,7 +1866,18 @@ where
             ))
         })?;
         self.storage.set_logical_shape(&shape)?;
-        self.set_format(format)
+        self.set_format(format)?; // clears any stale row_stride
+
+        // Preserve the backing's physical row pitch when it is wider than the
+        // natural (tightly-packed) row for this format — the physical-grid /
+        // logical-ROI decoupling for reused pool tensors.
+        if let Some(pitch) = self.storage.backing_row_stride() {
+            let natural = self.effective_row_stride().unwrap_or(0);
+            if pitch > natural {
+                self.set_row_stride_unchecked(pitch);
+            }
+        }
+        Ok(())
     }
 
     /// Allocate an image tensor sized to hold up to `width`×`height` in
@@ -3796,6 +3836,52 @@ mod tests {
             .configure_image(1920, 1080, PixelFormat::Nv12)
             .unwrap_err();
         assert!(matches!(err, Error::InsufficientCapacity { .. }));
+    }
+
+    /// A reused max-sized IOSurface pool keeps its physical `bytesPerRow` when
+    /// reconfigured to a smaller logical image (physical-grid / logical-ROI
+    /// decoupling), instead of collapsing to the frame's natural row stride.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn configure_image_preserves_iosurface_physical_stride() {
+        // Pool: GREY/R8 IOSurface 100 wide → bytesPerRow padded to 128.
+        let mut pool =
+            Tensor::<u8>::image(100, 64, PixelFormat::Grey, Some(TensorMemory::Dma)).unwrap();
+        let pitch = pool.effective_row_stride().unwrap();
+        assert!(
+            pitch >= 128 && pitch.is_multiple_of(64),
+            "padded bytesPerRow, got {pitch}"
+        );
+
+        // Reconfigure to a smaller NV12 frame; the physical pitch must survive
+        // (natural would be 32, but the surface stride is the 128-padded pitch).
+        pool.configure_image(32, 16, PixelFormat::Nv12).unwrap();
+        assert_eq!(pool.format(), Some(PixelFormat::Nv12));
+        assert_eq!(pool.width(), Some(32));
+        assert_eq!(pool.height(), Some(16));
+        assert_eq!(
+            pool.effective_row_stride(),
+            Some(pitch),
+            "configure_image must preserve the IOSurface physical bytesPerRow"
+        );
+
+        // Reconfigure again to NV24 — pitch still preserved.
+        pool.configure_image(32, 16, PixelFormat::Nv24).unwrap();
+        assert_eq!(pool.effective_row_stride(), Some(pitch));
+    }
+
+    /// A backing without a fixed physical pitch (Mem) stays tightly packed
+    /// through configure_image — the preservation only applies to backings that
+    /// report a `backing_row_stride` (IOSurface). Mem reconfigures to the
+    /// format's natural row stride.
+    #[test]
+    fn configure_image_mem_stays_tight() {
+        let mut t =
+            Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
+                .unwrap();
+        t.configure_image(32, 16, PixelFormat::Nv12).unwrap();
+        // Mem has no intrinsic pitch → NV12 natural row stride == even width 32.
+        assert_eq!(t.effective_row_stride(), Some(32));
     }
 
     #[test]

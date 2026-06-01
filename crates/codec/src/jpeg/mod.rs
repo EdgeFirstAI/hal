@@ -98,10 +98,13 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
     }
 }
 
-/// Native luma/primary-plane row stride in bytes for a freshly decoded image
-/// (NV12 luma and GREY are both 1 byte/pixel).
+/// Native luma/primary-plane row stride in bytes for a freshly decoded image.
+/// GREY and all semi-planar luma/UV planes are 1 byte/pixel; semi-planar grids
+/// are laid out at even width (the codec writer's `ceil(width/2)` chroma columns
+/// must be byte-aligned), so round up to keep the fallback `>= even_width` —
+/// the contract `mcu::decode_image` asserts.
 fn native_row_stride(width: usize) -> usize {
-    width
+    width.next_multiple_of(2)
 }
 
 /// Parse JPEG headers and return native dimensions, format, and EXIF

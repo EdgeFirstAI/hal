@@ -5046,6 +5046,198 @@ mod image_tests {
         assert!(checked >= w * h * 3, "expected >= 3 planes of samples, got {checked}");
     }
 
+    /// Profiler-shaped two-pass: a reused **R8/Grey pool** (allocated larger
+    /// than the frame, the NV24 worst case `3·H`) is reconfigured to an NV12
+    /// frame, filled at the preserved physical stride, and converted with a
+    /// letterbox `src_rect` crop into a model-sized PlanarRgb F16 destination —
+    /// exactly the orchestrator's preprocess. Guards against the pooled
+    /// two-pass NV→PlanarRgb F16 path hanging/erroring (the exact-size
+    /// `test_nv12_to_planar_f16_two_pass` never exercised the larger pool).
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_to_planar_f16_two_pass_pool_opengl_macos() {
+        let mut gpu = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                return;
+            }
+        };
+        // Frame 96×64 in a 256×768 R8 pool (3·256 height; bpr padded past 96).
+        let (fw, fh) = (96usize, 64usize);
+        let (pool_w, pool_h) = (256usize, 768usize);
+        let (model_w, model_h) = (128usize, 128usize);
+
+        let mut src = match TensorDyn::image(
+            pool_w,
+            pool_h,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — R8 pool alloc: {e:?}", function!());
+                return;
+            }
+        };
+        src.configure_image(fw, fh, PixelFormat::Nv12)
+            .unwrap_or_else(|e| panic!("configure_image NV12 on pool: {e}"));
+        let stride = src.as_u8().unwrap().effective_row_stride().unwrap();
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128); // neutral grey
+
+        let mut dst = match TensorDyn::image(
+            model_w,
+            model_h,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — F16 PlanarRgb dst: {e:?}", function!());
+                return;
+            }
+        };
+
+        // Letterbox crop like the profiler: source ROI is the true frame.
+        let crop = Crop {
+            src_rect: Some(Rect::new(0, 0, fw, fh)),
+            dst_rect: Some(Rect::new(0, 32, model_w, 64)), // arbitrary letterbox band
+            ..Crop::new()
+        };
+        if let Err(e) = ImageProcessorTrait::convert(
+            &mut gpu,
+            &src,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            crop,
+        ) {
+            eprintln!("SKIPPED: {} — NV12→PlanarRgb F16 unavailable ({e:?})", function!());
+            return;
+        }
+        let _ = stride;
+        // Neutral grey → ~0.5 inside the letterbox band; just assert the convert
+        // completed and produced finite values (no hang, no NaN garbage).
+        let dt = dst.as_f16().expect("dst F16");
+        let map = dt.map().unwrap();
+        let any_half = map.as_slice().iter().any(|&v| {
+            let f = f32::from(v);
+            (0.40..=0.60).contains(&f)
+        });
+        assert!(any_half, "expected ~0.5 grey samples in the letterbox band");
+    }
+
+    /// Mirrors the orchestrator: the `MacosGlProcessor` is created on one thread
+    /// and `convert()` is called from a *different* thread (the profiler's
+    /// Pre-processing worker). Reproduces (or rules out) the GL-context /
+    /// `glFinish` cross-thread hang seen in the live pipeline. A 20 s watchdog
+    /// fails loudly rather than hanging the whole test binary.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_to_planar_f16_cross_thread_opengl_macos() {
+        use std::sync::mpsc;
+        // Public ImageProcessor (Send) created HERE (the main test thread),
+        // exactly like the orchestrator builds `config.processor` during setup.
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let mut src = match TensorDyn::image(256, 768, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("SKIPPED: {} — pool: {e:?}", function!()); return; }
+        };
+        src.configure_image(fw, fh, PixelFormat::Nv12).unwrap();
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+        let mut dst = match TensorDyn::image(128, 128, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma)) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("SKIPPED: {} — dst: {e:?}", function!()); return; }
+        };
+        let crop = Crop { src_rect: Some(Rect::new(0, 0, fw, fh)), ..Crop::new() };
+
+        // ...then MOVED to a worker thread where convert() runs — exactly the
+        // orchestrator's create-on-setup / convert-on-Pre-processing split.
+        let (tx, rx) = mpsc::channel::<bool>();
+        let worker = std::thread::spawn(move || {
+            let _ = ImageProcessorTrait::convert(
+                &mut proc, &src, &mut dst, Rotation::None, Flip::None, crop,
+            );
+            let _ = tx.send(true);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(_) => { let _ = worker.join(); }
+            Err(_) => panic!(
+                "cross-thread NV12→PlanarRgb convert HUNG (>20s) — reproduces the orchestrator deadlock"
+            ),
+        }
+    }
+
+    /// Reproduces the profiler's progressive-slowdown/hang: one processor
+    /// converting many **varying-size** NV frames (like a COCO dataset) from a
+    /// reused R8 pool into a fixed PlanarRgb F16 model input. The two-pass path
+    /// reallocated its RGBA intermediate per frame-size, churning/leaking
+    /// pbuffers until the GPU stalled. Asserts per-convert latency stays bounded
+    /// (no runaway) over many iterations.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv_to_planar_f16_varying_sizes_no_leak_opengl_macos() {
+        let mut gpu = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                return;
+            }
+        };
+        // Mirror the orchestrator's ring buffers at depth 4: a pool of source R8
+        // tensors AND a pool of PlanarRgb F16 dst slots, both cycled per frame.
+        let (max_w, max_h) = (640usize, 640usize);
+        let depth = 4usize;
+        let mut srcs = Vec::new();
+        let mut dsts = Vec::new();
+        for _ in 0..depth {
+            srcs.push(match TensorDyn::image(max_w, max_h * 3, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("SKIPPED: {} — pool: {e:?}", function!()); return; }
+            });
+            dsts.push(match TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma)) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("SKIPPED: {} — dst: {e:?}", function!()); return; }
+            });
+        }
+        // COCO-like assorted frame sizes (all ≤ max), cycled.
+        let sizes = [(640, 480), (500, 375), (640, 427), (333, 500), (480, 640), (612, 612), (428, 640), (576, 432)];
+        let mut first_ms = 0f64;
+        let mut last_ms = 0f64;
+        let iters = 40usize;
+        for i in 0..iters {
+            let (fw, fh) = sizes[i % sizes.len()];
+            let src = &mut srcs[i % depth];
+            let dst = &mut dsts[i % depth];
+            src.configure_image(fw, fh, PixelFormat::Nv24).unwrap();
+            src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+            let crop = Crop { src_rect: Some(Rect::new(0, 0, fw, fh)), ..Crop::new() };
+            let t0 = std::time::Instant::now();
+            ImageProcessorTrait::convert(&mut gpu, src, dst, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| panic!("convert iter {i} ({fw}×{fh}): {e}"));
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            if i == 2 { first_ms = ms; }
+            if i == iters - 1 { last_ms = ms; }
+        }
+        eprintln!("first={first_ms:.2}ms last={last_ms:.2}ms");
+        assert!(
+            last_ms < first_ms * 5.0 + 5.0,
+            "convert latency ran away: first {first_ms:.2}ms → last {last_ms:.2}ms (intermediate/pbuffer leak)"
+        );
+    }
+
     /// Step-2 verification: NV12/NV16/NV24 (R8 IOSurface) → RGBA on the GPU
     /// must match the CPU `yuv` kernels within shader rounding. Fills an
     /// IOSurface source and a Mem source from the same logical YUV pattern
@@ -5135,6 +5327,115 @@ mod image_tests {
             assert!(
                 max_d <= 3,
                 "{fmt:?}: GPU vs CPU RGBA max channel diff {max_d} > 3"
+            );
+        }
+    }
+
+    /// Phase-0 gate: the reused-pool / larger-surface case. A single R8 pool
+    /// IOSurface (allocated bigger than the frame, so its `bytesPerRow` exceeds
+    /// the frame's even width) is reconfigured to each NV frame, filled at the
+    /// preserved physical stride, and converted on the GPU. This proves ANGLE
+    /// binds the *whole* physical surface as a pbuffer and that `texelFetch`
+    /// resolves the frame's Y/UV texels through the surface's real `bytesPerRow`
+    /// (the physical-grid / logical-ROI decoupling). GPU must match CPU ≤3 LSB.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv_to_rgba_larger_pool_surface_opengl_macos() {
+        let mut gpu = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let mut cpu = CPUProcessor::new();
+        // Frame is 40×24; the pool is generously oversized (256-wide → bpr 256,
+        // well beyond the frame's even width 40) and tall enough for NV24's 3·H.
+        let (w, h) = (40usize, 24usize);
+        let (pool_w, pool_h) = (256usize, 256usize);
+        let ew = w; // even width (w is even)
+
+        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
+            for y in 0..h {
+                for x in 0..w {
+                    buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
+                }
+            }
+            let (cw, ch, bytes_per_crow) = match fmt {
+                PixelFormat::Nv12 => (w / 2, h / 2, ew),
+                PixelFormat::Nv16 => (w / 2, h, ew),
+                _ => (w, h, ew * 2), // Nv24
+            };
+            let mut put = |lb: usize, val: u8| {
+                let row = h + lb / ew;
+                buf[row * stride + (lb % ew)] = val;
+            };
+            for cy in 0..ch {
+                for cx in 0..cw {
+                    let lb = cy * bytes_per_crow + cx * 2;
+                    put(lb, ((cx * 11 + 30) & 0xff) as u8);
+                    put(lb + 1, ((cy * 7 + 200) & 0xff) as u8);
+                }
+            }
+        };
+
+        for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            // CPU reference from a tightly-packed Mem tensor at the frame size.
+            let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+            let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
+            fill(mem.as_u8().unwrap().map().unwrap().as_mut_slice(), mem_stride, fmt);
+            let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+            let (r, _s, cpu_dst) =
+                convert_img(&mut cpu, mem, cpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
+
+            // GPU source: a LARGER R8 pool surface, reconfigured down to the
+            // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
+            // tensor's row stride; the fill writes the frame at that stride.
+            let mut ios =
+                match TensorDyn::image(pool_w, pool_h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
+                        return;
+                    }
+                };
+            ios.configure_image(w, h, fmt)
+                .unwrap_or_else(|e| panic!("configure_image {fmt:?} on pool: {e}"));
+            let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
+            assert!(
+                ios_stride > ew,
+                "{fmt:?}: pool stride {ios_stride} should exceed frame even width {ew} \
+                 (test must exercise padding)"
+            );
+            fill(ios.as_u8().unwrap().map().unwrap().as_mut_slice(), ios_stride, fmt);
+
+            let gpu_dst =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+            let (r, _s, gpu_dst) =
+                convert_img(&mut gpu, ios, gpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA (pool surface) on ANGLE: {e}"));
+
+            let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+            let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
+            let cb = cmap.as_slice();
+            let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+            let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
+            let gb = gmap.as_slice();
+            let mut max_d = 0i16;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let cv = cb[y * cs + x * 4 + c] as i16;
+                        let gv = gb[y * gs + x * 4 + c] as i16;
+                        max_d = max_d.max((cv - gv).abs());
+                    }
+                }
+            }
+            assert!(
+                max_d <= 3,
+                "{fmt:?}: GPU(pool surface) vs CPU RGBA max channel diff {max_d} > 3"
             );
         }
     }

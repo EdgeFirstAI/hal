@@ -258,10 +258,23 @@ rather than a refactor of the threaded Linux pipeline. Two reasons:
    larger than the macOS port itself. Parallel `MacosGlProcessor`
    keeps the Linux code untouched.
 
-The macOS backend ships with a single fragment shader today (BT.709
-limited-range YUYV → RGBA). Other convert pairs return
-`NotSupported` and `ImageProcessor::convert` falls back to CPU. Each
-new shader needs:
+The macOS backend ships several fragment shaders today:
+
+- **YUYV → RGBA** (packed `GL_RG` sampler).
+- **GREY → RGBA** (single `GL_RED` plane, identity luma).
+- **NV12 / NV16 / NV24 → RGBA** — one `GL_RED` shader that samples the
+  contiguous combined-plane buffer with in-shader semi-planar addressing
+  (`texelFetch`), parameterised by uniforms so a single program serves all
+  three subsamplings and is portable to Linux/embedded GLES.
+- **RGBA8 → PlanarRgb F16** — letterbox resize + `/255` normalize + HWC→CHW,
+  packed into an RGBA16F IOSurface (NCHW model input).
+- **NV12 / NV16 / NV24 → PlanarRgb F16** — the profiler's preprocess, run as a
+  two-pass chain (NV*→RGBA8 into a cached intermediate, then RGBA8→PlanarRgb
+  F16) under a *single* GL session (one `lock_gl` + `MakeCurrent` across both
+  passes, so the process-global ANGLE context is never released mid-operation).
+
+Convert pairs without a shader return `NotSupported` and
+`ImageProcessor::convert` falls back to CPU. Each new shader needs:
 
 - A GLSL ES 3.0 source in `macos_processor.rs`.
 - A FourCC entry for the destination layout in
@@ -275,6 +288,21 @@ new shader needs:
   `gl/iosurface_import.rs::ImageLayout::gl_internal_format` (the GL
   texture format must agree with the IOSurface FourCC — ANGLE
   validates this at `eglCreatePbufferFromClientBuffer` time).
+
+### Colorimetry
+
+All YUV→RGB conversions on the macOS GL backend currently use **BT.601
+full-range** coefficients, matching the CPU `yuv`-crate kernels and the JPEG
+codec (whose `JFIF` output is BT.601 full-range). This is an **interim
+stop-gap**: real-world camera fixtures (e.g. `camera720p`) are BT.709, so a
+GL→reference similarity test on such a fixture sits at ~0.97 RMS (≈2.7% off)
+rather than pixel-exact — hence the `0.95` thresholds and the
+`interim 601-full stop-gap` notes in the convert tests. The GPU and CPU paths
+agree with each other (≤3 LSB), so cross-backend parity holds; only the
+absolute colorimetry against a BT.709 source differs. Proper per-source
+colorimetry selection (tagging decoded frames with their color space and
+choosing the matching matrix) is a future change; until then every backend is
+deliberately BT.601-full for consistency.
 
 ### ANGLE constant gotchas
 

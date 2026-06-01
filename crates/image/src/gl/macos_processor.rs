@@ -850,6 +850,15 @@ impl MacosGlProcessor {
             .ok_or_else(|| Error::InvalidShape("src height".into()))?;
 
         // Reuse (or allocate) the full-res RGBA8 intermediate IOSurface.
+        //
+        // PERF (revisit in profiler measurement): this reallocates when the
+        // frame size changes. A reused dataset with many distinct sizes thrashes
+        // it. The decoupling now in place (physical grid vs logical ROI) makes
+        // the clean fix a single max-size intermediate reconfigured per frame —
+        // mirroring the R8 source pool — but that needs
+        // `convert_rgba8_to_planar_float` to sample a physical-dims-bound RGBA8
+        // source over a logical sub-rect, so it is deferred until the end-to-end
+        // numbers show this realloc matters.
         let mut slot = self
             .intermediate_rgba
             .lock()
@@ -866,10 +875,20 @@ impl MacosGlProcessor {
         }
         let interm = &mut slot.as_mut().unwrap().2;
 
+        // Both passes run under ONE GL session: a single `lock_gl` +
+        // `MakeCurrent` held across them so the process-global ANGLE context is
+        // never released between pass 1 and pass 2. Releasing/re-acquiring the
+        // context mid-operation (two separate sessions) deadlocked under the
+        // profiler's pipelined concurrency at depth > 1. Each pass still issues
+        // its own `glFinish` before releasing its tex-image bindings (so the GPU
+        // is done reading/writing the shared intermediate before it is rebound).
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
         // Pass 1: YUV(R8) → RGBA8, full-resolution, no crop.
-        self.convert_yuyv_to_rgba(src, interm, src_fmt, PixelFormat::Rgba)?;
+        self.convert_yuyv_to_rgba_inner(d, src, interm, src_fmt, PixelFormat::Rgba)?;
         // Pass 2: RGBA8 → PlanarRgb F16 with letterbox/resize.
-        self.convert_rgba8_to_planar_float(interm, dst, crop)
+        self.convert_rgba8_to_planar_float_inner(d, interm, dst, crop)
     }
 
     /// RGBA8 IOSurface source → PlanarRgb F16 IOSurface destination.
@@ -909,6 +928,24 @@ impl MacosGlProcessor {
     /// failed before reaching this method.
     pub fn convert_rgba8_to_planar_float(
         &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        crop: crate::Crop,
+    ) -> Result<()> {
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+        self.convert_rgba8_to_planar_float_inner(d, src, dst, crop)
+    }
+
+    /// RGBA8 → PlanarRgb F16 render, assuming the GL session (`lock_gl` held +
+    /// a context current for `d`) is ALREADY established by the caller.
+    /// Standalone via [`Self::convert_rgba8_to_planar_float`]; pass 2 of the
+    /// single-session two-pass [`Self::convert_nv_to_planar_float`], which holds
+    /// ONE session across both passes (no context release between them).
+    fn convert_rgba8_to_planar_float_inner(
+        &self,
+        d: &SharedAngleDisplay,
         src: &TensorDyn,
         dst: &mut TensorDyn,
         crop: crate::Crop,
@@ -975,7 +1012,6 @@ impl MacosGlProcessor {
         })?;
         let src_id = src_u8.iosurface_id().unwrap_or(0);
 
-        let d = shared_display()?;
         if !d.supports_f16_color {
             return Err(Error::NotSupported(
                 "GL_EXT_color_buffer_half_float not exposed by this ANGLE/Metal configuration — \
@@ -1009,9 +1045,6 @@ impl MacosGlProcessor {
             Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
             None => [0.0, 0.0, 0.0],
         };
-
-        let _gl_guard = lock_gl();
-        let _current = MakeCurrentGuard::new(d)?;
 
         let src_pbuf = self.get_or_create_pbuffer(
             d,
@@ -1178,6 +1211,27 @@ impl MacosGlProcessor {
         )
         .entered();
 
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+        self.convert_yuyv_to_rgba_inner(d, src, dst, src_fmt, dst_fmt)
+    }
+
+    /// Render NV*/YUYV/GREY → RGBA into `dst`, assuming the GL session
+    /// (`lock_gl` held + a context current for `d`) is ALREADY established by
+    /// the caller. Standalone callers use [`Self::convert_yuyv_to_rgba`]; the
+    /// two-pass [`Self::convert_nv_to_planar_float`] calls this as pass 1 under a
+    /// single shared session so the process-global ANGLE context is never
+    /// released between the passes — that mid-operation release/re-acquire
+    /// deadlocked under the profiler's pipelined concurrency (depth > 1).
+    fn convert_yuyv_to_rgba_inner(
+        &self,
+        d: &SharedAngleDisplay,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+    ) -> Result<()> {
         let src_w = src
             .width()
             .ok_or_else(|| Error::InvalidShape("src width".into()))?;
@@ -1217,18 +1271,41 @@ impl MacosGlProcessor {
         let src_id = src_u8.iosurface_id().unwrap_or(0);
         let dst_id = dst_u8.iosurface_id().unwrap_or(0);
 
-        let d = shared_display()?;
-        let _gl_guard = lock_gl();
-        let _current = MakeCurrentGuard::new(d)?;
-
         // Look up (or create) the source/dest pbuffers in the cache.
         // Cache miss path calls `eglCreatePbufferFromClientBuffer` and
         // inserts; cache hit returns the existing surface.
         // The src/dst as_u8/as_u8_mut checks above mean both tensors
         // are u8 today. Float-dtype rendering routes through the
         // separate `convert_rgba8_to_planar_float` call site.
-        let src_pbuf =
-            self.get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, DType::U8, src_w, src_h)?;
+        let src_pbuf = match src_fmt {
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
+                // The semi-planar source is a single contiguous R8 plane that may
+                // be a reused pool surface larger than this frame. Bind the WHOLE
+                // physical IOSurface as one GL_RED texture (not the frame-sized
+                // sub-region) so a single cached pbuffer serves every frame: the
+                // shader addresses each Y/UV texel within it via `texelFetch`,
+                // which Metal resolves to `row * bytesPerRow + col` against the
+                // surface's real pitch. Binding at frame dims would instead need
+                // a fresh pbuffer per distinct frame size (the regression's tax)
+                // and a stale cache entry across sizes.
+                let (pw, ph) = src.iosurface_physical_dims().ok_or_else(|| {
+                    Error::NotSupported(
+                        "GL convert: semi-planar source is not IOSurface-backed".into(),
+                    )
+                })?;
+                self.get_or_create_pbuffer(
+                    d,
+                    src_id,
+                    src_iosurface,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    pw,
+                    ph,
+                )?
+            }
+            _ => self
+                .get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, DType::U8, src_w, src_h)?,
+        };
         let dst_pbuf =
             self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, DType::U8, dst_w, dst_h)?;
 
@@ -1268,8 +1345,13 @@ impl MacosGlProcessor {
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
             match src_fmt {
                 PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
-                    // `src_w` is the (even) buffer width = the R8 texture width;
-                    // the Y plane is `src_h` rows of it, UV follows.
+                    // `src_w` is the frame's (even) buffer width — the *logical*
+                    // grid-wrap width the codec used, NOT the bound texture's
+                    // physical texel width (which is the whole pool surface). The
+                    // shader decomposes each plane's linear byte offset by this
+                    // wrap width into (col, row) and `texelFetch`es it; Metal maps
+                    // (col, row) to `row * bytesPerRow + col`, so logical wrap and
+                    // physical pitch stay decoupled. The Y plane is `src_h` rows.
                     let (cx, cy) = match src_fmt {
                         PixelFormat::Nv12 => (1, 1),
                         PixelFormat::Nv16 => (1, 0),

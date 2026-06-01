@@ -545,6 +545,15 @@ impl TensorDyn {
         dispatch!(self, iosurface_ref)
     }
 
+    /// Physical IOSurface dimensions in texels, independent of the logical
+    /// shape (macOS only). `None` when not IOSurface-backed. The GL backend
+    /// binds the EGL pbuffer at these dims so one cached pbuffer serves every
+    /// frame size a reused pool surface holds.
+    #[cfg(target_os = "macos")]
+    pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
+        dispatch!(self, iosurface_physical_dims)
+    }
+
     /// Create a type-erased image tensor.
     ///
     /// # Arguments
