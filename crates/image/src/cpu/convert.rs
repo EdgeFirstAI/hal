@@ -971,6 +971,102 @@ impl CPUProcessor {
         )?)
     }
 
+    // ── NV24 (4:4:4 semi-planar): full-resolution interleaved Cb/Cr ──
+    // Contiguous layout is `[3H, W]`: Y plane (H rows) then the interleaved UV
+    // plane (2H rows of W ⇒ `2*W` bytes per chroma row). The UV plane stride is
+    // therefore twice the luma stride.
+    pub(super) fn convert_nv24_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let src_h = src.shape()[0] / 3;
+        let stride = src.effective_row_stride().unwrap_or(src_w);
+        let map = src.map()?;
+        let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+        Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nv24_to_rgb_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        y_stride: usize,
+        dst: &mut Tensor<u8>,
+    ) -> Result<()> {
+        let src = yuv::YuvBiPlanarImage {
+            y_plane,
+            y_stride: y_stride as u32,
+            uv_plane,
+            uv_stride: (y_stride * 2) as u32,
+            width: width as u32,
+            height: height as u32,
+        };
+        Ok(yuv::yuv_nv24_to_rgb(
+            &src,
+            dst.map()?.as_mut_slice(),
+            super::tensor_row_stride(dst) as u32,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    pub(super) fn convert_nv24_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let src_h = src.shape()[0] / 3;
+        let stride = src.effective_row_stride().unwrap_or(src_w);
+        let map = src.map()?;
+        let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+        Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nv24_to_rgba_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        y_stride: usize,
+        dst: &mut Tensor<u8>,
+    ) -> Result<()> {
+        let src = yuv::YuvBiPlanarImage {
+            y_plane,
+            y_stride: y_stride as u32,
+            uv_plane,
+            uv_stride: (y_stride * 2) as u32,
+            width: width as u32,
+            height: height as u32,
+        };
+        Ok(yuv::yuv_nv24_to_rgba(
+            &src,
+            dst.map()?.as_mut_slice(),
+            super::tensor_row_stride(dst) as u32,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    /// NV24 → GREY: drop chroma, copy the luma plane honouring its row stride.
+    pub(super) fn convert_nv24_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let src_h = src.shape()[0] / 3;
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
+        let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
+        let mut dst_map = dst.map()?;
+        let dst_bytes = dst_map.as_mut_slice();
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            for (s, d) in s.iter().zip(d) {
+                *d = limit_to_full(*s);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn convert_8bps_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_map = src.map()?;
         let src_ = src_map.as_slice();

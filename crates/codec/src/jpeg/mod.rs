@@ -61,9 +61,35 @@ impl Default for JpegDecoderState {
 /// The codec's native output format for a JPEG: `Grey` for 1-component
 /// (greyscale) images, `Nv12` for 3-component (YCbCr) images.
 fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
-    match headers.header.components.len() {
+    let comps = &headers.header.components;
+    match comps.len() {
         1 => Ok(PixelFormat::Grey),
-        3 => Ok(PixelFormat::Nv12),
+        3 => {
+            // Emit the JPEG's NATIVE chroma format so no resampling is needed:
+            //   4:4:4 (full-res chroma)        → NV24
+            //   4:2:2 (half-width chroma)      → NV16
+            //   4:2:0 (quarter-res chroma)     → NV12
+            // The downsample path (avg_block in `write_nv12_rows`) then only
+            // runs for non-standard subsamplings (4:1:1, 4:1:0, mismatched
+            // Cb/Cr), which fall back to NV12.
+            let max_h = headers.header.max_h_samp as usize;
+            let max_v = headers.header.max_v_samp as usize;
+            let cb = comps[1].sampling;
+            let cr = comps[2].sampling;
+            // Both chroma components must share sampling for a clean native
+            // mapping; otherwise fall back to NV12.
+            if cb.h == cr.h && cb.v == cr.v && cb.h as usize > 0 && cb.v as usize > 0 {
+                let h_ratio = max_h / cb.h as usize;
+                let v_ratio = max_v / cb.v as usize;
+                return Ok(match (h_ratio, v_ratio) {
+                    (1, 1) => PixelFormat::Nv24, // 4:4:4
+                    (2, 1) => PixelFormat::Nv16, // 4:2:2
+                    (2, 2) => PixelFormat::Nv12, // 4:2:0
+                    _ => PixelFormat::Nv12,      // exotic → downsample to 4:2:0
+                });
+            }
+            Ok(PixelFormat::Nv12)
+        }
         n => Err(CodecError::Unsupported(
             UnsupportedFeature::JpegComponentCount {
                 components: n as u8,

@@ -29,6 +29,11 @@ pub enum PixelFormat {
     PlanarRgb,
     /// Planar RGBA, channels-first [4, H, W]
     PlanarRgba,
+    /// Semi-planar YUV 4:4:4 [H*2, W] or multiplane [H, W] + [H, W].
+    /// Full-resolution chroma: Y plane (H rows) + interleaved Cb/Cr plane
+    /// (H rows). Added last to keep the existing `#[repr(u8)]` discriminants
+    /// (and any serialized values) stable.
+    Nv24,
 }
 
 /// Memory layout category.
@@ -52,6 +57,7 @@ const FOURCC_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
 const FOURCC_VYUY: u32 = u32::from_le_bytes(*b"VYUY");
 const FOURCC_NV12: u32 = u32::from_le_bytes(*b"NV12");
 const FOURCC_NV16: u32 = u32::from_le_bytes(*b"NV16");
+const FOURCC_NV24: u32 = u32::from_le_bytes(*b"NV24");
 
 impl PixelFormat {
     /// Returns the number of channels for this pixel format.
@@ -63,7 +69,7 @@ impl PixelFormat {
         match self {
             Self::Rgb | Self::PlanarRgb => 3,
             Self::Rgba | Self::Bgra | Self::PlanarRgba => 4,
-            Self::Grey | Self::Nv12 | Self::Nv16 => 1,
+            Self::Grey | Self::Nv12 | Self::Nv16 | Self::Nv24 => 1,
             Self::Yuyv | Self::Vyuy => 2,
         }
     }
@@ -75,14 +81,14 @@ impl PixelFormat {
                 PixelLayout::Packed
             }
             Self::PlanarRgb | Self::PlanarRgba => PixelLayout::Planar,
-            Self::Nv12 | Self::Nv16 => PixelLayout::SemiPlanar,
+            Self::Nv12 | Self::Nv16 | Self::Nv24 => PixelLayout::SemiPlanar,
         }
     }
 
     /// The tensor shape for this format at `width`×`height`, or `None` if the
     /// dimensions are invalid for the format, or the format is an unsupported
-    /// semi-planar variant (any `SemiPlanar` variant other than `Nv12` and
-    /// `Nv16`).
+    /// semi-planar variant (any `SemiPlanar` variant other than `Nv12`,
+    /// `Nv16`, and `Nv24`).
     ///
     /// Odd dimensions are supported with one asymmetry. The combined-plane
     /// height for NV12 is `height + ceil(height / 2)` (luma rows + chroma rows),
@@ -103,8 +109,14 @@ impl PixelFormat {
             PixelLayout::SemiPlanar => {
                 let even_width = width.next_multiple_of(2);
                 let total_h = match self {
+                    // Combined-plane height in W-wide rows:
+                    //   NV12 (4:2:0): Y (H) + interleaved UV (H/2 rows of W) = 3H/2
+                    //   NV16 (4:2:2): Y (H) + interleaved UV (H rows of W)   = 2H
+                    //   NV24 (4:4:4): Y (H) + interleaved UV (2H rows of W)  = 3H
+                    // (the UV plane is W bytes/row for NV12·NV16 and 2W for NV24).
                     PixelFormat::Nv12 => height + height.div_ceil(2),
                     PixelFormat::Nv16 => height * 2,
+                    PixelFormat::Nv24 => height * 3,
                     _ => return None,
                 };
                 Some(vec![total_h, even_width])
@@ -114,7 +126,10 @@ impl PixelFormat {
 
     /// Returns `true` if this format encodes YUV (luma/chroma) data.
     pub const fn is_yuv(&self) -> bool {
-        matches!(self, Self::Yuyv | Self::Vyuy | Self::Nv12 | Self::Nv16)
+        matches!(
+            self,
+            Self::Yuyv | Self::Vyuy | Self::Nv12 | Self::Nv16 | Self::Nv24
+        )
     }
 
     /// Returns `true` if this format includes an alpha channel.
@@ -134,6 +149,7 @@ impl PixelFormat {
             Self::Vyuy => FOURCC_VYUY,
             Self::Nv12 => FOURCC_NV12,
             Self::Nv16 => FOURCC_NV16,
+            Self::Nv24 => FOURCC_NV24,
             Self::PlanarRgb | Self::PlanarRgba => 0,
         }
     }
@@ -150,6 +166,7 @@ impl PixelFormat {
             FOURCC_VYUY => Some(Self::Vyuy),
             FOURCC_NV12 => Some(Self::Nv12),
             FOURCC_NV16 => Some(Self::Nv16),
+            FOURCC_NV24 => Some(Self::Nv24),
             _ => None,
         }
     }
@@ -187,6 +204,7 @@ mod tests {
         assert_eq!(PixelFormat::Vyuy.channels(), 2);
         assert_eq!(PixelFormat::Nv12.channels(), 1);
         assert_eq!(PixelFormat::Nv16.channels(), 1);
+        assert_eq!(PixelFormat::Nv24.channels(), 1);
         assert_eq!(PixelFormat::PlanarRgb.channels(), 3);
         assert_eq!(PixelFormat::PlanarRgba.channels(), 4);
     }
@@ -201,6 +219,7 @@ mod tests {
         assert_eq!(PixelFormat::Vyuy.layout(), PixelLayout::Packed);
         assert_eq!(PixelFormat::Nv12.layout(), PixelLayout::SemiPlanar);
         assert_eq!(PixelFormat::Nv16.layout(), PixelLayout::SemiPlanar);
+        assert_eq!(PixelFormat::Nv24.layout(), PixelLayout::SemiPlanar);
         assert_eq!(PixelFormat::PlanarRgb.layout(), PixelLayout::Planar);
         assert_eq!(PixelFormat::PlanarRgba.layout(), PixelLayout::Planar);
     }
@@ -213,6 +232,7 @@ mod tests {
         assert!(PixelFormat::Vyuy.is_yuv());
         assert!(PixelFormat::Nv12.is_yuv());
         assert!(PixelFormat::Nv16.is_yuv());
+        assert!(PixelFormat::Nv24.is_yuv());
         assert!(!PixelFormat::PlanarRgb.is_yuv());
     }
 
@@ -238,6 +258,7 @@ mod tests {
             PixelFormat::Vyuy,
             PixelFormat::Nv12,
             PixelFormat::Nv16,
+            PixelFormat::Nv24,
         ] {
             let fcc = fmt.to_fourcc();
             assert_ne!(fcc, 0, "{fmt:?} should have a fourcc code");

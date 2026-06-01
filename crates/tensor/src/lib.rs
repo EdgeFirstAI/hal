@@ -1789,6 +1789,13 @@ where
                             shape[0]
                         )));
                     }
+                    // NV24 (4:4:4): combined-plane height is 3H (Y + 2H chroma).
+                    PixelFormat::Nv24 if !shape[0].is_multiple_of(3) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV24 contiguous shape[0] must be a multiple of 3 (= 3H), got {}",
+                            shape[0]
+                        )));
+                    }
                     _ => {}
                 }
             }
@@ -1876,6 +1883,7 @@ where
                     match fmt {
                         PixelFormat::Nv12 => Some(shape[0] * 2 / 3),
                         PixelFormat::Nv16 => Some(shape[0] / 2),
+                        PixelFormat::Nv24 => Some(shape[0] / 3),
                         _ => None,
                     }
                 }
@@ -1932,9 +1940,14 @@ where
                     )));
                 }
             }
+            // NV24's chroma plane is full-resolution (2×-wide interleaved UV),
+            // which the equal-width plane check above doesn't model. Multiplane
+            // NV24 is unused (the JPEG decoder emits a contiguous NV24 buffer),
+            // so it's not supported here yet.
             _ => {
                 return Err(Error::InvalidArgument(format!(
-                    "from_planes only supports NV12 and NV16, got {format:?}"
+                    "from_planes only supports NV12 and NV16 (NV24 multiplane not yet \
+                     supported — use a contiguous NV24 tensor), got {format:?}"
                 )));
             }
         }

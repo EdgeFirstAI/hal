@@ -177,6 +177,21 @@ pub fn decode_image(
                 img_w,
                 img_h,
             );
+        } else if output_format == PixelFormat::Nv16 || output_format == PixelFormat::Nv24 {
+            // Native (matching-subsampling) chroma: a direct interleave copy of
+            // the IDCT chroma buffers — no `avg_block` resampling.
+            write_nv16_nv24_rows(
+                hdr,
+                &scratch.component_bufs,
+                mcus_x,
+                dst,
+                dst_stride,
+                y_start,
+                num_rows,
+                img_w,
+                img_h,
+                output_format,
+            );
         } else {
             return Err(CodecError::UnsupportedFormat(output_format));
         }
@@ -297,6 +312,66 @@ fn write_nv12_rows(
             );
             dst[uv_off + ocx * 2] = cbv;
             dst[uv_off + ocx * 2 + 1] = crv;
+        }
+    }
+}
+
+/// Write NV16 (4:2:2) or NV24 (4:4:4) output: full-resolution Y plane plus an
+/// interleaved Cb/Cr plane at the source's NATIVE chroma resolution — a direct
+/// copy, no averaging. The codec only selects these formats when the JPEG's
+/// chroma matches (NV16 ⇔ 4:2:2, NV24 ⇔ 4:4:4), so the source chroma buffers
+/// are already at the output resolution.
+///
+/// Contiguous layout in the `[total_h, dst_stride]` buffer:
+///   * NV16: Y (`img_h` rows) + interleaved Cb/Cr (`img_h` rows, `dst_stride`
+///     bytes each → one buffer row per chroma row).
+///   * NV24: Y (`img_h` rows) + interleaved Cb/Cr (`img_h` rows of `2*img_w`
+///     bytes → `2*dst_stride` bytes per chroma row, i.e. two buffer rows).
+#[allow(clippy::too_many_arguments)]
+fn write_nv16_nv24_rows(
+    hdr: &crate::jpeg::types::ImageHeader,
+    comp_bufs: &[Vec<u8>],
+    mcus_x: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    y_start: usize,
+    num_rows: usize,
+    img_w: usize,
+    img_h: usize,
+    output_format: PixelFormat,
+) {
+    let y_comp = &hdr.components[0];
+    let cb = &hdr.components[1];
+    let y_stride = mcus_x * y_comp.sampling.h as usize * 8;
+    let c_stride = mcus_x * cb.sampling.h as usize * 8;
+
+    // Y plane — full-resolution copy.
+    for row in 0..num_rows {
+        let s = row * y_stride;
+        let d = (y_start + row) * dst_stride;
+        dst[d..d + img_w].copy_from_slice(&comp_bufs[0][s..s + img_w]);
+    }
+
+    // Chroma plane parameters by output format. Both keep full-height chroma
+    // (one chroma row per luma row); they differ in horizontal resolution and
+    // therefore in the per-chroma-row byte pitch within the contiguous buffer.
+    let (chroma_cols, uv_row_stride) = match output_format {
+        // 4:2:2: half-width chroma, `dst_stride` bytes per row.
+        PixelFormat::Nv16 => (img_w.div_ceil(2), dst_stride),
+        // 4:4:4: full-width chroma, `2*img_w` bytes per row (spans two buffer rows).
+        _ => (img_w, dst_stride * 2),
+    };
+    let uv_plane_offset = img_h * dst_stride;
+
+    let cb_buf = &comp_bufs[1];
+    let cr_buf = &comp_bufs[2];
+    for row in 0..num_rows {
+        let oy = y_start + row; // chroma row == luma row (full-height chroma)
+        let src = row * c_stride;
+        let uv_off = uv_plane_offset + oy * uv_row_stride;
+        for ocx in 0..chroma_cols {
+            dst[uv_off + ocx * 2] = cb_buf[src + ocx];
+            dst[uv_off + ocx * 2 + 1] = cr_buf[src + ocx];
         }
     }
 }

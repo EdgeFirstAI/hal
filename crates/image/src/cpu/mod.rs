@@ -199,6 +199,10 @@ impl CPUProcessor {
                 | (Nv16, Rgb)
                 | (Nv16, Rgba)
                 | (Nv16, Bgra)
+                | (Nv24, Rgb)
+                | (Nv24, Rgba)
+                | (Nv24, Grey)
+                | (Nv24, Bgra)
                 | (Yuyv, Rgb)
                 | (Yuyv, Rgba)
                 | (Yuyv, Grey)
@@ -306,6 +310,9 @@ impl CPUProcessor {
             // the following converts are added for use in testing
             (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst),
             (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst),
+            (Nv24, Rgb) => Self::convert_nv24_to_rgb(src, dst),
+            (Nv24, Rgba) => Self::convert_nv24_to_rgba(src, dst),
+            (Nv24, Grey) => Self::convert_nv24_to_grey(src, dst),
             (PlanarRgb, Rgb) => Self::convert_8bps_to_rgb(src, dst),
             (PlanarRgb, Rgba) => Self::convert_8bps_to_rgba(src, dst),
             (PlanarRgba, Rgb) => Self::convert_prgba_to_rgb(src, dst),
@@ -319,6 +326,10 @@ impl CPUProcessor {
             }
             (Nv16, Bgra) => {
                 Self::convert_nv16_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (Nv24, Bgra) => {
+                Self::convert_nv24_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Yuyv, Bgra) => {
@@ -590,6 +601,10 @@ impl CPUProcessor {
             (Nv12, Nv16) => Rgba,
             (Nv12, PlanarRgb) => Rgb,
             (Nv12, PlanarRgba) => Rgba,
+            (Nv16, PlanarRgb) => Rgb,
+            (Nv16, PlanarRgba) => Rgba,
+            (Nv24, PlanarRgb) => Rgb,
+            (Nv24, PlanarRgba) => Rgba,
             (Yuyv, Rgb) => Rgb,
             (Yuyv, Rgba) => Rgba,
             (Yuyv, Grey) => Grey,
@@ -635,6 +650,10 @@ impl CPUProcessor {
             (Nv16, Rgb) => Rgb,
             (Nv16, Rgba) => Rgba,
             (Nv16, Bgra) => Rgba,
+            (Nv24, Rgb) => Rgb,
+            (Nv24, Rgba) => Rgba,
+            (Nv24, Grey) => Grey,
+            (Nv24, Bgra) => Rgba,
             (PlanarRgb, Rgb) => Rgb,
             (PlanarRgb, Rgba) => Rgb,
             (PlanarRgb, Bgra) => Rgb,

@@ -5796,6 +5796,39 @@ mod image_tests {
     }
 
     #[test]
+    fn test_nv24_to_rgb_cpu() {
+        // NV24 (4:4:4) at 8×4: contiguous buffer is [4*3, 8] = [12, 8] — Y plane
+        // (4 rows) + full-res interleaved UV plane (8 rows = 2H, 2W bytes per
+        // chroma row). Neutral-grey fill (Y=U=V=128) must convert to uniform
+        // grey RGB, exercising the 2× UV stride and shape[0]/3 height recovery.
+        let src = TensorDyn::image(8, 4, PixelFormat::Nv24, DType::U8, None).unwrap();
+        assert_eq!(src.shape(), &[12, 8]);
+        assert_eq!((src.width(), src.height()), (Some(8), Some(4)));
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+
+        let dst = TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut cpu_converter = CPUProcessor::new();
+        let (result, _src, dst) = convert_img(
+            &mut cpu_converter,
+            src,
+            dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        );
+        result.unwrap();
+
+        assert_eq!((dst.width(), dst.height()), (Some(8), Some(4)));
+        let map = dst.as_u8().unwrap().map().unwrap();
+        for (i, &b) in map.as_slice().iter().enumerate() {
+            assert!(
+                (b as i16 - 128).abs() <= 2,
+                "pixel byte {i} = {b}, expected ~128 for neutral-grey NV24"
+            );
+        }
+    }
+
+    #[test]
     fn test_nv12_to_rgb_cpu() {
         let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
         let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
