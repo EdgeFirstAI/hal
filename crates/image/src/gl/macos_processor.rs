@@ -48,7 +48,7 @@ use super::platform::macos::MacosPlatform;
 use super::Egl;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use khronos_egl as egl;
 use log::debug;
 use std::collections::HashMap;
@@ -507,6 +507,11 @@ pub struct MacosGlProcessor {
     /// independent and easy to reason about. ANGLE's pbuffers are
     /// per-display, not per-context, so this is sound.
     pbuf_cache: Mutex<HashMap<PbufferCacheKey, egl::Surface>>,
+    /// Reusable full-resolution RGBA8 IOSurface for the two-pass YUV→PlanarRgb
+    /// path (`(W, H, tensor)`). Pass 1 renders the YUV source into it; pass 2
+    /// (`convert_rgba8_to_planar_float`) reads it with letterbox/resize. Cached
+    /// by dimensions so the steady-state hot loop never reallocates.
+    intermediate_rgba: Mutex<Option<(usize, usize, TensorDyn)>>,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
@@ -816,8 +821,55 @@ impl MacosGlProcessor {
                 src_tex,
                 dst_tex,
                 pbuf_cache: Mutex::new(HashMap::new()),
+                intermediate_rgba: Mutex::new(None),
             })
         }
+    }
+
+    /// Two-pass GPU path for the profiler's hot loop: a semi-planar YUV source
+    /// (`NV12`/`NV16`/`NV24`, R8 IOSurface) → `PlanarRgb` F16, fully on the GPU.
+    ///
+    /// Pass 1 samples the YUV source and renders full-resolution RGBA8 into a
+    /// cached intermediate IOSurface (reusing the verified `convert_yuyv_to_rgba`
+    /// render with the format-selected shader). Pass 2 runs the already-verified
+    /// `convert_rgba8_to_planar_float`, which applies the letterbox crop/resize
+    /// and packs into the RGBA16F-packed PlanarRgb F16 destination. Both passes
+    /// are zero-copy IOSurface↔IOSurface.
+    fn convert_nv_to_planar_float(
+        &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        src_fmt: PixelFormat,
+        crop: crate::Crop,
+    ) -> Result<()> {
+        let w = src
+            .width()
+            .ok_or_else(|| Error::InvalidShape("src width".into()))?;
+        let h = src
+            .height()
+            .ok_or_else(|| Error::InvalidShape("src height".into()))?;
+
+        // Reuse (or allocate) the full-res RGBA8 intermediate IOSurface.
+        let mut slot = self
+            .intermediate_rgba
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !matches!(*slot, Some((iw, ih, _)) if iw == w && ih == h) {
+            let interm = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                .map_err(|e| {
+                    Error::NotSupported(format!(
+                        "convert_nv_to_planar_float: RGBA8 intermediate IOSurface alloc \
+                         {w}x{h} failed: {e}"
+                    ))
+                })?;
+            *slot = Some((w, h, interm));
+        }
+        let interm = &mut slot.as_mut().unwrap().2;
+
+        // Pass 1: YUV(R8) → RGBA8, full-resolution, no crop.
+        self.convert_yuyv_to_rgba(src, interm, src_fmt, PixelFormat::Rgba)?;
+        // Pass 2: RGBA8 → PlanarRgb F16 with letterbox/resize.
+        self.convert_rgba8_to_planar_float(interm, dst, crop)
     }
 
     /// RGBA8 IOSurface source → PlanarRgb F16 IOSurface destination.
@@ -1102,6 +1154,10 @@ impl MacosGlProcessor {
                 | (PixelFormat::Nv16, PixelFormat::Rgba)
                 | (PixelFormat::Nv24, PixelFormat::Rgba)
                 | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
+                // Two-pass YUV → PlanarRgb F16 (the profiler's preprocess).
+                | (PixelFormat::Nv12, PixelFormat::PlanarRgb)
+                | (PixelFormat::Nv16, PixelFormat::PlanarRgb)
+                | (PixelFormat::Nv24, PixelFormat::PlanarRgb)
         )
     }
 
@@ -1404,6 +1460,13 @@ impl ImageProcessorTrait for MacosGlProcessor {
             (PixelFormat::Rgba, PixelFormat::PlanarRgb, DType::F16) => {
                 self.convert_rgba8_to_planar_float(src, dst, crop)
             }
+            // Semi-planar YUV → PlanarRgb F16: two GPU passes (YUV→RGBA8 then
+            // the verified RGBA8→PlanarRgb F16 with letterbox/resize).
+            (
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+            ) => self.convert_nv_to_planar_float(src, dst, src_fmt, crop),
             (PixelFormat::Rgba, PixelFormat::PlanarRgb, other) => {
                 Err(Error::NotSupported(format!(
                     "MacosGlProcessor: Rgba → PlanarRgb requires F16 destination on the \

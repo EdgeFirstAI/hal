@@ -322,11 +322,13 @@ fn write_nv12_rows(
 /// chroma matches (NV16 ⇔ 4:2:2, NV24 ⇔ 4:4:4), so the source chroma buffers
 /// are already at the output resolution.
 ///
-/// Contiguous layout in the `[total_h, dst_stride]` buffer:
-///   * NV16: Y (`img_h` rows) + interleaved Cb/Cr (`img_h` rows, `dst_stride`
-///     bytes each → one buffer row per chroma row).
-///   * NV24: Y (`img_h` rows) + interleaved Cb/Cr (`img_h` rows of `2*img_w`
-///     bytes → `2*dst_stride` bytes per chroma row, i.e. two buffer rows).
+/// The destination uses the `[total_h, even_width]` grid (even_width =
+/// `ceil(img_w/2)*2`), where each grid row is `dst_stride` bytes (≥ even_width;
+/// padded for IOSurface). The interleaved UV plane starts after the `img_h`
+/// luma rows. A chroma row is `even_width` bytes for NV16 (one grid row) and
+/// `2*even_width` bytes for NV24 (two grid rows). Each UV byte is placed by
+/// mapping its linear offset to a `(grid_row, col)` cell, so NV24's two-row
+/// wrap is correct for any `dst_stride` (matches the GPU R8 sampling shader).
 #[allow(clippy::too_many_arguments)]
 fn write_nv16_nv24_rows(
     hdr: &crate::jpeg::types::ImageHeader,
@@ -352,26 +354,26 @@ fn write_nv16_nv24_rows(
         dst[d..d + img_w].copy_from_slice(&comp_bufs[0][s..s + img_w]);
     }
 
-    // Chroma plane parameters by output format. Both keep full-height chroma
-    // (one chroma row per luma row); they differ in horizontal resolution and
-    // therefore in the per-chroma-row byte pitch within the contiguous buffer.
-    let (chroma_cols, uv_row_stride) = match output_format {
-        // 4:2:2: half-width chroma, `dst_stride` bytes per row.
-        PixelFormat::Nv16 => (img_w.div_ceil(2), dst_stride),
-        // 4:4:4: full-width chroma, `2*img_w` bytes per row (spans two buffer rows).
-        _ => (img_w, dst_stride * 2),
+    let even_width = img_w.next_multiple_of(2);
+    // Both keep full-height chroma (one chroma row per luma row); they differ in
+    // horizontal resolution and the per-chroma-row byte pitch in grid units.
+    let (chroma_cols, bytes_per_crow) = match output_format {
+        PixelFormat::Nv16 => (img_w.div_ceil(2), even_width), // 4:2:2
+        _ => (img_w, even_width * 2),                         // 4:4:4
     };
     let uv_plane_offset = img_h * dst_stride;
+    // Map a linear UV-plane byte to its physical offset in the strided grid.
+    let pos = |lb: usize| uv_plane_offset + (lb / even_width) * dst_stride + (lb % even_width);
 
     let cb_buf = &comp_bufs[1];
     let cr_buf = &comp_bufs[2];
     for row in 0..num_rows {
         let oy = y_start + row; // chroma row == luma row (full-height chroma)
         let src = row * c_stride;
-        let uv_off = uv_plane_offset + oy * uv_row_stride;
         for ocx in 0..chroma_cols {
-            dst[uv_off + ocx * 2] = cb_buf[src + ocx];
-            dst[uv_off + ocx * 2 + 1] = cr_buf[src + ocx];
+            let lb = oy * bytes_per_crow + ocx * 2;
+            dst[pos(lb)] = cb_buf[src + ocx];
+            dst[pos(lb + 1)] = cr_buf[src + ocx];
         }
     }
 }

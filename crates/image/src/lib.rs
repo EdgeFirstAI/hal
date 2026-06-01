@@ -4977,6 +4977,75 @@ mod image_tests {
         }
     }
 
+    /// Two-pass GPU chain: NV12 (R8 IOSurface) → PlanarRgb F16, the profiler's
+    /// preprocess. Verifies the chained `convert_nv_to_planar_float`
+    /// (NV12→RGBA8 then the verified RGBA8→PlanarRgb F16) executes on ANGLE and
+    /// produces a sane F16 planar result: a neutral-grey NV12 input (Y=U=V=128,
+    /// BT.601 full ⇒ RGB≈0.5) must yield all three planes ≈0.5 (half-float).
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_to_planar_f16_two_pass_opengl_macos() {
+        let mut gpu = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let (w, h) = (64usize, 64usize);
+        let src = match TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
+                return;
+            }
+        };
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128); // Y=U=V=128
+
+        let dst =
+            match TensorDyn::image(w, h, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma))
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} — F16 PlanarRgb IOSurface: {e:?}", function!());
+                    return;
+                }
+            };
+        let mut dst = dst;
+        // Call convert directly (the convert_img helper restores u8 only).
+        if let Err(e) = ImageProcessorTrait::convert(
+            &mut gpu,
+            &src,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        ) {
+            // GL_EXT_color_buffer_half_float may be absent on some configs; the
+            // RGBA8 pass-1 + F16 pass-2 path then can't render. Skip rather than
+            // fail on a capability gap (the same policy as the F16 path tests).
+            eprintln!("SKIPPED: {} — NV12→PlanarRgb F16 not available ({e:?})", function!());
+            return;
+        }
+        let dt = dst.as_f16().expect("dst is F16 PlanarRgb");
+        let map = dt.map().unwrap();
+        let vals = map.as_slice();
+        // Neutral grey → ~0.5 in every plane. Allow generous tolerance for the
+        // mediump YUV math + half-float rounding.
+        let mut checked = 0usize;
+        for &v in vals.iter() {
+            let f = f32::from(v);
+            assert!(
+                (0.40..=0.60).contains(&f),
+                "planar F16 value {f} not ~0.5 for neutral-grey NV12"
+            );
+            checked += 1;
+        }
+        assert!(checked >= w * h * 3, "expected >= 3 planes of samples, got {checked}");
+    }
+
     /// Step-2 verification: NV12/NV16/NV24 (R8 IOSurface) → RGBA on the GPU
     /// must match the CPU `yuv` kernels within shader rounding. Fills an
     /// IOSurface source and a Mem source from the same logical YUV pattern
