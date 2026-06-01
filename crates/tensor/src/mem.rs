@@ -8,11 +8,9 @@ use crate::{
 use log::trace;
 use num_traits::Num;
 use std::{
-    ffi::c_void,
     fmt,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 #[derive(Debug)]
 pub struct MemTensor<T>
@@ -21,7 +19,16 @@ where
 {
     pub name: String,
     pub shape: Vec<usize>,
-    pub data: Vec<T>,
+    /// Shared, fixed-size backing allocation. An owned tensor holds a
+    /// refcount-1 `Arc`; zero-copy sub-region views clone it to co-own the
+    /// parent's buffer. The allocation is never resized after creation
+    /// (`reshape`/`set_logical_shape` only adjust the logical `shape` within
+    /// capacity), so the base pointer is stable for the lifetime of the `Arc`.
+    data: Arc<Vec<T>>,
+    /// Byte offset into `data` where this tensor's logical window begins. `0`
+    /// for whole-buffer tensors; non-zero for sub-region views. Mirrors
+    /// `DmaTensor::mmap_offset`.
+    offset: usize,
     identity: crate::BufferIdentity,
 }
 
@@ -51,9 +58,67 @@ where
         Ok(MemTensor {
             name: name.unwrap_or("mem_tensor").to_owned(),
             shape: shape.to_vec(),
-            data: vec![T::zero(); cap_elems],
+            data: Arc::new(vec![T::zero(); cap_elems]),
+            offset: 0,
             identity: crate::BufferIdentity::new(),
         })
+    }
+
+    /// Create a zero-copy sub-region view that shares `parent`'s allocation.
+    ///
+    /// The view maps the window `[offset_bytes, offset_bytes + logical_size)`
+    /// measured from `parent`'s own logical start, where
+    /// `logical_size = shape.product() * size_of::<T>()`. N such views into one
+    /// parent share the buffer (no copy) and can be written independently.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
+    ///   `align_of::<T>()` (required for the pointer cast in `MemMap`).
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the parent
+    ///   allocation.
+    pub fn view(parent: &MemTensor<T>, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        if elem > 1 && !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "MemTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let logical: usize = shape.iter().product::<usize>() * elem;
+        // The view is positioned relative to this tensor's own window, so a
+        // sub-view of a sub-view composes correctly.
+        let abs_offset = parent
+            .offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let total = parent.data.len() * elem;
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > total {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: total,
+            });
+        }
+        Ok(MemTensor {
+            name: parent.name.clone(),
+            shape: shape.to_vec(),
+            data: Arc::clone(&parent.data),
+            offset: abs_offset,
+            // A sub-view is the *same* buffer: share the parent's identity so
+            // identity-keyed caches (e.g. the GL EGLImage cache) treat the
+            // windows as one buffer distinguished by offset, not as unrelated
+            // allocations.
+            identity: parent.identity.clone(),
+        })
+    }
+
+    /// Set the byte offset of the logical window into the backing allocation.
+    /// Validated against the allocation at `map()` time.
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
     }
 }
 
@@ -77,7 +142,8 @@ where
         Ok(MemTensor {
             name,
             shape: shape.to_vec(),
-            data,
+            data: Arc::new(data),
+            offset: 0,
             identity: crate::BufferIdentity::new(),
         })
     }
@@ -126,12 +192,33 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let mem_ptr = MemPtr(
-            NonNull::new(self.data.as_ptr() as *mut c_void)
-                .ok_or(Error::InvalidSize(self.size()))?,
-        );
+        let elem = std::mem::size_of::<T>();
+        // Validate the offset window fits the backing allocation (mirrors
+        // DmaMap::new_internal's bounds + alignment checks).
+        let logical = self.shape.iter().product::<usize>() * elem;
+        let total = self.data.len() * elem;
+        let end = self
+            .offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if end > total {
+            return Err(Error::InsufficientCapacity {
+                needed: end,
+                capacity: total,
+            });
+        }
+        if elem > 1 && !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "MemMap: offset {} not aligned to align_of::<T>()={}",
+                self.offset,
+                std::mem::align_of::<T>()
+            )));
+        }
         Ok(TensorMap::Mem(MemMap {
-            ptr: Arc::new(Mutex::new(mem_ptr)),
+            // Keep the backing allocation alive for the map's lifetime so the
+            // map stays valid even if the source tensor is dropped first.
+            backing: Arc::clone(&self.data),
+            offset: self.offset,
             shape: self.shape.clone(),
             _marker: std::marker::PhantomData,
         }))
@@ -142,7 +229,9 @@ where
     }
 
     fn capacity_bytes(&self) -> usize {
-        self.data.len() * std::mem::size_of::<T>()
+        // Capacity available to this tensor is the allocation minus its window
+        // start, so `set_logical_shape` stays bounded for sub-region views.
+        self.data.len() * std::mem::size_of::<T>() - self.offset
     }
 
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
@@ -164,7 +253,12 @@ pub struct MemMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    ptr: Arc<Mutex<MemPtr>>,
+    /// Keep-alive of the backing allocation. Owning the `Arc` (rather than a
+    /// raw pointer) ensures the buffer outlives the map even if the source
+    /// tensor is dropped first.
+    backing: Arc<Vec<T>>,
+    /// Byte offset of the mapped window into `backing`.
+    offset: usize,
     shape: Vec<usize>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -189,18 +283,6 @@ where
     }
 }
 
-#[derive(Debug)]
-struct MemPtr(NonNull<c_void>);
-impl Deref for MemPtr {
-    type Target = NonNull<c_void>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl Send for MemPtr {}
-
 impl<T> TensorMapTrait<T> for MemMap<T>
 where
     T: Num + Clone + fmt::Debug,
@@ -214,13 +296,19 @@ where
     }
 
     fn as_slice(&self) -> &[T] {
-        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+        // SAFETY: the window `[offset, offset + len*size_of::<T>())` was bounds-
+        // and alignment-checked in `MemTensor::map()`; `backing` keeps the
+        // allocation alive; the base pointer is stable (never reallocated).
+        let base = unsafe { (self.backing.as_ptr() as *const u8).add(self.offset) as *const T };
+        unsafe { std::slice::from_raw_parts(base, self.len()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
-        let ptr = self.ptr.lock().expect("Failed to lock MemMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+        // SAFETY: as above. Distinct sub-region views address non-overlapping
+        // windows of the shared allocation, so the aliased `&mut` access is
+        // sound at the byte level — the same contract as `DmaMap`.
+        let base = unsafe { (self.backing.as_ptr() as *const u8).add(self.offset) as *mut T };
+        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
     }
 }
 

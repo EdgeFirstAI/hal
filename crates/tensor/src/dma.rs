@@ -369,6 +369,46 @@ where
         )
     }
 
+    /// Create a zero-copy sub-region view sharing this buffer's fd and
+    /// `BufferIdentity`, positioned at `offset_bytes` from this tensor's own
+    /// window with logical `shape`. The view maps `[abs_offset, abs_offset +
+    /// shape.product()*size_of::<T>())` of the shared DMA-BUF.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is mis-aligned for `T`.
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the buffer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        if elem > 1 && !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "DmaTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = self
+            .mmap_offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * elem;
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > self.buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.buf_size,
+            });
+        }
+        // try_clone preserves fd, identity and buf_size; override the logical
+        // shape and absolute offset for this window.
+        let mut v = self.try_clone()?;
+        v.shape = shape.to_vec();
+        v.mmap_offset = abs_offset;
+        Ok(v)
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         let fd = self.clone_fd()?;
         // Preserve the imported/owned distinction: imported fds never get a
