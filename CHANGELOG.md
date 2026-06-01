@@ -163,6 +163,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during bring-up gave no path to the actual root cause; the
   enriched message names every input that the kernel rejected.
 
+### Fixed
+
+- PBO-backed tensors now implement a capacity-based `set_logical_shape` (and
+  `capacity_bytes`), matching `Mem`/`Shm`/`DMA`/`IOSurface`. Previously PBO fell
+  back to the strict-`reshape` default (exact element match), so an oversized
+  reusable pool could not be `configure_image`d to a smaller image. This broke
+  the native-chroma decode pool on PBO-backed hosts (e.g. Linux PCs / Jetson
+  without `/dev/dma_heap`), where reconfiguring the `3·H` GREY pool to a smaller
+  `NV12`/`NV16`/`NV24` shape failed with a `ShapeMismatch`. DMA-backed pools were
+  unaffected.
+
 ### Removed
 
 - **Breaking:** `DecodeOptions` and the `opts` parameter on all
