@@ -355,11 +355,10 @@ fn unsupported_progressive_jpeg_returns_typed_variant() {
 }
 
 #[test]
-fn odd_width_nv12_jpeg_is_rejected() {
-    // jaguar.jpg is 789×384 — odd width. NV12 supports odd *height* (via the
-    // `H + ceil(H/2)` combined-plane height) but not odd width yet: the chroma
-    // plane would need an even-padded row stride. `peek_info` still reports the
-    // true dims, and the decode is refused up front with a specific message.
+fn odd_width_nv12_jpeg_decodes_with_even_buffer_width() {
+    // jaguar.jpg is 789×384 — odd width. NV12's buffer width is rounded up to
+    // even (790) so the interleaved chroma plane is byte-aligned; the true odd
+    // width is reported in `ImageInfo` and trimmed by a downstream convert crop.
     let jpeg = testdata("jaguar.jpg");
     let info = peek_info(&jpeg).unwrap();
     assert_eq!((info.width, info.height), (789, 384));
@@ -369,13 +368,18 @@ fn odd_width_nv12_jpeg_is_rejected() {
         "colour JPEG should report native NV12 format"
     );
 
+    // Allocating at the odd width yields an even-width (790) NV12 buffer.
     let mut tensor =
-        Tensor::<u8>::image(790, 384, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        Tensor::<u8>::image(789, 384, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    assert_eq!(tensor.width(), Some(790), "buffer width is rounded to even");
+    assert_eq!(tensor.height(), Some(384));
+
     let mut decoder = ImageDecoder::new();
-    let result = tensor.load_image(&mut decoder, &jpeg);
-    let err = result.expect_err("odd-width NV12 JPEG decode should be rejected");
-    assert!(
-        err.to_string().contains("odd width"),
-        "error should name the odd-width limitation, got: {err}"
-    );
+    let info = tensor
+        .load_image(&mut decoder, &jpeg)
+        .expect("odd-width NV12 JPEG should decode into the even-width buffer");
+    // ImageInfo carries the true odd width; the tensor buffer stays even.
+    assert_eq!((info.width, info.height), (789, 384));
+    assert_eq!(tensor.width(), Some(790));
+    assert_eq!(tensor.height(), Some(384));
 }

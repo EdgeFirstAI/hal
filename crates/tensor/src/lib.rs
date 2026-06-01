@@ -1784,6 +1784,11 @@ where
     /// format layout; fails with `Error::InsufficientCapacity` if the
     /// allocation cannot hold `width`×`height` in `format`, or
     /// `Error::InvalidArgument` if the dimensions are invalid for the format.
+    ///
+    /// For NV12/NV16 the buffer width is rounded up to even (a chroma-plane
+    /// interleaving requirement); the true odd width is reported by the decoder
+    /// in `ImageInfo` and trimmed by a `convert()` crop. See
+    /// [`PixelFormat::image_shape`].
     pub fn configure_image(
         &mut self,
         width: usize,
@@ -2645,11 +2650,16 @@ mod image_tests {
             PixelFormat::Nv12.image_shape(640, 481),
             Some(vec![722, 640])
         );
-        // Odd width is carried in the logical shape (chroma padding is a stride
-        // concern handled at allocation, not here).
+        // Odd width rounds up to an even buffer width (641 → 642) so the chroma
+        // plane is byte-aligned; the true width is reported out-of-band.
         assert_eq!(
             PixelFormat::Nv12.image_shape(641, 480),
-            Some(vec![720, 641])
+            Some(vec![720, 642])
+        );
+        // NV16 odd width rounds the same way.
+        assert_eq!(
+            PixelFormat::Nv16.image_shape(641, 480),
+            Some(vec![960, 642])
         );
         assert_eq!(
             PixelFormat::PlanarRgb.image_shape(640, 480),

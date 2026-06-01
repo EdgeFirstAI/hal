@@ -84,23 +84,30 @@ impl PixelFormat {
     /// semi-planar variant (any `SemiPlanar` variant other than `Nv12` and
     /// `Nv16`).
     ///
-    /// Odd dimensions are supported. The combined-plane height for NV12 is
-    /// `height + ceil(height / 2)` (luma rows + chroma rows), which equals the
-    /// classic `height * 3 / 2` for even heights and stays exact for odd ones —
-    /// e.g. 483 → 725 rows (483 luma + 242 chroma). Odd *width* is carried in
-    /// the logical shape; the per-row padding chroma interleaving needs is
-    /// expressed separately via the tensor's row stride.
+    /// Odd dimensions are supported with one asymmetry. The combined-plane
+    /// height for NV12 is `height + ceil(height / 2)` (luma rows + chroma rows),
+    /// which equals the classic `height * 3 / 2` for even heights and stays
+    /// exact for odd ones — e.g. 483 → 725 rows (483 luma + 242 chroma).
+    ///
+    /// The semi-planar **width is rounded up to even**: the interleaved chroma
+    /// plane stores one `(U, V)` pair per two luma columns, so an odd width has
+    /// no whole-byte representation for its final column. The rounded width
+    /// pads the buffer by one column; the true odd image width is reported by
+    /// the decoder in `ImageInfo` and trimmed by a `convert()` crop. (Strided
+    /// odd-width buffers would avoid the pad but cannot be CPU-mapped on
+    /// non-Linux platforms, so the even buffer width is the portable choice.)
     pub fn image_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
         match self.layout() {
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
             PixelLayout::SemiPlanar => {
+                let even_width = width.next_multiple_of(2);
                 let total_h = match self {
                     PixelFormat::Nv12 => height + height.div_ceil(2),
                     PixelFormat::Nv16 => height * 2,
                     _ => return None,
                 };
-                Some(vec![total_h, width])
+                Some(vec![total_h, even_width])
             }
         }
     }

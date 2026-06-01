@@ -5761,11 +5761,13 @@ mod image_tests {
 
     #[test]
     fn test_nv12_odd_height_to_rgb_cpu() {
-        // Even width, odd height (8×5) — the reported failure class (e.g.
-        // 640×483). The contiguous NV12 buffer is `[5 + ceil(5/2), 8]` = `[8, 8]`
-        // (5 luma rows + 3 chroma rows). A neutral-grey fill (Y=U=V=128, BT.601
-        // full-range) must convert to a uniform grey RGB, exercising the
-        // odd-height row-count and the logical-height derivation in convert.
+        // Odd height (even width) — the logical-odd case, e.g. 640×483. The
+        // contiguous NV12 buffer is `[5 + ceil(5/2), 8]` = `[8, 8]` (5 luma rows
+        // + 3 chroma rows). A neutral-grey fill (Y=U=V=128, BT.601 full-range)
+        // must convert to a uniform grey RGB, exercising the odd-height
+        // chroma-row count and the logical-height derivation in convert.
+        // (Odd *width* is rounded to an even buffer at allocation, so it is
+        // covered by the decode integration tests rather than here.)
         let src = TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, None).unwrap();
         assert_eq!(src.shape(), &[8, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(5)));

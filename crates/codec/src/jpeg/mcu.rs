@@ -262,7 +262,10 @@ fn write_nv12_rows(
     // UV plane (4:2:0). The component buffer's local row 0 corresponds to the
     // global source-chroma row `band_src0`.
     let uv_plane_offset = img_h * dst_stride;
-    let chroma_w = img_w / 2;
+    // `ceil(img_w/2)` UV pairs per chroma row keeps the rightmost column for odd
+    // widths. The destination buffer width is rounded up to even, so the extra
+    // pair (`img_w + 1` bytes for odd `img_w`) stays within `dst_stride`.
+    let chroma_w = img_w.div_ceil(2);
     let band_src0 = (y_start * cb.sampling.v as usize) / max_v;
     let out_cy_start = y_start / 2;
     // Round up so an odd `img_h` keeps its final chroma row (e.g. a 483-tall

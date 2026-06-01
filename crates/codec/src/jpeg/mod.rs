@@ -130,20 +130,11 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let img_h = headers.header.height as usize;
     let output_fmt = native_format(&headers)?;
 
-    // NV12 supports odd *height*: the combined-plane height is `H + ceil(H/2)`
-    // (handled by `PixelFormat::image_shape`), giving a valid chroma-row count.
-    //
-    // Odd *width* is not yet supported. The chroma plane needs `ceil(W/2)`
-    // interleaved UV pairs per row — `W + 1` bytes for odd `W` — so it requires
-    // an even-padded row stride, which the contiguous NV12 allocation does not
-    // yet provide. Reject it up front with a specific message rather than let it
-    // surface as an opaque chroma-size mismatch inside the YUV convert kernel.
-    if output_fmt == PixelFormat::Nv12 && !img_w.is_multiple_of(2) {
-        return Err(CodecError::InvalidData(format!(
-            "NV12 odd width not yet supported (needs even-stride chroma padding); \
-             got {img_w}×{img_h}"
-        )));
-    }
+    // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
+    // combined-plane height (`PixelFormat::image_shape`). Odd *width* rounds the
+    // tensor's buffer width up to even (also via `image_shape`), so the MCU
+    // writer's `ceil(width/2)` chroma columns are byte-aligned; the reported
+    // `ImageInfo.width` below stays the true odd value for a downstream crop.
 
     // Native NV12/GREY are u8 formats; reject non-u8 destinations.
     if T::dtype() != edgefirst_tensor::DType::U8 {
