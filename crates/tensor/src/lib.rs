@@ -2283,85 +2283,85 @@ where
             memory = ?self.storage.memory(),
         )
         .entered();
-        // CPU mapping of strided tensors is allowed only when the HAL
-        // owns the underlying allocation — i.e. self-allocated DMA
-        // tensors with pitch padding added by `image_with_stride()`
-        // for GPU import alignment. In that case we know the buffer
-        // is exactly `row_stride × height` bytes (for packed formats)
-        // and callers that respect the stride can iterate rows
-        // correctly via `effective_row_stride()`.
+        // CPU mapping of a strided tensor exposes the full padded buffer
+        // (`row_stride × rows`) so callers can iterate rows via
+        // `effective_row_stride()` without running past the slice. This is sound
+        // only when the HAL owns and can size-check the allocation:
         //
-        // Foreign DMA-BUFs imported via `from_fd()` + `set_row_stride()`
-        // (the V4L2 / GStreamer case) are rejected: their layout comes
-        // from an external allocator and the HAL cannot validate what
-        // the caller expects the mapping to look like. Those tensors
-        // are intended for the GPU path only.
+        //   * Self-allocated Mem / Shm tensors (any platform) — the backing
+        //     `Vec` / shm segment is sized by `capacity_bytes()`, checked here.
+        //   * Self-allocated DMA tensors (Linux) — pitch padding from
+        //     `image_with_stride()`; checked against the DMA-BUF `buf_size`.
         //
-        // The cfg split keeps `stride` from being an unused binding on
-        // non-Linux builds (the Linux branch is the only consumer).
-        #[cfg(target_os = "linux")]
+        // Foreign DMA-BUFs (`from_fd()` + `set_row_stride()`, the V4L2 /
+        // GStreamer case), IOSurface, and PBO storages are rejected: their
+        // layout comes from an external allocator / GPU driver the HAL cannot
+        // validate for a strided CPU view, and they are intended for the GPU
+        // path. (Earlier this rejected *all* non-Linux strided maps with
+        // "DMA backing is Linux-only" — that was an unimplemented path, not a
+        // platform limit; HAL-owned Mem/Shm are trivially mappable and now are.)
         if let Some(stride) = self.row_stride {
-            if let TensorStorage::Dma(dma) = &self.storage {
-                if !dma.is_imported {
-                    // Self-allocated strided DMA tensor — expose the
-                    // full stride×height padded mmap via the override
-                    // constructor so callers can iterate rows with
-                    // `effective_row_stride()` without going past
-                    // the end of the returned slice.
-                    //
-                    // Validate the requested mapping fits inside the
-                    // actual DMA-BUF. `set_row_stride()` is a public
-                    // API and only validates `stride >= min_stride`,
-                    // not `stride × height <= buf_size`, so a caller
-                    // that tampers with the stride after allocation
-                    // could otherwise request a slice larger than the
-                    // underlying mmap — which would be undefined
-                    // behaviour in `DmaMap::as_slice`.
-                    //
-                    // Refuse to map if `height()` can't be derived
-                    // (e.g. raw 2D tensors without a PixelFormat that
-                    // got a `row_stride` set via `set_row_stride_unchecked`).
-                    // Returning a 0-byte view would silently truncate
-                    // rather than surface the misuse.
-                    let height = self.height().ok_or_else(|| {
-                        Error::InvalidOperation(
-                            "Tensor::map: strided DMA mapping requires a PixelFormat \
-                             so height() can be derived; set a format before mapping \
-                             or clear row_stride for raw tensor access"
-                                .into(),
-                        )
-                    })?;
-                    let total_bytes = stride.checked_mul(height).ok_or_else(|| {
-                        Error::InvalidOperation(format!(
-                            "Tensor::map: row_stride {stride} × height {height} overflows usize"
-                        ))
-                    })?;
+            // Rows sit at `stride`-byte spacing; the first shape dim is the row
+            // count for packed `[H, W, C]` and semi-planar `[H*k, W]` alike.
+            let rows = *self.shape().first().ok_or_else(|| {
+                Error::InvalidOperation(
+                    "Tensor::map: strided mapping requires a non-empty shape".into(),
+                )
+            })?;
+            let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
+                ))
+            })?;
+
+            match &self.storage {
+                #[cfg(target_os = "linux")]
+                TensorStorage::Dma(dma) if !dma.is_imported => {
+                    // `set_row_stride()` only validates `stride >= min_stride`,
+                    // not that `stride × rows` fits the DMA-BUF, so re-check
+                    // here — mapping past `buf_size` would SIGBUS on access.
                     let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
                     if total_bytes > available_bytes {
                         return Err(Error::InvalidOperation(format!(
                             "Tensor::map: strided mapping needs {total_bytes} bytes \
                              but DMA buffer only has {available_bytes} available \
-                             (buf_size={}, mmap_offset={}, stride={stride}, height={height}); \
+                             (buf_size={}, mmap_offset={}, stride={stride}, rows={rows}); \
                              the row_stride was likely set larger than the original allocation",
                             dma.buf_size, dma.mmap_offset
                         )));
                     }
                     return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
                 }
+                TensorStorage::Mem(mem) => {
+                    let capacity = self.storage.capacity_bytes();
+                    if total_bytes > capacity {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity,
+                        });
+                    }
+                    return mem.map_with_byte_size(total_bytes);
+                }
+                #[cfg(unix)]
+                TensorStorage::Shm(shm) => {
+                    let capacity = self.storage.capacity_bytes();
+                    if total_bytes > capacity {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity,
+                        });
+                    }
+                    return shm.map_with_byte_size(total_bytes);
+                }
+                _ => {
+                    return Err(Error::InvalidOperation(
+                        "CPU mapping of strided tensors is supported only for HAL-allocated \
+                         Mem/Shm (any platform) and self-allocated DMA (Linux); imported \
+                         DMA-BUF, IOSurface, and PBO storages are GPU-path only"
+                            .into(),
+                    ));
+                }
             }
-            return Err(Error::InvalidOperation(
-                "CPU mapping of strided foreign tensors is not supported; \
-                 use GPU path only"
-                    .into(),
-            ));
-        }
-        #[cfg(not(target_os = "linux"))]
-        if self.row_stride.is_some() {
-            return Err(Error::InvalidOperation(
-                "CPU mapping of strided tensors is not supported on this \
-                 platform (DMA backing is Linux-only)"
-                    .into(),
-            ));
         }
         // Offset tensors are supported for DMA storage — DmaMap adjusts the
         // mmap range and slice start position.  Non-DMA offset tensors are
@@ -3744,6 +3744,39 @@ mod tests {
             .configure_image(1920, 1080, PixelFormat::Nv12)
             .unwrap_err();
         assert!(matches!(err, Error::InsufficientCapacity { .. }));
+    }
+
+    #[test]
+    fn strided_mem_tensor_cpu_maps_full_padded_buffer() {
+        // A packed RGBA image with row padding (GPU-pitch style): logical width
+        // 8 px (32 B/row) but a 48-byte row stride. Over-allocate capacity (for
+        // 16 px), narrow the logical width, then record the padded stride.
+        // Previously `map()` rejected this on non-Linux with
+        // "DMA backing is Linux-only"; HAL-owned Mem is now mappable.
+        let mut t =
+            Tensor::<u8>::image_with_capacity(16, 3, PixelFormat::Rgba, Some(TensorMemory::Mem))
+                .unwrap(); // capacity 3 × 16 × 4 = 192 B
+        t.configure_image(8, 3, PixelFormat::Rgba).unwrap(); // logical [3, 8, 4] = 96 B
+        t.set_row_stride(48).unwrap(); // padded stride (>= 32 B min)
+
+        let map = t.map().expect("strided Mem tensor should CPU-map");
+        // Full padded buffer (stride 48 × 3 rows = 144 B), not the 96 B logical
+        // view — callers iterate rows via `effective_row_stride()`.
+        assert_eq!(map.as_slice().len(), 144);
+        // Logical shape is still reported for shape-aware consumers.
+        assert_eq!(map.shape(), &[3, 8, 4]);
+    }
+
+    #[test]
+    fn strided_mem_tensor_over_capacity_errors() {
+        // Stride larger than the allocation: 64 B × 3 rows = 192 B > 96 B cap.
+        let mut t = Tensor::<u8>::new(&[3, 8, 4], Some(TensorMemory::Mem), None).unwrap();
+        t.set_format(PixelFormat::Rgba).unwrap();
+        t.set_row_stride(64).unwrap();
+        assert!(matches!(
+            t.map(),
+            Err(Error::InsufficientCapacity { .. })
+        ));
     }
 
     /// Test that SHM memory allocation is available and usable on Unix systems.

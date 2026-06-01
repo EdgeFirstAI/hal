@@ -195,6 +195,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now stride- and logical-height-aware, so externally-allocated padded NV12
   buffers convert correctly too.
 
+- **Strided CPU mapping for Mem/Shm tensors (all platforms).** `Tensor::map()`
+  previously rejected any strided tensor on non-Linux with "CPU mapping of
+  strided tensors is not supported on this platform (DMA backing is
+  Linux-only)". That was an unimplemented path, not a platform limit: HAL-owned
+  `Mem` and `Shm` allocations can expose the full padded buffer for row-stride
+  iteration just like self-allocated Linux DMA tensors. `map()` now does so for
+  `Mem`/`Shm` on every platform, validating `row_stride × rows` against the
+  allocation capacity. Imported DMA-BUFs, IOSurface, and PBO storages remain
+  GPU-path only (their layout is owned by an external allocator/driver).
+
 - **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
   returns the GPU's actual `GL_EXT_color_buffer_half_float` /
   `GL_EXT_color_buffer_float` probe results on Linux. Vivante GC7000UL

@@ -55,6 +55,28 @@ where
             identity: crate::BufferIdentity::new(),
         })
     }
+
+    /// Map exposing `byte_size` bytes via `as_slice()` rather than the
+    /// shape-derived logical byte count, for self-allocated strided tensors
+    /// whose rows are padded. The caller (`Tensor::map`) validates
+    /// `byte_size <= capacity_bytes()` first. `Mem` is always HAL-owned, so the
+    /// backing `Vec` covers the full requested range.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size))
+    }
+
+    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+        let mem_ptr = MemPtr(
+            NonNull::new(self.data.as_ptr() as *mut c_void)
+                .ok_or(Error::InvalidSize(self.size()))?,
+        );
+        Ok(TensorMap::Mem(MemMap {
+            ptr: Arc::new(Mutex::new(mem_ptr)),
+            shape: self.shape.clone(),
+            byte_size_override,
+            _marker: std::marker::PhantomData,
+        }))
+    }
 }
 
 impl<T> TensorTrait<T> for MemTensor<T>
@@ -126,15 +148,7 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let mem_ptr = MemPtr(
-            NonNull::new(self.data.as_ptr() as *mut c_void)
-                .ok_or(Error::InvalidSize(self.size()))?,
-        );
-        Ok(TensorMap::Mem(MemMap {
-            ptr: Arc::new(Mutex::new(mem_ptr)),
-            shape: self.shape.clone(),
-            _marker: std::marker::PhantomData,
-        }))
+        self.map_inner(None)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -166,6 +180,11 @@ where
 {
     ptr: Arc<Mutex<MemPtr>>,
     shape: Vec<usize>,
+    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
+    /// (the full padded allocation) instead of `shape.product()`. Mirrors
+    /// `DmaMap`'s override for self-allocated strided tensors whose rows are
+    /// padded; callers iterate via `row_stride`.
+    byte_size_override: Option<usize>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -207,6 +226,13 @@ where
 {
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    fn len(&self) -> usize {
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
     }
 
     fn unmap(&mut self) {
