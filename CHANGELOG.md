@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Tensor::subview()` / `TensorDyn::subview()` (`edgefirst-tensor`): zero-copy
+  sub-region views that share the parent's allocation (`Mem` heap `Arc` or `Dma`
+  fd) and map at a byte offset, for assembling a batch into one buffer. N views
+  into one parent share the buffer (no copy) and write independently;
+  disjointness of simultaneously-mapped mutable windows is the caller's contract.
+  Wired through the Python bindings (`Tensor.subview()`, the `plane_offset`
+  property, `set_plane_offset()` — a view exposes the full NumPy buffer-protocol
+  surface via `map()`/`from_numpy()` like any tensor) and the C API
+  (`hal_tensor_subview`, `hal_tensor_plane_offset`, `hal_tensor_set_plane_offset`).
 - V4L2 hardware JPEG decode backend (`edgefirst-codec`, Linux, default-on
   `v4l2` feature). Capability-based probe drives any device exposing a JPEG
   decoder through the standard V4L2 mem2mem API (lead target i.MX `mxc-jpeg`),
@@ -173,6 +182,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The in-codec YCbCr→RGB/RGBA/BGRA colour kernels, chroma-upsample kernels, and
   SIMD type-conversion path (these moved to `ImageProcessor::convert()`); the
   JPEG CPU path now writes native `NV12`/`GREY` directly.
+- **Breaking (internal types):** the per-memory backing types
+  `MemTensor`/`MemMap`, `DmaTensor`/`DmaMap`, `ShmTensor`/`ShmMap`, and
+  `IoSurfaceTensor`/`IoSurfaceMap` are no longer re-exported from
+  `edgefirst-tensor` — they are implementation details. Allocate `Tensor<T>` /
+  `TensorDyn` and `map()` them instead. The PBO extension point
+  (`PboTensor`/`PboMap`/`PboMapping`/`PboOps`) and `image_iosurface_layout`
+  remain public.
+
+### Fixed
+
+- GPU and heap sub-region views now honor `plane_offset`. The OpenGL EGLImage
+  cache key includes the plane offset, so offset-distinct views of one DMA-BUF
+  no longer alias the offset-0 image (previously every view rendered/sampled the
+  base region — capping batched render-to-DMA-BUF). Heap (`Mem`) tensors map
+  correctly at non-zero offsets, and the shared backing uses interior-mutable
+  cells so disjoint sub-views carry correct write provenance.
 
 ### Notes
 

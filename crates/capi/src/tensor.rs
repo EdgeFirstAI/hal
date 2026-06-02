@@ -839,6 +839,106 @@ pub unsafe extern "C" fn hal_tensor_reshape(
     }
 }
 
+/// Create a zero-copy sub-region view that shares the parent's allocation.
+///
+/// The view maps the window `[offset_bytes, offset_bytes + size)` where
+/// `size = prod(shape) * element_size`, sharing the parent buffer (`Mem` heap
+/// allocation or `Dma` fd) with no copy. N views into one parent can each be
+/// mapped (via `hal_tensor_map_create`) and written independently — the basis
+/// for assembling a batch into one buffer. `offset_bytes` must be aligned to
+/// the element's alignment (its natural alignment, which equals the element
+/// size for the supported dtypes) and the window must fit the parent
+/// allocation.
+///
+/// The returned tensor must be freed with `hal_tensor_free()`. It co-owns the
+/// parent buffer (shared `Arc`/fd), so the buffer stays valid as long as any
+/// view is alive, even if the parent handle is freed first.
+///
+/// @param tensor Parent tensor handle
+/// @param offset_bytes Byte offset of the window into the parent allocation
+/// @param shape Array of dimension sizes (ndim elements)
+/// @param ndim Number of dimensions (1-8)
+/// @return New tensor handle viewing the window on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor/shape, ndim 0 or > 8, offset not element-aligned,
+///   window exceeds the parent allocation, or backing is not Mem/Dma
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_subview(
+    tensor: *const HalTensor,
+    offset_bytes: size_t,
+    shape: *const size_t,
+    ndim: size_t,
+) -> *mut HalTensor {
+    check_null_ret_null!(tensor, shape);
+    if ndim == 0 || ndim > 8 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
+    let view = try_or_null!(
+        unsafe { &*tensor }.inner.subview(offset_bytes, shape_slice),
+        libc::EINVAL
+    );
+    Box::into_raw(Box::new(HalTensor { inner: view }))
+}
+
+/// Get the byte offset of this tensor's window into its backing allocation.
+///
+/// Writes the offset to `*out_offset` (when non-NULL) and returns `true` when
+/// the tensor carries a plane offset — e.g. a view from `hal_tensor_subview`.
+/// Returns `false` for a whole-buffer tensor (writing `0`) or a NULL tensor.
+///
+/// @param tensor Tensor handle
+/// @param out_offset Out-param receiving the byte offset (may be NULL to query
+///        presence only)
+/// @return true if a plane offset is set, false otherwise
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_plane_offset(
+    tensor: *const HalTensor,
+    out_offset: *mut size_t,
+) -> bool {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return false;
+    }
+    match unsafe { &*tensor }.inner.plane_offset() {
+        Some(off) => {
+            if !out_offset.is_null() {
+                unsafe { *out_offset = off as size_t };
+            }
+            true
+        }
+        None => {
+            if !out_offset.is_null() {
+                unsafe { *out_offset = 0 };
+            }
+            false
+        }
+    }
+}
+
+/// Set the byte offset of this tensor's window into its backing allocation.
+///
+/// Validated against the allocation when the tensor is mapped. Prefer
+/// `hal_tensor_subview()` for sharing one buffer across independent windows.
+///
+/// @param tensor Tensor handle
+/// @param offset Byte offset into the backing allocation
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_set_plane_offset(
+    tensor: *mut HalTensor,
+    offset: size_t,
+) -> c_int {
+    check_null!(tensor);
+    unsafe { &mut *tensor }.inner.set_plane_offset(offset);
+    0
+}
+
 /// Attach per-tensor affine quantization metadata to an integer tensor.
 ///
 /// The schema-driven per-scale decoder reads quantization live from each

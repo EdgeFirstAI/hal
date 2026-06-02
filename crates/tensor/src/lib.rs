@@ -55,14 +55,22 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
     ctor
 };
 
+// Backing tensor/map types are internal implementation details: callers
+// allocate `Tensor<T>` / `TensorDyn` and map them, never naming the per-memory
+// backing types directly. They are `pub(crate)` so they stay nameable for the
+// `TensorStorage` / `TensorMap` enums without leaking into the public API.
+// Exceptions kept public: `Pbo*` is a GL extension point implemented by the
+// image crate, and `image_iosurface_layout` is a public helper.
 #[cfg(target_os = "linux")]
-pub use crate::dma::{DmaMap, DmaTensor};
+pub(crate) use crate::dma::{DmaMap, DmaTensor};
 #[cfg(target_os = "macos")]
-pub use crate::iosurface::{image_iosurface_layout, IoSurfaceMap, IoSurfaceTensor};
-pub use crate::mem::{MemMap, MemTensor};
+pub use crate::iosurface::image_iosurface_layout;
+#[cfg(target_os = "macos")]
+pub(crate) use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
+pub(crate) use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
-pub use crate::shm::{ShmMap, ShmTensor};
+pub(crate) use crate::shm::{ShmMap, ShmTensor};
 pub use cuda::{
     gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
     is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
@@ -1763,9 +1771,11 @@ where
         if self.format != Some(format) {
             self.row_stride = None;
             self.plane_offset = None;
-            #[cfg(target_os = "linux")]
-            if let TensorStorage::Dma(ref mut dma) = self.storage {
-                dma.mmap_offset = 0;
+            match self.storage {
+                TensorStorage::Mem(ref mut m) => m.set_offset(0),
+                #[cfg(target_os = "linux")]
+                TensorStorage::Dma(ref mut dma) => dma.mmap_offset = 0,
+                _ => {}
             }
         }
         self.format = Some(format);
@@ -2031,9 +2041,15 @@ where
     /// since the offset is format-independent.
     pub fn set_plane_offset(&mut self, offset: usize) {
         self.plane_offset = Some(offset);
-        #[cfg(target_os = "linux")]
-        if let TensorStorage::Dma(ref mut dma) = self.storage {
-            dma.mmap_offset = offset;
+        // The offset consulted by `map()` lives inside the storage variant.
+        // Keep it in sync with the wrapper field for every backing that
+        // honors it (DMA and Mem); see also the clear sites in `set_format`
+        // and `reshape`.
+        match self.storage {
+            TensorStorage::Mem(ref mut m) => m.set_offset(offset),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(ref mut dma) => dma.mmap_offset = offset,
+            _ => {}
         }
     }
 
@@ -2042,6 +2058,65 @@ where
     pub fn with_plane_offset(mut self, offset: usize) -> Self {
         self.set_plane_offset(offset);
         self
+    }
+
+    /// Create a zero-copy sub-region view of this tensor's backing buffer.
+    ///
+    /// The returned tensor shares this tensor's allocation (no copy) and maps
+    /// the window `[offset_bytes, offset_bytes + shape.product()*size_of::<T>())`
+    /// measured from this tensor's own logical start. N sub-views into one
+    /// parent can be written independently, enabling batched assembly into a
+    /// single buffer. Identical semantics across `Mem` (shared `Arc`) and
+    /// `Dma` (shared fd) backings.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if the backing is not `Mem` or `Dma`, or
+    ///   if `offset_bytes` is mis-aligned for `T`.
+    /// - [`Error::InsufficientCapacity`] / [`Error::InvalidSize`] if the window
+    ///   exceeds the parent allocation.
+    pub fn subview(&self, offset_bytes: usize, shape: &[usize]) -> Result<Tensor<T>> {
+        // Offset is absolute into the backing allocation: a sub-view of a
+        // sub-view composes by adding this tensor's own offset.
+        let abs_offset = self
+            .plane_offset
+            .unwrap_or(0)
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let mut t = match &self.storage {
+            TensorStorage::Mem(parent) => Tensor::wrap(TensorStorage::Mem(MemTensor::view(
+                parent,
+                offset_bytes,
+                shape,
+            )?)),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(parent) => {
+                // Shares the parent's fd AND BufferIdentity (unlike from_fd,
+                // which mints a fresh identity) so offset-distinct views of one
+                // DMA-BUF are cached per (identity, offset) in the GL backend.
+                Tensor::wrap(TensorStorage::Dma(parent.view(offset_bytes, shape)?))
+            }
+            _ => {
+                return Err(Error::InvalidOperation(
+                    "subview only supported for Mem and Dma tensors".into(),
+                ))
+            }
+        };
+        // Inherit the parent's image metadata so the view is a ready-to-use
+        // sub-image (e.g. a `convert()` destination). The offset is applied
+        // LAST because `set_format` deliberately clears it — the offset is a
+        // structural property of the sub-region, not format-dependent metadata.
+        if let Some(fmt) = self.format {
+            t.set_format(fmt)?;
+        }
+        if let Some(rs) = self.row_stride {
+            t.set_row_stride_unchecked(rs);
+        }
+        t.quantization = self.quantization.clone();
+        if abs_offset > 0 {
+            t.set_plane_offset(abs_offset);
+        }
+        Ok(t)
     }
 
     /// Downcast to PBO tensor reference (for GL backends).
@@ -2258,9 +2333,11 @@ where
         self.format = None;
         self.row_stride = None;
         self.plane_offset = None;
-        #[cfg(target_os = "linux")]
-        if let TensorStorage::Dma(ref mut dma) = self.storage {
-            dma.mmap_offset = 0;
+        match self.storage {
+            TensorStorage::Mem(ref mut m) => m.set_offset(0),
+            #[cfg(target_os = "linux")]
+            TensorStorage::Dma(ref mut dma) => dma.mmap_offset = 0,
+            _ => {}
         }
         Ok(())
     }
@@ -2351,20 +2428,19 @@ where
                     .into(),
             ));
         }
-        // Offset tensors are supported for DMA storage — DmaMap adjusts the
-        // mmap range and slice start position.  Non-DMA offset tensors are
-        // not meaningful (offset only applies to DMA-BUF sub-regions).
+        // Offset tensors are supported for storages that apply the offset
+        // inside their own `map()`: DMA (`DmaMap` adjusts the mmap range) and
+        // Mem (`MemMap` adjusts the slice base). Other backings have no
+        // sub-region concept, so a non-zero offset is rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
+            let supported = matches!(self.storage, TensorStorage::Mem(_));
             #[cfg(target_os = "linux")]
-            if !matches!(self.storage, TensorStorage::Dma(_)) {
+            let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
+            if !supported {
                 return Err(Error::InvalidOperation(
-                    "plane offset only supported for DMA tensors".into(),
+                    "plane offset only supported for DMA and Mem tensors".into(),
                 ));
             }
-            #[cfg(not(target_os = "linux"))]
-            return Err(Error::InvalidOperation(
-                "plane offset only supported for DMA tensors".into(),
-            ));
         }
         self.storage.map()
     }
@@ -3259,6 +3335,137 @@ mod tests {
             tensor_map[2] = 42;
             assert_eq!(tensor_map[1], 1, "Value at index 1 should be 1");
             assert_eq!(tensor_map[2], 42, "Value at index 2 should be 42");
+        }
+    }
+
+    #[test]
+    fn mem_subview_partitions_parent_buffer() {
+        // One heap [2,4] u8 parent (8 bytes). Two [1,4] sub-views at byte
+        // offsets 0 and 4 must share the parent allocation (zero-copy) and be
+        // independently writable: view 0 owns bytes [0,4), view 1 owns [4,8).
+        // Today this is impossible — heap offset is rejected and there is no
+        // shared sub-view constructor.
+        let parent = Tensor::<u8>::new(&[2, 4], Some(TensorMemory::Mem), None).unwrap();
+        let view0 = parent.subview(0, &[1, 4]).expect("subview at offset 0");
+        let view1 = parent.subview(4, &[1, 4]).expect("subview at offset 4");
+
+        view1
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[10, 20, 30, 40]);
+        view0
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        // Each view sees only its own window.
+        assert_eq!(view0.map().unwrap().as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(view1.map().unwrap().as_slice(), &[10, 20, 30, 40]);
+        // The parent buffer is correctly partitioned (shared, zero-copy).
+        assert_eq!(
+            parent.map().unwrap().as_slice(),
+            &[1, 2, 3, 4, 10, 20, 30, 40]
+        );
+    }
+
+    #[test]
+    fn mem_subview_rejects_unaligned_offset() {
+        // f32 has align 4; a byte offset of 2 cannot back a valid `*const f32`.
+        let parent = Tensor::<f32>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
+        assert!(parent.subview(2, &[1]).is_err());
+        // A correctly aligned offset is accepted.
+        assert!(parent.subview(4, &[1]).is_ok());
+    }
+
+    #[test]
+    fn mem_subview_rejects_out_of_bounds() {
+        let parent = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
+        // offset 6 + 4 bytes = 10 exceeds the 8-byte allocation.
+        assert!(parent.subview(6, &[4]).is_err());
+    }
+
+    #[test]
+    fn mem_subview_four_views_no_aliasing() {
+        // One [4,3] f32 parent; four [1,3] views at 12-byte strides, each
+        // written independently. Exercises a multi-byte element type (offsets
+        // must stay element-aligned) and N-way zero-copy sharing.
+        let parent = Tensor::<f32>::new(&[4, 3], Some(TensorMemory::Mem), None).unwrap();
+        let frame = 3 * std::mem::size_of::<f32>();
+        for i in 0..4 {
+            let v = parent.subview(i * frame, &[1, 3]).unwrap();
+            let val = i as f32 + 1.0;
+            v.map()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&[val, val, val]);
+        }
+        assert_eq!(
+            parent.map().unwrap().as_slice(),
+            &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn mem_subview_inherits_format_and_row_stride() {
+        // A sub-view is a ready-to-use sub-image: it inherits the parent's
+        // pixel format and (crucially) its padded row stride, so a strided
+        // parent yields strided windows. Set a stride wider than the tight row
+        // to exercise the row_stride inheritance path specifically.
+        let mut parent =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        parent.set_row_stride_unchecked(512); // padded stride (> 100*4)
+        let view = parent.subview(4096, &[10, 10, 4]).unwrap();
+        assert_eq!(view.format(), Some(PixelFormat::Rgba), "format inherited");
+        assert_eq!(view.row_stride(), Some(512), "row_stride inherited");
+    }
+
+    #[test]
+    fn subview_rejects_unsupported_storage() {
+        // subview shares either a heap `Arc` (Mem) or a dma-buf fd (Dma); any
+        // other backing (here Shm) must be refused with InvalidOperation rather
+        // than silently mishandled.
+        if !crate::is_shm_available() {
+            eprintln!("SKIPPED: shm not available");
+            return;
+        }
+        let shm = Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).unwrap();
+        match shm.subview(0, &[4]) {
+            Err(Error::InvalidOperation(_)) => {}
+            Err(other) => panic!("expected InvalidOperation, got {other:?}"),
+            Ok(_) => panic!("subview must reject Shm storage"),
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dma_subview_matches_mem_subview() {
+        // Serialize against the fd-leak tests: this test opens DMA fds (alloc +
+        // clone_fd), which would otherwise perturb their fd counts.
+        let _lock = FD_LOCK.read().unwrap();
+        // Identical sub-view semantics across Dma (shared fd) and Mem (shared
+        // Arc): same offsets → same logical windows → same partition.
+        let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::Dma), None) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIPPED: DMA not available");
+                return;
+            }
+        };
+        let mem = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
+        for parent in [&dma, &mem] {
+            let v0 = parent.subview(0, &[4]).unwrap();
+            let v1 = parent.subview(4, &[4]).unwrap();
+            v0.map()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&[1, 2, 3, 4]);
+            v1.map()
+                .unwrap()
+                .as_mut_slice()
+                .copy_from_slice(&[5, 6, 7, 8]);
+            assert_eq!(parent.map().unwrap().as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         }
     }
 

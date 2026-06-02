@@ -3584,4 +3584,71 @@ mod cpu_tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn cpu_convert_into_heap_subviews_no_aliasing() {
+        // Two distinct RGBA sources converted into two RGB sub-views of one
+        // heap parent buffer. Each window must bit-match a standalone convert
+        // of its source — proving the CPU convert path honors the heap
+        // plane_offset with no aliasing. Runs on CI with no GPU/NPU.
+        let mut converter = CPUProcessor::default();
+
+        let mut src0 =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        src0.as_u8_mut()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(50);
+        let mut src1 =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        src1.as_u8_mut()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(200);
+
+        let mut do_convert = |src: &TensorDyn, dst: &mut TensorDyn| {
+            converter
+                .convert(src, dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+        };
+
+        // Standalone reference conversions into full, independent buffers.
+        let mut ref0 =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        do_convert(&src0, &mut ref0);
+        let mut ref1 =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        do_convert(&src1, &mut ref1);
+
+        // One RGB parent holding two stacked 4x4 frames (4 wide, 8 tall). The
+        // sub-views inherit the Rgb format, so each is a ready convert target
+        // and the plane offset survives.
+        let frame = 4 * 4 * 3;
+        let parent =
+            TensorDyn::image(4, 8, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut view0 = parent.subview(0, &[4, 4, 3]).unwrap();
+        let mut view1 = parent.subview(frame, &[4, 4, 3]).unwrap();
+        assert_eq!(view1.plane_offset(), Some(frame));
+
+        do_convert(&src0, &mut view0);
+        do_convert(&src1, &mut view1);
+
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let ref0_bytes = ref0.as_u8().unwrap().map().unwrap().to_vec();
+        let ref1_bytes = ref1.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            &parent_bytes[..frame],
+            ref0_bytes.as_slice(),
+            "view 0 window must match a standalone convert of src0"
+        );
+        assert_eq!(
+            &parent_bytes[frame..2 * frame],
+            ref1_bytes.as_slice(),
+            "view 1 window must match a standalone convert of src1"
+        );
+    }
 }

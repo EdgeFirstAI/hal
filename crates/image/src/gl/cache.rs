@@ -26,8 +26,12 @@ pub(super) struct CachedEglImage {
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access
 /// updates the entry's `last_used` timestamp, and eviction removes the entry
 /// with the smallest `last_used` value.
-/// Cache key: `(luma_id, chroma_id)`. For single-plane images, `chroma_id` is `None`.
-pub(super) type EglCacheKey = (u64, Option<u64>);
+/// Cache key: `(luma_id, chroma_id, plane_offset)`. For single-plane images,
+/// `chroma_id` is `None`. `plane_offset` distinguishes sub-region views that
+/// share one buffer (same identities) but start at different byte offsets —
+/// without it, N offset-distinct views of one DMA-BUF collide on the first
+/// (offset-0) EGLImage and every view renders/samples the base region.
+pub(super) type EglCacheKey = (u64, Option<u64>, usize);
 
 pub(super) struct EglImageCache {
     pub(super) entries: std::collections::HashMap<EglCacheKey, CachedEglImage>,
@@ -101,5 +105,33 @@ impl Drop for EglImageCache {
             self.misses,
             self.entries.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EglCacheKey;
+    use std::collections::HashMap;
+
+    #[test]
+    fn cache_key_distinguishes_plane_offset() {
+        // Root-cause regression guard (no GPU needed): two sub-region views of
+        // one DMA-BUF share buffer identities but start at different byte
+        // offsets. The cache key must keep them as DISTINCT entries — otherwise
+        // the first (offset-0) EGLImage is reused for every offset and the GPU
+        // renders/samples the base region.
+        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let base: EglCacheKey = (0xABCD, None, 0);
+        let at_offset: EglCacheKey = (0xABCD, None, 4096);
+        map.insert(base, 1);
+        map.insert(at_offset, 2);
+        assert_eq!(map.len(), 2, "offset-distinct views must not collide");
+        assert_eq!(map.get(&base), Some(&1));
+        assert_eq!(map.get(&at_offset), Some(&2));
+
+        // Identical keys still collide (a genuine cache hit), as before.
+        map.insert(base, 3);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&base), Some(&3));
     }
 }

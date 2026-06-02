@@ -234,6 +234,29 @@ impl TensorDyn {
         self
     }
 
+    /// Create a zero-copy sub-region view of this tensor's backing buffer.
+    ///
+    /// The returned tensor shares this tensor's allocation and maps the window
+    /// `[offset_bytes, offset_bytes + shape.product() * element_size)`. N
+    /// sub-views into one parent can be written independently — the basis for
+    /// assembling a batch into one buffer. Works identically on `Mem` (shared
+    /// `Arc`) and `Dma` (shared fd) backings. See [`Tensor::subview`].
+    pub fn subview(&self, offset_bytes: usize, shape: &[usize]) -> crate::Result<TensorDyn> {
+        match self {
+            Self::U8(t) => t.subview(offset_bytes, shape).map(Self::U8),
+            Self::I8(t) => t.subview(offset_bytes, shape).map(Self::I8),
+            Self::U16(t) => t.subview(offset_bytes, shape).map(Self::U16),
+            Self::I16(t) => t.subview(offset_bytes, shape).map(Self::I16),
+            Self::U32(t) => t.subview(offset_bytes, shape).map(Self::U32),
+            Self::I32(t) => t.subview(offset_bytes, shape).map(Self::I32),
+            Self::U64(t) => t.subview(offset_bytes, shape).map(Self::U64),
+            Self::I64(t) => t.subview(offset_bytes, shape).map(Self::I64),
+            Self::F16(t) => t.subview(offset_bytes, shape).map(Self::F16),
+            Self::F32(t) => t.subview(offset_bytes, shape).map(Self::F32),
+            Self::F64(t) => t.subview(offset_bytes, shape).map(Self::F64),
+        }
+    }
+
     /// The CUDA registration for this tensor, if any.
     ///
     /// Returns `None` when no CUDA handle has been attached (the common non-CUDA case).
@@ -1090,14 +1113,43 @@ mod tests {
     }
 
     #[test]
-    fn map_rejects_offset_tensor() {
+    fn map_rejects_out_of_bounds_offset() {
         let mut t =
             Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
-        // Map works before offset is set
+        // Map works before offset is set.
         assert!(t.map().is_ok());
-        // After setting non-zero offset, map should be rejected
+        // Heap offsets are now honored, but an offset that pushes the full
+        // logical window (40000 bytes) past the allocation must be rejected.
         t.set_plane_offset(4096);
         assert!(t.map().is_err());
+    }
+
+    #[test]
+    fn mem_subview_in_bounds_maps_at_offset() {
+        // An in-bounds heap sub-view now maps at its offset (previously every
+        // non-zero heap offset was rejected outright).
+        let parent =
+            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        // A 10x10 RGBA window (400 bytes) at byte offset 4096 fits in 40000.
+        let view = parent.subview(4096, &[10, 10, 4]).unwrap();
+        assert_eq!(view.plane_offset(), Some(4096));
+        assert!(view.map().is_ok());
+    }
+
+    #[test]
+    fn dyn_subview_dispatches_every_dtype() {
+        // `TensorDyn::subview` fans out across all 11 dtype arms; exercise each
+        // so the window maps at its offset and preserves the element type.
+        // Byte offset 8 is aligned for every element type (max align is 8) and
+        // a 4-element window stays in-bounds of the 16-element parent.
+        use DType::*;
+        for dt in [U8, I8, U16, I16, U32, I32, U64, I64, F16, F32, F64] {
+            let parent = TensorDyn::new(&[16], dt, Some(TensorMemory::Mem), None).unwrap();
+            let view = parent.subview(8, &[4]).unwrap();
+            assert_eq!(view.dtype(), dt, "subview must preserve dtype {dt:?}");
+            assert_eq!(view.plane_offset(), Some(8), "{dt:?}");
+            assert_eq!(view.shape(), &[4], "{dt:?}");
+        }
     }
 
     #[test]

@@ -480,6 +480,98 @@ mod gl_tests {
         compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }
 
+    /// On-target (V3D) regression for the EGLImage cache `plane_offset` key:
+    /// render two distinct sources into two `plane_offset` sub-views of ONE
+    /// DMA-BUF and assert each window matches a standalone full-buffer convert.
+    ///
+    /// The two views share the parent's `BufferIdentity` but start at different
+    /// byte offsets. Before the cache-key fix the second view aliased the
+    /// first (offset-0) EGLImage, so both rendered into the base region — the
+    /// exact failure that capped batched render-to-DMA-BUF. With the fix each
+    /// offset gets its own EGLImage and the buffer is correctly partitioned.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn opengl_render_into_dma_subviews_no_aliasing() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let frame = w * h * 4; // RGBA bytes per frame
+
+        // Two distinct solid NV12 sources (different luma → different grey).
+        let make_nv12 = |y: u8| {
+            let mut buf = vec![y; w * h];
+            buf.extend(std::iter::repeat_n(128u8, w * h / 2)); // neutral chroma
+            buf
+        };
+        let src0 = load_raw_image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            &make_nv12(50),
+        )
+        .unwrap();
+        let src1 = load_raw_image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            &make_nv12(200),
+        )
+        .unwrap();
+
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        // Standalone full-buffer reference conversions (independent buffers).
+        let mut ref0 =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &src0, &mut ref0);
+        let mut ref1 =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &src1, &mut ref1);
+
+        // One DMA-BUF holding two stacked RGBA frames; two offset sub-views
+        // sharing the parent buffer identity (same fd) on the SAME processor,
+        // so view 1's lookup hits view 0's cache entry unless the key carries
+        // the offset.
+        let parent = TensorDyn::image(
+            w,
+            2 * h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut view0 = parent.subview(0, &[h, w, 4]).unwrap();
+        let mut view1 = parent.subview(frame, &[h, w, 4]).unwrap();
+        assert_eq!(view1.plane_offset(), Some(frame));
+
+        convert(&mut gl, &src0, &mut view0);
+        convert(&mut gl, &src1, &mut view1);
+
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let ref0_bytes = ref0.as_u8().unwrap().map().unwrap().to_vec();
+        let ref1_bytes = ref1.as_u8().unwrap().map().unwrap().to_vec();
+
+        assert_eq!(
+            &parent_bytes[..frame],
+            ref0_bytes.as_slice(),
+            "view 0 window (offset 0) must match a standalone convert of src0"
+        );
+        assert_eq!(
+            &parent_bytes[frame..2 * frame],
+            ref1_bytes.as_slice(),
+            "view 1 window (offset {frame}) must match a standalone convert of src1 — \
+             aliasing/cache-collision if it doesn't"
+        );
+    }
+
     // =========================================================================
     // EGL Display Probe & Override Tests
     // =========================================================================
