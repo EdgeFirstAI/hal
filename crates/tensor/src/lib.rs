@@ -55,14 +55,22 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
     ctor
 };
 
+// Backing tensor/map types are internal implementation details: callers
+// allocate `Tensor<T>` / `TensorDyn` and map them, never naming the per-memory
+// backing types directly. They are `pub(crate)` so they stay nameable for the
+// `TensorStorage` / `TensorMap` enums without leaking into the public API.
+// Exceptions kept public: `Pbo*` is a GL extension point implemented by the
+// image crate, and `image_iosurface_layout` is a public helper.
 #[cfg(target_os = "linux")]
-pub use crate::dma::{DmaMap, DmaTensor};
+pub(crate) use crate::dma::{DmaMap, DmaTensor};
 #[cfg(target_os = "macos")]
-pub use crate::iosurface::{image_iosurface_layout, IoSurfaceMap, IoSurfaceTensor};
-pub use crate::mem::{MemMap, MemTensor};
+pub use crate::iosurface::image_iosurface_layout;
+#[cfg(target_os = "macos")]
+pub(crate) use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
+pub(crate) use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 #[cfg(unix)]
-pub use crate::shm::{ShmMap, ShmTensor};
+pub(crate) use crate::shm::{ShmMap, ShmTensor};
 pub use cuda::{
     gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
     is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,

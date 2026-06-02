@@ -182,6 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The in-codec YCbCr→RGB/RGBA/BGRA colour kernels, chroma-upsample kernels, and
   SIMD type-conversion path (these moved to `ImageProcessor::convert()`); the
   JPEG CPU path now writes native `NV12`/`GREY` directly.
+- **Breaking (internal types):** the per-memory backing types
+  `MemTensor`/`MemMap`, `DmaTensor`/`DmaMap`, `ShmTensor`/`ShmMap`, and
+  `IoSurfaceTensor`/`IoSurfaceMap` are no longer re-exported from
+  `edgefirst-tensor` — they are implementation details. Allocate `Tensor<T>` /
+  `TensorDyn` and `map()` them instead. The PBO extension point
+  (`PboTensor`/`PboMap`/`PboMapping`/`PboOps`) and `image_iosurface_layout`
+  remain public.
 
 ### Fixed
 

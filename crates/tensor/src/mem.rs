@@ -102,7 +102,13 @@ where
 {
     /// Allocate `byte_capacity` bytes and set an initial logical `shape`
     /// (whose byte size must fit the capacity).
-    pub fn with_capacity_bytes(
+    ///
+    /// Test-only: production code allocates exactly `shape` via [`MemTensor::new`]
+    /// and grows the logical view with `set_logical_shape` within that capacity.
+    /// This over-allocating constructor exists for tests that need spare
+    /// capacity (e.g. an offset window past the logical end).
+    #[cfg(test)]
+    pub(crate) fn with_capacity_bytes(
         shape: &[usize],
         byte_capacity: usize,
         name: Option<&str>,

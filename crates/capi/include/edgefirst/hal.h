@@ -2795,7 +2795,9 @@ int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t nd
  * allocation or `Dma` fd) with no copy. N views into one parent can each be
  * mapped (via `hal_tensor_map_create`) and written independently — the basis
  * for assembling a batch into one buffer. `offset_bytes` must be aligned to
- * the element size and the window must fit the parent allocation.
+ * the element's alignment (its natural alignment, which equals the element
+ * size for the supported dtypes) and the window must fit the parent
+ * allocation.
  *
  * The returned tensor must be freed with `hal_tensor_free()`. It co-owns the
  * parent buffer (shared `Arc`/fd), so the buffer stays valid as long as any

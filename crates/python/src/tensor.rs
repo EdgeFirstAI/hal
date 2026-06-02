@@ -800,7 +800,9 @@ impl PyTensor {
     /// heap allocation or ``Dma`` fd) with **no copy**. N views into one parent
     /// can be mapped and written independently — the basis for assembling a
     /// batch into a single buffer. ``offset_bytes`` must be aligned to the
-    /// element size and the window must fit the parent allocation.
+    /// element's alignment (its natural alignment, which equals the element
+    /// size for the supported dtypes) and the window must fit the parent
+    /// allocation.
     ///
     /// The returned tensor exposes the same surface as any other tensor —
     /// :meth:`map` (NumPy buffer protocol), :meth:`from_numpy`, ``fd`` — so a
