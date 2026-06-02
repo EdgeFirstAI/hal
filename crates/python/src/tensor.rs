@@ -793,6 +793,27 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
+    /// Create a zero-copy sub-region view that shares this tensor's allocation.
+    ///
+    /// The view maps the window ``[offset_bytes, offset_bytes + size)`` where
+    /// ``size = prod(shape) * element_size``, sharing the parent buffer (``Mem``
+    /// heap allocation or ``Dma`` fd) with **no copy**. N views into one parent
+    /// can be mapped and written independently — the basis for assembling a
+    /// batch into a single buffer. ``offset_bytes`` must be aligned to the
+    /// element's alignment (its natural alignment, which equals the element
+    /// size for the supported dtypes) and the window must fit the parent
+    /// allocation.
+    ///
+    /// The returned tensor exposes the same surface as any other tensor —
+    /// :meth:`map` (NumPy buffer protocol), :meth:`from_numpy`, ``fd`` — so a
+    /// view reads and writes through NumPy exactly like the base API. The
+    /// window's byte offset is reported by :attr:`plane_offset`.
+    #[pyo3(signature = (offset_bytes, shape))]
+    fn subview(&self, offset_bytes: usize, shape: Vec<usize>) -> Result<Self> {
+        let view = self.0.subview(offset_bytes, &shape)?;
+        Ok(PyTensor(view))
+    }
+
     /// Attach pixel format metadata to this tensor.
     ///
     /// Validates that the tensor's shape is compatible with the format's
@@ -1020,6 +1041,23 @@ impl PyTensor {
     #[getter]
     fn row_stride(&self) -> Option<usize> {
         self.0.effective_row_stride()
+    }
+
+    /// Byte offset of this tensor's window into its backing allocation.
+    ///
+    /// ``None`` for a whole-buffer tensor; the sub-region start for a view
+    /// created via :meth:`subview` (or after :meth:`set_plane_offset`).
+    #[getter]
+    fn plane_offset(&self) -> Option<usize> {
+        self.0.plane_offset()
+    }
+
+    /// Set the byte offset of this tensor's window into its backing allocation.
+    ///
+    /// Validated against the allocation when the tensor is mapped. Prefer
+    /// :meth:`subview` for sharing one buffer across independent windows.
+    fn set_plane_offset(&mut self, offset: usize) {
+        self.0.set_plane_offset(offset);
     }
 
     /// Whether this image uses a planar pixel layout.

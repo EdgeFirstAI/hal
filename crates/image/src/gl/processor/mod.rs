@@ -1473,7 +1473,7 @@ impl GLProcessorST {
 
         let luma_id = dst.buffer_identity().id();
         let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
-        let dst_key = (luma_id, chroma_id);
+        let dst_key = (luma_id, chroma_id, dst.plane_offset().unwrap_or(0));
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
         match self.cached_dst_renderbuffer(dst) {
@@ -1555,7 +1555,7 @@ impl GLProcessorST {
 
         let luma_id = dst.buffer_identity().id();
         let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
-        let dst_key = (luma_id, chroma_id);
+        let dst_key = (luma_id, chroma_id, dst.plane_offset().unwrap_or(0));
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
         match self.cached_dst_renderbuffer(dst) {
@@ -2937,6 +2937,7 @@ impl GLProcessorST {
         let src_key = (
             src.buffer_identity().id(),
             src.chroma().map(|t| t.buffer_identity().id()),
+            src.plane_offset().unwrap_or(0),
         );
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
@@ -3811,7 +3812,7 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         let luma_id = src.buffer_identity().id();
         let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
-        let src_key = (luma_id, chroma_id);
+        let src_key = (luma_id, chroma_id, src.plane_offset().unwrap_or(0));
 
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
@@ -3971,7 +3972,10 @@ impl GLProcessorST {
     ) -> Result<egl::Image, crate::Error> {
         let luma_id = img.buffer_identity().id();
         let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
-        let id = (luma_id, chroma_id);
+        // Include the plane offset: sub-region views share one buffer identity
+        // but need distinct EGLImages, else offset-distinct views alias the
+        // first (offset-0) image and render/sample the base region.
+        let id = (luma_id, chroma_id, img.plane_offset().unwrap_or(0));
 
         // Sweep dead entries opportunistically before looking up.
         // Invalidate texture binding state since sweep may remove a bound entry.
@@ -4068,7 +4072,7 @@ impl GLProcessorST {
     {
         let luma_id = img.buffer_identity().id();
         let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
-        let id = (luma_id, chroma_id);
+        let id = (luma_id, chroma_id, img.plane_offset().unwrap_or(0));
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4143,7 +4147,11 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = (img.buffer_identity().id(), None);
+        let id = (
+            img.buffer_identity().id(),
+            None,
+            img.plane_offset().unwrap_or(0),
+        );
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }

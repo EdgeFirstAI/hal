@@ -601,7 +601,7 @@ where
     /// borrowed — its lifetime is tied to the tensor.
     pub fn iosurface_ref(&self) -> Option<*mut c_void> {
         match &self.storage {
-            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.surface.as_ptr()),
+            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.surface_ref()),
             _ => None,
         }
     }

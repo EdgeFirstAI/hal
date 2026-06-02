@@ -788,8 +788,7 @@ impl MacosGlProcessor {
             // Semi-planar YUV (NV12/NV16/NV24, R8) → RGBA program.
             let program_nv = compile_program(VERTEX_SHADER, NV_TO_RGBA_FRAGMENT)?;
             let uniform_nv_src = gls::gl::GetUniformLocation(program_nv, c"src".as_ptr());
-            let uniform_nv_img_size =
-                gls::gl::GetUniformLocation(program_nv, c"img_size".as_ptr());
+            let uniform_nv_img_size = gls::gl::GetUniformLocation(program_nv, c"img_size".as_ptr());
             let uniform_nv_tex_width =
                 gls::gl::GetUniformLocation(program_nv, c"tex_width".as_ptr());
             let uniform_nv_chroma_shift =
@@ -864,13 +863,14 @@ impl MacosGlProcessor {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !matches!(*slot, Some((iw, ih, _)) if iw == w && ih == h) {
-            let interm = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                .map_err(|e| {
-                    Error::NotSupported(format!(
-                        "convert_nv_to_planar_float: RGBA8 intermediate IOSurface alloc \
+            let interm =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .map_err(|e| {
+                        Error::NotSupported(format!(
+                            "convert_nv_to_planar_float: RGBA8 intermediate IOSurface alloc \
                          {w}x{h} failed: {e}"
-                    ))
-                })?;
+                        ))
+                    })?;
             *slot = Some((w, h, interm));
         }
         let interm = &mut slot.as_mut().unwrap().2;
@@ -1303,8 +1303,15 @@ impl MacosGlProcessor {
                     ph,
                 )?
             }
-            _ => self
-                .get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, DType::U8, src_w, src_h)?,
+            _ => self.get_or_create_pbuffer(
+                d,
+                src_id,
+                src_iosurface,
+                src_fmt,
+                DType::U8,
+                src_w,
+                src_h,
+            )?,
         };
         let dst_pbuf =
             self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, DType::U8, dst_w, dst_h)?;

@@ -4923,7 +4923,10 @@ mod image_tests {
         let mut proc = match MacosGlProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
                 return;
             }
         };
@@ -4944,8 +4947,8 @@ mod image_tests {
             }
         }
 
-        let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-            .unwrap();
+        let dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
         let (result, src_back, dst) = convert_img(
             &mut proc,
             src,
@@ -4994,25 +4997,29 @@ mod image_tests {
             }
         };
         let (w, h) = (64usize, 64usize);
-        let src = match TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma))
-        {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
-                return;
-            }
-        };
-        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128); // Y=U=V=128
-
-        let dst =
-            match TensorDyn::image(w, h, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma))
-            {
+        let src =
+            match TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("SKIPPED: {} — F16 PlanarRgb IOSurface: {e:?}", function!());
+                    eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
                     return;
                 }
             };
+        src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128); // Y=U=V=128
+
+        let dst = match TensorDyn::image(
+            w,
+            h,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — F16 PlanarRgb IOSurface: {e:?}", function!());
+                return;
+            }
+        };
         let mut dst = dst;
         // Call convert directly (the convert_img helper restores u8 only).
         if let Err(e) = ImageProcessorTrait::convert(
@@ -5026,7 +5033,10 @@ mod image_tests {
             // GL_EXT_color_buffer_half_float may be absent on some configs; the
             // RGBA8 pass-1 + F16 pass-2 path then can't render. Skip rather than
             // fail on a capability gap (the same policy as the F16 path tests).
-            eprintln!("SKIPPED: {} — NV12→PlanarRgb F16 not available ({e:?})", function!());
+            eprintln!(
+                "SKIPPED: {} — NV12→PlanarRgb F16 not available ({e:?})",
+                function!()
+            );
             return;
         }
         let dt = dst.as_f16().expect("dst is F16 PlanarRgb");
@@ -5043,7 +5053,10 @@ mod image_tests {
             );
             checked += 1;
         }
-        assert!(checked >= w * h * 3, "expected >= 3 planes of samples, got {checked}");
+        assert!(
+            checked >= w * h * 3,
+            "expected >= 3 planes of samples, got {checked}"
+        );
     }
 
     /// Profiler-shaped two-pass: a reused **R8/Grey pool** (allocated larger
@@ -5107,15 +5120,13 @@ mod image_tests {
             dst_rect: Some(Rect::new(0, 32, model_w, 64)), // arbitrary letterbox band
             ..Crop::new()
         };
-        if let Err(e) = ImageProcessorTrait::convert(
-            &mut gpu,
-            &src,
-            &mut dst,
-            Rotation::None,
-            Flip::None,
-            crop,
-        ) {
-            eprintln!("SKIPPED: {} — NV12→PlanarRgb F16 unavailable ({e:?})", function!());
+        if let Err(e) =
+            ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, Rotation::None, Flip::None, crop)
+        {
+            eprintln!(
+                "SKIPPED: {} — NV12→PlanarRgb F16 unavailable ({e:?})",
+                function!()
+            );
             return;
         }
         let _ = stride;
@@ -5150,24 +5161,50 @@ mod image_tests {
             }
         };
         let (fw, fh) = (96usize, 64usize);
-        let mut src = match TensorDyn::image(256, 768, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
+        let mut src = match TensorDyn::image(
+            256,
+            768,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        ) {
             Ok(t) => t,
-            Err(e) => { eprintln!("SKIPPED: {} — pool: {e:?}", function!()); return; }
+            Err(e) => {
+                eprintln!("SKIPPED: {} — pool: {e:?}", function!());
+                return;
+            }
         };
         src.configure_image(fw, fh, PixelFormat::Nv12).unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
-        let mut dst = match TensorDyn::image(128, 128, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma)) {
+        let mut dst = match TensorDyn::image(
+            128,
+            128,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        ) {
             Ok(t) => t,
-            Err(e) => { eprintln!("SKIPPED: {} — dst: {e:?}", function!()); return; }
+            Err(e) => {
+                eprintln!("SKIPPED: {} — dst: {e:?}", function!());
+                return;
+            }
         };
-        let crop = Crop { src_rect: Some(Rect::new(0, 0, fw, fh)), ..Crop::new() };
+        let crop = Crop {
+            src_rect: Some(Rect::new(0, 0, fw, fh)),
+            ..Crop::new()
+        };
 
         // ...then MOVED to a worker thread where convert() runs — exactly the
         // orchestrator's create-on-setup / convert-on-Pre-processing split.
         let (tx, rx) = mpsc::channel::<bool>();
         let worker = std::thread::spawn(move || {
             let _ = ImageProcessorTrait::convert(
-                &mut proc, &src, &mut dst, Rotation::None, Flip::None, crop,
+                &mut proc,
+                &src,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                crop,
             );
             let _ = tx.send(true);
         });
@@ -5203,17 +5240,48 @@ mod image_tests {
         let mut srcs = Vec::new();
         let mut dsts = Vec::new();
         for _ in 0..depth {
-            srcs.push(match TensorDyn::image(max_w, max_h * 3, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
-                Ok(t) => t,
-                Err(e) => { eprintln!("SKIPPED: {} — pool: {e:?}", function!()); return; }
-            });
-            dsts.push(match TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(TensorMemory::Dma)) {
-                Ok(t) => t,
-                Err(e) => { eprintln!("SKIPPED: {} — dst: {e:?}", function!()); return; }
-            });
+            srcs.push(
+                match TensorDyn::image(
+                    max_w,
+                    max_h * 3,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("SKIPPED: {} — pool: {e:?}", function!());
+                        return;
+                    }
+                },
+            );
+            dsts.push(
+                match TensorDyn::image(
+                    640,
+                    640,
+                    PixelFormat::PlanarRgb,
+                    DType::F16,
+                    Some(TensorMemory::Dma),
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("SKIPPED: {} — dst: {e:?}", function!());
+                        return;
+                    }
+                },
+            );
         }
         // COCO-like assorted frame sizes (all ≤ max), cycled.
-        let sizes = [(640, 480), (500, 375), (640, 427), (333, 500), (480, 640), (612, 612), (428, 640), (576, 432)];
+        let sizes = [
+            (640, 480),
+            (500, 375),
+            (640, 427),
+            (333, 500),
+            (480, 640),
+            (612, 612),
+            (428, 640),
+            (576, 432),
+        ];
         let mut first_ms = 0f64;
         let mut last_ms = 0f64;
         let iters = 40usize;
@@ -5223,13 +5291,20 @@ mod image_tests {
             let dst = &mut dsts[i % depth];
             src.configure_image(fw, fh, PixelFormat::Nv24).unwrap();
             src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
-            let crop = Crop { src_rect: Some(Rect::new(0, 0, fw, fh)), ..Crop::new() };
+            let crop = Crop {
+                src_rect: Some(Rect::new(0, 0, fw, fh)),
+                ..Crop::new()
+            };
             let t0 = std::time::Instant::now();
             ImageProcessorTrait::convert(&mut gpu, src, dst, Rotation::None, Flip::None, crop)
                 .unwrap_or_else(|e| panic!("convert iter {i} ({fw}×{fh}): {e}"));
             let ms = t0.elapsed().as_secs_f64() * 1e3;
-            if i == 2 { first_ms = ms; }
-            if i == iters - 1 { last_ms = ms; }
+            if i == 2 {
+                first_ms = ms;
+            }
+            if i == iters - 1 {
+                last_ms = ms;
+            }
         }
         eprintln!("first={first_ms:.2}ms last={last_ms:.2}ms");
         assert!(
@@ -5251,7 +5326,10 @@ mod image_tests {
         let mut gpu = match MacosGlProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
                 return;
             }
         };
@@ -5291,21 +5369,41 @@ mod image_tests {
         for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
             let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
             let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(mem.as_u8().unwrap().map().unwrap().as_mut_slice(), mem_stride, fmt);
+            fill(
+                mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                mem_stride,
+                fmt,
+            );
             let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
-            let (r, _s, cpu_dst) =
-                convert_img(&mut cpu, mem, cpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            let (r, _s, cpu_dst) = convert_img(
+                &mut cpu,
+                mem,
+                cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
             r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
 
             let ios = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
                 .unwrap_or_else(|e| panic!("{fmt:?} IOSurface alloc: {e}"));
             let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(ios.as_u8().unwrap().map().unwrap().as_mut_slice(), ios_stride, fmt);
+            fill(
+                ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                ios_stride,
+                fmt,
+            );
             let gpu_dst =
                 TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
                     .unwrap();
-            let (r, _s, gpu_dst) =
-                convert_img(&mut gpu, ios, gpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            let (r, _s, gpu_dst) = convert_img(
+                &mut gpu,
+                ios,
+                gpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
             r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA on ANGLE: {e}"));
 
             let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
@@ -5345,7 +5443,10 @@ mod image_tests {
         let mut gpu = match MacosGlProcessor::new() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("SKIPPED: {} — MacosGlProcessor init failed ({e:?})", function!());
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
                 return;
             }
         };
@@ -5384,23 +5485,38 @@ mod image_tests {
             // CPU reference from a tightly-packed Mem tensor at the frame size.
             let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
             let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(mem.as_u8().unwrap().map().unwrap().as_mut_slice(), mem_stride, fmt);
+            fill(
+                mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                mem_stride,
+                fmt,
+            );
             let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
-            let (r, _s, cpu_dst) =
-                convert_img(&mut cpu, mem, cpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+            let (r, _s, cpu_dst) = convert_img(
+                &mut cpu,
+                mem,
+                cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
             r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
 
             // GPU source: a LARGER R8 pool surface, reconfigured down to the
             // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
             // tensor's row stride; the fill writes the frame at that stride.
-            let mut ios =
-                match TensorDyn::image(pool_w, pool_h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
-                        return;
-                    }
-                };
+            let mut ios = match TensorDyn::image(
+                pool_w,
+                pool_h,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::Dma),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
+                    return;
+                }
+            };
             ios.configure_image(w, h, fmt)
                 .unwrap_or_else(|e| panic!("configure_image {fmt:?} on pool: {e}"));
             let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
@@ -5409,12 +5525,23 @@ mod image_tests {
                 "{fmt:?}: pool stride {ios_stride} should exceed frame even width {ew} \
                  (test must exercise padding)"
             );
-            fill(ios.as_u8().unwrap().map().unwrap().as_mut_slice(), ios_stride, fmt);
+            fill(
+                ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                ios_stride,
+                fmt,
+            );
 
             let gpu_dst =
-                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
-            let (r, _s, gpu_dst) =
-                convert_img(&mut gpu, ios, gpu_dst, Rotation::None, Flip::None, Crop::no_crop());
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            let (r, _s, gpu_dst) = convert_img(
+                &mut gpu,
+                ios,
+                gpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
             r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA (pool surface) on ANGLE: {e}"));
 
             let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();

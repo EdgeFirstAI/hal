@@ -473,7 +473,10 @@ mod tests {
         for gr in 0..used_rows {
             let t = &buf_tight[gr * tight..gr * tight + even_w];
             let p = &buf_padded[gr * padded..gr * padded + even_w];
-            assert_eq!(t, p, "grid row {gr} differs between tight and padded layout");
+            assert_eq!(
+                t, p,
+                "grid row {gr} differs between tight and padded layout"
+            );
         }
     }
 }
