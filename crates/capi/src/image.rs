@@ -1828,10 +1828,13 @@ mod tests {
             let formats = [
                 HalPixelFormat::Rgb,
                 HalPixelFormat::Rgba,
+                HalPixelFormat::Bgra,
                 HalPixelFormat::Grey,
                 HalPixelFormat::Nv12,
                 HalPixelFormat::Nv16,
+                HalPixelFormat::Nv24,
                 HalPixelFormat::Yuyv,
+                HalPixelFormat::Vyuy,
                 HalPixelFormat::PlanarRgb,
                 HalPixelFormat::PlanarRgba,
             ];

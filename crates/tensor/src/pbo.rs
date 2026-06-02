@@ -123,15 +123,18 @@ where
         name: Option<&str>,
         ops: Arc<dyn PboOps>,
     ) -> Result<Self> {
-        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size != expected {
-            return Err(Error::ShapeMismatch(format!(
-                "PBO size {size} does not match shape {shape:?} * sizeof({}) = {expected}",
-                std::any::type_name::<T>(),
-            )));
-        }
         if size == 0 {
             return Err(Error::InvalidSize(0));
+        }
+        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        // Allow `size >= expected`: PBOs allocated with a 64-byte-aligned row
+        // stride may be larger than the shape product.  Reject only if the
+        // allocation is strictly smaller than the logical content.
+        if size < expected {
+            return Err(Error::ShapeMismatch(format!(
+                "PBO size {size} is smaller than shape {shape:?} * sizeof({}) = {expected}",
+                std::any::type_name::<T>(),
+            )));
         }
         let name = name.unwrap_or("pbo_tensor").to_owned();
         Ok(Self {

@@ -4349,18 +4349,21 @@ mod tests {
         assert_eq!(pool.effective_row_stride(), Some(pitch));
     }
 
-    /// A backing without a fixed physical pitch (Mem) stays tightly packed
-    /// through configure_image — the preservation only applies to backings that
-    /// report a `backing_row_stride` (IOSurface). Mem reconfigures to the
-    /// format's natural row stride.
+    /// `configure_image` on a Mem backing reconfigures to the format's
+    /// **64-byte-aligned** row stride (the odd-dim contract: every image tensor
+    /// carries a 64-aligned `row_stride`). For NV12 32×16 the minimum is
+    /// `even(32)=32`, rounded up to the 64-byte alignment → 64. The capacity
+    /// (64×64×4 RGBA = 16 KiB) easily holds the 24×64 = 1.5 KiB NV12 layout.
     #[test]
-    fn configure_image_mem_stays_tight() {
+    fn configure_image_mem_aligns_stride() {
         let mut t =
             Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
                 .unwrap();
         t.configure_image(32, 16, PixelFormat::Nv12).unwrap();
-        // Mem has no intrinsic pitch → NV12 natural row stride == even width 32.
-        assert_eq!(t.effective_row_stride(), Some(32));
+        let s = t.effective_row_stride().unwrap();
+        assert_eq!(s % 64, 0, "stride must be 64-aligned");
+        assert!(s >= 32, "stride must cover the even-width minimum");
+        assert_eq!(s, 64);
     }
 
     #[test]

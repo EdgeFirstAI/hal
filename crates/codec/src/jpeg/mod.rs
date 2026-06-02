@@ -5,10 +5,11 @@
 //! native output.
 //!
 //! The decoder emits the source's native format only — `Grey` for greyscale
-//! (1-component) JPEGs, `Nv12` (4:2:0, with chroma downsampled from any source
-//! subsampling) for colour (3-component) JPEGs. It never converts to RGB and
-//! never rotates: colour and geometry are applied downstream by
-//! `ImageProcessor::convert()`. EXIF orientation is reported in [`ImageInfo`].
+//! (1-component) JPEGs, and the matching semi-planar format for colour
+//! (3-component) JPEGs by subsampling: `Nv12` for 4:2:0, `Nv16` for 4:2:2,
+//! `Nv24` for 4:4:4. It never converts to RGB and never rotates: colour and
+//! geometry are applied downstream by `ImageProcessor::convert()`. EXIF
+//! orientation is reported in [`ImageInfo`].
 
 pub mod bitstream;
 pub mod huffman;
@@ -59,7 +60,9 @@ impl Default for JpegDecoderState {
 }
 
 /// The codec's native output format for a JPEG: `Grey` for 1-component
-/// (greyscale) images, `Nv12` for 3-component (YCbCr) images.
+/// (greyscale) images, and the matching semi-planar format for 3-component
+/// (YCbCr) images by subsampling — `Nv24` (4:4:4), `Nv16` (4:2:2), or `Nv12`
+/// (4:2:0); non-standard subsamplings downsample to `Nv12`.
 fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
     let comps = &headers.header.components;
     match comps.len() {
@@ -99,12 +102,12 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
 }
 
 /// Native luma/primary-plane row stride in bytes for a freshly decoded image.
-/// GREY and all semi-planar luma/UV planes are 1 byte/pixel; semi-planar grids
-/// are laid out at even width (the codec writer's `ceil(width/2)` chroma columns
-/// must be byte-aligned), so round up to keep the fallback `>= even_width` —
-/// the contract `mcu::decode_image` asserts.
+/// GREY and all semi-planar luma/UV planes are 1 byte/pixel.  Semi-planar grids
+/// require at least `even(width)` bytes per row (chroma alignment); the stride
+/// is further rounded up to 64 bytes so `ImageInfo.row_stride` honours the
+/// same 64-byte-alignment invariant as `Tensor::image()`.
 fn native_row_stride(width: usize) -> usize {
-    width.next_multiple_of(2)
+    width.next_multiple_of(2).next_multiple_of(64)
 }
 
 /// Parse JPEG headers and return native dimensions, format, and EXIF

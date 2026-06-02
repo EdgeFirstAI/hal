@@ -67,8 +67,6 @@ pub(super) fn pixel_format_to_drm(fmt: PixelFormat) -> Result<DrmFourcc, Error> 
         PixelFormat::Rgb => Ok(DrmFourcc::Bgr888),
         PixelFormat::Grey => Ok(DrmFourcc::R8),
         PixelFormat::Nv12 => Ok(DrmFourcc::Nv12),
-        PixelFormat::Nv16 => Ok(DrmFourcc::Nv16),
-        PixelFormat::Nv24 => Ok(DrmFourcc::Nv24),
         PixelFormat::PlanarRgb => Ok(DrmFourcc::R8),
         _ => Err(Error::NotSupported(format!(
             "PixelFormat {fmt:?} has no DRM format mapping"
@@ -749,7 +747,10 @@ void main() {
 ///   * `img_size`     — logical (W, H); Y plane occupies rows [0, H).
 ///   * `tex_width`    — R8 texture width (= even buffer width / effective stride).
 ///   * `chroma_shift` — (cx, cy) right-shifts: NV12=(1,1), NV16=(1,0), NV24=(0,0).
-///   * `uv_row_bytes` — bytes per chroma row: NV12/NV16=tex_width, NV24=2*tex_width.
+///   * `chroma_lines`  — R8 buffer rows per image-chroma-row: NV12/NV16=1,
+///     NV24=2 (NV24's 2W-byte CbCr row wraps at `tex_width`, spanning 2 rows;
+///     the shader's `carry` term handles the wrap). Direct 2D addressing — no
+///     per-pixel integer divide/modulo (pathologically slow on Vivante).
 ///
 /// Vertex varying is `tc` (vec2, matching `generate_vertex_shader`).
 /// BT.601 full-range matches the CPU kernels and the EGL YUV color hints.
@@ -850,183 +851,6 @@ void main() {
     float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
     float b = clamp(yv + 1.772 * up, 0.0, 1.0);
     color = vec4(int8_bias(vec3(r, g, b)), 1.0);
-}
-"
-}
-
-/// Vectorized NV* → RGBA8 Path B shader (RGBA source view, 4-pixel-wide output).
-///
-/// **Render target**: `W/4 × H` RGBA32UI.  Each fragment writes one `uvec4`
-/// whose four components each pack one RGBA8 output pixel as
-/// `r | g<<8 | b<<16 | 0xFF<<24`.  The W/4-wide RGBA32UI surface byte-aliases
-/// the W×H RGBA8 destination buffer exactly.
-///
-/// **Source view**: the NV* DMA-BUF is imported as an RGBA8 texture of width
-/// `tex_width/4` (one RGBA texel = four consecutive R8 bytes = four Y samples).
-/// One `texelFetch` therefore fetches the luma values for all four output pixels
-/// of the current fragment at once.
-///
-/// **Chroma fetching**: chroma is fetched from the R8 source texture (bound to
-/// `TEXTURE1`) using the same addressing as the scalar Path B shader.  For four
-/// horizontally-adjacent output pixels at logical x = x0..x0+3:
-///   - NV12/NV16 (chroma_shift_x=1): CbCr pairs at cols x0/2 and (x0+2)/2
-///     (at most 2 unique chroma columns; both are fetched unconditionally).
-///   - NV24 (chroma_shift_x=0): four independent CbCr pairs.
-///
-/// Uniforms mirror the scalar shader exactly (`img_size`, `tex_width`,
-/// `chroma_shift`, `chroma_lines`) plus:
-///   * `src_rgba` (sampler2D, unit 0): the RGBA view (tex_width/4 wide).
-///   * `src_r8`   (sampler2D, unit 1): the R8  view (tex_width wide) for chroma.
-///
-/// BT.601 full-range, identical math to the scalar shader.
-/// No extension required: `texelFetch` + RGBA32UI FBO is GL ES 3.0 core.
-pub(super) fn generate_nv_to_rgba_vec4_shader_2d() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-uniform highp sampler2D src_rgba;  // RGBA view: tex_width/4 wide, combined height
-uniform highp sampler2D src_r8;    // R8  view: tex_width wide, combined height (chroma)
-uniform ivec2 img_size;            // logical (W, H)
-uniform int   tex_width;           // R8 texture width (effective row stride)
-uniform ivec2 chroma_shift;        // (cx_shift, cy_shift): NV12=(1,1), NV16=(1,0), NV24=(0,0)
-uniform int   chroma_lines;        // R8 rows per chroma image-row: NV24=2, others=1
-out uvec4 frag;
-
-// BT.601 full-range YCbCr → packed RGBA8 uint.
-// Returns `r | g<<8 | b<<16 | 255<<24`.
-uint yuv_to_packed(float yv, float u, float v) {
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
-    uint ri = uint(r * 255.0 + 0.5);
-    uint gi = uint(g * 255.0 + 0.5);
-    uint bi = uint(b * 255.0 + 0.5);
-    return ri | (gi << 8u) | (bi << 16u) | (255u << 24u);
-}
-
-// Fetch (U, V) from the R8 plane for a given image-space chroma column and row.
-// Mirrors the scalar shader's carry logic for NV24's 2W-byte chroma rows.
-vec2 fetch_uv(int ccol, int crow, int h) {
-    int ccol2  = ccol * 2;
-    int carry  = (ccol2 >= tex_width) ? 1 : 0;
-    int cy     = h + crow * chroma_lines + carry;
-    int cx     = ccol2 - carry * tex_width;
-    float u    = texelFetch(src_r8, ivec2(cx,     cy), 0).r;
-    float v    = texelFetch(src_r8, ivec2(cx + 1, cy), 0).r;
-    return vec2(u, v);
-}
-
-void main() {
-    int fx = int(floor(gl_FragCoord.x));  // output texel x in [0, W/4)
-    int fy = int(floor(gl_FragCoord.y));  // output texel y in [0, H)
-
-    int w  = img_size.x;
-    int h  = img_size.y;
-    int x0 = fx * 4;   // logical pixel column of the first output pixel
-
-    // Fetch 4 luma values from one RGBA texel (tex_width/4-wide view).
-    vec4 luma_rgba = texelFetch(src_rgba, ivec2(fx, fy), 0);
-    // RGBA texel stores the 4 bytes in r,g,b,a order which maps to
-    // consecutive columns x0, x0+1, x0+2, x0+3 in the R8 buffer.
-    float yv0 = luma_rgba.r;
-    float yv1 = luma_rgba.g;
-    float yv2 = luma_rgba.b;
-    float yv3 = luma_rgba.a;
-
-    int crow = fy >> chroma_shift.y;
-
-    // Fetch chroma for all 4 pixels.  NV12/NV16 share pairs at x0/2 and
-    // (x0+2)/2; NV24 has an independent pair per pixel.
-    vec2 uv0 = fetch_uv(x0       >> chroma_shift.x, crow, h);
-    vec2 uv1 = fetch_uv((x0 + 1) >> chroma_shift.x, crow, h);
-    vec2 uv2 = fetch_uv((x0 + 2) >> chroma_shift.x, crow, h);
-    vec2 uv3 = fetch_uv((x0 + 3) >> chroma_shift.x, crow, h);
-
-    frag = uvec4(
-        yuv_to_packed(yv0, uv0.x, uv0.y),
-        yuv_to_packed(yv1, uv1.x, uv1.y),
-        yuv_to_packed(yv2, uv2.x, uv2.y),
-        yuv_to_packed(yv3, uv3.x, uv3.y)
-    );
-}
-"
-}
-
-/// Int8 vectorized NV* → RGBA8 Path B shader (RGBA source view, 4-pixel-wide output).
-///
-/// Same as [`generate_nv_to_rgba_vec4_shader_2d`] but applies the XOR 0x80 bias
-/// (`(q + 128) mod 256`) to each output RGB channel before packing.
-pub(super) fn generate_nv_to_rgba_vec4_int8_shader_2d() -> &'static str {
-    "\
-#version 300 es
-precision highp float;
-precision highp int;
-uniform highp sampler2D src_rgba;
-uniform highp sampler2D src_r8;
-uniform ivec2 img_size;
-uniform int   tex_width;
-uniform ivec2 chroma_shift;
-uniform int   chroma_lines;
-out uvec4 frag;
-
-// XOR 0x80 bias on a [0,1]-normalized float channel: quantize to uint8,
-// add 128 mod 256, re-pack as uint.  Matches the scalar int8 shader.
-uint channel_int8(float v) {
-    uint q = uint(floor(v * 255.0 + 0.5));
-    return (q + 128u) & 255u;
-}
-
-uint yuv_to_packed_int8(float yv, float u, float v) {
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
-    uint ri = channel_int8(r);
-    uint gi = channel_int8(g);
-    uint bi = channel_int8(b);
-    return ri | (gi << 8u) | (bi << 16u) | (255u << 24u);
-}
-
-vec2 fetch_uv(int ccol, int crow, int h) {
-    int ccol2  = ccol * 2;
-    int carry  = (ccol2 >= tex_width) ? 1 : 0;
-    int cy     = h + crow * chroma_lines + carry;
-    int cx     = ccol2 - carry * tex_width;
-    float u    = texelFetch(src_r8, ivec2(cx,     cy), 0).r;
-    float v    = texelFetch(src_r8, ivec2(cx + 1, cy), 0).r;
-    return vec2(u, v);
-}
-
-void main() {
-    int fx = int(floor(gl_FragCoord.x));
-    int fy = int(floor(gl_FragCoord.y));
-
-    int h  = img_size.y;
-    int x0 = fx * 4;
-
-    vec4 luma_rgba = texelFetch(src_rgba, ivec2(fx, fy), 0);
-    float yv0 = luma_rgba.r;
-    float yv1 = luma_rgba.g;
-    float yv2 = luma_rgba.b;
-    float yv3 = luma_rgba.a;
-
-    int crow = fy >> chroma_shift.y;
-
-    vec2 uv0 = fetch_uv(x0       >> chroma_shift.x, crow, h);
-    vec2 uv1 = fetch_uv((x0 + 1) >> chroma_shift.x, crow, h);
-    vec2 uv2 = fetch_uv((x0 + 2) >> chroma_shift.x, crow, h);
-    vec2 uv3 = fetch_uv((x0 + 3) >> chroma_shift.x, crow, h);
-
-    frag = uvec4(
-        yuv_to_packed_int8(yv0, uv0.x, uv0.y),
-        yuv_to_packed_int8(yv1, uv1.x, uv1.y),
-        yuv_to_packed_int8(yv2, uv2.x, uv2.y),
-        yuv_to_packed_int8(yv3, uv3.x, uv3.y)
-    );
 }
 "
 }

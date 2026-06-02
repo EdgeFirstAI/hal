@@ -630,8 +630,10 @@ impl V4l2Context {
                     d[o..o + final_w].copy_from_slice(&y_plane[s..s + final_w]);
                 }
                 // Interleaved CbCr plane (`final_w` bytes/row = `final_w/2` pairs).
+                // `ceil(final_h/2)` chroma rows — the last row must be copied for
+                // odd luma heights (4:2:0 rounds the chroma row count up).
                 let uv_base = final_h * dst_stride;
-                for cy in 0..final_h / 2 {
+                for cy in 0..final_h.div_ceil(2) {
                     let s = cy * c_stride;
                     let o = uv_base + cy * dst_stride;
                     d[o..o + final_w].copy_from_slice(&cbcr[s..s + final_w]);

@@ -188,6 +188,38 @@ def test_rgba_to_rgb():
         assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
+@pytest.mark.parametrize(
+    "fixture,fmt",
+    [
+        ("testdata/zidane_422.jpg", PixelFormat.Nv16),
+        ("testdata/zidane_444.jpg", PixelFormat.Nv24),
+    ],
+    ids=["nv16_422", "nv24_444"],
+)
+def test_decode_native_nv16_nv24(fixture, fmt):
+    """The Python surface exposes NV16 (4:2:2) and NV24 (4:4:4): the decoder
+    selects the matching native format from the JPEG subsampling, and the
+    semi-planar source converts to RGB through the same path as NV12."""
+    if not os.path.exists(fixture):
+        pytest.skip(f"{fixture} fixture missing")
+    w, h = _image_size(fixture)
+    src = Tensor.image(w, h, format=fmt)
+    assert src.format == fmt
+    info = src.decode_image_file(fixture)
+    # The decoder reports (and configures) the native semi-planar format.
+    assert info.format == fmt
+    assert (info.width, info.height) == (w, h)
+
+    converter = ImageProcessor()
+    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    converter.convert(src, dst)
+    with dst.map() as m:
+        n = np.array(m.view()).reshape((dst.height, dst.width, 3))
+        expected = load_image(fixture, "RGB")
+        # 0.95: same BT.601-full-vs-PIL tolerance as the NV12 conversions.
+        assert calculate_similarity_rms_u8(n, expected) > 0.95
+
+
 def test_enum_cmp():
     dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     assert dst.format == PixelFormat.Rgba

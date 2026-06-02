@@ -29,10 +29,12 @@ pub enum PixelFormat {
     PlanarRgb,
     /// Planar RGBA, channels-first [4, H, W]
     PlanarRgba,
-    /// Semi-planar YUV 4:4:4 [H*2, W] or multiplane [H, W] + [H, W].
-    /// Full-resolution chroma: Y plane (H rows) + interleaved Cb/Cr plane
-    /// (H rows). Added last to keep the existing `#[repr(u8)]` discriminants
-    /// (and any serialized values) stable.
+    /// Semi-planar YUV 4:4:4, contiguous shape `[H*3, W]`. Full-resolution
+    /// chroma: Y plane (H rows of W bytes) + interleaved Cb/Cr plane (H image
+    /// rows of W pairs = 2W bytes/row, laid out as 2H rows of W) → 3H rows
+    /// total. Multiplane NV24 is not yet supported (see `from_planes`). Added
+    /// last to keep the existing `#[repr(u8)]` discriminants (and any
+    /// serialized values) stable.
     Nv24,
 }
 
@@ -90,36 +92,36 @@ impl PixelFormat {
     /// semi-planar variant (any `SemiPlanar` variant other than `Nv12`,
     /// `Nv16`, and `Nv24`).
     ///
-    /// Odd dimensions are supported with one asymmetry. The combined-plane
-    /// height for NV12 is `height + ceil(height / 2)` (luma rows + chroma rows),
-    /// which equals the classic `height * 3 / 2` for even heights and stays
-    /// exact for odd ones — e.g. 483 → 725 rows (483 luma + 242 chroma).
+    /// Odd dimensions are fully supported.  The combined-plane height for NV12
+    /// is `height + ceil(height / 2)` (luma rows + chroma rows), which equals
+    /// the classic `height * 3 / 2` for even heights and stays exact for odd
+    /// ones — e.g. 483 → 725 rows (483 luma + 242 chroma).
     ///
-    /// The semi-planar **width is rounded up to even**: the interleaved chroma
-    /// plane stores one `(U, V)` pair per two luma columns, so an odd width has
-    /// no whole-byte representation for its final column. The rounded width
-    /// pads the buffer by one column; the true odd image width is reported by
-    /// the decoder in `ImageInfo` and trimmed by a `convert()` crop. (Strided
-    /// odd-width buffers would avoid the pad but cannot be CPU-mapped on
-    /// non-Linux platforms, so the even buffer width is the portable choice.)
+    /// For semi-planar formats the shape carries the **logical** width as-is
+    /// (odd widths are preserved, e.g. `[720, 789]` for a 789×384 NV12).
+    /// The row stride recorded separately on the tensor is `>= even(width)` and
+    /// 64-byte aligned; it may exceed the logical width.  Use
+    /// `effective_row_stride()` to determine the true byte pitch for
+    /// mapping and allocation.  Allocation byte size = `total_h * row_stride`,
+    /// NOT the shape product.
     pub fn image_shape(&self, width: usize, height: usize) -> Option<Vec<usize>> {
         match self.layout() {
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
             PixelLayout::SemiPlanar => {
-                let even_width = width.next_multiple_of(2);
                 let total_h = match self {
-                    // Combined-plane height in W-wide rows:
-                    //   NV12 (4:2:0): Y (H) + interleaved UV (H/2 rows of W) = 3H/2
-                    //   NV16 (4:2:2): Y (H) + interleaved UV (H rows of W)   = 2H
-                    //   NV24 (4:4:4): Y (H) + interleaved UV (2H rows of W)  = 3H
-                    // (the UV plane is W bytes/row for NV12·NV16 and 2W for NV24).
+                    // Combined-plane height in stride-wide rows:
+                    //   NV12 (4:2:0): Y (H) + interleaved UV (ceil(H/2) rows) = H + ceil(H/2)
+                    //   NV16 (4:2:2): Y (H) + interleaved UV (H rows)         = 2H
+                    //   NV24 (4:4:4): Y (H) + interleaved UV (2H rows)        = 3H
                     PixelFormat::Nv12 => height + height.div_ceil(2),
                     PixelFormat::Nv16 => height * 2,
                     PixelFormat::Nv24 => height * 3,
                     _ => return None,
                 };
-                Some(vec![total_h, even_width])
+                // Shape carries logical width; row_stride (>= even(width), 64-aligned)
+                // is stored separately on the Tensor and governs byte layout.
+                Some(vec![total_h, width])
             }
         }
     }

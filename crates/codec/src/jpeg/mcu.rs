@@ -373,26 +373,47 @@ fn write_nv16_nv24_rows(
         dst[d..d + img_w].copy_from_slice(&comp_bufs[0][s..s + img_w]);
     }
 
-    let even_width = img_w.next_multiple_of(2);
     // Both keep full-height chroma (one chroma row per luma row); they differ in
-    // horizontal resolution and the per-chroma-row byte pitch in grid units.
-    let (chroma_cols, bytes_per_crow) = match output_format {
-        PixelFormat::Nv16 => (img_w.div_ceil(2), even_width), // 4:2:2
-        _ => (img_w, even_width * 2),                         // 4:4:4
+    // horizontal resolution.
+    // NV16 (4:2:2): one chroma row per luma row, each row is grid_row_stride
+    //   bytes, holding img_w/2 (Cb,Cr) pairs.
+    // NV24 (4:4:4): two chroma rows per luma row (2W bytes of UV per luma row),
+    //   each physical row is grid_row_stride bytes, holding img_w (Cb,Cr) pairs.
+    let chroma_cols = match output_format {
+        PixelFormat::Nv16 => img_w.div_ceil(2), // 4:2:2
+        _ => img_w,                             // 4:4:4
+    };
+    // How many grid rows the UV plane advances per luma row:
+    //   NV16: 1 grid row (UV bytes_per_luma_row == grid_row_stride)
+    //   NV24: 2 grid rows (UV bytes_per_luma_row == 2*grid_row_stride)
+    let uv_grid_rows_per_luma = match output_format {
+        PixelFormat::Nv16 => 1usize,
+        _ => 2usize,
     };
     let uv_plane_offset = img_h * grid_row_stride;
-    // Map a linear UV-plane byte to its physical offset in the strided grid.
-    let pos = |lb: usize| uv_plane_offset + (lb / even_width) * grid_row_stride + (lb % even_width);
 
     let cb_buf = &comp_bufs[1];
     let cr_buf = &comp_bufs[2];
     for row in 0..num_rows {
         let oy = y_start + row; // chroma row == luma row (full-height chroma)
         let src = row * c_stride;
+        // Each (Cb, Cr) pair at column ocx occupies two consecutive bytes on the
+        // same grid row.  For NV24 the UV for luma row `oy` spans two grid rows
+        // starting at grid row `oy * 2`.
+        //
+        // Grid row for the (ocx * 2)th UV byte of luma row oy:
+        //   grid_row = oy * uv_grid_rows_per_luma + (ocx * 2) / grid_row_stride
+        //   col      = (ocx * 2) % grid_row_stride
+        // Because ocx * 2 < img_w * 2 <= grid_row_stride * uv_grid_rows_per_luma
+        // (the assertion at the function top guarantees grid_row_stride >= even_width)
+        // the grid_row never overflows for either format.
         for ocx in 0..chroma_cols {
-            let lb = oy * bytes_per_crow + ocx * 2;
-            dst[pos(lb)] = cb_buf[src + ocx];
-            dst[pos(lb + 1)] = cr_buf[src + ocx];
+            let linear_uv = oy * uv_grid_rows_per_luma * grid_row_stride + ocx * 2;
+            let grid_row = linear_uv / grid_row_stride;
+            let col = linear_uv % grid_row_stride;
+            let off = uv_plane_offset + grid_row * grid_row_stride + col;
+            dst[off] = cb_buf[src + ocx];
+            dst[off + 1] = cr_buf[src + ocx];
         }
     }
 }

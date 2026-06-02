@@ -180,17 +180,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   during bring-up gave no path to the actual root cause; the
   enriched message names every input that the kernel rejected.
 
-### Fixed
-
-- PBO-backed tensors now implement a capacity-based `set_logical_shape` (and
-  `capacity_bytes`), matching `Mem`/`Shm`/`DMA`/`IOSurface`. Previously PBO fell
-  back to the strict-`reshape` default (exact element match), so an oversized
-  reusable pool could not be `configure_image`d to a smaller image. This broke
-  the native-chroma decode pool on PBO-backed hosts (e.g. Linux PCs / Jetson
-  without `/dev/dma_heap`), where reconfiguring the `3·H` GREY pool to a smaller
-  `NV12`/`NV16`/`NV24` shape failed with a `ShapeMismatch`. DMA-backed pools were
-  unaffected.
-
 ### Removed
 
 - **Breaking:** `DecodeOptions` and the `opts` parameter on all
@@ -211,15 +200,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GPU NV16/NV24 zero-copy convert on Linux/embedded GLES.** NV16 (4:2:2) and
+  NV24 (4:4:4) DMA-BUF sources previously had no GPU path and silently fell back
+  to the CPU YUV→RGB converter (the dominant cost in preprocessing on embedded
+  GPUs). They now convert on the GPU zero-copy via "Path B": the combined
+  semi-planar buffer is imported as a single-plane R8 EGLImage and a hand-written
+  `texelFetch` shader (core GL ES 3.0, no `GL_OES_EGL_image_external` extension)
+  does the YUV→RGB. The shader uses direct 2D addressing (no per-pixel integer
+  divide/modulo), which is essential on Vivante (≈3.3× over the naive form).
+  NV12 continues to use the proven Path A (`samplerExternalOES` hardware-YUV),
+  because `samplerExternalOES` does not correctly sample 4:2:2/4:4:4 on the
+  embedded drivers. The output dtype is target-appropriate (u8/i8 RGB for the
+  quantized NPU targets, F16 PlanarRgb on Tegra/macOS). Validated on Vivante
+  GC7000UL, Mali-G310, V3D, and Tegra. BT.601 full-range (interim colorimetry).
+- PBO-backed tensors now implement a capacity-based `set_logical_shape` (and
+  `capacity_bytes`), matching `Mem`/`Shm`/`DMA`/`IOSurface`. Previously PBO fell
+  back to the strict-`reshape` default (exact element match), so an oversized
+  reusable pool could not be `configure_image`d to a smaller image. This broke
+  the native-chroma decode pool on PBO-backed hosts (e.g. Linux PCs / Jetson
+  without `/dev/dma_heap`), where reconfiguring the `3·H` GREY pool to a smaller
+  `NV12`/`NV16`/`NV24` shape failed with a `ShapeMismatch`. DMA-backed pools were
+  unaffected.
 - GPU and heap sub-region views now honor `plane_offset`. The OpenGL EGLImage
   cache key includes the plane offset, so offset-distinct views of one DMA-BUF
   no longer alias the offset-0 image (previously every view rendered/sampled the
   base region — capping batched render-to-DMA-BUF). Heap (`Mem`) tensors map
   correctly at non-zero offsets, and the shared backing uses interior-mutable
   cells so disjoint sub-views carry correct write provenance.
-
-### Fixed
-
+- Odd-height NV12 from the V4L2 hardware JPEG decoder no longer drops its last
+  chroma row (the MMAP copy used `final_h / 2`; now `ceil(final_h / 2)`).
 - **NV12 odd-dimension support.** The JPEG decoder previously rejected any
   colour JPEG whose width *or* height was odd with `NV12 requires even
   dimensions`, breaking common photo/COCO images (e.g. 640×483, 375×500).

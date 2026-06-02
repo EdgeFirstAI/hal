@@ -1660,12 +1660,8 @@ impl ImageProcessor {
 
             let chroma_h = match format {
                 PixelFormat::Nv12 => {
-                    if !height.is_multiple_of(2) {
-                        return Err(Error::InvalidShape(format!(
-                            "NV12 requires even height, got {height}"
-                        )));
-                    }
-                    height / 2
+                    // NV12 (4:2:0): ceil(H/2) chroma rows — odd heights are valid.
+                    height.div_ceil(2)
                 }
                 // NV16 multiplane will be supported in a future release;
                 // the GL backend currently only handles NV12 plane1 attributes.
@@ -1749,14 +1745,8 @@ impl ImageProcessor {
                 PixelLayout::Planar => vec![format.channels(), height, width],
                 PixelLayout::SemiPlanar => {
                     let total_h = match format {
-                        PixelFormat::Nv12 => {
-                            if !height.is_multiple_of(2) {
-                                return Err(Error::InvalidShape(format!(
-                                    "NV12 requires even height, got {height}"
-                                )));
-                            }
-                            height * 3 / 2
-                        }
+                        // NV12 (4:2:0): H + ceil(H/2) — odd heights are valid.
+                        PixelFormat::Nv12 => height + height.div_ceil(2),
                         PixelFormat::Nv16 => height * 2,
                         _ => {
                             return Err(Error::InvalidShape(format!(

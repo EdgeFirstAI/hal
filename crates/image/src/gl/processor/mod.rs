@@ -44,16 +44,15 @@ pub(super) use float::dma_f16_packed_layout;
 ///
 /// Recorded by `draw_nv_texture_2d` / `draw_camera_texture_eglimage` / CPU
 /// fallback so that tests and the profiler can assert that DMA NV* inputs never
-/// silently fall back to CPU.
+/// silently fall back to CPU. Only meaningful immediately after a convert whose
+/// source is `Nv12`/`Nv16`/`Nv24`; it is not reset for non-NV* converts (a
+/// reader observing it after, say, an RGBA convert sees the prior NV* value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NvConvertPath {
     /// Path A: driver-decoded YUV via `samplerExternalOES` EGLImage.
     HwYuvA,
     /// Path B: hand-written texelFetch R8 shader (ES 3.0, no extension).
     R8ShaderB,
-    /// Path B vectorized: 4-pixel-wide RGBA32UI output; RGBA source view reduces
-    /// luma fetches ~4×.  Selected by `EDGEFIRST_GL_NV_VECTORIZED=1`.
-    R8ShaderBVec,
     /// CPU fallback (EGLImage creation failed or format not DMA-backed).
     Cpu,
     /// Not yet set (initial state, or non-NV* convert).
@@ -183,15 +182,6 @@ pub struct GLProcessorST {
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
     nv_r8_egl_cache: EglImageCache,
-    // ── Vectorized Path B (EDGEFIRST_GL_NV_VECTORIZED=1) ─────────────────────
-    /// Vec4 Path B shader: NV* → RGBA32UI (4 packed RGBA8 pixels per fragment).
-    nv_vec4_program: GlProgram,
-    /// Vec4 Path B int8 shader: same as above + XOR 0x80 bias.
-    nv_vec4_int8_program: GlProgram,
-    /// Texture bound to the RGBA8 source view (TEXTURE0, unit 0).
-    nv_vec4_rgba_texture: Texture,
-    /// EGLImage cache for the RGBA8 source view (keyed by buffer identity).
-    nv_vec4_rgba_egl_cache: EglImageCache,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     pub(super) gl_context: GlContext,
@@ -604,16 +594,6 @@ impl GLProcessorST {
             generate_nv_to_rgba_int8_shader_2d(),
         )?;
 
-        // Vectorized Path B: 4-pixel-wide RGBA32UI output (EDGEFIRST_GL_NV_VECTORIZED=1).
-        let nv_vec4_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_nv_to_rgba_vec4_shader_2d(),
-        )?;
-        let nv_vec4_int8_program = GlProgram::new(
-            generate_vertex_shader(),
-            generate_nv_to_rgba_vec4_int8_shader_2d(),
-        )?;
-
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
         let render_texture = Texture::new();
@@ -683,10 +663,6 @@ impl GLProcessorST {
             nv_r8_int8_program,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: EglImageCache::new(8),
-            nv_vec4_program,
-            nv_vec4_int8_program,
-            nv_vec4_rgba_texture: Texture::new(),
-            nv_vec4_rgba_egl_cache: EglImageCache::new(8),
             last_nv_convert_path: NvConvertPath::None,
         };
         check_gl_error(function!(), line!())?;
@@ -1773,8 +1749,6 @@ impl GLProcessorST {
                 // Path B int8: swap nv_r8_program ↔ nv_r8_int8_program so that
                 // draw_nv_texture_2d picks up the bias shader automatically.
                 std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                // Vec4 Path B int8: swap nv_vec4_program ↔ nv_vec4_int8_program.
-                std::mem::swap(&mut self.nv_vec4_program, &mut self.nv_vec4_int8_program);
                 // Bias the letterbox clear color since glClear bypasses the shader.
                 let mut crop = crop;
                 if let Some(ref mut color) = crop.dst_color {
@@ -1789,7 +1763,6 @@ impl GLProcessorST {
                     &mut self.texture_int8_program_yuv,
                 );
                 std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                std::mem::swap(&mut self.nv_vec4_program, &mut self.nv_vec4_int8_program);
                 result
             } else {
                 self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
@@ -2890,100 +2863,18 @@ impl GLProcessorST {
             crate::Rotation::CounterClockwise90 => 3,
         };
         if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
-            // NV16/NV24: Path B (R8 texelFetch shader, ES 3.0 core) by default.
-            // NV12: Path A (samplerExternalOES), proven on all targets.
+            // NV16/NV24: Path B (R8 texelFetch shader, ES 3.0 core).
+            // NV12: Path A (samplerExternalOES), proven on all targets — EXCEPT
+            // when the source width is not a multiple of 4: the NV12 YUV EGLImage
+            // import requires width % 4 == 0 on some drivers (e.g. V3D rejects
+            // "EGLImage requires width divisible by 4 for NV12"), so route those
+            // odd/non-mult-4 NV12 sources to Path B (the R8 shader has no width
+            // constraint and handles NV12 via chroma_shift=(1,1), chroma_lines=1).
             // Everything else: Path A first, CPU upload fallback on error.
-            //
-            // Phase-2 A/B override: `EDGEFIRST_GL_NV_FORCE_PATH_A` routes
-            // NV16/NV24 through Path A (hardware-YUV samplerExternalOES, using
-            // the NV16/NV24 DRM fourccs) so per-GPU correctness + speed can be
-            // compared against Path B. Some drivers accept the fourcc but
-            // produce wrong output (cf. the VYUY exclusion), so Path A stays
-            // off by default until validated per GPU.
-            let force_path_a = std::env::var_os("EDGEFIRST_GL_NV_FORCE_PATH_A").is_some();
-            let use_path_b =
-                matches!(src_fmt, PixelFormat::Nv16 | PixelFormat::Nv24) && !force_path_a;
-            // Phase-2 vectorized Path B: set EDGEFIRST_GL_NV_VECTORIZED=1 to
-            // select the 4-pixel-wide RGBA32UI render path (A/B performance
-            // experiment; default OFF = scalar Path B unchanged).
-            let use_vec4 = use_path_b
-                && !src.is_multiplane()
-                && std::env::var_os("EDGEFIRST_GL_NV_VECTORIZED").is_some();
+            let use_path_b = matches!(src_fmt, PixelFormat::Nv16 | PixelFormat::Nv24)
+                || (src_fmt == PixelFormat::Nv12 && !src_w.is_multiple_of(4));
 
-            if use_vec4 {
-                // Vectorized Path B: fetch 4 luma samples per RGBA texel;
-                // render to W/4×H RGBA32UI that byte-aliases the RGBA8 dst.
-                match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
-                    Ok(r8_egl) => {
-                        match self.get_or_create_nv_rgba_egl_image(src, src_fmt) {
-                            Ok(rgba_egl) => {
-                                tracing::trace!(
-                                    path = "R8ShaderBVec",
-                                    src_fmt = ?src_fmt,
-                                    "image.convert.gl.nv_path"
-                                );
-                                self.last_nv_convert_path = NvConvertPath::R8ShaderBVec;
-                                self.draw_nv_texture_2d_vec4(
-                                    src,
-                                    src_fmt,
-                                    r8_egl,
-                                    rgba_egl,
-                                    src_roi,
-                                    dst_roi,
-                                    rotation_offset,
-                                    flip,
-                                )?;
-                            }
-                            Err(e) => {
-                                // RGBA view failed (driver doesn't support the
-                                // alias); fall back to scalar Path B silently.
-                                log::debug!(
-                                    "Vec4 RGBA EGLImage failed for {src_fmt}: {e}; \
-                                     falling back to scalar Path B"
-                                );
-                                tracing::trace!(
-                                    path = "R8ShaderB",
-                                    src_fmt = ?src_fmt,
-                                    "image.convert.gl.nv_path"
-                                );
-                                self.last_nv_convert_path = NvConvertPath::R8ShaderB;
-                                self.draw_nv_texture_2d(
-                                    src,
-                                    src_fmt,
-                                    r8_egl,
-                                    src_roi,
-                                    dst_roi,
-                                    rotation_offset,
-                                    flip,
-                                )?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let src_w = src.width().unwrap_or(0);
-                        let src_h = src.height().unwrap_or(0);
-                        self.last_nv_convert_path = NvConvertPath::Cpu;
-                        tracing::warn!(
-                            src_fmt = ?src_fmt,
-                            src_w,
-                            src_h,
-                            error = %e,
-                            "Vec4 Path B R8 EGLImage creation failed for {src_fmt} \
-                             ({src_w}x{src_h}); falling back to CPU path"
-                        );
-                        let start = Instant::now();
-                        self.draw_src_texture(
-                            src,
-                            src_fmt,
-                            src_roi,
-                            dst_roi,
-                            rotation_offset,
-                            flip,
-                        )?;
-                        log::debug!("draw_src_texture takes {:?}", start.elapsed());
-                    }
-                }
-            } else if use_path_b {
+            if use_path_b {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
                     Ok(r8_egl) => {
                         tracing::trace!(
@@ -3029,14 +2920,10 @@ impl GLProcessorST {
                     }
                 }
             } else {
-                // Path A for NV12 (proven) and, when forced for A/B testing,
-                // NV16/NV24 via the hardware-YUV samplerExternalOES path.
+                // Path A for NV12 (proven); NV16/NV24 always use Path B above.
                 match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                     Ok(src_egl) => {
-                        if matches!(
-                            src_fmt,
-                            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-                        ) {
+                        if src_fmt == PixelFormat::Nv12 {
                             tracing::trace!(path = "HwYuvA", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
                             self.last_nv_convert_path = NvConvertPath::HwYuvA;
                         }
@@ -3053,10 +2940,7 @@ impl GLProcessorST {
                     Err(e) => {
                         let src_w = src.width().unwrap_or(0);
                         let src_h = src.height().unwrap_or(0);
-                        if matches!(
-                            src_fmt,
-                            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-                        ) {
+                        if src_fmt == PixelFormat::Nv12 {
                             self.last_nv_convert_path = NvConvertPath::Cpu;
                         }
                         log::warn!(
@@ -3077,6 +2961,9 @@ impl GLProcessorST {
                 }
             }
         } else {
+            // Non-DMA source: any NV* falls back to the CPU texture-upload path
+            // (no zero-copy EGLImage). Record it so tests/profiler see the CPU
+            // fallback rather than a stale path from a prior frame.
             if matches!(
                 src_fmt,
                 PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
@@ -4278,7 +4165,7 @@ impl GLProcessorST {
                 log::trace!("draw_nv_texture_2d: reusing bound R8 EGLImage id={luma_id:#x}");
             }
 
-            // Set uniforms (img_size, tex_width, chroma_shift, uv_row_bytes).
+            // Set uniforms (img_size, tex_width, chroma_shift, chroma_lines).
             let loc_img_size = gls::gl::GetUniformLocation(prog_id, c"img_size".as_ptr());
             gls::gl::Uniform2i(loc_img_size, src_w as i32, src_h as i32);
 
@@ -4428,294 +4315,6 @@ impl GLProcessorST {
             },
         );
         Ok(handle)
-    }
-
-    // ── Vectorized Path B helpers ─────────────────────────────────────────────
-
-    /// Create the RGBA8 source-view EGLImage for vectorized Path B.
-    ///
-    /// Views the same NV* DMA-BUF as `ABGR8888` of width `tex_width/4` so that
-    /// one `texelFetch` in the vec4 shader fetches four consecutive luma bytes.
-    fn create_image_from_dma_nv_rgba_view(
-        &self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-    ) -> Result<EglImage, Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor_nv_rgba_view(src, src_fmt)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
-    /// Look up or create the RGBA8 source-view EGLImage for vectorized Path B.
-    ///
-    /// Uses a dedicated cache (`nv_vec4_rgba_egl_cache`) keyed by buffer
-    /// identity so the R8 and RGBA views of the same buffer don't interfere.
-    fn get_or_create_nv_rgba_egl_image(
-        &mut self,
-        img: &Tensor<u8>,
-        img_fmt: PixelFormat,
-    ) -> Result<egl::Image, crate::Error> {
-        let luma_id = img.buffer_identity().id();
-        let id = (luma_id, None::<u64>, img.plane_offset().unwrap_or(0));
-
-        if self.nv_vec4_rgba_egl_cache.sweep() {
-            self.nv_vec4_rgba_texture.invalidate_egl_binding();
-        }
-
-        {
-            let ts = self.nv_vec4_rgba_egl_cache.next_timestamp();
-            if let Some(cached) = self.nv_vec4_rgba_egl_cache.entries.get_mut(&id) {
-                self.nv_vec4_rgba_egl_cache.hits += 1;
-                cached.last_used = ts;
-                log::trace!("nv_vec4_rgba_egl_cache hit: id={luma_id:#x}");
-                return Ok(cached.egl_image.egl_image);
-            }
-            self.nv_vec4_rgba_egl_cache.misses += 1;
-            log::trace!("nv_vec4_rgba_egl_cache miss: id={luma_id:#x}");
-        }
-
-        let egl_image_obj = self.create_image_from_dma_nv_rgba_view(img, img_fmt)?;
-        self.nv_vec4_rgba_texture.invalidate_egl_binding();
-
-        let handle = egl_image_obj.egl_image;
-        let guard = img.buffer_identity().weak();
-        if self.nv_vec4_rgba_egl_cache.entries.len() >= self.nv_vec4_rgba_egl_cache.capacity {
-            self.nv_vec4_rgba_egl_cache.evict_lru();
-        }
-        let ts = self.nv_vec4_rgba_egl_cache.next_timestamp();
-        self.nv_vec4_rgba_egl_cache.entries.insert(
-            id,
-            super::cache::CachedEglImage {
-                egl_image: egl_image_obj,
-                last_used: ts,
-                guard,
-                renderbuffer: None,
-            },
-        );
-        Ok(handle)
-    }
-
-    /// Vectorized Path B draw: 4-pixel-wide RGBA32UI render target.
-    ///
-    /// Sets up a W/4×H RGBA32UI FBO whose bytes alias the W×H RGBA8 dst buffer,
-    /// binds the RGBA source view (TEXTURE0) and R8 source (TEXTURE1), then
-    /// draws a full-screen quad.  The vec4 shader writes four packed RGBA8 pixels
-    /// per fragment, filling the dst buffer with the same byte layout as the
-    /// scalar Path B shader.
-    ///
-    /// The dst FBO attachment reuses the same DMA-backed EGLImage/texture as the
-    /// scalar path — no extra allocation is needed; the RGBA32UI and RGBA8 views
-    /// share the same underlying bytes.
-    ///
-    /// Driver feasibility risk: most GL ES 3.0 drivers allow a RGBA32UI texture
-    /// as a framebuffer color attachment (RGBA32UI is a required renderable format
-    /// in ES 3.0).  However, some older Vivante firmware may refuse to attach
-    /// a RGBA32UI texture that was created from an external DMA-BUF.  If
-    /// `glCheckFramebufferStatus` returns incomplete the caller falls back to
-    /// scalar Path B.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_nv_texture_2d_vec4(
-        &mut self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        r8_egl: egl::Image,
-        rgba_egl: egl::Image,
-        src_roi: RegionOfInterest,
-        mut dst_roi: RegionOfInterest,
-        rotation_offset: usize,
-        flip: Flip,
-    ) -> Result<(), Error> {
-        let src_w = src.width().ok_or(Error::NotAnImage)?;
-        let src_h = src.height().ok_or(Error::NotAnImage)?;
-        let tex_width = src.effective_row_stride().unwrap_or(src_w) as i32;
-
-        // Format-specific shader uniforms (same as scalar Path B).
-        let (chroma_shift_x, chroma_shift_y, chroma_lines) = match src_fmt {
-            PixelFormat::Nv12 => (1i32, 1i32, 1i32),
-            PixelFormat::Nv16 => (1i32, 0i32, 1i32),
-            PixelFormat::Nv24 => (0i32, 0i32, 2i32),
-            _ => {
-                return Err(Error::NotSupported(format!(
-                    "draw_nv_texture_2d_vec4: unsupported format {src_fmt:?}"
-                )));
-            }
-        };
-
-        // The W/4×H FBO reads from the dest EGLImage bound to `render_texture`.
-        // We reuse the same `convert_fbo` and `render_texture` slots that the
-        // scalar path uses — they will already be configured by the enclosing
-        // `convert_dest_dma` / `setup_renderbuffer_dma` call chain.  We only
-        // need to update the viewport to W/4 × H.
-        let vec4_w = (src_w / 4) as i32;
-        let vec4_h = src_h as i32;
-
-        let luma_id = src.buffer_identity().id();
-        let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
-        let src_key = (luma_id, chroma_id, src.plane_offset().unwrap_or(0));
-        let rgba_key = (luma_id, None::<u64>, src.plane_offset().unwrap_or(0));
-
-        let prog_id = self.nv_vec4_program.id;
-
-        unsafe {
-            gls::gl::UseProgram(prog_id);
-
-            // ── TEXTURE0: RGBA source view (luma, W/4 wide) ─────────────────
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.nv_vec4_rgba_texture.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            if self
-                .nv_vec4_rgba_texture
-                .bind_egl_image(rgba_key, rgba_egl.as_ptr())
-            {
-                log::trace!("draw_nv_texture_2d_vec4: bound RGBA EGLImage id={luma_id:#x}");
-            }
-
-            // ── TEXTURE1: R8 source view (combined height, for chroma) ───────
-            gls::gl::ActiveTexture(gls::gl::TEXTURE1);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.nv_r8_texture.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            if self.nv_r8_texture.bind_egl_image(src_key, r8_egl.as_ptr()) {
-                log::trace!("draw_nv_texture_2d_vec4: bound R8 EGLImage id={luma_id:#x}");
-            }
-
-            // Reset active texture to 0 before setting uniforms.
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-
-            // ── Uniforms ─────────────────────────────────────────────────────
-            let loc_src_rgba = gls::gl::GetUniformLocation(prog_id, c"src_rgba".as_ptr());
-            gls::gl::Uniform1i(loc_src_rgba, 0);
-
-            let loc_src_r8 = gls::gl::GetUniformLocation(prog_id, c"src_r8".as_ptr());
-            gls::gl::Uniform1i(loc_src_r8, 1);
-
-            let loc_img_size = gls::gl::GetUniformLocation(prog_id, c"img_size".as_ptr());
-            gls::gl::Uniform2i(loc_img_size, src_w as i32, src_h as i32);
-
-            let loc_tex_width = gls::gl::GetUniformLocation(prog_id, c"tex_width".as_ptr());
-            gls::gl::Uniform1i(loc_tex_width, tex_width);
-
-            let loc_chroma_shift = gls::gl::GetUniformLocation(prog_id, c"chroma_shift".as_ptr());
-            gls::gl::Uniform2i(loc_chroma_shift, chroma_shift_x, chroma_shift_y);
-
-            let loc_chroma_lines = gls::gl::GetUniformLocation(prog_id, c"chroma_lines".as_ptr());
-            gls::gl::Uniform1i(loc_chroma_lines, chroma_lines);
-
-            // ── Viewport: W/4 × H ────────────────────────────────────────────
-            gls::gl::Viewport(0, 0, vec4_w, vec4_h);
-
-            check_gl_error(function!(), line!())?;
-
-            // ── Quad geometry (same pattern as scalar draw_nv_texture_2d) ────
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-
-            match flip {
-                Flip::None => {}
-                Flip::Vertical => {
-                    std::mem::swap(&mut dst_roi.top, &mut dst_roi.bottom);
-                }
-                Flip::Horizontal => {
-                    std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
-                }
-            }
-
-            let camera_vertices: [f32; 12] = [
-                dst_roi.left,
-                dst_roi.top,
-                0.,
-                dst_roi.right,
-                dst_roi.top,
-                0.,
-                dst_roi.right,
-                dst_roi.bottom,
-                0.,
-                dst_roi.left,
-                dst_roi.bottom,
-                0.,
-            ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
-                0,
-                (size_of::<f32>() * camera_vertices.len()) as isize,
-                camera_vertices.as_ptr() as *const c_void,
-            );
-
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-
-            let texture_vertices: [f32; 16] = [
-                src_roi.left,
-                src_roi.top,
-                src_roi.right,
-                src_roi.top,
-                src_roi.right,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.top,
-                src_roi.right,
-                src_roi.top,
-                src_roi.right,
-                src_roi.bottom,
-                src_roi.left,
-                src_roi.bottom,
-            ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
-                0,
-                (size_of::<f32>() * 8) as isize,
-                (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
-            );
-
-            let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
-                vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
-                vertices_index.as_ptr() as *const c_void,
-            );
-        }
-        check_gl_error(function!(), line!())?;
-        Ok(())
     }
 
     fn create_image_from_dma2(

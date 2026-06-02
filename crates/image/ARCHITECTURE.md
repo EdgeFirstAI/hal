@@ -37,7 +37,7 @@ shutdown quirks of each driver stack.
 - [`ImageProcessorTrait`](https://docs.rs/edgefirst-image/latest/edgefirst_image/trait.ImageProcessorTrait.html) — the convert/draw API common to every backend.
 - [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — geometric parameters; `Crop::letterbox()` preserves aspect ratio.
 - [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`).
-- [`codec::ImageLoad`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/trait.ImageLoad.html) + [`codec::ImageDecoder`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/struct.ImageDecoder.html) — decode JPEG/PNG into a pre-allocated tensor at its native format (JPEG → `Nv12`/`Grey`, PNG → `Rgb`/`Rgba`/`Grey`); EXIF orientation is reported in `ImageInfo`, never applied (apply it via `convert()`). [`save_jpeg`](https://docs.rs/edgefirst-image/latest/edgefirst_image/fn.save_jpeg.html) — encode a `u8` tensor to JPEG.
+- [`codec::ImageLoad`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/trait.ImageLoad.html) + [`codec::ImageDecoder`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/struct.ImageDecoder.html) — decode JPEG/PNG into a pre-allocated tensor at its native format (JPEG → `Nv12`/`Nv16`/`Nv24` by subsampling, or `Grey`; PNG → `Rgb`/`Rgba`/`Grey`); EXIF orientation is reported in `ImageInfo`, never applied (apply it via `convert()`). [`save_jpeg`](https://docs.rs/edgefirst-image/latest/edgefirst_image/fn.save_jpeg.html) — encode a `u8` tensor to JPEG.
 
 ## Internal Architecture
 
@@ -109,8 +109,9 @@ from `width * bytes_per_pixel`.
 |--------|--------------|-------|
 | `Rgb`, `Rgba`, `Bgra`, `Grey`, `Yuyv`, `Vyuy` | `[H, W, C]` | Interleaved (channels-last) |
 | `PlanarRgb`, `PlanarRgba` | `[C, H, W]` | Channels-first |
-| `Nv12` | `[H*3/2, W]` | 2D — Y plane (H rows) + UV (H/2 rows) |
-| `Nv16` | `[H*2, W]` | 2D — Y plane (H rows) + UV (H rows) |
+| `Nv12` | `[H + ceil(H/2), W]` | 4:2:0 — Y plane (H rows) + UV (ceil(H/2) rows); `3H/2` for even H, exact for odd H |
+| `Nv16` | `[H*2, W]` | 4:2:2 — Y plane (H rows) + UV (H rows) |
+| `Nv24` | `[H*3, W]` | 4:4:4 — Y plane (H rows) + full-res CbCr (2H rows of W = H image rows of 2W) |
 
 For multi-plane DMA-BUF NV12/NV16 (V4L2 `NV12M` from VPU/NeoISP), Y and UV
 live in separate allocations. `Tensor::from_planes(luma, chroma,
@@ -242,6 +243,37 @@ addressable while `glFramebufferTexture2D` makes it framebuffer-
 addressable. Both bindings are valid simultaneously because ANGLE's
 Metal backend reference-counts the underlying Metal texture.
 
+### Linux NV12 / NV16 / NV24 → RGB convert (Path A / Path B)
+
+Semi-planar YUV sources reach the GPU on Linux via one of two zero-copy
+DMA-BUF import paths, selected by format (`processor/mod.rs::convert_to`):
+
+- **Path A — driver hardware-YUV (`samplerExternalOES`).** The two-plane
+  DMA-BUF is imported as an `EGL_LINUX_DMA_BUF_EXT` EGLImage with a YUV DRM
+  FourCC and sampled through `samplerExternalOES`; the driver does the
+  YUV→RGB. This is the path **NV12** uses on every GPU. It is *not* used for
+  NV16/NV24 on the embedded drivers: `samplerExternalOES` either rejects the
+  4:2:2/4:4:4 FourCC (Vivante: `EGL(BadMatch)`) or samples it incorrectly
+  (Mali/V3D produce wrong pixels). `pixel_format_to_drm` therefore maps only
+  NV12 among the semi-planar formats.
+- **Path B — hand-written R8 `texelFetch` shader.** The *combined* semi-planar
+  buffer is imported as a single-plane **R8** EGLImage (one `texelFetch`-able
+  `TEXTURE_2D`; combined height = luma `H` + chroma rows: NV12 `ceil(H/2)`,
+  NV16 `H`, NV24 `2H`). A core GL ES 3.0 shader (`generate_nv_to_rgba_*` in
+  `gl/shaders.rs`, no `GL_OES_EGL_image_external` extension) does the YUV→RGB
+  with direct 2D addressing — uniforms `chroma_shift` and `chroma_lines`, no
+  per-pixel integer divide/modulo (the divide/modulo form is ~3.3× slower on
+  Vivante GC7000UL, which is texture-fetch-bound for this kernel). This is the
+  path **NV16 and NV24** use on all GPUs. The `EDGEFIRST_GL_NV_FORCE_PATH_A`
+  env var forces Path A as a per-GPU A/B diagnostic.
+
+Both paths feed the existing, dtype-appropriate output render unchanged: u8/i8
+RGB(A) into a zero-copy DMA target for the quantized NPU targets (imx8mp vx,
+imx95 Neutron), or the RGBA8→PlanarRgb-F16 packer for the F16 targets
+(Tegra/orin, macOS). `last_nv_convert_path` records which path ran
+(`HwYuvA`/`R8ShaderB`/`Cpu`) so tests and the profiler can assert no silent CPU
+fallback for a DMA NV* source.
+
 ### macOS GL backend (`gl/macos_processor.rs`)
 
 The macOS implementation is a parallel single-threaded GL processor
@@ -302,7 +334,10 @@ agree with each other (≤3 LSB), so cross-backend parity holds; only the
 absolute colorimetry against a BT.709 source differs. Proper per-source
 colorimetry selection (tagging decoded frames with their color space and
 choosing the matching matrix) is a future change; until then every backend is
-deliberately BT.601-full for consistency.
+deliberately BT.601-full for consistency. This includes the Linux GL backend:
+the Path B `texelFetch` shader hard-codes the BT.601 full-range matrix, and
+Path A's `samplerExternalOES` import sets the matching EGL YUV color hints, so
+Linux Path A/Path B and the CPU/macOS kernels all agree.
 
 ### ANGLE constant gotchas
 
@@ -417,7 +452,10 @@ ExternalMem), and DMA-BUF import path, see
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —
 `src_egl_cache` for source tensors and `dst_egl_cache` for destination
-tensors. Each entry is keyed by `(BufferIdentity.id, chroma_id)`.
+tensors. Each entry is keyed by `(BufferIdentity.id, chroma_id,
+plane_offset)` — the plane offset is part of the key so offset-distinct
+sub-views of one DMA-BUF (e.g. batched render-to-DMA targets) get distinct
+EGLImages instead of all aliasing the offset-0 region.
 
 `BufferIdentity` is defined in
 [`crates/tensor/src/lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs)
@@ -460,13 +498,13 @@ See [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFir
 in the project ARCHITECTURE.md for the cross-crate cache story (V4L2
 fd recycling, inode-keyed cache, GStreamer adaptor integration).
 
-### Vivante NV12 → PlanarRgb two-pass workaround
+### Vivante NV12/NV16/NV24 → PlanarRgb two-pass workaround
 
-A single-pass NV12 → PlanarRgb shader causes a GPU hang on the Vivante
-GC7000UL (NXP i.MX 8M Plus). The workaround splits the conversion:
+A single-pass semi-planar-YUV → PlanarRgb shader causes a GPU hang on the
+Vivante GC7000UL (NXP i.MX 8M Plus). The workaround splits the conversion:
 
 ```text
-Pass 1:  NV12 → RGBA (intermediate)
+Pass 1:  NV12/NV16/NV24 → RGBA (intermediate)
          All geometry: resize, crop, rotation, flip, letterbox
 Pass 2:  RGBA → PlanarRgb (at destination resolution)
          Deinterleaves RGBA to three planes via sampler2D variants
@@ -475,8 +513,8 @@ Pass 2:  RGBA → PlanarRgb (at destination resolution)
 Pass 1 reuses the existing `packed_rgb_intermediate_tex` texture — no new
 GPU resources allocated. Pass 2 uses the same shader infrastructure as
 direct RGBA → PlanarRgb. The two-pass path is selected automatically when
-`is_vivante && src_fmt == Nv12 && dst_fmt.layout() == Planar`. No API
-changes required from callers.
+`is_vivante && matches!(src_fmt, Nv12 | Nv16 | Nv24) && dst_fmt.layout() ==
+Planar`. No API changes required from callers.
 
 ## Mask Rendering
 
@@ -866,7 +904,7 @@ image.materialize_masks                                 [user-facing fn]
 
 | Optimization | Why it matters |
 |--------------|----------------|
-| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. |
+| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id, plane_offset)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
 | One `ImageProcessor` per pipeline | Each instance owns its OpenGL context, GL thread, and per-thread caches (the EGL display is process-global and shared). Multiple instances still serialize on `GL_MUTEX`, so concurrent use across instances buys nothing. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |
@@ -889,7 +927,7 @@ in the project README for the user-facing rules and validation patterns.
 
 | Platform | Backends available | Float preprocessing | Notes |
 |----------|--------------------|---------------------|-------|
-| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12 → PlanarRgb requires the two-pass workaround; GPU float disabled (170–320 ms readback) |
+| Linux NXP i.MX 8M Plus (Vivante GC7000UL) | OpenGL, G2D, CPU | CPU only (float disabled) | NV12/NV16/NV24 → PlanarRgb requires the two-pass workaround; NV16/NV24 use the Path B R8 shader (NV12 uses Path A); GPU float disabled (170–320 ms readback) |
 | Linux NXP i.MX 95 (Mali-G310 / Panfrost) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | Concurrent GL works; `EDGEFIRST_OPENGL_RENDERSURFACE=1` required for Neutron NPU DMA-BUF destinations |
 | Linux RPi 5 (V3D / Broadcom) | OpenGL, CPU | F16 PBO + DMA-BUF; F32 PBO | |
 | Linux Tegra Orin / NVIDIA (orin-nano) | OpenGL (PBO path), CPU | F16 PBO; F32 PBO — **PBO → CUDA zero-copy implemented** (`cuda_map()` maps the PBO to a device pointer on the GL worker thread; TensorRT reads directly from device memory) | DMA-buf import unsupported; PBO path provides zero-copy to CUDA |

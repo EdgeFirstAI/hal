@@ -36,6 +36,49 @@ impl<T> ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Create a shared-memory tensor with a logical `shape` but a physical
+    /// allocation of `byte_size` bytes (which must be `>= shape.product() *
+    /// sizeof(T)`).  Used for image tensors with a 64-byte-aligned row stride
+    /// that exceeds the logical shape product.
+    pub(crate) fn new_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        let logical = shape.iter().product::<usize>() * elem;
+        if byte_size < logical {
+            return Err(Error::InsufficientCapacity {
+                needed: logical,
+                capacity: byte_size,
+            });
+        }
+        let name = match name {
+            Some(n) => n.to_owned(),
+            None => {
+                let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+                format!("/{}", &uuid[..16])
+            }
+        };
+        let shm_fd = nix::sys::mman::shm_open(
+            name.as_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let err = nix::sys::mman::shm_unlink(name.as_str());
+        if let Err(e) = err {
+            log::warn!("Failed to unlink shared memory: {e}");
+        }
+        ftruncate(&shm_fd, byte_size as i64)?;
+        Ok(ShmTensor::<T> {
+            name,
+            fd: shm_fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+            identity: crate::BufferIdentity::new(),
+        })
+    }
+
     /// Map exposing `byte_size` bytes via `as_slice()` (and mmap'ing exactly
     /// that many) for self-allocated strided tensors whose rows are padded. The
     /// caller (`Tensor::map`) validates `byte_size <= capacity_bytes()` first.

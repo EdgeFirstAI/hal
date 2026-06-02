@@ -103,11 +103,11 @@ where
     /// Allocate `byte_capacity` bytes and set an initial logical `shape`
     /// (whose byte size must fit the capacity).
     ///
-    /// Test-only: production code allocates exactly `shape` via [`MemTensor::new`]
-    /// and grows the logical view with `set_logical_shape` within that capacity.
-    /// This over-allocating constructor exists for tests that need spare
-    /// capacity (e.g. an offset window past the logical end).
-    #[cfg(test)]
+    /// Used for image tensors with a 64-byte-aligned row stride that may
+    /// exceed `shape.product() * sizeof(T)`: production callers allocate via
+    /// `Tensor::image()` (which routes through this constructor), and tests use
+    /// it directly when they need spare capacity (e.g. an offset window past
+    /// the logical end).
     pub(crate) fn with_capacity_bytes(
         shape: &[usize],
         byte_capacity: usize,
@@ -421,7 +421,10 @@ where
         // the shared `Arc` is sound. Distinct sub-region views address
         // non-overlapping windows (the documented `subview` disjointness
         // contract, matching `DmaMap`), so the `&mut` windows never alias.
-        let base = unsafe { (self.backing.base_ptr() as *const u8).add(self.offset) as *mut T };
+        // Keep the byte-offset arithmetic on `*mut u8` (not `*const u8`) so the
+        // write provenance from `base_ptr()` is preserved through the cast — the
+        // whole reason the backing is `UnsafeCell` rather than `Arc<Vec<T>>`.
+        let base = unsafe { (self.backing.base_ptr() as *mut u8).add(self.offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
     }
 }
