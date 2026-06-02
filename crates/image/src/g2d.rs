@@ -408,7 +408,7 @@ fn tensor_to_g2d_surface(img: &Tensor<u8>) -> Result<G2DSurface> {
         } else {
             let w = img.width().unwrap();
             let h = img.height().unwrap();
-            let stride = img.effective_row_stride().unwrap_or(w);
+            let stride = img.effective_row_stride().unwrap_or(w.next_multiple_of(2));
             let uv_offset = (luma_offset as usize + stride * h) as u64;
             [base_addr + luma_offset, base_addr + uv_offset, 0]
         }
@@ -1454,5 +1454,255 @@ mod g2d_tests {
         assert_eq!(s.planes[0], luma_base + 4096);
         // Chroma should include its offset
         assert_eq!(s.planes[1], chroma_base + 2048);
+    }
+
+    // =========================================================================
+    // Odd-dimension end-to-end cells (Deliverable C)
+    //
+    // Design contract:
+    //   • Source is a patterned NV12 tensor (Dma) filled stride-aware with a
+    //     pattern varying in both X and Y.  A Mem copy carries the same fill for
+    //     the CPU reference (trusted oracle from odd_dim_cpu.rs).
+    //   • G2D output (Dma RGBA) is compared against the CPU output pixel-by-pixel
+    //     at each tensor's own `effective_row_stride`.
+    //   • Tolerance: ±4 (same as GL).  G2D BT.601 is limited-range on the matrix
+    //     but historically matches within ±4 on real hardware; the tolerance is
+    //     tightened to ±6 only if on-target validation shows it is needed.
+    //   • If G2D rejects the dimensions (returns Err), the test documents the
+    //     behaviour via `assert!` rather than silently passing.
+    //   • Both test cells skip at runtime if DMA is unavailable or G2D init fails.
+    // =========================================================================
+
+    /// Fill a Nv12 tensor (any memory type) with a patterned, stride-aware
+    /// synthetic image that varies in both X and Y.
+    ///
+    /// Pattern: `Y(r,c) = (r*3 + c*5) % 256`
+    /// Chroma column `cc`, chroma row `cr_row` (NV12: 4:2:0 — half in both dims):
+    ///   `Cb = (cc*7 + cr_row*11 + 40) % 256`
+    ///   `Cr = (cc*13 + cr_row*3 + 80) % 256`
+    ///
+    /// This matches `make_odd_both_source` in `odd_dim_cpu.rs` so the two test
+    /// suites share an analytic ground truth.
+    #[cfg(target_os = "linux")]
+    fn fill_patterned_nv12(t: &TensorDyn) {
+        let w = t.width().unwrap();
+        let h = t.height().unwrap();
+        let stride = t.effective_row_stride().unwrap();
+
+        // NV12 (4:2:0): chroma is ceil(H/2) rows of W/2 pairs.
+        let chroma_h = h.div_ceil(2);
+        let chroma_w = w.div_ceil(2);
+
+        let bound = t.as_u8().unwrap();
+        let mut m = bound.map().unwrap();
+        let buf = m.as_mut_slice();
+        let uv_start = stride * h;
+
+        // Luma: diagonal gradient.
+        for r in 0..h {
+            for c in 0..w {
+                buf[r * stride + c] = ((r * 3 + c * 5) % 256) as u8;
+            }
+        }
+        // Chroma: UV row pitch == stride for NV12.
+        for cr_row in 0..chroma_h {
+            for cc in 0..chroma_w {
+                let cb_val = ((cc * 7 + cr_row * 11 + 40) % 256) as u8;
+                let cr_val = ((cc * 13 + cr_row * 3 + 80) % 256) as u8;
+                let uv_byte = uv_start + cr_row * stride + cc * 2;
+                buf[uv_byte] = cb_val;
+                buf[uv_byte + 1] = cr_val;
+            }
+        }
+    }
+
+    /// Compare a G2D RGBA `u8` DMA tensor against a CPU RGBA `u8` reference,
+    /// reading both at their real `effective_row_stride`.
+    ///
+    /// Returns `(max_diff, first_pixel_over_threshold)`.
+    #[cfg(target_os = "linux")]
+    fn compare_g2d_vs_cpu_rgba(
+        g2d_dst: &TensorDyn,
+        cpu_dst: &TensorDyn,
+        w: usize,
+        h: usize,
+        tol: u32,
+    ) -> (u32, Option<(usize, usize, usize)>) {
+        let channels = 4usize; // RGBA
+        let g2d_t = g2d_dst.as_u8().unwrap();
+        let cpu_t = cpu_dst.as_u8().unwrap();
+        let g2d_stride = g2d_t.effective_row_stride().unwrap_or(w * channels);
+        let cpu_stride = cpu_t.effective_row_stride().unwrap_or(w * channels);
+        let g2d_map = g2d_t.map().unwrap();
+        let cpu_map = cpu_t.map().unwrap();
+        let g2d_px = g2d_map.as_slice();
+        let cpu_px = cpu_map.as_slice();
+        let mut max_diff = 0u32;
+        let mut first_fail: Option<(usize, usize, usize)> = None;
+        for row in 0..h {
+            for col in 0..w {
+                for ch in 0..3usize {
+                    // Compare RGB channels only; alpha is hardware-defined
+                    let gi = row * g2d_stride + col * channels + ch;
+                    let ci = row * cpu_stride + col * channels + ch;
+                    let d = (g2d_px[gi] as i32 - cpu_px[ci] as i32).unsigned_abs();
+                    if d > max_diff {
+                        max_diff = d;
+                    }
+                    if first_fail.is_none() && d > tol {
+                        first_fail = Some((col, row, ch));
+                    }
+                }
+            }
+        }
+        (max_diff, first_fail)
+    }
+
+    // -------------------------------------------------------------------------
+    // D-01: NV12 odd-W (65×64) → RGBA via G2D vs CPU reference
+    // -------------------------------------------------------------------------
+
+    /// D-01: NV12 odd-width (65×64) → RGBA via G2D, compared to CPU reference.
+    ///
+    /// Asserts:
+    ///   (a) G2D accepts odd-width NV12 without returning an error.
+    ///   (b) G2D output matches CPU reference within ±4 on RGB channels.
+    ///       (Alpha is hardware-defined and excluded from the comparison.)
+    ///
+    /// If on-target validation shows the G2D hardware has wider tolerance for
+    /// odd widths, the tolerance may be relaxed to ±6 with a justification
+    /// comment — but only after observing an actual on-target failure, not
+    /// preemptively.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn d01_nv12_odd_w_g2d_vs_cpu() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - DMA not available");
+            return;
+        }
+        let (w, h) = (65usize, 64usize);
+
+        let src_dma =
+            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let src_mem =
+            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        fill_patterned_nv12(&src_dma);
+        fill_patterned_nv12(&src_mem);
+
+        // CPU reference: Nv12 → Rgba.
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        CPUProcessor::new()
+            .convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        // G2D convert: Nv12 → Rgba.
+        let mut g2d_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d = match G2DProcessor::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: d01_nv12_odd_w_g2d_vs_cpu - G2D not available: {e}");
+                return;
+            }
+        };
+
+        // (a) G2D must accept odd-width NV12 without error.
+        g2d.convert(
+            &src_dma,
+            &mut g2d_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("D-01: G2D rejected odd-width (65) NV12 source: {e}");
+        });
+
+        // (b) G2D output ≈ CPU reference ±4 on RGB channels.
+        let tol = 4u32;
+        let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
+        eprintln!("D-01 NV12 odd-W G2D vs CPU: max_diff={max_diff}");
+        assert!(
+            max_diff <= tol,
+            "D-01: NV12 odd-W G2D vs CPU max_diff={max_diff} > {tol}; first bad at {first_fail:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // D-03: NV12 odd-both (65×63) → RGBA via G2D vs CPU reference
+    // -------------------------------------------------------------------------
+
+    /// D-03: NV12 odd-width AND odd-height (65×63) → RGBA via G2D vs CPU reference.
+    ///
+    /// This is the strictest G2D odd-dimension cell: it exercises both the
+    /// stride-boundary at the last luma row AND the half-height chroma plane
+    /// boundary.  If the G2D hardware rejects the conversion (e.g. hardware
+    /// alignment requirement on chroma height), this test documents that via a
+    /// panic rather than passing silently.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn d03_nv12_odd_both_g2d_vs_cpu() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - DMA not available");
+            return;
+        }
+        let (w, h) = (65usize, 63usize);
+
+        let src_dma =
+            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let src_mem =
+            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        fill_patterned_nv12(&src_dma);
+        fill_patterned_nv12(&src_mem);
+
+        // CPU reference: Nv12 → Rgba.
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        CPUProcessor::new()
+            .convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        // G2D convert: Nv12 → Rgba.
+        let mut g2d_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d = match G2DProcessor::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: d03_nv12_odd_both_g2d_vs_cpu - G2D not available: {e}");
+                return;
+            }
+        };
+
+        // G2D must accept odd-both NV12 without error (documented behaviour).
+        // If hardware rejects it, the panic message is the intended failure report.
+        g2d.convert(
+            &src_dma,
+            &mut g2d_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("D-03: G2D rejected odd-both (65×63) NV12 source: {e}");
+        });
+
+        let tol = 4u32;
+        let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
+        eprintln!("D-03 NV12 odd-both G2D vs CPU: max_diff={max_diff}");
+        assert!(
+            max_diff <= tol,
+            "D-03: NV12 odd-both G2D vs CPU max_diff={max_diff} > {tol}; first bad at {first_fail:?}"
+        );
     }
 }
