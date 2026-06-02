@@ -2833,7 +2833,7 @@ mod gl_tests {
         let bpp: usize = 4;
         // 64-byte aligned stride: ceil(640*4 / 64) * 64 = 2560 (already aligned)
         // Use 128-byte alignment to get a genuinely padded stride.
-        let stride: usize = ((width * bpp + 127) / 128) * 128; // 2560 -> 2560 (already 128-aligned)
+        let stride: usize = (width * bpp).div_ceil(128) * 128; // 2560 -> 2560 (already 128-aligned)
                                                                // Force a wider stride to be sure it's padded
         let stride = stride + 128; // 2688
 
@@ -4309,5 +4309,604 @@ mod gl_tests {
             "device data does not match NHWC-normalized source (max_err={max_err})"
         );
         // drop(cm) unmaps
+    }
+
+    // =========================================================================
+    // Path B: NV16/NV24 → RGBA GPU round-trip tests
+    //
+    // Gate: Linux + dma_test_formats + runtime skip if DMA or GL unavailable.
+    // Strategy: solid-colour sources → exact expected RGB computable from
+    // BT.601 full-range; assert Path B ran (no CPU fallback); assert output
+    // matches CPU reference within tolerance.
+    // =========================================================================
+
+    /// Compute expected BT.601 full-range RGB from raw Y, Cb, Cr byte values.
+    ///
+    /// Matches the coefficient set used in both the CPU kernels and the
+    /// `generate_nv_to_rgba_shader_2d` shader (and the macOS `NV_TO_RGBA_FRAGMENT`).
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn yuv601_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+        let yf = y as f32 / 255.0;
+        let up = cb as f32 / 255.0 - 128.0 / 255.0;
+        let vp = cr as f32 / 255.0 - 128.0 / 255.0;
+        let r = (yf + 1.402 * vp).clamp(0.0, 1.0);
+        let g = (yf - 0.344 * up - 0.714 * vp).clamp(0.0, 1.0);
+        let b = (yf + 1.772 * up).clamp(0.0, 1.0);
+        [
+            (r * 255.0 + 0.5) as u8,
+            (g * 255.0 + 0.5) as u8,
+            (b * 255.0 + 0.5) as u8,
+        ]
+    }
+
+    /// Build a solid-colour NV16 (4:2:2) buffer of dimensions `(w, h)`.
+    ///
+    /// Layout: `[H rows of Y][H rows of interleaved CbCr]` (contiguous, width-aligned).
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn make_nv16_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
+        let y_plane = vec![y; w * h];
+        // NV16: H rows of UV, each row has w/2 pairs → w bytes/row.
+        let uv_plane: Vec<u8> = std::iter::repeat_n([cb, cr], w * h / 2).flatten().collect();
+        [y_plane, uv_plane].concat()
+    }
+
+    /// Build a solid-colour NV24 (4:4:4) buffer of dimensions `(w, h)`.
+    ///
+    /// Layout: `[H rows of Y][H rows of interleaved CbCr full-res]`.
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn make_nv24_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
+        let y_plane = vec![y; w * h];
+        // NV24: H rows of UV, each row has w pairs → 2w bytes/row.
+        let uv_plane: Vec<u8> = std::iter::repeat_n([cb, cr], w * h).flatten().collect();
+        [y_plane, uv_plane].concat()
+    }
+
+    /// Verify NV16→RGBA via Path B (R8 texelFetch shader) on DMA buffers.
+    ///
+    /// Checks:
+    ///   (a) `last_nv_convert_path` == `R8ShaderB` — no CPU fallback.
+    ///   (b) Every output pixel matches the expected BT.601 full-range RGB
+    ///       within ±2 (rounding from f32 shader arithmetic).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv16_to_rgba_path_b() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let (w, h) = (64usize, 64usize);
+        // Solid YCbCr: Y=100, Cb=150, Cr=80 → deterministic RGB.
+        let (yv, cb, cr) = (100u8, 150u8, 80u8);
+        let expected = yuv601_to_rgb(yv, cb, cr);
+
+        let src = load_raw_image(
+            w,
+            h,
+            PixelFormat::Nv16,
+            Some(TensorMemory::Dma),
+            &make_nv16_solid(w, h, yv, cb, cr),
+        )
+        .unwrap();
+
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // (a) Assert Path B ran — no CPU fallback for a DMA NV16 source.
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::R8ShaderB,
+            "NV16 DMA convert must use Path B (R8ShaderB), got {:?}",
+            gl.last_nv_convert_path
+        );
+
+        // (b) Check pixel values against BT.601 reference within ±2.
+        let map = dst.as_u8().unwrap().map().unwrap();
+        let pixels = map.as_slice();
+        for i in 0..(w * h) {
+            let r = pixels[i * 4];
+            let g = pixels[i * 4 + 1];
+            let b = pixels[i * 4 + 2];
+            let diff_r = (r as i32 - expected[0] as i32).unsigned_abs();
+            let diff_g = (g as i32 - expected[1] as i32).unsigned_abs();
+            let diff_b = (b as i32 - expected[2] as i32).unsigned_abs();
+            assert!(
+                diff_r <= 2 && diff_g <= 2 && diff_b <= 2,
+                "pixel {i}: got ({r},{g},{b}) expected ({},{},{}) — diff ({diff_r},{diff_g},{diff_b})",
+                expected[0], expected[1], expected[2]
+            );
+        }
+    }
+
+    /// Verify NV24→RGBA via Path B (R8 texelFetch shader) on DMA buffers.
+    ///
+    /// Checks:
+    ///   (a) `last_nv_convert_path` == `R8ShaderB` — no CPU fallback.
+    ///   (b) Every output pixel matches the expected BT.601 full-range RGB
+    ///       within ±2.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv24_to_rgba_path_b() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let (w, h) = (64usize, 64usize);
+        // Solid YCbCr: Y=180, Cb=90, Cr=200 → deterministic RGB.
+        let (yv, cb, cr) = (180u8, 90u8, 200u8);
+        let expected = yuv601_to_rgb(yv, cb, cr);
+
+        let src = load_raw_image(
+            w,
+            h,
+            PixelFormat::Nv24,
+            Some(TensorMemory::Dma),
+            &make_nv24_solid(w, h, yv, cb, cr),
+        )
+        .unwrap();
+
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // (a) Assert Path B ran — no CPU fallback for a DMA NV24 source.
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::R8ShaderB,
+            "NV24 DMA convert must use Path B (R8ShaderB), got {:?}",
+            gl.last_nv_convert_path
+        );
+
+        // (b) Check pixel values against BT.601 reference within ±2.
+        let map = dst.as_u8().unwrap().map().unwrap();
+        let pixels = map.as_slice();
+        for i in 0..(w * h) {
+            let r = pixels[i * 4];
+            let g = pixels[i * 4 + 1];
+            let b = pixels[i * 4 + 2];
+            let diff_r = (r as i32 - expected[0] as i32).unsigned_abs();
+            let diff_g = (g as i32 - expected[1] as i32).unsigned_abs();
+            let diff_b = (b as i32 - expected[2] as i32).unsigned_abs();
+            assert!(
+                diff_r <= 2 && diff_g <= 2 && diff_b <= 2,
+                "pixel {i}: got ({r},{g},{b}) expected ({},{},{}) — diff ({diff_r},{diff_g},{diff_b})",
+                expected[0], expected[1], expected[2]
+            );
+        }
+    }
+
+    /// Verify NV16→RGBA Path B output matches the CPU reference converter.
+    ///
+    /// Builds a patterned NV16 source, runs it through the CPU and GPU
+    /// converters, and asserts the GPU output matches the CPU output within ±2.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv16_matches_cpu_reference() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let (w, h) = (64usize, 64usize);
+        // Build a patterned NV16 source (varying luma + fixed neutral chroma).
+        let mut nv16 = vec![0u8; w * h * 2]; // H luma rows + H chroma rows
+        for row in 0..h {
+            for col in 0..w {
+                nv16[row * w + col] = ((row * 255) / h) as u8;
+            }
+        }
+        // Neutral chroma: Cb=128, Cr=128 → no colour shift.
+        for i in 0..w * h {
+            nv16[w * h + i] = 128;
+        }
+
+        let src_dma =
+            load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Dma), &nv16).unwrap();
+        let src_mem =
+            load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Mem), &nv16).unwrap();
+
+        // CPU reference.
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        {
+            let mut cpu = crate::cpu::CPUProcessor::new();
+            cpu.convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        }
+
+        // GPU Path B.
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::R8ShaderB,
+            "NV16 DMA convert must use Path B"
+        );
+
+        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+        let cpu_pixels = cpu_map.as_slice();
+        let gpu_pixels = gpu_map.as_slice();
+
+        let mut max_diff = 0u32;
+        for i in 0..(w * h * 4) {
+            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 2,
+            "NV16 GPU Path B vs CPU reference: max_diff={max_diff} (tolerance 2)"
+        );
+    }
+
+    /// Verify NV24→RGBA Path B output matches the CPU reference converter.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv24_matches_cpu_reference() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let (w, h) = (64usize, 64usize);
+        // Patterned NV24: varying luma, fixed neutral chroma.
+        let mut nv24 = vec![0u8; w * h * 3]; // H luma rows + 2H chroma rows
+        for row in 0..h {
+            for col in 0..w {
+                nv24[row * w + col] = ((row * 255) / h) as u8;
+            }
+        }
+        // Neutral chroma for NV24: 2*w*h chroma bytes, all 128.
+        for i in 0..w * h * 2 {
+            nv24[w * h + i] = 128;
+        }
+
+        let src_dma =
+            load_raw_image(w, h, PixelFormat::Nv24, Some(TensorMemory::Dma), &nv24).unwrap();
+        let src_mem =
+            load_raw_image(w, h, PixelFormat::Nv24, Some(TensorMemory::Mem), &nv24).unwrap();
+
+        // CPU reference.
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        {
+            let mut cpu = crate::cpu::CPUProcessor::new();
+            cpu.convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        }
+
+        // GPU Path B.
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::R8ShaderB,
+            "NV24 DMA convert must use Path B"
+        );
+
+        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+        let cpu_pixels = cpu_map.as_slice();
+        let gpu_pixels = gpu_map.as_slice();
+
+        let mut max_diff = 0u32;
+        for i in 0..(w * h * 4) {
+            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 2,
+            "NV24 GPU Path B vs CPU reference: max_diff={max_diff} (tolerance 2)"
+        );
+    }
+
+    /// Verify NV12 still uses Path A (samplerExternalOES) — no regression.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_still_uses_path_a() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let (w, h) = (64usize, 64usize);
+        // Solid grey NV12 (Y=128, Cb=128, Cr=128).
+        let mut nv12 = vec![128u8; w * h];
+        nv12.extend(vec![128u8; w * h / 2]); // UV plane
+        let src = load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &nv12).unwrap();
+
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+
+        // NV12 must still use Path A — no regression.
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::HwYuvA,
+            "NV12 DMA convert must still use Path A (HwYuvA), got {:?}",
+            gl.last_nv_convert_path
+        );
+    }
+
+    // ── Vectorized Path B (EDGEFIRST_GL_NV_VECTORIZED=1) tests ───────────────
+    //
+    // These tests force the vectorized path via a per-test environment variable
+    // set with `std::env::set_var` (safe because cargo tests run single-threaded
+    // via `--test-threads=1`). They assert:
+    //   (a) `last_nv_convert_path` is `R8ShaderBVec` or `R8ShaderB` (graceful
+    //       fallback when the driver rejects the RGBA view or vec4 FBO).
+    //   (b) Output matches the CPU reference within ±2.
+    //
+    // The existing scalar Path B tests are unchanged and continue to be the
+    // primary correctness gate.
+
+    /// Verify NV16→RGBA8 via the vectorized Path B (or graceful fallback) matches
+    /// the CPU reference within ±2.
+    ///
+    /// Forces `EDGEFIRST_GL_NV_VECTORIZED=1` for the duration of the test.
+    /// Accepts both `R8ShaderBVec` (vec4 path ran) and `R8ShaderB` (driver fell
+    /// back to scalar) because not all EGL implementations support the RGBA alias.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv16_vec4_matches_cpu_reference() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        // Safety: single-threaded test (--test-threads=1 is required by project).
+        // The var is unset after the test to avoid leaking state.
+        unsafe { std::env::set_var("EDGEFIRST_GL_NV_VECTORIZED", "1") };
+
+        let (w, h) = (64usize, 64usize);
+        // Patterned NV16: varying luma, neutral chroma.
+        let mut nv16 = vec![0u8; w * h * 2]; // H luma rows + H chroma rows
+        for row in 0..h {
+            for col in 0..w {
+                nv16[row * w + col] = ((col * 200) / w) as u8;
+            }
+        }
+        // Neutral chroma (Cb=128, Cr=128) for NV16.
+        for i in 0..w * h {
+            nv16[w * h + i] = 128;
+        }
+
+        let src_dma =
+            load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Dma), &nv16).unwrap();
+        let src_mem =
+            load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Mem), &nv16).unwrap();
+
+        // CPU reference (no GL).
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        {
+            let mut cpu = crate::cpu::CPUProcessor::new();
+            cpu.convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        }
+
+        // GPU vectorized Path B.
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                unsafe { std::env::remove_var("EDGEFIRST_GL_NV_VECTORIZED") };
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("EDGEFIRST_GL_NV_VECTORIZED") };
+
+        // Accept either the vec4 path or graceful scalar fallback.
+        assert!(
+            matches!(
+                gl.last_nv_convert_path,
+                NvConvertPath::R8ShaderBVec | NvConvertPath::R8ShaderB
+            ),
+            "NV16 vec4 test: expected R8ShaderBVec or R8ShaderB, got {:?}",
+            gl.last_nv_convert_path
+        );
+
+        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+        let cpu_pixels = cpu_map.as_slice();
+        let gpu_pixels = gpu_map.as_slice();
+
+        let mut max_diff = 0u32;
+        for i in 0..(w * h * 4) {
+            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 2,
+            "NV16 GPU vec4 Path B vs CPU reference: max_diff={max_diff} (tolerance 2)"
+        );
+    }
+
+    /// Verify NV24→RGBA8 via the vectorized Path B (or graceful fallback) matches
+    /// the CPU reference within ±2.
+    ///
+    /// Forces `EDGEFIRST_GL_NV_VECTORIZED=1` for the duration of the test.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_gpu_nv24_vec4_matches_cpu_reference() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        unsafe { std::env::set_var("EDGEFIRST_GL_NV_VECTORIZED", "1") };
+
+        let (w, h) = (64usize, 64usize);
+        // Patterned NV24: ramp luma, neutral chroma.
+        let mut nv24 = vec![0u8; w * h * 3]; // H luma rows + 2H chroma rows
+        for row in 0..h {
+            for col in 0..w {
+                nv24[row * w + col] = ((row * 255) / h) as u8;
+            }
+        }
+        // Neutral chroma for NV24: 2*w*h chroma bytes, all 128.
+        for i in 0..w * h * 2 {
+            nv24[w * h + i] = 128;
+        }
+
+        let src_dma =
+            load_raw_image(w, h, PixelFormat::Nv24, Some(TensorMemory::Dma), &nv24).unwrap();
+        let src_mem =
+            load_raw_image(w, h, PixelFormat::Nv24, Some(TensorMemory::Mem), &nv24).unwrap();
+
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        {
+            let mut cpu = crate::cpu::CPUProcessor::new();
+            cpu.convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        }
+
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                unsafe { std::env::remove_var("EDGEFIRST_GL_NV_VECTORIZED") };
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("EDGEFIRST_GL_NV_VECTORIZED") };
+
+        assert!(
+            matches!(
+                gl.last_nv_convert_path,
+                NvConvertPath::R8ShaderBVec | NvConvertPath::R8ShaderB
+            ),
+            "NV24 vec4 test: expected R8ShaderBVec or R8ShaderB, got {:?}",
+            gl.last_nv_convert_path
+        );
+
+        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+        let cpu_pixels = cpu_map.as_slice();
+        let gpu_pixels = gpu_map.as_slice();
+
+        let mut max_diff = 0u32;
+        for i in 0..(w * h * 4) {
+            let d = (gpu_pixels[i] as i32 - cpu_pixels[i] as i32).unsigned_abs();
+            max_diff = max_diff.max(d);
+        }
+        assert!(
+            max_diff <= 2,
+            "NV24 GPU vec4 Path B vs CPU reference: max_diff={max_diff} (tolerance 2)"
+        );
     }
 }

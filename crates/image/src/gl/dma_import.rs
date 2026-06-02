@@ -58,18 +58,18 @@ impl DmaImportAttrs {
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let src_channels = src_fmt.channels();
 
-        let (width, height, drm_fourcc, channels) = if src_fmt == PixelFormat::Nv12 {
+        let (width, height, drm_fourcc, channels) = if matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) {
             if !src_w.is_multiple_of(4) {
                 return Err(Error::NotSupported(format!(
                     "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
                 )));
             }
-            (
-                src_w,
-                src_h,
-                pixel_format_to_drm(PixelFormat::Nv12)?,
-                1usize,
-            )
+            // Luma (plane 0) is full-resolution R8 for all three; the chroma
+            // subsampling only affects plane 1 (handled below).
+            (src_w, src_h, pixel_format_to_drm(src_fmt)?, 1usize)
         } else if src_fmt.layout() == PixelLayout::Planar {
             if !src_w.is_multiple_of(16) {
                 return Err(Error::NotSupported(format!(
@@ -135,7 +135,11 @@ impl DmaImportAttrs {
         // Use the tensor's stored stride if set (for externally allocated buffers
         // with row padding), otherwise compute the tightly-packed pitch.
         let plane0_pitch = src.effective_row_stride().unwrap_or_else(|| {
-            if src_fmt == PixelFormat::Nv12 {
+            if matches!(
+                src_fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) {
+                // Luma plane is 1 byte/pixel for all semi-planar YUV.
                 width
             } else {
                 width * channels
@@ -144,34 +148,48 @@ impl DmaImportAttrs {
 
         let plane0_offset = src.plane_offset().unwrap_or(0);
 
-        // NV12 requires a second plane for UV data
-        let plane1 = if src_fmt == PixelFormat::Nv12 {
+        // Semi-planar YUV (NV12/NV16/NV24) carries a second (interleaved CbCr)
+        // plane. Geometry differs by chroma subsampling:
+        //   NV12 (4:2:0): H/2 rows, W bytes/row  (W/2 CbCr pairs)
+        //   NV16 (4:2:2): H   rows, W bytes/row  (W/2 CbCr pairs)
+        //   NV24 (4:4:4): H   rows, 2W bytes/row (W   CbCr pairs)
+        // Luma (plane 0) is always full-resolution W×H, so the contiguous UV
+        // offset is `plane0_offset + plane0_pitch * height` for all three.
+        let plane1 = if matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) {
+            let (chroma_h, default_chroma_pitch) = match src_fmt {
+                PixelFormat::Nv12 => (height / 2, plane0_pitch),
+                PixelFormat::Nv16 => (height, plane0_pitch),
+                PixelFormat::Nv24 => (height, plane0_pitch * 2),
+                _ => unreachable!(),
+            };
             let (plane1_fd, uv_offset) = if let Some(chroma_fd) = uv_fd {
                 // Multiplane: UV in separate DMA-BUF — use chroma's plane_offset or 0
                 let chroma_offset = src.chroma().and_then(|c| c.plane_offset()).unwrap_or(0);
                 (chroma_fd, chroma_offset)
             } else {
-                // Contiguous: UV follows Y in same buffer.
-                // Use stride-aware offset — if Y has padding, UV starts
-                // at stride * height, not width * height.  Include the
-                // luma plane_offset so the UV base is correct when pixel
-                // data does not start at byte 0.
+                // Contiguous: UV follows the full-height Y plane in the same
+                // buffer. Use stride-aware offset — if Y has padding, UV starts
+                // at stride * height. Include the luma plane_offset so the UV
+                // base is correct when pixel data does not start at byte 0.
                 (fd, plane0_offset + plane0_pitch * height)
             };
             let plane1_pitch = if let Some(chroma) = src.chroma() {
                 // Multiplane: use chroma's explicit stride if set (via
-                // set_row_stride_unchecked during import), or fall back to
-                // the luma pitch (NV12 UV row width in bytes equals Y width)
-                chroma.effective_row_stride().unwrap_or(plane0_pitch)
+                // set_row_stride_unchecked during import), else the
+                // subsampling-derived default (NV24 chroma row is 2×W).
+                chroma
+                    .effective_row_stride()
+                    .unwrap_or(default_chroma_pitch)
             } else {
-                // Contiguous NV12: UV stride matches Y stride
-                plane0_pitch
+                default_chroma_pitch
             };
             // Validate that the chroma offset + required data fits within the
             // chroma fd's buffer.  Catches client bugs where the wrong fd is
             // used for the UV plane (e.g. Y-only fd with vmeta global offset)
             // and produces a clear error instead of an opaque EGL(BadAlloc).
-            let chroma_h = height / 2;
             let chroma_data = plane1_pitch.saturating_mul(chroma_h);
             let required = uv_offset.saturating_add(chroma_data);
             let buf_size = {
@@ -185,7 +203,7 @@ impl DmaImportAttrs {
             if let Some(sz) = buf_size {
                 if required > sz {
                     return Err(Error::InvalidShape(format!(
-                        "NV12 chroma plane offset {uv_offset} + required {chroma_data} bytes \
+                        "{src_fmt} chroma plane offset {uv_offset} + required {chroma_data} bytes \
                          exceeds chroma fd buffer size {sz} — the chroma PlaneDescriptor \
                          likely references the wrong fd (e.g. Y-only buffer with the \
                          vmeta global offset instead of the UV buffer's own fd)",
@@ -211,6 +229,157 @@ impl DmaImportAttrs {
             plane0_offset,
             plane1,
             is_yuv: src_fmt.is_yuv(),
+        })
+    }
+
+    /// Build `DmaImportAttrs` for importing an NV* semi-planar buffer as a
+    /// **single-plane R8** EGLImage (Path B, GL ES 3.0 texelFetch shader).
+    ///
+    /// The combined buffer (luma + chroma rows stacked) is imported as one R8
+    /// plane of size `(effective_row_stride, luma_h + chroma_h)`.  This is
+    /// the Path-B zero-copy import used by `draw_nv_texture_2d` together with
+    /// the `generate_nv_to_rgba_shader_2d` shader.
+    ///
+    /// Returns the combined height and `uv_row_bytes` as extra fields via the
+    /// existing `DmaImportAttrs` struct:
+    ///   * `width`  = `effective_row_stride()` (even buffer width)
+    ///   * `height` = combined (luma + chroma) height
+    ///   * `drm_fourcc` = `DrmFourcc::R8`
+    ///   * `plane1` = `None`  (single-plane import)
+    ///
+    /// Requires a contiguous DMA buffer (not multiplane): the R8 import maps
+    /// the entire Y+UV region as one flat texture.
+    pub fn from_tensor_nv_r8(src: &Tensor<u8>, src_fmt: PixelFormat) -> Result<Self, Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+
+        if !matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) {
+            return Err(Error::NotSupported(format!(
+                "from_tensor_nv_r8 only supports NV12/NV16/NV24, got {src_fmt:?}"
+            )));
+        }
+
+        if src.is_multiplane() {
+            // Path B requires the Y and UV regions in the same DMA-BUF.
+            // Multiplane tensors have independent buffers; fall back to Path A.
+            return Err(Error::NotSupported(
+                "from_tensor_nv_r8: multiplane tensor not supported; use 2-plane Path A".into(),
+            ));
+        }
+
+        // Use the effective row stride as the R8 texture width so padding bytes
+        // are included in the linear addressing used by the shader.
+        let tex_width = src.effective_row_stride().unwrap_or(src_w);
+
+        // Combined (luma + chroma) height — mirrors the PlanarRgb R8 import
+        // (`src_h * 3` for 3-channel planar; here it is format-dependent).
+        // Combined (luma + chroma) buffer height, matching `PixelFormat::image_shape`:
+        //   NV12 (4:2:0): H luma + H/2 chroma          = H + ⌈H/2⌉
+        //   NV16 (4:2:2): H luma + H chroma (W bytes/row) = 2H
+        //   NV24 (4:4:4): H luma + 2H chroma (2W bytes/row laid out as 2H rows of W) = 3H
+        // The shader addresses chroma at byte `H*tex_width + ...`, reaching row
+        // 3H-1 for NV24, so the imported R8 texture MUST be 3H tall — a 2H import
+        // leaves the NV24 chroma rows out of bounds (reads garbage on strict tiled
+        // GPUs like Mali/V3D, tolerated on Vivante/Tegra).
+        let combined_h = match src_fmt {
+            PixelFormat::Nv12 => src_h + src_h.div_ceil(2),
+            PixelFormat::Nv16 => src_h * 2,
+            PixelFormat::Nv24 => src_h * 3,
+            _ => unreachable!(),
+        };
+
+        let dma = src.as_dma().ok_or_else(|| {
+            Error::NotImplemented(format!(
+                "OpenGL Path-B R8 import requires DMA tensor, got {:?}",
+                src.memory()
+            ))
+        })?;
+        let fd = dma.fd.as_raw_fd();
+        let plane0_offset = src.plane_offset().unwrap_or(0);
+
+        Ok(DmaImportAttrs {
+            width: tex_width,
+            height: combined_h,
+            drm_fourcc: DrmFourcc::R8,
+            plane0_fd: fd,
+            plane0_pitch: tex_width,
+            plane0_offset,
+            plane1: None,
+            is_yuv: false, // R8 is not a multi-plane YUV fourcc; no YUV hints
+        })
+    }
+
+    /// Build `DmaImportAttrs` for importing an NV* semi-planar buffer as an
+    /// **RGBA8** EGLImage (vectorized Path B source view).
+    ///
+    /// Views the **same combined DMA-BUF** (Y + chroma rows) as an `ABGR8888`
+    /// (RGBA8) texture of width `tex_width / 4`.  Each RGBA texel spans four
+    /// consecutive R8 bytes, so `texelFetch(src_rgba, ivec2(fx, y), 0).rgba`
+    /// returns four luma values at logical columns `fx*4 .. fx*4+3` in one fetch.
+    ///
+    /// The RGBA view covers only the **luma** rows `[0, H)` (height = `src_h`).
+    /// Chroma is still fetched from the R8 view (see [`Self::from_tensor_nv_r8`]);
+    /// the vec4 shader binds both views simultaneously.
+    ///
+    /// Prerequisites (already enforced by [`Self::from_tensor_nv_r8`]):
+    ///   - Contiguous DMA-BUF (not multiplane).
+    ///   - `tex_width % 4 == 0` (width is div-by-4, enforced upstream).
+    ///
+    /// Returns `Err(NotSupported)` for multiplane tensors.
+    pub fn from_tensor_nv_rgba_view(src: &Tensor<u8>, src_fmt: PixelFormat) -> Result<Self, Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
+
+        if !matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) {
+            return Err(Error::NotSupported(format!(
+                "from_tensor_nv_rgba_view only supports NV12/NV16/NV24, got {src_fmt:?}"
+            )));
+        }
+
+        if src.is_multiplane() {
+            return Err(Error::NotSupported(
+                "from_tensor_nv_rgba_view: multiplane tensor not supported".into(),
+            ));
+        }
+
+        let tex_width = src.effective_row_stride().unwrap_or(src_w);
+
+        if !tex_width.is_multiple_of(4) {
+            return Err(Error::NotSupported(format!(
+                "from_tensor_nv_rgba_view: tex_width {tex_width} is not divisible by 4"
+            )));
+        }
+
+        // RGBA view: width = tex_width / 4, height = luma rows only.
+        // The pitch of the RGBA8 view equals tex_width (4 bytes/texel × W/4
+        // texels/row = W bytes/row = same pitch as the R8 luma plane).
+        let rgba_w = tex_width / 4;
+        let rgba_pitch = tex_width; // 4 bytes × (tex_width/4) = tex_width bytes/row
+
+        let dma = src.as_dma().ok_or_else(|| {
+            Error::NotImplemented(format!(
+                "OpenGL Vec4 Path-B RGBA view requires DMA tensor, got {:?}",
+                src.memory()
+            ))
+        })?;
+        let fd = dma.fd.as_raw_fd();
+        let plane0_offset = src.plane_offset().unwrap_or(0);
+
+        Ok(DmaImportAttrs {
+            width: rgba_w,
+            height: src_h, // luma rows only
+            drm_fourcc: DrmFourcc::Abgr8888,
+            plane0_fd: fd,
+            plane0_pitch: rgba_pitch,
+            plane0_offset,
+            plane1: None,
+            is_yuv: false,
         })
     }
 
