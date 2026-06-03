@@ -27,6 +27,55 @@ pub(super) fn full_to_limit(l: u8) -> u8 {
     l
 }
 
+/// Scatter a packed `src_ch`-channel image into single-channel destination
+/// planes, honouring **both** source and destination row strides — rows are
+/// pitch-padded on DMA/IOSurface tensors (and `None`-memory tensors auto-select
+/// DMA on i.MX), so a flat `as_slice()` read shears the image. `plane_src[p]`
+/// selects the source channel copied into plane `p`, or `None` to fill that
+/// plane with a constant `255` (the alpha plane of a planar-RGBA destination).
+/// Each plane only touches the `w` logical bytes of every row; planes run
+/// concurrently.
+fn pack_to_planar(
+    src: &Tensor<u8>,
+    dst: &mut Tensor<u8>,
+    src_ch: usize,
+    plane_src: &[Option<usize>],
+) -> Result<()> {
+    let w = src.width().unwrap_or(0);
+    let h = src.height().unwrap_or(0);
+    let src_stride = super::tensor_row_stride(src);
+    let dst_stride = super::tensor_row_stride(dst);
+    let src_map = src.map()?;
+    let src_bytes = src_map.as_slice();
+    let mut dst_map = dst.map()?;
+    let dst_bytes = dst_map.as_mut_slice();
+
+    // Each destination plane is `h` rows of `dst_stride` bytes (the row pitch).
+    let plane = dst_stride * h;
+    let plane_slices: Vec<&mut [u8]> = dst_bytes.chunks_mut(plane).take(plane_src.len()).collect();
+    rayon::scope(|sc| {
+        for (pb, &chan) in plane_slices.into_iter().zip(plane_src.iter()) {
+            sc.spawn(move |_| match chan {
+                Some(c) => {
+                    for row in 0..h {
+                        let s = &src_bytes[row * src_stride..row * src_stride + w * src_ch];
+                        let d = &mut pb[row * dst_stride..row * dst_stride + w];
+                        for x in 0..w {
+                            d[x] = s[x * src_ch + c];
+                        }
+                    }
+                }
+                None => {
+                    for row in 0..h {
+                        pb[row * dst_stride..row * dst_stride + w].fill(255);
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
 impl CPUProcessor {
     pub(super) fn convert_nv12_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
@@ -507,42 +556,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_grey_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        rayon::scope(|s| {
-            s.spawn(|_| dst0.copy_from_slice(src));
-            s.spawn(|_| dst1.copy_from_slice(src));
-            s.spawn(|_| dst2.copy_from_slice(src));
-        });
-        Ok(())
+        // Grey broadcast into R, G, B planes.
+        pack_to_planar(src, dst, 1, &[Some(0), Some(0), Some(0)])
     }
 
     pub(super) fn convert_grey_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-        rayon::scope(|s| {
-            s.spawn(|_| dst0.copy_from_slice(src));
-            s.spawn(|_| dst1.copy_from_slice(src));
-            s.spawn(|_| dst2.copy_from_slice(src));
-            s.spawn(|_| dst3.fill(255));
-        });
-        Ok(())
+        // Grey broadcast into R, G, B planes + constant alpha plane.
+        pack_to_planar(src, dst, 1, &[Some(0), Some(0), Some(0), None])
     }
 
     pub(super) fn convert_grey_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
@@ -627,54 +647,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_rgba_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<4>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .for_each(|(((s, d0), d1), d2)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-            });
-        Ok(())
+        // RGBA → R, G, B planes (alpha dropped).
+        pack_to_planar(src, dst, 4, &[Some(0), Some(1), Some(2)])
     }
 
     pub(super) fn convert_rgba_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<4>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .zip_eq(dst3)
-            .for_each(|((((s, d0), d1), d2), d3)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-                *d3 = s[3];
-            });
-        Ok(())
+        // RGBA → R, G, B, A planes.
+        pack_to_planar(src, dst, 4, &[Some(0), Some(1), Some(2), Some(3)])
     }
 
     pub(super) fn convert_rgba_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
@@ -809,57 +788,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_rgb_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<3>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .for_each(|(((s, d0), d1), d2)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-            });
-        Ok(())
+        // RGB → R, G, B planes.
+        pack_to_planar(src, dst, 3, &[Some(0), Some(1), Some(2)])
     }
 
     pub(super) fn convert_rgb_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<3>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-
-        rayon::scope(|s| {
-            s.spawn(|_| {
-                src.par_iter()
-                    .zip_eq(dst0)
-                    .zip_eq(dst1)
-                    .zip_eq(dst2)
-                    .for_each(|(((s, d0), d1), d2)| {
-                        *d0 = s[0];
-                        *d1 = s[1];
-                        *d2 = s[2];
-                    })
-            });
-            s.spawn(|_| dst3.fill(255));
-        });
-        Ok(())
+        // RGB → R, G, B planes + constant alpha plane.
+        pack_to_planar(src, dst, 3, &[Some(0), Some(1), Some(2), None])
     }
 
     pub(super) fn convert_rgb_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
