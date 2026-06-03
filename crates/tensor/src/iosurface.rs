@@ -412,15 +412,13 @@ where
             // combined-plane buffer as one R8 texture, sized to the 64-aligned
             // row pitch (see `PixelFormat::semi_planar_surface_dims` for the
             // ANGLE width==pitch rationale).
-            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
-                format
-                    .semi_planar_surface_dims(width, height, bpe)
-                    .ok_or_else(|| {
-                        Error::InvalidShape(format!(
-                            "{format:?} has no semi-planar surface dims for {width}x{height}"
-                        ))
-                    })?
-            }
+            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => format
+                .semi_planar_surface_dims(width, height, bpe)
+                .ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "{format:?} has no semi-planar surface dims for {width}x{height}"
+                    ))
+                })?,
             _ => (width, height),
         };
 

@@ -144,7 +144,9 @@ fn split_semi_planar(
 ) -> Result<(&[u8], &[u8])> {
     let total_h = fmt.combined_plane_height(src_h).unwrap_or(src_h);
     let need = stride.checked_mul(total_h).ok_or_else(|| {
-        Error::InvalidShape(format!("{fmt:?} plane size overflow (stride={stride}, h={src_h})"))
+        Error::InvalidShape(format!(
+            "{fmt:?} plane size overflow (stride={stride}, h={src_h})"
+        ))
     })?;
     if bytes.len() < need {
         return Err(Error::InvalidShape(format!(

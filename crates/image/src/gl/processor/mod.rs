@@ -3327,9 +3327,8 @@ impl GLProcessorST {
 
         // --- Pass 1: NV12→RGBA into intermediate texture ---
         // No int8 bias here — bias is applied in pass 2's planar shader.
-        let _pass1 =
-            tracing::trace_span!("image.convert.gl.nv_to_planar.pass1_rgba", dst_w, dst_h)
-                .entered();
+        let _pass1 = tracing::trace_span!("image.convert.gl.nv_to_planar.pass1_rgba", dst_w, dst_h)
+            .entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
@@ -4142,7 +4141,9 @@ impl GLProcessorST {
         // direct 2D texel addressing (no per-pixel integer divide/modulo, which
         // is pathologically slow on some embedded GPUs e.g. Vivante GC7000UL).
         let layout = src_fmt.chroma_layout().ok_or_else(|| {
-            Error::NotSupported(format!("draw_nv_texture_2d: unsupported format {src_fmt:?}"))
+            Error::NotSupported(format!(
+                "draw_nv_texture_2d: unsupported format {src_fmt:?}"
+            ))
         })?;
         let chroma_shift_x = layout.shift_x as i32;
         let chroma_shift_y = layout.shift_y as i32;

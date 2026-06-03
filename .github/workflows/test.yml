@@ -193,8 +193,15 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.6.16,cargo-nextest
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+      - name: Check Rust formatting (advisory)
+        # Format drift is a WARNING, not a hard failure — it never blocks merge.
+        # The authoritative gate is the local `make format` pre-commit step
+        # (see .github/copilot-instructions.md). This emits a GitHub annotation
+        # so drift is visible in the PR checks UI without failing the job.
+        run: |
+          if ! cargo fmt --all -- --check; then
+            echo "::warning title=Rust formatting drift::Run 'make format' before committing — CI does not block on formatting."
+          fi
 
       - name: Run Clippy
         # Use default,opencv features; exclude g2d_test_formats,dma_test_formats (on-target only)

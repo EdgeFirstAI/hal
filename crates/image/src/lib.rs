@@ -5357,8 +5357,7 @@ mod image_tests {
                     w,
                     h,
                 );
-                let cpu_dst =
-                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
                 let (r, _s, cpu_dst) = convert_img(
                     &mut cpu,
                     mem,
@@ -5486,8 +5485,7 @@ mod image_tests {
                     w,
                     h,
                 );
-                let cpu_dst =
-                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
                 let (r, _s, cpu_dst) = convert_img(
                     &mut cpu,
                     mem,
@@ -5510,10 +5508,7 @@ mod image_tests {
                 ) {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!(
-                            "SKIPPED: {} — R8 pool IOSurface alloc: {e:?}",
-                            function!()
-                        );
+                        eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
                         return;
                     }
                 };
@@ -5533,14 +5528,9 @@ mod image_tests {
                     h,
                 );
 
-                let gpu_dst = TensorDyn::image(
-                    w,
-                    h,
-                    PixelFormat::Rgba,
-                    DType::U8,
-                    Some(TensorMemory::Dma),
-                )
-                .unwrap();
+                let gpu_dst =
+                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                        .unwrap();
                 let (r, _s, gpu_dst) = convert_img(
                     &mut gpu,
                     ios,

@@ -373,9 +373,9 @@ def test_dma_semiplanar_buffer_protocol_strided(fmt):
 
     with t.map() as m2:
         a2 = np.asarray(memoryview(m2))
-        assert all(
-            int(a2[r, 0]) == r % 256 for r in range(a2.shape[0])
-        ), "per-row zero-copy round-trip failed on padded semi-planar buffer"
+        assert all(int(a2[r, 0]) == r % 256 for r in range(a2.shape[0])), (
+            "per-row zero-copy round-trip failed on padded semi-planar buffer"
+        )
 
 
 def test_mem_tight_buffer_protocol_contiguous():

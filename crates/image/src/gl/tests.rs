@@ -5431,7 +5431,6 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn g_grey_odd_w_vs_cpu() {
         use edgefirst_codec::{ImageDecoder, ImageLoad};
-        use edgefirst_tensor::TensorTrait;
         if !is_dma_available() {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
@@ -5441,19 +5440,18 @@ mod gl_tests {
         let h = 438usize;
 
         // Decode into a DMA-backed Grey tensor (odd width, 64-aligned pitch).
-        let src_dma =
-            match Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Dma)) {
-                Ok(t) => {
-                    let mut t = t;
-                    let mut dec = ImageDecoder::new();
-                    t.load_image(&mut dec, jpeg).unwrap();
-                    TensorDyn::from(t)
-                }
-                Err(e) => {
-                    eprintln!("SKIPPED: {} - DMA Grey alloc failed: {e}", function!());
-                    return;
-                }
-            };
+        let src_dma = match Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Dma)) {
+            Ok(t) => {
+                let mut t = t;
+                let mut dec = ImageDecoder::new();
+                t.load_image(&mut dec, jpeg).unwrap();
+                TensorDyn::from(t)
+            }
+            Err(e) => {
+                eprintln!("SKIPPED: {} - DMA Grey alloc failed: {e}", function!());
+                return;
+            }
+        };
 
         // CPU reference: decode into a Mem Grey tensor, convert Grey→RGBA via CPU.
         let src_mem = {
