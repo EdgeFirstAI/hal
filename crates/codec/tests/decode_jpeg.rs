@@ -517,3 +517,48 @@ fn decode_zidane_nv16() {
 fn decode_zidane_nv24() {
     check_native_decode("zidane_444.jpg", PixelFormat::Nv24);
 }
+
+// ---------------------------------------------------------------------------
+// Real-world COCO odd-width greyscale fixture. The end-to-end odd-dimension
+// decode+convert coverage for the colour formats (NV12/NV16/NV24) lives in the
+// Python suite (`test_decode_native_odd_dimensions`), which compares the
+// converted RGB to PIL with a robust RMS metric across CPU and GPU backends.
+// This codec-level case guards the specific odd-WIDTH greyscale decode path:
+// the luma-only output decodes into a tight odd-width buffer (stride == img_w),
+// which must NOT trip the even-width grid-stride assertion. Luma is exact, so
+// a tight byte comparison is robust here (unlike point-sampled chroma).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decode_coco_grey_odd_width() {
+    // 595×438 — odd-width greyscale. Verify the native Grey format, the odd
+    // logical dims, and that the luma plane matches the image crate tightly.
+    let jpeg = testdata("coco_grey_odd.jpg");
+    let (w, h) = (595usize, 438usize);
+    let mut tensor = Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
+    assert_eq!(info.format, PixelFormat::Grey, "native greyscale format");
+    assert_eq!((info.width, info.height), (w, h), "odd dims preserved");
+
+    let stride = info.row_stride;
+    let ref_luma = image::load_from_memory(&jpeg).unwrap().to_luma8();
+    assert_eq!(ref_luma.dimensions(), (w as u32, h as u32));
+    let map = tensor.map().unwrap();
+    let buf: &[u8] = &map;
+    let mut y_max: u32 = 0;
+    let mut y_total: u64 = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let ours = buf[y * stride + x] as i32;
+            let refv = ref_luma.get_pixel(x as u32, y as u32)[0] as i32;
+            let d = (ours - refv).unsigned_abs();
+            y_max = y_max.max(d);
+            y_total += d as u64;
+        }
+    }
+    let y_mae = y_total as f64 / (w * h) as f64;
+    eprintln!("coco_grey_odd luma: MAE={y_mae:.3}, max={y_max}");
+    assert!(y_max <= 4, "grey luma max diff {y_max} > 4");
+    assert!(y_mae < 1.0, "grey luma MAE {y_mae:.3} > 1.0");
+}

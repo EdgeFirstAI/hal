@@ -220,11 +220,68 @@ def test_decode_native_nv16_nv24(fixture, fmt):
         assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
+@pytest.mark.parametrize(
+    "fixture,fmt",
+    [
+        ("testdata/coco_420_odd.jpg", PixelFormat.Nv12),
+        ("testdata/coco_422_odd.jpg", PixelFormat.Nv16),
+        ("testdata/coco_444_odd.jpg", PixelFormat.Nv24),
+        ("testdata/coco_grey_odd.jpg", PixelFormat.Grey),
+    ],
+    ids=["nv12_420", "nv16_422", "nv24_444", "grey"],
+)
+def test_decode_native_odd_dimensions(fixture, fmt):
+    """Real-world COCO JPEGs with ODD dimensions, one per native decode output:
+    4:2:0->NV12, 4:2:2->NV16, 4:4:4->NV24, greyscale->Grey. Each is decoded to
+    its native format and converted to RGB on whichever backend the lane
+    provides — CPU on headless x86_64, G2D/GL on i.MX8MP, ANGLE GL on macOS — so
+    the odd-stride chroma layout is exercised end-to-end on both CPU and GPU.
+
+    Odd dimensions stress the stride math: an odd width rounds the buffer up to
+    even(width) then 64-byte alignment (so chroma columns stay byte-aligned and
+    the GPU DMA pitch is valid), while NV12/NV24 chroma row counts use ceil(H/2)
+    and 2*H of an odd height.
+
+    The 4:2:2 fixture is the only synthesized one: COCO has no native 4:2:2
+    JPEGs, so it is re-encoded from a real COCO photo at its native odd size.
+    """
+    if not os.path.exists(fixture):
+        pytest.skip(f"{fixture} fixture missing")
+    w, h = _image_size(fixture)
+    assert (w % 2 == 1) or (h % 2 == 1), f"{fixture}: expected an odd dimension"
+
+    src = Tensor.image(w, h, format=fmt)
+    assert src.format == fmt
+    info = src.decode_image_file(fixture)
+    # The decoder selects + configures the native format and keeps the true
+    # (odd) logical dimensions — no even-rounding leaks into the reported size.
+    assert info.format == fmt
+    assert (info.width, info.height) == (w, h)
+
+    converter = ImageProcessor()
+    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    converter.convert(src, dst)
+    # normalize_to_numpy honours the destination's (possibly padded) row stride,
+    # which a flat reshape would not for odd widths.
+    n = np.zeros((h, w, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    expected = load_image(fixture, "RGB")
+    # 0.95: same BT.601-full-vs-PIL tolerance as the even-dim NV* cases, honest
+    # across CPU / ANGLE GL / Vivante GL backends.
+    assert calculate_similarity_rms_u8(n, expected) > 0.95
+
+
 def test_enum_cmp():
     dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     assert dst.format == PixelFormat.Rgba
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS DMA tensors are IOSurface-backed, which share cross-process via "
+    "surface_id() (a Mach port), not a POSIX fd — `tensor.fd` raises NotImplemented. "
+    "The IOSurface cross-process passing test is tracked as future work.",
+)
 def test_from_fd_dma():
     try:
         tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
@@ -587,9 +644,16 @@ def test_decode_image_from_bytes():
     assert info.width == 1280
     assert info.height == 720
     assert info.format == PixelFormat.Nv12
-    # NV12 luma plane is one byte per pixel; the reported stride is the decoded
-    # row width (the decoder reconfigures the tensor to the image dimensions).
-    assert info.row_stride == info.width
+    # The decoder reconfigures the tensor's LOGICAL width/height to the decoded
+    # image (1280x720) but PRESERVES the oversized buffer's allocated row stride
+    # so a consumer can still index rows of the reused buffer correctly. The
+    # tensor was allocated MAX_SRC_W (1920) wide — already 64-aligned — so the
+    # reported stride stays 1920, wider than the 1280 logical width. (Reporting
+    # the logical width here would make the buffer unreadable: rows would be
+    # indexed at the wrong byte offset.)
+    assert info.row_stride == MAX_SRC_W
+    assert info.row_stride >= info.width
+    assert info.row_stride % 64 == 0
 
 
 def test_decode_image_reuse():

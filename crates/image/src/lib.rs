@@ -5326,32 +5326,31 @@ mod image_tests {
         let mut cpu = CPUProcessor::new();
         let (w, h) = (16usize, 16usize);
 
-        // Fill Y plus the interleaved UV plane using the [total_h, even_width]
-        // grid layout (even_width == w here): a chroma row occupies one grid
-        // row for NV12/NV16 and two for NV24 (2W bytes). Map each linear UV
-        // byte to (row, col) so it lands at the correct grid cell regardless of
-        // the buffer's row stride (padded for IOSurface, tight for Mem).
-        let ew = w; // even width (w is even)
+        // Fill Y plus the interleaved UV plane in the canonical semi-planar
+        // layout — exactly what the codec writes and the CPU `yuv`-crate reader
+        // expects: the Y plane is `h` rows at the buffer's row stride; the UV
+        // plane starts at `h * stride`; each chroma row advances
+        // `uv_grid_rows * stride` bytes (NV24 carries a full-resolution `2*W`
+        // byte line == two grid rows, NV12/NV16 one row of `W/2` pairs); each
+        // (Cb,Cr) pair is two consecutive bytes at column `cx * 2`. This is
+        // stride-correct for both the tight Mem buffer and the padded IOSurface.
         let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
             for y in 0..h {
                 for x in 0..w {
                     buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
                 }
             }
-            let (cw, ch, bytes_per_crow) = match fmt {
-                PixelFormat::Nv12 => (w / 2, h / 2, ew),
-                PixelFormat::Nv16 => (w / 2, h, ew),
-                _ => (w, h, ew * 2), // Nv24
+            let (cw, ch, uv_grid_rows) = match fmt {
+                PixelFormat::Nv12 => (w / 2, h / 2, 1usize),
+                PixelFormat::Nv16 => (w / 2, h, 1usize),
+                _ => (w, h, 2usize), // Nv24: full-res chroma, 2W bytes/row
             };
-            let mut put = |lb: usize, val: u8| {
-                let row = h + lb / ew;
-                buf[row * stride + (lb % ew)] = val;
-            };
+            let uv_plane = h * stride;
             for cy in 0..ch {
                 for cx in 0..cw {
-                    let lb = cy * bytes_per_crow + cx * 2;
-                    put(lb, ((cx * 11 + 30) & 0xff) as u8);
-                    put(lb + 1, ((cy * 7 + 200) & 0xff) as u8);
+                    let off = uv_plane + cy * uv_grid_rows * stride + cx * 2;
+                    buf[off] = ((cx * 11 + 30) & 0xff) as u8;
+                    buf[off + 1] = ((cy * 7 + 200) & 0xff) as u8;
                 }
             }
         };
@@ -5447,26 +5446,28 @@ mod image_tests {
         let (pool_w, pool_h) = (256usize, 256usize);
         let ew = w; // even width (w is even)
 
+        // Canonical semi-planar fill (matches the codec writer + CPU reader):
+        // Y plane at the row stride, then the UV plane at `h * stride` with each
+        // chroma row advancing `uv_grid_rows * stride` bytes (NV24's `2*W`-byte
+        // line == two grid rows). Stride-correct for both the tight Mem
+        // reference and the padded pool IOSurface.
         let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
             for y in 0..h {
                 for x in 0..w {
                     buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
                 }
             }
-            let (cw, ch, bytes_per_crow) = match fmt {
-                PixelFormat::Nv12 => (w / 2, h / 2, ew),
-                PixelFormat::Nv16 => (w / 2, h, ew),
-                _ => (w, h, ew * 2), // Nv24
+            let (cw, ch, uv_grid_rows) = match fmt {
+                PixelFormat::Nv12 => (w / 2, h / 2, 1usize),
+                PixelFormat::Nv16 => (w / 2, h, 1usize),
+                _ => (w, h, 2usize), // Nv24: full-res chroma, 2W bytes/row
             };
-            let mut put = |lb: usize, val: u8| {
-                let row = h + lb / ew;
-                buf[row * stride + (lb % ew)] = val;
-            };
+            let uv_plane = h * stride;
             for cy in 0..ch {
                 for cx in 0..cw {
-                    let lb = cy * bytes_per_crow + cx * 2;
-                    put(lb, ((cx * 11 + 30) & 0xff) as u8);
-                    put(lb + 1, ((cy * 7 + 200) & 0xff) as u8);
+                    let off = uv_plane + cy * uv_grid_rows * stride + cx * 2;
+                    buf[off] = ((cx * 11 + 30) & 0xff) as u8;
+                    buf[off + 1] = ((cy * 7 + 200) & 0xff) as u8;
                 }
             }
         };

@@ -196,12 +196,19 @@ impl ImageLayout {
             }
             // Semi-planar YUV bound as a single R8 plane: the surface is the
             // combined-plane `[total_h, even_width]` shape (matches the tensor
-            // allocation in `iosurface::new_image`).
+            // allocation in `iosurface::new_image`). The width is rounded up to
+            // the 64-aligned row pitch so the IOSurface width equals its
+            // `bytes_per_row` — ANGLE won't bind a texture wider than the
+            // surface, and NV24's `2*W`-byte chroma line spills past the even
+            // width into the padding columns, so they must be addressable.
             (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
                 let shape = fmt.image_shape(width, height).ok_or_else(|| {
                     Error::Internal(format!("{fmt:?} has no image_shape for {width}x{height}"))
                 })?;
-                (shape[1], shape[0]) // (even_width, total_h)
+                // bpe == 1 for the R8 combined-plane binding, so pitch == width.
+                let pitch_width = (shape[1] * bytes_per_element).next_multiple_of(64)
+                    / bytes_per_element;
+                (pitch_width, shape[0]) // (row-pitch width, total_h)
             }
             _ => (width, height),
         };

@@ -412,13 +412,27 @@ where
             // combined-plane buffer as one R8 texture. The surface is the
             // `[total_h, even_width]` shape laid out 2D — the YUV→RGB shader
             // addresses the Y and interleaved-UV regions within it.
+            //
+            // The surface width is rounded up to the 64-aligned row pitch (==
+            // `bytes_per_row`) rather than left at the even width. ANGLE refuses
+            // to bind a GL texture wider than the IOSurface's declared width, so
+            // a surface narrower than its padded `bytes_per_row` leaves the
+            // padding columns unaddressable by `texelFetch`. That is fatal for
+            // NV24 (4:4:4): its chroma line is `2*W` interleaved bytes, which
+            // spills past the even width into those padding columns whenever the
+            // row is padded (`bytes_per_row > even_width`). Making the surface
+            // width equal the pitch keeps every byte of every row addressable
+            // and costs nothing — `bytes_per_row` is already this value.
             (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
                 let shape = format.image_shape(width, height).ok_or_else(|| {
                     Error::InvalidShape(format!(
                         "{format:?} has no image_shape for {width}x{height}"
                     ))
                 })?;
-                (shape[1], shape[0]) // (even_width, total_h)
+                // even_width rounded up to the 64-byte row pitch (bpe == 1 for
+                // the R8 combined-plane binding, so pitch == aligned width).
+                let pitch_width = (shape[1] * bpe).next_multiple_of(64) / bpe;
+                (pitch_width, shape[0]) // (row-pitch width, total_h)
             }
             _ => (width, height),
         };

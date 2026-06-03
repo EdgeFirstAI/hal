@@ -150,14 +150,19 @@ void main() {
 // subsamplings (and is portable to Linux DMA-BUF / embedded GLES — no
 // platform-specific multi-plane sampler):
 //   * `img_size`      logical (W, H); Y plane occupies rows [0, H).
-//   * `tex_width`     R8 texture width (= even buffer width).
+//   * `tex_width`     R8 texture width == the buffer's physical row pitch
+//                     (`bytes_per_row`). The semi-planar surface is allocated
+//                     so its IOSurface width equals this pitch, so every byte
+//                     of every row is addressable by `texelFetch`.
 //   * `chroma_shift`  (cx, cy) right-shifts on (x, y): NV12 (1,1), NV16 (1,0),
 //                     NV24 (0,0).
-//   * `uv_row_bytes`  bytes per chroma row in the UV plane: even_width for
-//                     NV12/NV16 (W/2 pairs), 2*even_width for NV24 (W pairs).
+//   * `uv_row_bytes`  bytes the UV plane advances per chroma row: `stride` for
+//                     NV12/NV16 (W/2 pairs fit in one row), `2*stride` for NV24
+//                     (W pairs == two grid rows).
 // A linear UV byte offset is converted to a 2D texel so NV24's 2-row-per-
-// chroma-line wrap is handled with no special case. BT.601 full-range matches
-// the codec + CPU kernels (interim colorimetry stop-gap).
+// chroma-line layout is handled with no special case. The byte offsets match
+// the codec's `row * grid_row_stride + col` writer exactly. BT.601 full-range
+// matches the codec + CPU kernels (interim colorimetry stop-gap).
 const NV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
@@ -1352,27 +1357,34 @@ impl MacosGlProcessor {
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
             match src_fmt {
                 PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
-                    // `src_w` is the frame's (even) buffer width — the *logical*
-                    // grid-wrap width the codec used, NOT the bound texture's
-                    // physical texel width (which is the whole pool surface). The
-                    // shader decomposes each plane's linear byte offset by this
-                    // wrap width into (col, row) and `texelFetch`es it; Metal maps
-                    // (col, row) to `row * bytesPerRow + col`, so logical wrap and
-                    // physical pitch stay decoupled. The Y plane is `src_h` rows.
+                    // The combined plane's physical row pitch (== bytes_per_row,
+                    // == the bound texture's texel width — the surface is now
+                    // allocated so width == pitch, see `iosurface::new_image`).
+                    // Every Y/UV byte is addressed in this physical-stride space:
+                    // `texelFetch(b % stride, b / stride)` lands exactly on byte
+                    // `b`, matching the codec's `row * grid_row_stride + col`
+                    // writer. This is what makes NV24's `2*W`-byte chroma line —
+                    // which exceeds the even width once the row is padded —
+                    // addressable; binding at the even width would leave its
+                    // tail columns outside the texture.
+                    let stride = src_u8.effective_row_stride().unwrap_or(src_w);
                     let (cx, cy) = match src_fmt {
                         PixelFormat::Nv12 => (1, 1),
                         PixelFormat::Nv16 => (1, 0),
                         _ => (0, 0), // Nv24
                     };
+                    // Bytes the UV plane advances per chroma row: NV24 carries
+                    // full-resolution `W` (Cb,Cr) pairs == `2*stride` bytes (two
+                    // grid rows); NV12/NV16 carry `W/2` pairs within one row.
                     let uv_row_bytes = if matches!(src_fmt, PixelFormat::Nv24) {
-                        (src_w * 2) as i32
+                        (stride * 2) as i32
                     } else {
-                        src_w as i32
+                        stride as i32
                     };
                     gls::gl::UseProgram(self.program_nv_to_rgba);
                     gls::gl::Uniform1i(self.uniform_nv_src, 0);
                     gls::gl::Uniform2i(self.uniform_nv_img_size, src_w as i32, src_h as i32);
-                    gls::gl::Uniform1i(self.uniform_nv_tex_width, src_w as i32);
+                    gls::gl::Uniform1i(self.uniform_nv_tex_width, stride as i32);
                     gls::gl::Uniform2i(self.uniform_nv_chroma_shift, cx, cy);
                     gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
                 }

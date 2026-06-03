@@ -75,13 +75,22 @@ pub fn decode_image(
     let img_h = hdr.height as usize;
     let num_components = hdr.components.len();
 
-    // The physical grid must be wide enough to place a full natural row. For
-    // semi-planar formats the natural row is the even width (UV is interleaved
-    // at full width per plane); GREY/luma needs `img_w`. Even width covers both.
+    // The physical grid must be wide enough to place a full natural row. A
+    // luma-only output (greyscale JPEG, or an explicit `Grey` target) writes
+    // exactly `img_w` bytes per row, so a tightly-packed odd-width buffer
+    // (stride == odd `img_w`) is valid. Semi-planar colour formats interleave
+    // full-width UV pairs, so they need `even(img_w)` to keep chroma columns
+    // byte-aligned. The bound is computed inline (not bound to a `let`) so it
+    // vanishes cleanly in release builds where `debug_assert!` is compiled out.
     debug_assert!(
-        grid_row_stride >= img_w.next_multiple_of(2),
-        "grid_row_stride {grid_row_stride} must be >= even width {}",
-        img_w.next_multiple_of(2),
+        grid_row_stride
+            >= if num_components == 1 || output_format == PixelFormat::Grey {
+                img_w
+            } else {
+                img_w.next_multiple_of(2)
+            },
+        "grid_row_stride {grid_row_stride} too small for {output_format:?} at {img_w}x{img_h} \
+         (need img_w for luma-only, even(img_w) for semi-planar chroma alignment)",
     );
 
     let idct_fn: IdctFn = idct::select_idct();
