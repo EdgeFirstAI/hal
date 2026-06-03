@@ -206,8 +206,8 @@ impl ImageLayout {
                     Error::Internal(format!("{fmt:?} has no image_shape for {width}x{height}"))
                 })?;
                 // bpe == 1 for the R8 combined-plane binding, so pitch == width.
-                let pitch_width = (shape[1] * bytes_per_element).next_multiple_of(64)
-                    / bytes_per_element;
+                let pitch_width =
+                    (shape[1] * bytes_per_element).next_multiple_of(64) / bytes_per_element;
                 (pitch_width, shape[0]) // (row-pitch width, total_h)
             }
             _ => (width, height),
