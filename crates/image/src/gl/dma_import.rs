@@ -256,11 +256,12 @@ impl DmaImportAttrs {
         }
 
         // Use the effective row stride as the R8 texture width so padding bytes
-        // are included in the linear addressing used by the shader. (Importing a
-        // narrower even-content width with pitch=stride does NOT fix the
-        // Mali/Vivante odd-dim import rejection — see the on-target note below —
-        // and would clip NV24's stride-wrapped chroma on V3D/Tegra, so width is
-        // kept equal to the stride here.)
+        // are included in the linear addressing used by the shader. The stride is
+        // always even and 64-byte aligned (`Tensor::image`), so this R8 import is
+        // accepted on every tested GPU — odd LOGICAL dimensions import fine once
+        // the buffer stride is 64-aligned (verified via gpu-probe on Mali,
+        // Vivante, and V3D). Keeping width == stride also avoids clipping NV24's
+        // stride-wrapped chroma on V3D/Tegra.
         let tex_width = src.effective_row_stride().unwrap_or(src_w);
 
         // Combined (luma + chroma) height — mirrors the PlanarRgb R8 import

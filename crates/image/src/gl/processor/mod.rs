@@ -338,12 +338,39 @@ impl ImageProcessorTrait for GLProcessorST {
             // F16/F32 via dyn_to_u8_dst → CPU fallback (existing behavior).
         }
 
+        // Capture odd-destination dims before the mutable borrow below, for the
+        // defense-in-depth wrap at the end (rule #2).
+        let dst_odd = match (dst.width(), dst.height()) {
+            (Some(w), Some(h)) if w % 2 != 0 || h % 2 != 0 => Some((w, h)),
+            _ => None,
+        };
+
         let (src_u8, src_fmt) = dyn_to_u8_src(src)?;
         let (dst_u8, dst_fmt, is_int8) = dyn_to_u8_dst(dst)?;
 
-        self.convert_impl(
+        let result = self.convert_impl(
             src_u8, src_fmt, dst_u8, dst_fmt, is_int8, rotation, flip, crop,
-        )
+        );
+
+        // Defense-in-depth (rule #2): `Tensor::image` now 64-aligns DMA strides,
+        // so image()-allocated destinations import fine at any width. But an
+        // externally-imported destination with an odd, non-64-aligned stride can
+        // still be rejected by a GPU that requires an aligned EGLImage pitch
+        // (Mali `BadAlloc`, Vivante `BadAccess`). Surface such EGL/GL failures as
+        // a descriptive `NotSupported` that PRESERVES the underlying error and
+        // flags it as a platform-consistency limitation, rather than leaking a
+        // raw `EGL(BadAlloc)`. (The F16/F32 float paths return earlier; their
+        // destinations are 64-aligned by the same allocator fix.)
+        match result {
+            Err(e) if dst_odd.is_some() && matches!(e, Error::EGL(_) | Error::OpenGl(_)) => {
+                let (w, h) = dst_odd.unwrap();
+                Err(Error::NotSupported(format!(
+                    "Conversion failed with {e:?} and target tensor has odd \
+                     dimensions {w}x{h}, which is not supported by all platforms"
+                )))
+            }
+            other => other,
+        }
     }
 
     fn draw_decoded_masks(

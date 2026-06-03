@@ -17,6 +17,7 @@ mod probe;
 mod probe_float_render;
 mod probe_int_textures;
 mod probe_min_sizes;
+mod probe_nv_dmabuf;
 mod probe_nvbufsurface;
 mod probe_rgb_fbo;
 
@@ -52,6 +53,11 @@ fn main() {
         probe::run_probes(&ctx);
         probe_int_textures::run(&ctx);
         probe_min_sizes::run(&ctx);
+        // NV12/NV16/NV24 DMA-buf import + render-surface ground-truth probe
+        // (rule #4): proves the real HAL allocations are GPU-importable for
+        // Path A (native YUV) and Path B (R8) at odd-logical/even-stride dims,
+        // with 64-aligned vs packed destination strides.
+        probe_nv_dmabuf::run(&ctx);
         probe_float_render::run(&ctx);
         // Jetson NvBufSurface dma-buf probe (O1-O3). Gated: SKIPs cleanly when
         // libnvbufsurface.so is absent, so non-Jetson runs are unaffected.

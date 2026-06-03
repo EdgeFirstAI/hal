@@ -4968,7 +4968,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 64usize);
+        let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv16);
 
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5028,7 +5028,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 64usize);
+        let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv24);
 
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5092,7 +5092,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 63usize);
+        let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv16);
 
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5156,7 +5156,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 63usize);
+        let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv24);
 
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5204,10 +5204,83 @@ mod gl_tests {
     }
 
     // -------------------------------------------------------------------------
-    // G-01: NV12 odd-W (65×64) → RGBA — routes to Path B (width % 4 != 0)
+    // G-09: odd dst with a deliberately NON-64-aligned stride — tolerant guard
     // -------------------------------------------------------------------------
 
-    /// G-01: NV12 with width not a multiple of 4 (65×64) routes to Path B (R8
+    /// G-09: an externally-strided odd destination whose row pitch is NOT
+    /// 64-byte aligned. `Tensor::image` always 64-aligns, so this case can only
+    /// arise from an explicit `image_with_stride` (or a `from_fd` import). It
+    /// exercises the reactive odd-destination guard in `GLProcessorST::convert`:
+    ///
+    ///   * On GPUs that accept a non-aligned EGLImage pitch (V3D, Tegra) the
+    ///     convert SUCCEEDS.
+    ///   * On GPUs that reject it (Mali `BadAlloc`, Vivante `BadAccess`) the raw
+    ///     EGL error is re-wrapped as a descriptive `NotSupported` naming the odd
+    ///     dimensions — NOT leaked as a bare `EGL(BadAlloc)`.
+    ///
+    /// Tolerant by design (platform-dependent), so it is CI-safe: it asserts the
+    /// outcome is one of those two, never a raw EGL error.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn g09_odd_dst_unaligned_stride_guarded() {
+        use crate::opengl_headless::processor::GLProcessorST;
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let (w, h) = (321usize, 240usize);
+        let (src_dma, _src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv12);
+
+        // Tight, NON-64-aligned RGBA stride (321*4 = 1284; 1284 % 64 != 0).
+        let tight_stride = w * 4;
+        assert_ne!(
+            tight_stride % 64,
+            0,
+            "test premise: stride must be unaligned"
+        );
+        let mut gpu_dst = TensorDyn::image_with_stride(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            tight_stride,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        match gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        ) {
+            Ok(()) => eprintln!("G-09: platform accepts non-aligned odd dst (OK)"),
+            Err(crate::Error::NotSupported(msg)) => {
+                assert!(
+                    msg.contains("odd dimensions"),
+                    "G-09: NotSupported must name the odd-dimension cause, got: {msg}"
+                );
+                eprintln!("G-09: platform rejects non-aligned odd dst, guarded as: {msg}");
+            }
+            Err(other) => panic!(
+                "G-09: odd-dst failure must be wrapped as NotSupported, not leaked raw: {other:?}"
+            ),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // G-01: NV12 odd-W (QVGA 321×240) → RGBA — routes to Path B (width % 4 != 0)
+    // -------------------------------------------------------------------------
+
+    /// G-01: NV12 with width not a multiple of 4 (321×240) routes to Path B (R8
     /// shader), because the NV12 samplerExternalOES EGLImage import requires
     /// width % 4 == 0 on some drivers (e.g. V3D). Even/mult-4 NV12 still uses
     /// Path A — see `test_nv12_still_uses_path_a` (64×64). Asserts the GPU output
@@ -5220,7 +5293,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 64usize);
+        let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv12);
 
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
@@ -5276,15 +5349,19 @@ mod gl_tests {
     ///
     /// Exercises the `nv_r8_int8` (XOR 0x80 bias) packing shader for NV12.
     /// GPU i8 output is compared to CPU i8 within ±2.
-    // Odd-WIDTH 3-channel RGB DMA *output* is unsupported by the GL DMA render
-    // target when `width*3 % 4 != 0` (driver requires a 4-byte-aligned RGB row
-    // pitch; e.g. V3D: "Packed RGB requires width*3 divisible by 4"). This is a
-    // destination constraint independent of the (now-working) odd-dim source
-    // path. Production model-input is an even/mult-4 dst, so this is not hit in
-    // practice; the i8 path is covered by `test_gpu_nv16_path_b_int8_output`.
-    // TODO(odd-dim): use an RGBA or even/mult-4 RGB dst, or document the limit.
+    // Odd-WIDTH 3-channel RGB DMA *output* needs `width*3 % 4 == 0`. This is NOT
+    // the stride-alignment bug fixed for RGBA dsts (g01-g06): it is architectural
+    // in `convert_to_packed_rgb`, which packs the RGB buffer by reinterpreting it
+    // as RGBA8 at `width*3/4` pixels. That reinterpretation only tiles when
+    // `width*3` is a multiple of 4 — width 321 → 963 bytes/row → 240.75 RGBA8
+    // texels, which does not tile (independent of the 64-aligned stride). Verified
+    // on-target 2026-06-02: still `NotSupported("Packed RGB requires width*3
+    // divisible by 4")`. Supporting it needs a different packing path (e.g. an R8
+    // output texture or fractional-last-texel handling), not a stride change.
+    // Production model-input is an even/mult-4 dst; the i8 path is covered by
+    // `test_gpu_nv16_path_b_int8_output`.
     #[test]
-    #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (driver constraint); even/mult-4 or RGBA dst required"]
+    #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn g07_nv12_odd_w_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
@@ -5292,7 +5369,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 64usize);
+        let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv12);
 
         // CPU i8 reference.
@@ -5351,11 +5428,12 @@ mod gl_tests {
     /// Combines the odd-dimension addressing check with the int8 XOR 0x80 bias
     /// packing.  This is the cell most likely to surface on NPU targets (imx8mp
     /// vx / imx95 Neutron) with unusual-resolution input streams.
-    // Same odd-width 3-channel RGB DMA *output* constraint as g07 (width*3 % 4).
-    // TODO(odd-dim): even/mult-4 or RGBA dst. i8 path covered by the even-dim
+    // Same odd-width 3-channel RGB DMA *output* constraint as g07: architectural
+    // in `convert_to_packed_rgb` (pack-as-RGBA8 needs width*3 % 4 == 0), NOT the
+    // stride bug fixed for RGBA dsts. The even-dim i8 path is covered by
     // `test_gpu_nv16_path_b_int8_output`.
     #[test]
-    #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (driver constraint); even/mult-4 or RGBA dst required"]
+    #[ignore = "odd-width 3-channel RGB DMA output needs width*3 % 4 == 0 (pack-as-RGBA8 architecture in convert_to_packed_rgb, NOT the stride bug); use RGBA or even/mult-4 RGB dst"]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn g08_nv16_odd_both_i8_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
@@ -5363,7 +5441,7 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
-        let (w, h) = (65usize, 63usize);
+        let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
         let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv16);
 
         // CPU i8 reference.

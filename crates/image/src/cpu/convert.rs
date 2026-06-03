@@ -1066,13 +1066,30 @@ impl CPUProcessor {
     // therefore twice the luma stride.
     pub(super) fn convert_nv24_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
-        let src_h = src.shape()[0] / 3;
         let stride = src
             .effective_row_stride()
             .unwrap_or(src_w.next_multiple_of(2));
-        let map = src.map()?;
-        let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
-        Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        // Mirror NV16: handle true-multiplane (separate Y / CbCr DMA-BUFs) as
+        // well as the contiguous combined buffer, so NV24 is not silently
+        // mis-sliced when the chroma plane lives in its own tensor.
+        if src.is_multiplane() {
+            let y_map = src.map()?;
+            let uv_map = src.chroma().unwrap().map()?;
+            let src_h = src.shape()[0];
+            Self::nv24_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
+        } else {
+            let src_h = src.shape()[0] / 3;
+            let map = src.map()?;
+            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1104,13 +1121,29 @@ impl CPUProcessor {
 
     pub(super) fn convert_nv24_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
-        let src_h = src.shape()[0] / 3;
         let stride = src
             .effective_row_stride()
             .unwrap_or(src_w.next_multiple_of(2));
-        let map = src.map()?;
-        let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
-        Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        // Mirror NV16: support true-multiplane (separate Y / CbCr buffers) as
+        // well as the contiguous combined buffer.
+        if src.is_multiplane() {
+            let y_map = src.map()?;
+            let uv_map = src.chroma().unwrap().map()?;
+            let src_h = src.shape()[0];
+            Self::nv24_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
+        } else {
+            let src_h = src.shape()[0] / 3;
+            let map = src.map()?;
+            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

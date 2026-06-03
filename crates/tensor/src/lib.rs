@@ -1662,36 +1662,60 @@ where
             // storage exists for this combination.
         }
 
-        // Compute the 64-byte-aligned row stride for all semi-planar formats
-        // (and for packed/planar formats when alignment is useful).  For
-        // semi-planar the minimum stride is `even(width) * sizeof::<T>`; then
-        // round up to the next multiple of 64.  The allocation byte size is
-        // `total_h * stride`, not the shape product (which only reflects the
-        // logical width and would under-allocate for odd widths).
+        // Compute the **64-byte-aligned** row stride for every image layout.
+        //
+        // Embedded GPUs reject `eglCreateImage` DMA-BUF imports whose row pitch
+        // is not 64-byte aligned: Mali returns `EGL_BAD_ALLOC`, Vivante
+        // `EGL_BAD_ACCESS`. This bit packed RGBA/RGB destinations at odd widths
+        // AND at even non-multiple-of-16 widths (e.g. 321→1284, 322→1288 bytes —
+        // neither divisible by 64), so an odd-source → RGBA convert failed on
+        // imx95/imx8mp while succeeding on V3D/Tegra. Semi-planar already aligned
+        // here; we now align packed and planar identically so every image()
+        // allocation is GPU-importable regardless of width.
+        //
+        // The per-layout natural pitch and total row count:
+        //   * SemiPlanar `[total_h, width]`     — pitch = even(width)·elem, rows = total_h
+        //   * Packed     `[height, width, ch]`  — pitch = width·ch·elem,    rows = height
+        //   * Planar     `[ch, height, width]`  — pitch = width·elem,       rows = ch·height
+        // Allocation byte size = `aligned_stride · total_rows` (NOT the shape
+        // product, which reflects only the logical width and under-allocates the
+        // padding on odd / unaligned widths).
         let elem = std::mem::size_of::<T>();
-        let (stride, byte_size) = if format.layout() == PixelLayout::SemiPlanar {
-            let total_h = shape[0];
-            let s = (width.next_multiple_of(2) * elem).next_multiple_of(64);
-            (s, s * total_h)
-        } else {
-            // Packed / planar: keep original allocation (shape product).
-            // No mandatory 64-byte alignment — those paths work without it.
-            let sz = shape.iter().product::<usize>() * elem;
-            (sz / shape[0].max(1), sz)
+        let channels = format.channels();
+        let (natural_stride, total_rows) = match format.layout() {
+            PixelLayout::SemiPlanar => (width.next_multiple_of(2) * elem, shape[0]),
+            PixelLayout::Packed => (width * channels * elem, height),
+            PixelLayout::Planar => (width * elem, channels * height),
         };
+        let aligned_stride = natural_stride.next_multiple_of(64);
+        let semi = format.layout() == PixelLayout::SemiPlanar;
 
-        let storage = match memory {
+        // DMA buffers MUST carry a 64-aligned row pitch — Mali/Vivante reject a
+        // DMA-BUF EGLImage whose pitch is not 64-aligned. Semi-planar also needs
+        // the aligned pitch on every backend (its chroma-plane offset math
+        // assumes it). Packed/planar on host-only memory (Mem/Shm) keep the
+        // natural tight pitch so the many flat CPU consumers are unaffected.
+        let host_stride = if semi { aligned_stride } else { natural_stride };
+        let host_byte_size = host_stride * total_rows;
+        #[cfg(target_os = "linux")]
+        let dma_byte_size = aligned_stride * total_rows;
+
+        // `used_stride` is the actual row pitch of the storage created below.
+        let (storage, used_stride) = match memory {
             #[cfg(target_os = "linux")]
-            Some(TensorMemory::Dma) => {
-                TensorStorage::<T>::new_dma_with_byte_size(&shape, byte_size, None)?
-            }
+            Some(TensorMemory::Dma) => (
+                TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None)?,
+                aligned_stride,
+            ),
             #[cfg(unix)]
-            Some(TensorMemory::Shm) => {
-                TensorStorage::<T>::new_shm_with_byte_size(&shape, byte_size, None)?
-            }
-            Some(TensorMemory::Mem) => {
-                TensorStorage::<T>::new_mem_with_byte_size(&shape, byte_size, None)?
-            }
+            Some(TensorMemory::Shm) => (
+                TensorStorage::<T>::new_shm_with_byte_size(&shape, host_byte_size, None)?,
+                host_stride,
+            ),
+            Some(TensorMemory::Mem) => (
+                TensorStorage::<T>::new_mem_with_byte_size(&shape, host_byte_size, None)?,
+                host_stride,
+            ),
             #[allow(unused_variables)]
             Some(other) => {
                 // PBO and any future variants: fall through to standard new().
@@ -1702,51 +1726,70 @@ where
                 };
             }
             None => {
-                // Auto-select: mirror the existing fallback chain
-                // (DMA → Shm → Mem on Linux; Shm → Mem on macOS).
+                // Auto-select: DMA → Shm → Mem on Linux; Shm → Mem on macOS.
+                // DMA gets the 64-aligned pitch; host fallbacks keep the tight
+                // (host) pitch, so the recorded stride matches the storage used.
                 #[cfg(target_os = "linux")]
                 {
-                    match TensorStorage::<T>::new_dma_with_byte_size(&shape, byte_size, None) {
-                        Ok(s) => s,
+                    match TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None) {
+                        Ok(s) => (s, aligned_stride),
                         Err(_) => {
                             match TensorStorage::<T>::new_shm_with_byte_size(
-                                &shape, byte_size, None,
+                                &shape,
+                                host_byte_size,
+                                None,
                             ) {
-                                Ok(s) => s,
-                                Err(_) => TensorStorage::<T>::new_mem_with_byte_size(
-                                    &shape, byte_size, None,
-                                )?,
+                                Ok(s) => (s, host_stride),
+                                Err(_) => (
+                                    TensorStorage::<T>::new_mem_with_byte_size(
+                                        &shape,
+                                        host_byte_size,
+                                        None,
+                                    )?,
+                                    host_stride,
+                                ),
                             }
                         }
                     }
                 }
                 #[cfg(all(unix, not(target_os = "linux")))]
                 {
-                    match TensorStorage::<T>::new_shm_with_byte_size(&shape, byte_size, None) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            TensorStorage::<T>::new_mem_with_byte_size(&shape, byte_size, None)?
-                        }
+                    match TensorStorage::<T>::new_shm_with_byte_size(&shape, host_byte_size, None) {
+                        Ok(s) => (s, host_stride),
+                        Err(_) => (
+                            TensorStorage::<T>::new_mem_with_byte_size(
+                                &shape,
+                                host_byte_size,
+                                None,
+                            )?,
+                            host_stride,
+                        ),
                     }
                 }
                 #[cfg(not(unix))]
                 {
-                    TensorStorage::<T>::new_mem_with_byte_size(&shape, byte_size, None)?
+                    (
+                        TensorStorage::<T>::new_mem_with_byte_size(&shape, host_byte_size, None)?,
+                        host_stride,
+                    )
                 }
             }
         };
 
         let mut t = Self::wrap(storage);
         t.format = Some(format);
-        // INVARIANT: every image tensor (created via Tensor::image()) MUST
-        // carry a row_stride.  For semi-planar formats this is the 64-aligned
-        // stride computed above.  For packed/planar formats we set the natural
-        // tight stride so the invariant holds uniformly.
-        if format.layout() == PixelLayout::SemiPlanar {
-            t.set_row_stride_unchecked(stride);
+        // Record the row stride when it exceeds the natural tight pitch (padding
+        // is present — DMA packed/planar at an unaligned width, or always for
+        // semi-planar), mirroring the IOSurface path above. Aligned-width and
+        // host-only packed/planar images keep their flat layout with no explicit
+        // stride; `effective_row_stride()` then falls back to the identical
+        // computed pitch. When padding IS present, consumers must iterate rows by
+        // `effective_row_stride()` to skip it.
+        if semi || used_stride > natural_stride {
+            t.set_row_stride_unchecked(used_stride);
         }
         debug_assert!(
-            t.row_stride.is_some() || format.layout() != PixelLayout::SemiPlanar,
+            t.row_stride.is_some() || !semi,
             "image() must always set row_stride for semi-planar tensors"
         );
         #[cfg(target_os = "linux")]
