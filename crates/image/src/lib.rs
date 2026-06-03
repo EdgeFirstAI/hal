@@ -6462,12 +6462,15 @@ mod image_tests {
         // (4 rows) + full-res interleaved UV plane (8 rows = 2H, 2W bytes per
         // chroma row). Neutral-grey fill (Y=U=V=128) must convert to uniform
         // grey RGB, exercising the 2× UV stride and shape[0]/3 height recovery.
-        let src = TensorDyn::image(8, 4, PixelFormat::Nv24, DType::U8, None).unwrap();
+        // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
+        let src =
+            TensorDyn::image(8, 4, PixelFormat::Nv24, DType::U8, Some(TensorMemory::Mem)).unwrap();
         assert_eq!(src.shape(), &[12, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(4)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
 
-        let dst = TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dst =
+            TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, dst) = convert_img(
             &mut cpu_converter,
