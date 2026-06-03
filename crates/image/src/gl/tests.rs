@@ -5402,10 +5402,15 @@ mod gl_tests {
         )
         .unwrap();
 
+        // Path A (HwYuvA, samplerExternalOES) is the correct, proven path here.
+        // Path B is only forced for NV12 when the *width* is not a multiple of 4
+        // (an NV12 YUV-EGLImage import constraint on some drivers); this source
+        // is even-width (320), so the odd *height* (241) is handled directly by
+        // Path A. (Odd-width NV12 → Path B is covered by the odd-width cases.)
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-02: NV12 odd-H must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::HwYuvA,
+            "G-02: even-width odd-height NV12 should use Path A (HwYuvA), got {:?}",
             gl.last_nv_convert_path
         );
 

@@ -6424,12 +6424,17 @@ mod image_tests {
         // chroma-row count and the logical-height derivation in convert.
         // (Odd *width* is rounded to an even buffer at allocation, so it is
         // covered by the decode integration tests rather than here.)
-        let src = TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, None).unwrap();
+        // CPU-only test: pin to tight host memory (None auto-selects pitch-padded
+        // DMA on i.MX, which would leave the dst's row padding unconverted and
+        // break the flat byte scan below).
+        let src =
+            TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
         assert_eq!(src.shape(), &[8, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(5)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
 
-        let dst = TensorDyn::image(8, 5, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dst =
+            TensorDyn::image(8, 5, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, dst) = convert_img(
             &mut cpu_converter,
@@ -6588,7 +6593,8 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_planar_rgb() {
-        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let src =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
         #[rustfmt::skip]
         let src_image = [
                     255, 0, 0, 255,     0, 255, 0, 255,     0, 0, 255, 255,     255, 255, 0, 255,
@@ -6603,7 +6609,14 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&src_image);
 
-        let cpu_dst = TensorDyn::image(5, 5, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            5,
+            5,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(
@@ -6638,7 +6651,8 @@ mod image_tests {
 
     #[test]
     fn test_cpu_resize_planar_rgba() {
-        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let src =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
         #[rustfmt::skip]
         let src_image = [
                     255, 0, 0, 255,     0, 255, 0, 255,     0, 0, 255, 255,     255, 255, 0, 255,
@@ -6653,7 +6667,14 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&src_image);
 
-        let cpu_dst = TensorDyn::image(5, 5, PixelFormat::PlanarRgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            5,
+            5,
+            PixelFormat::PlanarRgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(

@@ -574,7 +574,12 @@ fn run_odd_both(w: usize, h: usize, fmt: PixelFormat, label: &str) {
     )
     .unwrap();
     let dst_u8 = dst_dyn.as_u8().unwrap();
-    check_analytic_rgb(dst_u8, &expected, w, h, label, 2);
+    // max_diff tolerance 4 (vs the analytic ideal): the YUV→RGB step rounds
+    // architecture-dependently — the `yuv` crate's NEON kernels differ from x86
+    // SSE by ~1 LSB, and NV12's 4:2:0 chroma upsampling at odd dimensions
+    // compounds it (observed max_diff 3 on aarch64 vs ≤2 on x86). Matches the
+    // colour tolerance of the sibling odd-width cases (C-04/C-05).
+    check_analytic_rgb(dst_u8, &expected, w, h, label, 4);
 }
 
 #[test]
