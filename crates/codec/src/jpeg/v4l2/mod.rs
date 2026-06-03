@@ -878,8 +878,19 @@ fn dqbuf_capture(fd: RawFd, num_planes: usize, memory: u32) -> nix::Result<()> {
 
 /// Drain pending events after `SOURCE_CHANGE`, bounded to avoid the
 /// driver-re-returns-the-same-event hang.
+///
+/// The device fd is opened blocking (no `O_NONBLOCK`), and on the i.MX95
+/// `mxc-jpeg` driver `VIDIOC_DQEVENT` *blocks* when no event is pending instead
+/// of returning `EINVAL`. So whenever the best-effort `SOURCE_CHANGE` poll above
+/// times out — no event arrived in the window — an unconditional dequeue wedges
+/// the process, and the device, forever. (The driver itself decodes fine; this
+/// is purely an event-dequeue protocol hazard.) Gate every dequeue on a
+/// zero-timeout poll: no `POLLPRI` ⇒ no pending event ⇒ stop instead of block.
 fn drain_events(fd: RawFd) {
     for _ in 0..MAX_EVENTS {
+        if !poll_ready(fd, PollFlags::POLLPRI, 0) {
+            break;
+        }
         let mut ev = ioctl::v4l2_event::default();
         // SAFETY: valid event struct; best-effort, errors end the drain.
         if unsafe { ioctl::vidioc_dqevent(fd, &mut ev) }.is_err() {
