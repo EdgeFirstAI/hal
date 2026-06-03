@@ -3898,6 +3898,20 @@ impl GLProcessorST {
                     gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_comp as i32);
                 }
             }
+            // The source map exposes the full row-padded allocation (DMA/IOSurface
+            // tensors carry a 64-byte-aligned pitch). TexImage2D otherwise reads
+            // `src_w` tight pixels per row from a padded buffer, shearing every row
+            // after the first — the failure mode for odd-width Grey/RGB, whose
+            // 1-/3-bpp pitch is not 4-aligned so they can't take the stride-aware
+            // EGLImage path. Tell GL the real row length (in pixels) so it skips
+            // the padding; reset afterwards so other uploads stay tight.
+            let src_bpp = src_fmt.channels().max(1);
+            let row_len_px = src
+                .effective_row_stride()
+                .map(|s| s / src_bpp)
+                .filter(|&px| px != src_w)
+                .unwrap_or(0);
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
             self.camera_normal_texture.update_texture(
                 texture_target,
                 src_w,
@@ -3905,6 +3919,7 @@ impl GLProcessorST {
                 texture_format,
                 &src.map()?,
             );
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
