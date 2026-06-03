@@ -2338,10 +2338,17 @@ mod cpu_tests {
         let det0_contig = det0_seg.as_standard_layout();
         actual.extend_from_slice(det0_contig.as_slice().expect("standard layout gives slice"));
 
-        let golden_path = std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_mask0_160x160.bin"
-        ));
+        // Resolve testdata via EDGEFIRST_TESTDATA_DIR when set (on-target runs use
+        // a deployed copy; the compile-time manifest path does not exist there),
+        // falling back to the source tree for local runs.
+        let golden_path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
+            .map(|d| std::path::PathBuf::from(d).join("yolov8_mask0_160x160.bin"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_mask0_160x160.bin"
+                ))
+            });
 
         if std::env::var_os("REGEN_GOLDEN").is_some() {
             std::fs::write(&golden_path, &actual).expect("could not write golden");
