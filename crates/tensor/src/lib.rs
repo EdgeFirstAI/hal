@@ -2767,6 +2767,11 @@ where
                     }
                     return pbo.map();
                 }
+                // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
+                // is guarded `if !dma.is_imported`). On macOS/Windows every
+                // storage variant is matched explicitly, so this catch-all is
+                // unreachable there — allow it rather than cfg-gating per platform.
+                #[allow(unreachable_patterns)]
                 _ => {
                     return Err(Error::InvalidOperation(
                         "CPU mapping of strided tensors is supported only for HAL-allocated \
