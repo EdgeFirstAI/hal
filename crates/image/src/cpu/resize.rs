@@ -101,21 +101,24 @@ impl CPUProcessor {
         // The copy is gated on `actual_src_stride != tight_stride` so it is
         // a no-op for all already-tight sources.
         let mut src_map = src.map()?;
-        // Scratch buffer used when the source needs to be de-strided.
-        // Declared before the borrow of `src_map` so it outlives the borrow.
-        let mut src_tight_scratch: Vec<u8> = Vec::new();
-        if actual_src_stride != tight_stride {
-            src_tight_scratch = vec![0u8; src_h * tight_stride];
+        // When the source is padded (stride != tight), de-stride it into the
+        // processor-owned scratch (reused across calls — no per-call alloc).
+        // `destrided` records whether we populated the scratch this call.
+        let destrided = actual_src_stride != tight_stride;
+        if destrided {
+            let need = src_h * tight_stride;
+            self.resize_destride_scratch.clear();
+            self.resize_destride_scratch.resize(need, 0u8);
             let src_slice = src_map.as_slice();
             for row in 0..src_h {
                 let src_row =
                     &src_slice[row * actual_src_stride..row * actual_src_stride + tight_stride];
-                src_tight_scratch[row * tight_stride..(row + 1) * tight_stride]
+                self.resize_destride_scratch[row * tight_stride..(row + 1) * tight_stride]
                     .copy_from_slice(src_row);
             }
         }
-        let src_for_proc: &mut [u8] = if !src_tight_scratch.is_empty() {
-            &mut src_tight_scratch
+        let src_for_proc: &mut [u8] = if destrided {
+            &mut self.resize_destride_scratch[..src_h * tight_stride]
         } else {
             src_map.as_mut_slice()
         };

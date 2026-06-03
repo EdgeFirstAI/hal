@@ -85,41 +85,25 @@ fn pbo_elem_count(
     height: usize,
     format: edgefirst_tensor::PixelFormat,
 ) -> Option<usize> {
-    let channels = format.channels();
-    let wh = width.checked_mul(height)?;
-    match format.layout() {
-        edgefirst_tensor::PixelLayout::SemiPlanar => match format {
-            // NV12 is 1.5 bytes/px: multiply by 3 (checked) before halving.
-            edgefirst_tensor::PixelFormat::Nv12 => wh.checked_mul(3).map(|v| v / 2),
-            edgefirst_tensor::PixelFormat::Nv16 => wh.checked_mul(2),
-            _ => wh.checked_mul(channels),
-        },
-        edgefirst_tensor::PixelLayout::Packed | edgefirst_tensor::PixelLayout::Planar => {
-            wh.checked_mul(channels)
-        }
-        _ => wh.checked_mul(channels),
-    }
+    // Element count == product of the canonical image shape (the PBO holds u8,
+    // one byte per element). Delegating to `image_shape` keeps the combined
+    // semi-planar height in lockstep with every other consumer (and is exact
+    // for odd heights — `height*3/2` truncation under-sized odd-H NV12 by a
+    // row, and the old NV24 arm fell through to `channels` = far too small).
+    // `checked_mul` so a wrapped count can't silently undersize the PBO.
+    format
+        .image_shape(width, height)?
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
 }
 
-/// Compute the tensor shape for a PBO image of the given format.
-///
-/// Planar: `[channels, height, width]`.
-/// SemiPlanar: `[total_h, width]` (NV12 total_h = height*3/2; NV16 total_h = height*2).
-/// All others: `[height, width, channels]`.
+/// Compute the tensor shape for a PBO image of the given format — the canonical
+/// [`PixelFormat::image_shape`] (Planar `[C,H,W]`, SemiPlanar `[total_h, W]`
+/// with the odd-height-exact combined-plane height, Packed `[H,W,C]`).
 fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> Vec<usize> {
-    let channels = format.channels();
-    match format.layout() {
-        edgefirst_tensor::PixelLayout::Planar => vec![channels, height, width],
-        edgefirst_tensor::PixelLayout::SemiPlanar => {
-            let total_h = match format {
-                edgefirst_tensor::PixelFormat::Nv12 => height * 3 / 2,
-                edgefirst_tensor::PixelFormat::Nv16 => height * 2,
-                _ => height * 2,
-            };
-            vec![total_h, width]
-        }
-        _ => vec![height, width, channels],
-    }
+    format
+        .image_shape(width, height)
+        .unwrap_or_else(|| vec![height, width, format.channels()])
 }
 
 /// Best-effort registration of a freshly-created PBO with CUDA GL interop.

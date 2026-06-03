@@ -97,26 +97,22 @@ struct Programs {
     vao: u32,
 }
 
-/// Combined (luma + chroma) buffer height in stride-wide rows — identical to
-/// `PixelFormat::image_shape` and `from_tensor_nv_r8`.
+/// Combined (luma + chroma) buffer height in stride-wide rows — delegates to
+/// the canonical [`PixelFormat::combined_plane_height`] (falls back to `h` for
+/// non-semi-planar formats, which this probe never feeds it).
 fn combined_height(fmt: PixelFormat, h: usize) -> usize {
-    match fmt {
-        PixelFormat::Nv12 => h + h.div_ceil(2),
-        PixelFormat::Nv16 => h * 2,
-        PixelFormat::Nv24 => h * 3,
-        _ => h,
-    }
+    fmt.combined_plane_height(h).unwrap_or(h)
 }
 
 /// Native 2-plane chroma pitch (bytes/row) for the given luma stride —
-/// matches the DRM semi-planar layout the driver expects.
+/// matches the DRM semi-planar layout the driver expects. Derives from the
+/// canonical [`PixelFormat::chroma_layout`] (`uv_rows_per_luma`): NV24's
+/// full-resolution interleaved CbCr is `2*luma_stride`, NV12/NV16 is one
+/// `luma_stride` row.
 fn native_chroma_pitch(fmt: PixelFormat, luma_stride: usize) -> usize {
-    match fmt {
-        // 4:4:4 CbCr is full-resolution interleaved → 2 bytes/pixel.
-        PixelFormat::Nv24 => luma_stride * 2,
-        // 4:2:0 / 4:2:2 chroma row = ceil(W/2) CbCr pairs = W bytes = luma pitch.
-        _ => luma_stride,
-    }
+    fmt.chroma_layout()
+        .map(|c| luma_stride * c.uv_rows_per_luma)
+        .unwrap_or(luma_stride)
 }
 
 /// Query whether the current GL context advertises an extension.

@@ -76,7 +76,7 @@ pub use cuda::{
     is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
 };
 pub use error::{Error, Result};
-pub use format::{PixelFormat, PixelLayout};
+pub use format::{ChromaLayout, PixelFormat, PixelLayout};
 use num_traits::Num;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -2004,7 +2004,7 @@ where
     /// allocation cannot hold `width`×`height` in `format`, or
     /// `Error::InvalidArgument` if the dimensions are invalid for the format.
     ///
-    /// For NV12/NV16 the buffer width is rounded up to even (a chroma-plane
+    /// For NV12/NV16/NV24 the buffer width is rounded up to even (a chroma-plane
     /// interleaving requirement); the true odd width is reported by the decoder
     /// in `ImageInfo` and trimmed by a `convert()` crop. See
     /// [`PixelFormat::image_shape`].
@@ -2133,6 +2133,13 @@ where
     }
 
     /// Image height (None if not an image).
+    ///
+    /// For semi-planar formats the combined-plane shape row count is divided
+    /// by the format's luma-to-total ratio to recover logical height. This
+    /// returns the exact logical height (including odd heights) only because
+    /// the logical dimensions are tracked separately from the physical shape —
+    /// `configure_image` stores the actual `(width, height)` in the format's
+    /// `image_shape`, which round-trips losslessly via these accessors.
     pub fn height(&self) -> Option<usize> {
         let fmt = self.format?;
         let shape = self.shape();
@@ -2255,6 +2262,13 @@ where
     /// minimum stride computed from the format, width, and element size.
     /// Returns `None` only when no format is set and no explicit stride was
     /// stored via [`set_row_stride`](Self::set_row_stride).
+    ///
+    /// **GREY note:** `effective_row_stride()` for a GREY tensor returns the
+    /// tight `width` bytes (no padding), which is what `normalize_to_numpy` and
+    /// the CPU convert path expect. The codec's internal `native_row_stride`
+    /// (64-byte-aligned) is used only during decoding and is not propagated to
+    /// the tensor's stored stride, so callers reading via
+    /// `effective_row_stride()` always see the tight value for GREY.
     pub fn effective_row_stride(&self) -> Option<usize> {
         if let Some(s) = self.row_stride {
             return Some(s);

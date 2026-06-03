@@ -75,23 +75,44 @@ pub fn decode_image(
     let img_h = hdr.height as usize;
     let num_components = hdr.components.len();
 
-    // The physical grid must be wide enough to place a full natural row. A
-    // luma-only output (greyscale JPEG, or an explicit `Grey` target) writes
-    // exactly `img_w` bytes per row, so a tightly-packed odd-width buffer
-    // (stride == odd `img_w`) is valid. Semi-planar colour formats interleave
-    // full-width UV pairs, so they need `even(img_w)` to keep chroma columns
-    // byte-aligned. The bound is computed inline (not bound to a `let`) so it
-    // vanishes cleanly in release builds where `debug_assert!` is compiled out.
-    debug_assert!(
-        grid_row_stride
-            >= if num_components == 1 || output_format == PixelFormat::Grey {
-                img_w
-            } else {
-                img_w.next_multiple_of(2)
-            },
-        "grid_row_stride {grid_row_stride} too small for {output_format:?} at {img_w}x{img_h} \
-         (need img_w for luma-only, even(img_w) for semi-planar chroma alignment)",
-    );
+    // The physical grid must be wide enough to place a full natural row, and
+    // `dst` must hold every row. A luma-only output (greyscale JPEG, or an
+    // explicit `Grey` target) writes exactly `img_w` bytes per row, so a
+    // tightly-packed odd-width buffer (stride == odd `img_w`) is valid;
+    // semi-planar colour formats interleave full-width UV pairs and need
+    // `even(img_w)` to keep chroma columns byte-aligned. These are runtime
+    // checks (not `debug_assert!`) because `decode_image` is public and takes a
+    // caller-supplied `dst`/`grid_row_stride`: malformed/untrusted dimensions
+    // must return an error, not panic or write out of bounds in release builds.
+    let writes_only_luma = num_components == 1 || output_format == PixelFormat::Grey;
+    let min_stride = if writes_only_luma {
+        img_w
+    } else {
+        img_w.next_multiple_of(2)
+    };
+    if grid_row_stride < min_stride {
+        return Err(CodecError::InvalidData(format!(
+            "grid_row_stride {grid_row_stride} < required {min_stride} for {output_format:?} \
+             at {img_w}x{img_h}"
+        )));
+    }
+    let total_rows = if writes_only_luma {
+        img_h
+    } else {
+        output_format
+            .combined_plane_height(img_h)
+            .ok_or(CodecError::UnsupportedFormat(output_format))?
+    };
+    let needed = grid_row_stride.checked_mul(total_rows).ok_or_else(|| {
+        CodecError::InvalidData(format!("decode size overflow at {img_w}x{img_h}"))
+    })?;
+    if dst.len() < needed {
+        return Err(CodecError::InvalidData(format!(
+            "destination buffer {} bytes < required {needed} for {output_format:?} \
+             {img_w}x{img_h} @ stride {grid_row_stride}",
+            dst.len()
+        )));
+    }
 
     let idct_fn: IdctFn = idct::select_idct();
     let idct_dc_fn: IdctDcOnlyFn = idct::select_idct_dc_only();
@@ -383,22 +404,14 @@ fn write_nv16_nv24_rows(
     }
 
     // Both keep full-height chroma (one chroma row per luma row); they differ in
-    // horizontal resolution.
-    // NV16 (4:2:2): one chroma row per luma row, each row is grid_row_stride
-    //   bytes, holding img_w/2 (Cb,Cr) pairs.
-    // NV24 (4:4:4): two chroma rows per luma row (2W bytes of UV per luma row),
-    //   each physical row is grid_row_stride bytes, holding img_w (Cb,Cr) pairs.
-    let chroma_cols = match output_format {
-        PixelFormat::Nv16 => img_w.div_ceil(2), // 4:2:2
-        _ => img_w,                             // 4:4:4
-    };
-    // How many grid rows the UV plane advances per luma row:
-    //   NV16: 1 grid row (UV bytes_per_luma_row == grid_row_stride)
-    //   NV24: 2 grid rows (UV bytes_per_luma_row == 2*grid_row_stride)
-    let uv_grid_rows_per_luma = match output_format {
-        PixelFormat::Nv16 => 1usize,
-        _ => 2usize,
-    };
+    // horizontal resolution. The per-format geometry comes from the shared
+    // `chroma_layout` (single source of truth with the CPU readers + GL shaders):
+    //   NV16 (4:2:2): shift_x=1 → ceil(W/2) pairs, uv_rows_per_luma=1.
+    //   NV24 (4:4:4): shift_x=0 → W pairs (2W bytes), uv_rows_per_luma=2.
+    let layout = output_format
+        .chroma_layout()
+        .expect("write_nv16_nv24_rows is only called for semi-planar NV16/NV24");
+    let chroma_cols = img_w.div_ceil(1 << layout.shift_x);
     let uv_plane_offset = img_h * grid_row_stride;
 
     let cb_buf = &comp_bufs[1];
@@ -406,21 +419,16 @@ fn write_nv16_nv24_rows(
     for row in 0..num_rows {
         let oy = y_start + row; // chroma row == luma row (full-height chroma)
         let src = row * c_stride;
-        // Each (Cb, Cr) pair at column ocx occupies two consecutive bytes on the
-        // same grid row.  For NV24 the UV for luma row `oy` spans two grid rows
-        // starting at grid row `oy * 2`.
-        //
-        // Grid row for the (ocx * 2)th UV byte of luma row oy:
-        //   grid_row = oy * uv_grid_rows_per_luma + (ocx * 2) / grid_row_stride
-        //   col      = (ocx * 2) % grid_row_stride
-        // Because ocx * 2 < img_w * 2 <= grid_row_stride * uv_grid_rows_per_luma
-        // (the assertion at the function top guarantees grid_row_stride >= even_width)
-        // the grid_row never overflows for either format.
+        // The UV plane is contiguous: luma row `oy` starts at a grid-row
+        // boundary `uv_rows_per_luma * stride` into the plane, and successive
+        // (Cb,Cr) pairs are two consecutive bytes that flow naturally into the
+        // next physical grid row when `ocx*2` crosses `grid_row_stride` (the
+        // NV24 wrap). So the destination byte is simply `base + ocx*2` — no
+        // per-pixel divide/modulo needed (the old `/`,`%` recombined to exactly
+        // this linear offset).
+        let base = uv_plane_offset + oy * layout.uv_rows_per_luma * grid_row_stride;
         for ocx in 0..chroma_cols {
-            let linear_uv = oy * uv_grid_rows_per_luma * grid_row_stride + ocx * 2;
-            let grid_row = linear_uv / grid_row_stride;
-            let col = linear_uv % grid_row_stride;
-            let off = uv_plane_offset + grid_row * grid_row_stride + col;
+            let off = base + ocx * 2;
             dst[off] = cb_buf[src + ocx];
             dst[off + 1] = cr_buf[src + ocx];
         }

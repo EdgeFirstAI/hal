@@ -50,6 +50,23 @@ pub enum PixelLayout {
     SemiPlanar,
 }
 
+/// Chroma addressing parameters for a semi-planar (NV12/NV16/NV24) format —
+/// the single source of truth shared by the codec writer, CPU readers, and the
+/// Linux + macOS GL shaders. See [`PixelFormat::chroma_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromaLayout {
+    /// Right-shift applied to the luma `x` to get the chroma column: 1 = half
+    /// horizontal resolution (NV12/NV16), 0 = full resolution (NV24).
+    pub shift_x: u32,
+    /// Right-shift applied to the luma `y` to get the chroma row: 1 = half
+    /// vertical resolution (NV12), 0 = full vertical resolution (NV16/NV24).
+    pub shift_y: u32,
+    /// Physical buffer rows the UV plane advances per chroma line: 1 for
+    /// NV12/NV16 (one `(Cb,Cr)` line fits in a single stride-wide row), 2 for
+    /// NV24 (a full-width `2*W`-byte chroma line spans two stride-wide rows).
+    pub uv_rows_per_luma: usize,
+}
+
 /// FourCC code constants (V4L2/DRM compatible).
 const FOURCC_RGB: u32 = u32::from_le_bytes(*b"RGB ");
 const FOURCC_RGBA: u32 = u32::from_le_bytes(*b"RGBA");
@@ -109,21 +126,93 @@ impl PixelFormat {
             PixelLayout::Packed => Some(vec![height, width, self.channels()]),
             PixelLayout::Planar => Some(vec![self.channels(), height, width]),
             PixelLayout::SemiPlanar => {
-                let total_h = match self {
-                    // Combined-plane height in stride-wide rows:
-                    //   NV12 (4:2:0): Y (H) + interleaved UV (ceil(H/2) rows) = H + ceil(H/2)
-                    //   NV16 (4:2:2): Y (H) + interleaved UV (H rows)         = 2H
-                    //   NV24 (4:4:4): Y (H) + interleaved UV (2H rows)        = 3H
-                    PixelFormat::Nv12 => height + height.div_ceil(2),
-                    PixelFormat::Nv16 => height * 2,
-                    PixelFormat::Nv24 => height * 3,
-                    _ => return None,
-                };
                 // Shape carries logical width; row_stride (>= even(width), 64-aligned)
                 // is stored separately on the Tensor and governs byte layout.
-                Some(vec![total_h, width])
+                Some(vec![self.combined_plane_height(height)?, width])
             }
         }
+    }
+
+    /// Combined-plane height in physical (stride-wide) rows for a semi-planar
+    /// format: the Y rows plus the interleaved-UV rows.
+    ///
+    ///   * NV12 (4:2:0): `H + ceil(H/2)` — exact for odd heights (e.g. 483 →
+    ///     725 = 483 luma + 242 chroma), equals the classic `H*3/2` for even.
+    ///   * NV16 (4:2:2): `2H` (one full-height chroma row per luma row).
+    ///   * NV24 (4:4:4): `3H` (a full-width `2W`-byte chroma line spans two
+    ///     stride-wide buffer rows, so `2H` chroma rows).
+    ///
+    /// Returns `None` for non-semi-planar formats (and unsupported SemiPlanar
+    /// variants). This is the single source of truth for the vertical extent of
+    /// the contiguous NV* buffer — [`image_shape`](Self::image_shape), the GL
+    /// DMA-BUF/IOSurface imports, the PBO allocator, and the gpu-probe all
+    /// derive from it, so the combined-plane height can never drift between them.
+    pub const fn combined_plane_height(&self, height: usize) -> Option<usize> {
+        match self {
+            PixelFormat::Nv12 => Some(height + height.div_ceil(2)),
+            PixelFormat::Nv16 => Some(height * 2),
+            PixelFormat::Nv24 => Some(height * 3),
+            _ => None,
+        }
+    }
+
+    /// Per-format semi-planar chroma addressing parameters, shared by the codec
+    /// writer ([`uv_rows_per_luma`](ChromaLayout::uv_rows_per_luma)), the CPU
+    /// readers, and both GL shaders so the combined-plane chroma geometry has a
+    /// single source of truth. Returns `None` for non-semi-planar formats.
+    pub const fn chroma_layout(&self) -> Option<ChromaLayout> {
+        match self {
+            // 4:2:0 — half horizontal & vertical chroma resolution.
+            PixelFormat::Nv12 => Some(ChromaLayout {
+                shift_x: 1,
+                shift_y: 1,
+                uv_rows_per_luma: 1,
+            }),
+            // 4:2:2 — half horizontal, full vertical.
+            PixelFormat::Nv16 => Some(ChromaLayout {
+                shift_x: 1,
+                shift_y: 0,
+                uv_rows_per_luma: 1,
+            }),
+            // 4:4:4 — full resolution; the 2W-byte chroma line spans two rows.
+            PixelFormat::Nv24 => Some(ChromaLayout {
+                shift_x: 0,
+                shift_y: 0,
+                uv_rows_per_luma: 2,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Physical GPU-surface dimensions `(pitch_width, total_h)` in texels for a
+    /// semi-planar combined plane bound as one `bpe`-byte-per-element texture,
+    /// or `None` for non-semi-planar formats.
+    ///
+    /// The width is rounded up to the 64-aligned row pitch (`== bytes_per_row`)
+    /// rather than left at the even logical width. ANGLE (and tiled GPUs in
+    /// general) will not address texels beyond a surface's declared width via
+    /// `texelFetch`, so a surface narrower than its padded `bytes_per_row`
+    /// leaves the padding columns unreachable. That is fatal for NV24 (4:4:4):
+    /// its chroma line is `2*W` interleaved bytes, which spills past the even
+    /// width into those padding columns whenever the row is padded
+    /// (`bytes_per_row > even_width`). Making the surface width equal the pitch
+    /// keeps every byte addressable and costs nothing — `bytes_per_row` is
+    /// already this value.
+    ///
+    /// Single source of truth for both IOSurface allocators (the tensor crate's
+    /// `IoSurfaceTensor::new_image` and the image crate's `ImageLayout`), so
+    /// they cannot diverge.
+    pub fn semi_planar_surface_dims(
+        &self,
+        width: usize,
+        height: usize,
+        bpe: usize,
+    ) -> Option<(usize, usize)> {
+        let total_h = self.combined_plane_height(height)?;
+        // image_shape carries the logical width; round its byte pitch up to 64
+        // (bpe == 1 for the R8 combined-plane binding, so pitch == aligned width).
+        let pitch_width = (width * bpe).next_multiple_of(64) / bpe;
+        Some((pitch_width, total_h))
     }
 
     /// Returns `true` if this format encodes YUV (luma/chroma) data.

@@ -369,6 +369,73 @@ fn c03_nv12_odd_h_to_rgb() {
 }
 
 // ---------------------------------------------------------------------------
+// Deliverable 2 — C-04 NV16 odd-H (analytic, even-W 64×63)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c04_nv16_odd_h_to_rgb() {
+    run_odd_both(64, 63, PixelFormat::Nv16, "C-04 NV16 64x63 odd-H");
+}
+
+// ---------------------------------------------------------------------------
+// Deliverable 2 — C-05 NV24 odd-H (analytic, even-W 64×63)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c05_nv24_odd_h_to_rgb() {
+    run_odd_both(64, 63, PixelFormat::Nv24, "C-05 NV24 64x63 odd-H");
+}
+
+// ---------------------------------------------------------------------------
+// Degenerate mini-cases (1×1, 1×3, 3×1) for NV12/NV16/NV24
+// ---------------------------------------------------------------------------
+
+#[test]
+fn degenerate_nv12_1x1() {
+    run_odd_both(1, 1, PixelFormat::Nv12, "degenerate NV12 1x1");
+}
+
+#[test]
+fn degenerate_nv12_1x3() {
+    run_odd_both(1, 3, PixelFormat::Nv12, "degenerate NV12 1x3");
+}
+
+#[test]
+fn degenerate_nv12_3x1() {
+    run_odd_both(3, 1, PixelFormat::Nv12, "degenerate NV12 3x1");
+}
+
+#[test]
+fn degenerate_nv16_1x1() {
+    run_odd_both(1, 1, PixelFormat::Nv16, "degenerate NV16 1x1");
+}
+
+#[test]
+fn degenerate_nv16_1x3() {
+    run_odd_both(1, 3, PixelFormat::Nv16, "degenerate NV16 1x3");
+}
+
+#[test]
+fn degenerate_nv16_3x1() {
+    run_odd_both(3, 1, PixelFormat::Nv16, "degenerate NV16 3x1");
+}
+
+#[test]
+fn degenerate_nv24_1x1() {
+    run_odd_both(1, 1, PixelFormat::Nv24, "degenerate NV24 1x1");
+}
+
+#[test]
+fn degenerate_nv24_1x3() {
+    run_odd_both(1, 3, PixelFormat::Nv24, "degenerate NV24 1x3");
+}
+
+#[test]
+fn degenerate_nv24_3x1() {
+    run_odd_both(3, 1, PixelFormat::Nv24, "degenerate NV24 3x1");
+}
+
+// ---------------------------------------------------------------------------
 // Deliverable 2 — C-06..08 analytically-constructed odd-both sources
 // ---------------------------------------------------------------------------
 

@@ -334,6 +334,15 @@ fn src_view_strided<'a>(
     shape: [usize; 3],
 ) -> Result<(ArrayView3<'a, u8>, bool)> {
     use ndarray::ShapeBuilder;
+    // Planar layouts (PlanarRgb / PlanarRgba) are already rejected upstream
+    // before reaching this helper; only packed [H, W, C] tensors arrive here.
+    debug_assert!(
+        !matches!(
+            tensor.format().map(|f| f.layout()),
+            Some(tensor::PixelLayout::Planar)
+        ),
+        "src_view_strided: planar tensors must be handled upstream"
+    );
     let tight_stride = shape[1] * shape[2];
     let row_stride = tensor.effective_row_stride().unwrap_or(tight_stride);
     if row_stride == tight_stride {

@@ -213,11 +213,11 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     converter = ImageProcessor()
     dst = converter.create_image(w, h, PixelFormat.Rgb)
     converter.convert(src, dst)
-    with dst.map() as m:
-        n = np.array(m.view()).reshape((dst.height, dst.width, 3))
-        expected = load_image(fixture, "RGB")
-        # 0.95: same BT.601-full-vs-PIL tolerance as the NV12 conversions.
-        assert calculate_similarity_rms_u8(n, expected) > 0.95
+    n = np.zeros((h, w, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    expected = load_image(fixture, "RGB")
+    # 0.95: same BT.601-full-vs-PIL tolerance as the NV12 conversions.
+    assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
 @pytest.mark.parametrize(
@@ -266,9 +266,11 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     n = np.zeros((h, w, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
     expected = load_image(fixture, "RGB")
-    # 0.95: same BT.601-full-vs-PIL tolerance as the even-dim NV* cases, honest
-    # across CPU / ANGLE GL / Vivante GL backends.
-    assert calculate_similarity_rms_u8(n, expected) > 0.95
+    # GREY has no YUV colorimetry ambiguity (Grey→RGB = replicate luma), so a
+    # tighter tolerance is appropriate. All other formats use 0.95 to cover
+    # BT.601-full-vs-PIL divergence across CPU / ANGLE GL / Vivante GL backends.
+    threshold = 0.98 if fmt == PixelFormat.Grey else 0.95
+    assert calculate_similarity_rms_u8(n, expected) > threshold
 
 
 # ---------------------------------------------------------------------------

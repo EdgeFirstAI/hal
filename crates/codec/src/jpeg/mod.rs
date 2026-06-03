@@ -106,6 +106,11 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
 /// require at least `even(width)` bytes per row (chroma alignment); the stride
 /// is further rounded up to 64 bytes so `ImageInfo.row_stride` honours the
 /// same 64-byte-alignment invariant as `Tensor::image()`.
+///
+/// This MUST stay equal to the image crate's `align_width_for_gpu_pitch(width, 1)`
+/// and `PixelFormat::semi_planar_surface_dims(..)` pitch (both produce the same
+/// 64-aligned even width). The codec crate can't depend on `edgefirst-image`, so
+/// the value is recomputed here — keep the two in lockstep if either changes.
 fn native_row_stride(width: usize) -> usize {
     width.next_multiple_of(2).next_multiple_of(64)
 }

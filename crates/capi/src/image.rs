@@ -85,9 +85,11 @@ fn decode_err_to_errno(err: &CodecError) -> libc::c_int {
 pub enum HalPixelFormat {
     /// 8-bit interleaved YUV422, limited range (YUYV)
     Yuyv = 0,
-    /// 8-bit planar YUV420, limited range (NV12)
+    /// 8-bit semi-planar YUV 4:2:0 (NV12): Y plane + interleaved CbCr.
+    /// JPEG-decoded content is BT.601 full-range (interim).
     Nv12 = 1,
-    /// 8-bit planar YUV422, limited range (NV16)
+    /// 8-bit semi-planar YUV 4:2:2 (NV16): Y plane + interleaved CbCr.
+    /// JPEG-decoded content is BT.601 full-range (interim).
     Nv16 = 2,
     /// 8-bit RGBA (4 channels)
     Rgba = 3,
@@ -109,10 +111,11 @@ pub enum HalPixelFormat {
     /// but may differ slightly from the external-texture path used on other
     /// GPUs.
     Vyuy = 9,
-    /// 8-bit planar YUV444, full chroma (NV24)
+    /// 8-bit semi-planar YUV 4:4:4 (NV24): full-resolution chroma.
     ///
     /// Y plane (`H` rows) followed by an interleaved Cb/Cr plane at full
-    /// resolution. Emitted by the JPEG decoder for 4:4:4 sources.
+    /// resolution (`2*W` bytes per image row, stored as `2H` buffer rows).
+    /// Emitted by the JPEG decoder for 4:4:4 sources; BT.601 full-range (interim).
     Nv24 = 10,
 }
 
@@ -443,8 +446,9 @@ pub unsafe extern "C" fn hal_tensor_new_image(
 /// The tensor must have sufficient capacity for the decoded image.
 /// Returns 0 on success, -1 on error (errno set).
 ///
-/// The image is decoded to its native pixel format (JPEG → NV12 for colour
-/// or GREY for greyscale; PNG → RGB/RGBA/GREY) and the tensor is configured
+/// The image is decoded to its native pixel format (JPEG → NV12/NV16/NV24 by
+/// chroma subsampling (4:2:0/4:2:2/4:4:4) for colour or GREY for greyscale;
+/// PNG → RGB/RGBA/GREY) and the tensor is configured
 /// with that format and the decoded dimensions. Use the tensor's pixel format
 /// accessor (`hal_tensor_pixel_format()`) to inspect the result, and the image
 /// processor convert API (`hal_image_processor_convert()`) if a different

@@ -409,30 +409,17 @@ where
                 (width, sh)
             }
             // Semi-planar YUV (NV12/NV16/NV24): bind the whole contiguous
-            // combined-plane buffer as one R8 texture. The surface is the
-            // `[total_h, even_width]` shape laid out 2D — the YUV→RGB shader
-            // addresses the Y and interleaved-UV regions within it.
-            //
-            // The surface width is rounded up to the 64-aligned row pitch (==
-            // `bytes_per_row`) rather than left at the even width. ANGLE refuses
-            // to bind a GL texture wider than the IOSurface's declared width, so
-            // a surface narrower than its padded `bytes_per_row` leaves the
-            // padding columns unaddressable by `texelFetch`. That is fatal for
-            // NV24 (4:4:4): its chroma line is `2*W` interleaved bytes, which
-            // spills past the even width into those padding columns whenever the
-            // row is padded (`bytes_per_row > even_width`). Making the surface
-            // width equal the pitch keeps every byte of every row addressable
-            // and costs nothing — `bytes_per_row` is already this value.
+            // combined-plane buffer as one R8 texture, sized to the 64-aligned
+            // row pitch (see `PixelFormat::semi_planar_surface_dims` for the
+            // ANGLE width==pitch rationale).
             (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => {
-                let shape = format.image_shape(width, height).ok_or_else(|| {
-                    Error::InvalidShape(format!(
-                        "{format:?} has no image_shape for {width}x{height}"
-                    ))
-                })?;
-                // even_width rounded up to the 64-byte row pitch (bpe == 1 for
-                // the R8 combined-plane binding, so pitch == aligned width).
-                let pitch_width = (shape[1] * bpe).next_multiple_of(64) / bpe;
-                (pitch_width, shape[0]) // (row-pitch width, total_h)
+                format
+                    .semi_planar_surface_dims(width, height, bpe)
+                    .ok_or_else(|| {
+                        Error::InvalidShape(format!(
+                            "{format:?} has no semi-planar surface dims for {width}x{height}"
+                        ))
+                    })?
             }
             _ => (width, height),
         };
@@ -960,8 +947,24 @@ unsafe fn build_props(
     bytes_per_element: usize,
     fourcc: u32,
 ) -> Result<CFDictionaryRef> {
-    let bytes_per_row = (width * bytes_per_element + 63) & !63;
-    let alloc_size = bytes_per_row * height;
+    // Checked arithmetic (mirrors the image crate's `build_image_props`): an
+    // overflowing pitch or allocation size would describe an under-sized
+    // IOSurface that the GL import then treats as a valid buffer — a memory
+    // hazard. Fail loudly instead of wrapping.
+    let bytes_per_row = width
+        .checked_mul(bytes_per_element)
+        .and_then(|b| b.checked_add(63))
+        .map(|b| b & !63)
+        .ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "IOSurface bytes-per-row overflow (width={width}, bpe={bytes_per_element})"
+            ))
+        })?;
+    let alloc_size = bytes_per_row.checked_mul(height).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "IOSurface allocation size overflow (bytes_per_row={bytes_per_row}, height={height})"
+        ))
+    })?;
 
     let dict = CFDictionaryCreateMutable(
         std::ptr::null(),

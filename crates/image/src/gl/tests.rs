@@ -239,6 +239,9 @@ mod gl_tests {
         *NEUTRON_AVAILABLE.get_or_init(|| std::path::Path::new("/dev/neutron0").exists())
     }
 
+    // DEDUP: this function is also defined verbatim in the `image_tests` module
+    // of `crates/image/src/lib.rs`. Both copies must be kept in sync. See the
+    // comment there for why cross-module sharing was deferred.
     fn compare_images(img1: &TensorDyn, img2: &TensorDyn, threshold: f64, name: &str) {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");
@@ -363,6 +366,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_nv12_to_rgba_reference() {
         if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
         // Load PixelFormat::Nv12 source with DMA
@@ -424,6 +428,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_yuyv_to_rgba_reference() {
         if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
         // Load PixelFormat::Yuyv source with DMA
@@ -5338,6 +5343,161 @@ mod gl_tests {
         assert!(
             max_diff <= 4,
             "G-01: NV12 odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // G-02: NV12 even-W odd-H (320×241) → RGBA — Path B must run, GPU ≈ CPU ±4
+    // -------------------------------------------------------------------------
+
+    /// G-02: NV12 even-width odd-height (320×241) end-to-end GPU vs CPU.
+    ///
+    /// Exercises the luma/chroma row-boundary math for an odd height. With an odd
+    /// H the chroma plane is `ceil(H/2)` rows, and the last chroma row reads a
+    /// 64-byte-aligned row whose physical allocation is exactly stride bytes (no
+    /// half-row shortfall). Path B must be selected because this is a DMA source
+    /// where width (320) is a multiple of 4 but the height is odd.
+    ///
+    /// Asserts:
+    ///   (a) `last_nv_convert_path == R8ShaderB` — no CPU fallback for DMA source.
+    ///   (b) GPU output matches CPU reference within ±4.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn g02_nv12_odd_h_path_b_vs_cpu() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        // Even width, odd height — exercises odd-H chroma row boundary.
+        let (w, h) = (320usize, 241usize);
+        let (src_dma, src_mem) = make_patterned_nv_pair(w, h, PixelFormat::Nv12);
+
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        crate::cpu::CPUProcessor::new()
+            .convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::R8ShaderB,
+            "G-02: NV12 odd-H must use Path B (R8ShaderB), got {:?}",
+            gl.last_nv_convert_path
+        );
+
+        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+        eprintln!("G-02 NV12 odd-H (320×241): GPU vs CPU max_diff={max_diff}");
+        assert!(
+            max_diff <= 4,
+            "G-02: NV12 odd-H GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // g_grey_odd_w_vs_cpu: GREY odd-W (coco_grey_odd.jpg 595×438) → RGBA
+    // -------------------------------------------------------------------------
+
+    /// Grey odd-width (595×438) decode + GPU convert → RGBA vs CPU reference.
+    ///
+    /// Loads `coco_grey_odd.jpg` into a DMA Grey tensor (odd-W 595), converts
+    /// Grey→RGBA on GPU and on CPU, and asserts they agree within ±4 per pixel.
+    /// This guards the odd-W Grey IOSurface / EGLImage path that the macOS NV24
+    /// fix relies on (64-aligned pitch + physical-stride shader addressing).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn g_grey_odd_w_vs_cpu() {
+        use edgefirst_codec::{ImageDecoder, ImageLoad};
+        use edgefirst_tensor::TensorTrait;
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let jpeg: &[u8] = &edgefirst_bench::testdata::read("coco_grey_odd.jpg");
+        let w = 595usize;
+        let h = 438usize;
+
+        // Decode into a DMA-backed Grey tensor (odd width, 64-aligned pitch).
+        let src_dma =
+            match Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Dma)) {
+                Ok(t) => {
+                    let mut t = t;
+                    let mut dec = ImageDecoder::new();
+                    t.load_image(&mut dec, jpeg).unwrap();
+                    TensorDyn::from(t)
+                }
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - DMA Grey alloc failed: {e}", function!());
+                    return;
+                }
+            };
+
+        // CPU reference: decode into a Mem Grey tensor, convert Grey→RGBA via CPU.
+        let src_mem = {
+            let mut t =
+                Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+            let mut dec = ImageDecoder::new();
+            t.load_image(&mut dec, jpeg).unwrap();
+            TensorDyn::from(t)
+        };
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        crate::cpu::CPUProcessor::new()
+            .convert(
+                &src_mem,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        // GPU convert: Grey→RGBA on GL.
+        let mut gpu_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        gl.convert(
+            &src_dma,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
+        eprintln!("g_grey_odd_w: GPU vs CPU max_diff={max_diff}");
+        assert!(
+            max_diff <= 4,
+            "g_grey_odd_w: Grey odd-W GPU vs CPU max_diff={max_diff} > 4; first bad at {first_fail:?}"
         );
     }
 

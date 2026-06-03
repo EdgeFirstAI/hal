@@ -756,7 +756,16 @@ void main() {
 /// BT.601 full-range matches the CPU kernels and the EGL YUV color hints.
 /// No extension required: `texelFetch` + R8 is core ES 3.0.
 ///
-/// Ported from the macOS `NV_TO_RGBA_FRAGMENT` in `macos_processor.rs`.
+/// CHROMA-LAYOUT CONTRACT: this shader and the macOS `NV_TO_RGBA_FRAGMENT`
+/// (`macos_processor.rs`) decode the SAME `model-2` combined-plane byte layout
+/// (`PixelFormat::chroma_layout` + `combined_plane_height`), but parameterise it
+/// differently: this one uses `chroma_lines` + a branchless `carry` for direct
+/// 2D `texelFetch`, while macOS uses `uv_row_bytes` + a linear `fetch_r(b)` with
+/// `b % tex_width`. They are kept SEPARATE on purpose — the divide-free form
+/// here is required for Vivante/V3D, while Apple-silicon ANGLE tolerates the
+/// linear form. They are provably equivalent at every NV24 texel (the codec's
+/// `decode_padded_grid_matches_tight` fixture and the `*_opengl_macos` GPU-vs-CPU
+/// tests are the cross-checks); keep both in sync if the layout ever changes.
 pub(super) fn generate_nv_to_rgba_shader_2d() -> &'static str {
     "\
 #version 300 es

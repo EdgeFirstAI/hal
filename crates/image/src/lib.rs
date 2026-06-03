@@ -1740,29 +1740,14 @@ impl ImageProcessor {
             Ok(TensorDyn::from(tensor))
         } else {
             // ── Single-plane path ────────────────────────────────────
-            let shape = match format.layout() {
-                PixelLayout::Packed => vec![height, width, format.channels()],
-                PixelLayout::Planar => vec![format.channels(), height, width],
-                PixelLayout::SemiPlanar => {
-                    let total_h = match format {
-                        // NV12 (4:2:0): H + ceil(H/2) — odd heights are valid.
-                        PixelFormat::Nv12 => height + height.div_ceil(2),
-                        PixelFormat::Nv16 => height * 2,
-                        _ => {
-                            return Err(Error::InvalidShape(format!(
-                                "unknown semi-planar height multiplier for {format:?}"
-                            )))
-                        }
-                    };
-                    vec![total_h, width]
-                }
-                _ => {
-                    return Err(Error::NotSupported(format!(
-                        "unsupported pixel layout for import_image: {:?}",
-                        format.layout()
-                    )));
-                }
-            };
+            // Canonical shape (Packed [H,W,C] / Planar [C,H,W] / SemiPlanar
+            // [total_h, W]); `image_shape` supports NV12/NV16/NV24 (the old
+            // hand-rolled match erroneously rejected NV24).
+            let shape = format.image_shape(width, height).ok_or_else(|| {
+                Error::NotSupported(format!(
+                    "unsupported pixel format for import_image: {format:?}"
+                ))
+            })?;
             let tensor = TensorDyn::from_fd(image.into_fd(), &shape, dtype, None)?;
             if tensor.memory() != TensorMemory::Dma {
                 return Err(Error::NotSupported(format!(
@@ -5324,7 +5309,6 @@ mod image_tests {
             }
         };
         let mut cpu = CPUProcessor::new();
-        let (w, h) = (16usize, 16usize);
 
         // Fill Y plus the interleaved UV plane in the canonical semi-planar
         // layout — exactly what the codec writes and the CPU `yuv`-crate reader
@@ -5334,7 +5318,10 @@ mod image_tests {
         // byte line == two grid rows, NV12/NV16 one row of `W/2` pairs); each
         // (Cb,Cr) pair is two consecutive bytes at column `cx * 2`. This is
         // stride-correct for both the tight Mem buffer and the padded IOSurface.
-        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
+        //
+        // Takes explicit w/h so the closure can be reused across multiple frame
+        // sizes (even and odd) without capturing a fixed outer variable.
+        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat, w: usize, h: usize| {
             for y in 0..h {
                 for x in 0..w {
                     buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
@@ -5356,65 +5343,76 @@ mod image_tests {
         };
 
         for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
-            let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
-            let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(
-                mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
-                mem_stride,
-                fmt,
-            );
-            let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
-            let (r, _s, cpu_dst) = convert_img(
-                &mut cpu,
-                mem,
-                cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            );
-            r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
+            for (w, h) in [
+                (16usize, 16usize), // original even-dim case
+                (15, 16),           // odd-W
+                (16, 15),           // odd-H
+            ] {
+                let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+                let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
+                fill(
+                    mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                    mem_stride,
+                    fmt,
+                    w,
+                    h,
+                );
+                let cpu_dst =
+                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let (r, _s, cpu_dst) = convert_img(
+                    &mut cpu,
+                    mem,
+                    cpu_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                );
+                r.unwrap_or_else(|e| panic!("CPU {fmt:?}->{w}x{h}->RGBA: {e}"));
 
-            let ios = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
-                .unwrap_or_else(|e| panic!("{fmt:?} IOSurface alloc: {e}"));
-            let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(
-                ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
-                ios_stride,
-                fmt,
-            );
-            let gpu_dst =
-                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                    .unwrap();
-            let (r, _s, gpu_dst) = convert_img(
-                &mut gpu,
-                ios,
-                gpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            );
-            r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA on ANGLE: {e}"));
+                let ios = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap_or_else(|e| panic!("{fmt:?} {w}x{h} IOSurface alloc: {e}"));
+                let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
+                fill(
+                    ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                    ios_stride,
+                    fmt,
+                    w,
+                    h,
+                );
+                let gpu_dst =
+                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                        .unwrap();
+                let (r, _s, gpu_dst) = convert_img(
+                    &mut gpu,
+                    ios,
+                    gpu_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                );
+                r.unwrap_or_else(|e| panic!("GPU {fmt:?}->{w}x{h}->RGBA on ANGLE: {e}"));
 
-            let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
-            let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
-            let cb = cmap.as_slice();
-            let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
-            let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
-            let gb = gmap.as_slice();
-            let mut max_d = 0i16;
-            for y in 0..h {
-                for x in 0..w {
-                    for c in 0..3 {
-                        let cv = cb[y * cs + x * 4 + c] as i16;
-                        let gv = gb[y * gs + x * 4 + c] as i16;
-                        max_d = max_d.max((cv - gv).abs());
+                let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+                let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
+                let cb = cmap.as_slice();
+                let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+                let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
+                let gb = gmap.as_slice();
+                let mut max_d = 0i16;
+                for y in 0..h {
+                    for x in 0..w {
+                        for c in 0..3 {
+                            let cv = cb[y * cs + x * 4 + c] as i16;
+                            let gv = gb[y * gs + x * 4 + c] as i16;
+                            max_d = max_d.max((cv - gv).abs());
+                        }
                     }
                 }
+                assert!(
+                    max_d <= 3,
+                    "{fmt:?} {w}x{h}: GPU vs CPU RGBA max channel diff {max_d} > 3"
+                );
             }
-            assert!(
-                max_d <= 3,
-                "{fmt:?}: GPU vs CPU RGBA max channel diff {max_d} > 3"
-            );
         }
     }
 
@@ -5440,18 +5438,14 @@ mod image_tests {
             }
         };
         let mut cpu = CPUProcessor::new();
-        // Frame is 40×24; the pool is generously oversized (256-wide → bpr 256,
-        // well beyond the frame's even width 40) and tall enough for NV24's 3·H.
-        let (w, h) = (40usize, 24usize);
+        // The pool is generously oversized (256-wide → bpr 256, well beyond any
+        // frame's even width) and tall enough for NV24's 3·H at the test frames.
         let (pool_w, pool_h) = (256usize, 256usize);
-        let ew = w; // even width (w is even)
 
-        // Canonical semi-planar fill (matches the codec writer + CPU reader):
-        // Y plane at the row stride, then the UV plane at `h * stride` with each
-        // chroma row advancing `uv_grid_rows * stride` bytes (NV24's `2*W`-byte
-        // line == two grid rows). Stride-correct for both the tight Mem
-        // reference and the padded pool IOSurface.
-        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat| {
+        // Canonical semi-planar fill: Y plane at the row stride, then the UV
+        // plane at `h * stride` with each chroma row advancing `uv_grid_rows *
+        // stride` bytes. Stride-correct for both tight Mem and padded IOSurface.
+        let fill = |buf: &mut [u8], stride: usize, fmt: PixelFormat, w: usize, h: usize| {
             for y in 0..h {
                 for x in 0..w {
                     buf[y * stride + x] = ((x * 9 + y * 5) & 0xff) as u8;
@@ -5473,88 +5467,113 @@ mod image_tests {
         };
 
         for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
-            // CPU reference from a tightly-packed Mem tensor at the frame size.
-            let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
-            let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
-            fill(
-                mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
-                mem_stride,
-                fmt,
-            );
-            let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
-            let (r, _s, cpu_dst) = convert_img(
-                &mut cpu,
-                mem,
-                cpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            );
-            r.unwrap_or_else(|e| panic!("CPU {fmt:?}->RGBA: {e}"));
+            for (w, h) in [
+                (40usize, 24usize), // original even-dim case
+                (15, 16),           // odd-W
+                (16, 15),           // odd-H
+            ] {
+                // `ew` is the minimum even extent; the pool stride must exceed it
+                // to actually exercise the physical-stride shader decoupling.
+                let ew = w.next_multiple_of(2);
 
-            // GPU source: a LARGER R8 pool surface, reconfigured down to the
-            // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
-            // tensor's row stride; the fill writes the frame at that stride.
-            let mut ios = match TensorDyn::image(
-                pool_w,
-                pool_h,
-                PixelFormat::Grey,
-                DType::U8,
-                Some(TensorMemory::Dma),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("SKIPPED: {} — R8 pool IOSurface alloc: {e:?}", function!());
-                    return;
-                }
-            };
-            ios.configure_image(w, h, fmt)
-                .unwrap_or_else(|e| panic!("configure_image {fmt:?} on pool: {e}"));
-            let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
-            assert!(
-                ios_stride > ew,
-                "{fmt:?}: pool stride {ios_stride} should exceed frame even width {ew} \
-                 (test must exercise padding)"
-            );
-            fill(
-                ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
-                ios_stride,
-                fmt,
-            );
+                // CPU reference from a tightly-packed Mem tensor at the frame size.
+                let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+                let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
+                fill(
+                    mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                    mem_stride,
+                    fmt,
+                    w,
+                    h,
+                );
+                let cpu_dst =
+                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let (r, _s, cpu_dst) = convert_img(
+                    &mut cpu,
+                    mem,
+                    cpu_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                );
+                r.unwrap_or_else(|e| panic!("CPU {fmt:?}->{w}x{h}->RGBA: {e}"));
 
-            let gpu_dst =
-                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                    .unwrap();
-            let (r, _s, gpu_dst) = convert_img(
-                &mut gpu,
-                ios,
-                gpu_dst,
-                Rotation::None,
-                Flip::None,
-                Crop::no_crop(),
-            );
-            r.unwrap_or_else(|e| panic!("GPU {fmt:?}->RGBA (pool surface) on ANGLE: {e}"));
+                // GPU source: a LARGER R8 pool surface, reconfigured down to the
+                // frame. Phase 1 preserves the pool's padded `bytesPerRow` as the
+                // tensor's row stride; the fill writes the frame at that stride.
+                let mut ios = match TensorDyn::image(
+                    pool_w,
+                    pool_h,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(
+                            "SKIPPED: {} — R8 pool IOSurface alloc: {e:?}",
+                            function!()
+                        );
+                        return;
+                    }
+                };
+                ios.configure_image(w, h, fmt)
+                    .unwrap_or_else(|e| panic!("configure_image {fmt:?} {w}x{h} on pool: {e}"));
+                let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
+                assert!(
+                    ios_stride > ew,
+                    "{fmt:?} {w}x{h}: pool stride {ios_stride} should exceed even width {ew} \
+                     (test must exercise padding)"
+                );
+                fill(
+                    ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
+                    ios_stride,
+                    fmt,
+                    w,
+                    h,
+                );
 
-            let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
-            let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
-            let cb = cmap.as_slice();
-            let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
-            let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
-            let gb = gmap.as_slice();
-            let mut max_d = 0i16;
-            for y in 0..h {
-                for x in 0..w {
-                    for c in 0..3 {
-                        let cv = cb[y * cs + x * 4 + c] as i16;
-                        let gv = gb[y * gs + x * 4 + c] as i16;
-                        max_d = max_d.max((cv - gv).abs());
+                let gpu_dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                )
+                .unwrap();
+                let (r, _s, gpu_dst) = convert_img(
+                    &mut gpu,
+                    ios,
+                    gpu_dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                );
+                r.unwrap_or_else(|e| {
+                    panic!("GPU {fmt:?}->{w}x{h}->RGBA (pool surface) on ANGLE: {e}")
+                });
+
+                let cs = cpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+                let cmap = cpu_dst.as_u8().unwrap().map().unwrap();
+                let cb = cmap.as_slice();
+                let gs = gpu_dst.as_u8().unwrap().effective_row_stride().unwrap();
+                let gmap = gpu_dst.as_u8().unwrap().map().unwrap();
+                let gb = gmap.as_slice();
+                let mut max_d = 0i16;
+                for y in 0..h {
+                    for x in 0..w {
+                        for c in 0..3 {
+                            let cv = cb[y * cs + x * 4 + c] as i16;
+                            let gv = gb[y * gs + x * 4 + c] as i16;
+                            max_d = max_d.max((cv - gv).abs());
+                        }
                     }
                 }
+                assert!(
+                    max_d <= 3,
+                    "{fmt:?} {w}x{h}: GPU(pool surface) vs CPU RGBA max channel diff {max_d} > 3"
+                );
             }
-            assert!(
-                max_d <= 3,
-                "{fmt:?}: GPU(pool surface) vs CPU RGBA max channel diff {max_d} > 3"
-            );
         }
     }
 
@@ -6813,6 +6832,13 @@ mod image_tests {
         Ok(src)
     }
 
+    // DEDUP: this function is also defined verbatim in
+    // `crates/image/src/gl/tests.rs` (inside `mod gl_tests`). Both copies
+    // must be kept in sync. Cross-module sharing would require either a
+    // `pub(crate)` test-helper module (which pollutes the non-test API) or a
+    // separate test-utils crate — both are disproportionate for a single
+    // helper. If the implementation ever diverges, extract to a shared
+    // `test_helpers` module in this crate.
     fn compare_images(img1: &TensorDyn, img2: &TensorDyn, threshold: f64, name: &str) {
         assert_eq!(img1.height(), img2.height(), "Heights differ");
         assert_eq!(img1.width(), img2.width(), "Widths differ");

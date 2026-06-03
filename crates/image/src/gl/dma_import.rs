@@ -274,12 +274,9 @@ impl DmaImportAttrs {
         // 3H-1 for NV24, so the imported R8 texture MUST be 3H tall — a 2H import
         // leaves the NV24 chroma rows out of bounds (reads garbage on strict tiled
         // GPUs like Mali/V3D, tolerated on Vivante/Tegra).
-        let combined_h = match src_fmt {
-            PixelFormat::Nv12 => src_h + src_h.div_ceil(2),
-            PixelFormat::Nv16 => src_h * 2,
-            PixelFormat::Nv24 => src_h * 3,
-            _ => unreachable!(),
-        };
+        let combined_h = src_fmt.combined_plane_height(src_h).ok_or_else(|| {
+            Error::NotImplemented(format!("Path-B R8 import: {src_fmt:?} is not semi-planar"))
+        })?;
 
         let dma = src.as_dma().ok_or_else(|| {
             Error::NotImplemented(format!(

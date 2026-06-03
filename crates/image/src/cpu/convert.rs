@@ -62,7 +62,12 @@ impl CPUProcessor {
             let stride = src
                 .effective_row_stride()
                 .unwrap_or(src_w.next_multiple_of(2));
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
@@ -127,7 +132,12 @@ impl CPUProcessor {
             let stride = src
                 .effective_row_stride()
                 .unwrap_or(src_w.next_multiple_of(2));
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
@@ -295,11 +305,14 @@ impl CPUProcessor {
         // Split at the stride-aligned luma plane boundary, not the tight one.
         let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
 
-        // YUYV byte order per two-pixel macropixel: [Y0, Cb, Y1, Cr]
+        // YUYV byte order per two-pixel macropixel: [Y0, Cb, Y1, Cr].
+        // The NV16 chroma row is `even(dst_w)` bytes wide (one (Cb,Cr) pair per
+        // 2 luma columns, rounded up), so slice the UV row to the even width.
+        let chroma_w = dst_w.next_multiple_of(2);
         for row in 0..src_h {
             let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
             let y_row = &mut y_plane[row * dst_stride..row * dst_stride + dst_w];
-            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + dst_w];
+            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + chroma_w];
             let mut xi = 0usize;
             let mut si = 0usize;
             while xi + 1 < dst_w {
@@ -310,10 +323,14 @@ impl CPUProcessor {
                 xi += 2;
                 si += 4;
             }
-            // Odd width: one trailing luma/chroma sample
+            // Odd width: one trailing lone pixel. Write its Y and the full
+            // (Cb,Cr) chroma pair so the even-width chroma row is fully
+            // initialized; the lone pixel has no second-Y Cr in the source, so
+            // replicate Cb when absent.
             if xi < dst_w && si + 1 < src_row.len() {
                 y_row[xi] = src_row[si];
-                uv_row[xi] = src_row[si + 1]; // Cb for the last pixel
+                uv_row[xi] = src_row[si + 1]; // Cb
+                uv_row[xi + 1] = src_row.get(si + 3).copied().unwrap_or(src_row[si + 1]);
             }
         }
         Ok(())
@@ -422,11 +439,13 @@ impl CPUProcessor {
         // Split at the stride-aligned luma plane boundary, not the tight one.
         let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
 
-        // VYUY byte order per two-pixel macropixel: [V, Y0, U, Y1]
+        // VYUY byte order per two-pixel macropixel: [V, Y0, U, Y1]. The NV16
+        // chroma row is `even(dst_w)` bytes wide, so slice UV to the even width.
+        let chroma_w = dst_w.next_multiple_of(2);
         for row in 0..src_h {
             let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
             let y_row = &mut y_plane[row * dst_stride..row * dst_stride + dst_w];
-            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + dst_w];
+            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + chroma_w];
             let mut xi = 0usize;
             let mut si = 0usize;
             while xi + 1 < dst_w {
@@ -437,10 +456,13 @@ impl CPUProcessor {
                 xi += 2;
                 si += 4;
             }
-            // Odd width: one trailing luma/chroma sample
+            // Odd width: one trailing lone pixel — write Y and the full (Cb,Cr)
+            // pair (both are present in this macropixel's V,Y0,U bytes) so the
+            // even-width chroma row is fully initialized.
             if xi < dst_w && si + 2 < src_row.len() {
                 y_row[xi] = src_row[si + 1];
-                uv_row[xi] = src_row[si + 2]; // U (Cb) for the last pixel
+                uv_row[xi] = src_row[si + 2]; // U (Cb)
+                uv_row[xi + 1] = src_row[si]; // V (Cr)
             }
         }
         Ok(())
@@ -975,7 +997,12 @@ impl CPUProcessor {
         } else {
             let map = src.map()?;
             let src_h = src.shape()[0] / 2;
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv16_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }
@@ -1028,7 +1055,12 @@ impl CPUProcessor {
         } else {
             let map = src.map()?;
             let src_h = src.shape()[0] / 2;
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv16_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }
@@ -1087,7 +1119,12 @@ impl CPUProcessor {
         } else {
             let src_h = src.shape()[0] / 3;
             let map = src.map()?;
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }
@@ -1141,7 +1178,12 @@ impl CPUProcessor {
         } else {
             let src_h = src.shape()[0] / 3;
             let map = src.map()?;
-            let (y_plane, uv_plane) = map.as_slice().split_at(stride * src_h);
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
             Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }

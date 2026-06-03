@@ -1318,11 +1318,12 @@ impl PyCudaMap {
 pub struct PyTensorMap {
     pub(crate) mapped: Option<TensorMapT>,
     /// Physical row pitch in bytes for image tensors, captured from
-    /// `effective_row_stride()` at map time. `Some` only when the backing is
-    /// row-padded (pitch > the tight `inner_dims * itemsize`); used by
-    /// `__getbuffer__` to expose the correct outer stride so a padded DMA / GPU
-    /// tensor reads zero-copy as a strided array instead of a sheared
-    /// contiguous one. `None` for tight or non-image tensors.
+    /// `effective_row_stride()` at map time. `Some` for **any** image tensor
+    /// that has a pixel format set (including DMA, IOSurface, and
+    /// self-allocated semi-planar tensors whose stride is always
+    /// 64-byte-aligned). `None` only for non-image tensors or tensors without
+    /// a pixel format. The `__getbuffer__` impl applies the padded stride only
+    /// when `rs > strides[0]` (tight buffers pass through unchanged).
     pub(crate) row_stride: Option<usize>,
 }
 

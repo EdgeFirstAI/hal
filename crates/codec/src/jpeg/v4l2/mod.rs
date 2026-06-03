@@ -629,15 +629,22 @@ impl V4l2Context {
                     let o = y * dst_stride;
                     d[o..o + final_w].copy_from_slice(&y_plane[s..s + final_w]);
                 }
-                // Interleaved CbCr plane (`final_w` bytes/row = `final_w/2` pairs).
-                // `ceil(final_h/2)` chroma rows — the last row must be copied for
-                // odd luma heights (4:2:0 rounds the chroma row count up).
+                // Interleaved CbCr plane. An NV12 chroma row holds
+                // `ceil(final_w/2)` (Cb,Cr) pairs == `even(final_w)` bytes;
+                // copying only `final_w` drops the final Cr on ODD widths.
+                // `ceil(final_h/2)` chroma rows (4:2:0 rounds the row count up).
+                // Both `c_stride` (MCU-rounded CAPTURE pitch) and `dst_stride`
+                // (64-aligned tensor pitch) are >= even(final_w), so the wider
+                // copy stays in-bounds.
                 let uv_base = final_h * dst_stride;
-                for cy in 0..final_h.div_ceil(2) {
-                    let s = cy * c_stride;
-                    let o = uv_base + cy * dst_stride;
-                    d[o..o + final_w].copy_from_slice(&cbcr[s..s + final_w]);
-                }
+                copy_nv12_chroma(
+                    cbcr,
+                    c_stride,
+                    &mut d[uv_base..],
+                    dst_stride,
+                    final_w,
+                    final_h,
+                );
             }
             other => {
                 return Err(DecodeErr::Unsupported(format!(
@@ -686,6 +693,38 @@ impl Drop for V4l2Context {
     fn drop(&mut self) {
         // Release the streaming session and device buffers on decoder drop.
         self.drop_stream();
+    }
+}
+
+/// Copy the interleaved NV12 CbCr plane from a hardware CAPTURE buffer into the
+/// destination tensor, cropping to the logical image width.
+///
+/// An NV12 chroma row carries `ceil(final_w / 2)` (Cb, Cr) pairs, which is
+/// `even(final_w)` bytes. Copying only `final_w` bytes would silently drop the
+/// final Cr sample on **odd** widths. This function always copies
+/// `final_w.next_multiple_of(2)` bytes per row, preserving the last Cr.
+///
+/// # Arguments
+///
+/// * `src`       — the hardware CAPTURE chroma plane (may be MCU-rounded larger).
+/// * `src_stride`  — bytes per row in `src` (MCU-rounded CAPTURE pitch).
+/// * `dst`       — the destination chroma region starting at the UV plane base.
+/// * `dst_stride`  — bytes per row in `dst` (64-aligned tensor pitch).
+/// * `final_w`   — logical image width (may be odd).
+/// * `final_h`   — logical image height (may be odd).
+fn copy_nv12_chroma(
+    src: &[u8],
+    src_stride: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    final_w: usize,
+    final_h: usize,
+) {
+    let chroma_w = final_w.next_multiple_of(2);
+    for cy in 0..final_h.div_ceil(2) {
+        let s = cy * src_stride;
+        let o = cy * dst_stride;
+        dst[o..o + chroma_w].copy_from_slice(&src[s..s + chroma_w]);
     }
 }
 
@@ -909,5 +948,70 @@ mod tests {
             ioctl::V4L2_YCBCR_ENC_601,
             QUANT_LIMITED
         ));
+    }
+
+    /// `copy_nv12_chroma` with an odd `final_w` must copy `even(final_w)` bytes
+    /// per chroma row, preserving the final Cr sample that a naïve `final_w`-byte
+    /// copy would have silently dropped.
+    #[test]
+    fn copy_nv12_chroma_odd_w_preserves_last_cr() {
+        // Odd width 5: even(5) = 6. One chroma row (final_h = 2 → 1 chroma row).
+        let final_w = 5usize;
+        let final_h = 2usize;
+        let src_stride = 8usize; // MCU-rounded (>= even(final_w)=6)
+        let dst_stride = 64usize; // 64-aligned tensor pitch
+
+        // Build a src chroma row: [Cb0, Cr0, Cb1, Cr1, Cb2, Cr2, PAD, PAD]
+        // Index 4 is Cb2 and index 5 is Cr2 — the bytes that a naïve
+        // `final_w=5` copy would have omitted (it would stop at index 4).
+        let mut src = vec![0u8; src_stride];
+        src[0] = 10; // Cb0
+        src[1] = 11; // Cr0
+        src[2] = 20; // Cb1
+        src[3] = 21; // Cr1
+        src[4] = 30; // Cb2
+        src[5] = 31; // Cr2  ← last valid Cr, must NOT be dropped
+
+        let mut dst = vec![0u8; dst_stride];
+        copy_nv12_chroma(&src, src_stride, &mut dst, dst_stride, final_w, final_h);
+
+        // Bytes 0..6 in dst must match src 0..6 exactly.
+        assert_eq!(
+            &dst[..6],
+            &src[..6],
+            "copy_nv12_chroma: first 6 bytes (even(5)) must be copied verbatim"
+        );
+        // Specifically, the last Cr (index 5) must NOT be zero / dropped.
+        assert_eq!(
+            dst[5], 31,
+            "copy_nv12_chroma: last Cr at byte 5 must be preserved for odd final_w=5"
+        );
+    }
+
+    /// Sanity-check the even-width case: `copy_nv12_chroma` with an even
+    /// `final_w` behaves identically to copying `final_w` bytes (no implicit
+    /// extra byte).
+    #[test]
+    fn copy_nv12_chroma_even_w_no_extra_byte() {
+        let final_w = 4usize; // even
+        let final_h = 2usize;
+        let src_stride = 8usize;
+        let dst_stride = 64usize;
+
+        let mut src = vec![0u8; src_stride];
+        src[0] = 1;
+        src[1] = 2;
+        src[2] = 3;
+        src[3] = 4; // last valid byte for even(4)=4
+        src[4] = 99; // must NOT be copied
+
+        let mut dst = vec![0u8; dst_stride];
+        copy_nv12_chroma(&src, src_stride, &mut dst, dst_stride, final_w, final_h);
+
+        assert_eq!(&dst[..4], &src[..4]);
+        assert_eq!(
+            dst[4], 0,
+            "copy_nv12_chroma: byte beyond even(final_w) must remain untouched"
+        );
     }
 }

@@ -511,6 +511,16 @@ pub struct MacosGlProcessor {
     /// than globally so each processor's resource lifetime is
     /// independent and easy to reason about. ANGLE's pbuffers are
     /// per-display, not per-context, so this is sound.
+    ///
+    /// LIVE-SURFACE ASSUMPTION: an `IOSurfaceID` is unique only among *live*
+    /// surfaces — the kernel may reuse an ID after its surface is freed, and
+    /// this cache never evicts on tensor drop. Reuse is safe today because a
+    /// HAL `Tensor` keeps its IOSurface alive (`Arc<IoSurfaceHandle>`) for as
+    /// long as it can be converted, so a cached pbuffer's surface is always the
+    /// one its ID currently names. A caller that frees a tensor and then
+    /// converts a *different* tensor whose surface was assigned the recycled ID
+    /// would get a stale pbuffer; if that pattern is ever introduced, key the
+    /// cache on the tensor's `BufferIdentity` (a process-unique token) instead.
     pbuf_cache: Mutex<HashMap<PbufferCacheKey, egl::Surface>>,
     /// Reusable full-resolution RGBA8 IOSurface for the two-pass YUV→PlanarRgb
     /// path (`(W, H, tensor)`). Pass 1 renders the YUV source into it; pass 2
@@ -853,6 +863,14 @@ impl MacosGlProcessor {
             .height()
             .ok_or_else(|| Error::InvalidShape("src height".into()))?;
 
+        // Span for the two-pass NV*→PlanarRgb F16 chain. The `_inner` pass
+        // helpers below deliberately bypass the public-entry spans (to hold one
+        // GL session across both passes), so this is the only span covering the
+        // macOS NV→planar-float hot path — catalogued in ARCHITECTURE.md
+        // alongside the Linux `image.convert.gl.nv_to_planar.*` spans.
+        let _span =
+            tracing::trace_span!("image.convert.gl.macos.nv_to_planar", w, h, ?src_fmt).entered();
+
         // Reuse (or allocate) the full-res RGBA8 intermediate IOSurface.
         //
         // PERF (revisit in profiler measurement): this reallocates when the
@@ -1106,7 +1124,15 @@ impl MacosGlProcessor {
             // pixel holds 4 contiguous f16 elements of the planar
             // tensor's [3, H, W] byte stream. Viewport covers the
             // full surface so the fragment shader visits every
-            // packed pixel.
+            // packed pixel. `dst_w` must be a multiple of 4 for the
+            // packing to align — the IOSurface allocator
+            // (`packed_rgba16f_layout`) rejects non-multiple-of-4 widths, so a
+            // correctly-allocated dst can't reach here misaligned; guard anyway
+            // against a future caller constructing the dst differently.
+            debug_assert!(
+                dst_w % 4 == 0,
+                "RGBA16F-packed planar dst width {dst_w} must be a multiple of 4"
+            );
             let surface_w = (dst_w / 4) as i32;
             let surface_h = (dst_h * 3) as i32;
             gls::gl::Viewport(0, 0, surface_w, surface_h);
@@ -1368,24 +1394,24 @@ impl MacosGlProcessor {
                     // addressable; binding at the even width would leave its
                     // tail columns outside the texture.
                     let stride = src_u8.effective_row_stride().unwrap_or(src_w);
-                    let (cx, cy) = match src_fmt {
-                        PixelFormat::Nv12 => (1, 1),
-                        PixelFormat::Nv16 => (1, 0),
-                        _ => (0, 0), // Nv24
-                    };
-                    // Bytes the UV plane advances per chroma row: NV24 carries
-                    // full-resolution `W` (Cb,Cr) pairs == `2*stride` bytes (two
-                    // grid rows); NV12/NV16 carry `W/2` pairs within one row.
-                    let uv_row_bytes = if matches!(src_fmt, PixelFormat::Nv24) {
-                        (stride * 2) as i32
-                    } else {
-                        stride as i32
-                    };
+                    // Chroma geometry from the shared single source of truth
+                    // (`PixelFormat::chroma_layout`): `shift_x`/`shift_y` select
+                    // the sub-sampling, and the UV plane advances
+                    // `uv_rows_per_luma * stride` bytes per chroma row (NV24's
+                    // full-resolution 2*W-byte line == two grid rows).
+                    let layout = src_fmt
+                        .chroma_layout()
+                        .expect("NV12/NV16/NV24 always have a chroma layout");
+                    let uv_row_bytes = (layout.uv_rows_per_luma * stride) as i32;
                     gls::gl::UseProgram(self.program_nv_to_rgba);
                     gls::gl::Uniform1i(self.uniform_nv_src, 0);
                     gls::gl::Uniform2i(self.uniform_nv_img_size, src_w as i32, src_h as i32);
                     gls::gl::Uniform1i(self.uniform_nv_tex_width, stride as i32);
-                    gls::gl::Uniform2i(self.uniform_nv_chroma_shift, cx, cy);
+                    gls::gl::Uniform2i(
+                        self.uniform_nv_chroma_shift,
+                        layout.shift_x as i32,
+                        layout.shift_y as i32,
+                    );
                     gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
                 }
                 PixelFormat::Grey => {

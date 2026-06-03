@@ -1714,7 +1714,7 @@ impl GLProcessorST {
         } else if dst_fmt.layout() == PixelLayout::Planar {
             // Vivante two-pass: force RGBA8 intermediate for NV12 → PlanarRgb.
             // NV16/NV24 use Path B which always produces RGBA8 first — the
-            // `convert_nv12_to_planar_two_pass` function calls `convert_to`
+            // `convert_nv_to_planar_two_pass` function calls `convert_to`
             // internally, which now routes NV16/NV24 through Path B anyway.
             // So extending the Vivante guard to NV16/NV24 costs nothing extra
             // and avoids any potential single-pass hang on Vivante for these
@@ -1734,7 +1734,7 @@ impl GLProcessorST {
                      (Vivante workaround: RGBA intermediate + planar_2d{}shader)",
                     if is_int8 { "_int8_" } else { "_" }
                 );
-                self.convert_nv12_to_planar_two_pass(
+                self.convert_nv_to_planar_two_pass(
                     src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
                 )
             } else {
@@ -3296,7 +3296,7 @@ impl GLProcessorST {
     /// **Pass 2:** RGBA→PlanarRgb from intermediate to DMA destination via
     /// [`draw_intermediate_to_rgb_planar`] (channel deinterleave + optional int8 bias).
     #[allow(clippy::too_many_arguments)]
-    fn convert_nv12_to_planar_two_pass(
+    fn convert_nv_to_planar_two_pass(
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
@@ -3321,14 +3321,14 @@ impl GLProcessorST {
         };
 
         log::debug!(
-            "convert_nv12_to_planar_two_pass: {src_fmt}→{dst_fmt} {dst_w}x{dst_h} \
+            "convert_nv_to_planar_two_pass: {src_fmt}→{dst_fmt} {dst_w}x{dst_h} \
              int8={is_int8} (Vivante two-pass workaround)",
         );
 
         // --- Pass 1: NV12→RGBA into intermediate texture ---
         // No int8 bias here — bias is applied in pass 2's planar shader.
         let _pass1 =
-            tracing::trace_span!("image.convert.gl.nv12_to_planar.pass1_rgba", dst_w, dst_h)
+            tracing::trace_span!("image.convert.gl.nv_to_planar.pass1_rgba", dst_w, dst_h)
                 .entered();
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
@@ -3355,7 +3355,7 @@ impl GLProcessorST {
         // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
         // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
         let _pass2 = tracing::trace_span!(
-            "image.convert.gl.nv12_to_planar.pass2_deinterleave",
+            "image.convert.gl.nv_to_planar.pass2_deinterleave",
             dst_w,
             dst_h
         )
@@ -4134,21 +4134,19 @@ impl GLProcessorST {
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let tex_width = src.effective_row_stride().unwrap_or(src_w) as i32;
 
-        // Format-specific shader uniforms. `chroma_lines` is the number of R8
+        // Format-specific shader uniforms from the shared `chroma_layout`
+        // (single source of truth with the codec writer + CPU readers + macOS
+        // shader). `chroma_lines` (== `uv_rows_per_luma`) is the number of R8
         // buffer rows each image-chroma-row occupies (NV24's CbCr row is 2W
         // bytes = 2 rows; NV12/NV16 are W bytes = 1 row). The shader uses it for
         // direct 2D texel addressing (no per-pixel integer divide/modulo, which
         // is pathologically slow on some embedded GPUs e.g. Vivante GC7000UL).
-        let (chroma_shift_x, chroma_shift_y, chroma_lines) = match src_fmt {
-            PixelFormat::Nv12 => (1i32, 1i32, 1i32),
-            PixelFormat::Nv16 => (1i32, 0i32, 1i32),
-            PixelFormat::Nv24 => (0i32, 0i32, 2i32),
-            _ => {
-                return Err(Error::NotSupported(format!(
-                    "draw_nv_texture_2d: unsupported format {src_fmt:?}"
-                )));
-            }
-        };
+        let layout = src_fmt.chroma_layout().ok_or_else(|| {
+            Error::NotSupported(format!("draw_nv_texture_2d: unsupported format {src_fmt:?}"))
+        })?;
+        let chroma_shift_x = layout.shift_x as i32;
+        let chroma_shift_y = layout.shift_y as i32;
+        let chroma_lines = layout.uv_rows_per_luma as i32;
 
         let luma_id = src.buffer_identity().id();
         let chroma_id = src.chroma().map(|t| t.buffer_identity().id());

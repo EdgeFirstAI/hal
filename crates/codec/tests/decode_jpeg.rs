@@ -421,17 +421,33 @@ fn rgb_to_cbcr(r: f32, g: f32, b: f32) -> (f32, f32) {
 /// modest tolerance — proving the chroma layout (offset, pitch, Cb/Cr order)
 /// is correct, not merely present.
 fn check_native_decode(fixture: &str, expect_fmt: PixelFormat) {
+    check_native_decode_dims(fixture, expect_fmt, 1280, 720);
+}
+
+fn check_native_decode_dims(
+    fixture: &str,
+    expect_fmt: PixelFormat,
+    expect_w: usize,
+    expect_h: usize,
+) {
     let jpeg = testdata(fixture);
     // Over-allocate generously (NV24 needs 3·H rows); the decoder configures the
     // real shape/format from the bitstream.
-    let mut tensor = Tensor::<u8>::image(1280, 720, expect_fmt, Some(TensorMemory::Mem)).unwrap();
+    let alloc_w = expect_w.max(1280);
+    let alloc_h = expect_h.max(720);
+    let mut tensor =
+        Tensor::<u8>::image(alloc_w, alloc_h, expect_fmt, Some(TensorMemory::Mem)).unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.format, expect_fmt, "{fixture}: native format");
-    assert_eq!((info.width, info.height), (1280, 720), "{fixture}: dims");
+    assert_eq!(
+        (info.width, info.height),
+        (expect_w, expect_h),
+        "{fixture}: dims"
+    );
 
     let ref_rgb = image::load_from_memory(&jpeg).unwrap().to_rgb8();
-    assert_eq!(ref_rgb.dimensions(), (1280, 720));
+    assert_eq!(ref_rgb.dimensions(), (expect_w as u32, expect_h as u32));
 
     let w = info.width;
     let h = info.height;
@@ -466,24 +482,28 @@ fn check_native_decode(fixture: &str, expect_fmt: PixelFormat) {
     // row). Decode (Cb, Cr) for a sampled grid and compare to CbCr derived from
     // the image crate's RGB. A transposed/mis-offset plane shows up as a large
     // diff; smooth chroma keeps the honest tolerance small.
-    let even_w = w.next_multiple_of(2);
+    //
+    // Index directly from `stride` (the physical row pitch) rather than from
+    // `even_w` so the formula is correct for both even and odd widths. The
+    // `even_w`-based `pos` helper is only correct when `stride == even_w`
+    // (i.e., un-padded Mem tensors at even widths).
     let uv_off = h * stride;
-    let pos = |lb: usize| uv_off + (lb / even_w) * stride + (lb % even_w);
     let chroma_at = |x: usize, y: usize| -> (i32, i32) {
-        let lb = match expect_fmt {
-            // 4:2:2 — chroma col x/2, one chroma row per image row.
-            PixelFormat::Nv16 => y * even_w + (x / 2) * 2,
-            // 4:4:4 — chroma col x, pitch 2·even_w (spans two buffer rows).
-            _ => y * even_w * 2 + x * 2,
+        let byte_off = match expect_fmt {
+            // NV16 4:2:2: one chroma row per image row, chroma column x/2.
+            PixelFormat::Nv16 => uv_off + y * stride + (x / 2) * 2,
+            // NV24 4:4:4: two buffer rows per image row (UV pitch = 2 * stride),
+            // full-resolution chroma columns.
+            _ => uv_off + y * 2 * stride + x * 2,
         };
-        (buf[pos(lb)] as i32, buf[pos(lb + 1)] as i32)
+        (buf[byte_off] as i32, buf[byte_off + 1] as i32)
     };
 
     let mut c_max: u32 = 0;
     let mut c_total: u64 = 0;
     let mut samples: u64 = 0;
-    for y in (0..h).step_by(8) {
-        for x in (0..w).step_by(8) {
+    for y in (0..h).step_by(2) {
+        for x in (0..w).step_by(2) {
             let p = ref_rgb.get_pixel(x as u32, y as u32);
             let (ecb, ecr) = rgb_to_cbcr(p[0] as f32, p[1] as f32, p[2] as f32);
             let (cb, cr) = chroma_at(x, y);
@@ -516,6 +536,20 @@ fn decode_zidane_nv16() {
 #[test]
 fn decode_zidane_nv24() {
     check_native_decode("zidane_444.jpg", PixelFormat::Nv24);
+}
+
+/// Odd-width (789×384) NV16 decode — exercises the chroma layout and
+/// stride alignment for 4:2:2 at a non-even width.
+#[test]
+fn decode_jaguar_nv16() {
+    check_native_decode_dims("jaguar_422.jpg", PixelFormat::Nv16, 789, 384);
+}
+
+/// Odd-width (789×384) NV24 decode — exercises the chroma layout and
+/// stride alignment for 4:4:4 at a non-even width.
+#[test]
+fn decode_jaguar_nv24() {
+    check_native_decode_dims("jaguar_444.jpg", PixelFormat::Nv24, 789, 384);
 }
 
 // ---------------------------------------------------------------------------
