@@ -865,8 +865,12 @@ impl PyTensor {
     }
 
     fn map(&self) -> Result<PyTensorMap> {
+        // Capture the physical row pitch so the buffer protocol can expose a
+        // padded (DMA / GPU pitch-aligned) backing as a correctly-strided view.
+        let row_stride = self.0.effective_row_stride();
         Ok(PyTensorMap {
             mapped: Some(map_tensor_dyn(&self.0)?),
+            row_stride,
         })
     }
 
@@ -1313,6 +1317,13 @@ impl PyCudaMap {
 #[pyclass(name = "TensorMap")]
 pub struct PyTensorMap {
     pub(crate) mapped: Option<TensorMapT>,
+    /// Physical row pitch in bytes for image tensors, captured from
+    /// `effective_row_stride()` at map time. `Some` only when the backing is
+    /// row-padded (pitch > the tight `inner_dims * itemsize`); used by
+    /// `__getbuffer__` to expose the correct outer stride so a padded DMA / GPU
+    /// tensor reads zero-copy as a strided array instead of a sheared
+    /// contiguous one. `None` for tight or non-image tensors.
+    pub(crate) row_stride: Option<usize>,
 }
 
 unsafe impl Send for PyTensorMap {}
@@ -1384,6 +1395,26 @@ impl PyTensorMap {
             }
         }
 
+        // Default (tight / contiguous) byte length.
+        let mut buf_len = mapped.size() as isize;
+
+        // Row-padded image backing (DMA / GPU pitch alignment): `map().as_slice()`
+        // exposes the full padded buffer, so the rows sit at `row_stride` bytes,
+        // wider than the tight outer stride. Expose that pitch as the outer
+        // (row) stride and widen `len` to span the padded buffer, so a consumer
+        // (`np.asarray(memoryview(map))`) reads the logical pixels zero-copy
+        // instead of a sheared contiguous reinterpretation. Tight buffers
+        // (`row_stride == strides[0]`, or non-image `None`) are unchanged.
+        if ndim > 0 {
+            if let Some(rs) = slf2.row_stride {
+                let rs = rs as isize;
+                if rs > strides[0] {
+                    strides[0] = rs;
+                    buf_len = rs * shape[0];
+                }
+            }
+        }
+
         // Box both arrays together so we can recover the length in __releasebuffer__.
         // Store (shape_ptr, strides_ptr, ndim) using view.internal.
         let mut shape = shape.into_boxed_slice();
@@ -1394,7 +1425,7 @@ impl PyTensorMap {
 
         unsafe {
             (*view).buf = ptr;
-            (*view).len = mapped.size() as isize;
+            (*view).len = buf_len;
             (*view).itemsize = itemsize;
             (*view).readonly = 0;
 

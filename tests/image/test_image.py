@@ -271,6 +271,126 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
+# ---------------------------------------------------------------------------
+# Strided zero-copy + DMA buffer-protocol tests.
+#
+# A DMA / GPU image tensor is allocated with a 64-byte-aligned row pitch, so
+# whenever `width * channels` is not already 64-aligned the backing buffer is
+# ROW-PADDED: `row_stride > width * channels`. `map()` exposes the full padded
+# buffer, so any consumer that assumes a tight `width*channels`-per-row layout
+# reads every row after the first at the wrong offset (a progressive shear).
+# These cells prove both the read (buffer protocol + normalize_to_numpy) and
+# write (from_numpy) paths honour the physical pitch, zero-copy onto the DMA-BUF.
+#
+# On platforms without a DMA heap (headless x86 CI) the allocation falls back /
+# is unavailable and the cells skip — the padded pitch only arises on DMA.
+# ---------------------------------------------------------------------------
+
+
+def _dma_image_or_skip(w, h, fmt):
+    """Allocate a DMA-backed image tensor, or skip when DMA is unavailable."""
+    try:
+        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMA)
+    except (AttributeError, RuntimeError):
+        pytest.skip("DMA memory not supported on this platform")
+    if t.memory != TensorMemory.DMA:
+        pytest.skip("DMA requested but backend substituted another memory type")
+    return t
+
+
+@pytest.mark.parametrize(
+    "fmt,channels",
+    [
+        (PixelFormat.Rgb, 3),
+        (PixelFormat.Rgba, 4),
+        (PixelFormat.Grey, 1),
+    ],
+    ids=["rgb", "rgba", "grey"],
+)
+def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
+    """A padded-pitch DMA image tensor exposes a *strided* (not sheared
+    contiguous) buffer via the Python buffer protocol.
+
+    End-to-end: write a known gradient with `from_numpy` (stride-aware write),
+    read it back through `memoryview` / `np.asarray` (stride-aware read), then
+    mutate through the live mapping and confirm the change is visible on a fresh
+    map — i.e. the view is zero-copy onto the DMA-BUF, not a private copy.
+    """
+    w, h = 595, 438  # odd width → width*channels is not 64-aligned → padded
+    t = _dma_image_or_skip(w, h, fmt)
+    assert t.row_stride > w * channels, "expected a padded pitch for this width"
+    assert t.row_stride % 64 == 0, "DMA pitch must be 64-byte aligned"
+
+    ref = (np.arange(h * w * channels, dtype=np.uint8) % 251).reshape(h, w, channels)
+    t.from_numpy(ref)
+
+    with t.map() as m:
+        mv = memoryview(m)
+        # Logical shape, physical pitch as the outermost stride.
+        assert mv.shape == (h, w, channels)
+        assert mv.strides[0] == t.row_stride
+        arr = np.asarray(mv)
+        assert np.array_equal(arr, ref), "strided buffer-protocol read sheared the data"
+        # Poke the live mapping (zero-copy write-through onto the DMA-BUF).
+        poked = (int(ref[0, 0, 0]) ^ 0xFF) & 0xFF
+        memoryview(m)[0, 0, 0] = poked
+
+    with t.map() as m2:
+        arr2 = np.asarray(memoryview(m2))
+        assert int(arr2[0, 0, 0]) == poked, "mutation did not reach the DMA-BUF"
+
+    # normalize_to_numpy reads the same padded backing and must agree.
+    if channels == 3:
+        t.from_numpy(ref)
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        t.normalize_to_numpy(out, Normalization.RAW, None)
+        assert np.array_equal(out, ref), "normalize_to_numpy sheared the padded buffer"
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    [PixelFormat.Nv12, PixelFormat.Nv16, PixelFormat.Nv24],
+    ids=["nv12", "nv16", "nv24"],
+)
+def test_dma_semiplanar_buffer_protocol_strided(fmt):
+    """Semi-planar DMA tensors expose the combined Y+UV plane as a 2-D
+    ``[rows, width]`` buffer at the physical pitch. Verify the pitch is the
+    outer stride and that per-row writes through the mapping round-trip
+    zero-copy (the chroma rows share the same padded pitch as luma)."""
+    w, h = 595, 438
+    t = _dma_image_or_skip(w, h, fmt)
+    assert t.row_stride > w and t.row_stride % 64 == 0
+
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.ndim == 2 and mv.shape[1] == w
+        assert mv.strides[0] == t.row_stride
+        rows = mv.shape[0]
+        for r in range(rows):
+            mv[r, 0] = r % 256  # per-row marker through the live mapping
+
+    with t.map() as m2:
+        a2 = np.asarray(memoryview(m2))
+        assert all(
+            int(a2[r, 0]) == r % 256 for r in range(a2.shape[0])
+        ), "per-row zero-copy round-trip failed on padded semi-planar buffer"
+
+
+def test_mem_tight_buffer_protocol_contiguous():
+    """A tight (non-padded) image tensor still exposes a plain C-contiguous
+    buffer — the strided exposure must only engage for padded backings."""
+    w, h, c = 600, 400, 3
+    t = Tensor.image(w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM)
+    assert t.row_stride == w * c, "Mem image must be tightly packed"
+    ref = (np.arange(h * w * c, dtype=np.uint8) % 251).reshape(h, w, c)
+    t.from_numpy(ref)
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.shape == (h, w, c)
+        assert mv.strides == (w * c, c, 1), "tight buffer must be C-contiguous"
+        assert np.array_equal(np.asarray(mv), ref)
+
+
 def test_enum_cmp():
     dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     assert dst.format == PixelFormat.Rgba
