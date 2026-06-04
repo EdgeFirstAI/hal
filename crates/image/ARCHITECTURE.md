@@ -465,6 +465,51 @@ For the full CUDA type model, `CudaHandle` variants (GlBuffer vs
 ExternalMem), and DMA-BUF import path, see
 [`crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping).
 
+### CUDA → TensorRT integration contract
+
+The supported zero-copy hand-off to a CUDA/TensorRT client is the **output**
+path: allocate the convert destination through `create_image()` (a GPU **PBO**),
+`convert()` into it, then `cuda_map()` and bind the device pointer:
+
+```text
+decode/import → src → convert(src → dst = create_image(PlanarRgb|Rgb, F16|F32))
+             → CudaMap m = dst.cuda_map()
+             → trt_context.setInputTensorAddress(name, m.device_ptr())
+             → enqueueV3(stream)
+```
+
+Contract the client must honour:
+
+- **Lifetime.** The destination tensor *and* the live `CudaMap` guard must
+  outlive every `enqueueV3` that reads the pointer. Drop the guard only after
+  the inference stream has synchronised (`cudaStreamSynchronize` or the
+  set-input-consumed event). Dropping it early returns the PBO to GL.
+- **Synchronisation.** `convert()` finishes its GL work before `cuda_map()`
+  returns, so the device buffer is ready when bound. The producer (HAL convert)
+  and the consumer (TRT) are otherwise on independent streams; the guarantee is
+  "convert complete → map → enqueue". Shared-stream / external-semaphore
+  pipelining is a future optimisation.
+- **Layout / alignment.** The output is tight (no row padding) NCHW planar F16
+  (`PlanarRgb`) or NHWC `Rgb` F32 — `CudaMap::len()` equals the logical byte
+  size. The device pointer is **256-byte aligned**, satisfying TensorRT's
+  `setInputTensorAddress` requirement.
+
+**Jetson (Orin) note.** Orin has no `/dev/dma_heap`, so semi-planar YUV sources
+have no GPU convert path (that needs a DMA-BUF EGLImage). The CPU JPEG decoder
+emits native **NV12 / NV16 / NV24 / GREY** into an `mmap`'d PBO; `convert()`
+runs on the **CPU** (colorimetry-correct) and writes the result into the
+CUDA-registered output PBO, which is then `cuda_map`'d — the zero-copy is the
+*output* to TensorRT, not the decode. This is exercised end-to-end per format by
+`gl::tests::jpeg_{nv12,nv16,nv24,grey}_convert_cuda_devptr` (verified on GTX 1080
+and Tegra Orin) and the C-API `cuda_devptr_roundtrip` test.
+
+**DMA-BUF → CUDA import (`cudaImportExternalMemory`, `ExternalMem`)** is a
+separate, **experimental** path used only when a tensor is *both* a self-owned
+DMA-BUF *and* on a CUDA device. NVIDIA documents `cudaImportExternalMemory` on a
+dma-buf/opaque fd as **unsupported on Tegra/Orin** (use the EGLImage interop
+instead); it is left in place for discrete-x86 experimentation but is **not** the
+Jetson path and is not part of the supported contract above.
+
 ### EGL image cache
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —

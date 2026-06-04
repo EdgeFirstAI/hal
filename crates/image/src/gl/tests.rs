@@ -4439,6 +4439,161 @@ mod gl_tests {
         // drop(cm) unmaps
     }
 
+    /// Full Jetson zero-copy OUTPUT flow, per native JPEG format:
+    ///   JPEG decode → NV12/NV16/NV24/GREY source (JFIF/BT.601-full tagged) →
+    ///   `convert()` → `Rgb` `F32` PBO output → `cuda_map()` →
+    ///   `cudaMemcpy(D2H)` → compare to a CPU `convert()` reference.
+    ///
+    /// Proves the device pointer a TensorRT client receives holds the
+    /// correctly-converted, colorimetry-correct pixels for every format the CPU
+    /// JPEG decoder emits — and that the JPEG→NVxx/GREY decode path itself works
+    /// end to end. On a Jetson (no `/dev/dma_heap`) the NV source has no GPU
+    /// path, so `convert()` runs on the CPU and writes into the CUDA-registered
+    /// output PBO; this test exercises exactly that CPU→PBO→CUDA hand-off.
+    #[cfg(target_os = "linux")]
+    fn jpeg_cuda_devptr_check(fixture: &str, expect_fmt: PixelFormat, w: usize, h: usize) {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+        use edgefirst_codec::{ImageDecoder, ImageLoad};
+        use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
+        use std::ffi::c_void;
+
+        if !edgefirst_tensor::is_cuda_available() {
+            eprintln!("SKIP {fixture}: no libcudart");
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP {fixture}: no GL");
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f32 {
+            eprintln!("SKIP {fixture}: no f32 render");
+            return;
+        }
+
+        // Decode JPEG into its native format; the decoder tags JFIF (BT.601
+        // full-range), which the CPU convert below must honour.
+        let mut src_t = Tensor::<u8>::image(w, h, expect_fmt, Some(TensorMemory::Mem)).unwrap();
+        let mut dec = ImageDecoder::new();
+        let info = src_t
+            .load_image(&mut dec, &edgefirst_bench::testdata::read(fixture))
+            .unwrap();
+        assert_eq!(info.format, expect_fmt, "{fixture}: native decode format");
+        assert_eq!(
+            src_t.colorimetry(),
+            Some(edgefirst_tensor::Colorimetry::jfif()),
+            "{fixture}: decoder must tag JFIF colorimetry"
+        );
+        let src = TensorDyn::from(src_t);
+
+        // CPU reference: convert into a tight Mem Rgb F32.
+        let mut ref_dst =
+            TensorDyn::image(w, h, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem)).unwrap();
+        proc.convert(
+            &src,
+            &mut ref_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap();
+        let ref_map = ref_dst.as_f32().unwrap().map().unwrap();
+        let ref_px = ref_map.as_slice();
+
+        // Rgb F32 PBO output → cuda_map (the buffer a TRT client binds).
+        let mut pbo_dst = proc
+            .create_image(w, h, PixelFormat::Rgb, DType::F32, None)
+            .unwrap();
+        if pbo_dst.memory() != TensorMemory::Pbo {
+            eprintln!("SKIP {fixture}: dst not PBO");
+            return;
+        }
+        proc.convert(
+            &src,
+            &mut pbo_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        )
+        .unwrap();
+        let cm = match pbo_dst.cuda_map() {
+            Some(cm) => cm,
+            None => {
+                eprintln!("SKIP {fixture}: cuda_map None (CUDA-GL interop unavailable)");
+                return;
+            }
+        };
+        assert!(!cm.device_ptr().is_null(), "{fixture}: null device_ptr");
+        assert_eq!(
+            cm.device_ptr() as usize % 256,
+            0,
+            "{fixture}: device_ptr must be 256-byte aligned for TensorRT"
+        );
+
+        let n = cm.len() / std::mem::size_of::<f32>();
+        let mut host = vec![0f32; n];
+        // SAFETY: `host` has `cm.len()` bytes; device_ptr is valid while `cm` lives.
+        assert!(
+            unsafe {
+                edgefirst_tensor::memcpy_device_to_host(
+                    host.as_mut_ptr() as *mut c_void,
+                    cm.device_ptr() as *const c_void,
+                    cm.len(),
+                )
+            },
+            "{fixture}: cudaMemcpy device->host failed"
+        );
+
+        // Stride-aware compare: the device buffer carries the PBO's row pitch
+        // (`effective_row_stride`), the Mem reference is tight.
+        let dev_stride_elems =
+            pbo_dst.effective_row_stride().unwrap_or(w * 3 * 4) / std::mem::size_of::<f32>();
+        let mut max_err = 0f32;
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    let got = host[y * dev_stride_elems + x * 3 + c];
+                    let exp = ref_px[(y * w + x) * 3 + c];
+                    max_err = max_err.max((got - exp).abs());
+                }
+            }
+        }
+        eprintln!("jpeg_cuda_devptr {fixture} ({expect_fmt:?}): max_err={max_err}");
+        assert!(
+            max_err < 1e-3,
+            "{fixture}: cuda_map device buffer != CPU reference (max_err={max_err})"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn jpeg_nv12_convert_cuda_devptr() {
+        jpeg_cuda_devptr_check("zidane.jpg", PixelFormat::Nv12, 1280, 720);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn jpeg_nv16_convert_cuda_devptr() {
+        jpeg_cuda_devptr_check("zidane_422.jpg", PixelFormat::Nv16, 1280, 720);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn jpeg_nv24_convert_cuda_devptr() {
+        jpeg_cuda_devptr_check("zidane_444.jpg", PixelFormat::Nv24, 1280, 720);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn jpeg_grey_convert_cuda_devptr() {
+        jpeg_cuda_devptr_check("grey.jpg", PixelFormat::Grey, 1024, 681);
+    }
+
     // =========================================================================
     // Path B: NV16/NV24 → RGBA GPU round-trip tests
     //

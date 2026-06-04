@@ -329,6 +329,67 @@ static void test_image_processor_convert_invalid(void) {
     TEST_PASS();
 }
 
+// Zero-copy CUDA output path through the C API: convert() into a GPU PBO
+// destination, then hal_tensor_cuda_map() -> hal_tensor_cuda_device_ptr() ->
+// hal_tensor_cuda_unmap(). Mirrors the Rust convert_f32_pbo_cuda_map tests; the
+// device pointer is what a TensorRT client binds via setInputTensorAddress.
+// Skips cleanly when CUDA / GL / a PBO allocation is unavailable.
+static void test_cuda_devptr_roundtrip(void) {
+    TEST("cuda_devptr_roundtrip");
+
+    if (!hal_is_cuda_available()) {
+        TEST_SKIP("CUDA not available (libcudart not loaded)");
+        return;
+    }
+    struct hal_image_processor* proc =
+        hal_image_processor_new_with_backend(HAL_COMPUTE_BACKEND_OPENGL);
+    if (proc == NULL) {
+        TEST_SKIP("No OpenGL backend");
+        return;
+    }
+
+    const size_t w = 64, h = 64;
+    struct hal_tensor* src =
+        hal_tensor_new_image(w, h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(src);
+    // create_image selects the optimal memory (a GPU PBO on the GL backend),
+    // which is what makes the destination CUDA-mappable.
+    struct hal_tensor* dst =
+        hal_image_processor_create_image(proc, w, h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_F32);
+    ASSERT_NOT_NULL(dst);
+    if (hal_tensor_memory_type(dst) != HAL_TENSOR_MEMORY_PBO) {
+        TEST_SKIP("dst not a PBO (no CUDA-GL allocation on this host)");
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        hal_image_processor_free(proc);
+        return;
+    }
+
+    int rc = hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
+    ASSERT_EQ(0, rc);
+
+    void* map = hal_tensor_cuda_map(dst);
+    if (map == NULL) {
+        TEST_SKIP("cuda_map returned NULL (CUDA-GL interop unavailable for this context)");
+        hal_tensor_free(src);
+        hal_tensor_free(dst);
+        hal_image_processor_free(proc);
+        return;
+    }
+    size_t sz = 0;
+    void* dptr = hal_tensor_cuda_device_ptr(map, &sz);
+    ASSERT_NOT_NULL(dptr);
+    // [H,W,3] f32 device buffer; 256-byte aligned for TensorRT input pointers.
+    ASSERT_EQ(w * h * 3 * sizeof(float), sz);
+    ASSERT_EQ((size_t)0, ((size_t)dptr) % 256);
+
+    hal_tensor_cuda_unmap(map);
+    hal_tensor_free(src);
+    hal_tensor_free(dst);
+    hal_image_processor_free(proc);
+    TEST_PASS();
+}
+
 // =============================================================================
 // DMA Image Tests (Linux/on-target specific)
 // =============================================================================
@@ -664,6 +725,7 @@ void run_image_tests(void) {
     test_image_processor_convert_scale();
     test_image_processor_convert_with_rotation();
     test_image_processor_convert_invalid();
+    test_cuda_devptr_roundtrip();
 
     // DMA tests
     test_tensor_image_dma();

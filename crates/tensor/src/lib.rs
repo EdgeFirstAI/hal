@@ -2719,13 +2719,18 @@ where
         //   * Self-allocated DMA tensors (Linux) — pitch padding from
         //     `image_with_stride()`; checked against the DMA-BUF `buf_size`.
         //
+        //   * Self-allocated PBO tensors (any platform with GL) — the GL buffer
+        //     is sized by `capacity_bytes()` and may carry 64-byte row padding;
+        //     the JPEG decoder mmaps it and convert() reads it, both iterating
+        //     by `row_stride`. Checked against the PBO capacity below.
+        //
         // Foreign DMA-BUFs (`from_fd()` + `set_row_stride()`, the V4L2 /
-        // GStreamer case), IOSurface, and PBO storages are rejected: their
-        // layout comes from an external allocator / GPU driver the HAL cannot
-        // validate for a strided CPU view, and they are intended for the GPU
-        // path. (Earlier this rejected *all* non-Linux strided maps with
-        // "DMA backing is Linux-only" — that was an unimplemented path, not a
-        // platform limit; HAL-owned Mem/Shm are trivially mappable and now are.)
+        // GStreamer case) and IOSurface are rejected: their layout comes from an
+        // external allocator / GPU driver the HAL cannot validate for a strided
+        // CPU view, and they are intended for the GPU path. (Earlier this
+        // rejected *all* non-Linux strided maps with "DMA backing is Linux-only"
+        // — that was an unimplemented path, not a platform limit; HAL-owned
+        // Mem/Shm/PBO are trivially mappable and now are.)
         if let Some(stride) = self.row_stride {
             // Rows sit at `stride`-byte spacing; the first shape dim is the row
             // count for packed `[H, W, C]` and semi-planar `[H*k, W]` alike.
@@ -2795,10 +2800,12 @@ where
                     return io.map_with_byte_size(total_bytes);
                 }
                 TensorStorage::Pbo(pbo) => {
-                    // PBO: the GPU-side allocation may have a padded stride; the
-                    // map() call maps the full `handle.size` bytes and the caller
-                    // iterates rows via row_stride.  Validate that the strided
-                    // view fits the PBO capacity before mapping.
+                    // PBO: the GPU-side allocation may have a padded row stride
+                    // (e.g. 64-byte aligned). Expose the full padded buffer so a
+                    // CPU producer (JPEG decoder) and a strided convert source
+                    // can iterate rows via `effective_row_stride()` without
+                    // running past the slice — the logical `pbo.map()` view would
+                    // stop after `shape.product()` and lose bytes past row 0.
                     let capacity = pbo.capacity_bytes();
                     if total_bytes > capacity {
                         return Err(Error::InsufficientCapacity {
@@ -2806,7 +2813,7 @@ where
                             capacity,
                         });
                     }
-                    return pbo.map();
+                    return pbo.map_with_byte_size(total_bytes);
                 }
                 // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
                 // is guarded `if !dma.is_imported`). On macOS/Windows every

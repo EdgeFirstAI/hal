@@ -2477,8 +2477,22 @@ impl GLProcessorST {
                 }
             }
 
+            // Honour a padded source row stride: a PBO written by the CPU JPEG
+            // decoder (or any producer) may have 64-byte-aligned rows, so the
+            // bytes between logical rows must be skipped on upload. Mirror the
+            // non-PBO `draw_src_texture` path (GL_UNPACK_ROW_LENGTH in pixels);
+            // 0 means "tightly packed = src_w". Without this a padded PBO source
+            // shears on every row after the first.
+            let src_bpp = src_fmt.channels();
+            let row_len_px = src
+                .effective_row_stride()
+                .map(|s| s / src_bpp)
+                .filter(|&px| px != src_w)
+                .unwrap_or(0);
+
             // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
             gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
             gls::gl::TexImage2D(
                 texture_target,
                 0,
@@ -2490,6 +2504,7 @@ impl GLProcessorST {
                 gls::gl::UNSIGNED_BYTE,
                 std::ptr::null(), // NULL = read from bound UNPACK buffer
             );
+            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
             gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
 
             // Force texture cache state to be rebuilt next call

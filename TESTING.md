@@ -641,14 +641,40 @@ Run these on any host (no CUDA hardware required):
 cargo test -p edgefirst-tensor -- --test-threads=1
 ```
 
+### Device-pointer correctness tests (CUDA host — incl. dev PC)
+
+These exercise the real zero-copy output path end to end:
+`convert()` → `cuda_map()` → `cudaMemcpy(D2H)` → bit-compare to a CPU reference.
+They run on any CUDA-capable host and **skip cleanly** when `libcudart`, GL, or a
+PBO allocation is unavailable, so they are *not* part of `make test`.
+
+| Test (`crates/image`) | Covers |
+|------------------------|--------|
+| `gl::tests::convert_f32_pbo_cuda_map_{roundtrip,numeric}` | RGBA→Rgb F32 PBO → device ptr; 256-byte alignment; numeric match |
+| `gl::tests::jpeg_{nv12,nv16,nv24,grey}_convert_cuda_devptr` | full Jetson flow per native format: JPEG decode → NVxx/GREY → convert → PBO → `cuda_map` (colorimetry-correct) |
+| C-API `cuda_devptr_roundtrip` (`crates/capi/tests`) | `hal_tensor_cuda_map` → `hal_tensor_cuda_device_ptr` → `hal_tensor_cuda_unmap` |
+
+A **dev PC** typically has only the NVIDIA driver (no CUDA toolkit). Install the
+runtime into the local venv and run via the Makefile, which points the HAL's
+`libcudart` dlopen at it:
+
+```bash
+. venv/bin/activate
+pip install nvidia-cuda-runtime-cu12   # provides libcudart.so.12
+make test-cuda                         # sets LD_LIBRARY_PATH → runs the cuda tests
+```
+
+On Jetson/Orin `libcudart` is already on the system path, so `make test-cuda`
+(or the cross-built binary) finds it directly — the venv lookup is skipped.
+
 ### On-target validation
 
 Full-pipeline validation was performed on:
 
 | Platform | OS / CUDA / TensorRT | What was validated |
 |----------|----------------------|--------------------|
-| Jetson Orin-nano (O5/O6/O8) | L4T R36.4 / CUDA 12.6 / TRT 10.3 | DMA-import path, TRT `enqueue_v3`, GL-render→CUDA bridge; numeric max\_err 0.00024 vs CPU reference |
-| Desktop RTX 3090 | CUDA 12.6 | PBO→CUDA path (GL host + CUDA device) |
+| Jetson Orin-nano | L4T R36.4 / CUDA 12.6 / TRT 10.3 | PBO→CUDA output path; `convert→cuda_map→cudaMemcpy` device-ptr correctness, all native JPEG formats (NV12/NV16/NV24/GREY) `max_err=0` (CPU-into-PBO), synthetic GL-render path `max_err=2.4e-4`; device ptr 256-byte aligned. No `/dev/dma_heap` → PBO transfers. |
+| Desktop GTX 1080 | CUDA 12.9 (runtime via pip) | Same device-ptr suite `max_err=0`; C-API `cuda_devptr_roundtrip` |
 
 To run the on-target CUDA tests manually:
 
