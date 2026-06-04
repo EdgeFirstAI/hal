@@ -202,7 +202,13 @@ void main() {
     float u = fetch_r(cb);
     float v = fetch_r(cb + 1);
 
-    float yp = (yv - y_offset) * y_scale;
+    // Floor the expanded luma at 0, matching the CPU `yuv` crate's saturating
+    // `(Y - 16)` term: limited-range footroom (Y<16) folds to 0 instead of
+    // going negative. The top end is intentionally NOT capped here — the crate
+    // lets headroom (Y>235) exceed 1.0 and relies on the final per-channel RGB
+    // clamp below, so the GPU must do the same to agree bit-for-bit. No-op for
+    // full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
     float r = clamp(yp + c_vr * vp, 0.0, 1.0);

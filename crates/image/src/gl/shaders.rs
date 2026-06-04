@@ -811,7 +811,11 @@ void main() {
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
 
-    float yp = (yv - y_offset) * y_scale;
+    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
+    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
+    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
+    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
     float r = clamp(yp + c_vr * vp, 0.0, 1.0);
@@ -871,7 +875,11 @@ void main() {
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
 
-    float yp = (yv - y_offset) * y_scale;
+    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
+    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
+    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
+    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
     float r = clamp(yp + c_vr * vp, 0.0, 1.0);
