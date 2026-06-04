@@ -288,7 +288,7 @@ test-cuda:
 		echo "  using venv libcudart at $$CUDART_LIB"; \
 	fi; \
 	LD_LIBRARY_PATH="$$CUDART_LIB:$$LD_LIBRARY_PATH" \
-		cargo test --features opengl -p edgefirst-image --lib cuda_map -- --nocapture
+		cargo test --features opengl -p edgefirst-image --lib cuda -- --nocapture
 	@echo "✓ CUDA device-pointer tests complete"
 
 .PHONY: bench
