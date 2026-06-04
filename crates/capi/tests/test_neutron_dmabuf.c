@@ -122,7 +122,7 @@ static int test_convert(int neutron_fd, size_t offset,
         hal_plane_descriptor_set_offset(pd, offset);
 
     struct hal_tensor *dst = hal_import_image(proc, pd, NULL,
-        dst_w, dst_h, dst_fmt, dst_dtype);
+        dst_w, dst_h, dst_fmt, dst_dtype, NULL);
     if (!dst) {
         fprintf(stderr, "FAIL (import errno=%d: %s)\n", errno, strerror(errno));
         hal_tensor_free(src);

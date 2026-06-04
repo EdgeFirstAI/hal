@@ -709,6 +709,53 @@ def test_cuda_map_falls_back_to_map():
         assert len(host) == 16  # 4 * 4
 
 
+def test_colorimetry_roundtrip():
+    """Colorimetry set/get on a tensor is faithful and defaults to None."""
+    import edgefirst_hal as hal
+
+    t = Tensor.image(1280, 720, PixelFormat.Nv12)
+    assert t.colorimetry is None
+
+    # V4L2: colorspace=REC709(3), xfer=709(1), ycbcr_enc=709(2), quant=FULL(1)
+    c = hal.Colorimetry.from_v4l2(3, 1, 2, 1)
+    assert c.encoding == hal.ColorEncoding.Bt709
+    assert c.range == hal.ColorRange.Full
+    assert c.space == hal.ColorSpace.Bt709
+    assert c.transfer == hal.ColorTransfer.Bt709
+
+    t.colorimetry = c
+    got = t.colorimetry
+    assert got is not None
+    assert got.encoding == hal.ColorEncoding.Bt709
+    assert got.range == hal.ColorRange.Full
+
+    # Clearing roundtrips back to None.
+    t.colorimetry = None
+    assert t.colorimetry is None
+
+
+def test_colorimetry_construct_and_repr():
+    """Colorimetry is constructible with optional kwargs (default None)."""
+    import edgefirst_hal as hal
+
+    empty = hal.Colorimetry()
+    assert empty.space is None
+    assert empty.transfer is None
+    assert empty.encoding is None
+    assert empty.range is None
+
+    c = hal.Colorimetry(
+        space=hal.ColorSpace.Bt2020,
+        encoding=hal.ColorEncoding.Bt2020,
+        range=hal.ColorRange.Limited,
+    )
+    assert c.space == hal.ColorSpace.Bt2020
+    assert c.transfer is None
+    assert c.encoding == hal.ColorEncoding.Bt2020
+    assert c.range == hal.ColorRange.Limited
+    assert "Colorimetry" in repr(c)
+
+
 # ---------------------------------------------------------------------------
 # subview tests (zero-copy sub-region views with full numpy/buffer-protocol)
 # ---------------------------------------------------------------------------

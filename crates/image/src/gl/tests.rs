@@ -1776,6 +1776,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
         assert!(src.is_multiplane(), "must be multiplane after import");
@@ -2208,7 +2209,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         // Source: NV12 camera frame
@@ -2308,7 +2317,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(0);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst_imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
         gl.convert(
             &src_dyn,
@@ -2357,7 +2374,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgb, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgb,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         // Source: NV12 camera frame
@@ -2457,7 +2482,7 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let src = load_raw_image(
@@ -2541,7 +2566,7 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let proc = crate::ImageProcessor::new().unwrap();
         let mut dst_rgba = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgba, DType::U8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgba, DType::U8, None)
             .unwrap();
 
         let mut gl = GLProcessorThreaded::new(None).unwrap();
@@ -2574,7 +2599,7 @@ mod gl_tests {
         let fd = rgb_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_rgb = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let rgb_result = gl.convert(
@@ -2644,7 +2669,7 @@ mod gl_tests {
         let fd = u8_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_u8 = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::U8, None)
             .unwrap();
 
         let u8_result = gl.convert(
@@ -2676,7 +2701,7 @@ mod gl_tests {
         let fd = i8_buf.as_dma().unwrap().fd.as_fd();
         let plane = PlaneDescriptor::new(fd).unwrap().with_offset(offset);
         let mut dst_i8 = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let i8_result = gl.convert(
@@ -2749,7 +2774,7 @@ mod gl_tests {
             .unwrap()
             .with_offset(page_aligned_offset);
         let mut dst_aligned = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let aligned_result = gl.convert(
@@ -2784,7 +2809,7 @@ mod gl_tests {
             .unwrap()
             .with_offset(neutron_offset);
         let mut dst_unaligned = proc
-            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8)
+            .import_image(plane, None, 640, 640, PixelFormat::Rgb, DType::I8, None)
             .unwrap();
 
         let unaligned_result = gl.convert(
@@ -2844,7 +2869,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         assert_eq!(imported.width(), Some(width));
@@ -2895,7 +2928,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let imported = proc
-            .import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+            )
             .unwrap();
 
         assert_eq!(imported.width(), Some(width));
@@ -2959,6 +3000,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
 
@@ -3030,6 +3072,7 @@ mod gl_tests {
                 height,
                 PixelFormat::Nv12,
                 DType::U8,
+                None,
             )
             .unwrap();
         assert!(src.is_multiplane(), "must be multiplane after import");
@@ -3139,7 +3182,15 @@ mod gl_tests {
 
         let proc = crate::ImageProcessor::new().unwrap();
         let src = proc
-            .import_image(plane, None, width, height, PixelFormat::Nv12, DType::U8)
+            .import_image(
+                plane,
+                None,
+                width,
+                height,
+                PixelFormat::Nv12,
+                DType::U8,
+                None,
+            )
             .unwrap();
         assert!(
             !src.is_multiplane(),
@@ -3234,7 +3285,15 @@ mod gl_tests {
         let plane = PlaneDescriptor::new(fd).unwrap().with_stride(bad_stride);
 
         let proc = crate::ImageProcessor::new().unwrap();
-        let result = proc.import_image(plane, None, width, height, PixelFormat::Rgba, DType::U8);
+        let result = proc.import_image(
+            plane,
+            None,
+            width,
+            height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+        );
 
         assert!(
             result.is_err(),
@@ -4450,7 +4509,7 @@ mod gl_tests {
         let (yv, cb, cr) = (100u8, 150u8, 80u8);
         let expected = yuv601_to_rgb(yv, cb, cr);
 
-        let src = load_raw_image(
+        let mut src = load_raw_image(
             w,
             h,
             PixelFormat::Nv16,
@@ -4458,6 +4517,13 @@ mod gl_tests {
             &make_nv16_solid(w, h, yv, cb, cr),
         )
         .unwrap();
+        // `yuv601_to_rgb` is the full-range BT.601 reference, so tag the source
+        // full-range; otherwise the heuristic resolves untagged → limited.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
 
         let mut dst =
             TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
@@ -4519,7 +4585,7 @@ mod gl_tests {
         let (yv, cb, cr) = (180u8, 90u8, 200u8);
         let expected = yuv601_to_rgb(yv, cb, cr);
 
-        let src = load_raw_image(
+        let mut src = load_raw_image(
             w,
             h,
             PixelFormat::Nv24,
@@ -4527,6 +4593,12 @@ mod gl_tests {
             &make_nv24_solid(w, h, yv, cb, cr),
         )
         .unwrap();
+        // Full-range source to match the full-range `yuv601_to_rgb` reference.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
 
         let mut dst =
             TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
@@ -4807,10 +4879,17 @@ mod gl_tests {
             nv16[w * h + 2 * i + 1] = 150; // Cr
         }
 
-        let src_dma =
+        let mut src_dma =
             load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Dma), &nv16).unwrap();
-        let src_mem =
+        let mut src_mem =
             load_raw_image(w, h, PixelFormat::Nv16, Some(TensorMemory::Mem), &nv16).unwrap();
+        // Tag both BT.601 full-range so GPU and CPU resolve the same colorimetry
+        // (this test isolates the int8 bias path, not the matrix/range).
+        let cm = edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full);
+        src_dma.set_colorimetry(Some(cm));
+        src_mem.set_colorimetry(Some(cm));
 
         // CPU reference, int8 RGB.
         let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgb, DType::I8, None).unwrap();
@@ -4946,10 +5025,20 @@ mod gl_tests {
     /// one `Mem` (for the CPU reference).  Returns `(dma_src, mem_src)`.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn make_patterned_nv_pair(w: usize, h: usize, fmt: PixelFormat) -> (TensorDyn, TensorDyn) {
-        let dma = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma)).unwrap();
-        let mem = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut dma = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut mem = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
         fill_patterned_nv(&dma);
         fill_patterned_nv(&mem);
+        // Tag both sources BT.601 full-range so the GPU (shader) and CPU
+        // (`yuv` crate) sides resolve the SAME colorimetry — these GPU-vs-CPU
+        // comparisons must isolate the *path*, not the matrix/range. (Untagged,
+        // the heuristic picks limited range, whose ×1.164 luma gain amplifies
+        // the known odd-width chroma-edge delta past the ±4 tolerance.)
+        let cm = edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full);
+        dma.set_colorimetry(Some(cm));
+        mem.set_colorimetry(Some(cm));
         (dma, mem)
     }
 

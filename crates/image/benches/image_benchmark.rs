@@ -601,7 +601,7 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
             // Pre-flight: verify import_image works with this configuration.
             let fd = src_tensor.dmabuf().expect("dmabuf fd");
             let pd = PlaneDescriptor::new(fd).expect("PlaneDescriptor");
-            if let Err(e) = proc.import_image(pd, None, w, h, fmt, DType::U8) {
+            if let Err(e) = proc.import_image(pd, None, w, h, fmt, DType::U8, None) {
                 println!("  {:50} [unsupported: {}]", name, e);
                 continue;
             }
@@ -616,7 +616,7 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
                 let fd = src_tensor.dmabuf().expect("dmabuf fd");
                 let pd = PlaneDescriptor::new(fd).expect("PlaneDescriptor");
                 let img = proc
-                    .import_image(pd, None, w, h, fmt, DType::U8)
+                    .import_image(pd, None, w, h, fmt, DType::U8, None)
                     .expect("import_image failed");
                 std::hint::black_box(img);
             });

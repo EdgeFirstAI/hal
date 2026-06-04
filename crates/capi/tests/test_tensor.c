@@ -513,6 +513,61 @@ static void test_cuda_availability_and_fallback(void) {
 }
 
 // =============================================================================
+// Colorimetry Tests
+// =============================================================================
+
+static void test_tensor_colorimetry_roundtrip(void) {
+    TEST("tensor_colorimetry_roundtrip");
+    struct hal_tensor* t = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(t);
+    struct hal_colorimetry c;
+    ASSERT_EQ(0, hal_colorimetry_from_v4l2(3, 1, 2, 1, &c)); // REC709, XFER709, ENC709, FULL
+    ASSERT_EQ(2, c.encoding); // bt709
+    ASSERT_EQ(1, c.range);    // full
+    hal_tensor_set_colorimetry(t, &c);
+    struct hal_colorimetry got;
+    ASSERT_EQ(0, hal_tensor_colorimetry(t, &got));
+    ASSERT_EQ(c.encoding, got.encoding);
+    ASSERT_EQ(c.range, got.range);
+    ASSERT_EQ(c.space, got.space);
+    ASSERT_EQ(c.transfer, got.transfer);
+    hal_tensor_free(t);
+    TEST_PASS();
+}
+
+static void test_tensor_colorimetry_clear_and_unset(void) {
+    TEST("tensor_colorimetry_clear_and_unset");
+    struct hal_tensor* t = hal_tensor_new_image(64, 64, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    ASSERT_NOT_NULL(t);
+
+    // Freshly created tensor has no colorimetry: all axes read back as 0.
+    struct hal_colorimetry got;
+    ASSERT_EQ(0, hal_tensor_colorimetry(t, &got));
+    ASSERT_EQ(0, got.space);
+    ASSERT_EQ(0, got.transfer);
+    ASSERT_EQ(0, got.encoding);
+    ASSERT_EQ(0, got.range);
+
+    // Set something, then clear with NULL.
+    struct hal_colorimetry c = {1, 1, 1, 1};
+    hal_tensor_set_colorimetry(t, &c);
+    ASSERT_EQ(0, hal_tensor_colorimetry(t, &got));
+    ASSERT_EQ(1, got.space);
+    hal_tensor_set_colorimetry(t, NULL);
+    ASSERT_EQ(0, hal_tensor_colorimetry(t, &got));
+    ASSERT_EQ(0, got.space);
+    ASSERT_EQ(0, got.range);
+
+    // NULL-arg error handling.
+    ASSERT_EQ(-1, hal_tensor_colorimetry(NULL, &got));
+    ASSERT_EQ(-1, hal_tensor_colorimetry(t, NULL));
+    ASSERT_EQ(-1, hal_colorimetry_from_v4l2(3, 1, 2, 1, NULL));
+
+    hal_tensor_free(t);
+    TEST_PASS();
+}
+
+// =============================================================================
 // Main Test Runner
 // =============================================================================
 
@@ -547,6 +602,10 @@ void run_tensor_tests(void) {
 
     // CUDA capability query and try-cuda_map / fallback pattern
     test_cuda_availability_and_fallback();
+
+    // Colorimetry tests
+    test_tensor_colorimetry_roundtrip();
+    test_tensor_colorimetry_clear_and_unset();
 }
 
 #ifdef TEST_TENSOR_STANDALONE

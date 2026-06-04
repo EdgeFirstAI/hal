@@ -8,23 +8,157 @@ use rayon::iter::{
 };
 use std::ops::Shr;
 
-use super::CPUProcessor;
+use super::{CPUProcessor, ColorParams};
 
-// INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md "Colorimetry").
-// The HAL currently hardcodes BT.601 **full-range** for all YUV. Under that
-// assumption the luma plane and a Grey image share the same full 0..=255 range,
-// so the limited↔full luma remap is the identity. These helpers are kept as
-// no-ops (rather than deleting the ~9 call sites) so the proper per-source
-// colorimetry work on the `feature/colorimetry` branch can restore real range
-// handling in one place. When that lands, these become real conversions again.
 #[inline(always)]
 pub(super) fn limit_to_full(l: u8) -> u8 {
-    l
+    // Expand limited-range luma (16..=235, a 219-step swing) to full-range
+    // (0..=255). Luma uses the 219 swing, NOT the 224 chroma swing — this must
+    // match `colorimetry::yuv_to_rgb_coeffs` (255/219). Real decoded YUV (e.g.
+    // JPEG → NV12) can carry luma below 16 or above 235, so clamp into the valid
+    // limited range first to avoid u16 underflow on the `l - 16` term (and keep
+    // the result within 0..=255).
+    let l = (l as u16).clamp(16, 235);
+    (((l - 16) * 255 + (235 - 16) / 2) / (235 - 16)) as u8
 }
 
 #[inline(always)]
 pub(super) fn full_to_limit(l: u8) -> u8 {
-    l
+    // Compress full-range luma (0..=255) into limited-range luma (16..=235,
+    // the 219-step swing — luma max is 235, not the 240 chroma max).
+    ((l as u16 * (235 - 16) + 255 / 2) / 255 + 16) as u8
+}
+
+/// Select the luma-decode mapping for grey/luma extraction. Limited-range
+/// sources expand 16..=235 → 0..=255; full-range sources copy the byte as-is
+/// (the luma channel is already the grey value).
+#[inline(always)]
+fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
+    if full_range {
+        |l| l
+    } else {
+        limit_to_full
+    }
+}
+
+/// Select the luma-encode mapping for grey→YUV. Full-range destinations keep
+/// the grey value as Y directly; limited-range destinations compress it into
+/// 16..=235.
+#[inline(always)]
+fn luma_encoder(full_range: bool) -> fn(u8) -> u8 {
+    if full_range {
+        |l| l
+    } else {
+        full_to_limit
+    }
+}
+
+/// Fixed-point RGB→YUV coefficient table for the hand-rolled YUYV encoders,
+/// resolved from the destination tensor's matrix + range. All terms are
+/// `Q(BIAS)` fixed-point; `y_off`/`c_off` are the post-shift integer offsets.
+struct YuyvEncodeCoeffs {
+    y_r: i32,
+    y_g: i32,
+    y_b: i32,
+    u_r: i32,
+    u_g: i32,
+    u_b: i32,
+    v_r: i32,
+    v_g: i32,
+    v_b: i32,
+    y_off: i32,
+    c_off: i32,
+}
+
+impl YuyvEncodeCoeffs {
+    /// `BIAS` matches the original hand-rolled tables (Q20 fixed point).
+    const BIAS: i32 = 20;
+    const ROUND: i32 = 1 << (Self::BIAS - 1);
+    const ROUND2: i32 = 1 << Self::BIAS;
+
+    /// Build the table from the resolved `ColorParams`. The luma/chroma swings
+    /// are full-range (255/255) or limited-range (219/224) per `cp.range`; the
+    /// `KR`/`KB` luma weights come from `cp.matrix` (BT.601 / 709 / 2020).
+    fn from_params(cp: ColorParams) -> Self {
+        // KR/KB luma weights per standard matrix.
+        let (kr, kb) = match cp.matrix {
+            yuv::YuvStandardMatrix::Bt601 => (0.299_f64, 0.114_f64),
+            yuv::YuvStandardMatrix::Bt2020 => (0.2627_f64, 0.0593_f64),
+            // BT.709 and any future/unknown matrix default to 709 weights.
+            _ => (0.2126_f64, 0.0722_f64),
+        };
+        let kg = 1.0 - kr - kb;
+        let full = matches!(cp.range, yuv::YuvRange::Full);
+        // Luma swing / chroma swing and offsets for the selected range.
+        let (y_swing, c_swing, y_off, c_off) = if full {
+            (255.0_f64, 255.0_f64, 0, 128)
+        } else {
+            (219.0_f64, 224.0_f64, 16, 128)
+        };
+        let b = Self::BIAS;
+        let yscale = (1_i64 << b) as f64 * y_swing / 255.0;
+        let cscale = (1_i64 << b) as f64 * c_swing / 255.0;
+        Self {
+            y_r: (kr * yscale).round() as i32,
+            y_g: (kg * yscale).round() as i32,
+            y_b: (kb * yscale).round() as i32,
+            u_r: (-kr / (kr + kg) / 2.0 * cscale).round() as i32,
+            u_g: (-kg / (kr + kg) / 2.0 * cscale).round() as i32,
+            u_b: (0.5 * cscale).ceil() as i32,
+            v_r: (0.5 * cscale).ceil() as i32,
+            v_g: (-kg / (kg + kb) / 2.0 * cscale).round() as i32,
+            v_b: (-kb / (kg + kb) / 2.0 * cscale).round() as i32,
+            y_off,
+            c_off,
+        }
+    }
+
+    /// Encode two adjacent RGB pixels into a YUYV macropixel `[Y0,U,Y1,V]`,
+    /// matching the original subsampled-chroma averaging.
+    #[inline(always)]
+    fn encode_pair(&self, p0: [i32; 3], p1: [i32; 3]) -> [u8; 4] {
+        let [r0, g0, b0] = p0;
+        let [r1, g1, b1] = p1;
+        let b = Self::BIAS;
+        let y0 = ((self.y_r * r0 + self.y_g * g0 + self.y_b * b0 + Self::ROUND).shr(b) + self.y_off)
+            as u8;
+        let y1 = ((self.y_r * r1 + self.y_g * g1 + self.y_b * b1 + Self::ROUND).shr(b) + self.y_off)
+            as u8;
+        let u = ((self.u_r * r0
+            + self.u_g * g0
+            + self.u_b * b0
+            + self.u_r * r1
+            + self.u_g * g1
+            + self.u_b * b1
+            + Self::ROUND2)
+            .shr(b + 1)
+            + self.c_off) as u8;
+        let v = ((self.v_r * r0
+            + self.v_g * g0
+            + self.v_b * b0
+            + self.v_r * r1
+            + self.v_g * g1
+            + self.v_b * b1
+            + Self::ROUND2)
+            .shr(b + 1)
+            + self.c_off) as u8;
+        [y0, u, y1, v]
+    }
+
+    /// Encode a single RGB pixel into `[Y, U, Y, V]` (no chroma subsampling) —
+    /// used for solid fill colors.
+    #[inline(always)]
+    fn encode_single(&self, rgb: [i32; 3]) -> [u8; 4] {
+        let [r, g, b] = rgb;
+        let bias = Self::BIAS;
+        let y = (((self.y_r * r + self.y_g * g + self.y_b * b + Self::ROUND) >> bias) + self.y_off)
+            as u8;
+        let u = (((self.u_r * r + self.u_g * g + self.u_b * b + Self::ROUND) >> bias) + self.c_off)
+            as u8;
+        let v = (((self.v_r * r + self.v_g * g + self.v_b * b + Self::ROUND) >> bias) + self.c_off)
+            as u8;
+        [y, u, y, v]
+    }
 }
 
 /// Scatter a packed `src_ch`-channel image into single-channel destination
@@ -77,7 +211,11 @@ fn pack_to_planar(
 }
 
 impl CPUProcessor {
-    pub(super) fn convert_nv12_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv12_to_rgb(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         if src.is_multiplane() {
@@ -102,6 +240,7 @@ impl CPUProcessor {
                 y_stride,
                 uv_stride,
                 dst,
+                cp,
             )
         } else {
             // Contiguous NV12: `src_h` luma rows then `ceil(src_h/2)` chroma
@@ -117,7 +256,7 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
+            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst, cp)
         }
     }
 
@@ -130,6 +269,7 @@ impl CPUProcessor {
         y_stride: usize,
         uv_stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -144,8 +284,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -153,7 +293,11 @@ impl CPUProcessor {
     // NOTE: The `*_to_rgba` helpers below all accept BGRA destinations.
     // They always write pixels in RGBA channel order; for BGRA destinations the
     // caller applies an R<->B swizzle afterwards via `swizzle_rb_4chan`.
-    pub(super) fn convert_nv12_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv12_to_rgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         if src.is_multiplane() {
@@ -175,6 +319,7 @@ impl CPUProcessor {
                 y_stride,
                 uv_stride,
                 dst,
+                cp,
             )
         } else {
             let map = src.map()?;
@@ -187,7 +332,7 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
+            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst, cp)
         }
     }
 
@@ -200,6 +345,7 @@ impl CPUProcessor {
         y_stride: usize,
         uv_stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -214,13 +360,17 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
 
-    pub(super) fn convert_nv12_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv12_to_grey(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         // NV12→GREY drops chroma and copies the luma plane (the first `src_h`
         // rows). Honour the source row stride so padded buffers and odd widths
         // are handled correctly, and the destination grey stride so we write a
@@ -229,6 +379,9 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
+
+        // Full-range luma is copied directly; limited-range luma is expanded.
+        let luma = luma_mapper(cp.src_full_range);
 
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
@@ -241,17 +394,21 @@ impl CPUProcessor {
             let (s_chunks, s_rem) = s.as_chunks::<8>();
             let (d_chunks, d_rem) = d.as_chunks_mut::<8>();
             for (sc, dc) in s_chunks.iter().zip(d_chunks) {
-                sc.iter().zip(dc).for_each(|(s, d)| *d = limit_to_full(*s));
+                sc.iter().zip(dc).for_each(|(s, d)| *d = luma(*s));
             }
             for (s, d) in s_rem.iter().zip(d_rem) {
-                *d = limit_to_full(*s);
+                *d = luma(*s);
             }
         }
 
         Ok(())
     }
 
-    pub(super) fn convert_yuyv_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_yuyv_to_rgb(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
@@ -267,12 +424,16 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             dst_w as u32 * 3,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
         )?)
     }
 
-    pub(super) fn convert_yuyv_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_yuyv_to_rgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
@@ -287,12 +448,16 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
         )?)
     }
 
-    pub(super) fn convert_yuyv_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_yuyv_to_8bps(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let mut tmp = Tensor::<u8>::image(
@@ -301,11 +466,15 @@ impl CPUProcessor {
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?;
-        Self::convert_yuyv_to_rgb(src, &mut tmp)?;
+        Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
     }
 
-    pub(super) fn convert_yuyv_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_yuyv_to_prgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let mut tmp = Tensor::<u8>::image(
@@ -314,24 +483,26 @@ impl CPUProcessor {
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?;
-        Self::convert_yuyv_to_rgb(src, &mut tmp)?;
+        Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)
     }
 
-    pub(super) fn convert_yuyv_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_yuyv_to_grey(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        let luma = luma_mapper(cp.src_full_range);
         let src_map = src.map()?;
         let mut dst_map = dst.map()?;
         let src_chunks = src_map.as_chunks::<16>();
         let dst_chunks = dst_map.as_chunks_mut::<8>();
         for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
-            s.iter()
-                .step_by(2)
-                .zip(d)
-                .for_each(|(s, d)| *d = limit_to_full(*s));
+            s.iter().step_by(2).zip(d).for_each(|(s, d)| *d = luma(*s));
         }
 
         for (s, d) in src_chunks.1.iter().step_by(2).zip(dst_chunks.1) {
-            *d = limit_to_full(*s);
+            *d = luma(*s);
         }
 
         Ok(())
@@ -385,7 +556,11 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn convert_vyuy_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_vyuy_to_rgb(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
@@ -401,12 +576,16 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             dst_w as u32 * 3,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
         )?)
     }
 
-    pub(super) fn convert_vyuy_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_vyuy_to_rgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
@@ -421,12 +600,16 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
         )?)
     }
 
-    pub(super) fn convert_vyuy_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_vyuy_to_8bps(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let mut tmp = Tensor::<u8>::image(
@@ -435,11 +618,15 @@ impl CPUProcessor {
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?;
-        Self::convert_vyuy_to_rgb(src, &mut tmp)?;
+        Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
     }
 
-    pub(super) fn convert_vyuy_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_vyuy_to_prgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let mut tmp = Tensor::<u8>::image(
@@ -448,11 +635,16 @@ impl CPUProcessor {
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
         )?;
-        Self::convert_vyuy_to_rgb(src, &mut tmp)?;
+        Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)
     }
 
-    pub(super) fn convert_vyuy_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_vyuy_to_grey(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        let luma = luma_mapper(cp.src_full_range);
         let src_map = src.map()?;
         let mut dst_map = dst.map()?;
         // VYUY byte order: [V, Y0, U, Y1] — Y at offsets 1, 3
@@ -460,12 +652,12 @@ impl CPUProcessor {
         let dst_chunks = dst_map.as_chunks_mut::<8>();
         for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
             for (di, si) in (1..16).step_by(2).enumerate() {
-                d[di] = limit_to_full(s[si]);
+                d[di] = luma(s[si]);
             }
         }
 
         for (di, si) in (1..src_chunks.1.len()).step_by(2).enumerate() {
-            dst_chunks.1[di] = limit_to_full(src_chunks.1[si]);
+            dst_chunks.1[di] = luma(src_chunks.1[si]);
         }
 
         Ok(())
@@ -565,7 +757,13 @@ impl CPUProcessor {
         pack_to_planar(src, dst, 1, &[Some(0), Some(0), Some(0), None])
     }
 
-    pub(super) fn convert_grey_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_grey_to_yuyv(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        // Full-range luma maps directly into Y; limited-range compresses it.
+        let y_enc = luma_encoder(cp.dst_full_range);
         let src = src.map()?;
         let src = src.as_slice();
 
@@ -577,16 +775,21 @@ impl CPUProcessor {
             .iter()
             .zip(dst.as_chunks_mut::<4>().0.iter_mut())
         {
-            d[0] = full_to_limit(s[0]);
+            d[0] = y_enc(s[0]);
             d[1] = 128;
 
-            d[2] = full_to_limit(s[1]);
+            d[2] = y_enc(s[1]);
             d[3] = 128;
         }
         Ok(())
     }
 
-    pub(super) fn convert_grey_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_grey_to_nv16(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
+        let y_enc = luma_encoder(cp.dst_full_range);
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
@@ -603,7 +806,7 @@ impl CPUProcessor {
             let src_row = &src_bytes[row * src_stride..row * src_stride + src_w];
             let y_row = &mut y_plane[row * dst_stride..row * dst_stride + src_w];
             for (s, d) in src_row.iter().zip(y_row.iter_mut()) {
-                *d = full_to_limit(*s);
+                *d = y_enc(*s);
             }
             // UV row: neutral chroma (128 = no colour)
             let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + src_w];
@@ -656,50 +859,25 @@ impl CPUProcessor {
         pack_to_planar(src, dst, 4, &[Some(0), Some(1), Some(2), Some(3)])
     }
 
-    pub(super) fn convert_rgba_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_rgba_to_yuyv(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src = src.map()?;
         let src = src.as_slice();
 
         let mut dst = dst.map()?;
         let dst = dst.as_mut_slice();
 
-        // Quantized BT.601 FULL-range RGB->YUV matrix (interim colorimetry
-        // stop-gap; see crates/image/ARCHITECTURE.md "Colorimetry"). Full range:
-        // 255 scale and no +16 luma offset; chroma stays centred at 128.
-        const KR: f64 = 0.299f64;
-        const KB: f64 = 0.114f64;
-        const KG: f64 = 1.0 - KR - KB;
-        const BIAS: i32 = 20;
-
-        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
-
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-
-        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const ROUND: i32 = 1 << (BIAS - 1);
-        const ROUND2: i32 = 1 << BIAS;
+        // RGB→YUV coefficients resolved from the destination colorimetry.
+        let c = YuyvEncodeCoeffs::from_params(cp);
         let process_rgba_to_yuyv = |s: &[u8; 8], d: &mut [u8; 4]| {
             let [r0, g0, b0, _, r1, g1, b1, _] = *s;
-            let r0 = r0 as i32;
-            let g0 = g0 as i32;
-            let b0 = b0 as i32;
-            let r1 = r1 as i32;
-            let g1 = g1 as i32;
-            let b1 = b1 as i32;
-            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS)) as u8;
-            d[1] = ((U_R * r0 + U_G * g0 + U_B * b0 + U_R * r1 + U_G * g1 + U_B * b1 + ROUND2)
-                .shr(BIAS + 1)
-                + 128) as u8;
-            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS)) as u8;
-            d[3] = ((V_R * r0 + V_G * g0 + V_B * b0 + V_R * r1 + V_G * g1 + V_B * b1 + ROUND2)
-                .shr(BIAS + 1)
-                + 128) as u8;
+            *d = c.encode_pair(
+                [r0 as i32, g0 as i32, b0 as i32],
+                [r1 as i32, g1 as i32, b1 as i32],
+            );
         };
 
         let src = src.as_chunks::<{ 8 * 32 }>();
@@ -722,7 +900,11 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn convert_rgba_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_rgba_to_nv16(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let dst_w = dst.width().unwrap();
         let dst_h = if dst.is_multiplane() {
             dst.shape()[0]
@@ -748,8 +930,8 @@ impl CPUProcessor {
             &mut bi_planar_image,
             src.map()?.as_slice(),
             src_rs as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -797,48 +979,25 @@ impl CPUProcessor {
         pack_to_planar(src, dst, 3, &[Some(0), Some(1), Some(2), None])
     }
 
-    pub(super) fn convert_rgb_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_rgb_to_yuyv(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src = src.map()?;
         let src = src.as_slice();
 
         let mut dst = dst.map()?;
         let dst = dst.as_mut_slice();
 
-        // compute quantized Bt.709 limited range RGB to YUV matrix
-        const BIAS: i32 = 20;
-        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
-        const KR: f64 = 0.299f64;
-        const KB: f64 = 0.114f64;
-        const KG: f64 = 1.0 - KR - KB;
-        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
-
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-
-        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const ROUND: i32 = 1 << (BIAS - 1);
-        const ROUND2: i32 = 1 << BIAS;
+        // RGB→YUV coefficients resolved from the destination colorimetry.
+        let c = YuyvEncodeCoeffs::from_params(cp);
         let process_rgb_to_yuyv = |s: &[u8; 6], d: &mut [u8; 4]| {
             let [r0, g0, b0, r1, g1, b1] = *s;
-            let r0 = r0 as i32;
-            let g0 = g0 as i32;
-            let b0 = b0 as i32;
-            let r1 = r1 as i32;
-            let g1 = g1 as i32;
-            let b1 = b1 as i32;
-            d[0] = ((Y_R * r0 + Y_G * g0 + Y_B * b0 + ROUND).shr(BIAS)) as u8;
-            d[1] = ((U_R * r0 + U_G * g0 + U_B * b0 + U_R * r1 + U_G * g1 + U_B * b1 + ROUND2)
-                .shr(BIAS + 1)
-                + 128) as u8;
-            d[2] = ((Y_R * r1 + Y_G * g1 + Y_B * b1 + ROUND).shr(BIAS)) as u8;
-            d[3] = ((V_R * r0 + V_G * g0 + V_B * b0 + V_R * r1 + V_G * g1 + V_B * b1 + ROUND2)
-                .shr(BIAS + 1)
-                + 128) as u8;
+            *d = c.encode_pair(
+                [r0 as i32, g0 as i32, b0 as i32],
+                [r1 as i32, g1 as i32, b1 as i32],
+            );
         };
 
         let src = src.as_chunks::<{ 6 * 32 }>();
@@ -860,7 +1019,11 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn convert_rgb_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_rgb_to_nv16(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let dst_w = dst.width().unwrap();
         let dst_h = if dst.is_multiplane() {
             dst.shape()[0]
@@ -886,8 +1049,8 @@ impl CPUProcessor {
             &mut bi_planar_image,
             src.map()?.as_slice(),
             src_rs as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -907,7 +1070,11 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn convert_nv16_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv16_to_rgb(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         // NV16's UV plane is full-height with one (Cb,Cr) pair per two luma
         // columns ⇒ `width` bytes per chroma row, i.e. the SAME pitch as luma.
@@ -928,6 +1095,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 dst,
+                cp,
             )
         } else {
             let map = src.map()?;
@@ -938,10 +1106,11 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv16_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+            Self::nv16_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst, cp)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv16_to_rgb_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
@@ -949,6 +1118,7 @@ impl CPUProcessor {
         height: usize,
         stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -963,13 +1133,17 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
 
-    pub(super) fn convert_nv16_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv16_to_rgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         // See `convert_nv16_to_rgb`: both planes share the buffer row stride.
         let stride = src
@@ -986,6 +1160,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 dst,
+                cp,
             )
         } else {
             let map = src.map()?;
@@ -996,10 +1171,11 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv16_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+            Self::nv16_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst, cp)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv16_to_rgba_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
@@ -1007,6 +1183,7 @@ impl CPUProcessor {
         height: usize,
         stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -1021,8 +1198,8 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
@@ -1031,7 +1208,11 @@ impl CPUProcessor {
     // Contiguous layout is `[3H, W]`: Y plane (H rows) then the interleaved UV
     // plane (2H rows of W ⇒ `2*W` bytes per chroma row). The UV plane stride is
     // therefore twice the luma stride.
-    pub(super) fn convert_nv24_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv24_to_rgb(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let stride = src
             .effective_row_stride()
@@ -1050,6 +1231,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 dst,
+                cp,
             )
         } else {
             let src_h = src.shape()[0] / 3;
@@ -1060,7 +1242,7 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+            Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst, cp)
         }
     }
 
@@ -1072,6 +1254,7 @@ impl CPUProcessor {
         height: usize,
         y_stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -1085,13 +1268,17 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
 
-    pub(super) fn convert_nv24_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv24_to_rgba(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let stride = src
             .effective_row_stride()
@@ -1109,6 +1296,7 @@ impl CPUProcessor {
                 src_h,
                 stride,
                 dst,
+                cp,
             )
         } else {
             let src_h = src.shape()[0] / 3;
@@ -1119,7 +1307,7 @@ impl CPUProcessor {
                 src_h,
                 src.format().expect("semi-planar source has a pixel format"),
             )?;
-            Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+            Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst, cp)
         }
     }
 
@@ -1131,6 +1319,7 @@ impl CPUProcessor {
         height: usize,
         y_stride: usize,
         dst: &mut Tensor<u8>,
+        cp: ColorParams,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
@@ -1144,18 +1333,26 @@ impl CPUProcessor {
             &src,
             dst.map()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
-            yuv::YuvRange::Full,
-            yuv::YuvStandardMatrix::Bt601,
+            cp.range,
+            cp.matrix,
             yuv::YuvConversionMode::Balanced,
         )?)
     }
 
     /// NV24 → GREY: drop chroma, copy the luma plane honouring its row stride.
-    pub(super) fn convert_nv24_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    pub(super) fn convert_nv24_to_grey(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        cp: ColorParams,
+    ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.shape()[0] / 3;
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
+
+        // Full-range luma is copied directly; limited-range luma is expanded.
+        let luma = luma_mapper(cp.src_full_range);
+
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
@@ -1164,7 +1361,7 @@ impl CPUProcessor {
             let s = &src_bytes[row * src_stride..][..src_w];
             let d = &mut dst_bytes[row * dst_stride..][..src_w];
             for (s, d) in s.iter().zip(d) {
-                *d = limit_to_full(*s);
+                *d = luma(*s);
             }
         }
         Ok(())
@@ -1290,35 +1487,8 @@ impl CPUProcessor {
         [y]
     }
 
-    pub(super) fn rgba_to_yuyv(rgba: [u8; 4]) -> [u8; 4] {
-        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
-        const KR: f64 = 0.299f64;
-        const KB: f64 = 0.114f64;
-        const KG: f64 = 1.0 - KR - KB;
-        const BIAS: i32 = 20;
-
-        const Y_R: i32 = (KR * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_G: i32 = (KG * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const Y_B: i32 = (KB * (255 << BIAS) as f64 / 255.0).round() as i32;
-
-        const U_R: i32 = (-KR / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_G: i32 = (-KG / (KR + KG) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const U_B: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-
-        const V_R: i32 = (0.5_f64 * (255 << BIAS) as f64 / 255.0).ceil() as i32;
-        const V_G: i32 = (-KG / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const V_B: i32 = (-KB / (KG + KB) / 2.0 * (255 << BIAS) as f64 / 255.0).round() as i32;
-        const ROUND: i32 = 1 << (BIAS - 1);
-
+    pub(super) fn rgba_to_yuyv(rgba: [u8; 4], cp: ColorParams) -> [u8; 4] {
         let [r, g, b, _] = rgba;
-        let r = r as i32;
-        let g = g as i32;
-        let b = b as i32;
-        // Full-range BT.601: no +16 luma offset; chroma still centred at 128.
-        let y = ((Y_R * r + Y_G * g + Y_B * b + ROUND) >> BIAS) as u8;
-        let u = (((U_R * r + U_G * g + U_B * b + ROUND) >> BIAS) + 128) as u8;
-        let v = (((V_R * r + V_G * g + V_B * b + ROUND) >> BIAS) + 128) as u8;
-
-        [y, u, y, v]
+        YuyvEncodeCoeffs::from_params(cp).encode_single([r as i32, g as i32, b as i32])
     }
 }

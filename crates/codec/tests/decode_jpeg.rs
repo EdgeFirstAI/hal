@@ -357,6 +357,15 @@ fn unsupported_progressive_jpeg_returns_typed_variant() {
 }
 
 #[test]
+fn jpeg_decode_tags_jfif_colorimetry() {
+    use edgefirst_tensor::Colorimetry;
+    let mut t = Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut d = ImageDecoder::new();
+    t.load_image(&mut d, &testdata("zidane.jpg")).unwrap();
+    assert_eq!(t.colorimetry(), Some(Colorimetry::jfif()));
+}
+
+#[test]
 fn odd_width_nv12_jpeg_decodes_with_logical_width() {
     // jaguar.jpg is 789×384 — odd width.  The tensor carries the LOGICAL width
     // (789); the row_stride is >= even(789)=790 and 64-byte aligned, ensuring

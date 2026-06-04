@@ -776,6 +776,15 @@ uniform ivec2 img_size;
 uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
+// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
+// from the source tensor's resolved colorimetry. Path B applies the matrix in
+// the shader, so it is correct regardless of driver EGL color-hint support.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
 in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
@@ -802,11 +811,16 @@ void main() {
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
 
+    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
+    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
+    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
+    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
-    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
     color = vec4(r, g, b, 1.0);
 }
 "
@@ -827,6 +841,13 @@ uniform ivec2 img_size;
 uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int chroma_lines;
+// Per-tensor colorimetry (YUV→RGB matrix + range); see the non-int8 variant.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
 in vec3 fragPos;
 in vec2 tc;
 out vec4 color;
@@ -854,11 +875,16 @@ void main() {
     float u = texelFetch(src, ivec2(cx, cy), 0).r;
     float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
 
+    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
+    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
+    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
+    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
-    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
     color = vec4(int8_bias(vec3(r, g, b)), 1.0);
 }
 "

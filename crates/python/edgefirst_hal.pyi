@@ -1308,6 +1308,19 @@ class Tensor:
         unquantized integer tensors."""
         ...
 
+    @property
+    def colorimetry(self) -> Colorimetry | None:
+        """Colour signalling (matrix/range/primaries), or ``None`` if undefined.
+
+        Set automatically by the codec on decode (JPEG → JFIF/BT.601-full,
+        PNG → sRGB) and carried through ``convert()`` to pick the YUV→RGB
+        matrix and range. ``None`` is never auto-filled; consumers resolve
+        missing axes via an SD/HD height heuristic at use time.
+        """
+        ...
+
+    @colorimetry.setter
+    def colorimetry(self, value: Colorimetry | None) -> None: ...
     def set_quantization_per_tensor(self, scale: float, zero_point: int) -> None:
         """Attach per-tensor asymmetric quantization. Integer tensors only."""
         ...
@@ -1388,6 +1401,87 @@ class CudaMap:
 
     def __enter__(self) -> CudaMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
+
+class ColorSpace(enum.Enum):
+    """Colour primaries (the chromaticities of the RGB primaries)."""
+
+    Bt709: ColorSpace
+    Bt2020: ColorSpace
+    Srgb: ColorSpace
+    Smpte170m: ColorSpace
+
+class ColorTransfer(enum.Enum):
+    """Transfer function (opto-electronic / gamma)."""
+
+    Bt709: ColorTransfer
+    Srgb: ColorTransfer
+    Pq: ColorTransfer
+    Hlg: ColorTransfer
+    Linear: ColorTransfer
+
+class ColorEncoding(enum.Enum):
+    """YCbCr encoding matrix — selects the YUV↔RGB coefficients."""
+
+    Bt601: ColorEncoding
+    Bt709: ColorEncoding
+    Bt2020: ColorEncoding
+
+class ColorRange(enum.Enum):
+    """Quantization range of the luma/chroma samples."""
+
+    Full: ColorRange
+    """Full range (0–255), e.g. JFIF/JPEG."""
+    Limited: ColorRange
+    """Limited / studio range (luma 16–235), e.g. broadcast video."""
+
+class Colorimetry:
+    """Four-axis colour signalling (primaries / transfer / matrix / range).
+
+    Each axis is independently optional; ``None`` means "undefined" and is
+    resolved at use time by an SD/HD height heuristic. Carried on image
+    ``Tensor`` objects and consumed by ``convert()`` to select the exact
+    YUV→RGB matrix and range.
+    """
+
+    def __init__(
+        self,
+        space: ColorSpace | None = None,
+        transfer: ColorTransfer | None = None,
+        encoding: ColorEncoding | None = None,
+        range: ColorRange | None = None,
+    ) -> None: ...
+    @staticmethod
+    def from_v4l2(
+        colorspace: int, xfer: int, ycbcr_enc: int, quant: int
+    ) -> Colorimetry:
+        """Build from the four raw V4L2 colorimetry integers.
+
+        A ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved from the
+        colorspace (e.g. ``V4L2_COLORSPACE_JPEG`` → BT.601 full-range) per the
+        kernel ``V4L2_MAP_*_DEFAULT`` rules; an unrecognised value maps to
+        ``None``.
+        """
+        ...
+
+    @property
+    def space(self) -> ColorSpace | None:
+        """Colour primaries, or ``None`` if undefined."""
+        ...
+
+    @property
+    def transfer(self) -> ColorTransfer | None:
+        """Transfer function, or ``None`` if undefined."""
+        ...
+
+    @property
+    def encoding(self) -> ColorEncoding | None:
+        """YCbCr encoding matrix, or ``None`` if undefined."""
+        ...
+
+    @property
+    def range(self) -> ColorRange | None:
+        """Quantization range, or ``None`` if undefined."""
+        ...
 
 class PixelFormat(enum.Enum):
     """Pixel format for image tensors."""
@@ -1936,6 +2030,7 @@ class ImageProcessor:
             chroma_fd: int | None = None,
             chroma_stride: int | None = None,
             chroma_offset: int | None = None,
+            colorimetry: Colorimetry | None = None,
         ) -> Tensor:
             """Import an external DMA-BUF image.
 
@@ -1960,6 +2055,9 @@ class ImageProcessor:
                     (default: ``None`` = tightly packed).
                 chroma_offset: Byte offset within the chroma DMA-BUF where
                     data starts (default: ``None`` = 0).
+                colorimetry: Colour signalling (matrix/range/primaries) from the
+                    producer, used by ``convert()`` to pick the YUV→RGB matrix
+                    and range (default: ``None`` = resolved by heuristic).
 
             Returns:
                 A new image ``Tensor`` backed by the external DMA-BUF(s).

@@ -1316,6 +1316,52 @@ pub unsafe extern "C" fn hal_quantization_axis(
 }
 
 // ============================================================================
+// Colorimetry Functions
+// ============================================================================
+
+/// Set the tensor's colorimetry (each axis 0=unknown). Pass NULL to clear.
+///
+/// The four axes use stable HAL integer constants (see `hal_colorimetry`),
+/// not raw V4L2 values. A NULL `c` clears any colorimetry on the tensor.
+///
+/// @param tensor Tensor handle (no-op if NULL)
+/// @param c      Colorimetry to set, or NULL to clear
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_set_colorimetry(
+    tensor: *mut HalTensor,
+    c: *const crate::colorimetry::hal_colorimetry,
+) {
+    if tensor.is_null() {
+        return;
+    }
+    let value = if c.is_null() {
+        None
+    } else {
+        Some(edgefirst_tensor::Colorimetry::from(unsafe { *c }))
+    };
+    unsafe { &mut *tensor }.inner.set_colorimetry(value);
+}
+
+/// Read the tensor's colorimetry into `*out` (axes 0 when unknown/unset).
+///
+/// When the tensor has no colorimetry set, all axes are written as 0
+/// (unknown) and the call still succeeds.
+///
+/// @param tensor Tensor handle
+/// @param out    Output colorimetry (must not be NULL)
+/// @return 0 on success, -1 on bad args (NULL tensor or NULL out)
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_colorimetry(
+    tensor: *const HalTensor,
+    out: *mut crate::colorimetry::hal_colorimetry,
+) -> c_int {
+    check_null!(tensor, out);
+    let c = unsafe { &*tensor }.inner.colorimetry().unwrap_or_default();
+    unsafe { *out = c.into() };
+    0
+}
+
+// ============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;

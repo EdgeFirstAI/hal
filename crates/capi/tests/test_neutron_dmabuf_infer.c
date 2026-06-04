@@ -300,7 +300,7 @@ static void run_repeated_inferences(
     if (offset > 0)
         hal_plane_descriptor_set_offset(pd, offset);
 
-    hal_tensor *dst = hal_import_image(proc, pd, NULL, dst_w, dst_h, dst_fmt, dst_dtype);
+    hal_tensor *dst = hal_import_image(proc, pd, NULL, dst_w, dst_h, dst_fmt, dst_dtype, NULL);
     if (!dst) {
         fprintf(stderr, "    FAIL (import fd=%d offset=%zu errno=%d: %s)\n",
                 neutron_fd, offset, errno, strerror(errno));
@@ -378,7 +378,7 @@ static int run_inference(TfLiteInterpreter *interp, const TfliteAPI *api,
     if (offset > 0)
         hal_plane_descriptor_set_offset(pd, offset);
 
-    hal_tensor *dst = hal_import_image(proc, pd, NULL, dst_w, dst_h, dst_fmt, dst_dtype);
+    hal_tensor *dst = hal_import_image(proc, pd, NULL, dst_w, dst_h, dst_fmt, dst_dtype, NULL);
     if (!dst) {
         fprintf(stderr, "FAIL (import fd=%d offset=%zu errno=%d: %s)\n",
                 neutron_fd, offset, errno, strerror(errno));

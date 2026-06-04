@@ -505,6 +505,16 @@ fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Ve
         }
     }
 
+    // Tag the source BT.601 full-range so convert() uses the same matrix/range
+    // as the analytic `bt601_ycbcr_to_rgb` reference below. Without a tag, the
+    // colorimetry heuristic resolves an untagged SD tensor to BT.601 *limited*,
+    // expanding the luma and diverging from this full-range reference.
+    src.set_colorimetry(Some(
+        edgefirst_tensor::Colorimetry::default()
+            .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+            .with_range(edgefirst_tensor::ColorRange::Full),
+    ));
+
     // Build analytic RGB reference using the same pattern and BT.601-full.
     let mut expected = vec![[0u8; 3]; w * h];
     for r in 0..h {

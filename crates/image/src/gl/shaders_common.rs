@@ -3,6 +3,19 @@
 
 //! GL shader sources shared across platform backends (macOS ANGLE + Linux).
 
+// ---------------------------------------------------------------------------
+// Portable `#version 300 es` fragment shaders shared verbatim by both the
+// Linux (PBO/DMA EGLImage) and macOS (IOSurface/ANGLE) render paths, so the
+// GLSL bytes are validated identically on every backend.
+//
+// (YUV→RGB matrix conversion lives in the per-backend NV shaders — Linux
+// `shaders::generate_nv_to_rgba_shader_2d` and the macOS `NV_TO_RGBA_FRAGMENT`,
+// each carrying the six per-tensor colorimetry uniforms from
+// `crate::colorimetry::yuv_to_rgb_coeffs`. Packed YUYV uses the driver Path A
+// EGL color-space/range hints. Only the colorimetry-agnostic PlanarRgb F16
+// packer is shared here.)
+// ---------------------------------------------------------------------------
+
 /// RGBA8 -> packed RGBA16F PlanarRgb F16 fragment shader.
 ///
 /// The render target is a single `RGBA16F` texture sized `(W/4, 3*H)`.

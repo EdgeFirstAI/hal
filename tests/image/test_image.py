@@ -69,14 +69,10 @@ def test_flip():
     expected = load_image("testdata/zidane.jpg", "RGB")
     expected = expected[:, ::-1, :]
 
-    # Decode produces native NV12; convert() targets BT.601 full-range (JFIF).
-    # The CPU and ANGLE/Mesa GL paths achieve 0.98 vs PIL's full-range decode,
-    # but Vivante GL (i.MX8MP) silently ignores the EGL SAMPLE_RANGE_HINT and
-    # samples limited-range, dropping ~3.5% RMS. Use 0.95 to stay honest across
-    # all backends; the colorimetry PR (feature/colorimetry) restores 0.98 by
-    # doing the YUV->RGB matrix in-shader instead of via EGL hints.
-    # (Interim 601-full hardcode; see crates/image/ARCHITECTURE.md "Colorimetry".)
-    assert calculate_similarity_rms_u8(n, expected) > 0.95
+    # Decode produces native NV12 tagged JFIF (BT.601 full-range); convert()
+    # honors it, matching PIL's direct JPEG RGB decode. Only 4:2:0 chroma
+    # downsampling differs, so 0.98 holds.
+    assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
 def test_grey_load():
@@ -168,8 +164,8 @@ def test_rgb_resize():
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 4))
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=(640, 640))
-        # 0.95: NV12->RGB BT.709 conversion differs slightly from PIL's RGB.
-        assert calculate_similarity_rms_u8(n, expected) > 0.95
+        # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
+        assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
 def test_rgba_to_rgb():
@@ -184,8 +180,8 @@ def test_rgba_to_rgb():
     with dst.map() as m:
         n = np.array(m.view()).reshape((dst.height, dst.width, 3))
         expected = load_image("testdata/zidane.jpg", "RGB")
-        # 0.95: NV12->RGB BT.709 conversion differs slightly from PIL's RGB.
-        assert calculate_similarity_rms_u8(n, expected) > 0.95
+        # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
+        assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
 @pytest.mark.parametrize(

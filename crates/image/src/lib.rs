@@ -330,6 +330,7 @@ pub use opengl_headless::MacosGlProcessor;
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
 use std::{fmt::Display, time::Instant};
 
+mod colorimetry;
 mod cpu;
 mod error;
 mod g2d;
@@ -1616,14 +1617,17 @@ impl ImageProcessor {
     ///
     /// // Single-plane RGBA
     /// let pd = PlaneDescriptor::new(fd.as_fd())?;
-    /// let src = proc.import_image(pd, None, 1920, 1080, PixelFormat::Rgba, DType::U8)?;
+    /// let src = proc.import_image(pd, None, 1920, 1080, PixelFormat::Rgba, DType::U8, None)?;
     ///
     /// // Multi-plane NV12 with stride
     /// let y_pd = PlaneDescriptor::new(y_fd.as_fd())?.with_stride(2048);
     /// let uv_pd = PlaneDescriptor::new(uv_fd.as_fd())?.with_stride(2048);
     /// let src = proc.import_image(y_pd, Some(uv_pd), 1920, 1080,
-    ///                             PixelFormat::Nv12, DType::U8)?;
+    ///                             PixelFormat::Nv12, DType::U8, None)?;
     /// ```
+    // Import inherently needs plane(s) + geometry + format + dtype + colorimetry;
+    // a params struct would obscure more than it clarifies here.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(target_os = "linux")]
     pub fn import_image(
         &self,
@@ -1633,6 +1637,7 @@ impl ImageProcessor {
         height: usize,
         format: PixelFormat,
         dtype: DType,
+        colorimetry: Option<edgefirst_tensor::Colorimetry>,
     ) -> Result<TensorDyn> {
         use edgefirst_tensor::{Tensor, TensorMemory};
 
@@ -1735,9 +1740,13 @@ impl ImageProcessor {
                     );
                 }
                 let tensor_i8: Tensor<i8> = unsafe { std::mem::transmute(tensor) };
-                return Ok(TensorDyn::from(tensor_i8));
+                let mut dyn_tensor = TensorDyn::from(tensor_i8);
+                dyn_tensor.set_colorimetry(colorimetry);
+                return Ok(dyn_tensor);
             }
-            Ok(TensorDyn::from(tensor))
+            let mut dyn_tensor = TensorDyn::from(tensor);
+            dyn_tensor.set_colorimetry(colorimetry);
+            Ok(dyn_tensor)
         } else {
             // ── Single-plane path ────────────────────────────────────
             // Canonical shape (Packed [H,W,C] / Planar [C,H,W] / SemiPlanar
@@ -1762,6 +1771,7 @@ impl ImageProcessor {
             if let Some(o) = image_offset {
                 tensor.set_plane_offset(o);
             }
+            tensor.set_colorimetry(colorimetry);
             Ok(tensor)
         }
     }
@@ -1994,16 +2004,41 @@ impl ImageProcessorTrait for ImageProcessor {
 
         #[cfg(target_os = "linux")]
         if let Some(g2d) = self.g2d.as_mut() {
-            match g2d.convert(src, dst, rotation, flip, crop) {
-                Ok(_) => {
-                    log::trace!(
-                        "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
-                        start.elapsed()
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+            // G2D is matrix-only (no range control, no BT.2020). For any
+            // conversion with a YUV side, resolve that side's colorimetry and
+            // skip G2D entirely when it cannot be expressed (full-range YUV or
+            // BT.2020), letting the chain fall through to GL/CPU which honour
+            // range and BT.2020. YUV→RGB uses the source colorimetry; RGB→YUV
+            // uses the destination. RGB→RGB has no YUV side and is unaffected.
+            let src_is_yuv = src.format().is_some_and(|f| f.is_yuv());
+            let dst_is_yuv = dst.format().is_some_and(|f| f.is_yuv());
+            let g2d_eligible = if src_is_yuv || dst_is_yuv {
+                let cm = if src_is_yuv {
+                    crate::colorimetry::effective_colorimetry(src)
+                } else {
+                    crate::colorimetry::effective_colorimetry(dst)
+                };
+                crate::g2d::g2d_can_handle(&cm, true)
+            } else {
+                true
+            };
+            if !g2d_eligible {
+                log::trace!(
+                    "convert: auto g2d skipped {src_fmt:?}→{dst_fmt:?} \
+                     (colorimetry not expressible: full-range/BT.2020)"
+                );
+            } else {
+                match g2d.convert(src, dst, rotation, flip, crop) {
+                    Ok(_) => {
+                        log::trace!(
+                            "convert: auto selected=g2d for {src_fmt:?}→{dst_fmt:?} ({:?})",
+                            start.elapsed()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::trace!("convert: auto g2d declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                    }
                 }
             }
         }
@@ -6436,11 +6471,19 @@ mod image_tests {
         // CPU-only test: pin to tight host memory (None auto-selects pitch-padded
         // DMA on i.MX, which would leave the dst's row padding unconverted and
         // break the flat byte scan below).
-        let src =
+        let mut src =
             TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
         assert_eq!(src.shape(), &[8, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(5)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+        // Tag BT.601 full-range so Y=128 decodes to grey 128 (the neutral-grey
+        // identity this test asserts). Without a tag, the colorimetry heuristic
+        // resolves an SD tensor to BT.601 *limited*, expanding Y=128 → ~131.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
 
         let dst =
             TensorDyn::image(8, 5, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
@@ -6472,11 +6515,18 @@ mod image_tests {
         // chroma row). Neutral-grey fill (Y=U=V=128) must convert to uniform
         // grey RGB, exercising the 2× UV stride and shape[0]/3 height recovery.
         // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
-        let src =
+        let mut src =
             TensorDyn::image(8, 4, PixelFormat::Nv24, DType::U8, Some(TensorMemory::Mem)).unwrap();
         assert_eq!(src.shape(), &[12, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(4)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
+        // Tag BT.601 full-range (see test_nv12_odd_height_to_rgb_cpu): without it
+        // the heuristic picks limited range and Y=128 expands to ~131.
+        src.set_colorimetry(Some(
+            edgefirst_tensor::Colorimetry::default()
+                .with_encoding(edgefirst_tensor::ColorEncoding::Bt601)
+                .with_range(edgefirst_tensor::ColorRange::Full),
+        ));
 
         let dst =
             TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
@@ -8645,6 +8695,69 @@ mod image_tests {
         assert!(
             result.is_err(),
             "create_image(F32, Dma) must fail — no DRM fourcc for f32"
+        );
+    }
+
+    /// Verify that `import_image` stores the supplied `Option<Colorimetry>` on
+    /// the returned `TensorDyn`.
+    ///
+    /// `import_image` requires a DMA-backed fd on Linux.  When DMA is
+    /// unavailable we skip the DMA call but still verify the storage contract
+    /// by inspecting `set_colorimetry` / `colorimetry` on a plain `TensorDyn`
+    /// constructed the same way the function body does it — and we confirm via
+    /// code-read that the new parameter is unconditionally stored.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn import_image_carries_colorimetry() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry, TensorMemory};
+
+        let expected = Colorimetry::default()
+            .with_encoding(ColorEncoding::Bt709)
+            .with_range(ColorRange::Limited);
+
+        if !is_dma_available() {
+            // DMA unavailable on this host: exercise the storage path via
+            // TensorDyn directly (mirrors what import_image does internally).
+            let mut t =
+                TensorDyn::image(8, 8, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
+                    .expect("alloc");
+            assert_eq!(t.colorimetry(), None, "colorimetry must start as None");
+            t.set_colorimetry(Some(expected));
+            assert_eq!(
+                t.colorimetry(),
+                Some(expected),
+                "set_colorimetry must round-trip"
+            );
+            eprintln!("SKIPPED import_image_carries_colorimetry (DMA unavailable); storage contract verified via TensorDyn");
+            return;
+        }
+
+        // DMA is available: allocate a real DMA tensor, extract its fd, and
+        // call import_image with an explicit Colorimetry.
+        use edgefirst_tensor::{PlaneDescriptor, Tensor};
+
+        let rgba_bytes = 64 * 64 * 4; // 64×64 RGBA8
+        let dma_tensor =
+            Tensor::<u8>::new(&[rgba_bytes], Some(TensorMemory::Dma), Some("import_test"))
+                .expect("dma alloc");
+        let pd =
+            PlaneDescriptor::new(dma_tensor.dmabuf().expect("dma fd")).expect("PlaneDescriptor");
+
+        let proc = ImageProcessor::new().expect("ImageProcessor");
+        let result = proc.import_image(
+            pd,
+            None,
+            64,
+            64,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(expected),
+        );
+        let tensor = result.expect("import_image must succeed on DMA fd");
+        assert_eq!(
+            tensor.colorimetry(),
+            Some(expected),
+            "import_image must store the supplied colorimetry on the returned TensorDyn"
         );
     }
 }

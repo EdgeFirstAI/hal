@@ -927,13 +927,14 @@ mod cpu_tests {
             Crop::new().with_dst_rect(Some(Rect::new(0, 0, 2, 1))),
         )?;
 
-        // Interim 601-full stop-gap: grey luma maps to YUYV luma directly
-        // (full-range identity), so the row-averaged grey [4, 6] yields Y = 4, 6
-        // (previously 20, 21 under the limited-range encoding). The second dst
-        // row is outside the crop and keeps its pre-fill value.
+        // The untagged 2x2 Grey source is below the HD threshold, so the
+        // colorimetry heuristic resolves it to BT.601 limited range: grey luma
+        // is mapped into the 16..235 limited range (219-step), so the
+        // row-averaged grey [4, 6] yields Y = 19, 21. The second dst row is
+        // outside the crop and keeps its pre-fill value.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
-            &[4, 128, 6, 128, 200, 128, 200, 128]
+            &[19, 128, 21, 128, 200, 128, 200, 128]
         );
         Ok(())
     }
@@ -1002,12 +1003,12 @@ mod cpu_tests {
             },
         )?;
 
-        // Interim 601-full stop-gap: full-range BT.601 RGB->YUYV. Red [255,0,0]
-        // -> [Y=76, U=85, V=0]; the grey [3,3,3] src row -> Y=3 (no +16 offset),
-        // U=V=128. (Previously [63,102,63,240] / Y=19 under BT.709 limited.)
+        // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
+        // resolves it to BT.601 limited (previously a BT.709 hardcode). Red
+        // (255,0,0) → Y=81, U=90, V=240 under BT.601 limited.
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
-            &[76, 85, 76, 0, 3, 128, 3, 128, 76, 85, 76, 0]
+            &[81, 90, 81, 240, 19, 128, 19, 128, 81, 90, 81, 240]
         );
         Ok(())
     }
@@ -3610,6 +3611,122 @@ mod cpu_tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn cpu_nv12_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV12: 4 luma + 1 UV pair (U=200,V=40) — saturated chroma so 601≠709.
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv12,
+                None,
+                &[180, 180, 180, 180, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
+    }
+
+    #[test]
+    fn cpu_nv16_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV16 (4:2:2): 4 luma + full-height half-width chroma = 2 rows
+            // × 1 (Cb,Cr) pair = 4 chroma bytes (U=200,V=40, saturated so 601≠709).
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv16,
+                None,
+                &[180, 180, 180, 180, 200, 40, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
+    }
+
+    #[test]
+    fn cpu_nv24_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV24 (4:4:4): 4 luma + full-res chroma = 4 (Cb,Cr) pairs = 8
+            // chroma bytes (U=200,V=40, saturated so 601≠709).
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv24,
+                None,
+                &[180, 180, 180, 180, 200, 40, 200, 40, 200, 40, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
+    }
+
+    #[test]
+    fn cpu_convert_tagged_jfif_differs_from_untagged_heuristic_nv12() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        // Same 2x2 NV12 bytes — saturated chroma so matrix/range choice matters.
+        // NV12 2x2 = 4 Y-plane bytes + 2 UV-plane bytes = 6 total.
+        let bytes = [180u8, 180, 180, 180, 200, 40];
+        let convert = |cm: Option<Colorimetry>| {
+            let mut src = load_bytes_to_tensor(2, 2, PixelFormat::Nv12, None, &bytes).unwrap();
+            src.set_colorimetry(cm);
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        // Tagged JFIF (BT.601 full-range) — what the codec sets for JPEG.
+        let jfif = convert(Some(Colorimetry::jfif()));
+        // Untagged: 2x2 height is below HD_THRESHOLD (720) → heuristic resolves
+        // to BT.601 LIMITED.  JFIF is BT.601 FULL, so the two must differ.
+        let untagged = convert(None);
+        assert_ne!(
+            jfif, untagged,
+            "JFIF (BT.601 full-range) must differ from heuristic (BT.601 limited)"
+        );
+        // An explicitly-tagged BT.709-limited must also differ from BT.601 JFIF.
+        let bt709 = convert(Some(
+            Colorimetry::default()
+                .with_encoding(ColorEncoding::Bt709)
+                .with_range(ColorRange::Limited),
+        ));
+        assert_ne!(jfif, bt709, "BT.601-full must differ from BT.709-limited");
     }
 
     #[test]

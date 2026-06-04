@@ -2903,9 +2903,23 @@ impl GLProcessorST {
             // separate planes. For single-plane (combined) NV12, Path A is only
             // reliable on Vivante (garbage on Mali), so restrict it to Vivante at
             // a 4-aligned width; everything else takes the portable Path B.
+            // Path A (samplerExternalOES) hands YUV→RGB to the DRIVER. On
+            // hint-ignoring GPUs (Vivante) that is a FIXED BT.601-limited
+            // matrix, so single-plane Path A is only colorimetry-correct when
+            // the resolved colorimetry actually IS BT.601 limited. For any
+            // other colorimetry (full-range — e.g. JFIF JPEG — or BT.709/2020)
+            // force the in-shader Path B, which applies the exact matrix via
+            // the per-tensor uniforms. (True-multiplane NV12 can ONLY use Path
+            // A — Path B imports one combined buffer — but such tensors are
+            // camera BT.601-limited in practice; Path A's merged EGL color
+            // hints cover the hint-honoring drivers.)
+            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+            let driver_default_colorimetry = cm.encoding
+                == Some(edgefirst_tensor::ColorEncoding::Bt601)
+                && cm.range == Some(edgefirst_tensor::ColorRange::Limited);
             let nv12_path_a_ok = src_fmt == PixelFormat::Nv12
                 && src_w.is_multiple_of(4)
-                && (src.is_multiplane() || self.is_vivante);
+                && (src.is_multiplane() || (self.is_vivante && driver_default_colorimetry));
             let use_path_b = matches!(src_fmt, PixelFormat::Nv16 | PixelFormat::Nv24)
                 || (src_fmt == PixelFormat::Nv12 && !nv12_path_a_ok);
 
@@ -4226,6 +4240,41 @@ impl GLProcessorST {
 
             let loc_chroma_lines = gls::gl::GetUniformLocation(prog_id, c"chroma_lines".as_ptr());
             gls::gl::Uniform1i(loc_chroma_lines, chroma_lines);
+
+            // YUV→RGB matrix + range, resolved from the source tensor's
+            // colorimetry (missing axes filled by the SD/HD height heuristic).
+            // Path B applies the matrix in-shader, so it is colorimetry-correct
+            // on every GPU regardless of EGL color-hint support.
+            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+            let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
+                cm.encoding
+                    .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"y_offset".as_ptr()),
+                coeffs.y_offset,
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"y_scale".as_ptr()),
+                coeffs.y_scale,
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"c_vr".as_ptr()),
+                coeffs.c_vr,
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"c_ug".as_ptr()),
+                coeffs.c_ug,
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"c_vg".as_ptr()),
+                coeffs.c_vg,
+            );
+            gls::gl::Uniform1f(
+                gls::gl::GetUniformLocation(prog_id, c"c_ub".as_ptr()),
+                coeffs.c_ub,
+            );
 
             // Bind sampler to unit 0.
             let loc_src = gls::gl::GetUniformLocation(prog_id, c"src".as_ptr());

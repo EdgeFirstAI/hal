@@ -133,6 +133,18 @@ pub(crate) fn decode_png_into<T: ImagePixel>(
     dst.configure_image(img_w, img_h, format)
         .map_err(|e| config_err(e, img_w, img_h, cap))?;
 
+    let cm = match format {
+        PixelFormat::Rgb | PixelFormat::Rgba => edgefirst_tensor::Colorimetry::default()
+            .with_space(edgefirst_tensor::ColorSpace::Srgb)
+            .with_transfer(edgefirst_tensor::ColorTransfer::Srgb)
+            .with_range(edgefirst_tensor::ColorRange::Full),
+        PixelFormat::Grey => {
+            edgefirst_tensor::Colorimetry::default().with_range(edgefirst_tensor::ColorRange::Full)
+        }
+        _ => edgefirst_tensor::Colorimetry::default(),
+    };
+    dst.set_colorimetry(Some(cm));
+
     let channels = format.channels();
     let elem_size = std::mem::size_of::<T>();
     let dst_stride = dst

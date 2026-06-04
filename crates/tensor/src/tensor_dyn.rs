@@ -182,6 +182,22 @@ impl TensorDyn {
         Ok(self)
     }
 
+    /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
+        dispatch!(self, colorimetry)
+    }
+
+    /// Attach/clear colorimetry metadata.
+    pub fn set_colorimetry(&mut self, c: Option<crate::Colorimetry>) {
+        dispatch!(self, set_colorimetry, c)
+    }
+
+    /// Builder-style colorimetry attach (consumes and returns self).
+    pub fn with_colorimetry(mut self, c: crate::Colorimetry) -> Self {
+        self.set_colorimetry(Some(c));
+        self
+    }
+
     /// Row stride in bytes (`None` = tightly packed).
     pub fn row_stride(&self) -> Option<usize> {
         dispatch!(self, row_stride)
@@ -1204,6 +1220,16 @@ mod tests {
         t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!((t.width(), t.height()), (Some(320), Some(240)));
+    }
+
+    #[test]
+    fn tensordyn_colorimetry_roundtrip() {
+        use crate::{ColorEncoding, Colorimetry, DType, PixelFormat};
+        let mut t = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        assert_eq!(t.colorimetry(), None);
+        let c = Colorimetry::default().with_encoding(ColorEncoding::Bt709);
+        t.set_colorimetry(Some(c));
+        assert_eq!(t.colorimetry(), Some(c));
     }
 
     #[test]

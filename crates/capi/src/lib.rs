@@ -23,6 +23,7 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
     ctor
 };
 
+mod colorimetry;
 mod decoder;
 mod delegate;
 mod error;
@@ -32,6 +33,7 @@ mod tensor;
 mod trace;
 mod tracker;
 
+pub use colorimetry::*;
 pub use decoder::*;
 pub use delegate::*;
 pub use error::*;

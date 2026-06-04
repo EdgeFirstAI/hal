@@ -131,6 +131,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether semi-planar YUV DMA-BUF import succeeds on the platform.
 - `ImageProcessor::supported_render_dtypes()` now reports real GPU
   float-render capability on Linux (previously always reported none).
+- 4-axis `Colorimetry` (`space`/`transfer`/`encoding`/`range`, each `Option`)
+  carried on `Tensor`/`TensorDyn` (`edgefirst-tensor`). Set automatically by the
+  codec (JPEG → JFIF/BT.601-full, PNG Rgb/Rgba → sRGB+full, PNG Grey → full) and
+  by `ImageProcessor::import_image` (caller supplies colorimetry from the
+  producer's signalling). C surface: `hal_colorimetry` struct,
+  `hal_tensor_set_colorimetry` / `hal_tensor_colorimetry`,
+  `hal_colorimetry_from_v4l2`, `hal_import_image` colorimetry param. Python
+  surface: `Colorimetry` class + enums, `tensor.colorimetry` property,
+  `import_image(colorimetry=...)`.
 - **macOS NV12/NV16/NV24 GPU conversion.** `MacosGlProcessor` now converts
   NV12/NV16/NV24 → RGBA and NV12/NV16/NV24 → PlanarRgb F16 entirely on the
   GPU via the R8 IOSurface `texelFetch` shader. Previously semi-planar sources
@@ -145,6 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `convert()` now honors each tensor's `Colorimetry`, resolving unknown axes at
+  use-time via an SD/HD height heuristic (height ≥ 720 → BT.709, else BT.601;
+  limited range when unknown) without mutating the tensor. CPU and OpenGL backends
+  are fully colorimetry-correct (matrix + range). G2D applies the matrix
+  (`set_bt601/709_colorspace`) but cannot express full-range or BT.2020 via
+  `g2d-sys`; G2D declines those combinations and the dispatch falls back to
+  GL/CPU.
 - **Breaking:** `edgefirst-codec` now decodes to the image's native format only
   — JPEG → `Nv12` (4:2:0 chroma subsampling) / `Nv16` (4:2:2) / `Nv24` (4:4:4)
   or `Grey` (greyscale); PNG → `Rgb`/`Rgba`/`Grey`. The decoder configures the

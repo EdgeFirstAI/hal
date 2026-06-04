@@ -7,7 +7,7 @@
 //! from the actual `eglCreateImage` call so that the attribute construction
 //! can be unit-tested without a GPU context.
 
-use edgefirst_tensor::{PixelFormat, PixelLayout, Tensor, TensorTrait};
+use edgefirst_tensor::{ColorEncoding, ColorRange, PixelFormat, PixelLayout, Tensor, TensorTrait};
 use gbm::drm::buffer::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::os::fd::AsRawFd;
@@ -15,6 +15,7 @@ use std::os::unix::io::RawFd;
 
 use super::context::egl_ext;
 use super::shaders::pixel_format_to_drm;
+use crate::colorimetry::resolve_colorimetry;
 use crate::Error;
 
 /// Resolved DMA-BUF plane parameters for EGL image creation.
@@ -38,6 +39,12 @@ pub(super) struct DmaImportAttrs {
     /// Second plane for NV12.
     pub plane1: Option<DmaPlane1Attrs>,
     pub is_yuv: bool,
+    /// Resolved YUV matrix encoding for the EGL color-space hint.
+    /// Only meaningful when `is_yuv`; ignored otherwise.
+    pub yuv_encoding: ColorEncoding,
+    /// Resolved YUV sample range for the EGL sample-range hint.
+    /// Only meaningful when `is_yuv`; ignored otherwise.
+    pub yuv_range: ColorRange,
 }
 
 /// Resolved attributes for the chroma (UV) plane.
@@ -57,6 +64,13 @@ impl DmaImportAttrs {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let src_channels = src_fmt.channels();
+
+        // Resolve the tensor's colorimetry (pure — does not mutate the
+        // tensor). Missing axes are filled by the HD/SD height heuristic.
+        // Drives the EGL YUV color-space + sample-range hints below.
+        let cm = resolve_colorimetry(src.colorimetry(), src.height());
+        let yuv_encoding = cm.encoding.unwrap_or(ColorEncoding::Bt709);
+        let yuv_range = cm.range.unwrap_or(ColorRange::Limited);
 
         let (width, height, drm_fourcc, channels) = if src_fmt == PixelFormat::Nv12 {
             if !src_w.is_multiple_of(4) {
@@ -214,6 +228,8 @@ impl DmaImportAttrs {
             plane0_offset,
             plane1,
             is_yuv: src_fmt.is_yuv(),
+            yuv_encoding,
+            yuv_range,
         })
     }
 
@@ -295,7 +311,11 @@ impl DmaImportAttrs {
             plane0_pitch: tex_width,
             plane0_offset,
             plane1: None,
-            is_yuv: false, // R8 is not a multi-plane YUV fourcc; no YUV hints
+            is_yuv: false, // R8 is not a multi-plane YUV fourcc; no driver hints
+            // Path B applies the YUV→RGB matrix in-shader (per-tensor coeffs),
+            // so the driver EGL color-space/range hints are unused here.
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         })
     }
 
@@ -330,15 +350,26 @@ impl DmaImportAttrs {
         }
 
         if self.is_yuv {
-            // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
-            // "Colorimetry"): the HAL hardcodes BT.601 full-range (JFIF) for all
-            // YUV until per-source colorimetry tagging lands on the
-            // `feature/colorimetry` branch.
+            // Drive the driver's YUV→RGB matrix + range from the resolved
+            // per-tensor colorimetry rather than a fixed BT.709/limited.
+            let cs_hint = match self.yuv_encoding {
+                ColorEncoding::Bt601 => egl_ext::ITU_REC601,
+                ColorEncoding::Bt709 => egl_ext::ITU_REC709,
+                ColorEncoding::Bt2020 => egl_ext::ITU_REC2020,
+                // Future encodings default to BT.709 (HD broadcast).
+                _ => egl_ext::ITU_REC709,
+            };
+            let range_hint = match self.yuv_range {
+                ColorRange::Full => egl_ext::YUV_FULL_RANGE,
+                ColorRange::Limited => egl_ext::YUV_NARROW_RANGE,
+                // Future ranges default to narrow (broadcast convention).
+                _ => egl_ext::YUV_NARROW_RANGE,
+            };
             attrs.extend_from_slice(&[
                 egl_ext::YUV_COLOR_SPACE_HINT as Attrib,
-                egl_ext::ITU_REC601 as Attrib,
+                cs_hint as Attrib,
                 egl_ext::SAMPLE_RANGE_HINT as Attrib,
-                egl_ext::YUV_FULL_RANGE as Attrib,
+                range_hint as Attrib,
             ]);
         }
 
@@ -399,6 +430,7 @@ mod tests {
             height,
             PixelFormat::Nv12,
             edgefirst_tensor::DType::U8,
+            None,
         )
     }
 
@@ -779,6 +811,8 @@ mod tests {
                 offset: 0,
             }),
             is_yuv: true,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         };
 
         let egl = attrs.to_egl_attribs();
@@ -805,14 +839,14 @@ mod tests {
             Some(0)
         );
 
-        // YUV hints present (interim BT.601 full-range stop-gap)
+        // YUV hints present
         assert_eq!(
             egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT),
-            Some(egl_ext::ITU_REC601 as Attrib)
+            Some(egl_ext::ITU_REC709 as Attrib)
         );
         assert_eq!(
             egl_attrib_value(&egl, egl_ext::SAMPLE_RANGE_HINT),
-            Some(egl_ext::YUV_FULL_RANGE as Attrib)
+            Some(egl_ext::YUV_NARROW_RANGE as Attrib)
         );
 
         // Terminated with NONE
@@ -839,6 +873,8 @@ mod tests {
                 offset: luma_size,
             }),
             is_yuv: true,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         };
 
         let egl = attrs.to_egl_attribs();
@@ -872,6 +908,8 @@ mod tests {
                 offset: pitch * height,
             }),
             is_yuv: true,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         };
 
         let egl = attrs.to_egl_attribs();
@@ -901,6 +939,8 @@ mod tests {
             plane0_offset: 0,
             plane1: None,
             is_yuv: false,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         };
 
         let egl = attrs.to_egl_attribs();
@@ -936,6 +976,8 @@ mod tests {
                 offset: stride * height, // NOT width * height
             }),
             is_yuv: true,
+            yuv_encoding: ColorEncoding::Bt709,
+            yuv_range: ColorRange::Limited,
         };
 
         let egl = attrs.to_egl_attribs();
@@ -947,6 +989,78 @@ mod tests {
             "UV offset must use stride ({stride}×{height}={}) not width ({width}×{height}={})",
             stride * height,
             width * height,
+        );
+    }
+
+    // ─── Colorimetry-driven YUV hint tests ──────────────────────────────
+    // The EGL color-space + sample-range hints are selected from the
+    // resolved per-tensor colorimetry carried on `DmaImportAttrs`. These
+    // build the attr Vec only (no GPU), so they're the testable surface
+    // for the Linux EGL path.
+
+    /// Helper: build an NV12 attr struct with the given colorimetry.
+    fn nv12_attrs_with(encoding: ColorEncoding, range: ColorRange) -> DmaImportAttrs {
+        DmaImportAttrs {
+            width: 1920,
+            height: 1080,
+            drm_fourcc: DrmFourcc::Nv12,
+            plane0_fd: 10,
+            plane0_pitch: 1920,
+            plane0_offset: 0,
+            plane1: Some(DmaPlane1Attrs {
+                fd: 10,
+                pitch: 1920,
+                offset: 1920 * 1080,
+            }),
+            is_yuv: true,
+            yuv_encoding: encoding,
+            yuv_range: range,
+        }
+    }
+
+    /// BT.601 + Full range → ITU_REC601 + YUV_FULL_RANGE hints.
+    #[test]
+    fn test_egl_attribs_bt601_full() {
+        let attrs = nv12_attrs_with(ColorEncoding::Bt601, ColorRange::Full);
+        let egl = attrs.to_egl_attribs();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT),
+            Some(egl_ext::ITU_REC601 as Attrib),
+            "BT.601 must map to ITU_REC601"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::SAMPLE_RANGE_HINT),
+            Some(egl_ext::YUV_FULL_RANGE as Attrib),
+            "Full range must map to YUV_FULL_RANGE"
+        );
+    }
+
+    /// BT.709 + Limited range → ITU_REC709 + YUV_NARROW_RANGE hints.
+    #[test]
+    fn test_egl_attribs_bt709_limited() {
+        let attrs = nv12_attrs_with(ColorEncoding::Bt709, ColorRange::Limited);
+        let egl = attrs.to_egl_attribs();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT),
+            Some(egl_ext::ITU_REC709 as Attrib),
+            "BT.709 must map to ITU_REC709"
+        );
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::SAMPLE_RANGE_HINT),
+            Some(egl_ext::YUV_NARROW_RANGE as Attrib),
+            "Limited range must map to YUV_NARROW_RANGE"
+        );
+    }
+
+    /// BT.2020 → ITU_REC2020 hint.
+    #[test]
+    fn test_egl_attribs_bt2020() {
+        let attrs = nv12_attrs_with(ColorEncoding::Bt2020, ColorRange::Limited);
+        let egl = attrs.to_egl_attribs();
+        assert_eq!(
+            egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT),
+            Some(egl_ext::ITU_REC2020 as Attrib),
+            "BT.2020 must map to ITU_REC2020"
         );
     }
 

@@ -161,8 +161,9 @@ void main() {
 //                     (W pairs == two grid rows).
 // A linear UV byte offset is converted to a 2D texel so NV24's 2-row-per-
 // chroma-line layout is handled with no special case. The byte offsets match
-// the codec's `row * grid_row_stride + col` writer exactly. BT.601 full-range
-// matches the codec + CPU kernels (interim colorimetry stop-gap).
+// the codec's `row * grid_row_stride + col` writer exactly. The YUV→RGB matrix
+// + range come from the per-tensor colorimetry uniforms (y_offset/y_scale/
+// c_vr/c_ug/c_vg/c_ub), matching the Linux Path B NV shader and CPU kernels.
 const NV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
 precision highp float;
 precision highp int;
@@ -171,6 +172,14 @@ uniform ivec2 img_size;
 uniform int tex_width;
 uniform ivec2 chroma_shift;
 uniform int uv_row_bytes;
+// Per-tensor colorimetry (YUV→RGB matrix + range), set per-convert from the
+// source tensor's resolved colorimetry — mirrors the Linux Path B NV shader.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
 in vec2 v_uv;
 out vec4 frag;
 
@@ -193,11 +202,18 @@ void main() {
     float u = fetch_r(cb);
     float v = fetch_r(cb + 1);
 
+    // Floor the expanded luma at 0, matching the CPU `yuv` crate's saturating
+    // `(Y - 16)` term: limited-range footroom (Y<16) folds to 0 instead of
+    // going negative. The top end is intentionally NOT capped here — the crate
+    // lets headroom (Y>235) exceed 1.0 and relies on the final per-channel RGB
+    // clamp below, so the GPU must do the same to agree bit-for-bit. No-op for
+    // full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
     float up = u - 128.0 / 255.0;
     float vp = v - 128.0 / 255.0;
-    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
     frag = vec4(r, g, b, 1.0);
 }
 "#;
@@ -486,6 +502,14 @@ pub struct MacosGlProcessor {
     uniform_nv_tex_width: i32,
     uniform_nv_chroma_shift: i32,
     uniform_nv_uv_row_bytes: i32,
+    /// Per-tensor colorimetry uniforms for the NV→RGBA program (YUV→RGB
+    /// matrix + range), mirroring the Linux Path B NV shader.
+    uniform_nv_y_offset: i32,
+    uniform_nv_y_scale: i32,
+    uniform_nv_c_vr: i32,
+    uniform_nv_c_ug: i32,
+    uniform_nv_c_vg: i32,
+    uniform_nv_c_ub: i32,
     /// Program: RGBA8 source IOSurface → PlanarRgb F16 destination
     /// IOSurface — zero-copy preprocessing for ONNX+CoreML. The shader
     /// writes RGBA16F-packed half-floats; GL handles the implicit
@@ -810,6 +834,12 @@ impl MacosGlProcessor {
                 gls::gl::GetUniformLocation(program_nv, c"chroma_shift".as_ptr());
             let uniform_nv_uv_row_bytes =
                 gls::gl::GetUniformLocation(program_nv, c"uv_row_bytes".as_ptr());
+            let uniform_nv_y_offset = gls::gl::GetUniformLocation(program_nv, c"y_offset".as_ptr());
+            let uniform_nv_y_scale = gls::gl::GetUniformLocation(program_nv, c"y_scale".as_ptr());
+            let uniform_nv_c_vr = gls::gl::GetUniformLocation(program_nv, c"c_vr".as_ptr());
+            let uniform_nv_c_ug = gls::gl::GetUniformLocation(program_nv, c"c_ug".as_ptr());
+            let uniform_nv_c_vg = gls::gl::GetUniformLocation(program_nv, c"c_vg".as_ptr());
+            let uniform_nv_c_ub = gls::gl::GetUniformLocation(program_nv, c"c_ub".as_ptr());
 
             Ok(Self {
                 program_yuyv_to_rgba: program,
@@ -823,6 +853,12 @@ impl MacosGlProcessor {
                 uniform_nv_tex_width,
                 uniform_nv_chroma_shift,
                 uniform_nv_uv_row_bytes,
+                uniform_nv_y_offset,
+                uniform_nv_y_scale,
+                uniform_nv_c_vr,
+                uniform_nv_c_ug,
+                uniform_nv_c_vg,
+                uniform_nv_c_ub,
                 program_rgba8_to_planar_f16: program_rgba8_planar_f16,
                 uniform_rgba8_to_planar_f16_src,
                 uniform_rgba8_to_planar_f16_dst_size,
@@ -1413,6 +1449,24 @@ impl MacosGlProcessor {
                         layout.shift_y as i32,
                     );
                     gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
+                    // YUV→RGB matrix + range from the source colorimetry
+                    // (mirrors the Linux Path B NV shader; missing axes filled
+                    // by the SD/HD height heuristic).
+                    let cm = crate::colorimetry::resolve_colorimetry(
+                        src_u8.colorimetry(),
+                        src_u8.height(),
+                    );
+                    let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
+                        cm.encoding
+                            .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                        cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+                    );
+                    gls::gl::Uniform1f(self.uniform_nv_y_offset, coeffs.y_offset);
+                    gls::gl::Uniform1f(self.uniform_nv_y_scale, coeffs.y_scale);
+                    gls::gl::Uniform1f(self.uniform_nv_c_vr, coeffs.c_vr);
+                    gls::gl::Uniform1f(self.uniform_nv_c_ug, coeffs.c_ug);
+                    gls::gl::Uniform1f(self.uniform_nv_c_vg, coeffs.c_vg);
+                    gls::gl::Uniform1f(self.uniform_nv_c_ub, coeffs.c_ub);
                 }
                 PixelFormat::Grey => {
                     gls::gl::UseProgram(self.program_grey_to_rgba);

@@ -243,7 +243,7 @@ static bench_result bench_import_reuse(struct hal_image_processor *proc,
 
     // Import the image — consumes pd (do NOT free pd after this)
     struct hal_tensor *src = hal_import_image(
-        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     // pd is consumed — do NOT call hal_plane_descriptor_free(pd)
     if (!src) {
         res.skip_reason = "hal_import_image failed";
@@ -338,7 +338,7 @@ static bench_result bench_import_pool(struct hal_image_processor *proc,
         }
 
         pool[i] = hal_import_image(
-            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
         if (!pool[i]) {
             for (int j = 0; j < i; j++) hal_tensor_free(pool[j]);
             res.skip_reason = "hal_import_image failed";
@@ -432,7 +432,7 @@ static bench_result bench_import_stride(struct hal_image_processor *proc,
     hal_plane_descriptor_set_stride(pd, 2048);
 
     struct hal_tensor *src = hal_import_image(
-        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     if (!src) {
         res.skip_reason = "hal_import_image with stride failed";
         return res;
@@ -526,7 +526,7 @@ static bench_result bench_import_multiplane(struct hal_image_processor *proc,
     // Both descriptors are consumed by hal_import_image()
     struct hal_tensor *src = hal_import_image(
         proc, y_pd, uv_pd, SRC_W, SRC_H,
-        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     // y_pd and uv_pd are consumed — do NOT free them
     if (!src) {
         res.skip_reason = "multiplane hal_import_image failed";
@@ -625,7 +625,7 @@ static bench_result bench_import_multiplane_strided(
 
     struct hal_tensor *src = hal_import_image(
         proc, y_pd, uv_pd, SRC_W, SRC_H,
-        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     if (!src) {
         res.skip_reason = "multiplane+stride hal_import_image failed";
         return res;
@@ -718,7 +718,7 @@ static bench_result bench_import_render_target(struct hal_image_processor *proc,
     }
 
     struct hal_tensor *dst = hal_import_image(
-        proc, pd, NULL, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, pd, NULL, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, NULL);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "render target import failed";
@@ -804,7 +804,7 @@ static bench_result bench_import_recreate(struct hal_image_processor *proc,
             return res;
         }
         struct hal_tensor *test = hal_import_image(
-            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
         if (!test) {
             hal_tensor_free(dst);
             res.skip_reason = "hal_import_image failed";
@@ -828,7 +828,7 @@ static bench_result bench_import_recreate(struct hal_image_processor *proc,
         close(ext_fd);
         if (!pd) break;
         struct hal_tensor *src = hal_import_image(
-            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
         if (src) {
             hal_image_processor_convert(proc, src, dst,
                                          HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
@@ -849,7 +849,7 @@ static bench_result bench_import_recreate(struct hal_image_processor *proc,
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         struct hal_tensor *src = hal_import_image(
-            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, pd, NULL, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
         if (src) {
             hal_image_processor_convert(proc, src, dst,
                                          HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
