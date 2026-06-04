@@ -270,6 +270,27 @@ test-capi:
 	@$(MAKE) -C crates/capi/tests test
 	@echo "✓ C API tests passed"
 
+# Optional CUDA device-pointer tests (convert -> cuda_map -> cudaMemcpy). Not
+# part of `make test`: they need a CUDA-capable GPU + libcudart at runtime.
+# On a dev PC with only the driver, install the CUDA runtime into the local
+# venv (`pip install nvidia-cuda-runtime-cu12`) and this target points the HAL's
+# dlopen at it via LD_LIBRARY_PATH. On Jetson/Orin libcudart is already on the
+# system path so the venv lookup is simply skipped. Runtime-skips cleanly when
+# no GPU/libcudart is present.
+.PHONY: test-cuda
+test-cuda:
+	@echo "Running CUDA device-pointer tests..."
+	@CUDART_LIB=$$( \
+		if [ -d venv ]; then \
+			find venv -name 'libcudart.so*' -printf '%h\n' 2>/dev/null | head -1; \
+		fi); \
+	if [ -n "$$CUDART_LIB" ]; then \
+		echo "  using venv libcudart at $$CUDART_LIB"; \
+	fi; \
+	LD_LIBRARY_PATH="$$CUDART_LIB:$$LD_LIBRARY_PATH" \
+		cargo test --features opengl -p edgefirst-image --lib cuda_map -- --nocapture
+	@echo "✓ CUDA device-pointer tests complete"
+
 .PHONY: bench
 bench:
 	@echo "Running benchmarks..."

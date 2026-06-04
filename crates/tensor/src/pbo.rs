@@ -237,9 +237,34 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
+        self.map_internal(None)
+    }
+
+    fn buffer_identity(&self) -> &BufferIdentity {
+        &self.identity
+    }
+}
+
+impl<T> PboTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Map the PBO so `as_slice()` exposes the full padded buffer (`byte_size`
+    /// bytes) rather than the shape-derived logical count. Mirrors
+    /// [`DmaTensor::map_with_byte_size`]: a CPU producer (e.g. the JPEG decoder)
+    /// or a strided convert source iterates rows via `effective_row_stride()`
+    /// without running past the slice. Crate-private; the only caller is
+    /// `Tensor::map()`, which already checks `byte_size <= capacity_bytes()`.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+        self.map_internal(Some(byte_size))
+    }
+
+    fn map_internal(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
         if self.handle.mapped.swap(true, Ordering::AcqRel) {
             return Err(Error::PboMapped);
         }
+        // Always map the full GL allocation (`handle.size`); the slice length is
+        // narrowed by `byte_size_override` (or the logical shape) at access time.
         match self
             .handle
             .ops
@@ -254,6 +279,7 @@ where
                     ptr: Arc::new(Mutex::new(pbo_ptr)),
                     shape: self.shape.clone(),
                     handle: Arc::clone(&self.handle),
+                    byte_size_override,
                     _marker: PhantomData,
                 }))
             }
@@ -262,10 +288,6 @@ where
                 Err(e)
             }
         }
-    }
-
-    fn buffer_identity(&self) -> &BufferIdentity {
-        &self.identity
     }
 }
 
@@ -290,6 +312,12 @@ where
     ptr: Arc<Mutex<PboPtr>>,
     shape: Vec<usize>,
     handle: Arc<PboHandle>,
+    /// Optional override for `as_slice().len()`. `None` → `shape.product()`
+    /// elements (logical view). `Some(bytes)` → `bytes / sizeof(T)` elements,
+    /// exposing the full padded GL allocation so callers can iterate rows via
+    /// `row_stride` (set by `Tensor::map()` for strided PBO tensors). Mirrors
+    /// `DmaMap::byte_size_override`.
+    byte_size_override: Option<usize>,
     _marker: PhantomData<T>,
 }
 
@@ -323,12 +351,27 @@ where
 
     fn as_slice(&self) -> &[T] {
         let ptr = self.ptr.lock().expect("Failed to lock PboMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.slice_len_elems()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         let ptr = self.ptr.lock().expect("Failed to lock PboMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.slice_len_elems()) }
+    }
+}
+
+impl<T> PboMap<T>
+where
+    T: Num + Clone + fmt::Debug,
+{
+    /// Number of `T` elements exposed by `as_slice()`. Honours
+    /// `byte_size_override` (the full padded GL allocation) when set; otherwise
+    /// the shape-derived logical count. Mirrors `DmaMap::slice_len_elems`.
+    fn slice_len_elems(&self) -> usize {
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
     }
 }
 
