@@ -2891,15 +2891,23 @@ impl GLProcessorST {
         };
         if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
             // NV16/NV24: Path B (R8 texelFetch shader, ES 3.0 core).
-            // NV12: Path A (samplerExternalOES), proven on all targets — EXCEPT
-            // when the source width is not a multiple of 4: the NV12 YUV EGLImage
-            // import requires width % 4 == 0 on some drivers (e.g. V3D rejects
-            // "EGLImage requires width divisible by 4 for NV12"), so route those
-            // odd/non-mult-4 NV12 sources to Path B (the R8 shader has no width
-            // constraint and handles NV12 via chroma_shift=(1,1), chroma_lines=1).
-            // Everything else: Path A first, CPU upload fallback on error.
+            // NV12: Path A (samplerExternalOES YUV EGLImage) is only reliable on
+            // Vivante — on Mali-G310 (i.MX95) it samples garbage (GPU-vs-CPU
+            // max_diff 255), and the YUV EGLImage import also requires width % 4
+            // == 0 on some drivers (e.g. V3D). Restrict NV12 Path A to Vivante at
+            // a 4-aligned width; everything else takes Path B, the portable R8
+            // texelFetch shader (no width constraint; NV12 via chroma_shift=(1,1),
+            // chroma_lines=1). Path B already covers NV16/NV24 on every target.
+            // True-multiplane NV12 (separate Y/UV DMA-BUFs) MUST stay on Path A:
+            // Path B imports a single combined-plane R8 buffer and cannot address
+            // separate planes. For single-plane (combined) NV12, Path A is only
+            // reliable on Vivante (garbage on Mali), so restrict it to Vivante at
+            // a 4-aligned width; everything else takes the portable Path B.
+            let nv12_path_a_ok = src_fmt == PixelFormat::Nv12
+                && src_w.is_multiple_of(4)
+                && (src.is_multiplane() || self.is_vivante);
             let use_path_b = matches!(src_fmt, PixelFormat::Nv16 | PixelFormat::Nv24)
-                || (src_fmt == PixelFormat::Nv12 && !src_w.is_multiple_of(4));
+                || (src_fmt == PixelFormat::Nv12 && !nv12_path_a_ok);
 
             if use_path_b {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
@@ -6184,6 +6192,13 @@ impl GLProcessorST {
 
     /// Report the float render support that this processor instance should
     /// advertise.  Delegates to [`float_render_support`].
+    /// Whether the GPU is a Verisilicon/Vivante core (GL_RENDERER). Used by
+    /// tests to gate properties that only hold on Vivante's NV12 path (e.g. the
+    /// contiguous-vs-multiplane equality, which splits Path A/B off Vivante).
+    pub(super) fn is_vivante(&self) -> bool {
+        self.is_vivante
+    }
+
     pub(super) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
         float_render_support(
             self.is_vivante,
