@@ -56,6 +56,7 @@ const EGL_TEXTURE_2D: i32 = 0x305F;
 // `gles` crate isn't directly available here, so hardcode the values
 // from the spike. These have been part of OpenGL ES since 3.0 / the
 // GL_EXT_texture_format_BGRA8888 extension.
+const GL_RED: i32 = 0x1903;
 const GL_RG: i32 = 0x8227;
 const GL_RGBA: i32 = 0x1908;
 const GL_BGRA_EXT: i32 = 0x80E1;
@@ -68,6 +69,7 @@ const GL_HALF_FLOAT: i32 = 0x140B;
 // GL_RGBA)` = RGBA16F, mapped from FourCC `'RGhA'`
 // (kCVPixelFormatType_64RGBAHalf). No R32F, R16F, or RGBA32F binding
 // is accepted by the spec — calls return `EGL_BAD_ATTRIBUTE`.
+const FOURCC_L008: u32 = u32::from_be_bytes(*b"L008"); // 1-channel 8-bit (GREY / semi-planar YUV byte plane, GL_RED)
 const FOURCC_2C08: u32 = u32::from_be_bytes(*b"2C08"); // 2-channel 8-bit (YUYV-as-GL_RG)
 const FOURCC_RGBA: u32 = u32::from_be_bytes(*b"RGBA"); // 32-bit RGBA8888
 const FOURCC_BGRA: u32 = u32::from_be_bytes(*b"BGRA"); // 32-bit BGRA8888
@@ -192,6 +194,18 @@ impl ImageLayout {
                 })?;
                 (width, sh)
             }
+            // Semi-planar YUV bound as a single R8 plane: the combined-plane
+            // surface sized to the 64-aligned row pitch (matches the tensor
+            // allocation in `iosurface::new_image`; see
+            // `PixelFormat::semi_planar_surface_dims` for the ANGLE width==pitch
+            // rationale — the single source of truth for both allocators).
+            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => fmt
+                .semi_planar_surface_dims(width, height, bytes_per_element)
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "{fmt:?} has no semi-planar surface dims for {width}x{height}"
+                    ))
+                })?,
             _ => (width, height),
         };
         Ok(Self {
@@ -206,31 +220,37 @@ impl ImageLayout {
         })
     }
 
-    fn gl_type(&self) -> i32 {
+    // gl_type / gl_internal_format return `Result` rather than `unreachable!`:
+    // a `(dtype, FourCC)` that `image_iosurface_layout` accepts but these maps
+    // don't handle is a table-drift developer error (adding a format requires
+    // updating both the tensor-crate FourCC table and these GL pairings), not a
+    // runtime condition — but a clean error beats a panic if the two ever drift.
+    fn gl_type(&self) -> Result<i32, Error> {
         match self.dtype {
-            DType::U8 | DType::I8 => GL_UNSIGNED_BYTE,
+            DType::U8 | DType::I8 => Ok(GL_UNSIGNED_BYTE),
             // Per `EGL_ANGLE_iosurface_client_buffer.txt`, F16 is the
             // only ANGLE-supported float; we always use the packed
             // `GL_HALF_FLOAT + GL_RGBA` binding regardless of whether
             // the destination is packed Rgba or planar (planar uses
             // 4-element pixel packing).
-            DType::F16 => GL_HALF_FLOAT,
-            other => unreachable!(
-                "ImageLayout::gl_type: dtype {other:?} not supported on the GL/IOSurface path \
-                 (rejected earlier by image_iosurface_layout)"
-            ),
+            DType::F16 => Ok(GL_HALF_FLOAT),
+            other => Err(Error::NotSupported(format!(
+                "ImageLayout::gl_type: dtype {other:?} has no GL/IOSurface type mapping \
+                 (table drift vs image_iosurface_layout)"
+            ))),
         }
     }
 
-    fn gl_internal_format(&self) -> i32 {
+    fn gl_internal_format(&self) -> Result<i32, Error> {
         // The FourCC ↔ GL-internal-format mapping is image-side: the
         // tensor crate owns the FourCC choice (via `image_iosurface_layout`)
         // and this side owns the GL pairing. Adding a new shader requires
         // both sides to agree.
         match self.fourcc {
-            FOURCC_2C08 => GL_RG,
-            FOURCC_RGBA => GL_RGBA,
-            FOURCC_BGRA => GL_BGRA_EXT,
+            FOURCC_L008 => Ok(GL_RED),
+            FOURCC_2C08 => Ok(GL_RG),
+            FOURCC_RGBA => Ok(GL_RGBA),
+            FOURCC_BGRA => Ok(GL_BGRA_EXT),
             // RGBA16F: ANGLE's own
             // `EGLIOSurfaceClientBufferTest::RenderToRGBA16FIOSurface`
             // test uses the UNSIZED `GL_RGBA` (paired with
@@ -239,11 +259,11 @@ impl ImageLayout {
             // framebuffer; passing the sized `GL_RGBA16F` directly
             // is rejected with `EGL_BAD_ATTRIBUTE`. See ANGLE source
             // `src/tests/egl_tests/EGLIOSurfaceClientBufferTest.cpp`.
-            FOURCC_RGHA => GL_RGBA,
-            other => unreachable!(
-                "unsupported IOSurface FourCC 0x{other:08X} in GL import — \
-                 add a mapping here when extending image_iosurface_layout()"
-            ),
+            FOURCC_RGHA => Ok(GL_RGBA),
+            other => Err(Error::NotSupported(format!(
+                "unsupported IOSurface FourCC 0x{other:08X} in GL import \
+                 (table drift vs image_iosurface_layout)"
+            ))),
         }
     }
 }
@@ -410,6 +430,8 @@ pub(super) unsafe fn create_iosurface_pbuffer(
         })?;
     let create_pbuffer: FnCreatePbufferFromClientBuffer = std::mem::transmute(create_pbuffer_ptr);
 
+    let gl_internal_format = layout.gl_internal_format()?;
+    let gl_type = layout.gl_type()?;
     let attribs = [
         egl::WIDTH,
         layout.surface_width as i32,
@@ -420,11 +442,11 @@ pub(super) unsafe fn create_iosurface_pbuffer(
         EGL_TEXTURE_TARGET,
         EGL_TEXTURE_2D,
         EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,
-        layout.gl_internal_format(),
+        gl_internal_format,
         EGL_TEXTURE_FORMAT,
         EGL_TEXTURE_RGBA,
         EGL_TEXTURE_TYPE_ANGLE,
-        layout.gl_type(),
+        gl_type,
         egl::NONE,
     ];
 
@@ -448,8 +470,8 @@ pub(super) unsafe fn create_iosurface_pbuffer(
             surface_w = layout.surface_width,
             surface_h = layout.surface_height,
             fc = layout.fourcc,
-            ifmt = layout.gl_internal_format(),
-            ty = layout.gl_type(),
+            ifmt = gl_internal_format,
+            ty = gl_type,
             bpe = layout.bytes_per_element,
         ))));
     }

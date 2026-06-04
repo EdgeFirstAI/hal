@@ -123,15 +123,18 @@ where
         name: Option<&str>,
         ops: Arc<dyn PboOps>,
     ) -> Result<Self> {
-        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        if size != expected {
-            return Err(Error::ShapeMismatch(format!(
-                "PBO size {size} does not match shape {shape:?} * sizeof({}) = {expected}",
-                std::any::type_name::<T>(),
-            )));
-        }
         if size == 0 {
             return Err(Error::InvalidSize(0));
+        }
+        let expected = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        // Allow `size >= expected`: PBOs allocated with a 64-byte-aligned row
+        // stride may be larger than the shape product.  Reject only if the
+        // allocation is strictly smaller than the logical content.
+        if size < expected {
+            return Err(Error::ShapeMismatch(format!(
+                "PBO size {size} is smaller than shape {shape:?} * sizeof({}) = {expected}",
+                std::any::type_name::<T>(),
+            )));
         }
         let name = name.unwrap_or("pbo_tensor").to_owned();
         Ok(Self {
@@ -205,6 +208,29 @@ where
                 "Cannot reshape incompatible shape: {:?} to {:?}",
                 self.shape, shape
             )));
+        }
+        self.shape = shape.to_vec();
+        Ok(())
+    }
+
+    fn capacity_bytes(&self) -> usize {
+        self.handle.size
+    }
+
+    /// Capacity-based reconfigure (mirrors Mem/Shm/DMA/IOSurface): allow any
+    /// shape whose byte size fits the PBO allocation, so an oversized reusable
+    /// pool can be `configure_image`d to a smaller image. Without this PBO fell
+    /// back to the strict-`reshape` default and rejected pool reuse.
+    fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+        let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        if needed > self.handle.size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.handle.size,
+            });
         }
         self.shape = shape.to_vec();
         Ok(())
@@ -430,6 +456,27 @@ mod tests {
         assert_eq!(tensor.shape(), &[4, 6]);
         let result = tensor.reshape(&[100]);
         assert!(result.is_err(), "incompatible reshape should fail");
+    }
+
+    #[test]
+    fn test_pbo_tensor_set_logical_shape_capacity_based() {
+        // A 24-byte PBO can be reconfigured to any shape that fits (unlike the
+        // strict `reshape`), so an oversized reusable pool can be
+        // `configure_image`d to a smaller image (the native-chroma decode pool).
+        let ops = MockPboOps::new(24);
+        let mut tensor = PboTensor::<u8>::from_pbo(7, 24, &[24], None, ops).unwrap();
+        // Smaller-than-capacity logical shape is accepted (reshape would reject).
+        tensor
+            .set_logical_shape(&[4, 5])
+            .expect("shape within capacity should succeed");
+        assert_eq!(tensor.shape(), &[4, 5]);
+        // Exactly-capacity is fine.
+        tensor.set_logical_shape(&[24]).unwrap();
+        // Over-capacity is rejected.
+        assert!(
+            tensor.set_logical_shape(&[5, 5]).is_err(),
+            "shape exceeding PBO capacity must be rejected"
+        );
     }
 
     #[test]

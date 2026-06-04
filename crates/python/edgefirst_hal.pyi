@@ -1050,16 +1050,15 @@ class Tensor:
             data = np.random.rand(480, 640, 3).astype(np.float32)
 
             with tensor.map() as m:
-                # Wrap the raw buffer as a numpy array and copy into it
-                dst = np.frombuffer(m.view(), dtype=np.float32)
-                dst = dst.reshape(tensor.shape)
+                # np.asarray(memoryview(m)) honours the buffer-protocol strides,
+                # so padded (DMA/GPU) tensors map correctly without shearing.
+                dst = np.asarray(memoryview(m))
                 dst[:] = data
 
         Example — read tensor data as numpy::
 
             with tensor.map() as m:
-                arr = np.frombuffer(m.view(), dtype=np.float32)
-                arr = arr.reshape(tensor.shape)
+                arr = np.asarray(memoryview(m))
                 print(arr.mean())
 
         .. tip::
@@ -1206,6 +1205,7 @@ class Tensor:
         self,
         dst: npt.NDArray[np.uint8]
         | npt.NDArray[np.int8]
+        | npt.NDArray[np.float16]
         | npt.NDArray[np.float32]
         | npt.NDArray[np.float64],
         normalization: "Normalization" = ...,
@@ -1281,6 +1281,20 @@ class Tensor:
     @property
     def height(self) -> int | None:
         """Image height in pixels (None if not an image tensor)."""
+        ...
+
+    @property
+    def row_stride(self) -> int | None:
+        """Physical row pitch in bytes, or ``None`` for tightly packed tensors.
+
+        Set for every image tensor allocated via :meth:`image` or configured
+        via ``configure_image`` (DMA, IOSurface, and self-allocated semi-planar
+        tensors always carry a 64-byte-aligned stride). ``None`` only for
+        non-image tensors or raw tensors without a pixel format.
+
+        Use :meth:`effective_row_stride` when you need a non-``None`` fallback
+        equal to the minimum tight stride.
+        """
         ...
 
     @property
@@ -1402,6 +1416,10 @@ class PixelFormat(enum.Enum):
 
     Nv16: PixelFormat
     """Semi-planar YUV 4:2:2 [H*2, W]"""
+
+    Nv24: PixelFormat
+    """Semi-planar YUV 4:4:4 [H*3, W] (full chroma). Emitted by the JPEG
+    decoder for 4:4:4 sources."""
 
     PlanarRgb: PixelFormat
     """Planar RGB, channels-first [3, H, W]"""

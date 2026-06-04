@@ -50,20 +50,69 @@ impl McuScratch {
     }
 }
 
-/// Decode all MCUs and write output pixels into `dst` at `dst_stride` byte
-/// offsets. `output_format` must be `Grey` or `Nv12`.
+/// Decode all MCUs and write output pixels into `dst` on a fixed **physical
+/// grid** whose row pitch is `grid_row_stride` bytes.
+///
+/// `grid_row_stride` is the destination's physical row stride — the IOSurface
+/// `bytesPerRow` / allocator pitch for a reused pool, which is `>=` the format's
+/// natural row width (`even_width = ceil(img_w/2)*2` for semi-planar). The
+/// logical image wraps on its natural width while every row is *placed* at
+/// `grid_row_stride`, so the same byte layout is produced for a tightly-packed
+/// buffer and a padded pool surface. This is the identical split the GPU R8
+/// sampling shader applies (logical wrap vs. physical placement), keeping the
+/// codec and shader provably in agreement. `output_format` must be `Grey`,
+/// `Nv12`, `Nv16`, or `Nv24`.
 pub fn decode_image(
     data: &[u8],
     headers: &JpegHeaders,
     scratch: &mut McuScratch,
     dst: &mut [u8],
-    dst_stride: usize,
+    grid_row_stride: usize,
     output_format: PixelFormat,
 ) -> crate::Result<()> {
     let hdr = &headers.header;
     let img_w = hdr.width as usize;
     let img_h = hdr.height as usize;
     let num_components = hdr.components.len();
+
+    // The physical grid must be wide enough to place a full natural row, and
+    // `dst` must hold every row. A luma-only output (greyscale JPEG, or an
+    // explicit `Grey` target) writes exactly `img_w` bytes per row, so a
+    // tightly-packed odd-width buffer (stride == odd `img_w`) is valid;
+    // semi-planar colour formats interleave full-width UV pairs and need
+    // `even(img_w)` to keep chroma columns byte-aligned. These are runtime
+    // checks (not `debug_assert!`) because `decode_image` is public and takes a
+    // caller-supplied `dst`/`grid_row_stride`: malformed/untrusted dimensions
+    // must return an error, not panic or write out of bounds in release builds.
+    let writes_only_luma = num_components == 1 || output_format == PixelFormat::Grey;
+    let min_stride = if writes_only_luma {
+        img_w
+    } else {
+        img_w.next_multiple_of(2)
+    };
+    if grid_row_stride < min_stride {
+        return Err(CodecError::InvalidData(format!(
+            "grid_row_stride {grid_row_stride} < required {min_stride} for {output_format:?} \
+             at {img_w}x{img_h}"
+        )));
+    }
+    let total_rows = if writes_only_luma {
+        img_h
+    } else {
+        output_format
+            .combined_plane_height(img_h)
+            .ok_or(CodecError::UnsupportedFormat(output_format))?
+    };
+    let needed = grid_row_stride.checked_mul(total_rows).ok_or_else(|| {
+        CodecError::InvalidData(format!("decode size overflow at {img_w}x{img_h}"))
+    })?;
+    if dst.len() < needed {
+        return Err(CodecError::InvalidData(format!(
+            "destination buffer {} bytes < required {needed} for {output_format:?} \
+             {img_w}x{img_h} @ stride {grid_row_stride}",
+            dst.len()
+        )));
+    }
 
     let idct_fn: IdctFn = idct::select_idct();
     let idct_dc_fn: IdctDcOnlyFn = idct::select_idct_dc_only();
@@ -160,7 +209,7 @@ pub fn decode_image(
                 &scratch.component_bufs[0],
                 y_stride,
                 dst,
-                dst_stride,
+                grid_row_stride,
                 y_start,
                 num_rows,
                 img_w,
@@ -171,11 +220,26 @@ pub fn decode_image(
                 &scratch.component_bufs,
                 mcus_x,
                 dst,
-                dst_stride,
+                grid_row_stride,
                 y_start,
                 num_rows,
                 img_w,
                 img_h,
+            );
+        } else if output_format == PixelFormat::Nv16 || output_format == PixelFormat::Nv24 {
+            // Native (matching-subsampling) chroma: a direct interleave copy of
+            // the IDCT chroma buffers — no `avg_block` resampling.
+            write_nv16_nv24_rows(
+                hdr,
+                &scratch.component_bufs,
+                mcus_x,
+                dst,
+                grid_row_stride,
+                y_start,
+                num_rows,
+                img_w,
+                img_h,
+                output_format,
             );
         } else {
             return Err(CodecError::UnsupportedFormat(output_format));
@@ -191,14 +255,14 @@ fn write_grey_rows(
     y_buf: &[u8],
     y_stride: usize,
     dst: &mut [u8],
-    dst_stride: usize,
+    grid_row_stride: usize,
     y_start: usize,
     num_rows: usize,
     img_w: usize,
 ) {
     for row in 0..num_rows {
         let s = row * y_stride;
-        let d = (y_start + row) * dst_stride;
+        let d = (y_start + row) * grid_row_stride;
         dst[d..d + img_w].copy_from_slice(&y_buf[s..s + img_w]);
     }
 }
@@ -225,15 +289,16 @@ fn avg_block(plane: &[u8], stride: usize, x0: usize, y0: usize, xs: usize, ys: u
 /// to 4:2:0. Correct for any source subsampling (4:2:0 → passthrough, 4:2:2 →
 /// vertical average, 4:4:4 → 2×2 average).
 ///
-/// NV12 layout: `img_h` rows of `img_w` luma bytes at offset 0, then `img_h/2`
-/// rows of `img_w` interleaved Cb/Cr bytes at offset `img_h * dst_stride`.
+/// NV12 layout: `img_h` rows of `img_w` luma bytes at offset 0, then
+/// `ceil(img_h/2)` rows of interleaved Cb/Cr bytes at offset
+/// `img_h * grid_row_stride`.
 #[allow(clippy::too_many_arguments)]
 fn write_nv12_rows(
     hdr: &crate::jpeg::types::ImageHeader,
     comp_bufs: &[Vec<u8>],
     mcus_x: usize,
     dst: &mut [u8],
-    dst_stride: usize,
+    grid_row_stride: usize,
     y_start: usize,
     num_rows: usize,
     img_w: usize,
@@ -254,20 +319,27 @@ fn write_nv12_rows(
     // Y plane.
     for row in 0..num_rows {
         let s = row * y_stride;
-        let d = (y_start + row) * dst_stride;
+        let d = (y_start + row) * grid_row_stride;
         dst[d..d + img_w].copy_from_slice(&comp_bufs[0][s..s + img_w]);
     }
 
     // UV plane (4:2:0). The component buffer's local row 0 corresponds to the
     // global source-chroma row `band_src0`.
-    let uv_plane_offset = img_h * dst_stride;
-    let chroma_w = img_w / 2;
+    let uv_plane_offset = img_h * grid_row_stride;
+    // `ceil(img_w/2)` UV pairs per chroma row keeps the rightmost column for odd
+    // widths. The destination buffer width is rounded up to even, so the extra
+    // pair (`img_w + 1` bytes for odd `img_w`) stays within `grid_row_stride`.
+    let chroma_w = img_w.div_ceil(2);
     let band_src0 = (y_start * cb.sampling.v as usize) / max_v;
     let out_cy_start = y_start / 2;
-    let out_cy_end = (y_start + num_rows) / 2;
+    // Round up so an odd `img_h` keeps its final chroma row (e.g. a 483-tall
+    // image needs ceil(483/2) = 242 chroma rows, not 241). Only the last band
+    // reaches an odd boundary; intermediate bands end on even MCU heights where
+    // `div_ceil(2)` equals `/2`, so this never overlaps the next band.
+    let out_cy_end = (y_start + num_rows).div_ceil(2);
 
     for ocy in out_cy_start..out_cy_end {
-        let uv_off = uv_plane_offset + ocy * dst_stride;
+        let uv_off = uv_plane_offset + ocy * grid_row_stride;
         let src_y0 = ocy * y_samples - band_src0;
         for ocx in 0..chroma_w {
             let src_x0 = ocx * x_samples;
@@ -289,6 +361,76 @@ fn write_nv12_rows(
             );
             dst[uv_off + ocx * 2] = cbv;
             dst[uv_off + ocx * 2 + 1] = crv;
+        }
+    }
+}
+
+/// Write NV16 (4:2:2) or NV24 (4:4:4) output: full-resolution Y plane plus an
+/// interleaved Cb/Cr plane at the source's NATIVE chroma resolution — a direct
+/// copy, no averaging. The codec only selects these formats when the JPEG's
+/// chroma matches (NV16 ⇔ 4:2:2, NV24 ⇔ 4:4:4), so the source chroma buffers
+/// are already at the output resolution.
+///
+/// The destination uses the `[total_h, even_width]` grid (even_width =
+/// `ceil(img_w/2)*2`), where each grid row is `grid_row_stride` bytes (≥ even_width;
+/// padded for IOSurface). The interleaved UV plane starts after the `img_h`
+/// luma rows. A chroma row is `even_width` bytes for NV16 (one grid row) and
+/// `2*even_width` bytes for NV24 (two grid rows). Each UV byte is placed by
+/// mapping its linear offset to a `(grid_row, col)` cell, so NV24's two-row
+/// wrap is correct for any `grid_row_stride` (matches the GPU R8 sampling shader).
+#[allow(clippy::too_many_arguments)]
+fn write_nv16_nv24_rows(
+    hdr: &crate::jpeg::types::ImageHeader,
+    comp_bufs: &[Vec<u8>],
+    mcus_x: usize,
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    y_start: usize,
+    num_rows: usize,
+    img_w: usize,
+    img_h: usize,
+    output_format: PixelFormat,
+) {
+    let y_comp = &hdr.components[0];
+    let cb = &hdr.components[1];
+    let y_stride = mcus_x * y_comp.sampling.h as usize * 8;
+    let c_stride = mcus_x * cb.sampling.h as usize * 8;
+
+    // Y plane — full-resolution copy.
+    for row in 0..num_rows {
+        let s = row * y_stride;
+        let d = (y_start + row) * grid_row_stride;
+        dst[d..d + img_w].copy_from_slice(&comp_bufs[0][s..s + img_w]);
+    }
+
+    // Both keep full-height chroma (one chroma row per luma row); they differ in
+    // horizontal resolution. The per-format geometry comes from the shared
+    // `chroma_layout` (single source of truth with the CPU readers + GL shaders):
+    //   NV16 (4:2:2): shift_x=1 → ceil(W/2) pairs, uv_rows_per_luma=1.
+    //   NV24 (4:4:4): shift_x=0 → W pairs (2W bytes), uv_rows_per_luma=2.
+    let layout = output_format
+        .chroma_layout()
+        .expect("write_nv16_nv24_rows is only called for semi-planar NV16/NV24");
+    let chroma_cols = img_w.div_ceil(1 << layout.shift_x);
+    let uv_plane_offset = img_h * grid_row_stride;
+
+    let cb_buf = &comp_bufs[1];
+    let cr_buf = &comp_bufs[2];
+    for row in 0..num_rows {
+        let oy = y_start + row; // chroma row == luma row (full-height chroma)
+        let src = row * c_stride;
+        // The UV plane is contiguous: luma row `oy` starts at a grid-row
+        // boundary `uv_rows_per_luma * stride` into the plane, and successive
+        // (Cb,Cr) pairs are two consecutive bytes that flow naturally into the
+        // next physical grid row when `ocx*2` crosses `grid_row_stride` (the
+        // NV24 wrap). So the destination byte is simply `base + ocx*2` — no
+        // per-pixel divide/modulo needed (the old `/`,`%` recombined to exactly
+        // this linear offset).
+        let base = uv_plane_offset + oy * layout.uv_rows_per_luma * grid_row_stride;
+        for ocx in 0..chroma_cols {
+            let off = base + ocx * 2;
+            dst[off] = cb_buf[src + ocx];
+            dst[off + 1] = cr_buf[src + ocx];
         }
     }
 }
@@ -322,5 +464,64 @@ mod tests {
         let p = [5u8, 6, 7, 8];
         assert_eq!(avg_block(&p, 2, 1, 1, 1, 1), 8);
         assert_eq!(avg_block(&p, 2, 0, 0, 1, 1), 5);
+    }
+
+    fn test_jpeg(name: &str) -> Vec<u8> {
+        // Honour EDGEFIRST_TESTDATA_DIR for on-target runs (the compile-time
+        // manifest path does not exist on the board); fall back to the source
+        // tree for local runs.
+        let path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
+            .map(|d| std::path::PathBuf::from(d).join(name))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap()
+                    .join("testdata")
+                    .join(name)
+            });
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// The fixed-grid contract: decoding into a buffer whose physical row pitch
+    /// is padded beyond the natural width must place the same pixel bytes,
+    /// row-for-row, as a tightly-packed decode. This is what lets the profiler
+    /// reuse one oversized pool surface (padded `bytesPerRow`) for every frame.
+    #[test]
+    fn decode_padded_grid_matches_tight() {
+        let jpeg = test_jpeg("zidane.jpg"); // 1280×720, NV12 (4:2:0), even dims
+        let headers = super::super::markers::parse_markers(&jpeg).unwrap();
+        let img_w = headers.header.width as usize;
+        let img_h = headers.header.height as usize;
+        let fmt = super::super::native_format(&headers).unwrap();
+        assert_eq!(fmt, PixelFormat::Nv12);
+
+        let even_w = img_w.next_multiple_of(2);
+        // NV12 combined plane height = luma + ceil(h/2) chroma rows; over-size to
+        // 2·h rows so both the tight and padded buffers hold the full grid.
+        let rows = img_h * 2;
+        let tight = even_w;
+        let padded = even_w + 64; // physical pitch > natural width
+
+        let mut scratch = McuScratch::new(&headers);
+        scratch.ensure_capacity(&headers);
+        let mut buf_tight = vec![0u8; rows * tight];
+        let mut buf_padded = vec![0u8; rows * padded];
+
+        decode_image(&jpeg, &headers, &mut scratch, &mut buf_tight, tight, fmt).unwrap();
+        decode_image(&jpeg, &headers, &mut scratch, &mut buf_padded, padded, fmt).unwrap();
+
+        // Luma (img_h rows) + chroma (ceil(img_h/2) rows) live on the same grid,
+        // each placed at its stride. The natural-width content of every used row
+        // must be byte-identical.
+        let used_rows = img_h + img_h.div_ceil(2);
+        for gr in 0..used_rows {
+            let t = &buf_tight[gr * tight..gr * tight + even_w];
+            let p = &buf_padded[gr * padded..gr * padded + even_w];
+            assert_eq!(
+                t, p,
+                "grid row {gr} differs between tight and padded layout"
+            );
+        }
     }
 }

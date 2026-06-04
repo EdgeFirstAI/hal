@@ -80,6 +80,9 @@ extern "C" {
     fn IOSurfaceUnlock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
     fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: IOSurfaceRef) -> usize;
+    fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
+    fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
+    fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
     fn IOSurfaceGetID(surface: IOSurfaceRef) -> u32;
 
     fn CFRetain(cf: *const c_void) -> *const c_void;
@@ -178,6 +181,13 @@ where
     identity: BufferIdentity,
     /// Total bytes allocated by the IOSurface (from `IOSurfaceGetAllocSize`).
     pub(crate) buf_size: usize,
+    /// Row pitch in bytes (from `IOSurfaceGetBytesPerRow`). IOSurface rounds
+    /// this up to 64-byte alignment, so for image-formatted surfaces it can
+    /// exceed the natural `width × bytes_per_pixel`. Image-formatted tensors
+    /// carry this as their row stride so CPU consumers iterate rows correctly;
+    /// raw byte surfaces (`new_with_byte_size`, a single padded row) leave the
+    /// tensor stride natural.
+    pub(crate) bytes_per_row: usize,
     /// Whether this tensor was constructed from an externally-provided
     /// IOSurface via `from_surface`. Mirrors `DmaTensor::is_imported`
     /// and is reserved for diagnostic and C-API parity uses. Not yet
@@ -301,6 +311,7 @@ where
         unsafe { CFRelease(dict as *const c_void) };
         let surface = OwnedIoSurface::from_created(ptr)?;
         let alloc = unsafe { IOSurfaceGetAllocSize(surface.as_ptr()) };
+        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(surface.as_ptr()) };
 
         let name = match name {
             Some(s) => s.to_owned(),
@@ -316,6 +327,7 @@ where
             _marker: PhantomData,
             identity: BufferIdentity::new(),
             buf_size: alloc,
+            bytes_per_row,
             is_imported: false,
         })
     }
@@ -396,6 +408,17 @@ where
                 })?;
                 (width, sh)
             }
+            // Semi-planar YUV (NV12/NV16/NV24): bind the whole contiguous
+            // combined-plane buffer as one R8 texture, sized to the 64-aligned
+            // row pitch (see `PixelFormat::semi_planar_surface_dims` for the
+            // ANGLE width==pitch rationale).
+            (PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24, _) => format
+                .semi_planar_surface_dims(width, height, bpe)
+                .ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "{format:?} has no semi-planar surface dims for {width}x{height}"
+                    ))
+                })?,
             _ => (width, height),
         };
 
@@ -404,6 +427,7 @@ where
         unsafe { CFRelease(dict) };
         let surface = OwnedIoSurface::from_created(ptr)?;
         let alloc = unsafe { IOSurfaceGetAllocSize(surface.as_ptr()) };
+        let bytes_per_row = unsafe { IOSurfaceGetBytesPerRow(surface.as_ptr()) };
 
         let name = match name {
             Some(s) => s.to_owned(),
@@ -412,7 +436,8 @@ where
 
         trace!(
             "IoSurfaceTensor::new_image: name={name} surface={surface_width}x{surface_height} \
-             logical={width}x{height} {format:?}/{dtype:?} fourcc=0x{fourcc:08x} bytes={alloc}",
+             logical={width}x{height} {format:?}/{dtype:?} fourcc=0x{fourcc:08x} bytes={alloc} \
+             bytes_per_row={bytes_per_row}",
         );
 
         Ok(Self {
@@ -422,6 +447,7 @@ where
             _marker: PhantomData,
             identity: BufferIdentity::new(),
             buf_size: alloc,
+            bytes_per_row,
             is_imported: false,
         })
     }
@@ -459,6 +485,7 @@ where
     ) -> Result<Self> {
         let surface = OwnedIoSurface::from_external(surface_ref)?;
         let alloc = IOSurfaceGetAllocSize(surface.as_ptr());
+        let bytes_per_row = IOSurfaceGetBytesPerRow(surface.as_ptr());
 
         let elem_size = std::mem::size_of::<T>();
         let elems: usize = shape.iter().product();
@@ -485,8 +512,61 @@ where
             _marker: PhantomData,
             identity: BufferIdentity::new(),
             buf_size: alloc,
+            bytes_per_row,
             is_imported: true,
         })
+    }
+
+    /// Row pitch in bytes as reported by `IOSurfaceGetBytesPerRow` (64-byte
+    /// aligned). For image-formatted surfaces this is the authoritative row
+    /// stride; CPU consumers must iterate rows by this value, not by
+    /// `width × bytes_per_pixel`.
+    pub(crate) fn bytes_per_row(&self) -> usize {
+        self.bytes_per_row
+    }
+
+    /// Physical IOSurface dimensions in *texels* (`IOSurfaceGetWidth` /
+    /// `IOSurfaceGetHeight`), independent of the tensor's current logical shape.
+    ///
+    /// A reused pool surface keeps these fixed for its whole life while
+    /// `configure_image` changes the logical frame shape per decode. The GL
+    /// backend binds the EGL pbuffer at these physical dims so one cached
+    /// pbuffer serves every frame, and `texelFetch(col, row)` resolves to memory
+    /// `row * bytes_per_row + col` (the row pitch is carried by the surface, not
+    /// the declared texel width) — matching the codec's fixed-grid byte layout.
+    pub(crate) fn physical_surface_dims(&self) -> (usize, usize) {
+        let w = unsafe { IOSurfaceGetWidth(self.surface.as_ptr()) };
+        let h = unsafe { IOSurfaceGetHeight(self.surface.as_ptr()) };
+        (w, h)
+    }
+
+    /// Row pitch to honour as an *image* stride when a tensor is reconfigured
+    /// to a smaller image (`Tensor::configure_image`), or `None` for a generic
+    /// byte-bag surface.
+    ///
+    /// A byte-bag (`new_with_byte_size`) is a single `height == 1` row whose
+    /// `bytes_per_row` equals the entire allocation — meaningless as a per-row
+    /// image pitch. Adopting it would set a row stride spanning the whole buffer
+    /// and blow up the strided map's size check. Only genuine 2D image-formatted
+    /// surfaces (`new_image`, height > 1) carry a real row pitch to preserve.
+    pub(crate) fn image_backing_row_stride(&self) -> Option<usize> {
+        let (_w, h) = self.physical_surface_dims();
+        (h > 1).then_some(self.bytes_per_row)
+    }
+
+    /// Lock and map exposing `byte_size` bytes via `as_slice()` for strided
+    /// row iteration. The caller (`Tensor::map`) validates
+    /// `byte_size <= buf_size` first. The IOSurface lock yields the full
+    /// surface base address, so the strided view is genuinely zero-copy — no
+    /// staging buffer, just a wider slice over the same locked allocation.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+        let m = IoSurfaceMap::new_with_byte_size(
+            self.surface.clone(),
+            self.shape.clone(),
+            self.buf_size,
+            byte_size,
+        )?;
+        Ok(TensorMap::IoSurface(m))
     }
 
     /// Raw `IOSurfaceID` for cross-process sharing or GL backend import.
@@ -539,6 +619,20 @@ where
         }
     }
 
+    /// Physical IOSurface dimensions in texels (`IOSurfaceGetWidth` /
+    /// `IOSurfaceGetHeight`), independent of the logical shape. `None` when not
+    /// IOSurface-backed.
+    ///
+    /// The GL backend binds the EGL pbuffer at these dims so one cached pbuffer
+    /// serves every frame a reused pool surface holds; `texelFetch` then
+    /// resolves to `row * bytesPerRow + col` against the surface's real pitch.
+    pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
+        match &self.storage {
+            crate::TensorStorage::Dma(io_tensor) => Some(io_tensor.physical_surface_dims()),
+            _ => None,
+        }
+    }
+
     /// Wrap an externally-allocated IOSurface as a tensor (macOS only).
     ///
     /// Used to import IOSurfaces from VideoToolbox, AVFoundation, or
@@ -584,6 +678,12 @@ where
     shape: Vec<usize>,
     base_ptr: NonNull<c_void>,
     buf_size: usize,
+    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
+    /// (the full row-padded surface) instead of `shape.product()`. Mirrors
+    /// `DmaMap`/`MemMap`/`ShmMap`: used for strided IOSurface tensors so CPU
+    /// callers iterate rows via `effective_row_stride()` (= `bytes_per_row`)
+    /// without running past the locked region.
+    byte_size_override: Option<usize>,
     _marker: PhantomData<T>,
     /// Lock options used at map time, replayed in unmap for symmetry.
     lock_options: u32,
@@ -598,6 +698,28 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn new(surface: OwnedIoSurface, shape: Vec<usize>, buf_size: usize) -> Result<Self> {
+        Self::new_inner(surface, shape, buf_size, None)
+    }
+
+    /// Lock the surface and expose `byte_size` bytes via `as_slice()` rather
+    /// than the shape-derived element count — for strided IOSurface tensors
+    /// whose rows are `bytes_per_row`-padded. The caller (`Tensor::map`)
+    /// validates `byte_size <= buf_size` first.
+    fn new_with_byte_size(
+        surface: OwnedIoSurface,
+        shape: Vec<usize>,
+        buf_size: usize,
+        byte_size: usize,
+    ) -> Result<Self> {
+        Self::new_inner(surface, shape, buf_size, Some(byte_size))
+    }
+
+    fn new_inner(
+        surface: OwnedIoSurface,
+        shape: Vec<usize>,
+        buf_size: usize,
+        byte_size_override: Option<usize>,
+    ) -> Result<Self> {
         // Default to read-write (options = 0). The read-only path
         // (K_IOSURFACE_LOCK_READ_ONLY) skips a CPU cache flush when the
         // caller only reads — a measurable savings if it becomes a hot
@@ -622,6 +744,7 @@ where
             shape,
             base_ptr,
             buf_size,
+            byte_size_override,
             _marker: PhantomData,
             lock_options: options,
             locked: true,
@@ -629,7 +752,10 @@ where
     }
 
     fn elem_count(&self) -> usize {
-        self.shape.iter().product()
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
     }
 }
 
@@ -639,6 +765,10 @@ where
 {
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    fn len(&self) -> usize {
+        self.elem_count()
     }
 
     fn unmap(&mut self) {
@@ -760,6 +890,16 @@ fn image_fourcc_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize
         // wrong for the Rgba contract.
         (PixelFormat::Rgba, DType::U8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         (PixelFormat::Bgra, DType::U8) => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        // Single-channel 8-bit (`L008` = kCVPixelFormatType_OneComponent8),
+        // sampled as `GL_RED`. Used for GREY images and as the raw byte plane
+        // for the semi-planar YUV formats (NV12/NV16/NV24): the GPU binds the
+        // whole contiguous `[total_h, W]` buffer as one R8 texture and the
+        // YUV→RGB shader computes the luma/chroma texel positions itself
+        // (portable across ANGLE/Metal, Mali/EGL, and embedded GLES).
+        (
+            PixelFormat::Grey | PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24,
+            DType::U8,
+        ) => Some((u32::from_be_bytes(*b"L008"), 1)),
         // ── F16 IOSurface for zero-copy preprocessing (CoreML / ANE) ──
         // The only ANGLE-supported float (type, internal_format) pair
         // is `(GL_HALF_FLOAT, GL_RGBA)` = RGBA16F, FourCC 'RGhA'
@@ -805,8 +945,24 @@ unsafe fn build_props(
     bytes_per_element: usize,
     fourcc: u32,
 ) -> Result<CFDictionaryRef> {
-    let bytes_per_row = (width * bytes_per_element + 63) & !63;
-    let alloc_size = bytes_per_row * height;
+    // Checked arithmetic (mirrors the image crate's `build_image_props`): an
+    // overflowing pitch or allocation size would describe an under-sized
+    // IOSurface that the GL import then treats as a valid buffer — a memory
+    // hazard. Fail loudly instead of wrapping.
+    let bytes_per_row = width
+        .checked_mul(bytes_per_element)
+        .and_then(|b| b.checked_add(63))
+        .map(|b| b & !63)
+        .ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "IOSurface bytes-per-row overflow (width={width}, bpe={bytes_per_element})"
+            ))
+        })?;
+    let alloc_size = bytes_per_row.checked_mul(height).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "IOSurface allocation size overflow (bytes_per_row={bytes_per_row}, height={height})"
+        ))
+    })?;
 
     let dict = CFDictionaryCreateMutable(
         std::ptr::null(),
@@ -899,6 +1055,53 @@ mod tests {
     }
 
     #[test]
+    fn image_surface_strided_map_honours_bytes_per_row() {
+        use crate::Tensor;
+
+        // Packed RGBA U8 at width 17: natural row = 68 B, which IOSurface pads
+        // up to a 64-aligned `bytes_per_row` (128 B). Previously `image()`
+        // rejected this (forcing an SHM fallback); now it allocates a padded
+        // IOSurface and records the stride, so CPU access is correct + zero-copy.
+        let h = 3usize;
+        let w = 17usize;
+        let t = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma))
+            .expect("non-aligned packed RGBA should allocate a padded IOSurface");
+
+        let stride = t.effective_row_stride().expect("stride");
+        assert!(stride >= w * 4, "stride {stride} >= natural {}", w * 4);
+        assert_eq!(stride % 64, 0, "IOSurface pads bytes_per_row to 64");
+        assert!(stride > w * 4, "width 17 RGBA must be padded (68 -> 128)");
+        assert_eq!(t.width(), Some(w));
+        assert_eq!(t.height(), Some(h));
+
+        // Write a distinct value per logical pixel, iterating rows by `stride`.
+        {
+            let mut m = t.map().expect("strided IOSurface map");
+            let buf = m.as_mut_slice();
+            assert_eq!(buf.len(), stride * h, "map exposes the full padded surface");
+            for row in 0..h {
+                for col in 0..w * 4 {
+                    buf[row * stride + col] = (row * 37 + col) as u8;
+                }
+            }
+        }
+        // Read back via a fresh lock and verify the padded layout round-trips.
+        {
+            let m = t.map().expect("remap");
+            let buf = m.as_slice();
+            for row in 0..h {
+                for col in 0..w * 4 {
+                    assert_eq!(
+                        buf[row * stride + col],
+                        (row * 37 + col) as u8,
+                        "pixel byte ({row},{col}) mismatch"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn surface_id_is_nonzero() {
         let t = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
         assert!(t.surface_id() != 0, "IOSurface IDs should be nonzero");
@@ -973,8 +1176,12 @@ mod tests {
             image_fourcc_and_bpe(PixelFormat::PlanarRgb, DType::F32),
             None
         );
-        // NV12 / Nv16 have no IOSurface FourCC mapping in HAL today.
-        assert_eq!(image_fourcc_and_bpe(PixelFormat::Nv12, DType::U8), None);
+        // NV12/NV16/NV24/GREY (u8) now map to 'L008' (R8) so the GPU can sample
+        // the contiguous semi-planar buffer as a single-channel texture.
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Nv12, DType::U8),
+            Some((u32::from_be_bytes(*b"L008"), 1))
+        );
         // Float for YUYV / Grey isn't a meaningful combination.
         assert_eq!(image_fourcc_and_bpe(PixelFormat::Yuyv, DType::F16), None);
         assert_eq!(image_fourcc_and_bpe(PixelFormat::Grey, DType::F16), None);

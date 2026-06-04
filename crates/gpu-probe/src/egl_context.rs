@@ -45,6 +45,19 @@ const DMA_BUF_PLANE0_FD: u32 = 0x3272;
 const DMA_BUF_PLANE0_OFFSET: u32 = 0x3273;
 #[allow(dead_code)]
 const DMA_BUF_PLANE0_PITCH: u32 = 0x3274;
+// Second plane (interleaved CbCr for NV12/NV16/NV24 native YUV import).
+const DMA_BUF_PLANE1_FD: u32 = 0x3275;
+const DMA_BUF_PLANE1_OFFSET: u32 = 0x3276;
+const DMA_BUF_PLANE1_PITCH: u32 = 0x3277;
+// YUV import hints (EGL_EXT_image_dma_buf_import) — mirror the HAL's
+// BT.601 full-range (JFIF) stop-gap so the probe imports natively-sampled
+// YUV the same way `DmaImportAttrs::to_egl_attribs` does.
+const YUV_COLOR_SPACE_HINT: u32 = 0x327B;
+const SAMPLE_RANGE_HINT: u32 = 0x327C;
+const ITU_REC601: u32 = 0x327F;
+const YUV_FULL_RANGE: u32 = 0x3282;
+// EGL_IMAGE_PRESERVED_KHR — preserve pixel data across the import.
+const IMAGE_PRESERVED: u32 = 0x30D2;
 
 // ---------------------------------------------------------------------------
 // EGL library loader (leaked to avoid dlclose crashes)
@@ -436,10 +449,87 @@ impl GpuContext {
         )
     }
 
+    /// Create an EGLImage from a (possibly multi-plane) DMA-buf.
+    ///
+    /// This is the richer counterpart to [`create_egl_image_dma`]: it carries a
+    /// per-plane `offset`, an optional second plane (interleaved CbCr), and the
+    /// BT.601 full-range YUV import hints. It mirrors exactly what the HAL's
+    /// `DmaImportAttrs::to_egl_attribs` emits, so a successful import here proves
+    /// the real HAL allocation is GPU-importable.
+    ///
+    /// * `plane1` — second plane for NV12/NV16/NV24 native semi-planar import.
+    /// * `yuv_hints` — add BT.601 full-range colour-space hints (required for
+    ///   native YUV fourccs sampled via `samplerExternalOES`).
+    pub fn create_egl_image_planar(
+        &self,
+        width: i32,
+        height: i32,
+        drm_fourcc: u32,
+        plane0: EglPlane,
+        plane1: Option<EglPlane>,
+        yuv_hints: bool,
+    ) -> Result<egl::Image, String> {
+        let mut attribs: Vec<Attrib> = vec![
+            egl::WIDTH as Attrib,
+            width as Attrib,
+            egl::HEIGHT as Attrib,
+            height as Attrib,
+            LINUX_DRM_FOURCC as Attrib,
+            drm_fourcc as Attrib,
+            DMA_BUF_PLANE0_FD as Attrib,
+            plane0.fd as Attrib,
+            DMA_BUF_PLANE0_OFFSET as Attrib,
+            plane0.offset as Attrib,
+            DMA_BUF_PLANE0_PITCH as Attrib,
+            plane0.pitch as Attrib,
+            IMAGE_PRESERVED as Attrib,
+            egl::TRUE as Attrib,
+        ];
+
+        if let Some(p1) = plane1 {
+            attribs.extend_from_slice(&[
+                DMA_BUF_PLANE1_FD as Attrib,
+                p1.fd as Attrib,
+                DMA_BUF_PLANE1_OFFSET as Attrib,
+                p1.offset as Attrib,
+                DMA_BUF_PLANE1_PITCH as Attrib,
+                p1.pitch as Attrib,
+            ]);
+        }
+
+        if yuv_hints {
+            attribs.extend_from_slice(&[
+                YUV_COLOR_SPACE_HINT as Attrib,
+                ITU_REC601 as Attrib,
+                SAMPLE_RANGE_HINT as Attrib,
+                YUV_FULL_RANGE as Attrib,
+            ]);
+        }
+
+        attribs.push(egl::ATTRIB_NONE);
+
+        egl_create_image_with_fallback(
+            &self.egl,
+            self.display,
+            unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
+            LINUX_DMA_BUF,
+            unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
+            &attribs,
+        )
+    }
+
     /// Destroy a previously-created EGLImage.
     pub fn destroy_egl_image(&self, image: egl::Image) -> Result<(), String> {
         egl_destroy_image_with_fallback(&self.egl, self.display, image)
     }
+}
+
+/// One DMA-buf plane's import parameters (fd / byte offset / row pitch).
+#[derive(Clone, Copy, Debug)]
+pub struct EglPlane {
+    pub fd: i32,
+    pub offset: i32,
+    pub pitch: i32,
 }
 
 impl Drop for GpuContext {

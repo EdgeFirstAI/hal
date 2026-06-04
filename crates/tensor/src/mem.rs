@@ -103,11 +103,11 @@ where
     /// Allocate `byte_capacity` bytes and set an initial logical `shape`
     /// (whose byte size must fit the capacity).
     ///
-    /// Test-only: production code allocates exactly `shape` via [`MemTensor::new`]
-    /// and grows the logical view with `set_logical_shape` within that capacity.
-    /// This over-allocating constructor exists for tests that need spare
-    /// capacity (e.g. an offset window past the logical end).
-    #[cfg(test)]
+    /// Used for image tensors with a 64-byte-aligned row stride that may
+    /// exceed `shape.product() * sizeof(T)`: production callers allocate via
+    /// `Tensor::image()` (which routes through this constructor), and tests use
+    /// it directly when they need spare capacity (e.g. an offset window past
+    /// the logical end).
     pub(crate) fn with_capacity_bytes(
         shape: &[usize],
         byte_capacity: usize,
@@ -129,6 +129,58 @@ where
             offset: 0,
             identity: crate::BufferIdentity::new(),
         })
+    }
+
+    /// Map exposing `byte_size` bytes via `as_slice()` rather than the
+    /// shape-derived logical byte count, for self-allocated strided tensors
+    /// whose rows are padded. The caller (`Tensor::map`) validates
+    /// `byte_size <= capacity_bytes()` first; `map_inner` re-checks against the
+    /// backing allocation. `Mem` is always HAL-owned, so the backing covers the
+    /// full requested range.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size))
+    }
+
+    /// Shared map constructor. When `byte_size_override` is `Some(bytes)`,
+    /// `as_slice()` exposes the full padded allocation (`bytes / size_of::<T>()`
+    /// elements); otherwise the shape-derived logical length is used. Validates
+    /// that the exposed window `[offset, offset + exposed)` fits the backing
+    /// allocation and that `offset` is aligned to `align_of::<T>()` (mirrors
+    /// `DmaMap`'s bounds + alignment checks).
+    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+        let elem = std::mem::size_of::<T>();
+        let exposed = match byte_size_override {
+            Some(bytes) => bytes,
+            None => self.shape.iter().product::<usize>() * elem,
+        };
+        let total = self.data.len() * elem;
+        let end = self
+            .offset
+            .checked_add(exposed)
+            .ok_or(Error::InvalidSize(exposed))?;
+        if end > total {
+            return Err(Error::InsufficientCapacity {
+                needed: end,
+                capacity: total,
+            });
+        }
+        // Alignment depends on `align_of::<T>()`, not element size.
+        if !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "MemMap: offset {} not aligned to align_of::<T>()={}",
+                self.offset,
+                std::mem::align_of::<T>()
+            )));
+        }
+        Ok(TensorMap::Mem(MemMap {
+            // Keep the backing allocation alive for the map's lifetime so the
+            // map stays valid even if the source tensor is dropped first.
+            backing: Arc::clone(&self.data),
+            offset: self.offset,
+            shape: self.shape.clone(),
+            byte_size_override,
+            _marker: std::marker::PhantomData,
+        }))
     }
 
     /// Create a zero-copy sub-region view that shares `parent`'s allocation.
@@ -262,37 +314,7 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let elem = std::mem::size_of::<T>();
-        // Validate the offset window fits the backing allocation (mirrors
-        // DmaMap::new_internal's bounds + alignment checks).
-        let logical = self.shape.iter().product::<usize>() * elem;
-        let total = self.data.len() * elem;
-        let end = self
-            .offset
-            .checked_add(logical)
-            .ok_or(Error::InvalidSize(logical))?;
-        if end > total {
-            return Err(Error::InsufficientCapacity {
-                needed: end,
-                capacity: total,
-            });
-        }
-        // Alignment depends on `align_of::<T>()`, not element size.
-        if !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
-            return Err(Error::InvalidOperation(format!(
-                "MemMap: offset {} not aligned to align_of::<T>()={}",
-                self.offset,
-                std::mem::align_of::<T>()
-            )));
-        }
-        Ok(TensorMap::Mem(MemMap {
-            // Keep the backing allocation alive for the map's lifetime so the
-            // map stays valid even if the source tensor is dropped first.
-            backing: Arc::clone(&self.data),
-            offset: self.offset,
-            shape: self.shape.clone(),
-            _marker: std::marker::PhantomData,
-        }))
+        self.map_inner(None)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -338,6 +360,11 @@ where
     /// Byte offset of the mapped window into `backing`.
     offset: usize,
     shape: Vec<usize>,
+    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
+    /// (the full padded allocation) instead of `shape.product()`. Mirrors
+    /// `DmaMap`'s override for self-allocated strided tensors whose rows are
+    /// padded; callers iterate via `row_stride`.
+    byte_size_override: Option<usize>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -369,6 +396,13 @@ where
         &self.shape
     }
 
+    fn len(&self) -> usize {
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
+    }
+
     fn unmap(&mut self) {
         trace!("Unmapping MemMap memory");
     }
@@ -387,7 +421,10 @@ where
         // the shared `Arc` is sound. Distinct sub-region views address
         // non-overlapping windows (the documented `subview` disjointness
         // contract, matching `DmaMap`), so the `&mut` windows never alias.
-        let base = unsafe { (self.backing.base_ptr() as *const u8).add(self.offset) as *mut T };
+        // Keep the byte-offset arithmetic on `*mut u8` (not `*const u8`) so the
+        // write provenance from `base_ptr()` is preserved through the cast — the
+        // whole reason the backing is `UnsafeCell` rather than `Arc<Vec<T>>`.
+        let base = unsafe { (self.backing.base_ptr() as *mut u8).add(self.offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
     }
 }

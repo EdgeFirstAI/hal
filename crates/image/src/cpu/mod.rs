@@ -28,6 +28,14 @@ pub struct CPUProcessor {
     /// Reallocated only when the format or dimensions change, amortising
     /// the heap allocation across repeated same-size conversions.
     widen_scratch: Option<TensorDyn>,
+    /// Reusable scratch for de-striding a padded source before resize.
+    ///
+    /// `fast_image_resize` needs a tightly-packed input; a padded source
+    /// (64-aligned stride from codec decode / `create_image`) is copied here
+    /// row-by-row first. Kept on the processor so the steady-state resize loop
+    /// reuses the allocation instead of a fresh `Vec` per call (the stride
+    /// alignment in this release makes that de-stride copy fire far more often).
+    resize_destride_scratch: Vec<u8>,
 }
 
 // `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
@@ -42,6 +50,7 @@ impl Clone for CPUProcessor {
             options: self.options,
             colors: self.colors,
             widen_scratch: None,
+            resize_destride_scratch: Vec::new(),
         }
     }
 }
@@ -122,6 +131,32 @@ fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
     })
 }
 
+/// Split a contiguous semi-planar (NV12/NV16/NV24) tensor's mapped bytes into
+/// `(luma, chroma)` planes at the `stride * src_h` boundary, validating the map
+/// holds the full combined plane first. A bare `split_at` would panic if an
+/// imported tensor's caller-supplied dimensions/stride exceed its actual buffer
+/// (untrusted input), so this returns `Error::InvalidShape` instead.
+fn split_semi_planar(
+    bytes: &[u8],
+    stride: usize,
+    src_h: usize,
+    fmt: PixelFormat,
+) -> Result<(&[u8], &[u8])> {
+    let total_h = fmt.combined_plane_height(src_h).unwrap_or(src_h);
+    let need = stride.checked_mul(total_h).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "{fmt:?} plane size overflow (stride={stride}, h={src_h})"
+        ))
+    })?;
+    if bytes.len() < need {
+        return Err(Error::InvalidShape(format!(
+            "{fmt:?} source has {} bytes but needs {need} (stride={stride}, h={src_h})",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.split_at(stride * src_h))
+}
+
 /// Apply XOR 0x80 bias to color channels only, preserving alpha.
 ///
 /// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.
@@ -171,6 +206,7 @@ impl CPUProcessor {
             options,
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
+            resize_destride_scratch: Vec::new(),
         }
     }
 
@@ -186,6 +222,7 @@ impl CPUProcessor {
             options,
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
+            resize_destride_scratch: Vec::new(),
         }
     }
 
@@ -199,6 +236,10 @@ impl CPUProcessor {
                 | (Nv16, Rgb)
                 | (Nv16, Rgba)
                 | (Nv16, Bgra)
+                | (Nv24, Rgb)
+                | (Nv24, Rgba)
+                | (Nv24, Grey)
+                | (Nv24, Bgra)
                 | (Yuyv, Rgb)
                 | (Yuyv, Rgba)
                 | (Yuyv, Grey)
@@ -306,6 +347,9 @@ impl CPUProcessor {
             // the following converts are added for use in testing
             (Nv16, Rgb) => Self::convert_nv16_to_rgb(src, dst),
             (Nv16, Rgba) => Self::convert_nv16_to_rgba(src, dst),
+            (Nv24, Rgb) => Self::convert_nv24_to_rgb(src, dst),
+            (Nv24, Rgba) => Self::convert_nv24_to_rgba(src, dst),
+            (Nv24, Grey) => Self::convert_nv24_to_grey(src, dst),
             (PlanarRgb, Rgb) => Self::convert_8bps_to_rgb(src, dst),
             (PlanarRgb, Rgba) => Self::convert_8bps_to_rgba(src, dst),
             (PlanarRgba, Rgb) => Self::convert_prgba_to_rgb(src, dst),
@@ -319,6 +363,10 @@ impl CPUProcessor {
             }
             (Nv16, Bgra) => {
                 Self::convert_nv16_to_rgba(src, dst)?;
+                Self::swizzle_rb_4chan(dst)
+            }
+            (Nv24, Bgra) => {
+                Self::convert_nv24_to_rgba(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Yuyv, Bgra) => {
@@ -590,6 +638,10 @@ impl CPUProcessor {
             (Nv12, Nv16) => Rgba,
             (Nv12, PlanarRgb) => Rgb,
             (Nv12, PlanarRgba) => Rgba,
+            (Nv16, PlanarRgb) => Rgb,
+            (Nv16, PlanarRgba) => Rgba,
+            (Nv24, PlanarRgb) => Rgb,
+            (Nv24, PlanarRgba) => Rgba,
             (Yuyv, Rgb) => Rgb,
             (Yuyv, Rgba) => Rgba,
             (Yuyv, Grey) => Grey,
@@ -635,6 +687,10 @@ impl CPUProcessor {
             (Nv16, Rgb) => Rgb,
             (Nv16, Rgba) => Rgba,
             (Nv16, Bgra) => Rgba,
+            (Nv24, Rgb) => Rgb,
+            (Nv24, Rgba) => Rgba,
+            (Nv24, Grey) => Grey,
+            (Nv24, Bgra) => Rgba,
             (PlanarRgb, Rgb) => Rgb,
             (PlanarRgb, Rgba) => Rgb,
             (PlanarRgb, Bgra) => Rgb,

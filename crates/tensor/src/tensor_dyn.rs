@@ -568,6 +568,15 @@ impl TensorDyn {
         dispatch!(self, iosurface_ref)
     }
 
+    /// Physical IOSurface dimensions in texels, independent of the logical
+    /// shape (macOS only). `None` when not IOSurface-backed. The GL backend
+    /// binds the EGL pbuffer at these dims so one cached pbuffer serves every
+    /// frame size a reused pool surface holds.
+    #[cfg(target_os = "macos")]
+    pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
+        dispatch!(self, iosurface_physical_dims)
+    }
+
     /// Create a type-erased image tensor.
     ///
     /// # Arguments
@@ -939,9 +948,12 @@ mod tests {
 
     #[test]
     fn set_row_stride_too_small() {
-        // RGBA 100px: min stride = 400, set 300
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
-        assert!(t.set_row_stride(300).is_err());
+        // RGBA 64px (a 64-aligned width: 64*4 = 256, already a multiple of 64)
+        // carries no implicit stride. min stride = 256; setting 200 must error
+        // and leave row_stride unset. (Non-64-aligned widths now record the
+        // padded stride at allocation — see `Tensor::image`.)
+        let mut t = TensorDyn::image(64, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        assert!(t.set_row_stride(200).is_err());
         assert_eq!(t.row_stride(), None);
     }
 
@@ -959,9 +971,34 @@ mod tests {
 
     #[test]
     fn effective_row_stride_without_stride() {
-        let t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        // A 64-aligned-width packed image carries no explicit stride; the
+        // effective stride falls back to the computed tight pitch. (Width 64
+        // RGB → 64*3 = 192, already a multiple of 64, so no padding is added.
+        // Non-aligned widths now record the padded stride — see `Tensor::image`.)
+        let t = TensorDyn::image(64, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
         assert_eq!(t.row_stride(), None);
-        assert_eq!(t.effective_row_stride(), Some(300)); // 100 * 3
+        assert_eq!(t.effective_row_stride(), Some(192)); // 64 * 3
+    }
+
+    #[test]
+    fn effective_row_stride_padded_packed_dma() {
+        // A non-64-aligned packed width on a DMA buffer records the 64-aligned
+        // stride so the EGLImage import is accepted by Mali/Vivante (RGB 100px:
+        // 100*3 = 300 → padded to 320). This padding is DMA-specific — host-only
+        // memory keeps the tight pitch — so skip when DMA is unavailable (e.g. CI
+        // without dma_heap); the behaviour is also validated on-target.
+        let t = match TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) if t.memory() == TensorMemory::Dma => t,
+            _ => return,
+        };
+        assert_eq!(t.row_stride(), Some(320));
+        assert_eq!(t.effective_row_stride(), Some(320));
     }
 
     #[test]

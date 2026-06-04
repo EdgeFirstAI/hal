@@ -736,6 +736,134 @@ void main() {
 "
 }
 
+/// Semi-planar YUV (NV12/NV16/NV24) → RGBA, Path B (R8 sampler2D, ES 3.0 core).
+///
+/// The combined semi-planar buffer is imported as a single-plane R8 EGLImage
+/// (width = `effective_row_stride`, height = luma_h + chroma_h) and bound as
+/// `TEXTURE_2D`.  Y and UV texels are addressed directly with `texelFetch`,
+/// parameterised by uniforms so one program serves all three subsamplings.
+///
+/// Uniforms:
+///   * `img_size`     — logical (W, H); Y plane occupies rows [0, H).
+///   * `tex_width`    — R8 texture width (= even buffer width / effective stride).
+///   * `chroma_shift` — (cx, cy) right-shifts: NV12=(1,1), NV16=(1,0), NV24=(0,0).
+///   * `chroma_lines`  — R8 buffer rows per image-chroma-row: NV12/NV16=1,
+///     NV24=2 (NV24's 2W-byte CbCr row wraps at `tex_width`, spanning 2 rows;
+///     the shader's `carry` term handles the wrap). Direct 2D addressing — no
+///     per-pixel integer divide/modulo (pathologically slow on Vivante).
+///
+/// Vertex varying is `tc` (vec2, matching `generate_vertex_shader`).
+/// BT.601 full-range matches the CPU kernels and the EGL YUV color hints.
+/// No extension required: `texelFetch` + R8 is core ES 3.0.
+///
+/// CHROMA-LAYOUT CONTRACT: this shader and the macOS `NV_TO_RGBA_FRAGMENT`
+/// (`macos_processor.rs`) decode the SAME `model-2` combined-plane byte layout
+/// (`PixelFormat::chroma_layout` + `combined_plane_height`), but parameterise it
+/// differently: this one uses `chroma_lines` + a branchless `carry` for direct
+/// 2D `texelFetch`, while macOS uses `uv_row_bytes` + a linear `fetch_r(b)` with
+/// `b % tex_width`. They are kept SEPARATE on purpose — the divide-free form
+/// here is required for Vivante/V3D, while Apple-silicon ANGLE tolerates the
+/// linear form. They are provably equivalent at every NV24 texel (the codec's
+/// `decode_padded_grid_matches_tight` fixture and the `*_opengl_macos` GPU-vs-CPU
+/// tests are the cross-checks); keep both in sync if the layout ever changes.
+pub(super) fn generate_nv_to_rgba_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int chroma_lines;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    int w = img_size.x;
+    int h = img_size.y;
+    int x = clamp(int(tc.x * float(w)), 0, w - 1);
+    int y = clamp(int(tc.y * float(h)), 0, h - 1);
+
+    // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
+    // some embedded GPUs, e.g. Vivante GC7000UL).
+    float yv = texelFetch(src, ivec2(x, y), 0).r;
+
+    // Interleaved CbCr plane begins at buffer row `h`. Each image-chroma-row
+    // spans `chroma_lines` R8 rows: NV24's 2W-byte row wraps once at tex_width
+    // (carry); NV12/NV16 fit one row. `cx` is even so `cx+1` stays in-row.
+    int ccol = x >> chroma_shift.x;
+    int crow = y >> chroma_shift.y;
+    int ccol2 = ccol * 2;
+    int carry = ccol2 >= tex_width ? 1 : 0;
+    int cy = h + crow * chroma_lines + carry;
+    int cx = ccol2 - carry * tex_width;
+    float u = texelFetch(src, ivec2(cx, cy), 0).r;
+    float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
+
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
+    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
+    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    color = vec4(r, g, b, 1.0);
+}
+"
+}
+
+/// Int8 variant of [`generate_nv_to_rgba_shader_2d`].
+///
+/// Applies the same XOR 0x80 bias (`(q + 128) mod 256`) to each output RGB
+/// channel as [`generate_texture_int8_shader`] and the other int8 shaders.
+/// Used when the destination dtype is i8 so no CPU post-processing is needed.
+pub(super) fn generate_nv_to_rgba_int8_shader_2d() -> &'static str {
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int chroma_lines;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+vec3 int8_bias(vec3 v) {
+    vec3 q = floor(v * 255.0 + 0.5);
+    return mod(q + 128.0, 256.0) / 255.0;
+}
+
+void main() {
+    int w = img_size.x;
+    int h = img_size.y;
+    int x = clamp(int(tc.x * float(w)), 0, w - 1);
+    int y = clamp(int(tc.y * float(h)), 0, h - 1);
+
+    // Luma: direct 2D texel — no per-pixel integer divide/modulo.
+    float yv = texelFetch(src, ivec2(x, y), 0).r;
+
+    int ccol = x >> chroma_shift.x;
+    int crow = y >> chroma_shift.y;
+    int ccol2 = ccol * 2;
+    int carry = ccol2 >= tex_width ? 1 : 0;
+    int cy = h + crow * chroma_lines + carry;
+    int cx = ccol2 - carry * tex_width;
+    float u = texelFetch(src, ivec2(cx, cy), 0).r;
+    float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
+
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
+    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
+    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
+    color = vec4(int8_bias(vec3(r, g, b)), 1.0);
+}
+"
+}
+
 /// HWC → layer-first (CHW) repack compute shader for int8 protos.
 ///
 /// Reads proto data from an SSBO in row-major HWC layout `(H, W, num_protos)`.

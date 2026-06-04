@@ -48,7 +48,7 @@ use super::platform::macos::MacosPlatform;
 use super::Egl;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
-use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
+use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use khronos_egl as egl;
 use log::debug;
 use std::collections::HashMap;
@@ -124,6 +124,80 @@ void main() {
     float r = clamp(yp + 1.402 * vp, 0.0, 1.0);
     float g = clamp(yp - 0.344 * up - 0.714 * vp, 0.0, 1.0);
     float b = clamp(yp + 1.772 * up, 0.0, 1.0);
+    frag = vec4(r, g, b, 1.0);
+}
+"#;
+
+// GREY (single-channel R8 / `L008` IOSurface) → RGBA. This is also the probe
+// that proves ANGLE's Metal IOSurface-client-buffer path accepts an
+// `L008`→`GL_RED` binding; the semi-planar YUV shaders below build on the same
+// R8 source binding. Portable GLES 3.0 (`sampler2D` over a GL_RED texture).
+const GREY_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
+precision mediump float;
+uniform sampler2D src;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    float y = texture(src, v_uv).r;
+    frag = vec4(y, y, y, 1.0);
+}
+"#;
+
+// Semi-planar YUV (NV12/NV16/NV24) → RGBA, sampling the contiguous combined-
+// plane buffer as ONE R8 (`L008`/GL_RED) texture of `[total_h, even_width]`.
+// The shader computes the Y and interleaved-UV texel positions itself via
+// `texelFetch`, parameterised by uniforms so one program serves all three
+// subsamplings (and is portable to Linux DMA-BUF / embedded GLES — no
+// platform-specific multi-plane sampler):
+//   * `img_size`      logical (W, H); Y plane occupies rows [0, H).
+//   * `tex_width`     R8 texture width == the buffer's physical row pitch
+//                     (`bytes_per_row`). The semi-planar surface is allocated
+//                     so its IOSurface width equals this pitch, so every byte
+//                     of every row is addressable by `texelFetch`.
+//   * `chroma_shift`  (cx, cy) right-shifts on (x, y): NV12 (1,1), NV16 (1,0),
+//                     NV24 (0,0).
+//   * `uv_row_bytes`  bytes the UV plane advances per chroma row: `stride` for
+//                     NV12/NV16 (W/2 pairs fit in one row), `2*stride` for NV24
+//                     (W pairs == two grid rows).
+// A linear UV byte offset is converted to a 2D texel so NV24's 2-row-per-
+// chroma-line layout is handled with no special case. The byte offsets match
+// the codec's `row * grid_row_stride + col` writer exactly. BT.601 full-range
+// matches the codec + CPU kernels (interim colorimetry stop-gap).
+const NV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int uv_row_bytes;
+in vec2 v_uv;
+out vec4 frag;
+
+float fetch_r(int b) {
+    return texelFetch(src, ivec2(b % tex_width, b / tex_width), 0).r;
+}
+
+void main() {
+    int w = img_size.x;
+    int h = img_size.y;
+    int x = clamp(int(v_uv.x * float(w)), 0, w - 1);
+    int y = clamp(int(v_uv.y * float(h)), 0, h - 1);
+
+    float yv = fetch_r(y * tex_width + x); // Y plane, rows [0, H)
+
+    int ccol = x >> chroma_shift.x;
+    int crow = y >> chroma_shift.y;
+    int uv_base = h * tex_width;           // UV plane byte offset
+    int cb = uv_base + crow * uv_row_bytes + ccol * 2;
+    float u = fetch_r(cb);
+    float v = fetch_r(cb + 1);
+
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yv + 1.402 * vp, 0.0, 1.0);
+    float g = clamp(yv - 0.344 * up - 0.714 * vp, 0.0, 1.0);
+    float b = clamp(yv + 1.772 * up, 0.0, 1.0);
     frag = vec4(r, g, b, 1.0);
 }
 "#;
@@ -399,6 +473,19 @@ pub struct MacosGlProcessor {
     program_yuyv_to_rgba: u32,
     uniform_src: i32,
     uniform_src_size: i32,
+    /// Program: GREY (R8 `L008` IOSurface) → RGBA. Shares the `src` sampler
+    /// uniform; needs no `src_size`. Also the building block that proves the
+    /// R8 IOSurface binding works on ANGLE.
+    program_grey_to_rgba: u32,
+    uniform_grey_src: i32,
+    /// Program: semi-planar YUV (NV12/NV16/NV24, R8 `L008` IOSurface) → RGBA.
+    /// One program for all three subsamplings (uniforms select the layout).
+    program_nv_to_rgba: u32,
+    uniform_nv_src: i32,
+    uniform_nv_img_size: i32,
+    uniform_nv_tex_width: i32,
+    uniform_nv_chroma_shift: i32,
+    uniform_nv_uv_row_bytes: i32,
     /// Program: RGBA8 source IOSurface → PlanarRgb F16 destination
     /// IOSurface — zero-copy preprocessing for ONNX+CoreML. The shader
     /// writes RGBA16F-packed half-floats; GL handles the implicit
@@ -424,7 +511,22 @@ pub struct MacosGlProcessor {
     /// than globally so each processor's resource lifetime is
     /// independent and easy to reason about. ANGLE's pbuffers are
     /// per-display, not per-context, so this is sound.
+    ///
+    /// LIVE-SURFACE ASSUMPTION: an `IOSurfaceID` is unique only among *live*
+    /// surfaces — the kernel may reuse an ID after its surface is freed, and
+    /// this cache never evicts on tensor drop. Reuse is safe today because a
+    /// HAL `Tensor` keeps its IOSurface alive (`Arc<IoSurfaceHandle>`) for as
+    /// long as it can be converted, so a cached pbuffer's surface is always the
+    /// one its ID currently names. A caller that frees a tensor and then
+    /// converts a *different* tensor whose surface was assigned the recycled ID
+    /// would get a stale pbuffer; if that pattern is ever introduced, key the
+    /// cache on the tensor's `BufferIdentity` (a process-unique token) instead.
     pbuf_cache: Mutex<HashMap<PbufferCacheKey, egl::Surface>>,
+    /// Reusable full-resolution RGBA8 IOSurface for the two-pass YUV→PlanarRgb
+    /// path (`(W, H, tensor)`). Pass 1 renders the YUV source into it; pass 2
+    /// (`convert_rgba8_to_planar_float`) reads it with letterbox/resize. Cached
+    /// by dimensions so the steady-state hot loop never reallocates.
+    intermediate_rgba: Mutex<Option<(usize, usize, TensorDyn)>>,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
@@ -693,10 +795,34 @@ impl MacosGlProcessor {
             let uniform_rgba8_to_planar_f16_pad_color =
                 gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"pad_color".as_ptr());
 
+            // GREY (R8) → RGBA program — also the R8-binding probe.
+            let program_grey = compile_program(VERTEX_SHADER, GREY_TO_RGBA_FRAGMENT)?;
+            let uniform_grey_src =
+                gls::gl::GetUniformLocation(program_grey, c"src".as_ptr() as *const _);
+
+            // Semi-planar YUV (NV12/NV16/NV24, R8) → RGBA program.
+            let program_nv = compile_program(VERTEX_SHADER, NV_TO_RGBA_FRAGMENT)?;
+            let uniform_nv_src = gls::gl::GetUniformLocation(program_nv, c"src".as_ptr());
+            let uniform_nv_img_size = gls::gl::GetUniformLocation(program_nv, c"img_size".as_ptr());
+            let uniform_nv_tex_width =
+                gls::gl::GetUniformLocation(program_nv, c"tex_width".as_ptr());
+            let uniform_nv_chroma_shift =
+                gls::gl::GetUniformLocation(program_nv, c"chroma_shift".as_ptr());
+            let uniform_nv_uv_row_bytes =
+                gls::gl::GetUniformLocation(program_nv, c"uv_row_bytes".as_ptr());
+
             Ok(Self {
                 program_yuyv_to_rgba: program,
                 uniform_src,
                 uniform_src_size,
+                program_grey_to_rgba: program_grey,
+                uniform_grey_src,
+                program_nv_to_rgba: program_nv,
+                uniform_nv_src,
+                uniform_nv_img_size,
+                uniform_nv_tex_width,
+                uniform_nv_chroma_shift,
+                uniform_nv_uv_row_bytes,
                 program_rgba8_to_planar_f16: program_rgba8_planar_f16,
                 uniform_rgba8_to_planar_f16_src,
                 uniform_rgba8_to_planar_f16_dst_size,
@@ -709,8 +835,83 @@ impl MacosGlProcessor {
                 src_tex,
                 dst_tex,
                 pbuf_cache: Mutex::new(HashMap::new()),
+                intermediate_rgba: Mutex::new(None),
             })
         }
+    }
+
+    /// Two-pass GPU path for the profiler's hot loop: a semi-planar YUV source
+    /// (`NV12`/`NV16`/`NV24`, R8 IOSurface) → `PlanarRgb` F16, fully on the GPU.
+    ///
+    /// Pass 1 samples the YUV source and renders full-resolution RGBA8 into a
+    /// cached intermediate IOSurface (reusing the verified `convert_yuyv_to_rgba`
+    /// render with the format-selected shader). Pass 2 runs the already-verified
+    /// `convert_rgba8_to_planar_float`, which applies the letterbox crop/resize
+    /// and packs into the RGBA16F-packed PlanarRgb F16 destination. Both passes
+    /// are zero-copy IOSurface↔IOSurface.
+    fn convert_nv_to_planar_float(
+        &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        src_fmt: PixelFormat,
+        crop: crate::Crop,
+    ) -> Result<()> {
+        let w = src
+            .width()
+            .ok_or_else(|| Error::InvalidShape("src width".into()))?;
+        let h = src
+            .height()
+            .ok_or_else(|| Error::InvalidShape("src height".into()))?;
+
+        // Span for the two-pass NV*→PlanarRgb F16 chain. The `_inner` pass
+        // helpers below deliberately bypass the public-entry spans (to hold one
+        // GL session across both passes), so this is the only span covering the
+        // macOS NV→planar-float hot path — catalogued in ARCHITECTURE.md
+        // alongside the Linux `image.convert.gl.nv_to_planar.*` spans.
+        let _span =
+            tracing::trace_span!("image.convert.gl.macos.nv_to_planar", w, h, ?src_fmt).entered();
+
+        // Reuse (or allocate) the full-res RGBA8 intermediate IOSurface.
+        //
+        // PERF (revisit in profiler measurement): this reallocates when the
+        // frame size changes. A reused dataset with many distinct sizes thrashes
+        // it. The decoupling now in place (physical grid vs logical ROI) makes
+        // the clean fix a single max-size intermediate reconfigured per frame —
+        // mirroring the R8 source pool — but that needs
+        // `convert_rgba8_to_planar_float` to sample a physical-dims-bound RGBA8
+        // source over a logical sub-rect, so it is deferred until the end-to-end
+        // numbers show this realloc matters.
+        let mut slot = self
+            .intermediate_rgba
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !matches!(*slot, Some((iw, ih, _)) if iw == w && ih == h) {
+            let interm =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .map_err(|e| {
+                        Error::NotSupported(format!(
+                            "convert_nv_to_planar_float: RGBA8 intermediate IOSurface alloc \
+                         {w}x{h} failed: {e}"
+                        ))
+                    })?;
+            *slot = Some((w, h, interm));
+        }
+        let interm = &mut slot.as_mut().unwrap().2;
+
+        // Both passes run under ONE GL session: a single `lock_gl` +
+        // `MakeCurrent` held across them so the process-global ANGLE context is
+        // never released between pass 1 and pass 2. Releasing/re-acquiring the
+        // context mid-operation (two separate sessions) deadlocked under the
+        // profiler's pipelined concurrency at depth > 1. Each pass still issues
+        // its own `glFinish` before releasing its tex-image bindings (so the GPU
+        // is done reading/writing the shared intermediate before it is rebound).
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+        // Pass 1: YUV(R8) → RGBA8, full-resolution, no crop.
+        self.convert_yuyv_to_rgba_inner(d, src, interm, src_fmt, PixelFormat::Rgba)?;
+        // Pass 2: RGBA8 → PlanarRgb F16 with letterbox/resize.
+        self.convert_rgba8_to_planar_float_inner(d, interm, dst, crop)
     }
 
     /// RGBA8 IOSurface source → PlanarRgb F16 IOSurface destination.
@@ -750,6 +951,24 @@ impl MacosGlProcessor {
     /// failed before reaching this method.
     pub fn convert_rgba8_to_planar_float(
         &self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        crop: crate::Crop,
+    ) -> Result<()> {
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+        self.convert_rgba8_to_planar_float_inner(d, src, dst, crop)
+    }
+
+    /// RGBA8 → PlanarRgb F16 render, assuming the GL session (`lock_gl` held +
+    /// a context current for `d`) is ALREADY established by the caller.
+    /// Standalone via [`Self::convert_rgba8_to_planar_float`]; pass 2 of the
+    /// single-session two-pass [`Self::convert_nv_to_planar_float`], which holds
+    /// ONE session across both passes (no context release between them).
+    fn convert_rgba8_to_planar_float_inner(
+        &self,
+        d: &SharedAngleDisplay,
         src: &TensorDyn,
         dst: &mut TensorDyn,
         crop: crate::Crop,
@@ -816,7 +1035,6 @@ impl MacosGlProcessor {
         })?;
         let src_id = src_u8.iosurface_id().unwrap_or(0);
 
-        let d = shared_display()?;
         if !d.supports_f16_color {
             return Err(Error::NotSupported(
                 "GL_EXT_color_buffer_half_float not exposed by this ANGLE/Metal configuration — \
@@ -850,9 +1068,6 @@ impl MacosGlProcessor {
             Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
             None => [0.0, 0.0, 0.0],
         };
-
-        let _gl_guard = lock_gl();
-        let _current = MakeCurrentGuard::new(d)?;
 
         let src_pbuf = self.get_or_create_pbuffer(
             d,
@@ -909,7 +1124,15 @@ impl MacosGlProcessor {
             // pixel holds 4 contiguous f16 elements of the planar
             // tensor's [3, H, W] byte stream. Viewport covers the
             // full surface so the fragment shader visits every
-            // packed pixel.
+            // packed pixel. `dst_w` must be a multiple of 4 for the
+            // packing to align — the IOSurface allocator
+            // (`packed_rgba16f_layout`) rejects non-multiple-of-4 widths, so a
+            // correctly-allocated dst can't reach here misaligned; guard anyway
+            // against a future caller constructing the dst differently.
+            debug_assert!(
+                dst_w % 4 == 0,
+                "RGBA16F-packed planar dst width {dst_w} must be a multiple of 4"
+            );
             let surface_w = (dst_w / 4) as i32;
             let surface_h = (dst_h * 3) as i32;
             gls::gl::Viewport(0, 0, surface_w, surface_h);
@@ -989,7 +1212,16 @@ impl MacosGlProcessor {
     pub fn supports(src_fmt: PixelFormat, dst_fmt: PixelFormat) -> bool {
         matches!(
             (src_fmt, dst_fmt),
-            (PixelFormat::Yuyv, PixelFormat::Rgba) | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
+            (PixelFormat::Yuyv, PixelFormat::Rgba)
+                | (PixelFormat::Grey, PixelFormat::Rgba)
+                | (PixelFormat::Nv12, PixelFormat::Rgba)
+                | (PixelFormat::Nv16, PixelFormat::Rgba)
+                | (PixelFormat::Nv24, PixelFormat::Rgba)
+                | (PixelFormat::Rgba, PixelFormat::PlanarRgb)
+                // Two-pass YUV → PlanarRgb F16 (the profiler's preprocess).
+                | (PixelFormat::Nv12, PixelFormat::PlanarRgb)
+                | (PixelFormat::Nv16, PixelFormat::PlanarRgb)
+                | (PixelFormat::Nv24, PixelFormat::PlanarRgb)
         )
     }
 
@@ -1010,6 +1242,27 @@ impl MacosGlProcessor {
         )
         .entered();
 
+        let d = shared_display()?;
+        let _gl_guard = lock_gl();
+        let _current = MakeCurrentGuard::new(d)?;
+        self.convert_yuyv_to_rgba_inner(d, src, dst, src_fmt, dst_fmt)
+    }
+
+    /// Render NV*/YUYV/GREY → RGBA into `dst`, assuming the GL session
+    /// (`lock_gl` held + a context current for `d`) is ALREADY established by
+    /// the caller. Standalone callers use [`Self::convert_yuyv_to_rgba`]; the
+    /// two-pass [`Self::convert_nv_to_planar_float`] calls this as pass 1 under a
+    /// single shared session so the process-global ANGLE context is never
+    /// released between the passes — that mid-operation release/re-acquire
+    /// deadlocked under the profiler's pipelined concurrency (depth > 1).
+    fn convert_yuyv_to_rgba_inner(
+        &self,
+        d: &SharedAngleDisplay,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        src_fmt: PixelFormat,
+        dst_fmt: PixelFormat,
+    ) -> Result<()> {
         let src_w = src
             .width()
             .ok_or_else(|| Error::InvalidShape("src width".into()))?;
@@ -1049,18 +1302,48 @@ impl MacosGlProcessor {
         let src_id = src_u8.iosurface_id().unwrap_or(0);
         let dst_id = dst_u8.iosurface_id().unwrap_or(0);
 
-        let d = shared_display()?;
-        let _gl_guard = lock_gl();
-        let _current = MakeCurrentGuard::new(d)?;
-
         // Look up (or create) the source/dest pbuffers in the cache.
         // Cache miss path calls `eglCreatePbufferFromClientBuffer` and
         // inserts; cache hit returns the existing surface.
         // The src/dst as_u8/as_u8_mut checks above mean both tensors
         // are u8 today. Float-dtype rendering routes through the
         // separate `convert_rgba8_to_planar_float` call site.
-        let src_pbuf =
-            self.get_or_create_pbuffer(d, src_id, src_iosurface, src_fmt, DType::U8, src_w, src_h)?;
+        let src_pbuf = match src_fmt {
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
+                // The semi-planar source is a single contiguous R8 plane that may
+                // be a reused pool surface larger than this frame. Bind the WHOLE
+                // physical IOSurface as one GL_RED texture (not the frame-sized
+                // sub-region) so a single cached pbuffer serves every frame: the
+                // shader addresses each Y/UV texel within it via `texelFetch`,
+                // which Metal resolves to `row * bytesPerRow + col` against the
+                // surface's real pitch. Binding at frame dims would instead need
+                // a fresh pbuffer per distinct frame size (the regression's tax)
+                // and a stale cache entry across sizes.
+                let (pw, ph) = src.iosurface_physical_dims().ok_or_else(|| {
+                    Error::NotSupported(
+                        "GL convert: semi-planar source is not IOSurface-backed".into(),
+                    )
+                })?;
+                self.get_or_create_pbuffer(
+                    d,
+                    src_id,
+                    src_iosurface,
+                    PixelFormat::Grey,
+                    DType::U8,
+                    pw,
+                    ph,
+                )?
+            }
+            _ => self.get_or_create_pbuffer(
+                d,
+                src_id,
+                src_iosurface,
+                src_fmt,
+                DType::U8,
+                src_w,
+                src_h,
+            )?,
+        };
         let dst_pbuf =
             self.get_or_create_pbuffer(d, dst_id, dst_iosurface, dst_fmt, DType::U8, dst_w, dst_h)?;
 
@@ -1090,13 +1373,57 @@ impl MacosGlProcessor {
                 ))));
             }
 
-            // Render.
+            // Render. Select the source-sampling program by source format:
+            //   YUYV  → GL_RG packed sampler;
+            //   GREY  → GL_RED, identity luma;
+            //   NV12/16/24 → GL_RED single-plane sampler with in-shader
+            //     semi-planar addressing (uniforms select the layout).
             gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-            gls::gl::UseProgram(self.program_yuyv_to_rgba);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.src_tex);
-            gls::gl::Uniform1i(self.uniform_src, 0);
-            gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+            match src_fmt {
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24 => {
+                    // The combined plane's physical row pitch (== bytes_per_row,
+                    // == the bound texture's texel width — the surface is now
+                    // allocated so width == pitch, see `iosurface::new_image`).
+                    // Every Y/UV byte is addressed in this physical-stride space:
+                    // `texelFetch(b % stride, b / stride)` lands exactly on byte
+                    // `b`, matching the codec's `row * grid_row_stride + col`
+                    // writer. This is what makes NV24's `2*W`-byte chroma line —
+                    // which exceeds the even width once the row is padded —
+                    // addressable; binding at the even width would leave its
+                    // tail columns outside the texture.
+                    let stride = src_u8.effective_row_stride().unwrap_or(src_w);
+                    // Chroma geometry from the shared single source of truth
+                    // (`PixelFormat::chroma_layout`): `shift_x`/`shift_y` select
+                    // the sub-sampling, and the UV plane advances
+                    // `uv_rows_per_luma * stride` bytes per chroma row (NV24's
+                    // full-resolution 2*W-byte line == two grid rows).
+                    let layout = src_fmt
+                        .chroma_layout()
+                        .expect("NV12/NV16/NV24 always have a chroma layout");
+                    let uv_row_bytes = (layout.uv_rows_per_luma * stride) as i32;
+                    gls::gl::UseProgram(self.program_nv_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_nv_src, 0);
+                    gls::gl::Uniform2i(self.uniform_nv_img_size, src_w as i32, src_h as i32);
+                    gls::gl::Uniform1i(self.uniform_nv_tex_width, stride as i32);
+                    gls::gl::Uniform2i(
+                        self.uniform_nv_chroma_shift,
+                        layout.shift_x as i32,
+                        layout.shift_y as i32,
+                    );
+                    gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
+                }
+                PixelFormat::Grey => {
+                    gls::gl::UseProgram(self.program_grey_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_grey_src, 0);
+                }
+                _ => {
+                    gls::gl::UseProgram(self.program_yuyv_to_rgba);
+                    gls::gl::Uniform1i(self.uniform_src, 0);
+                    gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+                }
+            }
             gls::gl::BindVertexArray(self.vao);
             gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
             gls::gl::Finish();
@@ -1260,6 +1587,13 @@ impl ImageProcessorTrait for MacosGlProcessor {
             (PixelFormat::Rgba, PixelFormat::PlanarRgb, DType::F16) => {
                 self.convert_rgba8_to_planar_float(src, dst, crop)
             }
+            // Semi-planar YUV → PlanarRgb F16: two GPU passes (YUV→RGBA8 then
+            // the verified RGBA8→PlanarRgb F16 with letterbox/resize).
+            (
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+            ) => self.convert_nv_to_planar_float(src, dst, src_fmt, crop),
             (PixelFormat::Rgba, PixelFormat::PlanarRgb, other) => {
                 Err(Error::NotSupported(format!(
                     "MacosGlProcessor: Rgba → PlanarRgb requires F16 destination on the \

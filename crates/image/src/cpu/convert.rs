@@ -27,35 +27,115 @@ pub(super) fn full_to_limit(l: u8) -> u8 {
     l
 }
 
+/// Scatter a packed `src_ch`-channel image into single-channel destination
+/// planes, honouring **both** source and destination row strides — rows are
+/// pitch-padded on DMA/IOSurface tensors (and `None`-memory tensors auto-select
+/// DMA on i.MX), so a flat `as_slice()` read shears the image. `plane_src[p]`
+/// selects the source channel copied into plane `p`, or `None` to fill that
+/// plane with a constant `255` (the alpha plane of a planar-RGBA destination).
+/// Each plane only touches the `w` logical bytes of every row; planes run
+/// concurrently.
+fn pack_to_planar(
+    src: &Tensor<u8>,
+    dst: &mut Tensor<u8>,
+    src_ch: usize,
+    plane_src: &[Option<usize>],
+) -> Result<()> {
+    let w = src.width().unwrap_or(0);
+    let h = src.height().unwrap_or(0);
+    let src_stride = super::tensor_row_stride(src);
+    let dst_stride = super::tensor_row_stride(dst);
+    let src_map = src.map()?;
+    let src_bytes = src_map.as_slice();
+    let mut dst_map = dst.map()?;
+    let dst_bytes = dst_map.as_mut_slice();
+
+    // Each destination plane is `h` rows of `dst_stride` bytes (the row pitch).
+    let plane = dst_stride * h;
+    let plane_slices: Vec<&mut [u8]> = dst_bytes.chunks_mut(plane).take(plane_src.len()).collect();
+    rayon::scope(|sc| {
+        for (pb, &chan) in plane_slices.into_iter().zip(plane_src.iter()) {
+            sc.spawn(move |_| match chan {
+                Some(c) => {
+                    for row in 0..h {
+                        let s = &src_bytes[row * src_stride..row * src_stride + w * src_ch];
+                        let d = &mut pb[row * dst_stride..row * dst_stride + w];
+                        for x in 0..w {
+                            d[x] = s[x * src_ch + c];
+                        }
+                    }
+                }
+                None => {
+                    for row in 0..h {
+                        pb[row * dst_stride..row * dst_stride + w].fill(255);
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
 impl CPUProcessor {
     pub(super) fn convert_nv12_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
-            let src_h = src.shape()[0]; // multiplane: luma shape is [H, W]
-            Self::nv12_to_rgb_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            // The chroma plane is a raw tensor (no format), so its
+            // `effective_row_stride()` has no width-based fallback — default to
+            // even(width) so an odd-width odd-stride chroma plane stays aligned.
+            let y_stride = src
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            let uv_stride = src
+                .chroma()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            Self::nv12_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                y_stride,
+                uv_stride,
+                dst,
+            )
         } else {
+            // Contiguous NV12: `src_h` luma rows then `ceil(src_h/2)` chroma
+            // rows, every row `stride` bytes (>= even_width for padded buffers).
+            // The chroma plane starts after the luma rows: `stride * src_h`.
             let map = src.map()?;
-            // contiguous NV12: shape is [H*3/2, W], so height = shape[0] * 2 / 3
-            let src_h = src.shape()[0] * 2 / 3;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let stride = src
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv12_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv12_to_rgb_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        y_stride: usize,
+        uv_stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: y_stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: uv_stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -75,31 +155,57 @@ impl CPUProcessor {
     // caller applies an R<->B swizzle afterwards via `swizzle_rb_4chan`.
     pub(super) fn convert_nv12_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
-            let src_h = src.shape()[0];
-            Self::nv12_to_rgba_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            let y_stride = src
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            let uv_stride = src
+                .chroma()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            Self::nv12_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                y_stride,
+                uv_stride,
+                dst,
+            )
         } else {
             let map = src.map()?;
-            let src_h = src.shape()[0] * 2 / 3;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let stride = src
+                .effective_row_stride()
+                .unwrap_or(src_w.next_multiple_of(2));
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv12_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, stride, dst)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn nv12_to_rgba_kernel(
         y_plane: &[u8],
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        y_stride: usize,
+        uv_stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: y_stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: uv_stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -115,26 +221,31 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_nv12_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        // NV12→GREY drops chroma and copies the luma plane (the first `src_h`
+        // rows). Honour the source row stride so padded buffers and odd widths
+        // are handled correctly, and the destination grey stride so we write a
+        // tightly-packed [H, W] output.
         let src_w = src.width().unwrap();
-        let src_h = if src.is_multiplane() {
-            src.shape()[0]
-        } else {
-            src.shape()[0] * 2 / 3
-        };
+        let src_h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
 
         let src_map = src.map()?;
-        let y_len = src_w * src_h;
-        let y_slice = &src_map.as_slice()[..y_len];
-
+        let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        let src_chunks = y_slice.as_chunks::<8>();
-        let dst_chunks = dst_map.as_chunks_mut::<8>();
-        for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
-            s.iter().zip(d).for_each(|(s, d)| *d = limit_to_full(*s));
-        }
+        let dst_bytes = dst_map.as_mut_slice();
 
-        for (s, d) in src_chunks.1.iter().zip(dst_chunks.1) {
-            *d = limit_to_full(*s);
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            let (s_chunks, s_rem) = s.as_chunks::<8>();
+            let (d_chunks, d_rem) = d.as_chunks_mut::<8>();
+            for (sc, dc) in s_chunks.iter().zip(d_chunks) {
+                sc.iter().zip(dc).for_each(|(s, d)| *d = limit_to_full(*s));
+            }
+            for (s, d) in s_rem.iter().zip(d_rem) {
+                *d = limit_to_full(*s);
+            }
         }
 
         Ok(())
@@ -227,21 +338,49 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_yuyv_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let mut dst_map = dst.map()?;
-
-        let src_chunks = src_map.as_chunks::<2>().0;
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let src_rs = super::tensor_row_stride(src);
         let dst_w = dst.width().unwrap();
+        let dst_stride = super::tensor_row_stride(dst);
         let dst_h = if dst.is_multiplane() {
             dst.shape()[0]
         } else {
             dst.shape()[0] / 2
         };
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
+        let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
+        let mut dst_map = dst.map()?;
+        // Split at the stride-aligned luma plane boundary, not the tight one.
+        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
 
-        for ((s, y), uv) in src_chunks.iter().zip(y_plane).zip(uv_plane) {
-            *y = s[0];
-            *uv = s[1];
+        // YUYV byte order per two-pixel macropixel: [Y0, Cb, Y1, Cr].
+        // The NV16 chroma row is `even(dst_w)` bytes wide (one (Cb,Cr) pair per
+        // 2 luma columns, rounded up), so slice the UV row to the even width.
+        let chroma_w = dst_w.next_multiple_of(2);
+        for row in 0..src_h {
+            let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
+            let y_row = &mut y_plane[row * dst_stride..row * dst_stride + dst_w];
+            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + chroma_w];
+            let mut xi = 0usize;
+            let mut si = 0usize;
+            while xi + 1 < dst_w {
+                y_row[xi] = src_row[si]; // Y0
+                y_row[xi + 1] = src_row[si + 2]; // Y1
+                uv_row[xi] = src_row[si + 1]; // Cb
+                uv_row[xi + 1] = src_row[si + 3]; // Cr
+                xi += 2;
+                si += 4;
+            }
+            // Odd width: one trailing lone pixel. Write its Y and the full
+            // (Cb,Cr) chroma pair so the even-width chroma row is fully
+            // initialized; the lone pixel has no second-Y Cr in the source, so
+            // replicate Cb when absent.
+            if xi < dst_w && si + 1 < src_row.len() {
+                y_row[xi] = src_row[si];
+                uv_row[xi] = src_row[si + 1]; // Cb
+                uv_row[xi + 1] = src_row.get(si + 3).copied().unwrap_or(src_row[si + 1]);
+            }
         }
         Ok(())
     }
@@ -333,26 +472,47 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_vyuy_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let mut dst_map = dst.map()?;
-
-        // VYUY byte order: [V, Y0, U, Y1] — per 4-byte macropixel
-        let src_chunks = src_map.as_chunks::<4>().0;
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let src_rs = super::tensor_row_stride(src);
         let dst_w = dst.width().unwrap();
+        let dst_stride = super::tensor_row_stride(dst);
         let dst_h = if dst.is_multiplane() {
             dst.shape()[0]
         } else {
             dst.shape()[0] / 2
         };
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
-        let y_pairs = y_plane.as_chunks_mut::<2>().0;
-        let uv_pairs = uv_plane.as_chunks_mut::<2>().0;
+        let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
+        let mut dst_map = dst.map()?;
+        // Split at the stride-aligned luma plane boundary, not the tight one.
+        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
 
-        for ((s, y), uv) in src_chunks.iter().zip(y_pairs).zip(uv_pairs) {
-            y[0] = s[1]; // Y0
-            y[1] = s[3]; // Y1
-            uv[0] = s[2]; // U
-            uv[1] = s[0]; // V
+        // VYUY byte order per two-pixel macropixel: [V, Y0, U, Y1]. The NV16
+        // chroma row is `even(dst_w)` bytes wide, so slice UV to the even width.
+        let chroma_w = dst_w.next_multiple_of(2);
+        for row in 0..src_h {
+            let src_row = &src_bytes[row * src_rs..row * src_rs + src_w * 2];
+            let y_row = &mut y_plane[row * dst_stride..row * dst_stride + dst_w];
+            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + chroma_w];
+            let mut xi = 0usize;
+            let mut si = 0usize;
+            while xi + 1 < dst_w {
+                y_row[xi] = src_row[si + 1]; // Y0
+                y_row[xi + 1] = src_row[si + 3]; // Y1
+                uv_row[xi] = src_row[si + 2]; // U (Cb)
+                uv_row[xi + 1] = src_row[si]; // V (Cr)
+                xi += 2;
+                si += 4;
+            }
+            // Odd width: one trailing lone pixel — write Y and the full (Cb,Cr)
+            // pair (both are present in this macropixel's V,Y0,U bytes) so the
+            // even-width chroma row is fully initialized.
+            if xi < dst_w && si + 2 < src_row.len() {
+                y_row[xi] = src_row[si + 1];
+                uv_row[xi] = src_row[si + 2]; // U (Cb)
+                uv_row[xi + 1] = src_row[si]; // V (Cr)
+            }
         }
         Ok(())
     }
@@ -396,42 +556,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_grey_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        rayon::scope(|s| {
-            s.spawn(|_| dst0.copy_from_slice(src));
-            s.spawn(|_| dst1.copy_from_slice(src));
-            s.spawn(|_| dst2.copy_from_slice(src));
-        });
-        Ok(())
+        // Grey broadcast into R, G, B planes.
+        pack_to_planar(src, dst, 1, &[Some(0), Some(0), Some(0)])
     }
 
     pub(super) fn convert_grey_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-        rayon::scope(|s| {
-            s.spawn(|_| dst0.copy_from_slice(src));
-            s.spawn(|_| dst1.copy_from_slice(src));
-            s.spawn(|_| dst2.copy_from_slice(src));
-            s.spawn(|_| dst3.fill(255));
-        });
-        Ok(())
+        // Grey broadcast into R, G, B planes + constant alpha plane.
+        pack_to_planar(src, dst, 1, &[Some(0), Some(0), Some(0), None])
     }
 
     pub(super) fn convert_grey_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
@@ -456,16 +587,28 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_grey_to_nv16(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
+        let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
+        let mut dst_map = dst.map()?;
+        let dst_bytes = dst_map.as_mut_slice();
+        // NV16 luma plane: dst_h rows, then UV plane: another dst_h rows.
+        let (y_plane, uv_plane) = dst_bytes.split_at_mut(dst_stride * src_h);
 
-        let mut dst = dst.map()?;
-        let dst = dst.as_mut_slice();
-
-        for (s, d) in src.iter().zip(dst[0..src.len()].iter_mut()) {
-            *d = full_to_limit(*s);
+        for row in 0..src_h {
+            // Copy luma row, respecting source and destination strides.
+            let src_row = &src_bytes[row * src_stride..row * src_stride + src_w];
+            let y_row = &mut y_plane[row * dst_stride..row * dst_stride + src_w];
+            for (s, d) in src_row.iter().zip(y_row.iter_mut()) {
+                *d = full_to_limit(*s);
+            }
+            // UV row: neutral chroma (128 = no colour)
+            let uv_row = &mut uv_plane[row * dst_stride..row * dst_stride + src_w];
+            uv_row.fill(128);
         }
-        dst[src.len()..].fill(128);
 
         Ok(())
     }
@@ -504,54 +647,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_rgba_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<4>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .for_each(|(((s, d0), d1), d2)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-            });
-        Ok(())
+        // RGBA → R, G, B planes (alpha dropped).
+        pack_to_planar(src, dst, 4, &[Some(0), Some(1), Some(2)])
     }
 
     pub(super) fn convert_rgba_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<4>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .zip_eq(dst3)
-            .for_each(|((((s, d0), d1), d2), d3)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-                *d3 = s[3];
-            });
-        Ok(())
+        // RGBA → R, G, B, A planes.
+        pack_to_planar(src, dst, 4, &[Some(0), Some(1), Some(2), Some(3)])
     }
 
     pub(super) fn convert_rgba_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
@@ -628,14 +730,16 @@ impl CPUProcessor {
             dst.shape()[0] / 2
         };
         let src_rs = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map()?;
 
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one.
+        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
         let mut bi_planar_image = yuv::YuvBiPlanarImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(y_plane),
-            y_stride: dst_w as u32,
+            y_stride: dst_stride as u32,
             uv_plane: yuv::BufferStoreMut::Borrowed(uv_plane),
-            uv_stride: dst_w as u32,
+            uv_stride: dst_stride as u32,
             width: dst_w as u32,
             height: dst_h as u32,
         };
@@ -684,57 +788,13 @@ impl CPUProcessor {
     }
 
     pub(super) fn convert_rgb_to_8bps(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<3>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-
-        src.par_iter()
-            .zip_eq(dst0)
-            .zip_eq(dst1)
-            .zip_eq(dst2)
-            .for_each(|(((s, d0), d1), d2)| {
-                *d0 = s[0];
-                *d1 = s[1];
-                *d2 = s[2];
-            });
-        Ok(())
+        // RGB → R, G, B planes.
+        pack_to_planar(src, dst, 3, &[Some(0), Some(1), Some(2)])
     }
 
     pub(super) fn convert_rgb_to_prgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src = src.map()?;
-        let src = src.as_slice();
-        let src = src.as_chunks::<3>().0;
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        let plane_size = src.len();
-        let (dst0, dst1) = dst_.split_at_mut(plane_size);
-        let (dst1, dst2) = dst1.split_at_mut(plane_size);
-        let (dst2, dst3) = dst2.split_at_mut(plane_size);
-
-        rayon::scope(|s| {
-            s.spawn(|_| {
-                src.par_iter()
-                    .zip_eq(dst0)
-                    .zip_eq(dst1)
-                    .zip_eq(dst2)
-                    .for_each(|(((s, d0), d1), d2)| {
-                        *d0 = s[0];
-                        *d1 = s[1];
-                        *d2 = s[2];
-                    })
-            });
-            s.spawn(|_| dst3.fill(255));
-        });
-        Ok(())
+        // RGB → R, G, B planes + constant alpha plane.
+        pack_to_planar(src, dst, 3, &[Some(0), Some(1), Some(2), None])
     }
 
     pub(super) fn convert_rgb_to_yuyv(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
@@ -808,14 +868,16 @@ impl CPUProcessor {
             dst.shape()[0] / 2
         };
         let src_rs = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map()?;
 
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_w * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one.
+        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
         let mut bi_planar_image = yuv::YuvBiPlanarImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(y_plane),
-            y_stride: dst_w as u32,
+            y_stride: dst_stride as u32,
             uv_plane: yuv::BufferStoreMut::Borrowed(uv_plane),
-            uv_stride: dst_w as u32,
+            uv_stride: dst_stride as u32,
             width: dst_w as u32,
             height: dst_h as u32,
         };
@@ -847,16 +909,36 @@ impl CPUProcessor {
 
     pub(super) fn convert_nv16_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        // NV16's UV plane is full-height with one (Cb,Cr) pair per two luma
+        // columns ⇒ `width` bytes per chroma row, i.e. the SAME pitch as luma.
+        // Both planes use the buffer's (possibly even-padded) row stride; using
+        // the logical width here corrupts every row past the first when the
+        // width is odd (stride > width). See the NV24 kernel below.
+        let stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
             let src_h = src.shape()[0];
-            Self::nv16_to_rgb_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            Self::nv16_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
         } else {
             let map = src.map()?;
             let src_h = src.shape()[0] / 2;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv16_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv16_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }
 
@@ -865,13 +947,14 @@ impl CPUProcessor {
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -888,16 +971,32 @@ impl CPUProcessor {
 
     pub(super) fn convert_nv16_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
+        // See `convert_nv16_to_rgb`: both planes share the buffer row stride.
+        let stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
         if src.is_multiplane() {
             let y_map = src.map()?;
             let uv_map = src.chroma().unwrap().map()?;
             let src_h = src.shape()[0];
-            Self::nv16_to_rgba_kernel(y_map.as_slice(), uv_map.as_slice(), src_w, src_h, dst)
+            Self::nv16_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
         } else {
             let map = src.map()?;
             let src_h = src.shape()[0] / 2;
-            let (y_plane, uv_plane) = map.as_slice().split_at(src_w * src_h);
-            Self::nv16_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, dst)
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv16_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
         }
     }
 
@@ -906,13 +1005,14 @@ impl CPUProcessor {
         uv_plane: &[u8],
         width: usize,
         height: usize,
+        stride: usize,
         dst: &mut Tensor<u8>,
     ) -> Result<()> {
         let src = yuv::YuvBiPlanarImage {
             y_plane,
-            y_stride: width as u32,
+            y_stride: stride as u32,
             uv_plane,
-            uv_stride: width as u32,
+            uv_stride: stride as u32,
             width: width as u32,
             height: height as u32,
         };
@@ -925,6 +1025,149 @@ impl CPUProcessor {
             yuv::YuvStandardMatrix::Bt601,
             yuv::YuvConversionMode::Balanced,
         )?)
+    }
+
+    // ── NV24 (4:4:4 semi-planar): full-resolution interleaved Cb/Cr ──
+    // Contiguous layout is `[3H, W]`: Y plane (H rows) then the interleaved UV
+    // plane (2H rows of W ⇒ `2*W` bytes per chroma row). The UV plane stride is
+    // therefore twice the luma stride.
+    pub(super) fn convert_nv24_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
+        // Mirror NV16: handle true-multiplane (separate Y / CbCr DMA-BUFs) as
+        // well as the contiguous combined buffer, so NV24 is not silently
+        // mis-sliced when the chroma plane lives in its own tensor.
+        if src.is_multiplane() {
+            let y_map = src.map()?;
+            let uv_map = src.chroma().unwrap().map()?;
+            let src_h = src.shape()[0];
+            Self::nv24_to_rgb_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
+        } else {
+            let src_h = src.shape()[0] / 3;
+            let map = src.map()?;
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv24_to_rgb_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nv24_to_rgb_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        y_stride: usize,
+        dst: &mut Tensor<u8>,
+    ) -> Result<()> {
+        let src = yuv::YuvBiPlanarImage {
+            y_plane,
+            y_stride: y_stride as u32,
+            uv_plane,
+            uv_stride: (y_stride * 2) as u32,
+            width: width as u32,
+            height: height as u32,
+        };
+        Ok(yuv::yuv_nv24_to_rgb(
+            &src,
+            dst.map()?.as_mut_slice(),
+            super::tensor_row_stride(dst) as u32,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    pub(super) fn convert_nv24_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
+        // Mirror NV16: support true-multiplane (separate Y / CbCr buffers) as
+        // well as the contiguous combined buffer.
+        if src.is_multiplane() {
+            let y_map = src.map()?;
+            let uv_map = src.chroma().unwrap().map()?;
+            let src_h = src.shape()[0];
+            Self::nv24_to_rgba_kernel(
+                y_map.as_slice(),
+                uv_map.as_slice(),
+                src_w,
+                src_h,
+                stride,
+                dst,
+            )
+        } else {
+            let src_h = src.shape()[0] / 3;
+            let map = src.map()?;
+            let (y_plane, uv_plane) = super::split_semi_planar(
+                map.as_slice(),
+                stride,
+                src_h,
+                src.format().expect("semi-planar source has a pixel format"),
+            )?;
+            Self::nv24_to_rgba_kernel(y_plane, uv_plane, src_w, src_h, stride, dst)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nv24_to_rgba_kernel(
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        width: usize,
+        height: usize,
+        y_stride: usize,
+        dst: &mut Tensor<u8>,
+    ) -> Result<()> {
+        let src = yuv::YuvBiPlanarImage {
+            y_plane,
+            y_stride: y_stride as u32,
+            uv_plane,
+            uv_stride: (y_stride * 2) as u32,
+            width: width as u32,
+            height: height as u32,
+        };
+        Ok(yuv::yuv_nv24_to_rgba(
+            &src,
+            dst.map()?.as_mut_slice(),
+            super::tensor_row_stride(dst) as u32,
+            yuv::YuvRange::Full,
+            yuv::YuvStandardMatrix::Bt601,
+            yuv::YuvConversionMode::Balanced,
+        )?)
+    }
+
+    /// NV24 → GREY: drop chroma, copy the luma plane honouring its row stride.
+    pub(super) fn convert_nv24_to_grey(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let src_w = src.width().unwrap();
+        let src_h = src.shape()[0] / 3;
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
+        let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
+        let mut dst_map = dst.map()?;
+        let dst_bytes = dst_map.as_mut_slice();
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            for (s, d) in s.iter().zip(d) {
+                *d = limit_to_full(*s);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn convert_8bps_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {

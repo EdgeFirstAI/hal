@@ -76,7 +76,7 @@ pub use cuda::{
     is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
 };
 pub use error::{Error, Result};
-pub use format::{PixelFormat, PixelLayout};
+pub use format::{ChromaLayout, PixelFormat, PixelLayout};
 use num_traits::Num;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -1047,6 +1047,26 @@ impl<T> TensorStorage<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// The backing allocation's intrinsic physical row pitch in bytes, if it
+    /// has one that is fixed independent of the logical shape. macOS IOSurface
+    /// reports its 64-aligned `bytesPerRow`; other backings (Linux DMA, SHM,
+    /// Mem, PBO) have no fixed pitch beyond the logical shape and return `None`.
+    ///
+    /// Used by `configure_image` to preserve the physical pitch when a reused
+    /// pool tensor is reconfigured to a smaller logical image — so the decode
+    /// writes rows at the surface's real stride and the GPU samples them with
+    /// the same stride (the physical-grid / logical-ROI decoupling).
+    pub(crate) fn backing_row_stride(&self) -> Option<usize> {
+        match self {
+            // Only genuine image-formatted IOSurfaces (height > 1) carry a real
+            // per-row pitch; a generic byte-bag (height == 1) returns `None` so
+            // `configure_image` does not adopt its whole-buffer "row" as a stride.
+            #[cfg(target_os = "macos")]
+            TensorStorage::Dma(t) => t.image_backing_row_stride(),
+            _ => None,
+        }
+    }
+
     /// Create a new tensor storage with the given shape, memory type, and
     /// optional name. If no name is given, a random name will be generated.
     /// If no memory type is given, the best available memory type will be
@@ -1157,6 +1177,29 @@ where
     // returns `NotImplemented` directly on non-Linux without ever
     // reaching the storage layer, so defining a stub here would be
     // dead code and fail the `-D warnings` clippy gate on macOS CI.
+
+    /// Create a Mem-backed tensor storage with an explicit byte size that may
+    /// exceed `shape.product() * sizeof(T)`.  Used for image tensors with
+    /// 64-byte-aligned row strides (see `MemTensor::with_capacity_bytes`).
+    pub(crate) fn new_mem_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        MemTensor::<T>::with_capacity_bytes(shape, byte_size, name).map(TensorStorage::Mem)
+    }
+
+    /// Create a Shm-backed tensor storage with an explicit byte size that may
+    /// exceed `shape.product() * sizeof(T)`.  Used for image tensors with
+    /// 64-byte-aligned row strides (see `ShmTensor::new_with_byte_size`).
+    #[cfg(unix)]
+    pub(crate) fn new_shm_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        ShmTensor::<T>::new_with_byte_size(shape, byte_size, name).map(TensorStorage::Shm)
+    }
 
     /// Allocate an image-formatted IOSurface-backed storage (macOS).
     ///
@@ -1483,7 +1526,8 @@ where
         T: 'static,
     {
         // Shape comes from the shared `PixelFormat::image_shape` helper (packed /
-        // planar / semi-planar NV12·NV16, including the NV12 even-height check).
+        // planar / semi-planar NV12·NV16). NV12 supports odd dimensions via the
+        // `H + ceil(H/2)` combined-plane height.
         // The `T: 'static` bound is required by the macOS IOSurface path below.
         let shape = format.image_shape(width, height).ok_or_else(|| {
             Error::InvalidArgument(format!(
@@ -1524,7 +1568,22 @@ where
                 PixelLayout::Planar => width * std::mem::size_of::<T>(),
                 _ => width * format.channels() * std::mem::size_of::<T>(),
             };
-            if !natural_row_bytes.is_multiple_of(64) {
+            // A format with a real IOSurface FourCC (RGBA/BGRA/YUYV packed,
+            // GREY/NV12/NV16/NV24 as R8) tolerates a non-64-aligned natural
+            // pitch: the surface is allocated with its own 64-aligned
+            // `bytes_per_row`, the tensor records that stride below, and a CPU
+            // map iterates rows correctly via the strided-map path while the GL
+            // import uses the surface's pitch directly — fully zero-copy.
+            // Planar (the F16 RGBA16F packing) is consumed flat as
+            // `[1, C, H, W]` with no stride, so it still requires an aligned
+            // pitch; and formats without a FourCC would fall through to a
+            // generic byte-bag GL can't bind. Both fail loudly rather than
+            // silently downgrade.
+            let has_image_fourcc = dtype_of::<T>()
+                .and_then(|dt| crate::iosurface::image_iosurface_layout(format, dt))
+                .is_some();
+            let padded_ok = has_image_fourcc && format.layout() != PixelLayout::Planar;
+            if !natural_row_bytes.is_multiple_of(64) && !padded_ok {
                 let elem_size = std::mem::size_of::<T>();
                 let per_pixel_bytes = match format.layout() {
                     PixelLayout::Planar => elem_size.max(1),
@@ -1579,6 +1638,20 @@ where
                 ) {
                     let mut t = Self::wrap(storage);
                     t.format = Some(format);
+                    // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
+                    // pitch exceeds the natural packed/planar row stride, record
+                    // it so CPU consumers iterate rows correctly (the GL import
+                    // already uses the surface's own pitch). For 64-aligned rows
+                    // — the common model-input case — the two match and no stride
+                    // is stored, leaving the flat mapping unchanged.
+                    if let TensorStorage::Dma(ref io) = t.storage {
+                        let bpr = io.bytes_per_row();
+                        if let Some(natural) = t.effective_row_stride() {
+                            if bpr > natural {
+                                t.set_row_stride_unchecked(bpr);
+                            }
+                        }
+                    }
                     return Ok(t);
                 }
             }
@@ -1589,8 +1662,138 @@ where
             // storage exists for this combination.
         }
 
-        let mut t = Self::new(&shape, memory, None)?;
+        // Compute the **64-byte-aligned** row stride for every image layout.
+        //
+        // Embedded GPUs reject `eglCreateImage` DMA-BUF imports whose row pitch
+        // is not 64-byte aligned: Mali returns `EGL_BAD_ALLOC`, Vivante
+        // `EGL_BAD_ACCESS`. This bit packed RGBA/RGB destinations at odd widths
+        // AND at even non-multiple-of-16 widths (e.g. 321→1284, 322→1288 bytes —
+        // neither divisible by 64), so an odd-source → RGBA convert failed on
+        // imx95/imx8mp while succeeding on V3D/Tegra. Semi-planar already aligned
+        // here; we now align packed and planar identically so every image()
+        // allocation is GPU-importable regardless of width.
+        //
+        // The per-layout natural pitch and total row count:
+        //   * SemiPlanar `[total_h, width]`     — pitch = even(width)·elem, rows = total_h
+        //   * Packed     `[height, width, ch]`  — pitch = width·ch·elem,    rows = height
+        //   * Planar     `[ch, height, width]`  — pitch = width·elem,       rows = ch·height
+        // Allocation byte size = `aligned_stride · total_rows` (NOT the shape
+        // product, which reflects only the logical width and under-allocates the
+        // padding on odd / unaligned widths).
+        let elem = std::mem::size_of::<T>();
+        let channels = format.channels();
+        let (natural_stride, total_rows) = match format.layout() {
+            PixelLayout::SemiPlanar => (width.next_multiple_of(2) * elem, shape[0]),
+            PixelLayout::Packed => (width * channels * elem, height),
+            PixelLayout::Planar => (width * elem, channels * height),
+        };
+        let aligned_stride = natural_stride.next_multiple_of(64);
+        let semi = format.layout() == PixelLayout::SemiPlanar;
+
+        // DMA buffers MUST carry a 64-aligned row pitch — Mali/Vivante reject a
+        // DMA-BUF EGLImage whose pitch is not 64-aligned. Semi-planar also needs
+        // the aligned pitch on every backend (its chroma-plane offset math
+        // assumes it). Packed/planar on host-only memory (Mem/Shm) keep the
+        // natural tight pitch so the many flat CPU consumers are unaffected.
+        let host_stride = if semi { aligned_stride } else { natural_stride };
+        let host_byte_size = host_stride * total_rows;
+        #[cfg(target_os = "linux")]
+        let dma_byte_size = aligned_stride * total_rows;
+
+        // `used_stride` is the actual row pitch of the storage created below.
+        let (storage, used_stride) = match memory {
+            #[cfg(target_os = "linux")]
+            Some(TensorMemory::Dma) => (
+                TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None)?,
+                aligned_stride,
+            ),
+            #[cfg(unix)]
+            Some(TensorMemory::Shm) => (
+                TensorStorage::<T>::new_shm_with_byte_size(&shape, host_byte_size, None)?,
+                host_stride,
+            ),
+            Some(TensorMemory::Mem) => (
+                TensorStorage::<T>::new_mem_with_byte_size(&shape, host_byte_size, None)?,
+                host_stride,
+            ),
+            #[allow(unused_variables)]
+            Some(other) => {
+                // PBO and any future variants: fall through to standard new().
+                return {
+                    let mut t = Self::new(&shape, Some(other), None)?;
+                    t.format = Some(format);
+                    Ok(t)
+                };
+            }
+            None => {
+                // Auto-select: DMA → Shm → Mem on Linux; Shm → Mem on macOS.
+                // DMA gets the 64-aligned pitch; host fallbacks keep the tight
+                // (host) pitch, so the recorded stride matches the storage used.
+                #[cfg(target_os = "linux")]
+                {
+                    match TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None) {
+                        Ok(s) => (s, aligned_stride),
+                        Err(_) => {
+                            match TensorStorage::<T>::new_shm_with_byte_size(
+                                &shape,
+                                host_byte_size,
+                                None,
+                            ) {
+                                Ok(s) => (s, host_stride),
+                                Err(_) => (
+                                    TensorStorage::<T>::new_mem_with_byte_size(
+                                        &shape,
+                                        host_byte_size,
+                                        None,
+                                    )?,
+                                    host_stride,
+                                ),
+                            }
+                        }
+                    }
+                }
+                #[cfg(all(unix, not(target_os = "linux")))]
+                {
+                    match TensorStorage::<T>::new_shm_with_byte_size(&shape, host_byte_size, None) {
+                        Ok(s) => (s, host_stride),
+                        Err(_) => (
+                            TensorStorage::<T>::new_mem_with_byte_size(
+                                &shape,
+                                host_byte_size,
+                                None,
+                            )?,
+                            host_stride,
+                        ),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    (
+                        TensorStorage::<T>::new_mem_with_byte_size(&shape, host_byte_size, None)?,
+                        host_stride,
+                    )
+                }
+            }
+        };
+
+        let mut t = Self::wrap(storage);
         t.format = Some(format);
+        // Record the row stride when it exceeds the natural tight pitch (padding
+        // is present — DMA packed/planar at an unaligned width, or always for
+        // semi-planar), mirroring the IOSurface path above. Aligned-width and
+        // host-only packed/planar images keep their flat layout with no explicit
+        // stride; `effective_row_stride()` then falls back to the identical
+        // computed pitch. When padding IS present, consumers must iterate rows by
+        // `effective_row_stride()` to skip it.
+        if semi || used_stride > natural_stride {
+            t.set_row_stride_unchecked(used_stride);
+        }
+        debug_assert!(
+            t.row_stride.is_some() || !semi,
+            "image() must always set row_stride for semi-planar tensors"
+        );
+        #[cfg(target_os = "linux")]
+        t.try_init_dma_cuda();
         Ok(t)
     }
 
@@ -1750,15 +1953,28 @@ where
                     )));
                 }
                 match format {
-                    PixelFormat::Nv12 if !shape[0].is_multiple_of(3) => {
+                    // Combined-plane height is `H + ceil(H/2)` (luma + chroma
+                    // rows). For even H that is `3H/2` (≡ 0 mod 3); for odd H it
+                    // is `(3H+1)/2` (≡ 2 mod 3). Only totals ≡ 1 mod 3 are
+                    // unreachable, so reject just those — odd-height NV12 is
+                    // valid (e.g. 725 rows for a 483-tall image).
+                    PixelFormat::Nv12 if shape[0] % 3 == 1 => {
                         return Err(Error::InvalidShape(format!(
-                            "NV12 contiguous shape[0] must be divisible by 3, got {}",
+                            "NV12 contiguous shape[0] must be H + ceil(H/2) for some height; \
+                             {} is unreachable (≡ 1 mod 3)",
                             shape[0]
                         )));
                     }
                     PixelFormat::Nv16 if !shape[0].is_multiple_of(2) => {
                         return Err(Error::InvalidShape(format!(
                             "NV16 contiguous shape[0] must be even, got {}",
+                            shape[0]
+                        )));
+                    }
+                    // NV24 (4:4:4): combined-plane height is 3H (Y + 2H chroma).
+                    PixelFormat::Nv24 if !shape[0].is_multiple_of(3) => {
+                        return Err(Error::InvalidShape(format!(
+                            "NV24 contiguous shape[0] must be a multiple of 3 (= 3H), got {}",
                             shape[0]
                         )));
                     }
@@ -1787,6 +2003,20 @@ where
     /// format layout; fails with `Error::InsufficientCapacity` if the
     /// allocation cannot hold `width`×`height` in `format`, or
     /// `Error::InvalidArgument` if the dimensions are invalid for the format.
+    ///
+    /// For NV12/NV16/NV24 the buffer width is rounded up to even (a chroma-plane
+    /// interleaving requirement); the true odd width is reported by the decoder
+    /// in `ImageInfo` and trimmed by a `convert()` crop. See
+    /// [`PixelFormat::image_shape`].
+    ///
+    /// When the backing has a fixed physical row pitch (an IOSurface's
+    /// 64-aligned `bytesPerRow`) that exceeds the new format's natural row
+    /// stride — i.e. a reused max-sized pool tensor reconfigured to a smaller
+    /// image — the physical pitch is preserved as the tensor's `row_stride`.
+    /// This keeps the **physical grid** (allocation stride/surface) fixed while
+    /// the **logical ROI** (this image's W×H) changes, so the decode writes rows
+    /// at the surface's real stride and the GPU samples them at the same stride.
+    /// Exact-sized buffers (pitch == natural) stay tightly packed unchanged.
     pub fn configure_image(
         &mut self,
         width: usize,
@@ -1798,8 +2028,78 @@ where
                 "invalid dimensions {width}x{height} for format {format:?}"
             ))
         })?;
+        // Capture the pre-existing row stride before `set_format` clears it.
+        // For pool tensors that were allocated at a larger width (e.g. 1920-wide
+        // pool decoding a 789-wide image), this preserves the backing pitch so
+        // rows are still written at the correct physical stride.
+        let prior_stride = self.row_stride;
+
         self.storage.set_logical_shape(&shape)?;
-        self.set_format(format)
+        self.set_format(format)?; // clears any stale row_stride
+
+        // Preserve the backing's physical row pitch when it is wider than the
+        // natural (tightly-packed) row for this format — the physical-grid /
+        // logical-ROI decoupling for reused pool tensors.
+        let active_stride = if let Some(pitch) = self.storage.backing_row_stride() {
+            // macOS IOSurface: use the surface's native pitch.
+            let natural = self.effective_row_stride().unwrap_or(0);
+            if pitch > natural {
+                self.set_row_stride_unchecked(pitch);
+                pitch
+            } else {
+                natural
+            }
+        } else if format.layout() == PixelLayout::SemiPlanar {
+            // For self-allocated SemiPlanar tensors (Mem/Shm on any platform,
+            // DMA on Linux), restore the correct 64-byte-aligned stride so the
+            // buffer is fully exploited.
+            //
+            // Priority:
+            //   1. Prior stride (pool reuse): if the pre-existing stride is
+            //      64-aligned, >= even(width), and fits the allocation, keep it.
+            //      This is the hot-loop reuse case (large pool, small image).
+            //   2. Compute fresh 64-aligned stride for the current width.
+            let elem = std::mem::size_of::<T>();
+            let min_stride = width.next_multiple_of(2) * elem;
+            let aligned = min_stride.next_multiple_of(64);
+            let total_h = shape[0];
+            let capacity = self.storage.capacity_bytes();
+
+            let candidate = if let Some(ps) = prior_stride {
+                // Keep the prior stride only when it still satisfies the current
+                // minimum (even(width)) and the allocation can hold it.
+                if ps >= min_stride && ps % 64 == 0 && ps * total_h <= capacity {
+                    ps
+                } else {
+                    aligned
+                }
+            } else {
+                aligned
+            };
+
+            if candidate * total_h <= capacity {
+                self.set_row_stride_unchecked(candidate);
+                candidate
+            } else {
+                // Shouldn't happen for legitimate pools, but don't crash.
+                self.effective_row_stride().unwrap_or(0)
+            }
+        } else {
+            self.effective_row_stride().unwrap_or(0)
+        };
+
+        // For semi-planar formats, ensure the active stride fits the allocation.
+        // A pool reconfigured to a wider image than its backing would silently
+        // SIGBUS on any subsequent map/write — catch it here instead.
+        if format.layout() == PixelLayout::SemiPlanar && active_stride > 0 {
+            let total_h = shape[0];
+            let needed = active_stride * total_h;
+            let capacity = self.storage.capacity_bytes();
+            if needed > capacity {
+                return Err(Error::InsufficientCapacity { needed, capacity });
+            }
+        }
+        Ok(())
     }
 
     /// Allocate an image tensor sized to hold up to `width`×`height` in
@@ -1833,6 +2133,13 @@ where
     }
 
     /// Image height (None if not an image).
+    ///
+    /// For semi-planar formats the combined-plane shape row count is divided
+    /// by the format's luma-to-total ratio to recover logical height. This
+    /// returns the exact logical height (including odd heights) only because
+    /// the logical dimensions are tracked separately from the physical shape —
+    /// `configure_image` stores the actual `(width, height)` in the format's
+    /// `image_shape`, which round-trips losslessly via these accessors.
     pub fn height(&self) -> Option<usize> {
         let fmt = self.format?;
         let shape = self.shape();
@@ -1846,6 +2153,7 @@ where
                     match fmt {
                         PixelFormat::Nv12 => Some(shape[0] * 2 / 3),
                         PixelFormat::Nv16 => Some(shape[0] / 2),
+                        PixelFormat::Nv24 => Some(shape[0] / 3),
                         _ => None,
                     }
                 }
@@ -1902,9 +2210,14 @@ where
                     )));
                 }
             }
+            // NV24's chroma plane is full-resolution (2×-wide interleaved UV),
+            // which the equal-width plane check above doesn't model. Multiplane
+            // NV24 is unused (the JPEG decoder emits a contiguous NV24 buffer),
+            // so it's not supported here yet.
             _ => {
                 return Err(Error::InvalidArgument(format!(
-                    "from_planes only supports NV12 and NV16, got {format:?}"
+                    "from_planes only supports NV12 and NV16 (NV24 multiplane not yet \
+                     supported — use a contiguous NV24 tensor), got {format:?}"
                 )));
             }
         }
@@ -1949,6 +2262,13 @@ where
     /// minimum stride computed from the format, width, and element size.
     /// Returns `None` only when no format is set and no explicit stride was
     /// stored via [`set_row_stride`](Self::set_row_stride).
+    ///
+    /// **GREY note:** `effective_row_stride()` for a GREY tensor returns the
+    /// tight `width` bytes (no padding), which is what `normalize_to_numpy` and
+    /// the CPU convert path expect. The codec's internal `native_row_stride`
+    /// (64-byte-aligned) is used only during decoding and is not propagated to
+    /// the tensor's stored stride, so callers reading via
+    /// `effective_row_stride()` always see the tight value for GREY.
     pub fn effective_row_stride(&self) -> Option<usize> {
         if let Some(s) = self.row_stride {
             return Some(s);
@@ -1958,7 +2278,10 @@ where
         let elem = std::mem::size_of::<T>();
         Some(match fmt.layout() {
             PixelLayout::Packed => w * fmt.channels() * elem,
-            PixelLayout::Planar | PixelLayout::SemiPlanar => w * elem,
+            PixelLayout::Planar => w * elem,
+            // Semi-planar: minimum stride must cover the even width so the
+            // interleaved chroma columns are byte-aligned on odd-width images.
+            PixelLayout::SemiPlanar => w.next_multiple_of(2) * elem,
         })
     }
 
@@ -1998,7 +2321,9 @@ where
         let elem = std::mem::size_of::<T>();
         let min_stride = match fmt.layout() {
             PixelLayout::Packed => w * fmt.channels() * elem,
-            PixelLayout::Planar | PixelLayout::SemiPlanar => w * elem,
+            PixelLayout::Planar => w * elem,
+            // Semi-planar: minimum must cover even width for chroma alignment.
+            PixelLayout::SemiPlanar => w.next_multiple_of(2) * elem,
         };
         if stride < min_stride {
             return Err(Error::InvalidArgument(format!(
@@ -2069,10 +2394,19 @@ where
     /// single buffer. Identical semantics across `Mem` (shared `Arc`) and
     /// `Dma` (shared fd) backings.
     ///
+    /// # Disjointness
+    ///
+    /// Independent writes are sound *only* when the windows do not overlap. The
+    /// shared backing uses interior mutability (`UnsafeCell` cells), so two
+    /// sub-views whose byte ranges intersect alias the same cells: writing one
+    /// while reading or writing the other is a data race and therefore
+    /// **undefined behaviour**. The caller is responsible for keeping the
+    /// windows disjoint; this method does not check for overlap.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidOperation`] if the backing is not `Mem` or `Dma`, or
-    ///   if `offset_bytes` is mis-aligned for `T`.
+    ///   if `offset_bytes` is not a multiple of `align_of::<T>()`.
     /// - [`Error::InsufficientCapacity`] / [`Error::InvalidSize`] if the window
     ///   exceeds the parent allocation.
     pub fn subview(&self, offset_bytes: usize, shape: &[usize]) -> Result<Tensor<T>> {
@@ -2348,85 +2682,120 @@ where
             memory = ?self.storage.memory(),
         )
         .entered();
-        // CPU mapping of strided tensors is allowed only when the HAL
-        // owns the underlying allocation — i.e. self-allocated DMA
-        // tensors with pitch padding added by `image_with_stride()`
-        // for GPU import alignment. In that case we know the buffer
-        // is exactly `row_stride × height` bytes (for packed formats)
-        // and callers that respect the stride can iterate rows
-        // correctly via `effective_row_stride()`.
+        // CPU mapping of a strided tensor exposes the full padded buffer
+        // (`row_stride × rows`) so callers can iterate rows via
+        // `effective_row_stride()` without running past the slice. This is sound
+        // only when the HAL owns and can size-check the allocation:
         //
-        // Foreign DMA-BUFs imported via `from_fd()` + `set_row_stride()`
-        // (the V4L2 / GStreamer case) are rejected: their layout comes
-        // from an external allocator and the HAL cannot validate what
-        // the caller expects the mapping to look like. Those tensors
-        // are intended for the GPU path only.
+        //   * Self-allocated Mem / Shm tensors (any platform) — the backing
+        //     `Vec` / shm segment is sized by `capacity_bytes()`, checked here.
+        //   * Self-allocated DMA tensors (Linux) — pitch padding from
+        //     `image_with_stride()`; checked against the DMA-BUF `buf_size`.
         //
-        // The cfg split keeps `stride` from being an unused binding on
-        // non-Linux builds (the Linux branch is the only consumer).
-        #[cfg(target_os = "linux")]
+        // Foreign DMA-BUFs (`from_fd()` + `set_row_stride()`, the V4L2 /
+        // GStreamer case), IOSurface, and PBO storages are rejected: their
+        // layout comes from an external allocator / GPU driver the HAL cannot
+        // validate for a strided CPU view, and they are intended for the GPU
+        // path. (Earlier this rejected *all* non-Linux strided maps with
+        // "DMA backing is Linux-only" — that was an unimplemented path, not a
+        // platform limit; HAL-owned Mem/Shm are trivially mappable and now are.)
         if let Some(stride) = self.row_stride {
-            if let TensorStorage::Dma(dma) = &self.storage {
-                if !dma.is_imported {
-                    // Self-allocated strided DMA tensor — expose the
-                    // full stride×height padded mmap via the override
-                    // constructor so callers can iterate rows with
-                    // `effective_row_stride()` without going past
-                    // the end of the returned slice.
-                    //
-                    // Validate the requested mapping fits inside the
-                    // actual DMA-BUF. `set_row_stride()` is a public
-                    // API and only validates `stride >= min_stride`,
-                    // not `stride × height <= buf_size`, so a caller
-                    // that tampers with the stride after allocation
-                    // could otherwise request a slice larger than the
-                    // underlying mmap — which would be undefined
-                    // behaviour in `DmaMap::as_slice`.
-                    //
-                    // Refuse to map if `height()` can't be derived
-                    // (e.g. raw 2D tensors without a PixelFormat that
-                    // got a `row_stride` set via `set_row_stride_unchecked`).
-                    // Returning a 0-byte view would silently truncate
-                    // rather than surface the misuse.
-                    let height = self.height().ok_or_else(|| {
-                        Error::InvalidOperation(
-                            "Tensor::map: strided DMA mapping requires a PixelFormat \
-                             so height() can be derived; set a format before mapping \
-                             or clear row_stride for raw tensor access"
-                                .into(),
-                        )
-                    })?;
-                    let total_bytes = stride.checked_mul(height).ok_or_else(|| {
-                        Error::InvalidOperation(format!(
-                            "Tensor::map: row_stride {stride} × height {height} overflows usize"
-                        ))
-                    })?;
+            // Rows sit at `stride`-byte spacing; the first shape dim is the row
+            // count for packed `[H, W, C]` and semi-planar `[H*k, W]` alike.
+            let rows = *self.shape().first().ok_or_else(|| {
+                Error::InvalidOperation(
+                    "Tensor::map: strided mapping requires a non-empty shape".into(),
+                )
+            })?;
+            let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
+                ))
+            })?;
+
+            match &self.storage {
+                #[cfg(target_os = "linux")]
+                TensorStorage::Dma(dma) if !dma.is_imported => {
+                    // `set_row_stride()` only validates `stride >= min_stride`,
+                    // not that `stride × rows` fits the DMA-BUF, so re-check
+                    // here — mapping past `buf_size` would SIGBUS on access.
                     let available_bytes = dma.buf_size.saturating_sub(dma.mmap_offset);
                     if total_bytes > available_bytes {
                         return Err(Error::InvalidOperation(format!(
                             "Tensor::map: strided mapping needs {total_bytes} bytes \
                              but DMA buffer only has {available_bytes} available \
-                             (buf_size={}, mmap_offset={}, stride={stride}, height={height}); \
+                             (buf_size={}, mmap_offset={}, stride={stride}, rows={rows}); \
                              the row_stride was likely set larger than the original allocation",
                             dma.buf_size, dma.mmap_offset
                         )));
                     }
                     return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
                 }
+                TensorStorage::Mem(mem) => {
+                    let capacity = self.storage.capacity_bytes();
+                    if total_bytes > capacity {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity,
+                        });
+                    }
+                    return mem.map_with_byte_size(total_bytes);
+                }
+                #[cfg(unix)]
+                TensorStorage::Shm(shm) => {
+                    let capacity = self.storage.capacity_bytes();
+                    if total_bytes > capacity {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity,
+                        });
+                    }
+                    return shm.map_with_byte_size(total_bytes);
+                }
+                // macOS: `TensorStorage::Dma` is the IOSurface. The lock yields
+                // the full surface base address, and the row pitch
+                // (`IOSurfaceGetBytesPerRow`) is known from the API for both
+                // self-allocated and imported surfaces — unlike a foreign
+                // DMA-BUF — so a strided CPU view is sound and zero-copy.
+                #[cfg(target_os = "macos")]
+                TensorStorage::Dma(io) => {
+                    if total_bytes > io.buf_size {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity: io.buf_size,
+                        });
+                    }
+                    return io.map_with_byte_size(total_bytes);
+                }
+                TensorStorage::Pbo(pbo) => {
+                    // PBO: the GPU-side allocation may have a padded stride; the
+                    // map() call maps the full `handle.size` bytes and the caller
+                    // iterates rows via row_stride.  Validate that the strided
+                    // view fits the PBO capacity before mapping.
+                    let capacity = pbo.capacity_bytes();
+                    if total_bytes > capacity {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity,
+                        });
+                    }
+                    return pbo.map();
+                }
+                // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
+                // is guarded `if !dma.is_imported`). On macOS/Windows every
+                // storage variant is matched explicitly, so this catch-all is
+                // unreachable there — allow it rather than cfg-gating per platform.
+                #[allow(unreachable_patterns)]
+                _ => {
+                    return Err(Error::InvalidOperation(
+                        "CPU mapping of strided tensors is supported only for HAL-allocated \
+                         Mem/Shm (any platform), self-allocated DMA (Linux), IOSurface \
+                         (macOS), and PBO; imported DMA-BUF without self-allocation is \
+                         GPU-path only"
+                            .into(),
+                    ));
+                }
             }
-            return Err(Error::InvalidOperation(
-                "CPU mapping of strided foreign tensors is not supported; \
-                 use GPU path only"
-                    .into(),
-            ));
-        }
-        #[cfg(not(target_os = "linux"))]
-        if self.row_stride.is_some() {
-            return Err(Error::InvalidOperation(
-                "CPU mapping of strided tensors is not supported on this \
-                 platform (DMA backing is Linux-only)"
-                    .into(),
-            ));
         }
         // Offset tensors are supported for storages that apply the offset
         // inside their own `map()`: DMA (`DmaMap` adjusts the mmap range) and
@@ -2708,7 +3077,23 @@ mod image_tests {
             PixelFormat::Nv12.image_shape(640, 480),
             Some(vec![720, 640])
         );
-        assert_eq!(PixelFormat::Nv12.image_shape(640, 481), None);
+        // Odd height: combined-plane height is `481 + ceil(481/2)` = 481 + 241
+        // = 722 rows. Logical height is recovered as `722 * 2 / 3` = 481.
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(640, 481),
+            Some(vec![722, 640])
+        );
+        // Odd width: shape carries the LOGICAL width (641).
+        // The 64-aligned stride (>= 642) is stored separately on the Tensor.
+        assert_eq!(
+            PixelFormat::Nv12.image_shape(641, 480),
+            Some(vec![720, 641])
+        );
+        // NV16 odd width: same — logical width in shape, stride separate.
+        assert_eq!(
+            PixelFormat::Nv16.image_shape(641, 480),
+            Some(vec![960, 641])
+        );
         assert_eq!(
             PixelFormat::PlanarRgb.image_shape(640, 480),
             Some(vec![3, 480, 640])
@@ -2750,30 +3135,25 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn image_tensor_dma_rejects_non_aligned_width() {
-        // RGBA u8 at width=4 → 4*4*1 = 16 bytes/row, not 64-byte
-        // aligned. An explicit `Some(TensorMemory::Dma)` request must
-        // fail loudly with the alignment requirement spelled out
-        // rather than silently downgrading to a generic 'L008'
-        // byte-bag IOSurface (which would then fail at GL bind time
-        // with an opaque EGL_BAD_ATTRIBUTE). Same anti-pattern bit us
-        // previously on Mali GPUs with DMA-BUF padding.
-        let err = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect_err("misaligned Dma request must be rejected");
-        match err {
-            Error::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("64-byte aligned") && msg.contains("Pad width"),
-                    "error must spell out the alignment requirement: {msg}"
-                );
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
-        // Same misaligned dimensions with `memory=None` should
-        // auto-fall-back to SHM/Mem (no error).
-        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, None)
-            .expect("auto-select must fall back gracefully");
+    fn image_tensor_dma_non_aligned_packed_width_pads_zero_copy() {
+        // RGBA u8 at width=4 → 4*4 = 16 bytes/row, not 64-byte aligned. RGBA has
+        // a real IOSurface FourCC, so an explicit `Some(TensorMemory::Dma)`
+        // request now allocates a padded image IOSurface (64-aligned
+        // `bytes_per_row`) and records the stride — a fully zero-copy buffer GL
+        // can bind and the CPU can map via the strided path. (Previously this
+        // failed loudly to avoid an 'L008' byte-bag downgrade; with a real
+        // FourCC surface that concern no longer applies.)
+        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
+            .expect("padded RGBA IOSurface should allocate");
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
+        assert_eq!(t.width(), Some(4));
+        assert_eq!(t.height(), Some(4));
+        let stride = t.effective_row_stride().expect("stride");
+        assert_eq!(stride % 64, 0, "padded to 64-byte row alignment");
+        assert!(stride >= 16);
+        // A CPU map exposes the full padded surface for strided iteration.
+        let m = t.map().expect("strided IOSurface map");
+        assert_eq!(m.as_slice().len(), stride * 4);
     }
 
     /// `per_pixel_bytes` that doesn't divide 64 evenly (e.g. RGB u8 with
@@ -3422,6 +3802,41 @@ mod tests {
     }
 
     #[test]
+    fn mem_strided_subview_maps_offset_and_byte_size() {
+        // Integration of the sub-region offset (PR #89) and the strided-map
+        // `byte_size_override` (PR #90): a strided sub-view exposes its full
+        // padded window (`row_stride × rows`) starting at the view's byte
+        // offset, mapped zero-copy into the parent.
+        let parent = Tensor::<u8>::new(&[2048], Some(TensorMemory::Mem), None).unwrap();
+        let mut view = parent.subview(128, &[8, 16]).unwrap(); // 8 rows × 16 @ off 128
+        assert_eq!(view.plane_offset(), Some(128));
+        view.set_row_stride_unchecked(32); // padded stride (> 16)
+
+        {
+            let mut m = view.map().unwrap();
+            let s = m.as_mut_slice();
+            // Strided map exposes the padded window: stride(32) × rows(8) = 256.
+            assert_eq!(
+                s.len(),
+                256,
+                "strided map exposes the full padded byte window"
+            );
+            s[0] = 0xAA; // row 0, col 0
+            s[32] = 0xBB; // row 1, col 0 (one stride in)
+        }
+
+        // Zero-copy: the writes land in the parent at the view's offset.
+        let p = parent.map().unwrap();
+        let pb = p.as_slice();
+        assert_eq!(pb[128], 0xAA, "row 0 writes at parent offset 128");
+        assert_eq!(
+            pb[128 + 32],
+            0xBB,
+            "row 1 writes at parent offset 128 + stride"
+        );
+    }
+
+    #[test]
     fn subview_rejects_unsupported_storage() {
         // subview shares either a heap `Arc` (Mem) or a dma-buf fd (Dma); any
         // other backing (here Shm) must be refused with InvalidOperation rather
@@ -3467,6 +3882,45 @@ mod tests {
                 .copy_from_slice(&[5, 6, 7, 8]);
             assert_eq!(parent.map().unwrap().as_slice(), &[1, 2, 3, 4, 5, 6, 7, 8]);
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dma_strided_subview_maps_padded_window() {
+        // The strided-map path differs by backing: DMA maps through
+        // `mmap_offset` + the `byte_size_override`, not the Mem `Arc` slice. A
+        // padded sub-view of a DMA buffer must still expose its full
+        // `row_stride × rows` window zero-copy at the view's offset (the GPU
+        // batched-render-to-DMA case). Mirrors
+        // `mem_strided_subview_maps_offset_and_byte_size` on a Dma parent.
+        let _lock = FD_LOCK.read().unwrap();
+        let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::Dma), None) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIPPED: DMA not available");
+                return;
+            }
+        };
+        let mut view = parent.subview(128, &[8, 16]).unwrap();
+        assert_eq!(view.plane_offset(), Some(128));
+        view.set_row_stride_unchecked(32); // padded stride (> 16)
+
+        {
+            let mut m = view.map().unwrap();
+            let s = m.as_mut_slice();
+            assert_eq!(s.len(), 256, "strided DMA map exposes stride(32) × rows(8)");
+            s[0] = 0xAA; // row 0, col 0
+            s[32] = 0xBB; // row 1, col 0 (one stride in)
+        }
+
+        let p = parent.map().unwrap();
+        let pb = p.as_slice();
+        assert_eq!(pb[128], 0xAA, "row 0 writes at parent offset 128");
+        assert_eq!(
+            pb[128 + 32],
+            0xBB,
+            "row 1 writes at parent offset 128 + stride"
+        );
     }
 
     #[test]
@@ -3923,6 +4377,85 @@ mod tests {
             .configure_image(1920, 1080, PixelFormat::Nv12)
             .unwrap_err();
         assert!(matches!(err, Error::InsufficientCapacity { .. }));
+    }
+
+    /// A reused max-sized IOSurface pool keeps its physical `bytesPerRow` when
+    /// reconfigured to a smaller logical image (physical-grid / logical-ROI
+    /// decoupling), instead of collapsing to the frame's natural row stride.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn configure_image_preserves_iosurface_physical_stride() {
+        // Pool: GREY/R8 IOSurface 100 wide → bytesPerRow padded to 128.
+        let mut pool =
+            Tensor::<u8>::image(100, 64, PixelFormat::Grey, Some(TensorMemory::Dma)).unwrap();
+        let pitch = pool.effective_row_stride().unwrap();
+        assert!(
+            pitch >= 128 && pitch.is_multiple_of(64),
+            "padded bytesPerRow, got {pitch}"
+        );
+
+        // Reconfigure to a smaller NV12 frame; the physical pitch must survive
+        // (natural would be 32, but the surface stride is the 128-padded pitch).
+        pool.configure_image(32, 16, PixelFormat::Nv12).unwrap();
+        assert_eq!(pool.format(), Some(PixelFormat::Nv12));
+        assert_eq!(pool.width(), Some(32));
+        assert_eq!(pool.height(), Some(16));
+        assert_eq!(
+            pool.effective_row_stride(),
+            Some(pitch),
+            "configure_image must preserve the IOSurface physical bytesPerRow"
+        );
+
+        // Reconfigure again to NV24 — pitch still preserved.
+        pool.configure_image(32, 16, PixelFormat::Nv24).unwrap();
+        assert_eq!(pool.effective_row_stride(), Some(pitch));
+    }
+
+    /// `configure_image` on a Mem backing reconfigures to the format's
+    /// **64-byte-aligned** row stride (the odd-dim contract: every image tensor
+    /// carries a 64-aligned `row_stride`). For NV12 32×16 the minimum is
+    /// `even(32)=32`, rounded up to the 64-byte alignment → 64. The capacity
+    /// (64×64×4 RGBA = 16 KiB) easily holds the 24×64 = 1.5 KiB NV12 layout.
+    #[test]
+    fn configure_image_mem_aligns_stride() {
+        let mut t =
+            Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
+                .unwrap();
+        t.configure_image(32, 16, PixelFormat::Nv12).unwrap();
+        let s = t.effective_row_stride().unwrap();
+        assert_eq!(s % 64, 0, "stride must be 64-aligned");
+        assert!(s >= 32, "stride must cover the even-width minimum");
+        assert_eq!(s, 64);
+    }
+
+    #[test]
+    fn strided_mem_tensor_cpu_maps_full_padded_buffer() {
+        // A packed RGBA image with row padding (GPU-pitch style): logical width
+        // 8 px (32 B/row) but a 48-byte row stride. Over-allocate capacity (for
+        // 16 px), narrow the logical width, then record the padded stride.
+        // Previously `map()` rejected this on non-Linux with
+        // "DMA backing is Linux-only"; HAL-owned Mem is now mappable.
+        let mut t =
+            Tensor::<u8>::image_with_capacity(16, 3, PixelFormat::Rgba, Some(TensorMemory::Mem))
+                .unwrap(); // capacity 3 × 16 × 4 = 192 B
+        t.configure_image(8, 3, PixelFormat::Rgba).unwrap(); // logical [3, 8, 4] = 96 B
+        t.set_row_stride(48).unwrap(); // padded stride (>= 32 B min)
+
+        let map = t.map().expect("strided Mem tensor should CPU-map");
+        // Full padded buffer (stride 48 × 3 rows = 144 B), not the 96 B logical
+        // view — callers iterate rows via `effective_row_stride()`.
+        assert_eq!(map.as_slice().len(), 144);
+        // Logical shape is still reported for shape-aware consumers.
+        assert_eq!(map.shape(), &[3, 8, 4]);
+    }
+
+    #[test]
+    fn strided_mem_tensor_over_capacity_errors() {
+        // Stride larger than the allocation: 64 B × 3 rows = 192 B > 96 B cap.
+        let mut t = Tensor::<u8>::new(&[3, 8, 4], Some(TensorMemory::Mem), None).unwrap();
+        t.set_format(PixelFormat::Rgba).unwrap();
+        t.set_row_stride(64).unwrap();
+        assert!(matches!(t.map(), Err(Error::InsufficientCapacity { .. })));
     }
 
     /// Test that SHM memory allocation is available and usable on Unix systems.

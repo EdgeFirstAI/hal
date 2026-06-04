@@ -188,11 +188,222 @@ def test_rgba_to_rgb():
         assert calculate_similarity_rms_u8(n, expected) > 0.95
 
 
+@pytest.mark.parametrize(
+    "fixture,fmt",
+    [
+        ("testdata/zidane_422.jpg", PixelFormat.Nv16),
+        ("testdata/zidane_444.jpg", PixelFormat.Nv24),
+    ],
+    ids=["nv16_422", "nv24_444"],
+)
+def test_decode_native_nv16_nv24(fixture, fmt):
+    """The Python surface exposes NV16 (4:2:2) and NV24 (4:4:4): the decoder
+    selects the matching native format from the JPEG subsampling, and the
+    semi-planar source converts to RGB through the same path as NV12."""
+    if not os.path.exists(fixture):
+        pytest.skip(f"{fixture} fixture missing")
+    w, h = _image_size(fixture)
+    src = Tensor.image(w, h, format=fmt)
+    assert src.format == fmt
+    info = src.decode_image_file(fixture)
+    # The decoder reports (and configures) the native semi-planar format.
+    assert info.format == fmt
+    assert (info.width, info.height) == (w, h)
+
+    converter = ImageProcessor()
+    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    converter.convert(src, dst)
+    n = np.zeros((h, w, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    expected = load_image(fixture, "RGB")
+    # 0.95: same BT.601-full-vs-PIL tolerance as the NV12 conversions.
+    assert calculate_similarity_rms_u8(n, expected) > 0.95
+
+
+@pytest.mark.parametrize(
+    "fixture,fmt",
+    [
+        ("testdata/coco_420_odd.jpg", PixelFormat.Nv12),
+        ("testdata/coco_422_odd.jpg", PixelFormat.Nv16),
+        ("testdata/coco_444_odd.jpg", PixelFormat.Nv24),
+        ("testdata/coco_grey_odd.jpg", PixelFormat.Grey),
+    ],
+    ids=["nv12_420", "nv16_422", "nv24_444", "grey"],
+)
+def test_decode_native_odd_dimensions(fixture, fmt):
+    """Real-world COCO JPEGs with ODD dimensions, one per native decode output:
+    4:2:0->NV12, 4:2:2->NV16, 4:4:4->NV24, greyscale->Grey. Each is decoded to
+    its native format and converted to RGB on whichever backend the lane
+    provides — CPU on headless x86_64, G2D/GL on i.MX8MP, ANGLE GL on macOS — so
+    the odd-stride chroma layout is exercised end-to-end on both CPU and GPU.
+
+    Odd dimensions stress the stride math: an odd width rounds the buffer up to
+    even(width) then 64-byte alignment (so chroma columns stay byte-aligned and
+    the GPU DMA pitch is valid), while NV12/NV24 chroma row counts use ceil(H/2)
+    and 2*H of an odd height.
+
+    The 4:2:2 fixture is the only synthesized one: COCO has no native 4:2:2
+    JPEGs, so it is re-encoded from a real COCO photo at its native odd size.
+    """
+    if not os.path.exists(fixture):
+        pytest.skip(f"{fixture} fixture missing")
+    w, h = _image_size(fixture)
+    assert (w % 2 == 1) or (h % 2 == 1), f"{fixture}: expected an odd dimension"
+
+    src = Tensor.image(w, h, format=fmt)
+    assert src.format == fmt
+    info = src.decode_image_file(fixture)
+    # The decoder selects + configures the native format and keeps the true
+    # (odd) logical dimensions — no even-rounding leaks into the reported size.
+    assert info.format == fmt
+    assert (info.width, info.height) == (w, h)
+
+    converter = ImageProcessor()
+    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    converter.convert(src, dst)
+    # normalize_to_numpy honours the destination's (possibly padded) row stride,
+    # which a flat reshape would not for odd widths.
+    n = np.zeros((h, w, 3), dtype=np.uint8)
+    dst.normalize_to_numpy(n)
+    expected = load_image(fixture, "RGB")
+    # GREY has no YUV colorimetry ambiguity (Grey→RGB = replicate luma), so a
+    # tighter tolerance is appropriate. All other formats use 0.95 to cover
+    # BT.601-full-vs-PIL divergence across CPU / ANGLE GL / Vivante GL backends.
+    threshold = 0.98 if fmt == PixelFormat.Grey else 0.95
+    assert calculate_similarity_rms_u8(n, expected) > threshold
+
+
+# ---------------------------------------------------------------------------
+# Strided zero-copy + DMA buffer-protocol tests.
+#
+# A DMA / GPU image tensor is allocated with a 64-byte-aligned row pitch, so
+# whenever `width * channels` is not already 64-aligned the backing buffer is
+# ROW-PADDED: `row_stride > width * channels`. `map()` exposes the full padded
+# buffer, so any consumer that assumes a tight `width*channels`-per-row layout
+# reads every row after the first at the wrong offset (a progressive shear).
+# These cells prove both the read (buffer protocol + normalize_to_numpy) and
+# write (from_numpy) paths honour the physical pitch, zero-copy onto the DMA-BUF.
+#
+# On platforms without a DMA heap (headless x86 CI) the allocation falls back /
+# is unavailable and the cells skip — the padded pitch only arises on DMA.
+# ---------------------------------------------------------------------------
+
+
+def _dma_image_or_skip(w, h, fmt):
+    """Allocate a DMA-backed image tensor, or skip when DMA is unavailable."""
+    try:
+        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMA)
+    except (AttributeError, RuntimeError):
+        pytest.skip("DMA memory not supported on this platform")
+    if t.memory != TensorMemory.DMA:
+        pytest.skip("DMA requested but backend substituted another memory type")
+    return t
+
+
+@pytest.mark.parametrize(
+    "fmt,channels",
+    [
+        (PixelFormat.Rgb, 3),
+        (PixelFormat.Rgba, 4),
+        (PixelFormat.Grey, 1),
+    ],
+    ids=["rgb", "rgba", "grey"],
+)
+def test_dma_padded_buffer_protocol_zero_copy(fmt, channels):
+    """A padded-pitch DMA image tensor exposes a *strided* (not sheared
+    contiguous) buffer via the Python buffer protocol.
+
+    End-to-end: write a known gradient with `from_numpy` (stride-aware write),
+    read it back through `memoryview` / `np.asarray` (stride-aware read), then
+    mutate through the live mapping and confirm the change is visible on a fresh
+    map — i.e. the view is zero-copy onto the DMA-BUF, not a private copy.
+    """
+    w, h = 595, 438  # odd width → width*channels is not 64-aligned → padded
+    t = _dma_image_or_skip(w, h, fmt)
+    assert t.row_stride > w * channels, "expected a padded pitch for this width"
+    assert t.row_stride % 64 == 0, "DMA pitch must be 64-byte aligned"
+
+    ref = (np.arange(h * w * channels, dtype=np.uint8) % 251).reshape(h, w, channels)
+    t.from_numpy(ref)
+
+    with t.map() as m:
+        mv = memoryview(m)
+        # Logical shape, physical pitch as the outermost stride.
+        assert mv.shape == (h, w, channels)
+        assert mv.strides[0] == t.row_stride
+        arr = np.asarray(mv)
+        assert np.array_equal(arr, ref), "strided buffer-protocol read sheared the data"
+        # Poke the live mapping (zero-copy write-through onto the DMA-BUF).
+        poked = (int(ref[0, 0, 0]) ^ 0xFF) & 0xFF
+        memoryview(m)[0, 0, 0] = poked
+
+    with t.map() as m2:
+        arr2 = np.asarray(memoryview(m2))
+        assert int(arr2[0, 0, 0]) == poked, "mutation did not reach the DMA-BUF"
+
+    # normalize_to_numpy reads the same padded backing and must agree.
+    if channels == 3:
+        t.from_numpy(ref)
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        t.normalize_to_numpy(out, Normalization.RAW, None)
+        assert np.array_equal(out, ref), "normalize_to_numpy sheared the padded buffer"
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    [PixelFormat.Nv12, PixelFormat.Nv16, PixelFormat.Nv24],
+    ids=["nv12", "nv16", "nv24"],
+)
+def test_dma_semiplanar_buffer_protocol_strided(fmt):
+    """Semi-planar DMA tensors expose the combined Y+UV plane as a 2-D
+    ``[rows, width]`` buffer at the physical pitch. Verify the pitch is the
+    outer stride and that per-row writes through the mapping round-trip
+    zero-copy (the chroma rows share the same padded pitch as luma)."""
+    w, h = 595, 438
+    t = _dma_image_or_skip(w, h, fmt)
+    assert t.row_stride > w and t.row_stride % 64 == 0
+
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.ndim == 2 and mv.shape[1] == w
+        assert mv.strides[0] == t.row_stride
+        rows = mv.shape[0]
+        for r in range(rows):
+            mv[r, 0] = r % 256  # per-row marker through the live mapping
+
+    with t.map() as m2:
+        a2 = np.asarray(memoryview(m2))
+        assert all(int(a2[r, 0]) == r % 256 for r in range(a2.shape[0])), (
+            "per-row zero-copy round-trip failed on padded semi-planar buffer"
+        )
+
+
+def test_mem_tight_buffer_protocol_contiguous():
+    """A tight (non-padded) image tensor still exposes a plain C-contiguous
+    buffer — the strided exposure must only engage for padded backings."""
+    w, h, c = 600, 400, 3
+    t = Tensor.image(w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM)
+    assert t.row_stride == w * c, "Mem image must be tightly packed"
+    ref = (np.arange(h * w * c, dtype=np.uint8) % 251).reshape(h, w, c)
+    t.from_numpy(ref)
+    with t.map() as m:
+        mv = memoryview(m)
+        assert mv.shape == (h, w, c)
+        assert mv.strides == (w * c, c, 1), "tight buffer must be C-contiguous"
+        assert np.array_equal(np.asarray(mv), ref)
+
+
 def test_enum_cmp():
     dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
     assert dst.format == PixelFormat.Rgba
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS DMA tensors are IOSurface-backed, which share cross-process via "
+    "surface_id() (a Mach port), not a POSIX fd — `tensor.fd` raises NotImplemented. "
+    "The IOSurface cross-process passing test is tracked as future work.",
+)
 def test_from_fd_dma():
     try:
         tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
@@ -555,9 +766,16 @@ def test_decode_image_from_bytes():
     assert info.width == 1280
     assert info.height == 720
     assert info.format == PixelFormat.Nv12
-    # NV12 luma plane is one byte per pixel; the reported stride is the decoded
-    # row width (the decoder reconfigures the tensor to the image dimensions).
-    assert info.row_stride == info.width
+    # The decoder reconfigures the tensor's LOGICAL width/height to the decoded
+    # image (1280x720) but PRESERVES the oversized buffer's allocated row stride
+    # so a consumer can still index rows of the reused buffer correctly. The
+    # tensor was allocated MAX_SRC_W (1920) wide — already 64-aligned — so the
+    # reported stride stays 1920, wider than the 1280 logical width. (Reporting
+    # the logical width here would make the buffer unreadable: rows would be
+    # indexed at the wrong byte offset.)
+    assert info.row_stride == MAX_SRC_W
+    assert info.row_stride >= info.width
+    assert info.row_stride % 64 == 0
 
 
 def test_decode_image_reuse():

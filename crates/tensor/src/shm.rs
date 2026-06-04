@@ -31,6 +31,86 @@ where
 
 unsafe impl<T> Send for ShmTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
 unsafe impl<T> Sync for ShmTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
+
+impl<T> ShmTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Create a shared-memory tensor with a logical `shape` but a physical
+    /// allocation of `byte_size` bytes (which must be `>= shape.product() *
+    /// sizeof(T)`).  Used for image tensors with a 64-byte-aligned row stride
+    /// that exceeds the logical shape product.
+    pub(crate) fn new_with_byte_size(
+        shape: &[usize],
+        byte_size: usize,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        let logical = shape.iter().product::<usize>() * elem;
+        if byte_size < logical {
+            return Err(Error::InsufficientCapacity {
+                needed: logical,
+                capacity: byte_size,
+            });
+        }
+        let name = match name {
+            Some(n) => n.to_owned(),
+            None => {
+                let uuid = uuid::Uuid::new_v4().as_simple().to_string();
+                format!("/{}", &uuid[..16])
+            }
+        };
+        let shm_fd = nix::sys::mman::shm_open(
+            name.as_str(),
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let err = nix::sys::mman::shm_unlink(name.as_str());
+        if let Err(e) = err {
+            log::warn!("Failed to unlink shared memory: {e}");
+        }
+        ftruncate(&shm_fd, byte_size as i64)?;
+        Ok(ShmTensor::<T> {
+            name,
+            fd: shm_fd,
+            shape: shape.to_vec(),
+            _marker: std::marker::PhantomData,
+            identity: crate::BufferIdentity::new(),
+        })
+    }
+
+    /// Map exposing `byte_size` bytes via `as_slice()` (and mmap'ing exactly
+    /// that many) for self-allocated strided tensors whose rows are padded. The
+    /// caller (`Tensor::map`) validates `byte_size <= capacity_bytes()` first.
+    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size))
+    }
+
+    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+        let map_bytes = byte_size_override.unwrap_or_else(|| self.size());
+        let size = NonZero::new(map_bytes).ok_or(Error::InvalidSize(map_bytes))?;
+        let ptr = unsafe {
+            nix::sys::mman::mmap(
+                None,
+                size,
+                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
+                nix::sys::mman::MapFlags::MAP_SHARED,
+                &self.fd,
+                0,
+            )?
+        };
+
+        trace!("Mapping shared memory: {ptr:?}");
+        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(map_bytes))?);
+        Ok(TensorMap::Shm(ShmMap {
+            ptr: Arc::new(Mutex::new(shm_ptr)),
+            shape: self.shape.clone(),
+            byte_size_override,
+            _marker: std::marker::PhantomData,
+        }))
+    }
+}
+
 impl<T> TensorTrait<T> for ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -127,25 +207,7 @@ where
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
-        let size = NonZero::new(self.size()).ok_or(Error::InvalidSize(self.size()))?;
-        let ptr = unsafe {
-            nix::sys::mman::mmap(
-                None,
-                size,
-                nix::sys::mman::ProtFlags::PROT_READ | nix::sys::mman::ProtFlags::PROT_WRITE,
-                nix::sys::mman::MapFlags::MAP_SHARED,
-                &self.fd,
-                0,
-            )?
-        };
-
-        trace!("Mapping shared memory: {ptr:?}");
-        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(self.size()))?);
-        Ok(TensorMap::Shm(ShmMap {
-            ptr: Arc::new(Mutex::new(shm_ptr)),
-            shape: self.shape.clone(),
-            _marker: std::marker::PhantomData,
-        }))
+        self.map_inner(None)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -188,6 +250,11 @@ where
 {
     ptr: Arc<Mutex<ShmPtr>>,
     shape: Vec<usize>,
+    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
+    /// (the full padded mmap) instead of `shape.product()`. `unmap()` munmaps
+    /// `size()` = `len() * sizeof(T)`, which tracks this override, so the
+    /// munmap length matches the mmap length.
+    byte_size_override: Option<usize>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -229,6 +296,13 @@ where
 {
     fn shape(&self) -> &[usize] {
         &self.shape
+    }
+
+    fn len(&self) -> usize {
+        match self.byte_size_override {
+            Some(bytes) => bytes / std::mem::size_of::<T>(),
+            None => self.shape.iter().product(),
+        }
     }
 
     fn unmap(&mut self) {

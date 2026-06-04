@@ -576,8 +576,19 @@ impl GlContext {
 
 impl Drop for GlContext {
     fn drop(&mut self) {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // Quietening teardown panics means swapping the panic hook, but
+        // `take_hook`/`set_hook` themselves panic when the current thread is
+        // already unwinding ("cannot modify the panic hook from a panicking
+        // thread"). If this context is dropped while a panic is in flight (e.g.
+        // a GL test assertion failed), swapping the hook would double-panic and
+        // abort the whole test binary — aborting every test queued after it.
+        // Only swap when not already panicking; the `catch_unwind` below still
+        // contains any teardown panic either way.
+        let prev_hook = (!std::thread::panicking()).then(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            prev
+        });
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.egl.make_current(self.display, None, None, None);
 
@@ -589,7 +600,9 @@ impl Drop for GlContext {
             // GlContext instances. The display is leaked on process exit,
             // same as EGL_LIB.
         }));
-        std::panic::set_hook(prev_hook);
+        if let Some(prev_hook) = prev_hook {
+            std::panic::set_hook(prev_hook);
+        }
 
         // The Rc<Egl> (ManuallyDrop) is intentionally NOT dropped. The
         // khronos-egl Dynamic instance's Drop calls eglReleaseThread() which
