@@ -5,10 +5,11 @@
 //! native output.
 //!
 //! The decoder emits the source's native format only — `Grey` for greyscale
-//! (1-component) JPEGs, `Nv12` (4:2:0, with chroma downsampled from any source
-//! subsampling) for colour (3-component) JPEGs. It never converts to RGB and
-//! never rotates: colour and geometry are applied downstream by
-//! `ImageProcessor::convert()`. EXIF orientation is reported in [`ImageInfo`].
+//! (1-component) JPEGs, and the matching semi-planar format for colour
+//! (3-component) JPEGs by subsampling: `Nv12` for 4:2:0, `Nv16` for 4:2:2,
+//! `Nv24` for 4:4:4. It never converts to RGB and never rotates: colour and
+//! geometry are applied downstream by `ImageProcessor::convert()`. EXIF
+//! orientation is reported in [`ImageInfo`].
 
 pub mod bitstream;
 pub mod huffman;
@@ -59,11 +60,39 @@ impl Default for JpegDecoderState {
 }
 
 /// The codec's native output format for a JPEG: `Grey` for 1-component
-/// (greyscale) images, `Nv12` for 3-component (YCbCr) images.
+/// (greyscale) images, and the matching semi-planar format for 3-component
+/// (YCbCr) images by subsampling — `Nv24` (4:4:4), `Nv16` (4:2:2), or `Nv12`
+/// (4:2:0); non-standard subsamplings downsample to `Nv12`.
 fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
-    match headers.header.components.len() {
+    let comps = &headers.header.components;
+    match comps.len() {
         1 => Ok(PixelFormat::Grey),
-        3 => Ok(PixelFormat::Nv12),
+        3 => {
+            // Emit the JPEG's NATIVE chroma format so no resampling is needed:
+            //   4:4:4 (full-res chroma)        → NV24
+            //   4:2:2 (half-width chroma)      → NV16
+            //   4:2:0 (quarter-res chroma)     → NV12
+            // The downsample path (avg_block in `write_nv12_rows`) then only
+            // runs for non-standard subsamplings (4:1:1, 4:1:0, mismatched
+            // Cb/Cr), which fall back to NV12.
+            let max_h = headers.header.max_h_samp as usize;
+            let max_v = headers.header.max_v_samp as usize;
+            let cb = comps[1].sampling;
+            let cr = comps[2].sampling;
+            // Both chroma components must share sampling for a clean native
+            // mapping; otherwise fall back to NV12.
+            if cb.h == cr.h && cb.v == cr.v && cb.h as usize > 0 && cb.v as usize > 0 {
+                let h_ratio = max_h / cb.h as usize;
+                let v_ratio = max_v / cb.v as usize;
+                return Ok(match (h_ratio, v_ratio) {
+                    (1, 1) => PixelFormat::Nv24, // 4:4:4
+                    (2, 1) => PixelFormat::Nv16, // 4:2:2
+                    (2, 2) => PixelFormat::Nv12, // 4:2:0
+                    _ => PixelFormat::Nv12,      // exotic → downsample to 4:2:0
+                });
+            }
+            Ok(PixelFormat::Nv12)
+        }
         n => Err(CodecError::Unsupported(
             UnsupportedFeature::JpegComponentCount {
                 components: n as u8,
@@ -72,10 +101,18 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
     }
 }
 
-/// Native luma/primary-plane row stride in bytes for a freshly decoded image
-/// (NV12 luma and GREY are both 1 byte/pixel).
+/// Native luma/primary-plane row stride in bytes for a freshly decoded image.
+/// GREY and all semi-planar luma/UV planes are 1 byte/pixel.  Semi-planar grids
+/// require at least `even(width)` bytes per row (chroma alignment); the stride
+/// is further rounded up to 64 bytes so `ImageInfo.row_stride` honours the
+/// same 64-byte-alignment invariant as `Tensor::image()`.
+///
+/// This MUST stay equal to the image crate's `align_width_for_gpu_pitch(width, 1)`
+/// and `PixelFormat::semi_planar_surface_dims(..)` pitch (both produce the same
+/// 64-aligned even width). The codec crate can't depend on `edgefirst-image`, so
+/// the value is recomputed here — keep the two in lockstep if either changes.
 fn native_row_stride(width: usize) -> usize {
-    width
+    width.next_multiple_of(2).next_multiple_of(64)
 }
 
 /// Parse JPEG headers and return native dimensions, format, and EXIF
@@ -130,12 +167,11 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let img_h = headers.header.height as usize;
     let output_fmt = native_format(&headers)?;
 
-    // NV12 needs even dimensions (one Cb/Cr pair per 2×2 luma block).
-    if output_fmt == PixelFormat::Nv12 && (!img_w.is_multiple_of(2) || !img_h.is_multiple_of(2)) {
-        return Err(CodecError::InvalidData(format!(
-            "NV12 requires even dimensions; got {img_w}×{img_h}"
-        )));
-    }
+    // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
+    // combined-plane height (`PixelFormat::image_shape`). Odd *width* rounds the
+    // tensor's buffer width up to even (also via `image_shape`), so the MCU
+    // writer's `ceil(width/2)` chroma columns are byte-aligned; the reported
+    // `ImageInfo.width` below stays the true odd value for a downstream crop.
 
     // Native NV12/GREY are u8 formats; reject non-u8 destinations.
     if T::dtype() != edgefirst_tensor::DType::U8 {

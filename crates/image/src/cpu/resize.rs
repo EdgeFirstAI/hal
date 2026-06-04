@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{Crop, Error, Flip, FunctionTimer, Rect, Result, Rotation};
-use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorMapTrait, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use rayon::iter::IndexedParallelIterator;
 
@@ -91,7 +91,37 @@ impl CPUProcessor {
             }
         };
 
+        let actual_src_stride = tensor_row_stride(src);
+        let tight_stride = src_w * channels;
+        // `fast_image_resize` requires a tight (no row padding) input buffer,
+        // and `flip_rotate_ndarray_pf` uses ndarray shapes that assume tightly
+        // packed rows. When the source has a larger stride (e.g. from codec
+        // decode into a pre-allocated oversized tensor), copy the visible
+        // pixels row-by-row into a tight scratch before proceeding.
+        // The copy is gated on `actual_src_stride != tight_stride` so it is
+        // a no-op for all already-tight sources.
         let mut src_map = src.map()?;
+        // When the source is padded (stride != tight), de-stride it into the
+        // processor-owned scratch (reused across calls — no per-call alloc).
+        // `destrided` records whether we populated the scratch this call.
+        let destrided = actual_src_stride != tight_stride;
+        if destrided {
+            let need = src_h * tight_stride;
+            self.resize_destride_scratch.clear();
+            self.resize_destride_scratch.resize(need, 0u8);
+            let src_slice = src_map.as_slice();
+            for row in 0..src_h {
+                let src_row =
+                    &src_slice[row * actual_src_stride..row * actual_src_stride + tight_stride];
+                self.resize_destride_scratch[row * tight_stride..(row + 1) * tight_stride]
+                    .copy_from_slice(src_row);
+            }
+        }
+        let src_for_proc: &mut [u8] = if destrided {
+            &mut self.resize_destride_scratch[..src_h * tight_stride]
+        } else {
+            src_map.as_mut_slice()
+        };
         let mut dst_map = dst.map()?;
 
         // FIXME: fast_image_resize does not clamp its filter kernel at crop
@@ -145,7 +175,7 @@ impl CPUProcessor {
             let src_view = fast_image_resize::images::Image::from_slice_u8(
                 src_w as u32,
                 src_h as u32,
-                &mut src_map,
+                src_for_proc,
                 src_type,
             )?;
 
@@ -227,7 +257,7 @@ impl CPUProcessor {
             }
         } else {
             Self::flip_rotate_ndarray_pf(
-                &src_map,
+                src_for_proc,
                 &mut dst_map,
                 dst_w,
                 dst_h,

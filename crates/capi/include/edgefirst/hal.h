@@ -265,11 +265,13 @@ typedef enum hal_pixel_format {
    */
   HAL_PIXEL_FORMAT_YUYV = 0,
   /**
-   * 8-bit planar YUV420, limited range (NV12)
+   * 8-bit semi-planar YUV 4:2:0 (NV12): Y plane + interleaved CbCr.
+   * JPEG-decoded content is BT.601 full-range (interim).
    */
   HAL_PIXEL_FORMAT_NV12 = 1,
   /**
-   * 8-bit planar YUV422, limited range (NV16)
+   * 8-bit semi-planar YUV 4:2:2 (NV16): Y plane + interleaved CbCr.
+   * JPEG-decoded content is BT.601 full-range (interim).
    */
   HAL_PIXEL_FORMAT_NV16 = 2,
   /**
@@ -306,6 +308,14 @@ typedef enum hal_pixel_format {
    * GPUs.
    */
   HAL_PIXEL_FORMAT_VYUY = 9,
+  /**
+   * 8-bit semi-planar YUV 4:4:4 (NV24): full-resolution chroma.
+   *
+   * Y plane (`H` rows) followed by an interleaved Cb/Cr plane at full
+   * resolution (`2*W` bytes per image row, stored as `2H` buffer rows).
+   * Emitted by the JPEG decoder for 4:4:4 sources; BT.601 full-range (interim).
+   */
+  HAL_PIXEL_FORMAT_NV24 = 10,
 } hal_pixel_format;
 
 /**
@@ -1726,8 +1736,9 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
  * The tensor must have sufficient capacity for the decoded image.
  * Returns 0 on success, -1 on error (errno set).
  *
- * The image is decoded to its native pixel format (JPEG → NV12 for colour
- * or GREY for greyscale; PNG → RGB/RGBA/GREY) and the tensor is configured
+ * The image is decoded to its native pixel format (JPEG → NV12/NV16/NV24 by
+ * chroma subsampling (4:2:0/4:2:2/4:4:4) for colour or GREY for greyscale;
+ * PNG → RGB/RGBA/GREY) and the tensor is configured
  * with that format and the decoded dimensions. Use the tensor's pixel format
  * accessor (`hal_tensor_pixel_format()`) to inspect the result, and the image
  * processor convert API (`hal_image_processor_convert()`) if a different
@@ -2824,6 +2835,66 @@ void hal_tensor_cuda_unmap(void *map);
  * - EINVAL: NULL tensor/shape, ndim is 0, or element count mismatch
  */
 int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t ndim);
+
+/**
+ * Create a zero-copy sub-region view that shares the parent's allocation.
+ *
+ * The view maps the window `[offset_bytes, offset_bytes + size)` where
+ * `size = prod(shape) * element_size`, sharing the parent buffer (`Mem` heap
+ * allocation or `Dma` fd) with no copy. N views into one parent can each be
+ * mapped (via `hal_tensor_map_create`) and written independently — the basis
+ * for assembling a batch into one buffer. `offset_bytes` must be aligned to
+ * the element's alignment (its natural alignment, which equals the element
+ * size for the supported dtypes) and the window must fit the parent
+ * allocation.
+ *
+ * The returned tensor must be freed with `hal_tensor_free()`. It co-owns the
+ * parent buffer (shared `Arc`/fd), so the buffer stays valid as long as any
+ * view is alive, even if the parent handle is freed first.
+ *
+ * @param tensor Parent tensor handle
+ * @param offset_bytes Byte offset of the window into the parent allocation
+ * @param shape Array of dimension sizes (ndim elements)
+ * @param ndim Number of dimensions (1-8)
+ * @return New tensor handle viewing the window on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor/shape, ndim 0 or > 8, offset not element-aligned,
+ *   window exceeds the parent allocation, or backing is not Mem/Dma
+ */
+struct hal_tensor *hal_tensor_subview(const struct hal_tensor *tensor,
+                                      size_t offset_bytes,
+                                      const size_t *shape,
+                                      size_t ndim);
+
+/**
+ * Get the byte offset of this tensor's window into its backing allocation.
+ *
+ * Writes the offset to `*out_offset` (when non-NULL) and returns `true` when
+ * the tensor carries a plane offset — e.g. a view from `hal_tensor_subview`.
+ * Returns `false` for a whole-buffer tensor (writing `0`) or a NULL tensor.
+ *
+ * @param tensor Tensor handle
+ * @param out_offset Out-param receiving the byte offset (may be NULL to query
+ *        presence only)
+ * @return true if a plane offset is set, false otherwise
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ */
+bool hal_tensor_plane_offset(const struct hal_tensor *tensor, size_t *out_offset);
+
+/**
+ * Set the byte offset of this tensor's window into its backing allocation.
+ *
+ * Validated against the allocation when the tensor is mapped. Prefer
+ * `hal_tensor_subview()` for sharing one buffer across independent windows.
+ *
+ * @param tensor Tensor handle
+ * @param offset Byte offset into the backing allocation
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ */
+int hal_tensor_set_plane_offset(struct hal_tensor *tensor, size_t offset);
 
 /**
  * Attach per-tensor affine quantization metadata to an integer tensor.

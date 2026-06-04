@@ -873,6 +873,44 @@ class Tensor:
     def reshape(self, shape: list[int]) -> None: ...
     """Reshape the tensor to the given shape. The total number of elements must remain the same."""
 
+    def subview(self, offset_bytes: int, shape: list[int]) -> Tensor:
+        """Create a zero-copy sub-region view sharing this tensor's allocation.
+
+        The view maps the window ``[offset_bytes, offset_bytes + size)`` where
+        ``size = prod(shape) * element_size``, sharing the parent buffer (``Mem``
+        heap or ``Dma`` fd) with no copy. N views into one parent can be mapped
+        and written independently — the basis for assembling a batch into one
+        buffer. ``offset_bytes`` must be aligned to the element's alignment
+        (its natural alignment, which equals the element size for the supported
+        dtypes) and the window must fit the parent allocation.
+
+        The returned tensor exposes the full tensor surface (``map()`` with the
+        NumPy buffer protocol, ``from_numpy()``, ``fd``); its byte offset is
+        reported by :attr:`plane_offset`.
+
+        Args:
+            offset_bytes: Byte offset of the window into the parent allocation.
+            shape: Logical shape of the view.
+
+        Returns:
+            A new ``Tensor`` viewing the requested window.
+        """
+
+    @property
+    def plane_offset(self) -> int | None:
+        """Byte offset of this tensor's window into its backing allocation.
+
+        ``None`` for a whole-buffer tensor; the sub-region start for a view
+        created via :meth:`subview` (or after :meth:`set_plane_offset`).
+        """
+
+    def set_plane_offset(self, offset: int) -> None:
+        """Set the byte offset of this tensor's window into its backing allocation.
+
+        Validated against the allocation when the tensor is mapped. Prefer
+        :meth:`subview` for sharing one buffer across independent windows.
+        """
+
     def set_format(self, format: PixelFormat) -> None:
         """Attach pixel format metadata to this tensor.
 
@@ -1012,16 +1050,15 @@ class Tensor:
             data = np.random.rand(480, 640, 3).astype(np.float32)
 
             with tensor.map() as m:
-                # Wrap the raw buffer as a numpy array and copy into it
-                dst = np.frombuffer(m.view(), dtype=np.float32)
-                dst = dst.reshape(tensor.shape)
+                # np.asarray(memoryview(m)) honours the buffer-protocol strides,
+                # so padded (DMA/GPU) tensors map correctly without shearing.
+                dst = np.asarray(memoryview(m))
                 dst[:] = data
 
         Example — read tensor data as numpy::
 
             with tensor.map() as m:
-                arr = np.frombuffer(m.view(), dtype=np.float32)
-                arr = arr.reshape(tensor.shape)
+                arr = np.asarray(memoryview(m))
                 print(arr.mean())
 
         .. tip::
@@ -1168,6 +1205,7 @@ class Tensor:
         self,
         dst: npt.NDArray[np.uint8]
         | npt.NDArray[np.int8]
+        | npt.NDArray[np.float16]
         | npt.NDArray[np.float32]
         | npt.NDArray[np.float64],
         normalization: "Normalization" = ...,
@@ -1246,6 +1284,20 @@ class Tensor:
         ...
 
     @property
+    def row_stride(self) -> int | None:
+        """Physical row pitch in bytes, or ``None`` for tightly packed tensors.
+
+        Set for every image tensor allocated via :meth:`image` or configured
+        via ``configure_image`` (DMA, IOSurface, and self-allocated semi-planar
+        tensors always carry a 64-byte-aligned stride). ``None`` only for
+        non-image tensors or raw tensors without a pixel format.
+
+        Use :meth:`effective_row_stride` when you need a non-``None`` fallback
+        equal to the minimum tight stride.
+        """
+        ...
+
+    @property
     def is_planar(self) -> bool:
         """Whether this image uses a planar pixel layout."""
         ...
@@ -1256,6 +1308,19 @@ class Tensor:
         unquantized integer tensors."""
         ...
 
+    @property
+    def colorimetry(self) -> Colorimetry | None:
+        """Colour signalling (matrix/range/primaries), or ``None`` if undefined.
+
+        Set automatically by the codec on decode (JPEG → JFIF/BT.601-full,
+        PNG → sRGB) and carried through ``convert()`` to pick the YUV→RGB
+        matrix and range. ``None`` is never auto-filled; consumers resolve
+        missing axes via an SD/HD height heuristic at use time.
+        """
+        ...
+
+    @colorimetry.setter
+    def colorimetry(self, value: Colorimetry | None) -> None: ...
     def set_quantization_per_tensor(self, scale: float, zero_point: int) -> None:
         """Attach per-tensor asymmetric quantization. Integer tensors only."""
         ...
@@ -1337,6 +1402,87 @@ class CudaMap:
     def __enter__(self) -> CudaMap: ...
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None: ...
 
+class ColorSpace(enum.Enum):
+    """Colour primaries (the chromaticities of the RGB primaries)."""
+
+    Bt709: ColorSpace
+    Bt2020: ColorSpace
+    Srgb: ColorSpace
+    Smpte170m: ColorSpace
+
+class ColorTransfer(enum.Enum):
+    """Transfer function (opto-electronic / gamma)."""
+
+    Bt709: ColorTransfer
+    Srgb: ColorTransfer
+    Pq: ColorTransfer
+    Hlg: ColorTransfer
+    Linear: ColorTransfer
+
+class ColorEncoding(enum.Enum):
+    """YCbCr encoding matrix — selects the YUV↔RGB coefficients."""
+
+    Bt601: ColorEncoding
+    Bt709: ColorEncoding
+    Bt2020: ColorEncoding
+
+class ColorRange(enum.Enum):
+    """Quantization range of the luma/chroma samples."""
+
+    Full: ColorRange
+    """Full range (0–255), e.g. JFIF/JPEG."""
+    Limited: ColorRange
+    """Limited / studio range (luma 16–235), e.g. broadcast video."""
+
+class Colorimetry:
+    """Four-axis colour signalling (primaries / transfer / matrix / range).
+
+    Each axis is independently optional; ``None`` means "undefined" and is
+    resolved at use time by an SD/HD height heuristic. Carried on image
+    ``Tensor`` objects and consumed by ``convert()`` to select the exact
+    YUV→RGB matrix and range.
+    """
+
+    def __init__(
+        self,
+        space: ColorSpace | None = None,
+        transfer: ColorTransfer | None = None,
+        encoding: ColorEncoding | None = None,
+        range: ColorRange | None = None,
+    ) -> None: ...
+    @staticmethod
+    def from_v4l2(
+        colorspace: int, xfer: int, ycbcr_enc: int, quant: int
+    ) -> Colorimetry:
+        """Build from the four raw V4L2 colorimetry integers.
+
+        A ``DEFAULT`` (0) ``ycbcr_enc``/``quant`` is resolved from the
+        colorspace (e.g. ``V4L2_COLORSPACE_JPEG`` → BT.601 full-range) per the
+        kernel ``V4L2_MAP_*_DEFAULT`` rules; an unrecognised value maps to
+        ``None``.
+        """
+        ...
+
+    @property
+    def space(self) -> ColorSpace | None:
+        """Colour primaries, or ``None`` if undefined."""
+        ...
+
+    @property
+    def transfer(self) -> ColorTransfer | None:
+        """Transfer function, or ``None`` if undefined."""
+        ...
+
+    @property
+    def encoding(self) -> ColorEncoding | None:
+        """YCbCr encoding matrix, or ``None`` if undefined."""
+        ...
+
+    @property
+    def range(self) -> ColorRange | None:
+        """Quantization range, or ``None`` if undefined."""
+        ...
+
 class PixelFormat(enum.Enum):
     """Pixel format for image tensors."""
 
@@ -1364,6 +1510,10 @@ class PixelFormat(enum.Enum):
 
     Nv16: PixelFormat
     """Semi-planar YUV 4:2:2 [H*2, W]"""
+
+    Nv24: PixelFormat
+    """Semi-planar YUV 4:4:4 [H*3, W] (full chroma). Emitted by the JPEG
+    decoder for 4:4:4 sources."""
 
     PlanarRgb: PixelFormat
     """Planar RGB, channels-first [3, H, W]"""
@@ -1880,6 +2030,7 @@ class ImageProcessor:
             chroma_fd: int | None = None,
             chroma_stride: int | None = None,
             chroma_offset: int | None = None,
+            colorimetry: Colorimetry | None = None,
         ) -> Tensor:
             """Import an external DMA-BUF image.
 
@@ -1904,6 +2055,9 @@ class ImageProcessor:
                     (default: ``None`` = tightly packed).
                 chroma_offset: Byte offset within the chroma DMA-BUF where
                     data starts (default: ``None`` = 0).
+                colorimetry: Colour signalling (matrix/range/primaries) from the
+                    producer, used by ``convert()`` to pick the YUV→RGB matrix
+                    and range (default: ``None`` = resolved by heuristic).
 
             Returns:
                 A new image ``Tensor`` backed by the external DMA-BUF(s).

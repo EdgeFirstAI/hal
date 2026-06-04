@@ -430,6 +430,25 @@ Python wheels are built separately via `maturin` in CI.
 These are non-negotiable gates. If either fails, fix the issue before
 proceeding. Do not skip, defer, or rationalize skipping these steps.
 
+> **Formatting is enforced LOCALLY, not by CI.** CI's Rust formatting check is
+> intentionally **advisory** — it emits a warning annotation but never blocks
+> merge (see `.github/workflows/test.yml`). That makes `make format` the
+> **authoritative** defense against format drift: if you do not run it before
+> every commit, drift lands in `main` unchecked. This is not optional.
+
+> **`ruff` MUST be installed in the local `./venv/`.** The `format-python` and
+> `lint-python` Make targets run ruff only `if [ -f "venv/bin/ruff" ]` —
+> otherwise they print a warning and **silently pass without touching Python
+> code**. Without ruff in the venv, `make format` formats Rust only and Python
+> drift slips through undetected. One-time setup:
+>
+> ```bash
+> # Install Python tooling into the LOCAL venv (never the global environment)
+> python3 -m venv venv          # if ./venv does not exist yet (it is gitignored)
+> venv/bin/pip install ruff
+> venv/bin/ruff --version        # confirm make format/lint will run ruff
+> ```
+
 ```bash
 # Before EVERY commit:
 make format lint

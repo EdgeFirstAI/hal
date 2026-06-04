@@ -84,8 +84,8 @@ mod cpu_tests {
         let h = img1.height().unwrap();
 
         let (img_rgb1, img_rgb2) = {
-            let mut rgb1 = TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, None).unwrap();
-            let mut rgb2 = TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, None).unwrap();
+            let mut rgb1 = TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, mem()).unwrap();
+            let mut rgb2 = TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, mem()).unwrap();
             let r1 = converter.convert(
                 img1,
                 &mut rgb1,
@@ -143,6 +143,16 @@ mod cpu_tests {
         }
     }
 
+    /// CPU-processor tests operate on host memory: a tight `Mem` tensor whose
+    /// row stride equals `width * bpp`. Pinning these tests to `Mem` keeps them
+    /// deterministic across platforms — `None` auto-selects a pitch-padded DMA
+    /// tensor on i.MX (DMA heap present), which shears the flat `copy_from_slice`
+    /// fill and flat `as_slice()` assertions below. Padded-stride coverage lives
+    /// in the dedicated `odd_dim_cpu` integration suite.
+    fn mem() -> Option<TensorMemory> {
+        Some(TensorMemory::Mem)
+    }
+
     fn load_bytes_to_tensor(
         width: usize,
         height: usize,
@@ -151,6 +161,8 @@ mod cpu_tests {
         bytes: &[u8],
     ) -> Result<TensorDyn, Error> {
         log::debug!("Current function is {}", function!());
+        // Default to host memory (tight) so the flat fill matches the layout.
+        let memory = memory.or_else(mem);
         let src = TensorDyn::image(width, height, format, DType::U8, memory)?;
         src.as_u8().unwrap().map()?.as_mut_slice()[0..bytes.len()].copy_from_slice(bytes);
         Ok(src)
@@ -674,7 +686,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::new_nearest();
 
-        let converted = TensorDyn::image(4, 1, PixelFormat::Rgb, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 1, PixelFormat::Rgb, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -707,7 +719,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -741,7 +753,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -775,7 +787,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -809,7 +821,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -843,7 +855,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -871,7 +883,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(2, 2, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(2, 2, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -934,7 +946,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(2, 2, PixelFormat::Rgba, DType::U8, None)?;
+        let converted = TensorDyn::image(2, 2, PixelFormat::Rgba, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -970,7 +982,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(2, 3, PixelFormat::Yuyv, DType::U8, None)?;
+        let converted = TensorDyn::image(2, 3, PixelFormat::Yuyv, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -1009,7 +1021,7 @@ mod cpu_tests {
 
         let mut converter = CPUProcessor::default();
 
-        let converted = TensorDyn::image(2, 3, PixelFormat::Grey, DType::U8, None)?;
+        let converted = TensorDyn::image(2, 3, PixelFormat::Grey, DType::U8, mem())?;
         let src_dyn = src;
         let mut converted_dyn = converted;
 
@@ -1163,7 +1175,7 @@ mod cpu_tests {
     #[test]
     fn test_convert_rgb_to_planar_rgb_generic() {
         // Create PixelFormat::Rgb source image
-        let src = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let src = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, mem()).unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -1176,7 +1188,7 @@ mod cpu_tests {
         }
 
         // Create planar PixelFormat::Rgb destination using TensorDyn
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, mem()).unwrap();
 
         {
             let mut __cv = CPUProcessor::default();
@@ -1207,7 +1219,7 @@ mod cpu_tests {
     #[test]
     fn test_convert_rgba_to_planar_rgb_generic() {
         // Create PixelFormat::Rgba source image
-        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let src = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -1221,7 +1233,7 @@ mod cpu_tests {
         }
 
         // Create planar PixelFormat::Rgb destination
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, mem()).unwrap();
 
         {
             let mut __cv = CPUProcessor::default();
@@ -1247,7 +1259,7 @@ mod cpu_tests {
     #[test]
     fn test_copy_image_generic_same_format() {
         // Create source image with data
-        let src = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let src = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, mem()).unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -1257,7 +1269,7 @@ mod cpu_tests {
         }
 
         // Create destination tensor
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, mem()).unwrap();
 
         {
             let mut __cv = CPUProcessor::default();
@@ -1280,8 +1292,8 @@ mod cpu_tests {
     #[test]
     fn test_convert_unsupported_format_pair() {
         // Try NV12 -> NV12 (not supported by CPU converter)
-        let src = TensorDyn::image(8, 8, PixelFormat::Nv12, DType::U8, None).unwrap();
-        let mut dst = TensorDyn::image(8, 8, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(8, 8, PixelFormat::Nv12, DType::U8, mem()).unwrap();
+        let mut dst = TensorDyn::image(8, 8, PixelFormat::Nv12, DType::U8, mem()).unwrap();
 
         let result = {
             let mut __cv = CPUProcessor::default();
@@ -1299,7 +1311,7 @@ mod cpu_tests {
 
     #[test]
     fn test_fill_image_outside_crop_generic_rgba() {
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         // Initialize to zeros
         dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
 
@@ -1322,7 +1334,7 @@ mod cpu_tests {
 
     #[test]
     fn test_fill_image_outside_crop_generic_rgb() {
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, mem()).unwrap();
         dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
 
         let crop = Rect::new(1, 1, 2, 2);
@@ -1343,7 +1355,7 @@ mod cpu_tests {
 
     #[test]
     fn test_fill_image_outside_crop_generic_planar_rgb() {
-        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let mut dst = TensorDyn::image(4, 4, PixelFormat::PlanarRgb, DType::U8, mem()).unwrap();
         dst.as_u8().unwrap().map().unwrap().as_mut_slice().fill(0);
 
         let crop = Rect::new(1, 1, 2, 2);
@@ -1554,7 +1566,8 @@ mod cpu_tests {
         .unwrap();
 
         // Convert to both PixelFormat::Rgba and PixelFormat::Bgra, then compare
-        let mut rgba_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut rgba_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1567,7 +1580,8 @@ mod cpu_tests {
             .unwrap();
         }
 
-        let mut bgra_dst = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut bgra_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1594,7 +1608,8 @@ mod cpu_tests {
         )
         .unwrap();
 
-        let mut rgba_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut rgba_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1607,7 +1622,8 @@ mod cpu_tests {
             .unwrap();
         }
 
-        let mut bgra_dst = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut bgra_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1634,7 +1650,8 @@ mod cpu_tests {
         )
         .unwrap();
 
-        let mut rgba_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut rgba_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1647,7 +1664,8 @@ mod cpu_tests {
             .unwrap();
         }
 
-        let mut bgra_dst = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut bgra_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1674,7 +1692,8 @@ mod cpu_tests {
         )
         .unwrap();
 
-        let mut rgba_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut rgba_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -1687,7 +1706,8 @@ mod cpu_tests {
             .unwrap();
         }
 
-        let mut bgra_dst = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None).unwrap();
+        let mut bgra_dst =
+            TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, mem()).unwrap();
         {
             let mut __cv = CPUProcessor::default();
             __cv.convert(
@@ -2319,10 +2339,17 @@ mod cpu_tests {
         let det0_contig = det0_seg.as_standard_layout();
         actual.extend_from_slice(det0_contig.as_slice().expect("standard layout gives slice"));
 
-        let golden_path = std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/yolov8_mask0_160x160.bin"
-        ));
+        // Resolve testdata via EDGEFIRST_TESTDATA_DIR when set (on-target runs use
+        // a deployed copy; the compile-time manifest path does not exist there),
+        // falling back to the source tree for local runs.
+        let golden_path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
+            .map(|d| std::path::PathBuf::from(d).join("yolov8_mask0_160x160.bin"))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testdata/yolov8_mask0_160x160.bin"
+                ))
+            });
 
         if std::env::var_os("REGEN_GOLDEN").is_some() {
             std::fs::write(&golden_path, &actual).expect("could not write golden");
@@ -2933,7 +2960,7 @@ mod cpu_tests {
 
         // ── Contiguous path (baseline) ──────────────────────────────
         let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
-        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None)?;
+        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, mem())?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
@@ -2961,7 +2988,7 @@ mod cpu_tests {
             let __t = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)?;
             TensorDyn::from(__t)
         };
-        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None)?;
+        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, mem())?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
         converter.convert(
@@ -2992,7 +3019,7 @@ mod cpu_tests {
         let uv_size = width * (height / 2);
 
         let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
-        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgba, DType::U8, None)?;
+        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Rgba, DType::U8, mem())?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
@@ -3018,7 +3045,7 @@ mod cpu_tests {
             let __t = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)?;
             TensorDyn::from(__t)
         };
-        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Rgba, DType::U8, None)?;
+        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Rgba, DType::U8, mem())?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
         converter.convert(
@@ -3048,7 +3075,7 @@ mod cpu_tests {
         let uv_size = width * (height / 2);
 
         let contiguous = load_bytes_to_tensor(width, height, PixelFormat::Nv12, None, &nv12_bytes)?;
-        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Grey, DType::U8, None)?;
+        let dst_contiguous = TensorDyn::image(width, height, PixelFormat::Grey, DType::U8, mem())?;
         let mut converter = CPUProcessor::default();
         let contiguous_dyn = contiguous;
         let mut dst_contiguous_dyn = dst_contiguous;
@@ -3074,7 +3101,7 @@ mod cpu_tests {
             let __t = Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12)?;
             TensorDyn::from(__t)
         };
-        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Grey, DType::U8, None)?;
+        let dst_multiplane = TensorDyn::image(width, height, PixelFormat::Grey, DType::U8, mem())?;
         let multiplane_dyn = multiplane;
         let mut dst_multiplane_dyn = dst_multiplane;
         converter.convert(
@@ -3103,7 +3130,7 @@ mod cpu_tests {
     /// Create a synthetic RGB tensor where the left half is pure red and the
     /// right half is pure blue.
     fn make_red_blue_src(width: usize, height: usize) -> TensorDyn {
-        let mut t = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(width, height, PixelFormat::Rgb, DType::U8, mem()).unwrap();
         {
             let tensor_u8 = t.as_u8_mut().unwrap();
             let mut map = tensor_u8.map().unwrap();
@@ -3139,7 +3166,7 @@ mod cpu_tests {
         let dst_h = 32;
 
         let src = make_red_blue_src(src_w, src_h);
-        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, mem())?;
 
         let mut cpu = CPUProcessor::default();
 
@@ -3175,7 +3202,7 @@ mod cpu_tests {
         let dst_h = 32;
 
         let src = make_red_blue_src(src_w, src_h);
-        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, mem())?;
 
         let mut cpu = CPUProcessor::default();
 
@@ -3212,7 +3239,7 @@ mod cpu_tests {
         let dst_h = 64;
 
         let src = make_red_blue_src(src_w, src_h);
-        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, None)?;
+        let mut dst = TensorDyn::image(dst_w, dst_h, PixelFormat::Rgb, DType::U8, mem())?;
 
         let mut cpu = CPUProcessor::default();
 
@@ -3614,6 +3641,62 @@ mod cpu_tests {
     }
 
     #[test]
+    fn cpu_nv16_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV16 (4:2:2): 4 luma + full-height half-width chroma = 2 rows
+            // × 1 (Cb,Cr) pair = 4 chroma bytes (U=200,V=40, saturated so 601≠709).
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv16,
+                None,
+                &[180, 180, 180, 180, 200, 40, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
+    }
+
+    #[test]
+    fn cpu_nv24_to_rgb_respects_tagged_709_vs_601() {
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+        let make = |enc| {
+            // 2x2 NV24 (4:4:4): 4 luma + full-res chroma = 4 (Cb,Cr) pairs = 8
+            // chroma bytes (U=200,V=40, saturated so 601≠709).
+            let mut src = load_bytes_to_tensor(
+                2,
+                2,
+                PixelFormat::Nv24,
+                None,
+                &[180, 180, 180, 180, 200, 40, 200, 40, 200, 40, 200, 40],
+            )
+            .unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(ColorRange::Limited),
+            ));
+            let mut dst = TensorDyn::image(2, 2, PixelFormat::Rgb, DType::U8, None).unwrap();
+            CPUProcessor::default()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().as_slice().to_vec()
+        };
+        assert_ne!(make(ColorEncoding::Bt601), make(ColorEncoding::Bt709));
+    }
+
+    #[test]
     fn cpu_convert_tagged_jfif_differs_from_untagged_heuristic_nv12() {
         use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
         // Same 2x2 NV12 bytes — saturated chroma so matrix/range choice matters.
@@ -3644,5 +3727,72 @@ mod cpu_tests {
                 .with_range(ColorRange::Limited),
         ));
         assert_ne!(jfif, bt709, "BT.601-full must differ from BT.709-limited");
+    }
+
+    #[test]
+    fn cpu_convert_into_heap_subviews_no_aliasing() {
+        // Two distinct RGBA sources converted into two RGB sub-views of one
+        // heap parent buffer. Each window must bit-match a standalone convert
+        // of its source — proving the CPU convert path honors the heap
+        // plane_offset with no aliasing. Runs on CI with no GPU/NPU.
+        let mut converter = CPUProcessor::default();
+
+        let mut src0 =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        src0.as_u8_mut()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(50);
+        let mut src1 =
+            TensorDyn::image(4, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        src1.as_u8_mut()
+            .unwrap()
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .fill(200);
+
+        let mut do_convert = |src: &TensorDyn, dst: &mut TensorDyn| {
+            converter
+                .convert(src, dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+        };
+
+        // Standalone reference conversions into full, independent buffers.
+        let mut ref0 =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        do_convert(&src0, &mut ref0);
+        let mut ref1 =
+            TensorDyn::image(4, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        do_convert(&src1, &mut ref1);
+
+        // One RGB parent holding two stacked 4x4 frames (4 wide, 8 tall). The
+        // sub-views inherit the Rgb format, so each is a ready convert target
+        // and the plane offset survives.
+        let frame = 4 * 4 * 3;
+        let parent =
+            TensorDyn::image(4, 8, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut view0 = parent.subview(0, &[4, 4, 3]).unwrap();
+        let mut view1 = parent.subview(frame, &[4, 4, 3]).unwrap();
+        assert_eq!(view1.plane_offset(), Some(frame));
+
+        do_convert(&src0, &mut view0);
+        do_convert(&src1, &mut view1);
+
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let ref0_bytes = ref0.as_u8().unwrap().map().unwrap().to_vec();
+        let ref1_bytes = ref1.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            &parent_bytes[..frame],
+            ref0_bytes.as_slice(),
+            "view 0 window must match a standalone convert of src0"
+        );
+        assert_eq!(
+            &parent_bytes[frame..2 * frame],
+            ref1_bytes.as_slice(),
+            "view 1 window must match a standalone convert of src1"
+        );
     }
 }

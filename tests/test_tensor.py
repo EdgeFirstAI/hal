@@ -754,3 +754,110 @@ def test_colorimetry_construct_and_repr():
     assert c.encoding == hal.ColorEncoding.Bt2020
     assert c.range == hal.ColorRange.Limited
     assert "Colorimetry" in repr(c)
+
+
+# ---------------------------------------------------------------------------
+# subview tests (zero-copy sub-region views with full numpy/buffer-protocol)
+# ---------------------------------------------------------------------------
+
+
+def test_subview_partitions_parent_via_numpy():
+    """Two views of one Mem parent are written independently through numpy
+    and partition the parent buffer (zero-copy, no aliasing)."""
+    # 16-byte uint8 parent; two 8-byte windows at offsets 0 and 8.
+    parent = Tensor([16], dtype="uint8", mem=TensorMemory.MEM)
+    v0 = parent.subview(0, [8])
+    v1 = parent.subview(8, [8])
+
+    assert v0.shape == [8]
+    assert v1.shape == [8]
+    assert v0.plane_offset == 0 or v0.plane_offset is None
+    assert v1.plane_offset == 8
+
+    v0.from_numpy(np.arange(1, 9, dtype="uint8"))
+    v1.from_numpy(np.arange(11, 19, dtype="uint8"))
+
+    # Each view sees only its own window.
+    assert np.array_equal(_read_tensor(v0, "uint8"), np.arange(1, 9, dtype="uint8"))
+    assert np.array_equal(_read_tensor(v1, "uint8"), np.arange(11, 19, dtype="uint8"))
+    # The parent buffer is correctly partitioned (shared, zero-copy).
+    assert np.array_equal(
+        _read_tensor(parent, "uint8"),
+        np.array(
+            [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18], dtype="uint8"
+        ),
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="DMA-BUF is Linux-only; macOS uses IOSurface",
+)
+def test_subview_dma_partitions_parent_via_numpy():
+    """DMA parent: two sub-views written through numpy partition one dma-buf
+    (zero-copy), exercising the binding on DMA-backed memory (on-target)."""
+    try:
+        parent = Tensor([16], dtype="uint8", mem=TensorMemory.DMA)
+    except (AttributeError, RuntimeError):
+        pytest.skip("DMA memory not supported on this platform")
+    assert parent.memory == TensorMemory.DMA
+
+    v0 = parent.subview(0, [8])
+    v1 = parent.subview(8, [8])
+    assert v1.plane_offset == 8
+    # A view of a dma-buf shares the parent fd.
+    assert v1.memory == TensorMemory.DMA
+
+    v0.from_numpy(np.arange(1, 9, dtype="uint8"))
+    v1.from_numpy(np.arange(11, 19, dtype="uint8"))
+
+    assert np.array_equal(
+        _read_tensor(parent, "uint8"),
+        np.array(
+            [1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18], dtype="uint8"
+        ),
+    )
+
+
+def test_subview_buffer_protocol_zero_copy():
+    """A view's map() exposes the numpy buffer protocol; a write through the
+    live memoryview lands in the parent at the view's offset (zero-copy)."""
+    parent = Tensor([4, 4], dtype="float32", mem=TensorMemory.MEM)  # 64 bytes
+    # Second row: byte offset 4*4 = 16, a [1, 4] float32 window.
+    row = parent.subview(16, [1, 4])
+    assert row.plane_offset == 16
+
+    with row.map() as m:
+        # Buffer protocol: zero-copy numpy view over the live mapping.
+        arr = np.frombuffer(m.view(), dtype="float32").reshape(row.shape)
+        arr[0, :] = [1.5, 2.5, 3.5, 4.5]
+
+    # The write is visible in the parent's second row (zero-copy partition).
+    parent_arr = _read_tensor(parent, "float32")
+    assert np.array_equal(
+        parent_arr[1, :], np.array([1.5, 2.5, 3.5, 4.5], dtype="float32")
+    )
+    # Other rows untouched.
+    assert np.array_equal(parent_arr[0, :], np.zeros(4, dtype="float32"))
+
+
+def test_subview_rejects_misaligned_and_out_of_bounds():
+    """Element-alignment and bounds are enforced at subview() creation."""
+    # float32 align is 4; a 2-byte offset cannot back a valid float32 window.
+    parent = Tensor([8], dtype="float32", mem=TensorMemory.MEM)
+    with pytest.raises((ValueError, RuntimeError)):
+        parent.subview(2, [1])
+    # Aligned offset is accepted.
+    parent.subview(4, [1])
+    # Out of bounds: offset 6 + 4 bytes exceeds an 8-byte uint8 allocation.
+    small = Tensor([8], dtype="uint8", mem=TensorMemory.MEM)
+    with pytest.raises((ValueError, RuntimeError)):
+        small.subview(6, [4])
+
+
+def test_set_plane_offset_roundtrip():
+    """set_plane_offset / plane_offset round-trip and gate map() bounds."""
+    t = Tensor([100, 100, 4], dtype="uint8", mem=TensorMemory.MEM)
+    assert t.plane_offset is None or t.plane_offset == 0
+    t.set_plane_offset(4096)
+    assert t.plane_offset == 4096

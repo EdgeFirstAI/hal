@@ -136,6 +136,7 @@ pub enum PyPixelFormat {
     Vyuy = 6,
     Nv12 = 7,
     Nv16 = 8,
+    Nv24 = 11,
     PlanarRgb = 9,
     PlanarRgba = 10,
 }
@@ -160,6 +161,7 @@ impl TryFrom<&str> for PyPixelFormat {
             "RGB" | "RGB " => Ok(PyPixelFormat::Rgb),
             "NV12" => Ok(PyPixelFormat::Nv12),
             "NV16" => Ok(PyPixelFormat::Nv16),
+            "NV24" => Ok(PyPixelFormat::Nv24),
             "Y800" | "GREY" | "GRAY" => Ok(PyPixelFormat::Grey),
             "8BPS" | "PLANAR_RGB" | "PLANARRGB" => Ok(PyPixelFormat::PlanarRgb),
             "PLANAR_RGBA" | "PLANARRGBA" => Ok(PyPixelFormat::PlanarRgba),
@@ -179,6 +181,7 @@ impl From<PyPixelFormat> for PixelFormat {
             PyPixelFormat::Vyuy => PixelFormat::Vyuy,
             PyPixelFormat::Nv12 => PixelFormat::Nv12,
             PyPixelFormat::Nv16 => PixelFormat::Nv16,
+            PyPixelFormat::Nv24 => PixelFormat::Nv24,
             PyPixelFormat::PlanarRgb => PixelFormat::PlanarRgb,
             PyPixelFormat::PlanarRgba => PixelFormat::PlanarRgba,
         }
@@ -198,6 +201,7 @@ impl TryFrom<PixelFormat> for PyPixelFormat {
             PixelFormat::Vyuy => Ok(PyPixelFormat::Vyuy),
             PixelFormat::Nv12 => Ok(PyPixelFormat::Nv12),
             PixelFormat::Nv16 => Ok(PyPixelFormat::Nv16),
+            PixelFormat::Nv24 => Ok(PyPixelFormat::Nv24),
             PixelFormat::PlanarRgb => Ok(PyPixelFormat::PlanarRgb),
             PixelFormat::PlanarRgba => Ok(PyPixelFormat::PlanarRgba),
             _ => Err(Error::Format(format!("unsupported pixel format: {val:?}"))),
@@ -312,6 +316,47 @@ pub(crate) fn normalize_tensor_to_numpy(
     }
 }
 
+/// Build a stride-aware [`ArrayView3`] over a mapped `u8` image tensor.
+///
+/// `map().as_slice()` exposes the full backing buffer, which for a
+/// pitch-aligned (DMA / GPU) image tensor is **row-padded**: each row spans
+/// `effective_row_stride()` bytes, wider than the logical `W*C`. A naive
+/// `ArrayView3::from_shape(shape, data)` assumes a tight `W*C` row and so
+/// reads every row after the first at the wrong offset — a progressive shear
+/// that silently corrupts `normalize_to_numpy` output on i.MX (DMA dst) while
+/// passing on headless x86 (tight Mem/Shm dst).
+///
+/// Returns `(view, tight)`; `tight == true` means the buffer has no row
+/// padding, so callers may keep their flat (`as_chunks`) fast paths.
+fn src_view_strided<'a>(
+    tensor: &tensor::Tensor<u8>,
+    data: &'a [u8],
+    shape: [usize; 3],
+) -> Result<(ArrayView3<'a, u8>, bool)> {
+    use ndarray::ShapeBuilder;
+    // Planar layouts (PlanarRgb / PlanarRgba) are already rejected upstream
+    // before reaching this helper; only packed [H, W, C] tensors arrive here.
+    debug_assert!(
+        !matches!(
+            tensor.format().map(|f| f.layout()),
+            Some(tensor::PixelLayout::Planar)
+        ),
+        "src_view_strided: planar tensors must be handled upstream"
+    );
+    let tight_stride = shape[1] * shape[2];
+    let row_stride = tensor.effective_row_stride().unwrap_or(tight_stride);
+    if row_stride == tight_stride {
+        let view = ArrayView3::from_shape(shape, &data[..tight_stride * shape[0]])?;
+        return Ok((view, true));
+    }
+    // Rows sit at `row_stride` bytes; columns/channels remain tightly packed.
+    let view = ArrayView3::from_shape(
+        (shape[0], shape[1], shape[2]).strides((row_stride, shape[2], 1)),
+        data,
+    )?;
+    Ok((view, false))
+}
+
 #[inline(always)]
 fn normalize_to_uint8<'py>(
     tensor: &tensor::Tensor<u8>,
@@ -335,9 +380,9 @@ fn normalize_to_uint8<'py>(
     let mut dst = dst.as_array_mut();
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
-    if is_rgba && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -391,8 +436,8 @@ fn normalize_to_int8<'py>(
     let mut dst = dst.as_array_mut();
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
-    if is_rgba && dst_shape[2] == 3 {
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -468,8 +513,8 @@ fn normalize_to_float_16<'py>(
 
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
-    if is_rgba && dst_shape[2] == 3 {
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -537,7 +582,7 @@ fn normalize_to_float_16<'py>(
     let mut dst: ArrayViewMut3<half::f16> = dst.as_array_mut();
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
     let zp = if let Some(zp) = zero_point {
         if !(0..=255).contains(&zp) {
@@ -561,7 +606,7 @@ fn normalize_to_float_16<'py>(
         }
     };
 
-    if is_rgba && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let mut tmp = vec![0.0; dst.len()];
             let tmp_ = tmp.as_chunks_mut::<3>().0;
@@ -643,7 +688,7 @@ fn normalize_to_float_32<'py>(
     let mut dst = dst.as_array_mut();
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
     let zp = if let Some(zp) = zero_point {
         if !(0..=255).contains(&zp) {
@@ -667,7 +712,7 @@ fn normalize_to_float_32<'py>(
         }
     };
 
-    if is_rgba && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;
@@ -729,7 +774,7 @@ fn normalize_to_float_64<'py>(
     let mut dst = dst.as_array_mut();
     let map = tensor.map()?;
     let data = map.as_slice();
-    let ndarray = ArrayView3::from_shape(shape, data)?;
+    let (ndarray, tight) = src_view_strided(tensor, data, shape)?;
 
     let zp = if let Some(zp) = zero_point {
         if !(0..=255).contains(&zp) {
@@ -753,7 +798,7 @@ fn normalize_to_float_64<'py>(
         }
     };
 
-    if is_rgba && dst_shape[2] == 3 {
+    if is_rgba && dst_shape[2] == 3 && tight {
         if let Some(dst) = dst.as_slice_mut() {
             let dst = dst.as_chunks_mut::<3>().0;
             let src = data.as_chunks::<4>().0;

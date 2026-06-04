@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Tensor::subview()` / `TensorDyn::subview()` (`edgefirst-tensor`): zero-copy
+  sub-region views that share the parent's allocation (`Mem` heap `Arc` or `Dma`
+  fd) and map at a byte offset, for assembling a batch into one buffer. N views
+  into one parent share the buffer (no copy) and write independently;
+  disjointness of simultaneously-mapped mutable windows is the caller's contract.
+  Wired through the Python bindings (`Tensor.subview()`, the `plane_offset`
+  property, `set_plane_offset()` — a view exposes the full NumPy buffer-protocol
+  surface via `map()`/`from_numpy()` like any tensor) and the C API
+  (`hal_tensor_subview`, `hal_tensor_plane_offset`, `hal_tensor_set_plane_offset`).
 - V4L2 hardware JPEG decode backend (`edgefirst-codec`, Linux, default-on
   `v4l2` feature). Capability-based probe drives any device exposing a JPEG
   decoder through the standard V4L2 mem2mem API (lead target i.MX `mxc-jpeg`),
@@ -25,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`edgefirst-tensor`): capacity-aware reconfiguration of an existing allocation
   to a decoded image's dimensions and pixel format, erroring with
   `InsufficientCapacity` when the image exceeds the allocation.
+- `PixelFormat::Nv24` (semi-planar YUV 4:4:4) is now exposed in the **C** and
+  **Python** bindings (`HAL_PIXEL_FORMAT_NV24` / `PixelFormat.Nv24`), reaching
+  parity with the core enum. Previously a 4:4:4 JPEG decoded to the core's
+  `Nv24` but the Python binding raised `unsupported pixel format: Nv24` on
+  peek/decode and the C binding silently mis-reported it as `RGB`. Clients can
+  now peek, decode, and convert 4:4:4 (and 4:2:2 `Nv16`) sources through both
+  APIs. A C-API round-trip test now asserts every core `PixelFormat` has a
+  distinct `HalPixelFormat` mapping (no silent fallback).
 - EXIF orientation reporting in `ImageInfo` (`rotation_degrees`,
   `flip_horizontal`) for both JPEG and PNG, plus `peek_info()` to read it
   without decoding pixels.
@@ -109,6 +126,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and TensorRT (F16) consumers.
 - `gpu-probe`: F16/F32 float render-target capability probe (texture-FBO
   renderability, F16 dma-buf render, PBO readback timing).
+- `gpu-probe`: `probe_nv_dmabuf` module — imports a DMA-BUF as a combined R8
+  EGLImage (NV12/NV16/NV24), runs the Path B `texelFetch` shader, and reports
+  whether semi-planar YUV DMA-BUF import succeeds on the platform.
 - `ImageProcessor::supported_render_dtypes()` now reports real GPU
   float-render capability on Linux (previously always reported none).
 - 4-axis `Colorimetry` (`space`/`transfer`/`encoding`/`range`, each `Option`)
@@ -120,6 +140,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hal_colorimetry_from_v4l2`, `hal_import_image` colorimetry param. Python
   surface: `Colorimetry` class + enums, `tensor.colorimetry` property,
   `import_image(colorimetry=...)`.
+- **macOS NV12/NV16/NV24 GPU conversion.** `MacosGlProcessor` now converts
+  NV12/NV16/NV24 → RGBA and NV12/NV16/NV24 → PlanarRgb F16 entirely on the
+  GPU via the R8 IOSurface `texelFetch` shader. Previously semi-planar sources
+  fell back to the CPU YUV→RGB path on macOS. The two-pass NV* → PlanarRgb F16
+  path runs under a single GL session
+  (`image.convert.gl.macos.nv_to_planar` span).
+- **Python `TensorMap` strided buffer protocol.** `TensorMap.__getbuffer__`
+  now exposes the physical `effective_row_stride()` as the NumPy buffer's outer
+  stride for image tensors with row padding (DMA / GPU tensors). Previously the
+  tight logical stride was always reported, causing `np.asarray(memoryview(m))`
+  to produce a sheared array for padded NV12/NV16/NV24 or RGBA tensors.
 
 ### Changed
 
@@ -131,10 +162,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `g2d-sys`; G2D declines those combinations and the dispatch falls back to
   GL/CPU.
 - **Breaking:** `edgefirst-codec` now decodes to the image's native format only
-  — JPEG → `Nv12` (colour) / `Grey` (greyscale), PNG → `Rgb`/`Rgba`/`Grey`. The
-  decoder configures the destination tensor's dimensions and format to match and
-  never colour-converts, resizes, or rotates. Use `ImageProcessor::convert()`
-  for `Rgb`/`Rgba`/`Bgra`, resize, and applying the reported EXIF orientation.
+  — JPEG → `Nv12` (4:2:0 chroma subsampling) / `Nv16` (4:2:2) / `Nv24` (4:4:4)
+  or `Grey` (greyscale); PNG → `Rgb`/`Rgba`/`Grey`. The decoder configures the
+  destination tensor's dimensions and format to match and never colour-converts,
+  resizes, or rotates. Use `ImageProcessor::convert()` for `Rgb`/`Rgba`/`Bgra`,
+  resize, and applying the reported EXIF orientation.
   JPEG decodes to `u8` only (non-`u8` destinations return `UnsupportedDtype`).
 - **Breaking:** EXIF orientation is reported, never applied by the codec; the
   decoded pixels and dimensions are the source's native, unrotated values.
@@ -178,6 +210,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error code. The opaque `EGL_BAD_ATTRIBUTE` message that surfaced
   during bring-up gave no path to the actual root cause; the
   enriched message names every input that the kernel rejected.
+- **Tracing span rename** — the Vivante two-pass span pair
+  `image.convert.gl.nv12_to_planar.{pass1_rgba,pass2_deinterleave}` is renamed
+  to `image.convert.gl.nv_to_planar.{pass1_rgba,pass2_deinterleave}` to reflect
+  that the two-pass workaround now covers NV12/NV16/NV24, not just NV12. Saved
+  Perfetto queries targeting the old names will need updating.
 
 ### Removed
 
@@ -188,9 +225,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead.
 - The in-codec YCbCr→RGB/RGBA/BGRA colour kernels, chroma-upsample kernels, and
   SIMD type-conversion path (these moved to `ImageProcessor::convert()`); the
-  JPEG CPU path now writes native `NV12`/`GREY` directly.
+  JPEG CPU path now writes native `NV12`/`NV16`/`NV24`/`GREY` directly.
+- **Breaking (internal types):** the per-memory backing types
+  `MemTensor`/`MemMap`, `DmaTensor`/`DmaMap`, `ShmTensor`/`ShmMap`, and
+  `IoSurfaceTensor`/`IoSurfaceMap` are no longer re-exported from
+  `edgefirst-tensor` — they are implementation details. Allocate `Tensor<T>` /
+  `TensorDyn` and `map()` them instead. The PBO extension point
+  (`PboTensor`/`PboMap`/`PboMapping`/`PboOps`) and `image_iosurface_layout`
+  remain public.
 
-### Notes
+### Fixed
+
+- **GPU NV16/NV24 zero-copy convert on Linux/embedded GLES.** NV16 (4:2:2) and
+  NV24 (4:4:4) DMA-BUF sources previously had no GPU path and silently fell back
+  to the CPU YUV→RGB converter (the dominant cost in preprocessing on embedded
+  GPUs). They now convert on the GPU zero-copy via "Path B": the combined
+  semi-planar buffer is imported as a single-plane R8 EGLImage and a hand-written
+  `texelFetch` shader (core GL ES 3.0, no `GL_OES_EGL_image_external` extension)
+  does the YUV→RGB. The shader uses direct 2D addressing (no per-pixel integer
+  divide/modulo), which is essential on Vivante (≈3.3× over the naive form).
+  NV12 continues to use the proven Path A (`samplerExternalOES` hardware-YUV),
+  because `samplerExternalOES` does not correctly sample 4:2:2/4:4:4 on the
+  embedded drivers. The output dtype is target-appropriate (u8/i8 RGB for the
+  quantized NPU targets, F16 PlanarRgb on Tegra/macOS). Validated on Vivante
+  GC7000UL, Mali-G310, V3D, and Tegra. BT.601 full-range (interim colorimetry).
+- PBO-backed tensors now implement a capacity-based `set_logical_shape` (and
+  `capacity_bytes`), matching `Mem`/`Shm`/`DMA`/`IOSurface`. Previously PBO fell
+  back to the strict-`reshape` default (exact element match), so an oversized
+  reusable pool could not be `configure_image`d to a smaller image. This broke
+  the native-chroma decode pool on PBO-backed hosts (e.g. Linux PCs / Jetson
+  without `/dev/dma_heap`), where reconfiguring the `3·H` GREY pool to a smaller
+  `NV12`/`NV16`/`NV24` shape failed with a `ShapeMismatch`. DMA-backed pools were
+  unaffected.
+- GPU and heap sub-region views now honor `plane_offset`. The OpenGL EGLImage
+  cache key includes the plane offset, so offset-distinct views of one DMA-BUF
+  no longer alias the offset-0 image (previously every view rendered/sampled the
+  base region — capping batched render-to-DMA-BUF). Heap (`Mem`) tensors map
+  correctly at non-zero offsets, and the shared backing uses interior-mutable
+  cells so disjoint sub-views carry correct write provenance.
+- Odd-height NV12 from the V4L2 hardware JPEG decoder no longer drops its last
+  chroma row (the MMAP copy used `final_h / 2`; now `ceil(final_h / 2)`).
+- **NV12 odd-dimension support.** The JPEG decoder previously rejected any
+  colour JPEG whose width *or* height was odd with `NV12 requires even
+  dimensions`, breaking common photo/COCO images (e.g. 640×483, 375×500).
+  `PixelFormat::Nv12` now handles odd dimensions:
+  - **Odd height** is represented directly: the combined-plane shape is
+    `H + ceil(H/2)` rows (luma + chroma), which equals the classic `3H/2` for
+    even heights and stays exact for odd ones (e.g. 483 → 725 rows).
+  - **Odd width** rounds the buffer width up to even (a chroma-interleaving
+    requirement — one `(U, V)` pair per two luma columns has no whole-byte form
+    at odd width). The true odd width is reported by the decoder in `ImageInfo`
+    and trimmed by a `convert()` crop; `width()` reports the even buffer width.
+    This matches the standard even-width NV12 representation used by V4L2,
+    cameras, and most codecs, and avoids a row stride (strided NV12 buffers
+    cannot be CPU-mapped on non-Linux platforms).
+
+  The contiguous NV12 `convert()` CPU kernels (`Nv12`→`Rgb`/`Rgba`/`Grey`) are
+  now stride- and logical-height-aware, so externally-allocated padded NV12
+  buffers convert correctly too.
+
+- **Strided CPU mapping for Mem/Shm/IOSurface tensors.** `Tensor::map()`
+  previously rejected any strided tensor on non-Linux with "CPU mapping of
+  strided tensors is not supported on this platform (DMA backing is
+  Linux-only)". That was an unimplemented path, not a platform limit. `map()`
+  now exposes the full row-padded buffer for row-stride iteration across every
+  HAL-owned storage, mirroring the self-allocated Linux DMA path:
+  - **Mem / Shm** (all platforms): validates `row_stride × rows` against the
+    allocation capacity.
+  - **IOSurface** (macOS): plumbs `IOSurfaceGetBytesPerRow`; the
+    `IOSurfaceLock` already yields the surface base address, so the strided
+    view is genuinely zero-copy (no staging buffer). Image-formatted surfaces
+    carry their 64-aligned `bytes_per_row` as the tensor's row stride, and
+    `Tensor::image()` now allocates a **padded zero-copy IOSurface** for packed
+    formats whose width isn't 64-aligned (RGBA/BGRA/YUYV and packed F16) instead
+    of falling back to SHM — GL imports via the surface pitch and the CPU maps
+    via the strided path. Formats without an IOSurface FourCC (Rgb/Grey u8) and
+    the flat-consumed planar-F16 packing still require an aligned pitch.
+
+  Imported DMA-BUFs (external allocator layout) and PBO storages remain
+  GPU-path only.
 
 - **Linux reports real capability.** `ImageProcessor::supported_render_dtypes()`
   returns the GPU's actual `GL_EXT_color_buffer_half_float` /
