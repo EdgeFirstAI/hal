@@ -467,12 +467,19 @@ mod tests {
     }
 
     fn test_jpeg(name: &str) -> Vec<u8> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .join("testdata")
-            .join(name);
+        // Honour EDGEFIRST_TESTDATA_DIR for on-target runs (the compile-time
+        // manifest path does not exist on the board); fall back to the source
+        // tree for local runs.
+        let path = std::env::var_os("EDGEFIRST_TESTDATA_DIR")
+            .map(|d| std::path::PathBuf::from(d).join(name))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .unwrap()
+                    .join("testdata")
+                    .join(name)
+            });
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
