@@ -750,6 +750,7 @@ See [README.md § Benchmarking](../README.md#benchmarking) for full instructions
 |--------|-------|-----------------|
 | `tensor_benchmark` | `edgefirst-tensor` | Allocation and map/unmap latency (Heap, SHM, DMA) |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion |
+| `nv_path_benchmark` | `edgefirst-image` | NV12/16/24 `ExternalSampler` vs `ShaderR8` A/B (`EDGEFIRST_NV_CONVERT_PATH=sampler\|shader`) |
 | `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert (strided input, HWC/CHW) |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering paths (GL, CPU, hybrid) |
 | `image_benchmark` | `edgefirst-image` | JPEG loading, convert, and resize operations |

@@ -73,9 +73,16 @@ impl DmaImportAttrs {
         let yuv_range = cm.range.unwrap_or(ColorRange::Limited);
 
         let (width, height, drm_fourcc, channels) = if src_fmt == PixelFormat::Nv12 {
-            if !src_w.is_multiple_of(4) {
+            // NV12's genuine floor is even width (4:2:0 chroma is W/2 CbCr pairs).
+            // The historical width%4 gate was for word-aligned row reads of the
+            // tight luma pitch — now moot because the import uses the 64-aligned
+            // `plane0_pitch` (`effective_row_stride`) below, not `width`. Relaxed
+            // to width%2 so even-but-not-4-aligned camera widths take the
+            // zero-copy sampler path; a driver that still rejects falls back via
+            // `egl_create_image_with_fallback`.
+            if !src_w.is_multiple_of(2) {
                 return Err(Error::NotSupported(format!(
-                    "EGLImage requires width divisible by 4 for {src_fmt}, got {src_w}"
+                    "EGLImage requires even width for {src_fmt} (4:2:0 chroma), got {src_w}"
                 )));
             }
             // Luma (plane 0) is full-resolution R8; chroma subsampling
@@ -554,6 +561,44 @@ mod tests {
         assert_eq!(p1.pitch, stride);
         assert_eq!(attrs.width, width);
         assert_eq!(attrs.height, height);
+    }
+
+    /// Phase 5: even-but-not-4-aligned NV12 width imports (relaxed `%4→%2`
+    /// gate); odd width is still rejected (4:2:0 chroma is W/2 — needs even W).
+    /// The import uses the 64-aligned `plane0_pitch`, not `width`, so the old
+    /// word-alignment rationale for `%4` no longer applies.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn test_nv12_even_width_relaxed_gate() {
+        let (height, stride) = (64usize, 128usize);
+        let total = stride * height + stride * height.div_ceil(2);
+        let buf = match alloc_dma(total, "nv12_even_w") {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIPPED: test_nv12_even_width_relaxed_gate - DMA not available");
+                return;
+            }
+        };
+
+        // 66 is even but NOT 4-aligned — previously rejected by the width%4 gate.
+        let luma_pd = PlaneDescriptor::new(buf.dmabuf().unwrap())
+            .unwrap()
+            .with_stride(stride);
+        let t66 = import_nv12(luma_pd, None, 66, height).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(t66.as_u8().unwrap(), PixelFormat::Nv12)
+            .expect("even-but-not-4-aligned NV12 width must import after the %4→%2 relaxation");
+        assert_eq!(attrs.width, 66);
+
+        // Odd width still rejected (4:2:0 chroma needs even width).
+        let luma_pd2 = PlaneDescriptor::new(buf.dmabuf().unwrap())
+            .unwrap()
+            .with_stride(stride);
+        if let Ok(t65) = import_nv12(luma_pd2, None, 65, height) {
+            assert!(
+                DmaImportAttrs::from_tensor(t65.as_u8().unwrap(), PixelFormat::Nv12).is_err(),
+                "odd-width NV12 must still be rejected by the even-width gate"
+            );
+        }
     }
 
     /// Contiguous single-fd: no chroma descriptor, UV follows Y in buffer.

@@ -581,6 +581,386 @@ mod gl_tests {
     }
 
     // =========================================================================
+    // Recycled DMA-BUF *source* stale-read regression
+    //
+    // A DMA-BUF-backed source that is CPU-written, GPU-sampled by convert(),
+    // and then RECYCLED across frames must reflect the latest write. The
+    // recycled buffer keeps a stable BufferIdentity, so the source EGLImage
+    // cache (keyed by BufferIdentity + chroma id + plane_offset) hits.
+    //
+    // The defect this guards against: a decode pool reuses ONE oversized buffer
+    // and calls `configure_image()` each frame, so the SAME fd is presented to
+    // convert() with a DIFFERENT geometry/stride every frame (e.g. a 128-wide
+    // pool decoding a 96-wide image). Because the cache key omits geometry, the
+    // cached EGLImage built for the previous frame's stride is reused and the
+    // GPU samples the buffer at the wrong pitch — deterministically wrong
+    // single-threaded, nondeterministic in parallel, correct on a heap source.
+    // (Recycling at CONSTANT geometry is fine — V3D re-fetches the DMA-BUF each
+    // draw — so the constant-geometry tests below pass on buggy and fixed code
+    // alike; the geometry-change test is the one that fails pre-fix.)
+    //
+    // Oracle = a FRESH DMA source of the same content+geometry (new identity →
+    // cache miss → correct convert). Same code path as the recycled source; the
+    // only difference is buffer identity.
+    // =========================================================================
+
+    /// Overwrite an existing tensor's bytes in place (re-map → copy → drop →
+    /// DMA_BUF_IOCTL_SYNC(END)), simulating a pool recycle of one buffer.
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn overwrite_in_place(t: &TensorDyn, bytes: &[u8]) {
+        let mut map = t.as_u8().unwrap().map().unwrap();
+        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Write image A into a DMA source, convert, then overwrite the SAME source
+    /// with distinct image B and convert again on the SAME processor. Assert the
+    /// second output matches a fresh-DMA-source convert of B (no stale read).
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_recycle_stale_read_check(
+        w: usize,
+        h: usize,
+        src_fmt: PixelFormat,
+        bytes_a: &[u8],
+        bytes_b: &[u8],
+        tolerance: u8,
+    ) {
+        // ONE recycled DMA-BUF source, reused across two "frames".
+        let src = load_raw_image(w, h, src_fmt, Some(TensorMemory::Dma), bytes_a).unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        // Frame A: warms the src EGLImage cache + texture binding.
+        let mut dst_a =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &src, &mut dst_a);
+        let dst_a_bytes = dst_a.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Frame B: overwrite the SAME buffer (same fd / BufferIdentity), convert
+        // again. Cache HIT + binding-skip → this is where the stale read fires.
+        overwrite_in_place(&src, bytes_b);
+        let mut dst_b =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &src, &mut dst_b);
+        let dst_b_bytes = dst_b.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Oracle: a fresh DMA source of B (new identity → cache miss → correct).
+        let fresh_b = load_raw_image(w, h, src_fmt, Some(TensorMemory::Dma), bytes_b).unwrap();
+        let mut oracle_b =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &fresh_b, &mut oracle_b);
+        let oracle_b_bytes = oracle_b.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Guard against bad test data: A and B must produce different output, or
+        // the test could never distinguish stale from correct.
+        assert_ne!(
+            dst_a_bytes, oracle_b_bytes,
+            "test data invalid for {src_fmt:?}: frame A and frame B convert identically"
+        );
+
+        // The bug: dst_b carries frame-A content (stale) instead of frame-B.
+        assert_pixels_match(&oracle_b_bytes, &dst_b_bytes, tolerance);
+    }
+
+    /// Grey source (profiler's decode-pool format; EXTERNAL_OES Path A).
+    /// Grey→Rgba is a scalar luma replicate (no YUV matrix) → byte-exact.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_recycle_grey_stale_read() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        dma_recycle_stale_read_check(
+            w,
+            h,
+            PixelFormat::Grey,
+            &vec![50u8; w * h],
+            &vec![200u8; w * h],
+            0,
+        );
+    }
+
+    /// NV12 source (EXTERNAL_OES Path A on Vivante / R8 texelFetch Path B on
+    /// V3D/Mali). YUV→Rgba carries a small color-matrix rounding → tolerance 4.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_recycle_nv12_stale_read() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let make_nv12 = |y: u8| {
+            let mut buf = vec![y; w * h];
+            buf.extend(std::iter::repeat_n(128u8, w * h / 2)); // neutral chroma
+            buf
+        };
+        dma_recycle_stale_read_check(w, h, PixelFormat::Nv12, &make_nv12(50), &make_nv12(200), 4);
+    }
+
+    /// NV16 source (full-res chroma; R8 texelFetch Path B). tolerance 4.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_recycle_nv16_stale_read() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let make_nv16 = |y: u8| {
+            let mut buf = vec![y; w * h];
+            buf.extend(std::iter::repeat_n(128u8, w * h)); // full-res neutral chroma
+            buf
+        };
+        dma_recycle_stale_read_check(w, h, PixelFormat::Nv16, &make_nv16(50), &make_nv16(200), 4);
+    }
+
+    /// Small-pool recycle: 2 DMA-BUF sources round-robined over 5 distinct
+    /// solid-fill frames; every GPU output must equal a fresh-source convert of
+    /// the same frame. Exercises the cache/LRU interaction across more than one
+    /// recycled identity.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_pool_recycle_all_frames_match_oracle() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let lumas: [u8; 5] = [20, 70, 130, 180, 240];
+
+        let pool = [
+            TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)).unwrap(),
+            TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)).unwrap(),
+        ];
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        for (frame, &luma) in lumas.iter().enumerate() {
+            let buf = &pool[frame % pool.len()];
+            overwrite_in_place(buf, &vec![luma; w * h]);
+
+            let mut gpu =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, buf, &mut gpu);
+
+            // Fresh-source oracle for this exact frame.
+            let fresh = load_raw_image(
+                w,
+                h,
+                PixelFormat::Grey,
+                Some(TensorMemory::Dma),
+                &vec![luma; w * h],
+            )
+            .unwrap();
+            let mut oracle =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, &fresh, &mut oracle);
+
+            let oracle_map = oracle.as_u8().unwrap().map().unwrap();
+            let gpu_map = gpu.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(oracle_map.as_slice(), gpu_map.as_slice(), 0);
+        }
+    }
+
+    /// Fill `[h][w]` of `t`'s buffer with a non-uniform 2D pattern at the
+    /// tensor's effective row stride. Non-uniform content is essential: a solid
+    /// fill survives any stride/geometry misread, so it could not detect the
+    /// cache-key bug.
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn fill_grey_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
+        let stride = t.effective_row_stride().unwrap_or(w);
+        let mut map = t.as_u8().unwrap().map().unwrap();
+        let buf = map.as_mut_slice();
+        for r in 0..h {
+            for c in 0..w {
+                buf[r * stride + c] = ((r * 13 + c * 7) as u8).wrapping_add(salt);
+            }
+        }
+    }
+
+    /// THE faithful profiler repro. One oversized DMA pool buffer is recycled
+    /// across frames of DIFFERENT geometry via `configure_image()` (exactly what
+    /// the JPEG decoder does into `create_decode_source_pool`). Each frame's GPU
+    /// convert must equal a fresh-source convert of the same geometry+content.
+    ///
+    /// Pre-fix: frame N hits the cached EGLImage built for an earlier frame's
+    /// stride and samples the buffer at the wrong pitch → mismatch. This test
+    /// FAILS on buggy main and passes once the cache key carries geometry.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_recycle_geometry_change_stale_read() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        // Oversized pool (like the profiler's pool_w x 3*max_h R8 surface),
+        // recycled in place via configure_image — keeps ONE BufferIdentity.
+        let mut pool = TensorDyn::image(
+            128,
+            128,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        // A sequence of DISTINCT geometries (varying width → varying stride),
+        // each with distinct content. Reusing the same buffer means every frame
+        // shares the pool's BufferIdentity but needs its own EGLImage geometry.
+        let frames: [(usize, usize, u8); 4] =
+            [(128, 96, 0), (96, 128, 40), (120, 100, 80), (64, 128, 120)];
+
+        for (i, &(w, h, salt)) in frames.iter().enumerate() {
+            // Recycled pool: reconfigure to this frame's geometry, write, convert.
+            pool.configure_image(w, h, PixelFormat::Grey).unwrap();
+            fill_grey_pattern(&pool, w, h, salt);
+            let mut dst_recycled =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, &pool, &mut dst_recycled);
+            let recycled_bytes = dst_recycled.as_u8().unwrap().map().unwrap().to_vec();
+
+            // Fresh-source oracle: new buffer, same geometry+content.
+            let fresh =
+                TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            fill_grey_pattern(&fresh, w, h, salt);
+            let mut dst_fresh =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, &fresh, &mut dst_fresh);
+            let fresh_bytes = dst_fresh.as_u8().unwrap().map().unwrap().to_vec();
+
+            assert_eq!(
+                recycled_bytes.len(),
+                fresh_bytes.len(),
+                "frame {i} ({w}x{h}): output size mismatch"
+            );
+            assert_pixels_match(&fresh_bytes, &recycled_bytes, 0);
+        }
+    }
+
+    /// Stronger guard for the parallel-decode manifestation: a POOL of pooled
+    /// buffers, each recycled through DIFFERENT geometries, INTERLEAVED on one
+    /// processor — the same shared-cache access pattern parallel decode threads
+    /// produce (which buffer+geometry populates the cache first is what varied
+    /// run-to-run, giving 822–833). With a geometry-aware key every
+    /// (buffer, geometry) has its own entry, so interleaving is order-
+    /// independent and every output must match its fresh-source oracle.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_pool_geometry_interleaved_stale_read() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let mut pool = [
+            TensorDyn::image(
+                128,
+                128,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::Dma),
+            )
+            .unwrap(),
+            TensorDyn::image(
+                128,
+                128,
+                PixelFormat::Grey,
+                DType::U8,
+                Some(TensorMemory::Dma),
+            )
+            .unwrap(),
+        ];
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        // Interleave buffers AND geometries: each step reuses a pool slot at a
+        // new size, so the cache sees the worst-case mix of identities+geometry.
+        let steps: [(usize, usize, usize, u8); 6] = [
+            (0, 128, 96, 0),
+            (1, 96, 128, 30),
+            (0, 64, 100, 60),  // slot 0 reused at a 3rd geometry
+            (1, 120, 64, 90),  // slot 1 reused at a 2nd geometry
+            (0, 128, 96, 120), // slot 0 back to its 1st geometry, new content
+            (1, 96, 128, 150),
+        ];
+
+        for &(slot, w, h, salt) in steps.iter() {
+            pool[slot].configure_image(w, h, PixelFormat::Grey).unwrap();
+            fill_grey_pattern(&pool[slot], w, h, salt);
+            let mut dst =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, &pool[slot], &mut dst);
+
+            let fresh =
+                TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            fill_grey_pattern(&fresh, w, h, salt);
+            let mut oracle =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            convert(&mut gl, &fresh, &mut oracle);
+
+            let dst_map = dst.as_u8().unwrap().map().unwrap();
+            let oracle_map = oracle.as_u8().unwrap().map().unwrap();
+            assert_pixels_match(oracle_map.as_slice(), dst_map.as_slice(), 0);
+        }
+    }
+
+    /// Regression guard: a single-shot (non-recycled) DMA source must equal a
+    /// fresh-source convert — the fix must not break the first-frame path.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_single_shot_grey_matches_fresh() {
+        if !is_dma_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let bytes = vec![128u8; w * h];
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let convert = |gl: &mut GLProcessorThreaded, s: &TensorDyn, d: &mut TensorDyn| {
+            gl.convert(s, d, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        };
+
+        let src = load_raw_image(w, h, PixelFormat::Grey, Some(TensorMemory::Dma), &bytes).unwrap();
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &src, &mut dst);
+
+        let fresh =
+            load_raw_image(w, h, PixelFormat::Grey, Some(TensorMemory::Dma), &bytes).unwrap();
+        let mut oracle =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        convert(&mut gl, &fresh, &mut oracle);
+
+        let oracle_map = oracle.as_u8().unwrap().map().unwrap();
+        let dst_map = dst.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(oracle_map.as_slice(), dst_map.as_slice(), 0);
+    }
+
+    // =========================================================================
     // EGL Display Probe & Override Tests
     // =========================================================================
 
@@ -4647,7 +5027,7 @@ mod gl_tests {
     /// Verify NV16→RGBA via Path B (R8 texelFetch shader) on DMA buffers.
     ///
     /// Checks:
-    ///   (a) `last_nv_convert_path` == `R8ShaderB` — no CPU fallback.
+    ///   (a) `last_nv_convert_path` == `ShaderR8` — no CPU fallback.
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2 (rounding from f32 shader arithmetic).
     #[test]
@@ -4697,8 +5077,8 @@ mod gl_tests {
         // (a) Assert Path B ran — no CPU fallback for a DMA NV16 source.
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "NV16 DMA convert must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "NV16 DMA convert must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -4720,10 +5100,592 @@ mod gl_tests {
         }
     }
 
+    /// RAII guard: sets `EDGEFIRST_NV_CONVERT_PATH` and removes it on drop, so a
+    /// panic in `GLProcessorST::new` cannot leak the override to later tests.
+    /// GL tests run `--test-threads=1` (CI), so there is no concurrent reader.
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    struct NvPathEnvGuard;
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl NvPathEnvGuard {
+        fn set(v: &str) -> Self {
+            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", v);
+            NvPathEnvGuard
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl Drop for NvPathEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
+        }
+    }
+
+    /// `EDGEFIRST_NV_CONVERT_PATH` selects the NV12 GPU conversion path.
+    ///
+    /// - `auto` (default) and `shader` → `ShaderR8` (single-plane NV12 prefers
+    ///   the portable in-shader path).
+    /// - `sampler` → the driver `ExternalSampler` path is selected; the actual
+    ///   recorded path is `ExternalSampler` on success or `Cpu` if the driver
+    ///   rejects the NV12 EGLImage import — never `ShaderR8`.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_path_env_override() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize); // width % 4 == 0 so the sampler import is accepted
+        let mut bytes = vec![100u8; w * h]; // Y plane
+        for _ in 0..(w * h / 4) {
+            bytes.push(150); // Cb
+            bytes.push(80); // Cr
+        }
+
+        let run = |env: Option<&str>| -> Option<NvConvertPath> {
+            // The env var is read once in `GLProcessorST::new`; the guard sets it
+            // for exactly that construction and removes it on drop (panic-safe).
+            let gl = {
+                std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
+                let _guard = env.map(NvPathEnvGuard::set);
+                GLProcessorST::new(None)
+            };
+            let mut gl = match gl {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                    return None;
+                }
+            };
+            let mut src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
+            // Tag full-range so the Vivante Auto carve-out (BT.601-LIMITED only)
+            // does NOT engage — keeps `auto → ShaderR8` deterministic on every
+            // platform, including Vivante (where BT.601-limited NV12 would
+            // otherwise correctly prefer ExternalSampler; see select_nv_path).
+            src.set_colorimetry(Some(
+                edgefirst_tensor::Colorimetry::default()
+                    .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
+                    .with_range(edgefirst_tensor::ColorRange::Full),
+            ));
+            let mut dst =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            Some(gl.last_nv_convert_path)
+        };
+
+        if let Some(p) = run(None) {
+            assert_eq!(
+                p,
+                NvConvertPath::ShaderR8,
+                "auto default: single-plane full-range NV12 must prefer ShaderR8"
+            );
+        }
+        if let Some(p) = run(Some("shader")) {
+            assert_eq!(
+                p,
+                NvConvertPath::ShaderR8,
+                "forced shader must use ShaderR8"
+            );
+        }
+        if let Some(p) = run(Some("sampler")) {
+            assert_ne!(
+                p,
+                NvConvertPath::ShaderR8,
+                "forced sampler must NOT use ShaderR8 (got ExternalSampler or Cpu)"
+            );
+        }
+    }
+
+    /// Phase 4b: a NON-DMA (heap/PBO) NV12 source must be GPU-converted via the
+    /// R8-UPLOAD `ShaderR8` path — not the CPU fallback. This is the path that
+    /// gives orin (no DMA-BUF EGLImage import) GPU NV conversion. Gated on
+    /// OpenGL only (NOT DMA), so it runs on orin.
+    ///
+    /// Asserts: (a) `last_nv_convert_path == ShaderR8` for a `Mem` NV12 source;
+    /// (b) the GPU upload output matches the `CPUProcessor` reference within ±2
+    /// (same in-shader matrix as DMA `ShaderR8`).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_nondma_upload_uses_shader() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        // Patterned NV12 (luma gradient + neutral chroma) — exercises the shader.
+        let mut bytes = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                bytes[r * w + c] = ((r + c) * 255 / (w + h)) as u8;
+            }
+        }
+        bytes.extend(std::iter::repeat_n(128u8, w * h / 2)); // neutral chroma
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        // Non-DMA (Mem) NV12 source → must take the R8-upload ShaderR8 path.
+        let mem_src =
+            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+        let mut gpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        gl.convert(
+            &mem_src,
+            &mut gpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::ShaderR8,
+            "non-DMA NV12 must use the R8-upload ShaderR8 path, not CPU (got {:?})",
+            gl.last_nv_convert_path
+        );
+
+        // CPU reference (same matrix) — outputs must agree within ±2.
+        let cpu_src =
+            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        crate::cpu::CPUProcessor::new()
+            .convert(
+                &cpu_src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+        let gpu_map = gpu_dst.as_u8().unwrap().map().unwrap();
+        let cpu_map = cpu_dst.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(cpu_map.as_slice(), gpu_map.as_slice(), 2);
+    }
+
+    /// Regression for the planar `select_nv_path` fix: NV12 (DMA) → PlanarRgb
+    /// must route through the colorimetry-exact `ShaderR8` two-pass — NOT the
+    /// driver `samplerExternalOES` the single-pass `convert_to_planar` used,
+    /// which diverged on chroma edges (V3D/Mali) and had no path for NV16/NV24.
+    /// Full-range tag keeps the path deterministic (avoids the Vivante carve-out).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv12_to_planar_rgb_uses_shader_path() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        // NV12 with a vertical chroma edge — where the driver sampler diverged.
+        let mut bytes = Vec::with_capacity(w * h * 3 / 2);
+        for r in 0..h {
+            for c in 0..w {
+                bytes.push(((r + c) * 255 / (w + h)) as u8);
+            }
+        }
+        for _ in 0..h / 2 {
+            for c in 0..w / 2 {
+                let (cb, cr) = if c < w / 4 { (90, 160) } else { (200, 40) };
+                bytes.push(cb);
+                bytes.push(cr);
+            }
+        }
+        fn tag(t: &mut TensorDyn) {
+            t.set_colorimetry(Some(
+                edgefirst_tensor::Colorimetry::default()
+                    .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
+                    .with_range(edgefirst_tensor::ColorRange::Full),
+            ));
+        }
+
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let mut src =
+            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
+        tag(&mut src);
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+            .unwrap();
+        assert_eq!(
+            gl.last_nv_convert_path,
+            NvConvertPath::ShaderR8,
+            "NV12→PlanarRgb must use the ShaderR8 two-pass (select_nv_path), not the driver sampler"
+        );
+
+        // Correctness: matches the CPU planar reference (the sampler did not).
+        let mut cpu_src =
+            load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+        tag(&mut cpu_src);
+        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        crate::cpu::CPUProcessor::new()
+            .convert(
+                &cpu_src,
+                &mut cpu_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+        compare_images(&cpu_dst, &dst, 0.95, "nv12_to_planar_rgb_shader");
+    }
+
+    /// Phase 4b coverage: NV16/NV24 (not just NV12) on a non-DMA (heap) source
+    /// must also GPU-convert via the R8-upload `ShaderR8` path and match CPU ≤2.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn test_nv16_nv24_nondma_upload_uses_shader() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        // (format, chroma byte count): NV16 4:2:2 = w*h UV; NV24 4:4:4 = 2*w*h UV.
+        for (fmt, uv) in [(PixelFormat::Nv16, w * h), (PixelFormat::Nv24, 2 * w * h)] {
+            let mut bytes = vec![0u8; w * h];
+            for r in 0..h {
+                for c in 0..w {
+                    bytes[r * w + c] = ((r + c) * 255 / (w + h)) as u8; // Y gradient
+                }
+            }
+            bytes.extend(std::iter::repeat_n(128u8, uv)); // neutral chroma
+
+            let mem_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
+            let mut gpu = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+            gl.convert(
+                &mem_src,
+                &mut gpu,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            assert_eq!(
+                gl.last_nv_convert_path,
+                NvConvertPath::ShaderR8,
+                "non-DMA {fmt:?} must use the R8-upload ShaderR8 path (got {:?})",
+                gl.last_nv_convert_path
+            );
+
+            let cpu_src = load_raw_image(w, h, fmt, Some(TensorMemory::Mem), &bytes).unwrap();
+            let mut cpu = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(
+                    &cpu_src,
+                    &mut cpu,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::no_crop(),
+                )
+                .unwrap();
+            assert_pixels_match(
+                cpu.as_u8().unwrap().map().unwrap().as_slice(),
+                gpu.as_u8().unwrap().map().unwrap().as_slice(),
+                2,
+            );
+        }
+    }
+
+    /// Diagnostic probe (Phase 2): quantify *why* the driver `ExternalSampler`
+    /// path diverges from the exact reference, separating colorimetry/matrix
+    /// error (flat regions) from chroma-upsampling error (chroma edges).
+    ///
+    /// Converts NV12 three ways — `ExternalSampler` (driver YUV), `ShaderR8`
+    /// (exact in-shader matrix), and CPU (the heap/`Mem` reference, == the
+    /// profiler's 841 path) — and prints per-path deltas vs CPU. Run with
+    /// `--nocapture` and read the `PROBE[...]` lines per platform.
+    ///
+    /// Asserts only that `ShaderR8` matches CPU on a SOLID frame (pure matrix —
+    /// must agree); the `ExternalSampler` divergence is characterised, not
+    /// bounded (it is platform-dependent and is the thing under study).
+    #[test]
+    #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn probe_nv12_sampler_vs_shader_divergence() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let (w, h) = (64usize, 64usize); // width % 4 == 0 for the sampler import
+
+        // Build NV12 (Y plane then h/2 rows of w/2 interleaved CbCr pairs). The
+        // chroma closure maps a luma column to (Cb, Cr).
+        let build = |y: u8, chroma: &dyn Fn(usize) -> (u8, u8)| -> Vec<u8> {
+            let mut buf = vec![y; w * h];
+            for _r in 0..h / 2 {
+                for c in 0..w / 2 {
+                    let (cb, cr) = chroma(c * 2);
+                    buf.push(cb);
+                    buf.push(cr);
+                }
+            }
+            buf
+        };
+        let solid = build(120, &|_| (90, 160));
+        let edge = build(120, &|col| if col < w / 2 { (90, 160) } else { (200, 40) });
+
+        // Force a path via the env var (read at construction), then clear it.
+        let convert_dma = |env: &str, bytes: &[u8]| -> Option<(NvConvertPath, Vec<u8>)> {
+            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", env);
+            let gl = GLProcessorST::new(None);
+            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
+            let mut gl = match gl {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                    return None;
+                }
+            };
+            let src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), bytes).unwrap();
+            let mut dst =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            let out = dst.as_u8().unwrap().map().unwrap().to_vec();
+            Some((gl.last_nv_convert_path, out))
+        };
+        let cpu_ref = |bytes: &[u8]| -> Vec<u8> {
+            let src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), bytes).unwrap();
+            let mut dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            dst.as_u8().unwrap().map().unwrap().to_vec()
+        };
+        // (max, mean, max in flat regions, max within ±2 cols of the w/2 edge)
+        let stats = |a: &[u8], b: &[u8]| -> (u32, f64, u32, u32) {
+            let (mut maxd, mut sum, mut maxflat, mut maxbound) = (0u32, 0u64, 0u32, 0u32);
+            for i in 0..w * h {
+                let boundary = ((i % w) as i64 - (w as i64 / 2)).abs() <= 2;
+                for ch in 0..3 {
+                    let d = (a[i * 4 + ch] as i32 - b[i * 4 + ch] as i32).unsigned_abs();
+                    maxd = maxd.max(d);
+                    sum += d as u64;
+                    if boundary {
+                        maxbound = maxbound.max(d);
+                    } else {
+                        maxflat = maxflat.max(d);
+                    }
+                }
+            }
+            (maxd, sum as f64 / (w * h * 3) as f64, maxflat, maxbound)
+        };
+
+        for (name, bytes) in [("solid", &solid), ("chroma-edge", &edge)] {
+            let cpu = cpu_ref(bytes);
+            let Some((ps, sampler)) = convert_dma("sampler", bytes) else {
+                return;
+            };
+            let Some((pb, shader)) = convert_dma("shader", bytes) else {
+                return;
+            };
+            let (smax, smean, sflat, sbound) = stats(&sampler, &cpu);
+            let (bmax, bmean, bflat, bbound) = stats(&shader, &cpu);
+            eprintln!(
+                "PROBE[{name}] ExternalSampler({ps:?}) vs CPU: max={smax} mean={smean:.2} \
+                 flat(matrix)={sflat} boundary(chroma)={sbound}"
+            );
+            eprintln!(
+                "PROBE[{name}] ShaderR8({pb:?})       vs CPU: max={bmax} mean={bmean:.2} \
+                 flat(matrix)={bflat} boundary(chroma)={bbound}"
+            );
+            if name == "solid" {
+                assert!(
+                    bmax <= 4,
+                    "ShaderR8 must match CPU reference on a solid frame (pure matrix): max={bmax}"
+                );
+            }
+        }
+    }
+
+    /// Diagnostic probe (Phase 4): isolate where the profiler's NV12→packed-RGB
+    /// DMA path diverges from the CPU reference (the 830-vs-841), using the
+    /// profiler's EXACT letterbox (mirrors `LetterboxTransform::compute`:
+    /// aspect-fit + neutral-grey `[114,114,114,255]` bars).
+    ///
+    /// NV12 sampling already matches CPU at same size (Phase 2). This exercises
+    /// the camera→model letterbox resize. Reports DMA-GL vs `CPUProcessor`:
+    ///   - `same-size`     : no resize → baseline (sampling + pack).
+    ///   - `lb-full`       : whole frame incl. grey bars (catches bar-fill diffs).
+    ///   - `lb-content`    : the resized image region only (pure resize delta).
+    ///   - shader vs sampler shows whether the driver's LINEAR resize is closer.
+    #[test]
+    #[ignore = "diagnostic probe — run manually on-target with --nocapture --ignored"]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn probe_nv12_packed_letterbox_divergence() {
+        use crate::opengl_headless::processor::GLProcessorST;
+        use crate::Rect;
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        // 16:9 source so fitting into a square model produces top/bottom bars.
+        let (sw, sh) = (192usize, 108usize);
+        let model = 96usize;
+
+        // Patterned NV12: luma gradient + a vertical chroma edge.
+        let mut bytes = Vec::with_capacity(sw * sh * 3 / 2);
+        for r in 0..sh {
+            for c in 0..sw {
+                bytes.push(((r + c) * 255 / (sw + sh)) as u8);
+            }
+        }
+        for _r in 0..sh / 2 {
+            for c in 0..sw / 2 {
+                let (cb, cr) = if c < sw / 4 { (90, 160) } else { (200, 40) };
+                bytes.push(cb);
+                bytes.push(cr);
+            }
+        }
+
+        // Mirror LetterboxTransform::compute (profiler/src/pipeline.rs:1648).
+        let scale = (model as f32 / sw as f32).min(model as f32 / sh as f32);
+        let scaled_w = (sw as f32 * scale).round() as usize;
+        let scaled_h = (sh as f32 * scale).round() as usize;
+        let pad_x = (model - scaled_w) / 2;
+        let pad_y = (model - scaled_h) / 2;
+        let letterbox = || {
+            Crop::new()
+                .with_src_rect(Some(Rect::new(0, 0, sw, sh)))
+                .with_dst_rect(Some(Rect::new(pad_x, pad_y, scaled_w, scaled_h)))
+                .with_dst_color(Some([114, 114, 114, 255]))
+        };
+
+        let gl_packed = |env: &str, crop: Crop, dw: usize, dh: usize| -> Option<(usize, Vec<u8>)> {
+            std::env::set_var("EDGEFIRST_NV_CONVERT_PATH", env);
+            let g = GLProcessorST::new(None);
+            std::env::remove_var("EDGEFIRST_NV_CONVERT_PATH");
+            let mut g = match g {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("SKIPPED: {} - GL: {e}", function!());
+                    return None;
+                }
+            };
+            let src =
+                load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
+            let mut dst = TensorDyn::image(dw, dh, PixelFormat::Rgb, DType::U8, None).unwrap();
+            g.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                .ok()?;
+            let stride = dst
+                .as_u8()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(dw * 3);
+            Some((stride, dst.as_u8().unwrap().map().unwrap().to_vec()))
+        };
+        let cpu_packed = |crop: Crop, dw: usize, dh: usize| -> (usize, Vec<u8>) {
+            let src =
+                load_raw_image(sw, sh, PixelFormat::Nv12, Some(TensorMemory::Mem), &bytes).unwrap();
+            let mut dst = TensorDyn::image(dw, dh, PixelFormat::Rgb, DType::U8, None).unwrap();
+            crate::cpu::CPUProcessor::new()
+                .convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                .unwrap();
+            let stride = dst
+                .as_u8()
+                .unwrap()
+                .effective_row_stride()
+                .unwrap_or(dw * 3);
+            (stride, dst.as_u8().unwrap().map().unwrap().to_vec())
+        };
+        // Stride-aware delta over a pixel region [r0..r0+rh) × [c0..c0+cw) (RGB).
+        let region = |a: &[u8],
+                      sa: usize,
+                      b: &[u8],
+                      sb: usize,
+                      c0: usize,
+                      r0: usize,
+                      cw: usize,
+                      rh: usize|
+         -> (u32, f64) {
+            let (mut mx, mut sum) = (0u32, 0u64);
+            for r in r0..r0 + rh {
+                for c in (c0 * 3)..((c0 + cw) * 3) {
+                    let d = (a[r * sa + c] as i32 - b[r * sb + c] as i32).unsigned_abs();
+                    mx = mx.max(d);
+                    sum += d as u64;
+                }
+            }
+            (mx, sum as f64 / (cw * 3 * rh) as f64)
+        };
+
+        // same-size baseline (no resize)
+        let cpu0 = cpu_packed(Crop::no_crop(), sw, sh);
+        if let Some(g) = gl_packed("shader", Crop::no_crop(), sw, sh) {
+            let (mx, mean) = region(&g.1, g.0, &cpu0.1, cpu0.0, 0, 0, sw, sh);
+            eprintln!("PROBE2[same-size]   ShaderR8 vs CPU: max={mx} mean={mean:.2}");
+        }
+
+        // letterbox (aspect-fit + grey bars), full frame + content region only
+        let cpu1 = cpu_packed(letterbox(), model, model);
+        // Decisive content-region pixel dump: flip / offset / rescale vs CPU?
+        if let Some(g) = gl_packed("shader", letterbox(), model, model) {
+            let px = |buf: &[u8], stride: usize, r: usize, c: usize| {
+                let o = r * stride + c * 3;
+                (buf[o], buf[o + 1], buf[o + 2])
+            };
+            let (ctop, cleft) = (pad_y, pad_x);
+            let (cbot, cright) = (pad_y + scaled_h - 1, pad_x + scaled_w - 1);
+            eprintln!(
+                "DUMP content TL cpu={:?} gl={:?} | TR cpu={:?} gl={:?} | BL cpu={:?} gl={:?} | BR cpu={:?} gl={:?}",
+                px(&cpu1.1, cpu1.0, ctop, cleft),
+                px(&g.1, g.0, ctop, cleft),
+                px(&cpu1.1, cpu1.0, ctop, cright),
+                px(&g.1, g.0, ctop, cright),
+                px(&cpu1.1, cpu1.0, cbot, cleft),
+                px(&g.1, g.0, cbot, cleft),
+                px(&cpu1.1, cpu1.0, cbot, cright),
+                px(&g.1, g.0, cbot, cright),
+            );
+        }
+        for env in ["shader", "sampler"] {
+            if let Some(g) = gl_packed(env, letterbox(), model, model) {
+                let (fmx, fmean) = region(&g.1, g.0, &cpu1.1, cpu1.0, 0, 0, model, model);
+                let (cmx, cmean) =
+                    region(&g.1, g.0, &cpu1.1, cpu1.0, pad_x, pad_y, scaled_w, scaled_h);
+                eprintln!(
+                    "PROBE2[lb-full/{env:8}] vs CPU: max={fmx} mean={fmean:.2}   \
+                     lb-content: max={cmx} mean={cmean:.2}"
+                );
+            }
+        }
+    }
+
     /// Verify NV24→RGBA via Path B (R8 texelFetch shader) on DMA buffers.
     ///
     /// Checks:
-    ///   (a) `last_nv_convert_path` == `R8ShaderB` — no CPU fallback.
+    ///   (a) `last_nv_convert_path` == `ShaderR8` — no CPU fallback.
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2.
     #[test]
@@ -4772,8 +5734,8 @@ mod gl_tests {
         // (a) Assert Path B ran — no CPU fallback for a DMA NV24 source.
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "NV24 DMA convert must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "NV24 DMA convert must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -4861,7 +5823,7 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
+            NvConvertPath::ShaderR8,
             "NV16 DMA convert must use Path B"
         );
 
@@ -4944,7 +5906,7 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
+            NvConvertPath::ShaderR8,
             "NV24 DMA convert must use Path B"
         );
 
@@ -4964,10 +5926,11 @@ mod gl_tests {
         );
     }
 
-    /// Verify NV12 still uses Path A (samplerExternalOES) — no regression.
+    /// Verify a DMA NV12 source converts on the GPU (ExternalSampler or
+    /// ShaderR8, platform-dependent) and never silently falls back to CPU.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    fn test_nv12_still_uses_path_a() {
+    fn test_nv12_dma_gpu_path_no_cpu_fallback() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
         if !is_dma_available() {
             eprintln!("SKIPPED: {} - DMA not available", function!());
@@ -4995,14 +5958,14 @@ mod gl_tests {
             .unwrap();
 
         // NV12 must stay on a GPU path (no CPU-fallback regression). The exact
-        // path is GPU-dependent: Path A (HwYuvA) on Vivante, Path B (R8ShaderB)
+        // path is GPU-dependent: Path A (ExternalSampler) on Vivante, Path B (ShaderR8)
         // elsewhere — single-plane Path A YUV sampling is unreliable on Mali.
         assert!(
             matches!(
                 gl.last_nv_convert_path,
-                NvConvertPath::HwYuvA | NvConvertPath::R8ShaderB
+                NvConvertPath::ExternalSampler | NvConvertPath::ShaderR8
             ),
-            "NV12 DMA convert must use a GPU path (HwYuvA/R8ShaderB), got {:?}",
+            "NV12 DMA convert must use a GPU path (ExternalSampler/ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
     }
@@ -5081,7 +6044,7 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
+            NvConvertPath::ShaderR8,
             "NV16 int8 DMA convert must use Path B"
         );
 
@@ -5273,7 +6236,7 @@ mod gl_tests {
     /// G-03: NV16 odd-width (65×64) end-to-end GPU vs CPU reference.
     ///
     /// Asserts:
-    ///   (a) `last_nv_convert_path == R8ShaderB` — no CPU fallback.
+    ///   (a) `last_nv_convert_path == ShaderR8` — no CPU fallback.
     ///   (b) GPU output matches CPU reference within ±4 (per-pixel, each RGBA channel).
     ///       Tolerance 4 absorbs f32 shader rounding; identical fill on both sides
     ///       rules out test-infrastructure bias.
@@ -5319,8 +6282,8 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-03: NV16 odd-W must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-03: NV16 odd-W must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5379,8 +6342,8 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-04: NV24 odd-W must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-04: NV24 odd-W must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5443,8 +6406,8 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-05: NV16 odd-both must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-05: NV16 odd-both must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5507,8 +6470,8 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-06: NV24 odd-both must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-06: NV24 odd-both must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5645,8 +6608,8 @@ mod gl_tests {
         // NV12 width 65 (not mult-4) routes to Path B (R8 shader).
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-01: non-mult-4 NV12 must route to Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-01: non-mult-4 NV12 must route to Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5671,7 +6634,7 @@ mod gl_tests {
     /// where width (320) is a multiple of 4 but the height is odd.
     ///
     /// Asserts:
-    ///   (a) `last_nv_convert_path == R8ShaderB` — no CPU fallback for DMA source.
+    ///   (a) `last_nv_convert_path == ShaderR8` — no CPU fallback for DMA source.
     ///   (b) GPU output matches CPU reference within ±4.
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
@@ -5714,17 +6677,17 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Even-width NV12 uses a hardware GPU path: Path A (HwYuvA,
-        // samplerExternalOES) on Vivante, or Path B (R8ShaderB) elsewhere —
+        // Even-width NV12 uses a hardware GPU path: Path A (ExternalSampler,
+        // samplerExternalOES) on Vivante, or Path B (ShaderR8) elsewhere —
         // Path A's YUV-EGLImage sampling is only reliable on Vivante (it samples
         // garbage on Mali-G310). Either is correct here; what matters is that it
         // stays on the GPU rather than falling back to the CPU.
         assert!(
             matches!(
                 gl.last_nv_convert_path,
-                NvConvertPath::HwYuvA | NvConvertPath::R8ShaderB
+                NvConvertPath::ExternalSampler | NvConvertPath::ShaderR8
             ),
-            "G-02: even-W odd-H NV12 should use a GPU path (HwYuvA/R8ShaderB), got {:?}",
+            "G-02: even-W odd-H NV12 should use a GPU path (ExternalSampler/ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5892,11 +6855,13 @@ mod gl_tests {
         )
         .unwrap();
 
-        // NV12 i8 must still use Path A (HwYuvA).
+        // Odd-width single-plane NV12 routes to ShaderR8 (no width gate); the
+        // driver ExternalSampler requires even/4-aligned width. (This assert only
+        // runs if the #[ignore] is lifted — kept accurate per current routing.)
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::HwYuvA,
-            "G-07: NV12 i8 odd-W must still use Path A (HwYuvA), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-07: odd-W single-plane NV12 must use ShaderR8, got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -5966,8 +6931,8 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
-            "G-08: NV16 i8 odd-both must use Path B (R8ShaderB), got {:?}",
+            NvConvertPath::ShaderR8,
+            "G-08: NV16 i8 odd-both must use Path B (ShaderR8), got {:?}",
             gl.last_nv_convert_path
         );
 
@@ -6030,7 +6995,7 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
+            NvConvertPath::ShaderR8,
             "even NV16 regression: must use Path B"
         );
         let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
@@ -6084,7 +7049,7 @@ mod gl_tests {
 
         assert_eq!(
             gl.last_nv_convert_path,
-            NvConvertPath::R8ShaderB,
+            NvConvertPath::ShaderR8,
             "even NV24 regression: must use Path B"
         );
         let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);

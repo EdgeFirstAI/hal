@@ -67,6 +67,10 @@ name = "pipeline_benchmark"
 harness = false
 
 [[bench]]
+name = "nv_path_benchmark"
+harness = false
+
+[[bench]]
 name = "mask_benchmark"
 harness = false
 

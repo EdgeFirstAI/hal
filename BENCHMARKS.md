@@ -94,6 +94,49 @@ Orthogonally, each compute backend operates on buffers using different memory an
 
 Typically we benchmark DMA-buf and PBO for GPU backends. The Sync (upload/readpixels) path is only benchmarked when PBO is not supported on a platform.
 
+### NV12 / NV16 / NV24 Conversion Paths (sampler vs shader)
+
+Semi-planar YUV (NV12/NV16/NV24) → RGB on the OpenGL backend has two GPU paths,
+selectable via the **`EDGEFIRST_NV_CONVERT_PATH`** environment variable
+(`sampler` | `shader` | `auto`, default `auto`):
+
+| Path | `NvConvertPath` | Mechanism | YUV→RGB by | Notes |
+|------|-----------------|-----------|-----------|-------|
+| **Sampler** | `ExternalSampler` | `samplerExternalOES` EGLImage | the **GPU driver** | NV12 only (incl. multiplane). Colorimetry & chroma upsampling are the driver's. |
+| **Shader** | `ShaderR8` | R8 `texelFetch` + in-shader matrix | **HAL** (exact, per-tensor) | NV12/NV16/NV24, single-plane (combined buffer). Portable & identical across GPUs. |
+
+On a **non-DMA** backend (PBO/Sync, e.g. orin) `ShaderR8` uploads the combined
+buffer as an R8 texture (`glTexImage2D`) and runs the same shader — so the GPU
+NV path is available even without DMA-buf EGLImage import. True-multiplane NV12
+(separate Y/UV fds) has no single-buffer R8 view, so it always uses `Sampler`.
+
+**Correctness (per-pixel Δ vs CPU reference, on-target):** the matrix matches on
+every GPU (solid frames ≤1); the divergence is **chroma upsampling**. `Sampler`
+uses the driver's *bilinear* chroma (≤55 at chroma edges on V3D & Mali);
+`ShaderR8` uses nearest/replicate and matches CPU (≤2). Vivante's sampler is
+nearest-like and also matches CPU.
+
+**Latency (NV12 720p convert, median, on-target A/B via `nv_path_benchmark`):**
+
+| Platform | GPU | Sampler | Shader | Selected by `auto` |
+|----------|-----|---------|--------|--------------------|
+| rpi5-hailo | V3D | 2.1 ms | 2.4 ms | **Shader** (correct, ~equal speed) |
+| imx95-frdm | Mali-G310 | 1.5 ms | 2.3 ms | **Shader** (chroma correctness) |
+| imx8mp-frdm | Vivante GC7000UL | **2.5 ms** | **29.2 ms** | **Sampler** (shader ~12× slower; sampler also correct here) |
+| jetson-orin-nano | Tegra (NVIDIA) | 2.4 ms | 2.1 ms | **Shader** (R8 upload; no DMA-buf import) |
+
+**`auto` policy:** prefer `ShaderR8` (portable, colorimetry-exact) everywhere
+**except** single-plane, BT.601-limited, even-and-4-aligned NV12 on **Vivante**,
+where `ExternalSampler` is both ~12× faster and colorimetry-correct. Full-range /
+BT.709 sources on Vivante still take `ShaderR8` (slower but correct — the fixed
+driver matrix would be wrong). `EDGEFIRST_NV_CONVERT_PATH` overrides this for
+benchmarking and platform bring-up.
+
+Source-width constraint for the `Sampler` (NV12 EGLImage) path: **even width**
+(4:2:0 chroma is W/2). The import uses the 64-byte-aligned row pitch, so widths
+that are even but not 4-aligned (e.g. 1282) take the zero-copy sampler path; a
+driver that still rejects falls back automatically.
+
 ### Buffer Infrastructure Benchmarks
 
 In addition to compute benchmarks, we separately measure:
@@ -170,6 +213,7 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types (Heap, SHM, DMA) |
 | `image_benchmark` | `edgefirst-image` | JPEG loading, format convert, resize operations across buffer backends |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
+| `nv_path_benchmark` | `edgefirst-image` | NV12/16/24 sampler-vs-shader A/B (set `EDGEFIRST_NV_CONVERT_PATH=sampler\|shader`); synthesized sources, no testdata |
 | `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert end-to-end (strided input, HWC/CHW output) |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |

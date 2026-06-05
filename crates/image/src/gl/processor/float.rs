@@ -737,7 +737,7 @@ impl GLProcessorST {
         // Attach the EGLImage (renderbuffer when supported, else texture) to the
         // FBO, mirroring the u8 packed-RGB DMA destination path.
         unsafe {
-            match self.cached_dst_renderbuffer(dst_f16) {
+            match self.cached_dst_renderbuffer(dst_f16, PixelFormat::PlanarRgb) {
                 Some(rbo) => {
                     gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
                     gls::gl::FramebufferRenderbuffer(

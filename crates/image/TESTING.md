@@ -19,6 +19,7 @@ crates/image/
     ├── mask_benchmark.rs        # Mask decode + draw paths
     ├── mask_decode_benchmark.rs # Mask materialization vs proto-only
     ├── pipeline_benchmark.rs    # End-to-end pipeline measurements
+    ├── nv_path_benchmark.rs     # NV12/16/24 sampler-vs-shader A/B (EDGEFIRST_NV_CONVERT_PATH)
     ├── decode_pipeline_benchmark.rs  # JPEG decode → letterbox convert pipeline
     ├── opencv_benchmark.rs      # Comparison vs OpenCV reference (optional)
     ├── sanity_check.rs          # Quick smoke tests for bench harness setup
@@ -111,6 +112,8 @@ cargo test -p edgefirst-image --features g2d_test_formats -- --test-threads=1
 | `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even if available |
 | `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even if available |
 | `EDGEFIRST_FORCE_TRANSFER=dmabuf` / `=pbo` / `=sync` | Force GL transfer backend (the `sync` value pins the non-zero-copy `glReadPixels` baseline used for benchmarking) |
+| `EDGEFIRST_NV_CONVERT_PATH=sampler` / `=shader` / `=auto` | Force the NV12 GPU conversion path (`auto` default; see BENCHMARKS.md) |
+| `EDGEFIRST_EGL_CACHE_CAPACITY=<n>` | Override the per-cache EGLImage capacity (default 64) |
 
 Example — run tests without any GPU backend:
 

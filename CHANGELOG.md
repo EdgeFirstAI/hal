@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **GPU NV12/NV16/NV24 conversion on non-DMA (heap/PBO) backends**
+  (`edgefirst-image`): the in-shader R8 (`ShaderR8`) path now also runs when
+  DMA-BUF EGLImage import is unavailable (e.g. NVIDIA Jetson Orin) by uploading
+  the combined semi-planar buffer as an R8 texture, replacing the CPU fallback.
+- **`EDGEFIRST_NV_CONVERT_PATH`** (`sampler` | `shader` | `auto`,
+  `edgefirst-image`): selects the NV12 GPU conversion path. `auto` (default)
+  prefers the portable, colorimetry-exact in-shader `ShaderR8`, except
+  BT.601-limited single-plane NV12 on Vivante (where the hardware sampler is
+  ~12× faster and colorimetry-correct). `sampler`/`shader` force a path for
+  benchmarking and platform bring-up.
+- **`EDGEFIRST_EGL_CACHE_CAPACITY`** (`edgefirst-image`): overrides the per-cache
+  EGLImage capacity (default 64) for high-cardinality varied-geometry streams.
+- `nv_path_benchmark` (`edgefirst-image`): cross-platform `sampler`-vs-`shader`
+  NV12/16/24 A/B benchmark (synthesized sources, no testdata required).
 - `Tensor::subview()` / `TensorDyn::subview()` (`edgefirst-tensor`): zero-copy
   sub-region views that share the parent's allocation (`Mem` heap `Arc` or `Dma`
   fd) and map at a byte offset, for assembling a batch into one buffer. N views
@@ -236,6 +250,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GPU EGLImage source cache stale-geometry read (recycled DMA-BUF pools).**
+  The OpenGL source EGLImage cache keyed only on buffer identity + plane offset.
+  A pooled DMA-BUF tensor reconfigured between converts (`configure_image`, e.g.
+  a decode pool reused at a new width/format/stride per frame) reused the cached
+  EGLImage imported at the *previous* geometry, so the GPU sampled at the wrong
+  pitch — producing wrong/garbage output (deterministic single-threaded,
+  nondeterministic under parallel decode). The cache key now carries
+  `width`/`height`/`row_stride`/`format`, so a content/geometry change is a
+  distinct entry. Constant-geometry reuse still hits the cache (no perf change).
 - **GPU NV16/NV24 zero-copy convert on Linux/embedded GLES.** NV16 (4:2:2) and
   NV24 (4:4:4) DMA-BUF sources previously had no GPU path and silently fell back
   to the CPU YUV→RGB converter (the dominant cost in preprocessing on embedded
