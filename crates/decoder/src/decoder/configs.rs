@@ -190,6 +190,14 @@ pub enum DimName {
     Padding,
     #[serde(rename = "box_coords")]
     BoxCoords,
+    /// Any axis name the HAL does not recognise (e.g. a producer's
+    /// `channels` on the input dshape). Preserved so the dshape length still
+    /// matches the shape and the axis sorts to the canonical tail in
+    /// `swap_axes_if_needed`, but it never satisfies a required-dimension
+    /// check. Keeps metadata parsing tolerant of unknown axis names instead
+    /// of failing the whole decoder build (DE-2651).
+    #[serde(other)]
+    Unknown,
 }
 
 impl Display for DimName {
@@ -214,6 +222,7 @@ impl Display for DimName {
             DimName::NumAnchorsXFeatures => write!(f, "num_anchors_x_features"),
             DimName::Padding => write!(f, "padding"),
             DimName::BoxCoords => write!(f, "box_coords"),
+            DimName::Unknown => write!(f, "unknown"),
         }
     }
 }

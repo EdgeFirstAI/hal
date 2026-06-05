@@ -1188,6 +1188,250 @@ mod decoder_builder_tests {
     }
 
     #[test]
+    fn test_modelpack_seg_infers_classes_without_numclasses_dshape() {
+        // Regression for DE-2651 / DE-2628: a ModelPack segmentation output
+        // whose canonical NHWC channel axis is not tagged `NumClasses` (the
+        // validator's shape-inference fallback tags it `NumProtos`) must still
+        // build. HAL infers the class count from the NHWC shape and relies on
+        // `swap_axes_if_needed` to keep the physical layout intact at decode.
+
+        // Segmentation-only: channel axis mis-tagged as NumProtos.
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
+                    decoder: configs::DecoderType::ModelPack,
+                    shape: vec![1, 160, 160, 5],
+                    quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Height, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 5),
+                    ],
+                })],
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            result.is_ok(),
+            "seg-only ModelPack with mis-tagged channel should build, got {result:?}"
+        );
+
+        // Multitask (boxes + scores + segmentation): the seg/detection
+        // `classes + 1` cross-check must use the NHWC channel count (shape[3])
+        // when the dshape lacks NumClasses. Detection declares 3 classes, so
+        // the seg channel axis must be 4.
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Boxes(configs::Boxes {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 1, 4],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::Padding, 1),
+                            (DimName::BoxCoords, 4),
+                        ],
+                        normalized: Some(true),
+                    }),
+                    ConfigOutput::Scores(configs::Scores {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumClasses, 3),
+                        ],
+                    }),
+                    ConfigOutput::Segmentation(configs::Segmentation {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 160, 160, 4],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::Height, 160),
+                            (DimName::Width, 160),
+                            (DimName::NumProtos, 4),
+                        ],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            result.is_ok(),
+            "multitask ModelPack with mis-tagged seg channel should build, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_modelpack_seg_inferred_count_mismatch_is_rejected() {
+        // DE-2651 follow-up: when the seg channel axis is mis-tagged (NumProtos)
+        // the `classes + 1` cross-check must still fire using the *inferred*
+        // NHWC channel count (shape[3]). Detection declares 3 classes, so a seg
+        // channel count of 6 (≠ 3 + 1) must be rejected — exercising the
+        // inference failure branch, not just the happy path.
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![
+                    ConfigOutput::Boxes(configs::Boxes {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 1, 4],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::Padding, 1),
+                            (DimName::BoxCoords, 4),
+                        ],
+                        normalized: Some(true),
+                    }),
+                    ConfigOutput::Scores(configs::Scores {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 8400, 3],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::NumBoxes, 8400),
+                            (DimName::NumClasses, 3),
+                        ],
+                    }),
+                    ConfigOutput::Segmentation(configs::Segmentation {
+                        decoder: configs::DecoderType::ModelPack,
+                        shape: vec![1, 160, 160, 6],
+                        quantization: None,
+                        dshape: vec![
+                            (DimName::Batch, 1),
+                            (DimName::Height, 160),
+                            (DimName::Width, 160),
+                            (DimName::NumProtos, 6),
+                        ],
+                    }),
+                ],
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            matches!(
+                &result,
+                Err(DecoderError::InvalidConfig(s))
+                    if s == "ModelPack Segmentation channels 6 incompatible with number of classes 3"
+            ),
+            "mis-tagged seg channel count must fail the classes+1 check, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_modelpack_seg_explicit_numclasses_tag_drives_cross_check() {
+        // Regression guard for the refactor: an explicitly-tagged `NumClasses`
+        // seg axis must still drive the detection `classes + 1` check —
+        // `modelpack_seg_num_classes` prefers the tag. Detection declares 3
+        // classes, so a tagged seg channel of 4 builds and 5 is rejected.
+        let build = |seg_channels: usize| {
+            DecoderBuilder::new()
+                .with_config(ConfigOutputs {
+                    outputs: vec![
+                        ConfigOutput::Boxes(configs::Boxes {
+                            decoder: configs::DecoderType::ModelPack,
+                            shape: vec![1, 8400, 1, 4],
+                            quantization: None,
+                            dshape: vec![
+                                (DimName::Batch, 1),
+                                (DimName::NumBoxes, 8400),
+                                (DimName::Padding, 1),
+                                (DimName::BoxCoords, 4),
+                            ],
+                            normalized: Some(true),
+                        }),
+                        ConfigOutput::Scores(configs::Scores {
+                            decoder: configs::DecoderType::ModelPack,
+                            shape: vec![1, 8400, 3],
+                            quantization: None,
+                            dshape: vec![
+                                (DimName::Batch, 1),
+                                (DimName::NumBoxes, 8400),
+                                (DimName::NumClasses, 3),
+                            ],
+                        }),
+                        ConfigOutput::Segmentation(configs::Segmentation {
+                            decoder: configs::DecoderType::ModelPack,
+                            shape: vec![1, 160, 160, seg_channels],
+                            quantization: None,
+                            dshape: vec![
+                                (DimName::Batch, 1),
+                                (DimName::Height, 160),
+                                (DimName::Width, 160),
+                                (DimName::NumClasses, seg_channels),
+                            ],
+                        }),
+                    ],
+                    ..Default::default()
+                })
+                .build()
+        };
+        assert!(
+            build(4).is_ok(),
+            "explicit NumClasses == classes + 1 must build, got {:?}",
+            build(4)
+        );
+        assert!(
+            matches!(
+                build(5),
+                Err(DecoderError::InvalidConfig(s))
+                    if s == "ModelPack Segmentation channels 5 incompatible with number of classes 3"
+            ),
+            "explicit NumClasses ≠ classes + 1 must be rejected, got {:?}",
+            build(5)
+        );
+    }
+
+    #[test]
+    fn test_modelpack_seg_missing_spatial_axis_is_rejected() {
+        // The relaxation made only the *channel* axis optional; the spatial
+        // axes (Batch/Height/Width) must still be named. A seg dshape that omits
+        // Height (an Unknown axis fills the slot) must still be rejected — the
+        // relaxation must not have over-loosened.
+        let result = DecoderBuilder::new()
+            .with_config(ConfigOutputs {
+                outputs: vec![ConfigOutput::Segmentation(configs::Segmentation {
+                    decoder: configs::DecoderType::ModelPack,
+                    shape: vec![1, 160, 160, 5],
+                    quantization: None,
+                    dshape: vec![
+                        (DimName::Batch, 1),
+                        (DimName::Unknown, 160),
+                        (DimName::Width, 160),
+                        (DimName::NumProtos, 5),
+                    ],
+                })],
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            matches!(
+                &result,
+                Err(DecoderError::InvalidConfig(s))
+                    if s == "Segmentation dshape missing required dimension Height"
+            ),
+            "seg dshape missing the Height axis must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_dshape_axis_name_deserializes_to_unknown() {
+        // DE-2651: an unrecognised dshape axis name must deserialize to
+        // `DimName::Unknown` (via `#[serde(other)]`) instead of failing the
+        // parse, while recognised names still map to their variant. Locks the
+        // serde contract independently of the seg/decoder pipeline.
+        let mut de = serde_json::Deserializer::from_str(r#"[{"channels": 3}, {"batch": 1}]"#);
+        let dshape = configs::deserialize_dshape(&mut de).expect("unknown axis name must parse");
+        assert_eq!(dshape, vec![(DimName::Unknown, 3), (DimName::Batch, 1)]);
+    }
+
+    #[test]
     fn test_modelpack_invalid_det() {
         let result = DecoderBuilder::new()
             .with_config_modelpack_det(
