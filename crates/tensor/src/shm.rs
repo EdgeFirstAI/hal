@@ -25,6 +25,11 @@ where
     pub name: String,
     pub fd: OwnedFd,
     pub shape: Vec<usize>,
+    /// Byte offset into the shared segment where this tensor's logical window
+    /// begins. `0` for whole-segment tensors; non-zero for `view()` sub-regions
+    /// (mirrors `DmaTensor::mmap_offset` / `MemTensor::offset`). Applied in
+    /// `ShmMap::as_slice`, which maps the whole segment and indexes from here.
+    offset: usize,
     pub _marker: std::marker::PhantomData<T>,
     identity: crate::BufferIdentity,
 }
@@ -74,21 +79,92 @@ where
             name,
             fd: shm_fd,
             shape: shape.to_vec(),
+            offset: 0,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
     }
 
-    /// Map exposing `byte_size` bytes via `as_slice()` (and mmap'ing exactly
-    /// that many) for self-allocated strided tensors whose rows are padded. The
-    /// caller (`Tensor::map`) validates `byte_size <= capacity_bytes()` first.
+    /// Create a zero-copy sub-region view that shares `parent`'s segment via a
+    /// cloned fd (the SHM sharing model is fd-based, like `clone_fd`/`from_fd`).
+    ///
+    /// The view maps the window `[offset_bytes, offset_bytes + logical_size)`
+    /// measured from `parent`'s own window (`logical_size = shape.product() *
+    /// size_of::<T>()`), so a sub-view of a sub-view composes. N such views into
+    /// one parent share the segment (no copy) and write independently.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
+    ///   `align_of::<T>()` (required for the `ShmMap` pointer cast).
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the segment.
+    pub(crate) fn view(
+        parent: &ShmTensor<T>,
+        offset_bytes: usize,
+        shape: &[usize],
+    ) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "ShmTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = parent
+            .offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * elem;
+        let capacity = parent.capacity_bytes();
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > capacity {
+            return Err(Error::InsufficientCapacity { needed, capacity });
+        }
+        Ok(ShmTensor {
+            name: parent.name.clone(),
+            fd: parent.fd.try_clone()?,
+            shape: shape.to_vec(),
+            offset: abs_offset,
+            _marker: std::marker::PhantomData,
+            // A sub-view is the *same* segment: share the parent's identity so
+            // identity-keyed logic treats the windows as one buffer at distinct
+            // offsets, not unrelated allocations.
+            identity: parent.identity.clone(),
+        })
+    }
+
+    /// Map exposing `byte_size` bytes via `as_slice()` for self-allocated
+    /// strided tensors whose rows are padded. The caller (`Tensor::map`)
+    /// validates `byte_size <= capacity_bytes()` first.
     pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
         self.map_inner(Some(byte_size))
     }
 
     fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
-        let map_bytes = byte_size_override.unwrap_or_else(|| self.size());
-        let size = NonZero::new(map_bytes).ok_or(Error::InvalidSize(map_bytes))?;
+        let exposed = byte_size_override.unwrap_or_else(|| self.size());
+        // Map the whole segment from fd offset 0 and apply `self.offset` in
+        // `ShmMap::as_slice` — mmap cannot take a non-page-aligned fd offset,
+        // and the segment is small (mirrors `DmaMap`, which maps `buf_size`).
+        let mmap_size = self.capacity_bytes();
+        let end = self
+            .offset
+            .checked_add(exposed)
+            .ok_or(Error::InvalidSize(exposed))?;
+        if end > mmap_size {
+            return Err(Error::InsufficientCapacity {
+                needed: end,
+                capacity: mmap_size,
+            });
+        }
+        if std::mem::size_of::<T>() > 1 && !self.offset.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "ShmMap: offset {} not aligned to align_of::<T>()={}",
+                self.offset,
+                std::mem::align_of::<T>()
+            )));
+        }
+        let size = NonZero::new(mmap_size).ok_or(Error::InvalidSize(mmap_size))?;
         let ptr = unsafe {
             nix::sys::mman::mmap(
                 None,
@@ -101,10 +177,12 @@ where
         };
 
         trace!("Mapping shared memory: {ptr:?}");
-        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(map_bytes))?);
+        let shm_ptr = ShmPtr(NonNull::new(ptr.as_ptr()).ok_or(Error::InvalidSize(mmap_size))?);
         Ok(TensorMap::Shm(ShmMap {
             ptr: Arc::new(Mutex::new(shm_ptr)),
             shape: self.shape.clone(),
+            offset: self.offset,
+            mmap_size,
             byte_size_override,
             _marker: std::marker::PhantomData,
         }))
@@ -149,6 +227,7 @@ where
             name: name.to_owned(),
             fd: shm_fd,
             shape: shape.to_vec(),
+            offset: 0,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
@@ -168,6 +247,7 @@ where
             name: name.unwrap_or("").to_owned(),
             fd,
             shape: shape.to_vec(),
+            offset: 0,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
@@ -250,10 +330,14 @@ where
 {
     ptr: Arc<Mutex<ShmPtr>>,
     shape: Vec<usize>,
+    /// Byte offset into the mmap'd segment where this map's window begins
+    /// (non-zero for sub-region views). `as_slice()` returns `base + offset`.
+    offset: usize,
+    /// Bytes actually mmap'd (the whole segment). `unmap()` munmaps exactly
+    /// this, independent of the logical `offset`/`len()` window.
+    mmap_size: usize,
     /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
-    /// (the full padded mmap) instead of `shape.product()`. `unmap()` munmaps
-    /// `size()` = `len() * sizeof(T)`, which tracks this override, so the
-    /// munmap length matches the mmap length.
+    /// (the full padded window) instead of `shape.product()`.
     byte_size_override: Option<usize>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -307,7 +391,9 @@ where
 
     fn unmap(&mut self) {
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        let err = unsafe { nix::sys::mman::munmap(**ptr, self.size()) };
+        // Munmap the whole mmap'd segment (`mmap_size`), not the logical window
+        // — `offset` only shifts where `as_slice()` reads, not the mapping.
+        let err = unsafe { nix::sys::mman::munmap(**ptr, self.mmap_size) };
         if let Err(e) = err {
             warn!("Failed to unmap shared memory: {e}");
         }
@@ -315,12 +401,14 @@ where
 
     fn as_slice(&self) -> &[T] {
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.len()) }
+        let base = unsafe { (ptr.as_ptr() as *const u8).add(self.offset) as *const T };
+        unsafe { std::slice::from_raw_parts(base, self.len()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.len()) }
+        let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
+        unsafe { std::slice::from_raw_parts_mut(base, self.len()) }
     }
 }
 
