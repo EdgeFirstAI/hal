@@ -3,9 +3,8 @@
 
 use crate::Result;
 use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
-};
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 use std::ops::Shr;
 
 use super::{CPUProcessor, ColorParams};
@@ -492,19 +491,29 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
+        // YUYV→GREY keeps the luma samples and drops chroma. Honour the source
+        // row stride so padded/odd-width buffers are not read across row
+        // boundaries (a flat `as_chunks` over the whole map ignores stride and
+        // reads pad bytes as luma — see EDGEAI stride-handling fix).
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
+
         let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        let src_chunks = src_map.as_chunks::<16>();
-        let dst_chunks = dst_map.as_chunks_mut::<8>();
-        for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
-            s.iter().step_by(2).zip(d).for_each(|(s, d)| *d = luma(*s));
-        }
+        let dst_bytes = dst_map.as_mut_slice();
 
-        for (s, d) in src_chunks.1.iter().step_by(2).zip(dst_chunks.1) {
-            *d = luma(*s);
+        // YUYV byte order per macropixel: [Y0, U, Y1, V] — luma at even offsets.
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w * 2];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            for (x, dx) in d.iter_mut().enumerate() {
+                *dx = luma(s[x * 2]);
+            }
         }
-
         Ok(())
     }
 
@@ -644,22 +653,28 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
+        // VYUY→GREY keeps the luma samples and drops chroma. Honour the source
+        // row stride so padded/odd-width buffers are not read across row
+        // boundaries (a flat `as_chunks` over the whole map ignores stride).
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
+
         let src_map = src.map()?;
+        let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        // VYUY byte order: [V, Y0, U, Y1] — Y at offsets 1, 3
-        let src_chunks = src_map.as_chunks::<16>();
-        let dst_chunks = dst_map.as_chunks_mut::<8>();
-        for (s, d) in src_chunks.0.iter().zip(dst_chunks.0) {
-            for (di, si) in (1..16).step_by(2).enumerate() {
-                d[di] = luma(s[si]);
+        let dst_bytes = dst_map.as_mut_slice();
+
+        // VYUY byte order per macropixel: [V, Y0, U, Y1] — luma at odd offsets.
+        for row in 0..src_h {
+            let s = &src_bytes[row * src_stride..][..src_w * 2];
+            let d = &mut dst_bytes[row * dst_stride..][..src_w];
+            for (x, dx) in d.iter_mut().enumerate() {
+                *dx = luma(s[x * 2 + 1]);
             }
         }
-
-        for (di, si) in (1..src_chunks.1.len()).step_by(2).enumerate() {
-            dst_chunks.1[di] = luma(src_chunks.1[si]);
-        }
-
         Ok(())
     }
 
@@ -1346,7 +1361,16 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         let src_w = src.width().unwrap();
-        let src_h = src.shape()[0] / 3;
+        // The luma plane height: for a true-multiplane NV24 the (luma) tensor's
+        // shape[0] is already the logical height; for the contiguous combined
+        // buffer the shape is [3H, W] so divide by three. Computing this before
+        // the multiplane check (as the previous code did) truncated multiplane
+        // output to one third of its rows.
+        let src_h = if src.is_multiplane() {
+            src.shape()[0]
+        } else {
+            src.shape()[0] / 3
+        };
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
 
@@ -1367,102 +1391,74 @@ impl CPUProcessor {
         Ok(())
     }
 
-    pub(super) fn convert_8bps_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    /// Read a planar `[C, H, W]` source into a packed interleaved destination,
+    /// honouring both the source row stride and the destination row stride.
+    /// Colour planes 0..3 map to destination channels R, G, B. When the
+    /// destination has a fourth channel it is taken from source plane 3 if the
+    /// source has one (`PlanarRgba`), otherwise filled with 255 (`PlanarRgb`).
+    ///
+    /// Plane offsets are derived from `height * row_stride` and rows are walked
+    /// individually, so strided / pitch-aligned sources (DMA, `create_image`)
+    /// are not mis-sliced or read across their per-row padding — a flat
+    /// `mapped_len / channels` split reads pad bytes as pixels on padded buffers.
+    fn planar_to_packed(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        src_planes: usize,
+        dst_ch: usize,
+    ) -> Result<()> {
+        let w = src.width().unwrap();
+        let h = src.height().unwrap();
+        let src_stride = super::tensor_row_stride(src);
+        let plane_stride = src_stride * h;
+        let dst_stride = super::tensor_row_stride(dst);
+        let has_alpha_plane = dst_ch == 4 && src_planes >= 4;
+
         let src_map = src.map()?;
-        let src_ = src_map.as_slice();
-
-        // Planar [C, H, W] — plane size = H*W = total/3
-        let plane_size = src_.len() / 3;
-        let (src0, src1) = src_.split_at(plane_size);
-        let (src1, src2) = src1.split_at(plane_size);
-
+        let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
+        let dst_bytes = dst_map.as_mut_slice();
 
-        src0.par_iter()
-            .zip_eq(src1)
-            .zip_eq(src2)
-            .zip_eq(dst_.as_chunks_mut::<3>().0.par_iter_mut())
-            .for_each(|(((s0, s1), s2), d)| {
-                d[0] = *s0;
-                d[1] = *s1;
-                d[2] = *s2;
+        dst_bytes
+            .par_chunks_mut(dst_stride)
+            .take(h)
+            .enumerate()
+            .for_each(|(row, d)| {
+                let off = row * src_stride;
+                let r = &src_bytes[off..][..w];
+                let g = &src_bytes[plane_stride + off..][..w];
+                let b = &src_bytes[2 * plane_stride + off..][..w];
+                for x in 0..w {
+                    let p = &mut d[x * dst_ch..][..dst_ch];
+                    p[0] = r[x];
+                    p[1] = g[x];
+                    p[2] = b[x];
+                    if dst_ch == 4 {
+                        p[3] = if has_alpha_plane {
+                            src_bytes[3 * plane_stride + off + x]
+                        } else {
+                            255
+                        };
+                    }
+                }
             });
         Ok(())
+    }
+
+    pub(super) fn convert_8bps_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        Self::planar_to_packed(src, dst, 3, 3)
     }
 
     pub(super) fn convert_8bps_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let src_ = src_map.as_slice();
-
-        let plane_size = src_.len() / 3;
-        let (src0, src1) = src_.split_at(plane_size);
-        let (src1, src2) = src1.split_at(plane_size);
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        src0.par_iter()
-            .zip_eq(src1)
-            .zip_eq(src2)
-            .zip_eq(dst_.as_chunks_mut::<4>().0.par_iter_mut())
-            .for_each(|(((s0, s1), s2), d)| {
-                d[0] = *s0;
-                d[1] = *s1;
-                d[2] = *s2;
-                d[3] = 255;
-            });
-        Ok(())
+        Self::planar_to_packed(src, dst, 3, 4)
     }
 
     pub(super) fn convert_prgba_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let src_ = src_map.as_slice();
-
-        let plane_size = src_.len() / 4;
-        let (src0, src1) = src_.split_at(plane_size);
-        let (src1, src2) = src1.split_at(plane_size);
-        let (src2, _src3) = src2.split_at(plane_size);
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        src0.par_iter()
-            .zip_eq(src1)
-            .zip_eq(src2)
-            .zip_eq(dst_.as_chunks_mut::<3>().0.par_iter_mut())
-            .for_each(|(((s0, s1), s2), d)| {
-                d[0] = *s0;
-                d[1] = *s1;
-                d[2] = *s2;
-            });
-        Ok(())
+        Self::planar_to_packed(src, dst, 4, 3)
     }
 
     pub(super) fn convert_prgba_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let src_ = src_map.as_slice();
-
-        let plane_size = src_.len() / 4;
-        let (src0, src1) = src_.split_at(plane_size);
-        let (src1, src2) = src1.split_at(plane_size);
-        let (src2, src3) = src2.split_at(plane_size);
-
-        let mut dst_map = dst.map()?;
-        let dst_ = dst_map.as_mut_slice();
-
-        src0.par_iter()
-            .zip_eq(src1)
-            .zip_eq(src2)
-            .zip_eq(src3)
-            .zip_eq(dst_.as_chunks_mut::<4>().0.par_iter_mut())
-            .for_each(|((((s0, s1), s2), s3), d)| {
-                d[0] = *s0;
-                d[1] = *s1;
-                d[2] = *s2;
-                d[3] = *s3;
-            });
-        Ok(())
+        Self::planar_to_packed(src, dst, 4, 4)
     }
 
     pub(super) fn rgba_to_rgb(rgba: [u8; 4]) -> [u8; 3] {
