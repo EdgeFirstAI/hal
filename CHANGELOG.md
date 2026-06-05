@@ -168,6 +168,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Single source for the YUV↔RGB matrix/range constants** (`edgefirst-tensor`,
+  `edgefirst-image`). The BT.601/709/2020 luma weights `(kr, kb)` and the
+  full/limited-range luma/chroma swings are now defined once, as
+  `ColorEncoding::luma_weights()` (→ `MatrixWeights`) and
+  `ColorRange::scaling()` (→ `RangeScaling`) on the core colorimetry types. The
+  in-shader GL coefficients (`yuv_to_rgb_coeffs`) and the hand-rolled
+  fixed-point CPU YUYV encoders both derive from this source instead of carrying
+  private duplicate tables, so a coefficient change is made in exactly one
+  place. Output is byte-identical (verified by the existing encode goldens and a
+  new absolute-value coefficient test).
+- **Documented colorimetry transfer-function limitation.** The `ColorTransfer`
+  (gamma / TRC) axis is stored, propagated, and round-tripped but is **not
+  applied** by any conversion backend; all YUV↔RGB paths operate on the matrix
+  and range only and assume the platform-native transfer curve. HDR curves
+  (PQ / HLG) are therefore not tone-mapped. This is now called out on the type.
 - `convert()` now honors each tensor's `Colorimetry`, resolving unknown axes at
   use-time via an SD/HD height heuristic (height ≥ 720 → BT.709, else BT.601;
   limited range when unknown) without mutating the tensor. CPU and OpenGL backends

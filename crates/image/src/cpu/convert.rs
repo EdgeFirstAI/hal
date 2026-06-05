@@ -53,8 +53,9 @@ fn luma_encoder(full_range: bool) -> fn(u8) -> u8 {
 }
 
 /// Fixed-point RGB→YUV coefficient table for the hand-rolled YUYV encoders,
-/// resolved from the destination tensor's matrix + range. All terms are
-/// `Q(BIAS)` fixed-point; `y_off`/`c_off` are the post-shift integer offsets.
+/// resolved from the destination tensor's encoding (`cp.encoding`) and range
+/// (`cp.range_kind`). All terms are `Q(BIAS)` fixed-point; `y_off`/`c_off` are
+/// the post-shift integer offsets.
 struct YuyvEncodeCoeffs {
     y_r: i32,
     y_g: i32,
@@ -70,30 +71,26 @@ struct YuyvEncodeCoeffs {
 }
 
 impl YuyvEncodeCoeffs {
-    /// `BIAS` matches the original hand-rolled tables (Q20 fixed point).
+    /// `BIAS` is Q20 fixed point — retained from the pre-refactor hand-coded
+    /// tables to keep encoder output byte-identical.
     const BIAS: i32 = 20;
     const ROUND: i32 = 1 << (Self::BIAS - 1);
     const ROUND2: i32 = 1 << Self::BIAS;
 
     /// Build the table from the resolved `ColorParams`. The luma/chroma swings
-    /// are full-range (255/255) or limited-range (219/224) per `cp.range`; the
-    /// `KR`/`KB` luma weights come from `cp.matrix` (BT.601 / 709 / 2020).
+    /// are full-range (255/255) or limited-range (219/224) per `cp.range_kind`;
+    /// the `KR`/`KB` luma weights come from `cp.encoding` (BT.601 / 709 / 2020).
     fn from_params(cp: ColorParams) -> Self {
-        // KR/KB luma weights per standard matrix.
-        let (kr, kb) = match cp.matrix {
-            yuv::YuvStandardMatrix::Bt601 => (0.299_f64, 0.114_f64),
-            yuv::YuvStandardMatrix::Bt2020 => (0.2627_f64, 0.0593_f64),
-            // BT.709 and any future/unknown matrix default to 709 weights.
-            _ => (0.2126_f64, 0.0722_f64),
-        };
-        let kg = 1.0 - kr - kb;
-        let full = matches!(cp.range, yuv::YuvRange::Full);
-        // Luma swing / chroma swing and offsets for the selected range.
-        let (y_swing, c_swing, y_off, c_off) = if full {
-            (255.0_f64, 255.0_f64, 0, 128)
-        } else {
-            (219.0_f64, 224.0_f64, 16, 128)
-        };
+        // KR/KB luma weights and luma/chroma swings come from the canonical
+        // source in `edgefirst_tensor::colorimetry`, shared with the in-shader
+        // GL coefficients (see `crate::colorimetry::yuv_to_rgb_coeffs`).
+        let w = cp.encoding.luma_weights();
+        let (kr, kb) = (w.kr, w.kb);
+        let kg = w.kg();
+        let s = cp.range_kind.scaling();
+        // Chroma is always centred on 128; the luma black level (`y_off`) and
+        // the swings come from the resolved range.
+        let (y_swing, c_swing, y_off, c_off) = (s.y_swing, s.c_swing, s.y_offset as i32, 128);
         let b = Self::BIAS;
         let yscale = (1_i64 << b) as f64 * y_swing / 255.0;
         let cscale = (1_i64 << b) as f64 * c_swing / 255.0;

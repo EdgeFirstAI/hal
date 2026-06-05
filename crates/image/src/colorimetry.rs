@@ -98,24 +98,20 @@ pub(crate) struct YuvToRgbCoeffs {
 /// Compute the in-shader YUV→RGB coefficients for a resolved
 /// `(ColorEncoding, ColorRange)`. Pure; platform-neutral.
 pub(crate) fn yuv_to_rgb_coeffs(encoding: ColorEncoding, range: ColorRange) -> YuvToRgbCoeffs {
-    // Luma weights (kr, kb) per encoding matrix.
-    let (kr, kb) = match encoding {
-        ColorEncoding::Bt601 => (0.299_f32, 0.114_f32),
-        ColorEncoding::Bt709 => (0.2126_f32, 0.0722_f32),
-        ColorEncoding::Bt2020 => (0.2627_f32, 0.0593_f32),
-        // Future encodings default to BT.709 (HD broadcast).
-        _ => (0.2126_f32, 0.0722_f32),
-    };
+    // Luma weights (kr, kb) and range swings come from the canonical source in
+    // `edgefirst_tensor::colorimetry` so the GL coefficients stay in lockstep
+    // with the CPU encoders. The arithmetic below is kept in `f32` (the GL
+    // uniform type) for bit-stable shader output.
+    let w = encoding.luma_weights();
+    let (kr, kb) = (w.kr as f32, w.kb as f32);
     let kg = 1.0 - kr - kb;
 
-    // Range scaling. Limited: luma spans 16..235 (gain 255/219), chroma
-    // spans 16..240 (gain 255/224). Full: both unity.
-    let (y_offset, y_scale, c_scale) = match range {
-        ColorRange::Full => (0.0, 1.0, 1.0),
-        ColorRange::Limited => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
-        // Future ranges default to limited (broadcast convention).
-        _ => (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0),
-    };
+    // Limited: luma spans 16..235 (gain 255/219), chroma spans 16..240 (gain
+    // 255/224). Full: both unity.
+    let s = range.scaling();
+    let y_offset = s.y_offset as f32 / 255.0;
+    let y_scale = 255.0 / s.y_swing as f32;
+    let c_scale = 255.0 / s.c_swing as f32;
 
     YuvToRgbCoeffs {
         y_offset,
@@ -158,6 +154,39 @@ mod tests {
         let t = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
         let _ = effective_colorimetry(&t);
         assert_eq!(t.colorimetry(), None); // unchanged
+    }
+
+    #[test]
+    fn yuv_to_rgb_coeffs_match_reference_values() {
+        // Reference YCbCr→RGB cross-terms (well-known broadcast constants). The
+        // shader applies `r = y' + c_vr*v'`, `b = y' + c_ub*u'`, etc.
+        fn close(a: f32, b: f32, what: &str) {
+            assert!((a - b).abs() < 2e-3, "{what}: {a} vs expected {b}");
+        }
+
+        // BT.601 limited range — the canonical SD decode.
+        let c = yuv_to_rgb_coeffs(ColorEncoding::Bt601, ColorRange::Limited);
+        close(c.y_offset, 16.0 / 255.0, "601L y_offset");
+        close(c.y_scale, 255.0 / 219.0, "601L y_scale");
+        close(c.c_vr, 1.596, "601L c_vr");
+        close(c.c_ub, 2.017, "601L c_ub");
+        close(c.c_ug, 0.391, "601L c_ug");
+        close(c.c_vg, 0.813, "601L c_vg");
+
+        // BT.709 limited range — the canonical HD decode.
+        let c = yuv_to_rgb_coeffs(ColorEncoding::Bt709, ColorRange::Limited);
+        close(c.c_vr, 1.793, "709L c_vr");
+        close(c.c_ub, 2.113, "709L c_ub");
+        close(c.c_ug, 0.213, "709L c_ug");
+        close(c.c_vg, 0.533, "709L c_vg");
+
+        // Full range zeroes the luma offset and unity-scales luma; the chroma
+        // cross-terms drop the 255/224 gain.
+        let c = yuv_to_rgb_coeffs(ColorEncoding::Bt601, ColorRange::Full);
+        close(c.y_offset, 0.0, "601F y_offset");
+        close(c.y_scale, 1.0, "601F y_scale");
+        close(c.c_vr, 2.0 * (1.0 - 0.299), "601F c_vr");
+        close(c.c_ub, 2.0 * (1.0 - 0.114), "601F c_ub");
     }
 
     #[test]

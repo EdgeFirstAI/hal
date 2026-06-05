@@ -42,7 +42,9 @@ mod pbo;
 #[cfg(unix)]
 mod shm;
 mod tensor_dyn;
-pub use colorimetry::{ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry};
+pub use colorimetry::{
+    ColorEncoding, ColorRange, ColorSpace, ColorTransfer, Colorimetry, MatrixWeights, RangeScaling,
+};
 
 /// Retained constructor: installs the coverage flush-on-abort handler for this
 /// crate's instrumented test binary. See `covguard`. Only present under
