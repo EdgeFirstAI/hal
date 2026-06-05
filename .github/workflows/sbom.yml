@@ -18,9 +18,9 @@ name: SBOM Generation & License Compliance
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
   release:
     types: [published]
 
