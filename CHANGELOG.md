@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-06-04
+
+### Fixed
+
+- **ModelPack segmentation decoder rejected valid models** (DE-2651, DE-2628):
+  `Decoder` construction failed with `InvalidConfig("Segmentation dshape missing
+  required dimension NumClasses")` — and, when the segmentation output was
+  consequently dropped, `InvalidConfig("Invalid ModelPack model outputs")` — for
+  ModelPack models whose segmentation `dshape` did not name the channel axis
+  `num_classes` (e.g. the cloud validator's shape-inference fallback for
+  ModelPack `.keras` models, which tags it `num_protos`). `verify_modelpack_seg`
+  now requires only the spatial dshape axes by name and infers the class count
+  from the canonical NHWC channel axis (`shape[3]`) when `num_classes` is absent,
+  preferring an explicit `num_classes` tag when present. A channel axis tagged
+  with an unrecognised name is already sorted to the canonical tail by
+  `swap_axes_if_needed`, so decode is unaffected; structural dshape integrity
+  remains enforced by `validate_output_layout`.
+- **Unknown dshape axis names no longer fail metadata parsing** (DE-2651):
+  `DimName` gained a catch-all `Unknown` variant, so an unrecognised axis name
+  (e.g. older ModelPack exports tagging the input dshape channel axis
+  `channels`) is preserved as `Unknown` — keeping the dshape length aligned
+  with the shape and sorting the axis to the canonical tail — instead of
+  rejecting the entire decoder build.
+
 ## [0.22.1] - 2026-05-15
 
 ### Added

@@ -924,7 +924,7 @@ fn child_to_batch_feature_spatial(
             | DimName::NumProtos
             | DimName::BoxCoords
             | DimName::NumAnchorsXFeatures => features = size,
-            DimName::NumBoxes | DimName::Padding => {}
+            DimName::NumBoxes | DimName::Padding | DimName::Unknown => {}
         }
     }
 
