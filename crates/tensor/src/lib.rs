@@ -330,17 +330,12 @@ impl fmt::Display for DType {
 /// `None` for types that do not have a `DType` representation (e.g.
 /// user-defined wrappers in tests).
 ///
-/// Used by image-tensor constructors that need the runtime dtype to
-/// look up FourCC / pixel-format mappings on the macOS IOSurface path,
-/// where the GPU backend cares about whether the bytes are u8 / f16 /
-/// f32 even though the static `Tensor<T>` carries the same information
-/// at the type level.
-///
-/// macOS-only: the sole caller is the IOSurface DMA branch in
-/// `Tensor::<T>::image()`, which is itself `cfg(target_os = "macos")`.
-/// Leaving this ungated makes it dead code on every other target, which
-/// fails CI under `-D warnings`.
-#[cfg(target_os = "macos")]
+/// Runtime dtype of a static `Tensor<T>` element type — a safe `TypeId`
+/// allowlist of HAL's primitive numeric types (`Some` for `u8`..`i64` /
+/// `f16` / `f32` / `f64`, `None` otherwise). Used by the macOS IOSurface
+/// image constructors (FourCC / pixel-format lookup) and by the `Mem`
+/// backing's `alloc_zeroed` fast path (these types' `T::zero()` is the
+/// all-zeros bit pattern), so it is compiled on every target.
 pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
     use std::any::TypeId;
     let id = TypeId::of::<T>();
@@ -1189,7 +1184,10 @@ where
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
         MemTensor::<T>::with_capacity_bytes(shape, byte_size, name).map(TensorStorage::Mem)
     }
 

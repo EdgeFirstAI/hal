@@ -481,10 +481,15 @@ impl CPUProcessor {
                 let src_slice = m.as_slice();
                 let transposed_storage =
                     if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
-                        let hw = proto_h * proto_w;
-                        // Guard the proto buffer length before the per-plane
-                        // slice so an undersized (e.g. imported `from_fd`) proto
-                        // tensor yields `InvalidShape` instead of a panic/SIGBUS.
+                        // Guard the proto geometry before the per-plane slice so
+                        // an undersized or overflowing (e.g. imported `from_fd`)
+                        // proto tensor yields `InvalidShape` instead of a wrapped
+                        // `hw` slipping past the bounds check (panic/SIGBUS).
+                        let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
+                            crate::Error::InvalidShape(format!(
+                                "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
+                            ))
+                        })?;
                         let need = hw.checked_mul(num_protos).ok_or_else(|| {
                             crate::Error::InvalidShape(format!(
                                 "proto NCHW size overflow (hw={hw}, n={num_protos})"
@@ -865,10 +870,15 @@ impl CPUProcessor {
                 let src_slice = m.as_slice();
                 let transposed_storage =
                     if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
-                        let hw = proto_h * proto_w;
-                        // Guard the proto buffer length before the per-plane
-                        // slice so an undersized (e.g. imported `from_fd`) proto
-                        // tensor yields `InvalidShape` instead of a panic/SIGBUS.
+                        // Guard the proto geometry before the per-plane slice so
+                        // an undersized or overflowing (e.g. imported `from_fd`)
+                        // proto tensor yields `InvalidShape` instead of a wrapped
+                        // `hw` slipping past the bounds check (panic/SIGBUS).
+                        let hw = proto_h.checked_mul(proto_w).ok_or_else(|| {
+                            crate::Error::InvalidShape(format!(
+                                "proto plane size overflow (proto_h={proto_h}, proto_w={proto_w})"
+                            ))
+                        })?;
                         let need = hw.checked_mul(num_protos).ok_or_else(|| {
                             crate::Error::InvalidShape(format!(
                                 "proto NCHW size overflow (hw={hw}, n={num_protos})"

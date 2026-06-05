@@ -61,37 +61,49 @@ impl<T> MemBacking<T> {
         self.cells.as_ptr() as *mut T
     }
 
-    /// Build a zeroed backing of `n` elements.
-    ///
-    /// For every numeric type HAL instantiates (`u8`..=`f64`), `T::zero()` is
-    /// the all-zeros bit pattern, so the allocation comes from `alloc_zeroed`
-    /// (calloc): the kernel hands back lazily-zeroed pages instead of eagerly
-    /// writing every element. That matters because this backs every
-    /// `Tensor::image(.., Mem)` and the per-call image intermediates the CPU
-    /// converter allocates — a `(0..n).map(UnsafeCell::new).collect()` forces a
-    /// full eager memset and commits every page up front. The bit pattern is
-    /// checked at runtime, so the fast path is taken only when it is provably
-    /// correct; any exotic `T` whose zero is not all-zeros uses the per-element
-    /// loop.
+    /// Build a zeroed backing of `n` elements by writing `T::zero()` into each
+    /// cell. Type-agnostic; used by the `TensorTrait::new` path. The
+    /// image/capacity path uses [`zeroed_fast`](Self::zeroed_fast) for the
+    /// `alloc_zeroed` win.
     fn zeroed(n: usize) -> Self
     where
         T: Num + Clone,
+    {
+        let cells: Vec<UnsafeCell<T>> = (0..n).map(|_| UnsafeCell::new(T::zero())).collect();
+        Self {
+            cells: cells.into_boxed_slice(),
+        }
+    }
+
+    /// Build a zeroed backing of `n` elements, using the allocator's zeroed
+    /// (calloc) path when `T` is one of HAL's primitive numeric element types.
+    ///
+    /// For those types `T::zero()` is the all-zeros bit pattern, so the kernel
+    /// can hand back lazily-zeroed pages instead of eagerly writing every
+    /// element — a `(0..n).map(UnsafeCell::new).collect()` forces a full memset
+    /// and commits every page up front. This backs every `Tensor::image(.., Mem)`
+    /// and the per-call image intermediates the CPU converter allocates. Any
+    /// other `T` falls back to the per-element [`zeroed`](Self::zeroed) loop.
+    ///
+    /// `crate::dtype_of` is the single source for "is `T` a HAL numeric
+    /// primitive" — a safe `TypeId` allowlist, with no inspection of
+    /// (possibly padded/uninitialised) bytes.
+    fn zeroed_fast(n: usize) -> Self
+    where
+        T: Num + Clone + 'static,
     {
         if n == 0 {
             return Self {
                 cells: Vec::new().into_boxed_slice(),
             };
         }
-        if zero_is_all_zero_bytes::<T>() {
-            // SAFETY: `T::zero()` is the all-zeros bit pattern (just checked),
-            // so a zero-filled allocation is a valid `[UnsafeCell<T>; n]`, and
-            // `n > 0`.
+        if crate::dtype_of::<T>().is_some() {
+            // SAFETY: `dtype_of` is `Some` only for HAL's primitive numeric
+            // types, whose `T::zero()` is the all-zeros bit pattern, so a
+            // zero-filled allocation is a valid `[UnsafeCell<T>; n]`; `n > 0`.
             return unsafe { Self::alloc_zeroed_unchecked(n) };
         }
-        let cells: Vec<UnsafeCell<T>> = (0..n).map(|_| UnsafeCell::new(T::zero())).collect();
-        Self {
-            cells: cells.into_boxed_slice(),
-        }
+        Self::zeroed(n)
     }
 
     /// Allocate `n` zeroed `UnsafeCell<T>` via the global allocator's zeroed
@@ -120,18 +132,6 @@ impl<T> MemBacking<T> {
             cells: Box::from_raw(slice),
         }
     }
-}
-
-/// True iff `T::zero()` has an all-zeros bit pattern — the case for every
-/// primitive numeric type HAL uses, enabling the `alloc_zeroed` fast path.
-fn zero_is_all_zero_bytes<T: Num>() -> bool {
-    let z = T::zero();
-    // SAFETY: reads the `size_of::<T>()` initialised bytes of a valid `T`
-    // value; the slice does not outlive `z`.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(&z as *const T as *const u8, std::mem::size_of::<T>())
-    };
-    bytes.iter().all(|&b| b == 0)
 }
 
 #[derive(Debug)]
@@ -173,7 +173,10 @@ where
         shape: &[usize],
         byte_capacity: usize,
         name: Option<&str>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
         let elem = std::mem::size_of::<T>();
         let cap_elems = byte_capacity / elem;
         let logical: usize = shape.iter().product();
@@ -186,7 +189,7 @@ where
         Ok(MemTensor {
             name: name.unwrap_or("mem_tensor").to_owned(),
             shape: shape.to_vec(),
-            data: Arc::new(MemBacking::zeroed(cap_elems)),
+            data: Arc::new(MemBacking::zeroed_fast(cap_elems)),
             offset: 0,
             identity: crate::BufferIdentity::new(),
         })
@@ -547,19 +550,21 @@ mod tests {
 
     #[test]
     fn zeroed_backing_reads_all_zero_across_types() {
-        // Every primitive numeric T has an all-zeros bit pattern for T::zero(),
-        // so `zeroed` takes the alloc_zeroed (calloc) fast path. A large
-        // allocation spanning many pages must still read back entirely zero.
+        // Every HAL primitive numeric T is alloc_zeroed-fast-path eligible
+        // (`dtype_of` is `Some`). A large allocation spanning many pages, built
+        // through the capacity path (`with_capacity_bytes` → `zeroed_fast`),
+        // must still read back entirely zero.
         fn assert_all_zero<T>(n: usize)
         where
-            T: Num + Clone + fmt::Debug + Send + Sync + Copy + PartialEq,
+            T: Num + Clone + fmt::Debug + Send + Sync + Copy + PartialEq + 'static,
         {
             assert!(
-                zero_is_all_zero_bytes::<T>(),
-                "{} should use the alloc_zeroed fast path",
+                crate::dtype_of::<T>().is_some(),
+                "{} should be alloc_zeroed fast-path eligible",
                 std::any::type_name::<T>()
             );
-            let t = MemTensor::<T>::new(&[n], Some("z")).unwrap();
+            let bytes = n * std::mem::size_of::<T>();
+            let t = MemTensor::<T>::with_capacity_bytes(&[n], bytes, Some("z")).unwrap();
             let map = t.map().unwrap();
             assert!(
                 map.as_slice().iter().all(|v| *v == T::zero()),
