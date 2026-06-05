@@ -61,7 +61,10 @@ impl<T> MemBacking<T> {
         self.cells.as_ptr() as *mut T
     }
 
-    /// Build a zeroed backing of `n` elements.
+    /// Build a zeroed backing of `n` elements by writing `T::zero()` into each
+    /// cell. Type-agnostic; used by the `TensorTrait::new` path. The
+    /// image/capacity path uses [`zeroed_fast`](Self::zeroed_fast) for the
+    /// `alloc_zeroed` win.
     fn zeroed(n: usize) -> Self
     where
         T: Num + Clone,
@@ -69,6 +72,64 @@ impl<T> MemBacking<T> {
         let cells: Vec<UnsafeCell<T>> = (0..n).map(|_| UnsafeCell::new(T::zero())).collect();
         Self {
             cells: cells.into_boxed_slice(),
+        }
+    }
+
+    /// Build a zeroed backing of `n` elements, using the allocator's zeroed
+    /// (calloc) path when `T` is one of HAL's primitive numeric element types.
+    ///
+    /// For those types `T::zero()` is the all-zeros bit pattern, so the kernel
+    /// can hand back lazily-zeroed pages instead of eagerly writing every
+    /// element — a `(0..n).map(UnsafeCell::new).collect()` forces a full memset
+    /// and commits every page up front. This backs every `Tensor::image(.., Mem)`
+    /// and the per-call image intermediates the CPU converter allocates. Any
+    /// other `T` falls back to the per-element [`zeroed`](Self::zeroed) loop.
+    ///
+    /// `crate::dtype_of` is the single source for "is `T` a HAL numeric
+    /// primitive" — a safe `TypeId` allowlist, with no inspection of
+    /// (possibly padded/uninitialised) bytes.
+    fn zeroed_fast(n: usize) -> Self
+    where
+        T: Num + Clone + 'static,
+    {
+        if n == 0 {
+            return Self {
+                cells: Vec::new().into_boxed_slice(),
+            };
+        }
+        if crate::dtype_of::<T>().is_some() {
+            // SAFETY: `dtype_of` is `Some` only for HAL's primitive numeric
+            // types, whose `T::zero()` is the all-zeros bit pattern, so a
+            // zero-filled allocation is a valid `[UnsafeCell<T>; n]`; `n > 0`.
+            return unsafe { Self::alloc_zeroed_unchecked(n) };
+        }
+        Self::zeroed(n)
+    }
+
+    /// Allocate `n` zeroed `UnsafeCell<T>` via the global allocator's zeroed
+    /// (calloc) path.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `T::zero()` is the all-zeros bit pattern (so a
+    /// zero-filled block is a valid `[UnsafeCell<T>; n]`) and that `n > 0`.
+    unsafe fn alloc_zeroed_unchecked(n: usize) -> Self {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        // `UnsafeCell<T>` is `#[repr(transparent)]` over `T`, so its layout
+        // equals `T`'s; allocating an array of it round-trips on `Box` drop.
+        let layout = Layout::array::<UnsafeCell<T>>(n).expect("allocation layout overflow");
+        let ptr = alloc_zeroed(layout) as *mut UnsafeCell<T>;
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: `ptr` is a freshly-allocated, suitably-aligned block of `n`
+        // zeroed `UnsafeCell<T>`; the zero pattern is a valid `T::zero()` per
+        // the contract above. `Box::from_raw` over a slice built from the same
+        // `(ptr, n)` and element type deallocates with the matching
+        // `Layout::array::<UnsafeCell<T>>(n)` on drop.
+        let slice = std::slice::from_raw_parts_mut(ptr, n);
+        Self {
+            cells: Box::from_raw(slice),
         }
     }
 }
@@ -112,7 +173,10 @@ where
         shape: &[usize],
         byte_capacity: usize,
         name: Option<&str>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
         let elem = std::mem::size_of::<T>();
         let cap_elems = byte_capacity / elem;
         let logical: usize = shape.iter().product();
@@ -125,7 +189,7 @@ where
         Ok(MemTensor {
             name: name.unwrap_or("mem_tensor").to_owned(),
             shape: shape.to_vec(),
-            data: Arc::new(MemBacking::zeroed(cap_elems)),
+            data: Arc::new(MemBacking::zeroed_fast(cap_elems)),
             offset: 0,
             identity: crate::BufferIdentity::new(),
         })
@@ -482,6 +546,41 @@ mod tests {
         assert_eq!(map.as_slice()[1], 99);
         // Remaining elements should still be zero-initialized.
         assert_eq!(map.as_slice()[2], 0);
+    }
+
+    #[test]
+    fn zeroed_backing_reads_all_zero_across_types() {
+        // Every HAL primitive numeric T is alloc_zeroed-fast-path eligible
+        // (`dtype_of` is `Some`). A large allocation spanning many pages, built
+        // through the capacity path (`with_capacity_bytes` → `zeroed_fast`),
+        // must still read back entirely zero.
+        fn assert_all_zero<T>(n: usize)
+        where
+            T: Num + Clone + fmt::Debug + Send + Sync + Copy + PartialEq + 'static,
+        {
+            assert!(
+                crate::dtype_of::<T>().is_some(),
+                "{} should be alloc_zeroed fast-path eligible",
+                std::any::type_name::<T>()
+            );
+            let bytes = n * std::mem::size_of::<T>();
+            let t = MemTensor::<T>::with_capacity_bytes(&[n], bytes, Some("z")).unwrap();
+            let map = t.map().unwrap();
+            assert!(
+                map.as_slice().iter().all(|v| *v == T::zero()),
+                "zeroed {} backing not all-zero",
+                std::any::type_name::<T>()
+            );
+        }
+        let n = 200_000; // spans many pages
+        assert_all_zero::<u8>(n);
+        assert_all_zero::<u16>(n);
+        assert_all_zero::<i32>(n);
+        assert_all_zero::<f32>(n);
+        assert_all_zero::<f64>(n);
+        // n == 0 and n == 1 cover the empty-box and single-element edges.
+        assert_all_zero::<u8>(0);
+        assert_all_zero::<f32>(1);
     }
 
     #[test]

@@ -330,17 +330,12 @@ impl fmt::Display for DType {
 /// `None` for types that do not have a `DType` representation (e.g.
 /// user-defined wrappers in tests).
 ///
-/// Used by image-tensor constructors that need the runtime dtype to
-/// look up FourCC / pixel-format mappings on the macOS IOSurface path,
-/// where the GPU backend cares about whether the bytes are u8 / f16 /
-/// f32 even though the static `Tensor<T>` carries the same information
-/// at the type level.
-///
-/// macOS-only: the sole caller is the IOSurface DMA branch in
-/// `Tensor::<T>::image()`, which is itself `cfg(target_os = "macos")`.
-/// Leaving this ungated makes it dead code on every other target, which
-/// fails CI under `-D warnings`.
-#[cfg(target_os = "macos")]
+/// Runtime dtype of a static `Tensor<T>` element type — a safe `TypeId`
+/// allowlist of HAL's primitive numeric types (`Some` for `u8`..`i64` /
+/// `f16` / `f32` / `f64`, `None` otherwise). Used by the macOS IOSurface
+/// image constructors (FourCC / pixel-format lookup) and by the `Mem`
+/// backing's `alloc_zeroed` fast path (these types' `T::zero()` is the
+/// all-zeros bit pattern), so it is compiled on every target.
 pub(crate) fn dtype_of<T: 'static>() -> Option<DType> {
     use std::any::TypeId;
     let id = TypeId::of::<T>();
@@ -1106,49 +1101,35 @@ where
                 {
                     MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
                 } else {
+                    // Auto-select priority: Dma > Mem. Shm is intentionally NOT
+                    // auto-selected — it offers no advantage over Mem for an
+                    // in-process tensor and Mem always succeeds, so Shm below Mem
+                    // is effectively never reached. Request Shm explicitly via
+                    // `TensorMemory::Shm` when cross-process sharing is needed.
+                    // (PBO sits between Dma and Mem but is GL-backed and created
+                    // only via `ImageProcessor::create_image`.)
                     #[cfg(target_os = "linux")]
                     {
-                        // Linux: Try DMA -> SHM -> Mem
+                        // Linux: Try DMA -> Mem
                         match DmaTensor::<T>::new(shape, name) {
                             Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
-                            Err(_) => {
-                                match ShmTensor::<T>::new(shape, name)
-                                    .map(TensorStorage::Shm)
-                                {
-                                    Ok(tensor) => Ok(tensor),
-                                    Err(_) => MemTensor::<T>::new(shape, name)
-                                        .map(TensorStorage::Mem),
-                                }
-                            }
+                            Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
                     #[cfg(target_os = "macos")]
                     {
-                        // macOS: Try IOSurface -> SHM -> Mem. IOSurface
-                        // is the GPU-shareable backend (zero-copy via
-                        // ANGLE), filling the same role as DMA-BUF on
-                        // Linux. Falls back to SHM if IOSurface alloc
-                        // fails (memory pressure or sandboxed contexts).
+                        // macOS: Try IOSurface -> Mem. IOSurface is the
+                        // GPU-shareable backend (zero-copy via ANGLE), filling the
+                        // same role as DMA-BUF on Linux.
                         match IoSurfaceTensor::<T>::new(shape, name) {
                             Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
-                            Err(_) => match ShmTensor::<T>::new(shape, name)
-                                .map(TensorStorage::Shm)
-                            {
-                                Ok(tensor) => Ok(tensor),
-                                Err(_) => MemTensor::<T>::new(shape, name)
-                                    .map(TensorStorage::Mem),
-                            },
+                            Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
                     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
                     {
-                        // Other Unix (BSD): Try SHM -> Mem (no DMA)
-                        match ShmTensor::<T>::new(shape, name) {
-                            Ok(tensor) => Ok(TensorStorage::Shm(tensor)),
-                            Err(_) => {
-                                MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
-                            }
-                        }
+                        // Other Unix (BSD): Mem only (no DMA; Shm is explicit-only)
+                        MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
                     }
                     #[cfg(not(unix))]
                     {
@@ -1189,7 +1170,10 @@ where
         shape: &[usize],
         byte_size: usize,
         name: Option<&str>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        T: 'static,
+    {
         MemTensor::<T>::with_capacity_bytes(shape, byte_size, name).map(TensorStorage::Mem)
     }
 
@@ -1733,36 +1717,16 @@ where
                 };
             }
             None => {
-                // Auto-select: DMA → Shm → Mem on Linux; Shm → Mem on macOS.
-                // DMA gets the 64-aligned pitch; host fallbacks keep the tight
-                // (host) pitch, so the recorded stride matches the storage used.
+                // Auto-select priority: DMA → Mem (DMA gets the 64-aligned
+                // pitch; the Mem fallback keeps the tight host pitch, so the
+                // recorded stride matches the storage used). Shm is NOT
+                // auto-selected — it offers no advantage over Mem for an
+                // in-process image and Mem always succeeds, so it sits below Mem
+                // and is reached only via an explicit `TensorMemory::Shm`.
                 #[cfg(target_os = "linux")]
                 {
                     match TensorStorage::<T>::new_dma_with_byte_size(&shape, dma_byte_size, None) {
                         Ok(s) => (s, aligned_stride),
-                        Err(_) => {
-                            match TensorStorage::<T>::new_shm_with_byte_size(
-                                &shape,
-                                host_byte_size,
-                                None,
-                            ) {
-                                Ok(s) => (s, host_stride),
-                                Err(_) => (
-                                    TensorStorage::<T>::new_mem_with_byte_size(
-                                        &shape,
-                                        host_byte_size,
-                                        None,
-                                    )?,
-                                    host_stride,
-                                ),
-                            }
-                        }
-                    }
-                }
-                #[cfg(all(unix, not(target_os = "linux")))]
-                {
-                    match TensorStorage::<T>::new_shm_with_byte_size(&shape, host_byte_size, None) {
-                        Ok(s) => (s, host_stride),
                         Err(_) => (
                             TensorStorage::<T>::new_mem_with_byte_size(
                                 &shape,
@@ -1773,7 +1737,7 @@ where
                         ),
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(target_os = "linux"))]
                 {
                     (
                         TensorStorage::<T>::new_mem_with_byte_size(&shape, host_byte_size, None)?,
@@ -2454,9 +2418,19 @@ where
                 // DMA-BUF are cached per (identity, offset) in the GL backend.
                 Tensor::wrap(TensorStorage::Dma(parent.view(offset_bytes, shape)?))
             }
+            #[cfg(unix)]
+            TensorStorage::Shm(parent) => {
+                // Shares the parent's segment via a cloned fd (the SHM sharing
+                // model) and its BufferIdentity, distinguished by offset.
+                Tensor::wrap(TensorStorage::Shm(ShmTensor::view(
+                    parent,
+                    offset_bytes,
+                    shape,
+                )?))
+            }
             _ => {
                 return Err(Error::InvalidOperation(
-                    "subview only supported for Mem and Dma tensors".into(),
+                    "subview only supported for Mem, Dma, and Shm tensors".into(),
                 ))
             }
         };
@@ -2834,16 +2808,19 @@ where
             }
         }
         // Offset tensors are supported for storages that apply the offset
-        // inside their own `map()`: DMA (`DmaMap` adjusts the mmap range) and
-        // Mem (`MemMap` adjusts the slice base). Other backings have no
-        // sub-region concept, so a non-zero offset is rejected.
+        // inside their own `map()`: DMA (`DmaMap` adjusts the mmap range), Mem
+        // (`MemMap` adjusts the slice base), and Shm (`ShmMap` adjusts the slice
+        // base). Other backings have no sub-region concept, so a non-zero
+        // offset is rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
             let supported = matches!(self.storage, TensorStorage::Mem(_));
             #[cfg(target_os = "linux")]
             let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
+            #[cfg(unix)]
+            let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
             if !supported {
                 return Err(Error::InvalidOperation(
-                    "plane offset only supported for DMA and Mem tensors".into(),
+                    "plane offset only supported for DMA, Mem, and Shm tensors".into(),
                 ));
             }
         }
@@ -3540,9 +3517,10 @@ mod tests {
         let dma_enabled = tensor.is_ok();
 
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
+        // Auto-select priority is Dma > Mem; Shm is never auto-selected.
         match dma_enabled {
             true => assert_eq!(tensor.memory(), TensorMemory::Dma),
-            false => assert_eq!(tensor.memory(), TensorMemory::Shm),
+            false => assert_eq!(tensor.memory(), TensorMemory::Mem),
         }
     }
 
@@ -3551,13 +3529,12 @@ mod tests {
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
-        // macOS auto-fallback chain: IOSurface (Dma) → SHM → Mem.
-        // Healthy systems always return Dma; SHM/Mem only appear under
-        // memory pressure or sandboxed contexts where IOSurfaceCreate
-        // fails.
+        // macOS auto-fallback chain: IOSurface (Dma) → Mem. Healthy systems
+        // return Dma; Mem only appears under memory pressure or sandboxed
+        // contexts where IOSurfaceCreate fails. Shm is never auto-selected.
         let m = tensor.memory();
         assert!(
-            matches!(m, TensorMemory::Dma | TensorMemory::Shm | TensorMemory::Mem),
+            matches!(m, TensorMemory::Dma | TensorMemory::Mem),
             "Unexpected auto-fallback result on macOS: {m:?}"
         );
     }
@@ -3567,12 +3544,9 @@ mod tests {
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
-        // Other Unix (BSD): auto-detection tries SHM first, falls back to Mem.
-        assert!(
-            tensor.memory() == TensorMemory::Shm || tensor.memory() == TensorMemory::Mem,
-            "Expected SHM or Mem, got {:?}",
-            tensor.memory()
-        );
+        // Other Unix (BSD): no DMA, so auto-selection is Mem (Shm is
+        // explicit-only, never auto-selected).
+        assert_eq!(tensor.memory(), TensorMemory::Mem);
     }
 
     #[test]
@@ -3873,20 +3847,57 @@ mod tests {
     }
 
     #[test]
-    fn subview_rejects_unsupported_storage() {
-        // subview shares either a heap `Arc` (Mem) or a dma-buf fd (Dma); any
-        // other backing (here Shm) must be refused with InvalidOperation rather
-        // than silently mishandled.
+    #[cfg(unix)]
+    fn shm_subview_partitions_parent_buffer() {
+        // Mirrors `mem_subview_partitions_parent_buffer` for Shm: one [2,4] u8
+        // parent shared segment (8 bytes); two [1,4] sub-views at byte offsets 0
+        // and 4 must share the segment (zero-copy, via cloned fd) and be
+        // independently writable — view 0 owns [0,4), view 1 owns [4,8).
         if !crate::is_shm_available() {
             eprintln!("SKIPPED: shm not available");
             return;
         }
-        let shm = Tensor::<u8>::new(&[64], Some(TensorMemory::Shm), None).unwrap();
-        match shm.subview(0, &[4]) {
-            Err(Error::InvalidOperation(_)) => {}
-            Err(other) => panic!("expected InvalidOperation, got {other:?}"),
-            Ok(_) => panic!("subview must reject Shm storage"),
+        let parent = Tensor::<u8>::new(&[2, 4], Some(TensorMemory::Shm), None).unwrap();
+        let view0 = parent.subview(0, &[1, 4]).expect("shm subview at offset 0");
+        let view1 = parent.subview(4, &[1, 4]).expect("shm subview at offset 4");
+
+        view1
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[10, 20, 30, 40]);
+        view0
+            .map()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        assert_eq!(view0.map().unwrap().as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(view1.map().unwrap().as_slice(), &[10, 20, 30, 40]);
+        // The parent sees the full partitioned segment (shared, zero-copy).
+        assert_eq!(
+            parent.map().unwrap().as_slice(),
+            &[1, 2, 3, 4, 10, 20, 30, 40]
+        );
+        // A sub-view of a sub-view composes the offset.
+        let nested = view1.subview(2, &[1, 2]).expect("nested shm subview");
+        assert_eq!(nested.map().unwrap().as_slice(), &[30, 40]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shm_subview_rejects_unaligned_and_oob() {
+        if !crate::is_shm_available() {
+            eprintln!("SKIPPED: shm not available");
+            return;
         }
+        // f32 align 4: a 2-byte offset cannot back a valid `*const f32`.
+        let parent = Tensor::<f32>::new(&[8], Some(TensorMemory::Shm), None).unwrap();
+        assert!(parent.subview(2, &[1]).is_err());
+        assert!(parent.subview(4, &[1]).is_ok());
+        // Out of bounds: offset 6 + 4 bytes = 10 > 8-byte (u8) segment.
+        let p2 = Tensor::<u8>::new(&[8], Some(TensorMemory::Shm), None).unwrap();
+        assert!(p2.subview(6, &[4]).is_err());
     }
 
     #[test]
