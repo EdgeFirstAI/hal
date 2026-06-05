@@ -62,15 +62,76 @@ impl<T> MemBacking<T> {
     }
 
     /// Build a zeroed backing of `n` elements.
+    ///
+    /// For every numeric type HAL instantiates (`u8`..=`f64`), `T::zero()` is
+    /// the all-zeros bit pattern, so the allocation comes from `alloc_zeroed`
+    /// (calloc): the kernel hands back lazily-zeroed pages instead of eagerly
+    /// writing every element. That matters because this backs every
+    /// `Tensor::image(.., Mem)` and the per-call image intermediates the CPU
+    /// converter allocates — a `(0..n).map(UnsafeCell::new).collect()` forces a
+    /// full eager memset and commits every page up front. The bit pattern is
+    /// checked at runtime, so the fast path is taken only when it is provably
+    /// correct; any exotic `T` whose zero is not all-zeros uses the per-element
+    /// loop.
     fn zeroed(n: usize) -> Self
     where
         T: Num + Clone,
     {
+        if n == 0 {
+            return Self {
+                cells: Vec::new().into_boxed_slice(),
+            };
+        }
+        if zero_is_all_zero_bytes::<T>() {
+            // SAFETY: `T::zero()` is the all-zeros bit pattern (just checked),
+            // so a zero-filled allocation is a valid `[UnsafeCell<T>; n]`, and
+            // `n > 0`.
+            return unsafe { Self::alloc_zeroed_unchecked(n) };
+        }
         let cells: Vec<UnsafeCell<T>> = (0..n).map(|_| UnsafeCell::new(T::zero())).collect();
         Self {
             cells: cells.into_boxed_slice(),
         }
     }
+
+    /// Allocate `n` zeroed `UnsafeCell<T>` via the global allocator's zeroed
+    /// (calloc) path.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `T::zero()` is the all-zeros bit pattern (so a
+    /// zero-filled block is a valid `[UnsafeCell<T>; n]`) and that `n > 0`.
+    unsafe fn alloc_zeroed_unchecked(n: usize) -> Self {
+        use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+        // `UnsafeCell<T>` is `#[repr(transparent)]` over `T`, so its layout
+        // equals `T`'s; allocating an array of it round-trips on `Box` drop.
+        let layout = Layout::array::<UnsafeCell<T>>(n).expect("allocation layout overflow");
+        let ptr = alloc_zeroed(layout) as *mut UnsafeCell<T>;
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+        // SAFETY: `ptr` is a freshly-allocated, suitably-aligned block of `n`
+        // zeroed `UnsafeCell<T>`; the zero pattern is a valid `T::zero()` per
+        // the contract above. `Box::from_raw` over a slice built from the same
+        // `(ptr, n)` and element type deallocates with the matching
+        // `Layout::array::<UnsafeCell<T>>(n)` on drop.
+        let slice = std::slice::from_raw_parts_mut(ptr, n);
+        Self {
+            cells: Box::from_raw(slice),
+        }
+    }
+}
+
+/// True iff `T::zero()` has an all-zeros bit pattern — the case for every
+/// primitive numeric type HAL uses, enabling the `alloc_zeroed` fast path.
+fn zero_is_all_zero_bytes<T: Num>() -> bool {
+    let z = T::zero();
+    // SAFETY: reads the `size_of::<T>()` initialised bytes of a valid `T`
+    // value; the slice does not outlive `z`.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(&z as *const T as *const u8, std::mem::size_of::<T>())
+    };
+    bytes.iter().all(|&b| b == 0)
 }
 
 #[derive(Debug)]
@@ -482,6 +543,39 @@ mod tests {
         assert_eq!(map.as_slice()[1], 99);
         // Remaining elements should still be zero-initialized.
         assert_eq!(map.as_slice()[2], 0);
+    }
+
+    #[test]
+    fn zeroed_backing_reads_all_zero_across_types() {
+        // Every primitive numeric T has an all-zeros bit pattern for T::zero(),
+        // so `zeroed` takes the alloc_zeroed (calloc) fast path. A large
+        // allocation spanning many pages must still read back entirely zero.
+        fn assert_all_zero<T>(n: usize)
+        where
+            T: Num + Clone + fmt::Debug + Send + Sync + Copy + PartialEq,
+        {
+            assert!(
+                zero_is_all_zero_bytes::<T>(),
+                "{} should use the alloc_zeroed fast path",
+                std::any::type_name::<T>()
+            );
+            let t = MemTensor::<T>::new(&[n], Some("z")).unwrap();
+            let map = t.map().unwrap();
+            assert!(
+                map.as_slice().iter().all(|v| *v == T::zero()),
+                "zeroed {} backing not all-zero",
+                std::any::type_name::<T>()
+            );
+        }
+        let n = 200_000; // spans many pages
+        assert_all_zero::<u8>(n);
+        assert_all_zero::<u16>(n);
+        assert_all_zero::<i32>(n);
+        assert_all_zero::<f32>(n);
+        assert_all_zero::<f64>(n);
+        // n == 0 and n == 1 cover the empty-box and single-element edges.
+        assert_all_zero::<u8>(0);
+        assert_all_zero::<f32>(1);
     }
 
     #[test]
