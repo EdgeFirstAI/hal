@@ -346,12 +346,14 @@ impl Drop for CudaHandle {
     fn drop(&mut self) {
         match &self.kind {
             CudaBacking::GlBuffer { resource, ops } => ops.unregister(*resource),
-            CudaBacking::ExternalMem { ext_mem, dptr } => {
+            CudaBacking::ExternalMem { ext_mem, dptr: _ } => {
+                // The device pointer comes from `cudaExternalMemoryGetMappedBuffer`,
+                // which CUDA frees together with the external-memory object. Calling
+                // `cudaFree` on such a pointer is explicitly disallowed and corrupts
+                // the driver's bookkeeping (risking a double-free when the handle is
+                // destroyed), so only destroy the external-memory object here.
                 if let Some(t) = table() {
-                    // cudaExternalMemoryGetMappedBuffer's pointer must be freed with
-                    // cudaFree before destroying the external-memory handle.
                     unsafe {
-                        (t.free)(*dptr);
                         (t.destroy_external_memory)(*ext_mem);
                     }
                 }

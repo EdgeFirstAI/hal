@@ -1084,3 +1084,173 @@ fn d3_resize_strided_rgb_source() {
         "d3: strided-src resize differs from tight-src resize: max_diff={max_diff}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WS0 correctness regressions
+// ---------------------------------------------------------------------------
+
+/// Convert a packed-YUV tensor to GREY through the public CPU pipeline and
+/// return the tightly-packed `w*h` luma bytes.
+fn cpu_to_grey_packed(src: Tensor<u8>, w: usize, h: usize) -> Vec<u8> {
+    let mut proc = CPUProcessor::default();
+    let src_dyn = TensorDyn::from(src);
+    let mut dst =
+        TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    proc.convert(
+        &src_dyn,
+        &mut dst,
+        Rotation::None,
+        Flip::None,
+        Crop::default(),
+    )
+    .unwrap();
+    let dst_u8 = dst.as_u8().unwrap();
+    let stride = dst_u8.effective_row_stride().unwrap_or(w);
+    let map = dst_u8.map().unwrap();
+    let s = map.as_slice();
+    let mut out = vec![0u8; w * h];
+    for r in 0..h {
+        out[r * w..(r + 1) * w].copy_from_slice(&s[r * stride..r * stride + w]);
+    }
+    out
+}
+
+/// Packed YUYV/VYUY → GREY must read luma honouring the source row stride. A
+/// padded (DMA / V4L2) source previously chunked the flat map and read pad
+/// bytes as luma; the tight and strided sources must now agree. `luma_off` is
+/// the byte offset of the luma sample within each 2-byte unit (0 for YUYV's
+/// `[Y,C]`, 1 for VYUY's `[C,Y]`).
+fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
+    let w = 64usize; // even width: one YUYV/VYUY macropixel spans 2 px
+    let h = 16usize;
+
+    let fill = |buf: &mut [u8], stride: usize| {
+        for r in 0..h {
+            for x in 0..w {
+                let base = r * stride + x * 2;
+                buf[base + luma_off] = ((r * 7 + x * 3) % 220 + 16) as u8; // luma
+                buf[base + (1 - luma_off)] = ((r * 5 + x * 11) % 256) as u8; // chroma
+            }
+        }
+    };
+
+    let tight = {
+        let mut s = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+        let stride = s.effective_row_stride().unwrap_or(w * 2);
+        {
+            let mut m = s.map().unwrap();
+            fill(m.as_mut_slice(), stride);
+        }
+        s
+    };
+    let tight_grey = cpu_to_grey_packed(tight, w, h);
+
+    // Strided source is DMA-backed (Linux only); elsewhere `image_with_stride`
+    // returns NotImplemented and the tight path above is the whole assertion.
+    let padded = 192usize; // 64-aligned, > w*2 = 128
+    if let Ok(mut s) = Tensor::<u8>::image_with_stride(w, h, fmt, padded, None) {
+        let stride = s.effective_row_stride().unwrap_or(padded);
+        assert!(stride > w * 2, "expected a padded stride, got {stride}");
+        {
+            let mut m = s.map().unwrap();
+            fill(m.as_mut_slice(), stride);
+        }
+        let strided_grey = cpu_to_grey_packed(s, w, h);
+        assert_eq!(
+            tight_grey, strided_grey,
+            "{fmt:?}→Grey: strided source diverges from tight source (stride bug)"
+        );
+    }
+}
+
+#[test]
+fn d4_yuyv_to_grey_strided_matches_tight() {
+    packed_yuv_to_grey_strided_matches_tight(PixelFormat::Yuyv, 0);
+}
+
+#[test]
+fn d5_vyuy_to_grey_strided_matches_tight() {
+    packed_yuv_to_grey_strided_matches_tight(PixelFormat::Vyuy, 1);
+}
+
+/// Planar → packed read-back (`convert_8bps_*` / `convert_prgba_*`) round-trips
+/// losslessly. Locks in the stride-aware `planar_to_packed` helper on the tight
+/// path; the strided planar path is not reachable through the public API
+/// (`image_with_stride` rejects planar layouts) but shares the same code.
+#[test]
+fn d6_planar_packed_roundtrip() {
+    let w = 40usize;
+    let h = 24usize;
+
+    let convert = |src: &TensorDyn, dst_fmt: PixelFormat, dst_ch: usize| -> TensorDyn {
+        let mut proc = CPUProcessor::default();
+        let mut dst = TensorDyn::image(w, h, dst_fmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let _ = dst_ch;
+        proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        dst
+    };
+
+    let read_packed = |t: &TensorDyn, ch: usize| -> Vec<u8> {
+        let u8t = t.as_u8().unwrap();
+        let stride = u8t.effective_row_stride().unwrap_or(w * ch);
+        let map = u8t.map().unwrap();
+        let s = map.as_slice();
+        let mut out = vec![0u8; w * h * ch];
+        for r in 0..h {
+            out[r * w * ch..(r + 1) * w * ch].copy_from_slice(&s[r * stride..r * stride + w * ch]);
+        }
+        out
+    };
+
+    // RGB → PlanarRgb → RGB is the identity.
+    let mut rgb = Tensor::<u8>::image(w, h, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    {
+        let stride = rgb.effective_row_stride().unwrap_or(w * 3);
+        let mut m = rgb.map().unwrap();
+        let s = m.as_mut_slice();
+        for r in 0..h {
+            for x in 0..w {
+                let b = r * stride + x * 3;
+                s[b] = ((r * 9 + x * 5) % 256) as u8;
+                s[b + 1] = ((r * 3 + x * 13) % 256) as u8;
+                s[b + 2] = ((r * 17 + x * 2) % 256) as u8;
+            }
+        }
+    }
+    let rgb_dyn = TensorDyn::from(rgb);
+    let rgb_orig = read_packed(&rgb_dyn, 3);
+    let planar = convert(&rgb_dyn, PixelFormat::PlanarRgb, 3);
+    let back = convert(&planar, PixelFormat::Rgb, 3);
+    assert_eq!(
+        rgb_orig,
+        read_packed(&back, 3),
+        "RGB→PlanarRgb→RGB not identity"
+    );
+
+    // RGBA → PlanarRgba → RGBA is the identity (exercises the alpha plane).
+    let mut rgba = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+    {
+        let stride = rgba.effective_row_stride().unwrap_or(w * 4);
+        let mut m = rgba.map().unwrap();
+        let s = m.as_mut_slice();
+        for r in 0..h {
+            for x in 0..w {
+                let b = r * stride + x * 4;
+                s[b] = ((r + x) % 256) as u8;
+                s[b + 1] = ((r * 2 + x * 3) % 256) as u8;
+                s[b + 2] = ((r * 4 + x) % 256) as u8;
+                s[b + 3] = ((r * 6 + x * 7) % 256) as u8;
+            }
+        }
+    }
+    let rgba_dyn = TensorDyn::from(rgba);
+    let rgba_orig = read_packed(&rgba_dyn, 4);
+    let planar_a = convert(&rgba_dyn, PixelFormat::PlanarRgba, 4);
+    let back_a = convert(&planar_a, PixelFormat::Rgba, 4);
+    assert_eq!(
+        rgba_orig,
+        read_packed(&back_a, 4),
+        "RGBA→PlanarRgba→RGBA not identity"
+    );
+}

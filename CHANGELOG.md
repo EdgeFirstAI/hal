@@ -250,6 +250,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPU packed-YUV → GREY ignored the source row stride** (`edgefirst-image`).
+  `Yuyv`/`Vyuy` → `Grey` chunked the flat mapped buffer with a fixed 16-byte
+  stride, so a padded source (DMA-BUF, V4L2 hardware decode, or pitch-aligned
+  `create_image`) read luma from per-row padding and produced misaligned/garbage
+  output. Both paths now iterate rows honouring `effective_row_stride`, matching
+  the other `*_to_grey` converters.
+- **CPU planar → packed read-back ignored stride** (`edgefirst-image`).
+  `PlanarRgb`/`PlanarRgba` → `Rgb`/`Rgba` derived plane boundaries from
+  `mapped_len / channels` and walked each plane as if tightly packed, corrupting
+  output for strided/padded planar sources. The four converters now share a
+  single stride-aware `planar_to_packed` helper that derives plane offsets from
+  `height × row_stride` and reads each row at its true offset.
+- **CPU NV24 → GREY truncated multiplane sources** (`edgefirst-image`).
+  `convert_nv24_to_grey` computed the luma height as `shape[0] / 3` before the
+  multiplane check, so a true-multiplane NV24 tensor (separate luma/chroma
+  allocations) produced only the top third of its rows. The height is now
+  resolved inside the multiplane branch, matching `convert_nv24_to_rgb`.
+- **CUDA external-memory handle drop called `cudaFree` on a mapped pointer**
+  (`edgefirst-tensor`). `CudaHandle::Drop` for an imported DMA-BUF (`ExternalMem`)
+  called `cudaFree` on the pointer returned by `cudaExternalMemoryGetMappedBuffer`
+  before destroying the external-memory object. CUDA frees that buffer together
+  with the external-memory object, so the extra `cudaFree` is disallowed and can
+  corrupt driver bookkeeping / double-free. Drop now only calls
+  `cudaDestroyExternalMemory`.
 - **GPU EGLImage source cache stale-geometry read (recycled DMA-BUF pools).**
   The OpenGL source EGLImage cache keyed only on buffer identity + plane offset.
   A pooled DMA-BUF tensor reconfigured between converts (`configure_image`, e.g.
