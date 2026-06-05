@@ -13,137 +13,61 @@ use pyo3::prelude::*;
 
 // ─── Axis enums ──────────────────────────────────────────────────────────────
 
-/// Color primaries (`color_space` in the EdgeFirst schema).
-#[pyclass(name = "ColorSpace", eq, eq_int, from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyColorSpace {
-    Bt709,
-    Bt2020,
-    Srgb,
-    Smpte170m,
-}
-
-impl From<PyColorSpace> for ColorSpace {
-    fn from(v: PyColorSpace) -> Self {
-        match v {
-            PyColorSpace::Bt709 => ColorSpace::Bt709,
-            PyColorSpace::Bt2020 => ColorSpace::Bt2020,
-            PyColorSpace::Srgb => ColorSpace::Srgb,
-            PyColorSpace::Smpte170m => ColorSpace::Smpte170m,
+/// Generate a PyO3 mirror of a core `edgefirst_tensor` colorimetry enum plus
+/// the bidirectional conversions. `From<Py> for Rs` is total; `TryFrom<Rs> for
+/// Py` is fallible because the core enums are `#[non_exhaustive]` — a variant
+/// added in a newer core has no Python binding, so it maps to `Err(())` (the
+/// getters surface that as `None` rather than panicking).
+macro_rules! bridge_enum {
+    (
+        $(#[$meta:meta])*
+        $py:ident <=> $rs:ident as $name:literal { $($variant:ident),+ $(,)? }
+    ) => {
+        $(#[$meta])*
+        #[pyclass(name = $name, eq, eq_int, from_py_object)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $py {
+            $($variant),+
         }
-    }
-}
 
-// Rs→Py is fallible: the Rust enums are `#[non_exhaustive]`, so a variant added
-// in a newer core may have no Python binding. Map it to `Err` and let the
-// getters surface it as `None` (unknown) rather than panicking.
-impl TryFrom<ColorSpace> for PyColorSpace {
-    type Error = ();
-    fn try_from(v: ColorSpace) -> Result<Self, ()> {
-        match v {
-            ColorSpace::Bt709 => Ok(PyColorSpace::Bt709),
-            ColorSpace::Bt2020 => Ok(PyColorSpace::Bt2020),
-            ColorSpace::Srgb => Ok(PyColorSpace::Srgb),
-            ColorSpace::Smpte170m => Ok(PyColorSpace::Smpte170m),
-            _ => Err(()),
+        impl From<$py> for $rs {
+            fn from(v: $py) -> Self {
+                match v {
+                    $($py::$variant => $rs::$variant),+
+                }
+            }
         }
-    }
-}
 
-/// Transfer function (`color_transfer` in the EdgeFirst schema).
-#[pyclass(name = "ColorTransfer", eq, eq_int, from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyColorTransfer {
-    Bt709,
-    Srgb,
-    Pq,
-    Hlg,
-    Linear,
-}
-
-impl From<PyColorTransfer> for ColorTransfer {
-    fn from(v: PyColorTransfer) -> Self {
-        match v {
-            PyColorTransfer::Bt709 => ColorTransfer::Bt709,
-            PyColorTransfer::Srgb => ColorTransfer::Srgb,
-            PyColorTransfer::Pq => ColorTransfer::Pq,
-            PyColorTransfer::Hlg => ColorTransfer::Hlg,
-            PyColorTransfer::Linear => ColorTransfer::Linear,
+        impl TryFrom<$rs> for $py {
+            type Error = ();
+            fn try_from(v: $rs) -> Result<Self, ()> {
+                match v {
+                    $($rs::$variant => Ok($py::$variant),)+
+                    _ => Err(()),
+                }
+            }
         }
-    }
+    };
 }
 
-impl TryFrom<ColorTransfer> for PyColorTransfer {
-    type Error = ();
-    fn try_from(v: ColorTransfer) -> Result<Self, ()> {
-        match v {
-            ColorTransfer::Bt709 => Ok(PyColorTransfer::Bt709),
-            ColorTransfer::Srgb => Ok(PyColorTransfer::Srgb),
-            ColorTransfer::Pq => Ok(PyColorTransfer::Pq),
-            ColorTransfer::Hlg => Ok(PyColorTransfer::Hlg),
-            ColorTransfer::Linear => Ok(PyColorTransfer::Linear),
-            _ => Err(()),
-        }
-    }
+bridge_enum! {
+    /// Color primaries (`color_space` in the EdgeFirst schema).
+    PyColorSpace <=> ColorSpace as "ColorSpace" { Bt709, Bt2020, Srgb, Smpte170m }
 }
 
-/// YCbCr encoding matrix (`color_encoding` in the EdgeFirst schema).
-#[pyclass(name = "ColorEncoding", eq, eq_int, from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyColorEncoding {
-    Bt601,
-    Bt709,
-    Bt2020,
+bridge_enum! {
+    /// Transfer function (`color_transfer` in the EdgeFirst schema).
+    PyColorTransfer <=> ColorTransfer as "ColorTransfer" { Bt709, Srgb, Pq, Hlg, Linear }
 }
 
-impl From<PyColorEncoding> for ColorEncoding {
-    fn from(v: PyColorEncoding) -> Self {
-        match v {
-            PyColorEncoding::Bt601 => ColorEncoding::Bt601,
-            PyColorEncoding::Bt709 => ColorEncoding::Bt709,
-            PyColorEncoding::Bt2020 => ColorEncoding::Bt2020,
-        }
-    }
+bridge_enum! {
+    /// YCbCr encoding matrix (`color_encoding` in the EdgeFirst schema).
+    PyColorEncoding <=> ColorEncoding as "ColorEncoding" { Bt601, Bt709, Bt2020 }
 }
 
-impl TryFrom<ColorEncoding> for PyColorEncoding {
-    type Error = ();
-    fn try_from(v: ColorEncoding) -> Result<Self, ()> {
-        match v {
-            ColorEncoding::Bt601 => Ok(PyColorEncoding::Bt601),
-            ColorEncoding::Bt709 => Ok(PyColorEncoding::Bt709),
-            ColorEncoding::Bt2020 => Ok(PyColorEncoding::Bt2020),
-            _ => Err(()),
-        }
-    }
-}
-
-/// Quantization range (`color_range` in the EdgeFirst schema).
-#[pyclass(name = "ColorRange", eq, eq_int, from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PyColorRange {
-    Full,
-    Limited,
-}
-
-impl From<PyColorRange> for ColorRange {
-    fn from(v: PyColorRange) -> Self {
-        match v {
-            PyColorRange::Full => ColorRange::Full,
-            PyColorRange::Limited => ColorRange::Limited,
-        }
-    }
-}
-
-impl TryFrom<ColorRange> for PyColorRange {
-    type Error = ();
-    fn try_from(v: ColorRange) -> Result<Self, ()> {
-        match v {
-            ColorRange::Full => Ok(PyColorRange::Full),
-            ColorRange::Limited => Ok(PyColorRange::Limited),
-            _ => Err(()),
-        }
-    }
+bridge_enum! {
+    /// Quantization range (`color_range` in the EdgeFirst schema).
+    PyColorRange <=> ColorRange as "ColorRange" { Full, Limited }
 }
 
 // ─── Colorimetry ─────────────────────────────────────────────────────────────
