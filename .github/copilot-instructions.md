@@ -201,6 +201,47 @@ git tag -a -s v0.6.0rc1 -m "Version 0.6.0 Release Candidate 1"
 
 Release candidates are published to PyPI but marked as pre-release.
 
+### Maintenance / Back-Port Patch Release
+
+Use this when patching an **older, superseded release line** — e.g. shipping
+`0.22.2` while `main` has already advanced to `0.24.x`. The patch is **not**
+merged into `main`; it is released by tagging a maintenance branch directly.
+
+1. **Branch from the previous release tag**, not from `main`:
+
+   ```bash
+   git checkout -b release/0.22.2 v0.22.1
+   ```
+
+2. Apply the fix, bump the **patch** version (`make verify-version` must pass),
+   add a CHANGELOG entry, and run the normal pre-release checks
+   (`make format lint verify-version sbom`).
+
+3. **Push the branch.** CI (`test.yml`, `sbom.yml`) now runs on `release/**`
+   branches and on PRs targeting them, so the back-port is validated before it
+   is tagged. Wait for green checks.
+
+4. **Tag to release.** The `release.yml` workflow runs from the tagged commit
+   and builds/publishes as usual. A back-version is published as a normal,
+   **non-latest** release — the GitHub "Latest" badge stays on the highest
+   semver tag (`make_latest` is computed from `git tag` at release time), and
+   PyPI/crates.io keep the highest version as the default. So tagging `v0.22.2`
+   after `v0.24.x` will not displace the current line.
+
+   ```bash
+   git push origin release/0.22.2
+   git push origin v0.22.2   # triggers the release workflow
+   ```
+
+   > **Important:** a tag runs the workflow files **as they exist at the tagged
+   > commit**. If a maintenance branch predates a workflow change, port the
+   > relevant `.github/workflows/` edits onto that branch (adapted to its own
+   > files — do not wholesale-copy `main`'s) and re-create the tag, or the
+   > release runs the stale workflow.
+
+5. **Forward-port the fix to `main`** in a separate `bugfix/` PR (the
+   maintenance line and `main` diverge, so the same fix is needed on both).
+
 ---
 
 ## Code Quality
