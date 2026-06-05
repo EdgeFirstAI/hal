@@ -30,6 +30,13 @@ where
     /// (mirrors `DmaTensor::mmap_offset` / `MemTensor::offset`). Applied in
     /// `ShmMap::as_slice`, which maps the whole segment and indexes from here.
     offset: usize,
+    /// Logical byte length of the backing segment (the size requested at
+    /// `ftruncate`), as opposed to the physical `fstat().st_size` exposed by
+    /// [`capacity_bytes`](Self::capacity_bytes). These diverge on macOS, where
+    /// POSIX shm segments are rounded up to a page, so bounds checks must use
+    /// this logical length to stay platform-consistent. Inherited unchanged by
+    /// `view()` sub-regions (they share the same segment).
+    byte_len: usize,
     pub _marker: std::marker::PhantomData<T>,
     identity: crate::BufferIdentity,
 }
@@ -80,6 +87,7 @@ where
             fd: shm_fd,
             shape: shape.to_vec(),
             offset: 0,
+            byte_len: byte_size,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
@@ -114,7 +122,10 @@ where
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
         let logical = shape.iter().product::<usize>() * elem;
-        let capacity = parent.capacity_bytes();
+        // Bound against the segment's *logical* byte length, not the physical
+        // `capacity_bytes()` (`st_size`): the latter is page-rounded on macOS,
+        // which would let an out-of-bounds window slip through (see `byte_len`).
+        let capacity = parent.byte_len;
         let needed = abs_offset
             .checked_add(logical)
             .ok_or(Error::InvalidSize(logical))?;
@@ -126,6 +137,7 @@ where
             fd: parent.fd.try_clone()?,
             shape: shape.to_vec(),
             offset: abs_offset,
+            byte_len: parent.byte_len,
             _marker: std::marker::PhantomData,
             // A sub-view is the *same* segment: share the parent's identity so
             // identity-keyed logic treats the windows as one buffer at distinct
@@ -228,6 +240,7 @@ where
             fd: shm_fd,
             shape: shape.to_vec(),
             offset: 0,
+            byte_len: size,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
@@ -243,11 +256,17 @@ where
             return Err(Error::InvalidSize(0));
         }
 
+        // The true logical length of an externally shared segment is unknown
+        // here; `fstat` is the only signal (exact on Linux, page-rounded on
+        // macOS). Fall back to the declared `size` when it is unavailable.
+        let byte_len = fstat(&fd).map(|s| s.st_size as usize).unwrap_or(size);
+
         Ok(ShmTensor {
             name: name.unwrap_or("").to_owned(),
             fd,
             shape: shape.to_vec(),
             offset: 0,
+            byte_len,
             _marker: std::marker::PhantomData,
             identity: crate::BufferIdentity::new(),
         })
