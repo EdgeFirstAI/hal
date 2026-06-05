@@ -42,6 +42,14 @@ pub enum ColorSpace {
 }
 
 /// Transfer function (`color_transfer` in the EdgeFirst schema).
+///
+/// **Limitation:** this axis is stored, propagated, and round-tripped, but it is
+/// **not applied** by any conversion backend. All YUV↔RGB paths operate only on
+/// the matrix ([`ColorEncoding`]) and range ([`ColorRange`]); the transfer
+/// function (gamma / TRC) is assumed to be the platform-native curve and is left
+/// unchanged. HDR transfer curves ([`Self::Pq`] / [`Self::Hlg`]) are therefore
+/// *not* tone-mapped — consumers needing linear-light or HDR handling must apply
+/// the curve themselves.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ColorTransfer {
@@ -187,6 +195,79 @@ macro_rules! display_via_as_str {
     )*};
 }
 display_via_as_str!(ColorSpace, ColorTransfer, ColorEncoding, ColorRange);
+
+/// YCbCr matrix luma weights `(kr, kb)`; the green weight is `kg = 1 - kr - kb`.
+///
+/// This is the single source of the BT.601/709/2020 coefficients. Every
+/// YUV↔RGB path (the in-shader GL coefficients and the hand-rolled fixed-point
+/// CPU encoders) derives its matrix from here so a coefficient change is made
+/// in exactly one place.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatrixWeights {
+    pub kr: f64,
+    pub kb: f64,
+}
+
+impl MatrixWeights {
+    /// Green luma weight, `1 - kr - kb`.
+    pub fn kg(self) -> f64 {
+        1.0 - self.kr - self.kb
+    }
+}
+
+impl ColorEncoding {
+    /// The matrix luma weights `(kr, kb)` for this encoding — the canonical
+    /// BT.601/709/2020 coefficients shared by every YUV↔RGB conversion path.
+    pub fn luma_weights(self) -> MatrixWeights {
+        match self {
+            Self::Bt601 => MatrixWeights {
+                kr: 0.299,
+                kb: 0.114,
+            },
+            Self::Bt709 => MatrixWeights {
+                kr: 0.2126,
+                kb: 0.0722,
+            },
+            Self::Bt2020 => MatrixWeights {
+                kr: 0.2627,
+                kb: 0.0593,
+            },
+        }
+    }
+}
+
+/// Quantization swings (out of 255) for a YCbCr range: the luma black offset and
+/// the luma/chroma excursions. Full range is `0 / 255 / 255`; limited (studio)
+/// range is `16 / 219 / 224`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangeScaling {
+    /// Luma black level (0 for full range, 16 for limited).
+    pub y_offset: f64,
+    /// Luma excursion (255 for full range, 219 for limited).
+    pub y_swing: f64,
+    /// Chroma excursion (255 for full range, 224 for limited).
+    pub c_swing: f64,
+}
+
+impl ColorRange {
+    /// The luma/chroma quantization swings for this range — the canonical
+    /// 0/255/255 (full) or 16/219/224 (limited) studio-swing constants shared
+    /// by every YUV↔RGB conversion path.
+    pub fn scaling(self) -> RangeScaling {
+        match self {
+            Self::Full => RangeScaling {
+                y_offset: 0.0,
+                y_swing: 255.0,
+                c_swing: 255.0,
+            },
+            Self::Limited => RangeScaling {
+                y_offset: 16.0,
+                y_swing: 219.0,
+                c_swing: 224.0,
+            },
+        }
+    }
+}
 
 /// Full 4-axis colorimetry. Each axis is `Option`; `None` means "undefined"
 /// and is never auto-filled — consumers (e.g. `convert()`) resolve missing
@@ -381,6 +462,55 @@ mod tests {
         let unknown_enc = Colorimetry::from_v4l2(7, 0, 99, 0);
         assert_eq!(unknown_enc.encoding, None);
         assert_eq!(unknown_enc.range, Some(ColorRange::Full)); // quant still defaulted from JPEG
+    }
+
+    #[test]
+    fn luma_weights_are_the_canonical_bt_constants() {
+        assert_eq!(
+            ColorEncoding::Bt601.luma_weights(),
+            MatrixWeights {
+                kr: 0.299,
+                kb: 0.114
+            }
+        );
+        assert_eq!(
+            ColorEncoding::Bt709.luma_weights(),
+            MatrixWeights {
+                kr: 0.2126,
+                kb: 0.0722
+            }
+        );
+        assert_eq!(
+            ColorEncoding::Bt2020.luma_weights(),
+            MatrixWeights {
+                kr: 0.2627,
+                kb: 0.0593
+            }
+        );
+        // kg = 1 - kr - kb (BT.709 green weight ≈ 0.7152).
+        assert!((ColorEncoding::Bt709.luma_weights().kg() - 0.7152).abs() < 1e-9);
+    }
+
+    #[test]
+    fn range_scaling_is_full_or_studio_swing() {
+        let full = ColorRange::Full.scaling();
+        assert_eq!(
+            full,
+            RangeScaling {
+                y_offset: 0.0,
+                y_swing: 255.0,
+                c_swing: 255.0
+            }
+        );
+        let limited = ColorRange::Limited.scaling();
+        assert_eq!(
+            limited,
+            RangeScaling {
+                y_offset: 16.0,
+                y_swing: 219.0,
+                c_swing: 224.0
+            }
+        );
     }
 
     #[test]

@@ -29,6 +29,12 @@ pub(crate) struct ColorParams {
     pub matrix: yuv::YuvStandardMatrix,
     /// Range resolved from the YUV side (src for decode, dst for encode).
     pub range: yuv::YuvRange,
+    /// The same matrix/range in HAL's own terms, so the hand-rolled fixed-point
+    /// encoders draw their `(kr, kb)` weights and luma/chroma swings from the
+    /// canonical [`edgefirst_tensor::colorimetry`] source rather than a private
+    /// duplicate table.
+    pub encoding: edgefirst_tensor::ColorEncoding,
+    pub range_kind: edgefirst_tensor::ColorRange,
     /// True when the **source** tensor's resolved range is full (decode-side
     /// luma extraction: copy luma directly instead of limited→full expansion).
     pub src_full_range: bool,
@@ -441,6 +447,8 @@ impl CPUProcessor {
         let cp = ColorParams {
             matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
             range: crate::colorimetry::yuv_range(cm.range.unwrap()),
+            encoding: cm.encoding.unwrap(),
+            range_kind: cm.range.unwrap(),
             src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
             dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
         };
@@ -580,12 +588,16 @@ impl CPUProcessor {
         let src_params = ColorParams {
             matrix: crate::colorimetry::yuv_matrix(src_cm.encoding.unwrap()),
             range: crate::colorimetry::yuv_range(src_cm.range.unwrap()),
+            encoding: src_cm.encoding.unwrap(),
+            range_kind: src_cm.range.unwrap(),
             src_full_range: src_full,
             dst_full_range: dst_full,
         };
         let dst_params = ColorParams {
             matrix: crate::colorimetry::yuv_matrix(dst_cm.encoding.unwrap()),
             range: crate::colorimetry::yuv_range(dst_cm.range.unwrap()),
+            encoding: dst_cm.encoding.unwrap(),
+            range_kind: dst_cm.range.unwrap(),
             src_full_range: src_full,
             dst_full_range: dst_full,
         };
