@@ -258,6 +258,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Full history + all tags so the make_latest comparison below can see
+          # every released version, not just the one being tagged.
+          fetch-depth: 0
 
       - name: Download wheel artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -279,6 +283,25 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           awk "/## \[$VERSION\]/,/^## \[/{if (/^## \[/ && !found) {found=1; next} if (/^## \[/ && found) exit; if (found) print}" CHANGELOG.md > RELEASE_NOTES.md || echo "Release $VERSION" > RELEASE_NOTES.md
 
+      - name: Determine 'Latest' eligibility
+        id: latest
+        # Only the highest stable semver tag is marked as the repo's "Latest"
+        # release. A back-version maintenance patch (e.g. v0.22.2 tagged after
+        # v0.24.x already shipped) is published as a normal, non-latest release
+        # so it never displaces the current line's badge. rc tags are excluded
+        # from the comparison and never become Latest. GITHUB_REF is the tag
+        # ref (trusted, matches the workflow's tag trigger pattern).
+        run: |
+          CURRENT="${GITHUB_REF#refs/tags/}"
+          HIGHEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ "$CURRENT" = "$HIGHEST" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Tag $CURRENT (highest stable: $HIGHEST) -> make_latest=$([ "$CURRENT" = "$HIGHEST" ] && echo true || echo false)"
+
       - name: Create Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
@@ -286,3 +309,4 @@ jobs:
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(github.ref, 'rc') }}
+          make_latest: ${{ steps.latest.outputs.make_latest }}
