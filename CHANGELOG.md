@@ -250,6 +250,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Heap (`Mem`) tensor allocation no longer eagerly memsets every element**
+  (`edgefirst-tensor`). `MemBacking::zeroed` had regressed to
+  `(0..n).map(UnsafeCell::new).collect()`, which allocates uninitialised then
+  writes every element — committing every page up front. It now allocates via
+  `alloc_zeroed` (calloc) when `T::zero()` is the all-zeros bit pattern (every
+  primitive numeric type), so the kernel returns lazily-zeroed pages. This backs
+  every `Tensor::image(.., Mem)` and the per-call image intermediates the CPU
+  converter allocates, restoring the pre-regression allocation latency.
 - **GPU EGLImage source cache stale-geometry read (recycled DMA-BUF pools).**
   The OpenGL source EGLImage cache keyed only on buffer identity + plane offset.
   A pooled DMA-BUF tensor reconfigured between converts (`configure_image`, e.g.
