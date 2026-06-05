@@ -185,6 +185,58 @@ fn split_semi_planar(
     Ok(bytes.split_at(stride * src_h))
 }
 
+/// Mutable mirror of [`split_semi_planar`]: split a contiguous semi-planar
+/// destination's mapped bytes into `(luma, chroma)` planes at the
+/// `stride * dst_h` boundary, validating the map holds the full combined plane
+/// first. A bare `split_at_mut` would panic if a caller-supplied (untrusted)
+/// destination's declared dimensions/stride exceed its actual buffer, so this
+/// returns `Error::InvalidShape` instead.
+fn split_semi_planar_mut(
+    bytes: &mut [u8],
+    stride: usize,
+    dst_h: usize,
+    fmt: PixelFormat,
+) -> Result<(&mut [u8], &mut [u8])> {
+    let total_h = fmt.combined_plane_height(dst_h).unwrap_or(dst_h);
+    let need = stride.checked_mul(total_h).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "{fmt:?} plane size overflow (stride={stride}, h={dst_h})"
+        ))
+    })?;
+    if bytes.len() < need {
+        return Err(Error::InvalidShape(format!(
+            "{fmt:?} destination has {} bytes but needs {need} (stride={stride}, h={dst_h})",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.split_at_mut(stride * dst_h))
+}
+
+/// Validate that a mapped plane buffer of `buf_len` bytes can hold `rows` rows
+/// of `stride` bytes each, with `row_bytes` valid bytes per row. Returns
+/// `Error::InvalidShape` (instead of letting a later row slice panic) when a
+/// caller-supplied stride/shape exceeds the actual allocation. `what` labels the
+/// buffer in the error message.
+fn guard_plane(
+    buf_len: usize,
+    stride: usize,
+    rows: usize,
+    row_bytes: usize,
+    what: &str,
+) -> Result<()> {
+    let need = stride.checked_mul(rows).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "{what} plane size overflow (stride={stride}, rows={rows})"
+        ))
+    })?;
+    if row_bytes > stride || buf_len < need {
+        return Err(Error::InvalidShape(format!(
+            "{what} buffer too small: {buf_len} bytes, need {need} (stride={stride}, rows={rows}, row_bytes={row_bytes})"
+        )));
+    }
+    Ok(())
+}
+
 /// Apply XOR 0x80 bias to color channels only, preserving alpha.
 ///
 /// Matches GL int8 shader behavior: `vec4(int8_bias(c.rgb), c.a)`.

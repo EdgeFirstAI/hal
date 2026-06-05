@@ -417,7 +417,20 @@ impl CPUProcessor {
         uv: [u8; 2],
         mut crop: Rect,
     ) -> Result<()> {
-        let (y_plane, uv_plane) = dst.split_at_mut(dst_width * dst_height);
+        // Validate the buffer holds the luma plane before splitting so a
+        // caller-supplied (untrusted) dst cannot panic the `split_at_mut`.
+        let luma = dst_width.checked_mul(dst_height).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "semiplanar fill luma size overflow (w={dst_width}, h={dst_height})"
+            ))
+        })?;
+        if dst.len() < luma {
+            return Err(Error::InvalidShape(format!(
+                "semiplanar fill dst {} bytes < luma plane {luma} (w={dst_width}, h={dst_height})",
+                dst.len()
+            )));
+        }
+        let (y_plane, uv_plane) = dst.split_at_mut(luma);
         Self::fill_image_outside_crop_::<1>((y_plane, dst_width, dst_height), [y], crop)?;
         crop.left /= 2;
         crop.width /= 2;

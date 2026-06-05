@@ -970,7 +970,15 @@ mod g2d_tests {
     ) -> Result<TensorDyn, crate::Error> {
         let img = TensorDyn::image(width, height, format, DType::U8, memory)?;
         let mut map = img.as_u8().unwrap().map()?;
-        map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        let dst = map.as_mut_slice();
+        if bytes.len() > dst.len() {
+            return Err(crate::Error::InvalidShape(format!(
+                "load_raw_image: {} input bytes exceed {}-byte image buffer",
+                bytes.len(),
+                dst.len()
+            )));
+        }
+        dst[..bytes.len()].copy_from_slice(bytes);
         Ok(img)
     }
 

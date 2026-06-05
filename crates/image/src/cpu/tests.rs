@@ -12,6 +12,46 @@ mod cpu_tests {
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
 
+    /// The buffer-geometry guards reject undersized/overflowing inputs with
+    /// `InvalidShape` instead of panicking. Exercised directly on plain slices
+    /// (the end-to-end malformed-tensor path needs an undersized `from_fd`/DMA
+    /// buffer, which is Linux+DMA-gated).
+    #[test]
+    fn buffer_geometry_guards_reject_bad_input() {
+        use super::super::{guard_plane, split_semi_planar_mut};
+
+        // NV16 combined-plane height = 2*h ⇒ stride 4 × h 2 needs 16 bytes.
+        let mut ok = [0u8; 16];
+        let (y, uv) = split_semi_planar_mut(&mut ok, 4, 2, PixelFormat::Nv16).unwrap();
+        assert_eq!((y.len(), uv.len()), (8, 8)); // luma split at stride*h = 8
+
+        let mut small = [0u8; 12];
+        assert!(matches!(
+            split_semi_planar_mut(&mut small, 4, 2, PixelFormat::Nv16),
+            Err(Error::InvalidShape(_))
+        ));
+        let mut tiny = [0u8; 1];
+        assert!(matches!(
+            split_semi_planar_mut(&mut tiny, usize::MAX, 4, PixelFormat::Nv16),
+            Err(Error::InvalidShape(_))
+        ));
+
+        // guard_plane: ok, row_bytes>stride, buffer too small, overflow.
+        assert!(guard_plane(16, 4, 2, 4, "t").is_ok());
+        assert!(matches!(
+            guard_plane(16, 4, 2, 5, "t"),
+            Err(Error::InvalidShape(_))
+        ));
+        assert!(matches!(
+            guard_plane(7, 4, 2, 4, "t"),
+            Err(Error::InvalidShape(_))
+        ));
+        assert!(matches!(
+            guard_plane(1, usize::MAX, 4, 1, "t"),
+            Err(Error::InvalidShape(_))
+        ));
+    }
+
     macro_rules! function {
         () => {{
             fn f() {}

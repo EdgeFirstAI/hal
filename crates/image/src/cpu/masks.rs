@@ -482,7 +482,22 @@ impl CPUProcessor {
                 let transposed_storage =
                     if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
                         let hw = proto_h * proto_w;
-                        let mut nhwc = vec![0i8; hw * num_protos];
+                        // Guard the proto buffer length before the per-plane
+                        // slice so an undersized (e.g. imported `from_fd`) proto
+                        // tensor yields `InvalidShape` instead of a panic/SIGBUS.
+                        let need = hw.checked_mul(num_protos).ok_or_else(|| {
+                            crate::Error::InvalidShape(format!(
+                                "proto NCHW size overflow (hw={hw}, n={num_protos})"
+                            ))
+                        })?;
+                        if src_slice.len() < need {
+                            return Err(crate::Error::InvalidShape(format!(
+                                "proto buffer {} bytes < {need} (proto_h={proto_h}, \
+                                 proto_w={proto_w}, num_protos={num_protos})",
+                                src_slice.len()
+                            )));
+                        }
+                        let mut nhwc = vec![0i8; need];
                         for c in 0..num_protos {
                             let plane = &src_slice[c * hw..(c + 1) * hw];
                             for px in 0..hw {
@@ -851,7 +866,22 @@ impl CPUProcessor {
                 let transposed_storage =
                     if proto_data.layout == edgefirst_decoder::ProtoLayout::Nchw {
                         let hw = proto_h * proto_w;
-                        let mut nhwc = vec![0i8; hw * num_protos];
+                        // Guard the proto buffer length before the per-plane
+                        // slice so an undersized (e.g. imported `from_fd`) proto
+                        // tensor yields `InvalidShape` instead of a panic/SIGBUS.
+                        let need = hw.checked_mul(num_protos).ok_or_else(|| {
+                            crate::Error::InvalidShape(format!(
+                                "proto NCHW size overflow (hw={hw}, n={num_protos})"
+                            ))
+                        })?;
+                        if src_slice.len() < need {
+                            return Err(crate::Error::InvalidShape(format!(
+                                "proto buffer {} bytes < {need} (proto_h={proto_h}, \
+                                 proto_w={proto_w}, num_protos={num_protos})",
+                                src_slice.len()
+                            )));
+                        }
+                        let mut nhwc = vec![0i8; need];
                         for c in 0..num_protos {
                             let plane = &src_slice[c * hw..(c + 1) * hw];
                             for px in 0..hw {

@@ -180,8 +180,42 @@ fn pack_to_planar(
     let mut dst_map = dst.map()?;
     let dst_bytes = dst_map.as_mut_slice();
 
+    // Validate the mapped buffers against the derived geometry before indexing,
+    // so a malformed/untrusted tensor yields `InvalidShape` instead of a panic
+    // (mirrors `planar_to_packed` / `split_semi_planar`).
+    let src_row = w.checked_mul(src_ch).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "pack_to_planar src row overflow (w={w}, ch={src_ch})"
+        ))
+    })?;
     // Each destination plane is `h` rows of `dst_stride` bytes (the row pitch).
-    let plane = dst_stride * h;
+    let plane = dst_stride.checked_mul(h).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "pack_to_planar plane size overflow (stride={dst_stride}, h={h})"
+        ))
+    })?;
+    let src_need = src_stride.checked_mul(h).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "pack_to_planar src size overflow (stride={src_stride}, h={h})"
+        ))
+    })?;
+    let dst_need = plane.checked_mul(plane_src.len()).ok_or_else(|| {
+        Error::InvalidShape(format!(
+            "pack_to_planar dst size overflow (plane={plane}, planes={})",
+            plane_src.len()
+        ))
+    })?;
+    if src_row > src_stride || src_bytes.len() < src_need || dst_bytes.len() < dst_need {
+        return Err(Error::InvalidShape(format!(
+            "pack_to_planar geometry exceeds buffers: src {} (need {src_need}), dst {} (need \
+             {dst_need}), row {src_row} vs stride {src_stride} (w={w}, h={h}, src_ch={src_ch})",
+            src_bytes.len(),
+            dst_bytes.len()
+        )));
+    }
+    if plane == 0 {
+        return Ok(()); // zero-height / empty image: nothing to scatter
+    }
     let plane_slices: Vec<&mut [u8]> = dst_bytes.chunks_mut(plane).take(plane_src.len()).collect();
     rayon::scope(|sc| {
         for (pb, &chan) in plane_slices.into_iter().zip(plane_src.iter()) {
@@ -350,6 +384,8 @@ impl CPUProcessor {
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
+        super::guard_plane(src_bytes.len(), src_stride, src_h, src_w, "nv12→grey src")?;
+        super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "nv12→grey dst")?;
 
         for row in 0..src_h {
             let s = &src_bytes[row * src_stride..][..src_w];
@@ -469,6 +505,14 @@ impl CPUProcessor {
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
+        super::guard_plane(
+            src_bytes.len(),
+            src_stride,
+            src_h,
+            src_w * 2,
+            "yuyv→grey src",
+        )?;
+        super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "yuyv→grey dst")?;
 
         // YUYV byte order per macropixel: [Y0, U, Y1, V] — luma at even offsets.
         for row in 0..src_h {
@@ -495,8 +539,14 @@ impl CPUProcessor {
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        // Split at the stride-aligned luma plane boundary, not the tight one.
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one,
+        // validating the destination holds the full combined plane first.
+        let (y_plane, uv_plane) = super::split_semi_planar_mut(
+            dst_map.as_mut_slice(),
+            dst_stride,
+            dst_h,
+            edgefirst_tensor::PixelFormat::Nv16,
+        )?;
 
         // YUYV byte order per two-pixel macropixel: [Y0, Cb, Y1, Cr].
         // The NV16 chroma row is `even(dst_w)` bytes wide (one (Cb,Cr) pair per
@@ -630,6 +680,14 @@ impl CPUProcessor {
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
+        super::guard_plane(
+            src_bytes.len(),
+            src_stride,
+            src_h,
+            src_w * 2,
+            "vyuy→grey src",
+        )?;
+        super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "vyuy→grey dst")?;
 
         // VYUY byte order per macropixel: [V, Y0, U, Y1] — luma at odd offsets.
         for row in 0..src_h {
@@ -656,8 +714,14 @@ impl CPUProcessor {
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
-        // Split at the stride-aligned luma plane boundary, not the tight one.
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one,
+        // validating the destination holds the full combined plane first.
+        let (y_plane, uv_plane) = super::split_semi_planar_mut(
+            dst_map.as_mut_slice(),
+            dst_stride,
+            dst_h,
+            edgefirst_tensor::PixelFormat::Nv16,
+        )?;
 
         // VYUY byte order per two-pixel macropixel: [V, Y0, U, Y1]. The NV16
         // chroma row is `even(dst_w)` bytes wide, so slice UV to the even width.
@@ -777,8 +841,14 @@ impl CPUProcessor {
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
-        // NV16 luma plane: dst_h rows, then UV plane: another dst_h rows.
-        let (y_plane, uv_plane) = dst_bytes.split_at_mut(dst_stride * src_h);
+        // NV16 luma plane: src_h rows, then UV plane: another src_h rows.
+        // Validate the destination holds the full combined plane before splitting.
+        let (y_plane, uv_plane) = super::split_semi_planar_mut(
+            dst_bytes,
+            dst_stride,
+            src_h,
+            edgefirst_tensor::PixelFormat::Nv16,
+        )?;
 
         for row in 0..src_h {
             // Copy luma row, respecting source and destination strides.
@@ -894,8 +964,14 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map()?;
 
-        // Split at the stride-aligned luma plane boundary, not the tight one.
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one,
+        // validating the destination holds the full combined plane first.
+        let (y_plane, uv_plane) = super::split_semi_planar_mut(
+            dst_map.as_mut_slice(),
+            dst_stride,
+            dst_h,
+            edgefirst_tensor::PixelFormat::Nv16,
+        )?;
         let mut bi_planar_image = yuv::YuvBiPlanarImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(y_plane),
             y_stride: dst_stride as u32,
@@ -1013,8 +1089,14 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let mut dst_map = dst.map()?;
 
-        // Split at the stride-aligned luma plane boundary, not the tight one.
-        let (y_plane, uv_plane) = dst_map.split_at_mut(dst_stride * dst_h);
+        // Split at the stride-aligned luma plane boundary, not the tight one,
+        // validating the destination holds the full combined plane first.
+        let (y_plane, uv_plane) = super::split_semi_planar_mut(
+            dst_map.as_mut_slice(),
+            dst_stride,
+            dst_h,
+            edgefirst_tensor::PixelFormat::Nv16,
+        )?;
         let mut bi_planar_image = yuv::YuvBiPlanarImageMut::<u8> {
             y_plane: yuv::BufferStoreMut::Borrowed(y_plane),
             y_stride: dst_stride as u32,
@@ -1035,7 +1117,19 @@ impl CPUProcessor {
     }
 
     pub(super) fn copy_image(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        dst.map()?.copy_from_slice(&src.map()?);
+        let src_map = src.map()?;
+        let mut dst_map = dst.map()?;
+        let (s, d) = (src_map.as_slice(), dst_map.as_mut_slice());
+        // Guard the length before `copy_from_slice` (which panics on mismatch),
+        // for parity with `prepare_dst_base_cpu`.
+        if s.len() != d.len() {
+            return Err(Error::InvalidShape(format!(
+                "copy_image source/destination size mismatch: {} vs {} bytes",
+                s.len(),
+                d.len()
+            )));
+        }
+        d.copy_from_slice(s);
         Ok(())
     }
 
@@ -1234,6 +1328,8 @@ impl CPUProcessor {
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
+        super::guard_plane(src_bytes.len(), src_stride, src_h, src_w, "nv24→grey src")?;
+        super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "nv24→grey dst")?;
         for row in 0..src_h {
             let s = &src_bytes[row * src_stride..][..src_w];
             let d = &mut dst_bytes[row * dst_stride..][..src_w];
