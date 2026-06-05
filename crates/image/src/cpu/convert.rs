@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::Result;
+use crate::{Error, Result};
 use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -1410,14 +1410,53 @@ impl CPUProcessor {
         let w = src.width().unwrap();
         let h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
-        let plane_stride = src_stride * h;
         let dst_stride = super::tensor_row_stride(dst);
         let has_alpha_plane = dst_ch == 4 && src_planes >= 4;
+        // Planes actually read: R/G/B always, plus the alpha plane when the
+        // destination has one and the source supplies it.
+        let planes_read = if has_alpha_plane { 4 } else { 3 };
 
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
+
+        // Validate the buffers against the derived geometry before indexing.
+        // Like `split_semi_planar`, an imported tensor may carry a stride/shape
+        // that exceeds its actual allocation (untrusted input), so use checked
+        // arithmetic and return `InvalidShape` instead of panicking with an
+        // out-of-bounds slice. `src_stride >= w`, so a plane spans at most
+        // `h * src_stride` bytes and the last row's `w` bytes stay in-plane.
+        let plane_stride = src_stride.checked_mul(h).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "planar plane size overflow (stride={src_stride}, h={h})"
+            ))
+        })?;
+        let src_need = plane_stride.checked_mul(planes_read).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "planar source size overflow (plane_stride={plane_stride}, planes={planes_read})"
+            ))
+        })?;
+        if src_bytes.len() < src_need {
+            return Err(Error::InvalidShape(format!(
+                "planar source has {} bytes but needs {src_need} (stride={src_stride}, h={h}, planes={planes_read})",
+                src_bytes.len()
+            )));
+        }
+        let dst_row = w.checked_mul(dst_ch).ok_or_else(|| {
+            Error::InvalidShape(format!("packed dst row overflow (w={w}, ch={dst_ch})"))
+        })?;
+        let dst_need = dst_stride.checked_mul(h).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "packed dst size overflow (stride={dst_stride}, h={h})"
+            ))
+        })?;
+        if dst_stride < dst_row || dst_bytes.len() < dst_need {
+            return Err(Error::InvalidShape(format!(
+                "packed dst has stride={dst_stride}, {} bytes but needs stride>={dst_row} and {dst_need} bytes (w={w}, h={h}, ch={dst_ch})",
+                dst_bytes.len()
+            )));
+        }
 
         dst_bytes
             .par_chunks_mut(dst_stride)
