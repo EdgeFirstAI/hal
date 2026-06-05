@@ -163,23 +163,6 @@ impl From<PyDimName> for configs::DimName {
     }
 }
 
-impl From<configs::DimName> for PyDimName {
-    fn from(dn: configs::DimName) -> Self {
-        match dn {
-            configs::DimName::Batch => PyDimName::Batch,
-            configs::DimName::Height => PyDimName::Height,
-            configs::DimName::Width => PyDimName::Width,
-            configs::DimName::NumClasses => PyDimName::NumClasses,
-            configs::DimName::NumFeatures => PyDimName::NumFeatures,
-            configs::DimName::NumBoxes => PyDimName::NumBoxes,
-            configs::DimName::NumProtos => PyDimName::NumProtos,
-            configs::DimName::NumAnchorsXFeatures => PyDimName::NumAnchorsXFeatures,
-            configs::DimName::Padding => PyDimName::Padding,
-            configs::DimName::BoxCoords => PyDimName::BoxCoords,
-        }
-    }
-}
-
 /// A model output configuration for programmatic decoder setup.
 ///
 /// Use the static factory methods (`detection`, `boxes`, `scores`, etc.) to

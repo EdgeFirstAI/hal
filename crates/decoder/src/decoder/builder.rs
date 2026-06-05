@@ -1986,24 +1986,36 @@ impl DecoderBuilder {
                 segmentation.shape
             )));
         }
-        Self::verify_dshapes(
-            &segmentation.dshape,
-            &segmentation.shape,
-            "Segmentation",
-            &[
-                DimName::Batch,
-                DimName::Height,
-                DimName::Width,
-                DimName::NumClasses,
-            ],
-        )?;
+        // ModelPack segmentation is canonical NHWC: [Batch, Height, Width,
+        // NumClasses]. Structural integrity of the dshape (rank, per-axis size
+        // agreement with `shape`, no duplicate axes) is already enforced for
+        // every output by `Decoder::validate_output_layout` at build entry, so
+        // here we only require the spatial axes to be named and recover the
+        // class count from the channel axis below.
+        //
+        // Metadata producers that lack embedded metadata (the validator's
+        // shape-inference fallback for ModelPack `.keras` models) tag the
+        // channel axis as `num_protos` or omit its name, which previously
+        // hard-failed here with "Segmentation dshape missing required
+        // dimension NumClasses" (DE-2651 / DE-2628). That is unnecessarily
+        // strict: an unnamed or mis-named channel axis at position 3 is sorted
+        // to the canonical tail by `swap_axes_if_needed`, so the physical NHWC
+        // order — and therefore decode — is unaffected. Infer the class count
+        // from the NHWC shape instead of rejecting the model.
+        if !segmentation.dshape.is_empty() {
+            let names =
+                HashSet::<DimName>::from_iter(segmentation.dshape.iter().map(|(name, _)| *name));
+            for dim in [DimName::Batch, DimName::Height, DimName::Width] {
+                if !names.contains(&dim) {
+                    return Err(DecoderError::InvalidConfig(format!(
+                        "Segmentation dshape missing required dimension {dim:?}"
+                    )));
+                }
+            }
+        }
 
         if let Some(classes) = classes {
-            let seg_classes = if !segmentation.dshape.is_empty() {
-                Self::get_class_count(&segmentation.dshape, None, None)?
-            } else {
-                Self::get_class_count_no_dshape(segmentation.into(), None)?
-            };
+            let seg_classes = Self::modelpack_seg_num_classes(segmentation);
 
             if seg_classes != classes + 1 {
                 return Err(DecoderError::InvalidConfig(format!(
@@ -2013,6 +2025,23 @@ impl DecoderBuilder {
             }
         }
         Ok(())
+    }
+
+    /// Number of segmentation classes for a ModelPack segmentation output.
+    ///
+    /// Prefers an explicit `NumClasses` dshape dimension when present;
+    /// otherwise falls back to the canonical NHWC channel axis (`shape[3]`).
+    /// This tolerates metadata that omits or mis-tags the class axis while
+    /// still honouring a correctly-tagged dshape. Only called after
+    /// `verify_modelpack_seg` has validated that `shape` is rank-4 (it returns
+    /// `InvalidConfig` otherwise), so `shape[3]` cannot panic.
+    fn modelpack_seg_num_classes(segmentation: &configs::Segmentation) -> usize {
+        for (dim_name, dim_size) in &segmentation.dshape {
+            if *dim_name == DimName::NumClasses {
+                return *dim_size;
+            }
+        }
+        segmentation.shape[3]
     }
 
     // verifies that dshapes match the given shape
@@ -2139,7 +2168,6 @@ impl DecoderBuilder {
                 DecoderType::Ultralytics => Ok(scores.shape[1]),
                 DecoderType::ModelPack => Ok(scores.shape[2]),
             },
-            ConfigOutputRef::Segmentation(seg) => Ok(seg.shape[3]),
             _ => Err(DecoderError::Internal(
                 "Attempted to get class count from unsupported config output".to_owned(),
             )),
