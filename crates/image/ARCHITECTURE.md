@@ -285,7 +285,7 @@ Both paths feed the existing, dtype-appropriate output render unchanged: u8/i8
 RGB(A) into a zero-copy DMA target for the quantized NPU targets (imx8mp vx,
 imx95 Neutron), or the RGBA8→PlanarRgb-F16 packer for the F16 targets
 (Tegra/orin, macOS). `last_nv_convert_path` records which path ran
-(`HwYuvA`/`R8ShaderB`/`Cpu`) so tests and the profiler can assert no silent CPU
+(`ExternalSampler`/`ShaderR8`/`Cpu`) so tests and the profiler can assert no silent CPU
 fallback for a DMA NV* source.
 
 ### macOS GL backend (`gl/macos_processor.rs`)

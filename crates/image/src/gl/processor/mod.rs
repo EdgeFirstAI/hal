@@ -49,14 +49,34 @@ pub(super) use float::dma_f16_packed_layout;
 /// reader observing it after, say, an RGBA convert sees the prior NV* value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NvConvertPath {
-    /// Path A: driver-decoded YUV via `samplerExternalOES` EGLImage.
-    HwYuvA,
-    /// Path B: hand-written texelFetch R8 shader (ES 3.0, no extension).
-    R8ShaderB,
+    /// Driver-decoded YUV via `samplerExternalOES` EGLImage. The GPU driver
+    /// performs YUV→RGB (matrix + chroma upsampling); colorimetry is only as
+    /// correct as the driver's EGL hint support. Required for true-multiplane
+    /// NV12 (separate Y/UV fds). Was "Path A".
+    ExternalSampler,
+    /// R8 `texelFetch` shader applying the exact per-tensor YUV→RGB matrix in
+    /// the shader (ES 3.0, no extension). Portable and identical across GPUs;
+    /// no width constraint (uses the 64-aligned stride). Was "Path B".
+    ShaderR8,
     /// CPU fallback (EGLImage creation failed or format not DMA-backed).
     Cpu,
     /// Not yet set (initial state, or non-NV* convert).
     None,
+}
+
+/// Client preference for the NV* GPU conversion path, set via
+/// `EDGEFIRST_NV_CONVERT_PATH` (`sampler` | `shader` | `auto`).
+///
+/// `Auto` prefers [`NvConvertPath::ShaderR8`] (portable, colorimetry-exact)
+/// wherever possible, using [`NvConvertPath::ExternalSampler`] only when the
+/// shader path is impossible (true-multiplane NV12). The forced variants are
+/// for benchmarking and platform bring-up; an impossible force logs a warning
+/// and falls back rather than failing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NvPathPref {
+    Auto,
+    ForceSampler,
+    ForceShader,
 }
 
 /// OpenGL single-threaded image converter.
@@ -184,6 +204,8 @@ pub struct GLProcessorST {
     nv_r8_egl_cache: EglImageCache,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
+    /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
+    nv_path_pref: NvPathPref,
     pub(super) gl_context: GlContext,
 }
 
@@ -631,6 +653,45 @@ impl GLProcessorST {
         let vertex_buffer = Buffer::new(0, 3, 100);
         let texture_buffer = Buffer::new(1, 2, 100);
 
+        // EGLImage cache capacity (per cache: src / dst / nv_r8). The key carries
+        // geometry, so a pool buffer reused at N distinct sizes needs N live
+        // EGLImages to avoid evict/re-import churn; a parallel decode pool wants
+        // headroom for (pool slots × distinct sizes). Capacity is the eviction
+        // bound only — EGLImages are lightweight views into the tensor's existing
+        // DMA-BUF (no pixel copy) and are created on demand, so a large default is
+        // free for fixed-dimension workloads (live camera) that only ever use a
+        // size or two. Override with EDGEFIRST_EGL_CACHE_CAPACITY for high-
+        // cardinality varied-size streams (e.g. dataset validation).
+        const DEFAULT_EGL_CACHE_CAPACITY: usize = 64;
+        let egl_cache_capacity = std::env::var("EDGEFIRST_EGL_CACHE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(DEFAULT_EGL_CACHE_CAPACITY);
+
+        // NV* conversion-path preference. `auto` (default) prefers the portable,
+        // colorimetry-exact in-shader ShaderR8 path; `sampler`/`shader` force a
+        // path for benchmarking / platform bring-up (an impossible force warns
+        // and falls back). Mirrors the EDGEFIRST_FORCE_TRANSFER idiom below.
+        let nv_path_pref = match std::env::var("EDGEFIRST_NV_CONVERT_PATH") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "sampler" | "external" | "a" => NvPathPref::ForceSampler,
+                "shader" | "r8" | "b" => NvPathPref::ForceShader,
+                "auto" | "" => NvPathPref::Auto,
+                other => {
+                    log::warn!(
+                        "EDGEFIRST_NV_CONVERT_PATH={other:?} not recognised \
+                         (expected sampler|shader|auto), using auto"
+                    );
+                    NvPathPref::Auto
+                }
+            },
+            Err(_) => NvPathPref::Auto,
+        };
+        if nv_path_pref != NvPathPref::Auto {
+            log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
+        }
+
         let mut converter = GLProcessorST {
             gl_context,
             texture_program,
@@ -666,8 +727,8 @@ impl GLProcessorST {
             convert_fbo: FrameBuffer::new(),
             draw_fbo: FrameBuffer::new(),
             draw_render_texture,
-            src_egl_cache: EglImageCache::new(8),
-            dst_egl_cache: EglImageCache::new(8),
+            src_egl_cache: EglImageCache::new(egl_cache_capacity),
+            dst_egl_cache: EglImageCache::new(egl_cache_capacity),
             bgra_warned: false,
             is_vivante,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -689,8 +750,9 @@ impl GLProcessorST {
             nv_r8_program,
             nv_r8_int8_program,
             nv_r8_texture: Texture::new(),
-            nv_r8_egl_cache: EglImageCache::new(8),
+            nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
+            nv_path_pref,
         };
         check_gl_error(function!(), line!())?;
 
@@ -1395,10 +1457,18 @@ impl GLProcessorST {
                     | PixelFormat::Nv24
             )
         } else {
+            // Non-DMA (PBO/Sync): packed RGB(A)/Grey upload via draw_src_texture,
+            // plus single-plane NV12/NV16/NV24 via the R8-upload ShaderR8 path
+            // (combined buffer uploaded as R8 + in-shader YUV — no DMA-BUF
+            // EGLImage needed; the GPU NV path on e.g. orin). Multiplane NV12
+            // can't be uploaded as one R8 texture and falls to CPU.
             matches!(
                 fmt,
                 PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Grey
-            )
+            ) || (matches!(
+                fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) && !img.is_multiplane())
         }
     }
 
@@ -1551,12 +1621,11 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let luma_id = dst.buffer_identity().id();
-        let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
-        let dst_key = (luma_id, chroma_id, dst.plane_offset().unwrap_or(0));
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
-        match self.cached_dst_renderbuffer(dst) {
+        match self.cached_dst_renderbuffer(dst, dst_fmt) {
             Some(rbo) => unsafe {
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
                 gls::gl::FramebufferRenderbuffer(
@@ -1633,12 +1702,11 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let luma_id = dst.buffer_identity().id();
-        let chroma_id = dst.chroma().map(|t| t.buffer_identity().id());
-        let dst_key = (luma_id, chroma_id, dst.plane_offset().unwrap_or(0));
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
-        match self.cached_dst_renderbuffer(dst) {
+        match self.cached_dst_renderbuffer(dst, dst_fmt) {
             Some(rbo) => unsafe {
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
                 gls::gl::FramebufferRenderbuffer(
@@ -1712,26 +1780,23 @@ impl GLProcessorST {
             );
             self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else if dst_fmt.layout() == PixelLayout::Planar {
-            // Vivante two-pass: force RGBA8 intermediate for NV12 → PlanarRgb.
-            // NV16/NV24 use Path B which always produces RGBA8 first — the
-            // `convert_nv_to_planar_two_pass` function calls `convert_to`
-            // internally, which now routes NV16/NV24 through Path B anyway.
-            // So extending the Vivante guard to NV16/NV24 costs nothing extra
-            // and avoids any potential single-pass hang on Vivante for these
-            // formats (untested on Vivante, but safe-by-construction).
-            if self.is_vivante
-                && matches!(
-                    src_fmt,
-                    PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-                )
-            {
-                // Two-pass workaround: NV*→RGBA intermediate → RGBA→PlanarRgb.
-                // NV12: required (EDGEAI-1180 GPU hang on Vivante GC7000UL).
-                // NV16/NV24: Path B already produces RGBA8, making the "two-pass"
-                // the natural pipeline — no extra cost, just consistent dispatch.
+            // All NV12/NV16/NV24 → Planar go through the two-pass pipeline
+            // (NV*→RGBA8 intermediate → RGBA→PlanarRgb), because the intermediate
+            // pass delegates to `convert_to`, which routes NV* through
+            // `select_nv_path` — giving planar output the SAME colorimetry-exact
+            // `ShaderR8` path (and Vivante carve-out, and multiplane→ExternalSampler)
+            // as the packed path. The old single-pass `convert_to_planar` binds
+            // `samplerExternalOES` directly (driver YUV→RGB): colorimetry-wrong on
+            // hint-ignoring/bilinear-chroma drivers for NV12, and has NO sampler
+            // path at all for NV16/NV24. Two-pass also subsumes the Vivante NV12
+            // single-pass GPU hang (EDGEAI-1180).
+            if matches!(
+                src_fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) {
                 log::trace!(
                     "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass planar \
-                     (Vivante workaround: RGBA intermediate + planar_2d{}shader)",
+                     (RGBA intermediate + planar_2d{}shader; select_nv_path-driven)",
                     if is_int8 { "_int8_" } else { "_" }
                 );
                 self.convert_nv_to_planar_two_pass(
@@ -2837,6 +2902,77 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Pick the NV* GPU conversion path for `src`/`src_fmt`, honoring the
+    /// `EDGEFIRST_NV_CONVERT_PATH` preference. Returns the path to *attempt*;
+    /// the caller maps an EGLImage-creation error to the [`NvConvertPath::Cpu`]
+    /// fallback. Forcing an unavailable path logs a warning and falls back to
+    /// the only viable one rather than failing.
+    ///
+    /// Capability:
+    /// - [`NvConvertPath::ShaderR8`] needs a single combined-plane buffer, so it
+    ///   covers single-plane NV12/NV16/NV24 but NOT true-multiplane NV12.
+    /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) is wired for
+    ///   NV12 only (incl. multiplane); NV16/NV24 have no sampler path.
+    fn select_nv_path(&self, src: &Tensor<u8>, src_fmt: PixelFormat) -> NvConvertPath {
+        // `ShaderR8` (R8 texelFetch) only applies to SINGLE-PLANE semi-planar
+        // NV12/NV16/NV24. Everything else routed through this picker —
+        // RGBA/Grey/YUYV/RGB and true-multiplane NV12 — uses the
+        // `ExternalSampler` (samplerExternalOES / `draw_camera_texture_eglimage`)
+        // path, so that is the default.
+        let shader_capable = matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) && !src.is_multiplane();
+        if !shader_capable {
+            return NvConvertPath::ExternalSampler;
+        }
+        // From here: single-plane NV12/NV16/NV24 — ShaderR8 is viable. Only NV12
+        // also has an ExternalSampler path (NV16/NV24 do not).
+        match self.nv_path_pref {
+            NvPathPref::ForceShader => NvConvertPath::ShaderR8,
+            NvPathPref::ForceSampler => {
+                if src_fmt == PixelFormat::Nv12 {
+                    NvConvertPath::ExternalSampler
+                } else {
+                    log::warn!(
+                        "EDGEFIRST_NV_CONVERT_PATH=sampler unavailable for {src_fmt:?} \
+                         (no external-sampler path); using shader"
+                    );
+                    NvConvertPath::ShaderR8
+                }
+            }
+            // Auto: prefer the portable, colorimetry-exact in-shader ShaderR8.
+            //
+            // EXCEPTION — Vivante (i.MX 8MP): the texelFetch shader is ~12×
+            // slower than the hardware samplerExternalOES (on-target benchmark:
+            // NV12 720p convert 29ms shader vs 2.5ms sampler), and Vivante's
+            // fixed BT.601-limited sampler matrix MATCHES the reference for
+            // BT.601-limited sources (Phase 2 probe: ≤1 vs CPU). So for
+            // single-plane NV12 that is BT.601-limited and 4-aligned (the
+            // sampler import constraint), prefer ExternalSampler on Vivante.
+            // Full-range / BT.709 on Vivante still take ShaderR8 (slow but
+            // colorimetry-correct — the driver would apply the wrong matrix).
+            NvPathPref::Auto => {
+                let vivante_sampler_fast_path = src_fmt == PixelFormat::Nv12
+                    && self.is_vivante
+                    && src.width().is_some_and(|w| w.is_multiple_of(4))
+                    && {
+                        let cm = crate::colorimetry::resolve_colorimetry(
+                            src.colorimetry(),
+                            src.height(),
+                        );
+                        cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
+                            && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
+                    };
+                if vivante_sampler_fast_path {
+                    NvConvertPath::ExternalSampler
+                } else {
+                    NvConvertPath::ShaderR8
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn convert_to(
         &mut self,
@@ -2905,52 +3041,26 @@ impl GLProcessorST {
             crate::Rotation::CounterClockwise90 => 3,
         };
         if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
-            // NV16/NV24: Path B (R8 texelFetch shader, ES 3.0 core).
-            // NV12: Path A (samplerExternalOES YUV EGLImage) is only reliable on
-            // Vivante — on Mali-G310 (i.MX95) it samples garbage (GPU-vs-CPU
-            // max_diff 255), and the YUV EGLImage import also requires width % 4
-            // == 0 on some drivers (e.g. V3D). Restrict NV12 Path A to Vivante at
-            // a 4-aligned width; everything else takes Path B, the portable R8
-            // texelFetch shader (no width constraint; NV12 via chroma_shift=(1,1),
-            // chroma_lines=1). Path B already covers NV16/NV24 on every target.
-            // True-multiplane NV12 (separate Y/UV DMA-BUFs) MUST stay on Path A:
-            // Path B imports a single combined-plane R8 buffer and cannot address
-            // separate planes. For single-plane (combined) NV12, Path A is only
-            // reliable on Vivante (garbage on Mali), so restrict it to Vivante at
-            // a 4-aligned width; everything else takes the portable Path B.
-            // Path A (samplerExternalOES) hands YUV→RGB to the DRIVER. On
-            // hint-ignoring GPUs (Vivante) that is a FIXED BT.601-limited
-            // matrix, so single-plane Path A is only colorimetry-correct when
-            // the resolved colorimetry actually IS BT.601 limited. For any
-            // other colorimetry (full-range — e.g. JFIF JPEG — or BT.709/2020)
-            // force the in-shader Path B, which applies the exact matrix via
-            // the per-tensor uniforms. (True-multiplane NV12 can ONLY use Path
-            // A — Path B imports one combined buffer — but such tensors are
-            // camera BT.601-limited in practice; Path A's merged EGL color
-            // hints cover the hint-honoring drivers.)
-            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
-            let driver_default_colorimetry = cm.encoding
-                == Some(edgefirst_tensor::ColorEncoding::Bt601)
-                && cm.range == Some(edgefirst_tensor::ColorRange::Limited);
-            let nv12_path_a_ok = src_fmt == PixelFormat::Nv12
-                && src_w.is_multiple_of(4)
-                && (src.is_multiplane() || (self.is_vivante && driver_default_colorimetry));
-            let use_path_b = matches!(src_fmt, PixelFormat::Nv16 | PixelFormat::Nv24)
-                || (src_fmt == PixelFormat::Nv12 && !nv12_path_a_ok);
+            // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
+            // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
+            // prefers the portable, colorimetry-exact in-shader ShaderR8 for
+            // single-plane NV12/NV16/NV24, using the driver ExternalSampler only
+            // for true-multiplane NV12 (which ShaderR8 cannot import).
+            let chosen = self.select_nv_path(src, src_fmt);
 
-            if use_path_b {
+            if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
                     Ok(r8_egl) => {
                         tracing::trace!(
-                            path = "R8ShaderB",
+                            path = "ShaderR8",
                             src_fmt = ?src_fmt,
                             "image.convert.gl.nv_path"
                         );
-                        self.last_nv_convert_path = NvConvertPath::R8ShaderB;
+                        self.last_nv_convert_path = NvConvertPath::ShaderR8;
                         self.draw_nv_texture_2d(
                             src,
                             src_fmt,
-                            r8_egl,
+                            Some(r8_egl),
                             src_roi,
                             dst_roi,
                             rotation_offset,
@@ -2984,12 +3094,14 @@ impl GLProcessorST {
                     }
                 }
             } else {
-                // Path A for NV12 (proven); NV16/NV24 always use Path B above.
+                // ExternalSampler path (samplerExternalOES): NV12 (incl.
+                // multiplane) and all non-shader DMA formats (RGBA/Grey/YUYV);
+                // single-plane NV12/NV16/NV24 take ShaderR8 above.
                 match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                     Ok(src_egl) => {
                         if src_fmt == PixelFormat::Nv12 {
-                            tracing::trace!(path = "HwYuvA", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
-                            self.last_nv_convert_path = NvConvertPath::HwYuvA;
+                            tracing::trace!(path = "ExternalSampler", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
+                            self.last_nv_convert_path = NvConvertPath::ExternalSampler;
                         }
                         self.draw_camera_texture_eglimage(
                             src,
@@ -3024,10 +3136,22 @@ impl GLProcessorST {
                     }
                 }
             }
+        } else if matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        ) && !src.is_multiplane()
+        {
+            // Non-DMA (PBO/Sync) single-plane NV*: GPU-convert via the SAME
+            // ShaderR8 in-shader path used for DMA, but with the combined buffer
+            // CPU-UPLOADED as R8 instead of EGLImage-imported. This enables the
+            // NV shaders on backends without DMA-BUF EGLImage import (e.g. orin),
+            // replacing the old CPU fallback. Multiplane NV12 (separate Y/UV
+            // buffers) cannot be uploaded as one R8 texture → CPU below.
+            tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
+            self.last_nv_convert_path = NvConvertPath::ShaderR8;
+            self.draw_nv_texture_2d(src, src_fmt, None, src_roi, dst_roi, rotation_offset, flip)?;
         } else {
-            // Non-DMA source: any NV* falls back to the CPU texture-upload path
-            // (no zero-copy EGLImage). Record it so tests/profiler see the CPU
-            // fallback rather than a stale path from a prior frame.
+            // Non-DMA source, non-NV (or multiplane NV): CPU texture-upload path.
             if matches!(
                 src_fmt,
                 PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
@@ -3152,11 +3276,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_key = (
-            src.buffer_identity().id(),
-            src.chroma().map(|t| t.buffer_identity().id()),
-            src.plane_offset().unwrap_or(0),
-        );
+        let src_key = EglCacheKey::from_tensor(src, src_fmt);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
@@ -3249,7 +3369,7 @@ impl GLProcessorST {
             4,
         )?;
         unsafe {
-            match self.cached_dst_renderbuffer(dst) {
+            match self.cached_dst_renderbuffer(dst, dst_fmt) {
                 Some(rbo) => {
                     gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
                     gls::gl::FramebufferRenderbuffer(
@@ -3629,12 +3749,12 @@ impl GLProcessorST {
                 check_gl_error(function!(), line!())?;
                 log::trace!(
                     "draw_camera_planar: bound new src EGLImage id={:#x}",
-                    src_key.0
+                    src_key.luma_id
                 );
             } else {
                 log::trace!(
                     "draw_camera_planar: reusing bound src EGLImage id={:#x}",
-                    src_key.0
+                    src_key.luma_id
                 );
             }
             let y_centers = if alpha {
@@ -4035,16 +4155,15 @@ impl GLProcessorST {
     fn draw_camera_texture_eglimage(
         &mut self,
         src: &Tensor<u8>,
-        _src_fmt: PixelFormat,
+        src_fmt: PixelFormat,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        let luma_id = src.buffer_identity().id();
-        let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
-        let src_key = (luma_id, chroma_id, src.plane_offset().unwrap_or(0));
+        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let luma_id = src_key.luma_id;
 
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
@@ -4161,12 +4280,18 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Path B: render NV12/NV16/NV24 → RGBA8 via the R8 texelFetch shader.
+    /// `ShaderR8`: render NV12/NV16/NV24 → RGBA8 via the R8 texelFetch shader.
     ///
-    /// The combined semi-planar buffer was imported as a single-plane R8
-    /// EGLImage (`create_image_from_dma_nv_r8`) and bound as `TEXTURE_2D`.
-    /// The shader addresses Y and UV bytes directly, parameterised by four
-    /// uniforms derived from the source format.
+    /// The combined semi-planar buffer is presented as a single-plane R8
+    /// `TEXTURE_2D` and the shader addresses Y and UV bytes directly,
+    /// parameterised by four uniforms derived from the source format.
+    ///
+    /// `r8_src` selects how the R8 texture is established:
+    /// - `Some(egl_img)` — zero-copy EGLImage import (DMA-BUF source, the
+    ///   `create_image_from_dma_nv_r8` path).
+    /// - `None` — CPU upload of the combined buffer via `glTexImage2D` (the
+    ///   non-DMA / PBO path, e.g. orin where DMA-BUF EGLImage import is
+    ///   unavailable). Same shader, same exact in-shader matrix.
     ///
     /// Renders into the currently-bound FBO (the RGBA8 intermediate or the
     /// DMA destination) — identical output slot to `draw_camera_texture_eglimage`.
@@ -4175,7 +4300,7 @@ impl GLProcessorST {
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-        egl_img: egl::Image,
+        r8_src: Option<egl::Image>,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -4201,9 +4326,8 @@ impl GLProcessorST {
         let chroma_shift_y = layout.shift_y as i32;
         let chroma_lines = layout.uv_rows_per_luma as i32;
 
-        let luma_id = src.buffer_identity().id();
-        let chroma_id = src.chroma().map(|t| t.buffer_identity().id());
-        let src_key = (luma_id, chroma_id, src.plane_offset().unwrap_or(0));
+        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let luma_id = src_key.luma_id;
 
         // `nv_r8_program` may have been swapped to the int8 variant by
         // `convert_dest_dma` for int8 destinations — always use the current
@@ -4236,11 +4360,73 @@ impl GLProcessorST {
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
 
-            if self.nv_r8_texture.bind_egl_image(src_key, egl_img.as_ptr()) {
-                check_gl_error(function!(), line!())?;
-                log::trace!("draw_nv_texture_2d: bound new R8 EGLImage id={luma_id:#x}");
-            } else {
-                log::trace!("draw_nv_texture_2d: reusing bound R8 EGLImage id={luma_id:#x}");
+            match r8_src {
+                Some(egl_img) => {
+                    if self.nv_r8_texture.bind_egl_image(src_key, egl_img.as_ptr()) {
+                        check_gl_error(function!(), line!())?;
+                        log::trace!("draw_nv_texture_2d: bound new R8 EGLImage id={luma_id:#x}");
+                    } else {
+                        log::trace!(
+                            "draw_nv_texture_2d: reusing bound R8 EGLImage id={luma_id:#x}"
+                        );
+                    }
+                }
+                None => {
+                    // Non-DMA upload path: upload the combined semi-planar buffer
+                    // as an R8 texture (tex_width × combined_plane_height). The
+                    // shader addresses it identically to the EGLImage case, so
+                    // the in-shader YUV matrix is byte-for-byte the same as the
+                    // DMA ShaderR8 path. Used where DMA-BUF EGLImage import is
+                    // unavailable (e.g. orin) or the source is heap-backed.
+                    //
+                    // A PBO source MUST NOT reach here: `map()` on a PBO tensor on
+                    // the GL thread deadlocks (the buffer is GL-owned). PBO sources
+                    // go through `draw_src_texture_from_pbo`; guard the invariant
+                    // locally rather than relying solely on the dispatch call graph.
+                    if src.as_pbo().is_some() {
+                        return Err(Error::NotSupported(
+                            "NV R8 upload cannot map a PBO source on the GL thread; \
+                             route PBO sources through the PBO upload path"
+                                .into(),
+                        ));
+                    }
+                    let combined_h = src_fmt.combined_plane_height(src_h).ok_or_else(|| {
+                        Error::NotSupported(format!(
+                            "draw_nv_texture_2d upload: {src_fmt:?} is not semi-planar"
+                        ))
+                    })?;
+                    let offset = src.plane_offset().unwrap_or(0);
+                    let needed = tex_width as usize * combined_h;
+                    let map = src.map()?;
+                    let bytes = map.as_slice();
+                    if offset + needed > bytes.len() {
+                        return Err(Error::InvalidShape(format!(
+                            "NV R8 upload: need {needed} bytes at offset {offset} but buffer is {}",
+                            bytes.len()
+                        )));
+                    }
+                    // `UNPACK_ALIGNMENT` is 1 (set once in `new`), so any row width
+                    // is valid — no 4-aligned-pitch requirement on the upload.
+                    // (TODO/EDGEAI: reuse storage via glTexSubImage2D when dims are
+                    // unchanged instead of reallocating every frame — tracked
+                    // follow-up; needs EGLImage-vs-upload storage tracking to be safe.)
+                    gls::gl::TexImage2D(
+                        gls::gl::TEXTURE_2D,
+                        0,
+                        gls::gl::R8 as i32,
+                        tex_width,
+                        combined_h as i32,
+                        0,
+                        gls::gl::RED,
+                        gls::gl::UNSIGNED_BYTE,
+                        bytes[offset..].as_ptr() as *const c_void,
+                    );
+                    check_gl_error(function!(), line!())?;
+                    // The texture now holds uploaded pixels, not an EGLImage —
+                    // clear the EGLImage binding key so a later DMA convert rebinds.
+                    self.nv_r8_texture.invalidate_egl_binding();
+                    log::trace!("draw_nv_texture_2d: uploaded R8 ({tex_width}x{combined_h})");
+                }
             }
 
             // Set uniforms (img_size, tex_width, chroma_shift, chroma_lines).
@@ -4389,9 +4575,8 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<egl::Image, crate::Error> {
-        let luma_id = img.buffer_identity().id();
-        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
-        let id = (luma_id, chroma_id, img.plane_offset().unwrap_or(0));
+        let id = EglCacheKey::from_tensor(img, img_fmt);
+        let luma_id = id.luma_id;
 
         if self.nv_r8_egl_cache.sweep() {
             self.nv_r8_texture.invalidate_egl_binding();
@@ -4471,12 +4656,12 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<egl::Image, crate::Error> {
-        let luma_id = img.buffer_identity().id();
-        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
-        // Include the plane offset: sub-region views share one buffer identity
-        // but need distinct EGLImages, else offset-distinct views alias the
-        // first (offset-0) image and render/sample the base region.
-        let id = (luma_id, chroma_id, img.plane_offset().unwrap_or(0));
+        // Identity + offset + geometry: sub-region views share one buffer
+        // identity but need distinct EGLImages (offset), and a pooled buffer
+        // reconfigured to a new size/format/stride needs a fresh import
+        // (geometry) — see EglCacheKey.
+        let id = EglCacheKey::from_tensor(img, img_fmt);
+        let luma_id = id.luma_id;
 
         // Sweep dead entries opportunistically before looking up.
         // Invalidate texture binding state since sweep may remove a bound entry.
@@ -4567,13 +4752,11 @@ impl GLProcessorST {
     }
 
     /// Look up the renderbuffer ID for a cached destination EGLImage.
-    fn cached_dst_renderbuffer<T>(&self, img: &Tensor<T>) -> Option<u32>
+    fn cached_dst_renderbuffer<T>(&self, img: &Tensor<T>, fmt: PixelFormat) -> Option<u32>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let luma_id = img.buffer_identity().id();
-        let chroma_id = img.chroma().map(|t| t.buffer_identity().id());
-        let id = (luma_id, chroma_id, img.plane_offset().unwrap_or(0));
+        let id = EglCacheKey::from_tensor(img, fmt);
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4639,7 +4822,7 @@ impl GLProcessorST {
     fn get_or_create_egl_image_rgb<T>(
         &mut self,
         img: &Tensor<T>,
-        _img_fmt: PixelFormat,
+        img_fmt: PixelFormat,
         width: usize,
         height: usize,
         drm_format: DrmFourcc,
@@ -4648,11 +4831,10 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = (
-            img.buffer_identity().id(),
-            None,
-            img.plane_offset().unwrap_or(0),
-        );
+        // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
+        // dst path: the packed render dims derive deterministically from the
+        // tensor's logical geometry, so `from_tensor` is a consistent key.
+        let id = EglCacheKey::from_tensor(img, img_fmt);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }
@@ -4661,11 +4843,11 @@ impl GLProcessorST {
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
-            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.0);
+            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.luma_id);
             return Ok(cached.egl_image.egl_image);
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.0);
+        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.luma_id);
         // Invalidate dst texture binding state on cache miss (new EGLImage creation).
         self.invalidate_dst_textures();
 

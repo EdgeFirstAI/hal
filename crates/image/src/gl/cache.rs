@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::resources::EglImage;
+use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 
 /// Selects which EGLImage cache to use.
 #[derive(Debug, PartialEq)]
@@ -26,12 +27,52 @@ pub(super) struct CachedEglImage {
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access
 /// updates the entry's `last_used` timestamp, and eviction removes the entry
 /// with the smallest `last_used` value.
-/// Cache key: `(luma_id, chroma_id, plane_offset)`. For single-plane images,
-/// `chroma_id` is `None`. `plane_offset` distinguishes sub-region views that
-/// share one buffer (same identities) but start at different byte offsets —
-/// without it, N offset-distinct views of one DMA-BUF collide on the first
-/// (offset-0) EGLImage and every view renders/samples the base region.
-pub(super) type EglCacheKey = (u64, Option<u64>, usize);
+/// Identity + geometry that uniquely determine an imported EGLImage.
+///
+/// `luma_id` / `chroma_id` are the buffer identities; `plane_offset`
+/// distinguishes sub-region views that share one buffer but start at different
+/// byte offsets (without it, N offset-distinct views of one DMA-BUF collide on
+/// the first EGLImage and every view renders/samples the base region).
+///
+/// `width` / `height` / `row_stride` / `format` capture the geometry the
+/// EGLImage was imported with. A pooled buffer reused at a different size via
+/// `Tensor::configure_image` (e.g. a 128-wide pool decoding a 96-wide image)
+/// keeps the same identities and `plane_offset`, but needs a fresh import: the
+/// import's pitch/dimensions/fourcc all derive from these fields. Omitting them
+/// reuses the stale-geometry EGLImage and the GPU samples the buffer at the
+/// wrong pitch — deterministically wrong single-threaded, nondeterministic in
+/// parallel, correct only on a heap source (which never takes this path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct EglCacheKey {
+    pub(super) luma_id: u64,
+    pub(super) chroma_id: Option<u64>,
+    pub(super) plane_offset: usize,
+    pub(super) width: usize,
+    pub(super) height: usize,
+    pub(super) row_stride: usize,
+    pub(super) format: PixelFormat,
+}
+
+impl EglCacheKey {
+    /// Build the cache key from a tensor and the format it will be imported as.
+    /// Every construction site MUST go through this so the key used to insert
+    /// an EGLImage matches the key used to look it up and to gate the texture
+    /// binding-skip.
+    pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat) -> Self
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
+        Self {
+            luma_id: img.buffer_identity().id(),
+            chroma_id: img.chroma().map(|t| t.buffer_identity().id()),
+            plane_offset: img.plane_offset().unwrap_or(0),
+            width: img.width().unwrap_or(0),
+            height: img.height().unwrap_or(0),
+            row_stride: img.effective_row_stride().unwrap_or(0),
+            format,
+        }
+    }
+}
 
 pub(super) struct EglImageCache {
     pub(super) entries: std::collections::HashMap<EglCacheKey, CachedEglImage>,
@@ -111,7 +152,27 @@ impl Drop for EglImageCache {
 #[cfg(test)]
 mod tests {
     use super::EglCacheKey;
+    use edgefirst_tensor::PixelFormat;
     use std::collections::HashMap;
+
+    fn key(
+        luma_id: u64,
+        plane_offset: usize,
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        format: PixelFormat,
+    ) -> EglCacheKey {
+        EglCacheKey {
+            luma_id,
+            chroma_id: None,
+            plane_offset,
+            width,
+            height,
+            row_stride,
+            format,
+        }
+    }
 
     #[test]
     fn cache_key_distinguishes_plane_offset() {
@@ -121,8 +182,8 @@ mod tests {
         // the first (offset-0) EGLImage is reused for every offset and the GPU
         // renders/samples the base region.
         let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
-        let base: EglCacheKey = (0xABCD, None, 0);
-        let at_offset: EglCacheKey = (0xABCD, None, 4096);
+        let base = key(0xABCD, 0, 64, 64, 64, PixelFormat::Grey);
+        let at_offset = key(0xABCD, 4096, 64, 64, 64, PixelFormat::Grey);
         map.insert(base, 1);
         map.insert(at_offset, 2);
         assert_eq!(map.len(), 2, "offset-distinct views must not collide");
@@ -133,5 +194,47 @@ mod tests {
         map.insert(base, 3);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&base), Some(&3));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_geometry() {
+        // Root-cause regression guard for the pool-recycle bug: ONE buffer
+        // (same luma_id + offset) reconfigured to different geometry via
+        // `configure_image` must produce DISTINCT keys — otherwise the EGLImage
+        // imported for the first geometry is reused at the wrong pitch.
+        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let g0 = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
+        let g1 = key(0xBEEF, 0, 96, 128, 96, PixelFormat::Grey); // different w/h/stride
+        let g2 = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Nv12); // different format
+        map.insert(g0, 1);
+        map.insert(g1, 2);
+        map.insert(g2, 3);
+        assert_eq!(
+            map.len(),
+            3,
+            "geometry/format-distinct reuses must not collide"
+        );
+
+        // Same identity + same geometry is still a genuine hit.
+        let g0_again = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
+        map.insert(g0_again, 4);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&g0), Some(&4));
+    }
+
+    #[test]
+    fn cache_key_distinguishes_stride() {
+        // A stride-only change (same identity/offset/w/h/format, different
+        // row_stride — e.g. a padded vs tight pool buffer) must be a DISTINCT
+        // key. Guards against dropping `row_stride` from the key, which would
+        // reintroduce the wrong-pitch stale read on a re-padded pool.
+        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let tight = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
+        let padded = key(0xBEEF, 0, 128, 96, 256, PixelFormat::Grey); // stride differs
+        map.insert(tight, 1);
+        map.insert(padded, 2);
+        assert_eq!(map.len(), 2, "stride-distinct imports must not collide");
+        assert_eq!(map.get(&tight), Some(&1));
+        assert_eq!(map.get(&padded), Some(&2));
     }
 }
