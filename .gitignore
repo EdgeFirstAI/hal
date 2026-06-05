@@ -37,6 +37,7 @@ env.sh
 /docs/
 *.profraw
 .remember
+.mcp.json
 
 # Benchmark intermediate data (JSON results, logs)
 /benchmarks/
