@@ -53,8 +53,9 @@ fn luma_encoder(full_range: bool) -> fn(u8) -> u8 {
 }
 
 /// Fixed-point RGB→YUV coefficient table for the hand-rolled YUYV encoders,
-/// resolved from the destination tensor's matrix + range. All terms are
-/// `Q(BIAS)` fixed-point; `y_off`/`c_off` are the post-shift integer offsets.
+/// resolved from the destination tensor's encoding (`cp.encoding`) and range
+/// (`cp.range_kind`). All terms are `Q(BIAS)` fixed-point; `y_off`/`c_off` are
+/// the post-shift integer offsets.
 struct YuyvEncodeCoeffs {
     y_r: i32,
     y_g: i32,
@@ -70,14 +71,15 @@ struct YuyvEncodeCoeffs {
 }
 
 impl YuyvEncodeCoeffs {
-    /// `BIAS` matches the original hand-rolled tables (Q20 fixed point).
+    /// `BIAS` is Q20 fixed point — retained from the pre-refactor hand-coded
+    /// tables to keep encoder output byte-identical.
     const BIAS: i32 = 20;
     const ROUND: i32 = 1 << (Self::BIAS - 1);
     const ROUND2: i32 = 1 << Self::BIAS;
 
     /// Build the table from the resolved `ColorParams`. The luma/chroma swings
-    /// are full-range (255/255) or limited-range (219/224) per `cp.range`; the
-    /// `KR`/`KB` luma weights come from `cp.matrix` (BT.601 / 709 / 2020).
+    /// are full-range (255/255) or limited-range (219/224) per `cp.range_kind`;
+    /// the `KR`/`KB` luma weights come from `cp.encoding` (BT.601 / 709 / 2020).
     fn from_params(cp: ColorParams) -> Self {
         // KR/KB luma weights and luma/chroma swings come from the canonical
         // source in `edgefirst_tensor::colorimetry`, shared with the in-shader
