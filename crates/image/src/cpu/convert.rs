@@ -501,22 +501,21 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
 
+        // Each macropixel is 2 bytes/px; check the row width for overflow so a
+        // malformed width can't wrap and slip past `guard_plane`.
+        let src_row = src_w.checked_mul(2).ok_or_else(|| {
+            Error::InvalidShape(format!("yuyv→grey src row overflow (w={src_w})"))
+        })?;
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
-        super::guard_plane(
-            src_bytes.len(),
-            src_stride,
-            src_h,
-            src_w * 2,
-            "yuyv→grey src",
-        )?;
+        super::guard_plane(src_bytes.len(), src_stride, src_h, src_row, "yuyv→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "yuyv→grey dst")?;
 
         // YUYV byte order per macropixel: [Y0, U, Y1, V] — luma at even offsets.
         for row in 0..src_h {
-            let s = &src_bytes[row * src_stride..][..src_w * 2];
+            let s = &src_bytes[row * src_stride..][..src_row];
             let d = &mut dst_bytes[row * dst_stride..][..src_w];
             for (x, dx) in d.iter_mut().enumerate() {
                 *dx = luma(s[x * 2]);
@@ -676,22 +675,21 @@ impl CPUProcessor {
         let dst_stride = super::tensor_row_stride(dst);
         let luma = luma_mapper(cp.src_full_range);
 
+        // Each macropixel is 2 bytes/px; check the row width for overflow so a
+        // malformed width can't wrap and slip past `guard_plane`.
+        let src_row = src_w.checked_mul(2).ok_or_else(|| {
+            Error::InvalidShape(format!("vyuy→grey src row overflow (w={src_w})"))
+        })?;
         let src_map = src.map()?;
         let src_bytes = src_map.as_slice();
         let mut dst_map = dst.map()?;
         let dst_bytes = dst_map.as_mut_slice();
-        super::guard_plane(
-            src_bytes.len(),
-            src_stride,
-            src_h,
-            src_w * 2,
-            "vyuy→grey src",
-        )?;
+        super::guard_plane(src_bytes.len(), src_stride, src_h, src_row, "vyuy→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "vyuy→grey dst")?;
 
         // VYUY byte order per macropixel: [V, Y0, U, Y1] — luma at odd offsets.
         for row in 0..src_h {
-            let s = &src_bytes[row * src_stride..][..src_w * 2];
+            let s = &src_bytes[row * src_stride..][..src_row];
             let d = &mut dst_bytes[row * dst_stride..][..src_w];
             for (x, dx) in d.iter_mut().enumerate() {
                 *dx = luma(s[x * 2 + 1]);

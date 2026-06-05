@@ -200,12 +200,12 @@ fn split_semi_planar_mut(
     let total_h = fmt.combined_plane_height(dst_h).unwrap_or(dst_h);
     let need = stride.checked_mul(total_h).ok_or_else(|| {
         Error::InvalidShape(format!(
-            "{fmt:?} plane size overflow (stride={stride}, h={dst_h})"
+            "{fmt:?} plane size overflow (stride={stride}, combined_h={total_h})"
         ))
     })?;
     if bytes.len() < need {
         return Err(Error::InvalidShape(format!(
-            "{fmt:?} destination has {} bytes but needs {need} (stride={stride}, h={dst_h})",
+            "{fmt:?} destination has {} bytes but needs {need} (stride={stride}, combined_h={total_h})",
             bytes.len()
         )));
     }
