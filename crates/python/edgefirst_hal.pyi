@@ -1996,9 +1996,9 @@ class ImageProcessor:
         """Create an image tensor with the processor's optimal memory backend.
 
         Selects the best available backing storage based on hardware capabilities:
-        DMA-buf > PBO (GPU buffer, byte-sized types: uint8, int8) > system memory.
-        Images created this way benefit from zero-copy GPU paths when used with
-        this processor's ``convert()``.
+        DMA-buf > PBO (GPU buffer) > system memory. Images created this way
+        benefit from zero-copy GPU paths when used with this processor's
+        ``convert()``.
 
         Args:
             width: Image width in pixels.
@@ -2008,9 +2008,11 @@ class ImageProcessor:
                 Supported values: ``"uint8"``, ``"int8"``, ``"uint16"``,
                 ``"int16"``, ``"uint32"``, ``"int32"``, ``"uint64"``,
                 ``"int64"``, ``"float16"``, ``"float32"``, ``"float64"``.
-                PBO is only available for byte-sized types (``"uint8"``,
-                ``"int8"``); other types still prefer DMA-buf when available
-                and otherwise use system memory.
+                PBO backing covers ``"uint8"``/``"int8"`` and, on GL backends
+                advertising float-texture support, ``"float16"`` and
+                ``"float32"`` (for GPU float model-input paths); other types
+                still prefer DMA-buf when available and otherwise use system
+                memory.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

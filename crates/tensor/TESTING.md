@@ -102,7 +102,7 @@ The CUDA zero-copy surface (`cuda_map()`, `is_cuda_available()`, `CudaMap`,
 | Mock `CudaGlOps` — map/unmap/unregister call sequence | `crates/tensor/src/cuda.rs` `#[cfg(test)]` | `CudaMap` construction calls `map`; `Drop` calls `unmap`; handle drop calls `unregister` in the correct order (before PBO storage drops) |
 | `Debug` impl on `CudaMap` / `CudaHandle` | Same | No panics, no format-string UB |
 | Primitive degradation — absent `libcudart` | Same | `is_cuda_available()` returns `false`; `cuda_map()` returns `None`; no crash |
-| ABI layout asserts | `crates/tensor/src/cuda_abi.rs` | `sizeof` / `alignof` of HAL's CUDA type wrappers match CUDA 12.6 `driver_types.h` — verified as static compile-time assertions |
+| ABI layout asserts | `crates/tensor/src/cuda.rs` (`mod ext_mem_layout`) | `sizeof` / `alignof` of HAL's CUDA type wrappers match CUDA 12.6 `driver_types.h` — verified as static compile-time assertions |
 
 Run all CUDA tests on the host (no hardware required):
 
