@@ -3752,8 +3752,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -3929,8 +3933,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -3983,8 +3991,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -4495,8 +4507,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -4756,7 +4772,9 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap vs BT.709 camera fixture; see ARCHITECTURE.md "Colorimetry"
+        // CPU path resolves the untagged 720p source to BT.709 limited (height
+        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -4800,7 +4818,9 @@ mod image_tests {
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap vs BT.709 camera fixture; see ARCHITECTURE.md "Colorimetry"
+        // CPU path resolves the untagged 720p source to BT.709 limited (height
+        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -4855,8 +4875,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // 0.95 (was 0.98): known GPU-vs-reference colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst, &target_image, 0.95, function!());
+        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
+        // so the matrix delta vs the reference that forced 0.95 has closed;
+        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -4913,8 +4935,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // 0.95 (was 0.98): known GPU-vs-reference colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst, &target_image, 0.95, function!());
+        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
+        // so the matrix delta vs the reference that forced 0.95 has closed;
+        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     /// macOS analog of `test_yuyv_to_rgba_opengl` — drives the ANGLE +
@@ -5657,7 +5681,11 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap: macOS ANGLE shader now BT.601 full-range, ~2.7% RMS from BT.709 camera720p ref (measured 0.9733); matches Linux camera-fixture tests; see ARCHITECTURE.md "Colorimetry"
+        // macOS YUYV shader now threads per-tensor colorimetry: the untagged
+        // camera720p source resolves to BT.709 limited (matching the BT.709
+        // reference), measured 0.9973 on ANGLE — up from 0.9733 under the old
+        // BT.601-full stop-gap. 0.98 leaves headroom for cross-GPU variance.
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     /// Multi-resolution smoke test: convert YUYV→RGBA via the GL
@@ -5866,8 +5894,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -5930,9 +5962,10 @@ mod image_tests {
 
         // TODO: compare PixelFormat::Yuyv and PixelFormat::Yuyv images without having to convert them to PixelFormat::Rgb
         // Threshold relaxed to 0.85 for now: comparing via a YUYV→RGB convert
-        // inherits the CPU-vs-GPU colorimetry delta (feature/colorimetry WIP);
-        // follow up to tighten once colorimetry is unified.
-        compare_images_convert_to_rgb(&g2d_dst, &cpu_dst, 0.85, function!());
+        // YUYV→YUYV resize: the residual is G2D-vs-CPU resize interpolation,
+        // not colorimetry (both sides share the same YUV matrix). Tightened
+        // 0.85 → 0.95; confirmed on the G2D lane.
+        compare_images_convert_to_rgb(&g2d_dst, &cpu_dst, 0.95, function!());
     }
 
     #[test]
@@ -5982,7 +6015,9 @@ mod image_tests {
         );
         result.unwrap();
 
-        compare_images(&dst, &dst_target, 0.95, function!()); // interim 601-full stop-gap vs BT.709 camera fixture; see ARCHITECTURE.md "Colorimetry"
+        // CPU path resolves the untagged 720p source to BT.709 limited (height
+        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
+        compare_images(&dst, &dst_target, 0.98, function!());
     }
 
     #[test]
@@ -6061,8 +6096,12 @@ mod image_tests {
             crop,
         );
         result.unwrap();
-        // Relaxed to 0.95: known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst_g2d, &dst_cpu, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&dst_g2d, &dst_cpu, 0.98, function!());
     }
 
     #[test]
@@ -6142,8 +6181,11 @@ mod image_tests {
             crop,
         );
         result.unwrap();
-        // Relaxed to 0.95: known CPU-vs-GL colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst_gl, &dst_cpu, 0.95, function!());
+        // Post-WS1 the GL path applies the resolved colorimetry via the EGL
+        // YUV color-space/sample-range hints, so the matrix delta that forced
+        // 0.95 has closed; tightened to 0.98 (driver-matrix rounding confirmed
+        // on the GPU lanes).
+        compare_images(&dst_gl, &dst_cpu, 0.98, function!());
     }
 
     #[test]
@@ -6179,7 +6221,9 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap vs BT.709 camera fixture; see ARCHITECTURE.md "Colorimetry"
+        // CPU path resolves the untagged 720p source to BT.709 limited (height
+        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -6223,7 +6267,9 @@ mod image_tests {
             )
             .for_each(|(dst, src)| *dst = [src[0], src[1], src[2]]);
 
-        compare_images(&dst, &target_image, 0.95, function!()); // interim 601-full stop-gap vs BT.709 camera fixture; see ARCHITECTURE.md "Colorimetry"
+        // CPU path resolves the untagged 720p source to BT.709 limited (height
+        // heuristic), matching the BT.709 camera fixture; measured 0.9995.
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -6285,8 +6331,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // 0.95 (was 0.98): known GPU-vs-reference colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst, &target_image, 0.95, function!());
+        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
+        // so the matrix delta vs the reference that forced 0.95 has closed;
+        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -6354,8 +6402,12 @@ mod image_tests {
         );
         result.unwrap();
 
-        // 0.95 (was 0.98): known CPU-vs-G2D colorimetry delta (feature/colorimetry WIP).
-        compare_images(&g2d_dst, &cpu_dst, 0.95, function!());
+        // Post-WS1 both CPU and G2D resolve untagged sources to limited-
+        // range BT.601/709 (G2D is limited-range matrix-only hardware), so
+        // the YUV-matrix delta that forced 0.95 has closed; tightened to
+        // 0.98. G2D declines full-range and BT.2020 (handled by GL/CPU) — a
+        // structural gap not exercised by these limited-range fixtures.
+        compare_images(&g2d_dst, &cpu_dst, 0.98, function!());
     }
 
     #[test]
@@ -6421,8 +6473,10 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&edgefirst_bench::testdata::read("camera720p.rgba"));
 
-        // 0.95 (was 0.98): known GPU-vs-reference colorimetry delta (feature/colorimetry WIP).
-        compare_images(&dst, &target_image, 0.95, function!());
+        // Post-WS1 the GPU path applies the resolved per-tensor colorimetry,
+        // so the matrix delta vs the reference that forced 0.95 has closed;
+        // tightened to 0.98 (confirmed on the GPU/G2D lanes).
+        compare_images(&dst, &target_image, 0.98, function!());
     }
 
     #[test]
@@ -6549,6 +6603,73 @@ mod image_tests {
                 "pixel byte {i} = {b}, expected ~128 for neutral-grey NV24"
             );
         }
+    }
+
+    #[test]
+    fn cpu_nv12_to_rgb_respects_tagged_bt2020() {
+        // A uniform but *saturated* chroma sample (U/V far from neutral) so the
+        // YUV→RGB matrix — not just the range — drives the result. Decoding the
+        // same NV12 bytes under BT.601 / BT.709 / BT.2020 must yield three
+        // distinct RGB triples, proving the CPU path honours the source's tagged
+        // ColorEncoding instead of a hardcoded matrix. (G2D declines BT.2020 and
+        // falls through to this CPU path; QA F9.)
+        // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
+        fn decode_tagged(enc: edgefirst_tensor::ColorEncoding) -> [u8; 3] {
+            let mut src =
+                TensorDyn::image(8, 4, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem))
+                    .unwrap();
+            // NV12 8×4: 32-byte Y plane + 16-byte interleaved UV plane (4:2:0).
+            assert_eq!(src.shape(), &[6, 8]);
+            {
+                let mut map = src.as_u8().unwrap().map().unwrap();
+                let buf = map.as_mut_slice();
+                buf[..32].fill(120); // Y
+                for px in buf[32..].chunks_exact_mut(2) {
+                    px[0] = 180; // U / Cb
+                    px[1] = 64; // V / Cr
+                }
+            }
+            // Range held constant (Limited) across all three so only the encoding
+            // matrix varies between runs.
+            src.set_colorimetry(Some(
+                edgefirst_tensor::Colorimetry::default()
+                    .with_encoding(enc)
+                    .with_range(edgefirst_tensor::ColorRange::Limited),
+            ));
+            let dst =
+                TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem))
+                    .unwrap();
+            let mut cpu = CPUProcessor::new();
+            let (result, _src, dst) = convert_img(
+                &mut cpu,
+                src,
+                dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            );
+            result.unwrap();
+            let map = dst.as_u8().unwrap().map().unwrap();
+            let s = map.as_slice();
+            [s[0], s[1], s[2]]
+        }
+
+        let bt601 = decode_tagged(edgefirst_tensor::ColorEncoding::Bt601);
+        let bt709 = decode_tagged(edgefirst_tensor::ColorEncoding::Bt709);
+        let bt2020 = decode_tagged(edgefirst_tensor::ColorEncoding::Bt2020);
+
+        assert_ne!(
+            bt2020, bt601,
+            "BT.2020 must decode differently from BT.601 ({bt2020:?} vs {bt601:?})"
+        );
+        assert_ne!(
+            bt2020, bt709,
+            "BT.2020 must decode differently from BT.709 ({bt2020:?} vs {bt709:?})"
+        );
+        assert_ne!(
+            bt601, bt709,
+            "BT.601 must decode differently from BT.709 ({bt601:?} vs {bt709:?})"
+        );
     }
 
     #[test]

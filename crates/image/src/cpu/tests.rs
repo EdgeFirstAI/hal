@@ -248,13 +248,11 @@ mod cpu_tests {
                 Crop::default(),
             )?;
 
-            // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
-            // "Colorimetry"): the camera720p/1080p reference fixtures are
-            // BT.709 limited-range ground truth, but the HAL currently hardcodes
-            // BT.601 full-range for all YUV. That mismatch drops similarity to
-            // ~0.97, so the threshold is loosened from 0.99 to 0.95 here. The
-            // colorimetry PR restores 0.99 with correct per-source handling.
-            compare_images_convert_to_rgb(&dst, &converted, 0.95, function!());
+            // Post-WS1 the CPU YUV paths resolve per-source colorimetry against
+            // the BT.709 fixtures: every colour↔colour conversion here now
+            // measures ≥0.9946 (was the YUV-matrix delta that forced 0.95).
+            // Tightened to 0.99.
+            compare_images_convert_to_rgb(&dst, &converted, 0.99, function!());
 
             Ok(())
         }};
@@ -300,10 +298,12 @@ mod cpu_tests {
                 Crop::default(),
             )?;
 
-            // INTERIM COLORIMETRY STOP-GAP (see generate_conversion_tests! and
-            // crates/image/ARCHITECTURE.md "Colorimetry"): loosened 0.97 -> 0.95
-            // while the HAL hardcodes BT.601 full-range against BT.709 fixtures.
-            compare_images_convert_to_grey(&dst, &converted, 0.95, function!());
+            // Used whenever grey is on either side (compared in luma space). The
+            // floor is grey→colour (~0.978): one luma channel replicated to RGB
+            // inherently loses chroma vs a colour fixture — structural, not a
+            // colorimetry gap. Grey→grey / colour→grey measure ≥0.997. Tightened
+            // 0.95 → 0.97.
+            compare_images_convert_to_grey(&dst, &converted, 0.97, function!());
 
             Ok(())
         }};

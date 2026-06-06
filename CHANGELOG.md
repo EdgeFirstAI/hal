@@ -265,6 +265,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **macOS YUYV→RGBA now honors per-tensor colorimetry** (`edgefirst-image`).
+  The macOS ANGLE YUYV shader baked BT.601 full-range coefficients into GLSL;
+  it now derives its YUV→RGB matrix + range from the source tensor's resolved
+  colorimetry via six uniforms, like the NV path. An untagged 720p source
+  resolves to BT.709 limited, raising camera-fixture similarity from 0.9733 to
+  0.9973 on ANGLE. The relaxed `feature/colorimetry WIP` test tolerances are
+  re-justified against measured data (CPU/GL/macOS tightened; G2D reclassified
+  as a structural fixed-point bound, not a WIP delta), and new BT.2020 (CPU) and
+  BT.601-vs-BT.709 (Python) pixel-difference tests guard the per-source matrix.
+
+### Changed
+
+- **GL backend portability refactor** (`edgefirst-image`, internal). Decoupled
+  the shader/format code from `gbm` by taking `DrmFourcc` from the portable
+  `drm-fourcc` crate — `gbm` is now referenced only by the GBM EGL-display
+  backend (`gl/context.rs`) and two error variants. Unified the Linux and macOS
+  NV12/16/24→RGBA shaders onto one divide-free body in the new portable
+  `gl::shaders_common` (faster-or-neutral on Apple ANGLE; the divide-free form
+  avoids per-fragment integer modulo of a variable divisor), guarded by a
+  byte-identity golden test that runs on every platform. Added portable
+  `gl::core` (shared `float_crop_uniforms`) and `gl::fourcc`, and removed the
+  macOS-only `IoSurfaceF16Nchw` variant from the shared float-path enum. No
+  user-visible behavior change beyond the YUYV fix above.
+
 - **Heap (`Mem`) tensor allocation no longer eagerly memsets every element**
   (`edgefirst-tensor`). `MemBacking::zeroed` had regressed to
   `(0..n).map(UnsafeCell::new).collect()`, which allocates uninitialised then

@@ -48,7 +48,16 @@ mod dma_import;
 // truth for the "(PixelFormat, DType, TensorMemory) → float path" decision and
 // is compiled on every platform so both the Linux and macOS backends share one
 // definition (see `crates/image/ARCHITECTURE.md`, review item #4).
+// Portable renderer helpers (crop uniforms, …) shared by both platform
+// backends. No gbm/IOSurface types; compiled on both.
+mod core;
 mod float_dispatch;
+// PixelFormat -> DRM FourCC mapping via the portable `drm_fourcc` crate (NOT
+// `gbm`). DRM FourCC is a Linux/DMA-BUF concept, so this lives with the other
+// Linux graphics modules; the point is that it carries no `gbm` coupling, so
+// `shaders.rs` and the format code no longer pull in `gbm`.
+#[cfg(target_os = "linux")]
+mod fourcc;
 #[cfg(target_os = "macos")]
 mod iosurface_import;
 #[cfg(target_os = "macos")]

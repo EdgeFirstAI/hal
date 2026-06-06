@@ -18,8 +18,9 @@
 
 use std::ffi::{c_void, CStr};
 
-use gbm::drm::buffer::DrmFourcc;
+use drm_fourcc::DrmFourcc;
 
+use super::super::core::float_crop_uniforms;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Crop, Error, Flip, Rotation};
 use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
@@ -76,40 +77,6 @@ pub(in super::super) fn dma_f16_packed_layout(w: u32, h: u32) -> Option<(u32, u3
         layout.surface_h as u32,
         layout.pitch as u32,
     ))
-}
-
-/// Crop-derived float render uniforms shared by both float render paths.
-///
-/// Computes `(src_rect_uv, dst_rect_px, pad_color)` from `crop` after running
-/// [`Crop::check_crop_dims`] (the dimension validation must happen first, as it
-/// can error). `src_rect_uv` is normalized to source dims; `dst_rect_px` is in
-/// single-plane pixel coords; `pad_color` is normalized `[0,1]`.
-fn float_crop_uniforms(
-    crop: &Crop,
-    src_w: usize,
-    src_h: usize,
-    dst_w: usize,
-    dst_h: usize,
-) -> crate::Result<([f32; 4], [f32; 4], [f32; 3])> {
-    crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
-    let src_rect_uv = match crop.src_rect {
-        Some(r) => [
-            r.left as f32 / src_w as f32,
-            r.top as f32 / src_h as f32,
-            r.width as f32 / src_w as f32,
-            r.height as f32 / src_h as f32,
-        ],
-        None => [0.0, 0.0, 1.0, 1.0],
-    };
-    let dst_rect_px = match crop.dst_rect {
-        Some(r) => [r.left as f32, r.top as f32, r.width as f32, r.height as f32],
-        None => [0.0, 0.0, dst_w as f32, dst_h as f32],
-    };
-    let pad_color = match crop.dst_color {
-        Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
-        None => [0.0, 0.0, 0.0],
-    };
-    Ok((src_rect_uv, dst_rect_px, pad_color))
 }
 
 /// Fetch the PBO buffer id of a float PBO destination tensor.
@@ -383,9 +350,9 @@ impl GLProcessorST {
     ///   contiguous planar f16 elements per texel; readback is
     ///   `(RGBA, HALF_FLOAT)`.
     ///
-    /// [`FloatRenderPath::DmaF16Nchw`], [`FloatRenderPath::IoSurfaceF16Nchw`]
-    /// (macOS only) and [`FloatRenderPath::None`] are not handled here — they
-    /// return `NotSupported` so `convert()` falls back to CPU. Likewise,
+    /// [`FloatRenderPath::DmaF16Nchw`] and [`FloatRenderPath::None`] are not
+    /// handled here — they return `NotSupported` so `convert()` falls back to
+    /// CPU. Likewise,
     /// non-`Rgba` sources and any rotation/flip fall back: the
     /// float shaders are uniform-driven and normalize `[0,1]` via the texture
     /// fetch, but do not implement rotation/flip.
@@ -403,9 +370,7 @@ impl GLProcessorST {
         let (internal, client_fmt, gl_type) = match path {
             FloatRenderPath::PboF32Nhwc => (gls::gl::R32F, gls::gl::RED, gls::gl::FLOAT),
             FloatRenderPath::PboF16Nchw => (gls::gl::RGBA16F, gls::gl::RGBA, gls::gl::HALF_FLOAT),
-            FloatRenderPath::DmaF16Nchw
-            | FloatRenderPath::IoSurfaceF16Nchw
-            | FloatRenderPath::None => {
+            FloatRenderPath::DmaF16Nchw | FloatRenderPath::None => {
                 return Err(crate::Error::NotSupported(
                     "GL float render-to-PBO: only PBO F32 NHWC / F16 NCHW are implemented; \
                      using CPU fallback"
@@ -523,16 +488,7 @@ impl GLProcessorST {
         unsafe {
             // ── Float render texture + FBO ──
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, render_tex_id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
+            super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
             // Only (re)spec the render-target storage when the packed dims or
             // internal format change (mirrors `proto_tex_dims` / Texture's
             // size cache). On the steady-state fixed-input video path this is
@@ -566,8 +522,7 @@ impl GLProcessorST {
                 render_tex_id,
                 0,
             );
-            let fbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if fbo_status != gls::gl::FRAMEBUFFER_COMPLETE {
+            if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
                 gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
                 return Err(crate::Error::NotSupported(format!(
                     "GL float render-to-PBO: FBO incomplete (0x{fbo_status:x}) for {path:?}; \
@@ -750,16 +705,7 @@ impl GLProcessorST {
                 None => {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MIN_FILTER,
-                        gls::gl::NEAREST as i32,
-                    );
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MAG_FILTER,
-                        gls::gl::NEAREST as i32,
-                    );
+                    super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
                     gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -775,8 +721,7 @@ impl GLProcessorST {
                 }
             }
 
-            let fbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if fbo_status != gls::gl::FRAMEBUFFER_COMPLETE {
+            if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
                 gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
                 return Err(crate::Error::NotSupported(format!(
                     "GL float render-to-DMA: FBO incomplete (0x{fbo_status:x}) for the RGBA16F \
@@ -811,72 +756,15 @@ impl GLProcessorST {
     }
 }
 
-// `float_crop_uniforms` and `float_pbo_buffer_id` are pure (no GL state), so
-// they are unit-testable without a GPU. The GL draw/upload/readback methods
-// above need a real V3D/Mali device and are covered on-target, not in CI.
+// `float_pbo_buffer_id` is pure (no GL state), so it is unit-testable without a
+// GPU. The GL draw/upload/readback methods above need a real V3D/Mali device and
+// are covered on-target, not in CI. (`float_crop_uniforms` moved to `gl::core`
+// and is tested there.)
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{float_crop_uniforms, float_pbo_buffer_id};
-    use crate::{Crop, Error, Rect};
-
-    #[test]
-    fn crop_uniforms_default_is_full_frame_no_pad() {
-        // No src/dst rects, no pad color → sample the whole source into the
-        // whole destination with black pad.
-        let (uv, px, pad) = float_crop_uniforms(&Crop::default(), 8, 8, 4, 4).unwrap();
-        assert_eq!(uv, [0.0, 0.0, 1.0, 1.0]);
-        assert_eq!(px, [0.0, 0.0, 4.0, 4.0]);
-        assert_eq!(pad, [0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn crop_uniforms_with_rects_and_pad() {
-        let crop = Crop {
-            src_rect: Some(Rect {
-                left: 2,
-                top: 2,
-                width: 4,
-                height: 4,
-            }),
-            dst_rect: Some(Rect {
-                left: 1,
-                top: 1,
-                width: 6,
-                height: 6,
-            }),
-            dst_color: Some([255, 128, 0, 255]),
-        };
-        let (uv, px, pad) = float_crop_uniforms(&crop, 8, 8, 8, 8).unwrap();
-        // src_rect normalized to UV: (2/8, 2/8, 4/8, 4/8).
-        assert_eq!(uv, [0.25, 0.25, 0.5, 0.5]);
-        // dst_rect passed through as pixels.
-        assert_eq!(px, [1.0, 1.0, 6.0, 6.0]);
-        // pad color normalized to [0,1], alpha dropped.
-        assert_eq!(pad[0], 1.0);
-        assert!((pad[1] - 128.0 / 255.0).abs() < 1e-6);
-        assert_eq!(pad[2], 0.0);
-    }
-
-    #[test]
-    fn crop_uniforms_out_of_bounds_rect_errors() {
-        // src_rect exceeds the source extent → check_crop_dims rejects it.
-        let crop = Crop {
-            src_rect: Some(Rect {
-                left: 6,
-                top: 0,
-                width: 4, // 6 + 4 = 10 > src_w = 8
-                height: 4,
-            }),
-            dst_rect: None,
-            dst_color: None,
-        };
-        let err = float_crop_uniforms(&crop, 8, 8, 8, 8).unwrap_err();
-        assert!(
-            matches!(err, Error::CropInvalid(_)),
-            "expected CropInvalid, got {err:?}"
-        );
-    }
+    use super::float_pbo_buffer_id;
+    use crate::Error;
 
     #[test]
     fn pbo_buffer_id_rejects_non_pbo_tensor() {
