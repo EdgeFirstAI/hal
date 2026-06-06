@@ -164,7 +164,7 @@ void main() {
 //                     NV12/NV16 (W/2 pairs fit one row), 2 for NV24 (W pairs ==
 //                     two grid rows; the wrap is handled by a branchless carry).
 // The shader uses the divide-free 2D-`texelFetch` addressing form shared with
-// the Linux Path B NV shader (`shaders_common::NV_RGBA_FRAGMENT_MACOS`) — no
+// the Linux Path B NV shader (`shaders_common::NV_RGBA_FRAGMENT`) — no
 // per-pixel integer divide/modulo, which is the software-emulated slow path on
 // Apple GPUs and pathological on Vivante/V3D. The YUV→RGB matrix + range come
 // from the per-tensor colorimetry uniforms, matching the CPU kernels.
