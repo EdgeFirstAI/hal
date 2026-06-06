@@ -95,3 +95,136 @@ void main() {
     frag = vec4(e0, e1, e2, e3);
 }
 "#;
+
+/// Fullscreen-quad vertex shader shared by both backends. Position is a `vec3`
+/// (NDC, `z` unused for the 2D quad but carried so the same shader serves the
+/// segmentation passes); passes `fragPos`/`tc` to the fragment stage. The VBO
+/// feeds `pos` (location 0) and `texCoord` (location 1).
+pub(crate) const VERTEX_SHADER: &str = "\
+#version 300 es
+precision mediump float;
+layout(location = 0) in vec3 pos;
+layout(location = 1) in vec2 texCoord;
+
+out vec3 fragPos;
+out vec2 tc;
+
+void main() {
+    fragPos = pos;
+    tc = texCoord;
+
+    gl_Position = vec4(pos, 1.0);
+}
+";
+
+// ---------------------------------------------------------------------------
+// NV12/NV16/NV24 (semi-planar YUV, single R8 plane) -> RGBA, shared across
+// backends. Both the Linux (DMA-BUF EGLImage) and macOS (IOSurface/ANGLE) paths
+// decode the SAME combined-plane byte layout (`PixelFormat::chroma_layout` +
+// `combined_plane_height`) using the **divide-free** addressing form: direct 2D
+// `texelFetch` + a branchless `carry` for NV24's wrapping 2W-byte chroma row.
+// No per-pixel integer divide/modulo — that is pathologically slow on Vivante
+// GC7000UL / V3D and is also the software-emulated slow path on Apple GPUs
+// (variable divisor), so the divide-free form is the right default everywhere.
+//
+// Both backends use the same `VERTEX_SHADER` (above), so the fragment shader is
+// byte-identical on both — ONE source string. The bytes are validated on-target
+// (Linux) and frozen by `nv_fragment_byte_identical` below.
+
+/// Shared `main()` body (statements + closing brace) for the NV->RGBA shader.
+/// References `tc` (vertex UV), the `chroma_shift`/`chroma_lines`/`tex_width`
+/// layout uniforms, and the six colorimetry uniforms; writes `color`.
+macro_rules! nv_rgba_body_divfree {
+    () => {
+        "    int w = img_size.x;
+    int h = img_size.y;
+    int x = clamp(int(tc.x * float(w)), 0, w - 1);
+    int y = clamp(int(tc.y * float(h)), 0, h - 1);
+
+    // Luma: direct 2D texel — no per-pixel integer divide/modulo (very slow on
+    // some embedded GPUs, e.g. Vivante GC7000UL).
+    float yv = texelFetch(src, ivec2(x, y), 0).r;
+
+    // Interleaved CbCr plane begins at buffer row `h`. Each image-chroma-row
+    // spans `chroma_lines` R8 rows: NV24's 2W-byte row wraps once at tex_width
+    // (carry); NV12/NV16 fit one row. `cx` is even so `cx+1` stays in-row.
+    int ccol = x >> chroma_shift.x;
+    int crow = y >> chroma_shift.y;
+    int ccol2 = ccol * 2;
+    int carry = ccol2 >= tex_width ? 1 : 0;
+    int cy = h + crow * chroma_lines + carry;
+    int cx = ccol2 - carry * tex_width;
+    float u = texelFetch(src, ivec2(cx, cy), 0).r;
+    float v = texelFetch(src, ivec2(cx + 1, cy), 0).r;
+
+    // Floor expanded luma at 0 to match the CPU `yuv` crate's saturating
+    // (Y-16) term (limited footroom Y<16 → 0). The top is left uncapped — the
+    // crate lets headroom exceed 1.0 and relies on the final RGB clamp, so the
+    // GL path must too. No-op for full range (y_offset=0, y_scale=1).
+    float yp = max((yv - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
+    color = vec4(r, g, b, 1.0);
+}
+"
+    };
+}
+
+/// NV->RGBA fragment shader (Path B), shared verbatim by both backends. Vertex
+/// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
+/// bytes are validated on-target (Linux) and frozen by the golden test below.
+pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
+    "\
+#version 300 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D src;
+uniform ivec2 img_size;
+uniform int tex_width;
+uniform ivec2 chroma_shift;
+uniform int chroma_lines;
+// Per-tensor colorimetry (YUV→RGB matrix + range), set by draw_nv_texture_2d
+// from the source tensor's resolved colorimetry. Path B applies the matrix in
+// the shader, so it is correct regardless of driver EGL color-hint support.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+void main() {
+",
+    nv_rgba_body_divfree!()
+);
+
+#[cfg(test)]
+mod nv_shader_golden {
+    /// The NV->RGBA shader source is validated on-target (V3D/Mali/Vivante/Tegra);
+    /// its bytes must not drift. `golden/nv_rgba_linux.glsl` is the frozen
+    /// reference. This test runs on every platform (the module is uncfg'd), so
+    /// byte-identity is enforced on the macOS host too, not just the Linux lane.
+    #[test]
+    fn nv_fragment_byte_identical() {
+        assert_eq!(
+            super::NV_RGBA_FRAGMENT,
+            include_str!("golden/nv_rgba_linux.glsl"),
+            "NV->RGBA shader bytes drifted from the on-target-validated golden"
+        );
+    }
+
+    #[test]
+    fn vertex_byte_identical() {
+        assert_eq!(
+            super::VERTEX_SHADER,
+            include_str!("golden/vertex.glsl"),
+            "vertex shader bytes drifted from the on-target-validated golden"
+        );
+    }
+}

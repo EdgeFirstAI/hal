@@ -3,6 +3,9 @@
 
 from edgefirst_hal import (
     ColorMode,
+    Colorimetry,
+    ColorEncoding,
+    ColorRange,
     Decoder,
     ImageInfo,
     ImageProcessor,
@@ -974,3 +977,38 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
         assert len(raw) == width * height, (
             f"mapped view length {len(raw)} != Image.size {width * height}"
         )
+
+
+def test_convert_honors_tagged_colorimetry():
+    """convert() must honor the source tensor's tagged colorimetry (QA F11).
+
+    The same NV12 bytes decoded as BT.601 full-range vs BT.709 limited-range
+    must produce visibly different RGB pixels — proving the HAL threads the
+    per-source colorimetry tag through the conversion instead of applying one
+    hardcoded YUV matrix/range.
+    """
+    w, h = 1280, 720
+    nv12 = np.fromfile("testdata/zidane.nv12", dtype=np.uint8).reshape(h * 3 // 2, w)
+    converter = ImageProcessor()
+
+    def convert_as(encoding, color_range):
+        src = Tensor.image(w, h, format=PixelFormat.Nv12)
+        src.from_numpy(nv12)
+        src.colorimetry = Colorimetry(encoding=encoding, range=color_range)
+        dst = converter.create_image(w, h, PixelFormat.Rgb)
+        converter.convert(src, dst)
+        out = np.zeros((h, w, 3), dtype=np.uint8)
+        dst.normalize_to_numpy(out)
+        return out
+
+    bt601_full = convert_as(ColorEncoding.Bt601, ColorRange.Full)
+    bt709_limited = convert_as(ColorEncoding.Bt709, ColorRange.Limited)
+
+    assert not np.array_equal(bt601_full, bt709_limited), (
+        "BT.601-full and BT.709-limited decoded to identical pixels — "
+        "convert() ignored the tagged colorimetry"
+    )
+    # A whole-matrix/range change shifts pixels well beyond a stray rounding
+    # difference; require a clearly visible mean delta.
+    mean_diff = np.abs(bt601_full.astype(int) - bt709_limited.astype(int)).mean()
+    assert mean_diff > 1.0, f"mean pixel delta {mean_diff:.3f} too small to be real"

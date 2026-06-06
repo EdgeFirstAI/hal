@@ -14,7 +14,7 @@ documentation = "https://docs.rs/edgefirst-image"
 
 [features]
 default = ["opengl"]
-opengl = ["dep:khronos-egl", "dep:gbm"]
+opengl = ["dep:khronos-egl", "dep:gbm", "dep:drm-fourcc"]
 tracker = ["edgefirst-decoder/tracker", "dep:edgefirst-tracker"]
 opencv = ["dep:opencv"]
 g2d_test_formats = []
@@ -49,6 +49,10 @@ ndarray-stats = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dma-heap = { workspace = true }
+# Portable DRM FourCC enum (the type `gbm` re-exports), used directly so the
+# format mapping does not pull in `gbm`. DRM FourCC is a Linux/DMA-BUF concept,
+# so the dep lives with the other Linux graphics deps.
+drm-fourcc = { workspace = true, optional = true }
 g2d-sys = { workspace = true }
 gbm = { workspace = true, optional = true }
 

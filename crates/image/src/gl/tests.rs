@@ -420,9 +420,10 @@ mod gl_tests {
             .as_mut_slice()
             .copy_from_slice(dst_dyn.as_u8().unwrap().map().unwrap().as_slice());
 
-        // 0.95 (was 0.98): GPU vs ffmpeg reference differ by the known YUV-matrix
-        // colorimetry delta (feature/colorimetry WIP).
-        compare_images(&reference, &cpu_dst, 0.95, "opengl_nv12_to_rgba_reference");
+        // Post-WS1 the GL NV path threads per-tensor colorimetry (same coeffs as
+        // CPU/ffmpeg for the resolved encoding+range), so the YUV-matrix delta
+        // that forced 0.95 has closed; restored to the pre-WIP 0.98.
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_nv12_to_rgba_reference");
     }
 
     /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Rgba conversion against ffmpeg reference
@@ -484,8 +485,12 @@ mod gl_tests {
             .as_mut_slice()
             .copy_from_slice(dst_dyn.as_u8().unwrap().map().unwrap().as_slice());
 
-        // 0.95 (was 0.98): known YUV-matrix colorimetry delta (feature/colorimetry WIP).
-        compare_images(&reference, &cpu_dst, 0.95, "opengl_yuyv_to_rgba_reference");
+        // Post-WS1 the GL YUYV path applies the resolved colorimetry via the EGL
+        // YUV color-space/sample-range hints (dma_import), so the YUV-matrix
+        // delta that forced 0.95 has closed; restored to the pre-WIP 0.98.
+        // (Driver matrix may differ from CPU by rounding — confirmed on the GPU
+        // lanes.)
+        compare_images(&reference, &cpu_dst, 0.98, "opengl_yuyv_to_rgba_reference");
     }
 
     /// On-target (V3D) regression for the EGLImage cache `plane_offset` key:
@@ -6693,21 +6698,20 @@ mod gl_tests {
 
         let (max_diff, first_fail) = compare_gpu_vs_cpu_u8(&gpu_dst, &cpu_dst, w, h);
         eprintln!("G-02 NV12 odd-H (320×241): GPU vs CPU max_diff={max_diff}");
-        // Colorimetry stop-gap (tracked separately on feature/colorimetry): the
-        // CPU path is BT.601 full-range while the GL NV12 path uses a different
-        // YUV matrix, so GPU-vs-CPU differs by ~29 (green) on this pattern. Warn
-        // on the known delta rather than fail; still fail on a gross mismatch
-        // (>64) that would signal a real geometry/stride regression (the odd-H
-        // stride handling is what this test really guards).
+        // Post-WS1 both CPU and the GL NV12 path resolve this untagged odd-H
+        // source to the same limited-range matrix, so the YUV-matrix delta that
+        // forced the loose >64 bound has closed; the residual is GPU rounding.
+        // Warn above a tight ±4, fail on >35 (was 64) so the odd-H stride
+        // handling this test really guards still trips on a real regression.
         if max_diff > 4 {
             eprintln!(
                 "WARNING: G-02 NV12 odd-H GPU vs CPU max_diff={max_diff} > 4 \
-                 (colorimetry WIP; first bad at {first_fail:?})"
+                 (GPU rounding; first bad at {first_fail:?})"
             );
         }
         assert!(
-            max_diff <= 64,
-            "G-02: gross NV12 odd-H GPU vs CPU mismatch max_diff={max_diff} (>64); first bad at {first_fail:?}"
+            max_diff <= 35,
+            "G-02: gross NV12 odd-H GPU vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
     }
 

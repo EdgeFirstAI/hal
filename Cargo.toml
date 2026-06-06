@@ -41,6 +41,9 @@ env_logger = "0.11.10"
 fast-math = "0.1.1"
 fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
+# Portable (platform-neutral) DRM FourCC enum — the same type `gbm` re-exports,
+# used directly so shader/format code need not pull in `gbm` (Linux-only).
+drm-fourcc = "2.2.0"
 g2d-sys = "1.2.0"
 
 gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }

@@ -1454,7 +1454,8 @@ impl CPUProcessor {
 
     pub(super) fn rgba_to_grey(rgba: [u8; 4]) -> [u8; 1] {
         const BIAS: i32 = 20;
-        // BT.601 luma coefficients (interim 601-full colorimetry stop-gap).
+        // Conventional BT.601 luma weights (Rec.601 is the standard luma basis
+        // for RGB→grayscale; full-range, no 16/235 expansion).
         const KR: f64 = 0.299f64;
         const KB: f64 = 0.114f64;
         const KG: f64 = 1.0 - KR - KB;

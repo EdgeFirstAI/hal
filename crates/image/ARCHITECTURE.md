@@ -26,6 +26,9 @@ shutdown quirks of each driver stack.
 | [`cpu/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/cpu) | local | `CPUProcessor` — fast_image_resize + rayon, plus the f16 mask kernels |
 | [`g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs) | local | `G2DProcessor` — NXP i.MX G2D 2D-engine bindings |
 | [`gl/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/gl) | local | OpenGL backend: threaded wrapper, context, EGL+PBO caches, shaders, DMA-BUF import |
+| [`gl/shaders_common.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/shaders_common.rs) | local | **Portable** GLSL shared by both backends (compiled on every OS): the PlanarRgb F16 packer and the NV→RGBA shader (`NV_RGBA_FRAGMENT_LINUX`/`_MACOS`, one divide-free body, per-backend header). Linux bytes are byte-frozen by a golden-file test that runs on every platform. |
+| [`gl/core.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/core.rs) | local | **Portable** renderer helpers shared by both backends (no gbm/IOSurface types): `float_crop_uniforms` and its unit tests. |
+| [`gl/fourcc.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/fourcc.rs) | local | `PixelFormat`→`DrmFourcc` mapping via the portable `drm_fourcc` crate (NOT `gbm`), so shader/format code carries no `gbm` coupling. |
 | [`gl/platform/macos.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | local | `MacosPlatform::{load_egl_lib, create_display}` — two associated functions, the only macOS-specific helpers the GL backend needs. No trait, no enum dispatch. Linux helpers live directly in `gl/context.rs`. |
 | [`gl/iosurface_import.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/iosurface_import.rs) | local | macOS-only: builds the `EGL_ANGLE_iosurface_client_buffer` attribute list and converts a tensor's IOSurface into an EGL pbuffer. |
 | [`gl/macos_processor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) | local | macOS-only single-threaded GL pipeline (ANGLE → Metal). Parallel to `gl/processor.rs` rather than a refactor — the Linux processor stays untouched. |
@@ -219,13 +222,19 @@ only macOS-specific helpers the rest of the backend needs are:
 | [`MacosPlatform::create_display`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | Bring up an ANGLE Metal display via `eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE)`. |
 
 The pbuffer import, texture binding, FBO setup, and shader compilation
-are inline inside [`MacosGlProcessor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs) — there is no shared cross-platform
-trait. An earlier draft of this branch defined a `GlPlatform` trait
-that the macOS processor was meant to route through, but the trait was
-never wired up and was removed before merge. If and when Linux and
-macOS share a processor implementation (e.g. as part of a Windows
-backend bringup), the seam can be reintroduced; until then it would be
-fiction.
+are inline inside [`MacosGlProcessor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/macos_processor.rs); the two processors are parallel,
+with no shared cross-platform trait. An earlier draft introduced a bare
+`GlPlatform` trait with no consumer and removed it as fiction — a
+platform trait is only real once a shared renderer actually routes
+through it.
+
+The platform-independent pieces that *are* shared live in modules
+compiled on every OS: `gl::shaders_common` (the GLSL sources, including
+one NV→RGBA body for both backends, byte-frozen by a golden test),
+`gl::core` (`float_crop_uniforms`), and `gl::fourcc` (the
+`PixelFormat`→`DrmFourcc` map via the portable `drm_fourcc` crate). As a
+result `gbm` is referenced only by `gl/context.rs` (the GBM EGL-display
+backend) and `error.rs` (two error variants).
 
 The EGL flow itself differs by platform:
 
@@ -351,8 +360,11 @@ YUV→RGB on every backend is driven by the source tensor's per-tensor
   BT.601-limited matrix, **single-plane NV12 with non-default colorimetry
   (full-range, or non-BT.601) is forced to Path B** so the exact matrix always
   applies; only multiplane NV12 (which Path B cannot import) stays on Path A.
-- Packed **YUYV/VYUY** has no in-shader path and relies on the Path A EGL
-  hints, falling back to the colorimetry-correct CPU path otherwise.
+- Packed **YUYV/VYUY**: the **macOS** YUYV shader threads the same six
+  colorimetry uniforms as the NV path (`yuv_to_rgb_coeffs`), so an untagged
+  720p source resolves to BT.709 limited and matches the camera fixture (~0.997
+  on ANGLE). On **Linux** packed YUYV has no in-shader path and relies on the
+  Path A EGL hints, falling back to the colorimetry-correct CPU path otherwise.
 
 See the [Colorimetry](#colorimetry-1) section for the full design.
 

@@ -74,12 +74,11 @@ impl G2DProcessor {
     /// YUV and BT.2020 conversions are declined and fall through to GL/CPU.
     pub fn new() -> Result<Self> {
         let mut g2d = G2D::new("libg2d.so.2")?;
-        // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
-        // "Colorimetry"): hardcode BT.601 to match the codec/JFIF and the other
-        // backends until per-source colorimetry tagging lands. NOTE: the g2d-sys
-        // API selects only the matrix, not full vs limited range, so G2D cannot
-        // currently express full-range — a residual limitation to revisit with
-        // the proper colorimetry implementation.
+        // Safe initial default only: every `convert()` re-programs the matrix
+        // from the resolved colorimetry of that conversion (see `convert_impl`).
+        // The g2d-sys API selects only the matrix, not full-vs-limited range, so
+        // G2D is limited-range only — full-range and BT.2020 are declined and
+        // fall through to GL/CPU (a structural hardware limit, not a stop-gap).
         g2d.set_bt601_colorspace()?;
 
         log::debug!("G2DConverter created with version {:?}", g2d.version());
@@ -1728,20 +1727,21 @@ mod g2d_tests {
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
         eprintln!("D-01 NV12 odd-W G2D vs CPU: max_diff={max_diff}");
-        // Colorimetry stop-gap (tracked separately on feature/colorimetry): the
-        // CPU path is BT.601 full-range while G2D uses a different YUV matrix, so
-        // GPU-vs-CPU differs by ~28 (green) on saturated content. Warn on that
-        // known delta rather than fail; still fail on a gross mismatch (>64) that
-        // would signal a real geometry/stride regression.
+        // Post-WS1 both CPU and G2D resolve this untagged odd-W NV12 source to
+        // limited-range BT.601 (G2D is limited-range matrix-only), so the
+        // YUV-matrix delta that previously forced the loose >64 bound has
+        // closed; the residual is G2D fixed-point rounding. Warn above the tight
+        // ±tol, fail on >35 (was 64) so a real geometry/stride regression — the
+        // odd-W stride handling this test guards — still trips.
         if max_diff > tol {
             eprintln!(
                 "WARNING: D-01 NV12 odd-W G2D vs CPU max_diff={max_diff} > {tol} \
-                 (colorimetry WIP; first bad at {first_fail:?})"
+                 (G2D fixed-point rounding; first bad at {first_fail:?})"
             );
         }
         assert!(
-            max_diff <= 64,
-            "D-01: gross NV12 odd-W G2D vs CPU mismatch max_diff={max_diff} (>64); first bad at {first_fail:?}"
+            max_diff <= 35,
+            "D-01: gross NV12 odd-W G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
     }
 
@@ -1811,17 +1811,18 @@ mod g2d_tests {
         let tol = 4u32;
         let (max_diff, first_fail) = compare_g2d_vs_cpu_rgba(&g2d_dst, &cpu_dst, w, h, tol);
         eprintln!("D-03 NV12 odd-both G2D vs CPU: max_diff={max_diff}");
-        // Colorimetry stop-gap — see test_d01 above (warn on the known YUV-matrix
-        // delta, fail only on a gross >64 geometry/stride regression).
+        // Post-WS1 the YUV-matrix delta has closed — see test_d01 above. Warn
+        // above ±tol on G2D fixed-point rounding, fail only on a gross >35
+        // geometry/stride regression (was 64).
         if max_diff > tol {
             eprintln!(
                 "WARNING: D-03 NV12 odd-both G2D vs CPU max_diff={max_diff} > {tol} \
-                 (colorimetry WIP; first bad at {first_fail:?})"
+                 (G2D fixed-point rounding; first bad at {first_fail:?})"
             );
         }
         assert!(
-            max_diff <= 64,
-            "D-03: gross NV12 odd-both G2D vs CPU mismatch max_diff={max_diff} (>64); first bad at {first_fail:?}"
+            max_diff <= 35,
+            "D-03: gross NV12 odd-both G2D vs CPU mismatch max_diff={max_diff} (>35); first bad at {first_fail:?}"
         );
     }
 }

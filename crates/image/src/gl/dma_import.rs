@@ -8,13 +8,13 @@
 //! can be unit-tested without a GPU context.
 
 use edgefirst_tensor::{ColorEncoding, ColorRange, PixelFormat, PixelLayout, Tensor, TensorTrait};
-use gbm::drm::buffer::DrmFourcc;
+use drm_fourcc::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 
 use super::context::egl_ext;
-use super::shaders::pixel_format_to_drm;
+use super::fourcc::pixel_format_to_drm;
 use crate::colorimetry::resolve_colorimetry;
 use crate::Error;
 

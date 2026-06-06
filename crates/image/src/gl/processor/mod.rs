@@ -5,7 +5,7 @@ use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use gbm::drm::buffer::DrmFourcc;
+use drm_fourcc::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
@@ -1640,16 +1640,7 @@ impl GLProcessorST {
                 gls::gl::UseProgram(self.texture_program_yuv.id);
                 gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MIN_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MAG_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
+                super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .render_texture
                     .bind_egl_image(dst_key, dest_egl.as_ptr())
@@ -1720,16 +1711,7 @@ impl GLProcessorST {
             None => unsafe {
                 gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.draw_render_texture.id);
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MIN_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MAG_FILTER,
-                    gls::gl::LINEAR as i32,
-                );
+                super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .draw_render_texture
                     .bind_egl_image(dst_key, dest_egl.as_ptr())
@@ -2023,16 +2005,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
+            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             gls::gl::TexImage2D(
                 gls::gl::TEXTURE_2D,
@@ -2164,16 +2137,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
+            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             // Upload existing PBO content to the render texture.
             // Binding PBO as UNPACK buffer makes TexImage2D read from it.
@@ -2504,26 +2468,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
+            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
@@ -3382,16 +3327,7 @@ impl GLProcessorST {
                 None => {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MIN_FILTER,
-                        gls::gl::NEAREST as i32,
-                    );
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MAG_FILTER,
-                        gls::gl::NEAREST as i32,
-                    );
+                    super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
                     gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -3416,16 +3352,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(program.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE1);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
+            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
         }
 
         // Set uniform: tex = TEXTURE1 (intermediate RGBA texture)
@@ -3583,16 +3510,7 @@ impl GLProcessorST {
         }
         unsafe {
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
+            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
             gls::gl::TexImage2D(
                 gls::gl::TEXTURE_2D,
                 0,
@@ -3720,16 +3638,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(program.id);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
+            super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
             gls::gl::TexParameteri(
                 texture_target,
                 gls::gl::TEXTURE_WRAP_S,
@@ -3874,26 +3783,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(program.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
+            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
             // Set tex uniform to unit 0
             let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
@@ -4018,26 +3908,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(self.texture_program.id);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
+            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
                     gls::gl::TEXTURE_SWIZZLE_R,
@@ -4170,26 +4041,7 @@ impl GLProcessorST {
             gls::gl::UseProgram(self.texture_program_yuv.id);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                texture_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
+            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for
             // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
@@ -4339,26 +4191,7 @@ impl GLProcessorST {
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.nv_r8_texture.id);
             // NEAREST — we address by integer texel; no interpolation wanted.
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::NEAREST as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
-            );
+            super::core::set_tex_filter_clamp(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
 
             match r8_src {
                 Some(egl_img) => {

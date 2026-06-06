@@ -11,8 +11,9 @@
 //! instead of through a dedicated thread + command channel.
 //!
 //! Format coverage in this initial implementation:
-//!   * YUYV → RGBA — full shader-based BT.601 full-range conversion (interim
-//!     colorimetry stop-gap; see crates/image/ARCHITECTURE.md "Colorimetry")
+//!   * YUYV → RGBA — full shader-based conversion; YUV→RGB matrix + range come
+//!     from the per-tensor colorimetry uniforms (see "Colorimetry" in
+//!     crates/image/ARCHITECTURE.md)
 //!
 //! Other format pairs and the mask-rendering / decoder paths return
 //! `NotImplemented` and fall back to the CPU backend, matching the
@@ -52,7 +53,7 @@ use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use khronos_egl as egl;
 use log::debug;
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -76,33 +77,36 @@ const EGL_BACK_BUFFER: i32 = 0x3084;
 // Shaders. YUYV-as-GL_RG sampling: each source texel is (Y, C) where C
 // alternates U/V every other column. We sample the current and partner
 // texel to recover both chroma values for each output pixel, then apply
-// the BT.601 full-range matrix (interim colorimetry stop-gap).
+// the YUV→RGB matrix from the per-tensor colorimetry uniforms.
 //
 // The shader matches the spike at `spikes/angle_iosurface/`. Bit-near-
 // exact (≤1 LSB) match to the CPU scalar reference was validated there.
 // ---------------------------------------------------------------------------
 
-const VERTEX_SHADER: &str = r#"#version 300 es
-precision mediump float;
-layout(location = 0) in vec2 pos;
-layout(location = 1) in vec2 uv_in;
-out vec2 v_uv;
-void main() {
-    v_uv = uv_in;
-    gl_Position = vec4(pos, 0.0, 1.0);
-}
-"#;
+// Shared with the Linux backend (vec3 `pos` → `fragPos`/`tc`); the VBO below
+// feeds `pos` (location 0) and `texCoord` (location 1).
+use super::shaders_common::VERTEX_SHADER;
 
 const YUYV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
-precision mediump float;
-uniform sampler2D src;
+precision highp float;
+uniform highp sampler2D src;
 uniform vec2 src_size;
-in vec2 v_uv;
-out vec4 frag;
+// Per-tensor colorimetry (YUV→RGB matrix + range), set per-convert from the
+// source tensor's resolved colorimetry — mirrors the NV→RGBA program and the
+// Linux backends. No axis is baked into the shader.
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
 
 void main() {
     vec2 texel = vec2(1.0) / src_size;
-    vec2 col = floor(v_uv * src_size);
+    vec2 col = floor(tc * src_size);
     bool even = mod(col.x, 2.0) < 0.5;
     vec2 self_uv = (col + vec2(0.5)) * texel;
     vec2 pair_uv = (col + vec2(even ? 1.5 : -0.5, 0.5)) * texel;
@@ -114,17 +118,16 @@ void main() {
     if (even) { u = self_rg.g; v = pair_rg.g; }
     else      { v = self_rg.g; u = pair_rg.g; }
 
-    // INTERIM COLORIMETRY STOP-GAP (see crates/image/ARCHITECTURE.md
-    // "Colorimetry"): BT.601 full-range (JFIF) to match the codec and the Linux
-    // backends until per-source colorimetry tagging lands. Full range → luma is
-    // used directly (no 16/235 expansion); BT.601 coefficients.
-    float yp = y;
-    float up = u - 128.0/255.0;
-    float vp = v - 128.0/255.0;
-    float r = clamp(yp + 1.402 * vp, 0.0, 1.0);
-    float g = clamp(yp - 0.344 * up - 0.714 * vp, 0.0, 1.0);
-    float b = clamp(yp + 1.772 * up, 0.0, 1.0);
-    frag = vec4(r, g, b, 1.0);
+    // Identical matrix/range math to the NV→RGBA program: floor the expanded
+    // luma at 0 (limited-range footroom folds to 0, full range is a no-op with
+    // y_offset=0/y_scale=1), leave the top end to the final per-channel clamp.
+    float yp = max((y - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
+    color = vec4(r, g, b, 1.0);
 }
 "#;
 
@@ -135,11 +138,12 @@ void main() {
 const GREY_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
 precision mediump float;
 uniform sampler2D src;
-in vec2 v_uv;
-out vec4 frag;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
 void main() {
-    float y = texture(src, v_uv).r;
-    frag = vec4(y, y, y, 1.0);
+    float y = texture(src, tc).r;
+    color = vec4(y, y, y, 1.0);
 }
 "#;
 
@@ -156,67 +160,15 @@ void main() {
 //                     of every row is addressable by `texelFetch`.
 //   * `chroma_shift`  (cx, cy) right-shifts on (x, y): NV12 (1,1), NV16 (1,0),
 //                     NV24 (0,0).
-//   * `uv_row_bytes`  bytes the UV plane advances per chroma row: `stride` for
-//                     NV12/NV16 (W/2 pairs fit in one row), `2*stride` for NV24
-//                     (W pairs == two grid rows).
-// A linear UV byte offset is converted to a 2D texel so NV24's 2-row-per-
-// chroma-line layout is handled with no special case. The byte offsets match
-// the codec's `row * grid_row_stride + col` writer exactly. The YUV→RGB matrix
-// + range come from the per-tensor colorimetry uniforms (y_offset/y_scale/
-// c_vr/c_ug/c_vg/c_ub), matching the Linux Path B NV shader and CPU kernels.
-const NV_TO_RGBA_FRAGMENT: &str = r#"#version 300 es
-precision highp float;
-precision highp int;
-uniform highp sampler2D src;
-uniform ivec2 img_size;
-uniform int tex_width;
-uniform ivec2 chroma_shift;
-uniform int uv_row_bytes;
-// Per-tensor colorimetry (YUV→RGB matrix + range), set per-convert from the
-// source tensor's resolved colorimetry — mirrors the Linux Path B NV shader.
-uniform float y_offset;
-uniform float y_scale;
-uniform float c_vr;
-uniform float c_ug;
-uniform float c_vg;
-uniform float c_ub;
-in vec2 v_uv;
-out vec4 frag;
-
-float fetch_r(int b) {
-    return texelFetch(src, ivec2(b % tex_width, b / tex_width), 0).r;
-}
-
-void main() {
-    int w = img_size.x;
-    int h = img_size.y;
-    int x = clamp(int(v_uv.x * float(w)), 0, w - 1);
-    int y = clamp(int(v_uv.y * float(h)), 0, h - 1);
-
-    float yv = fetch_r(y * tex_width + x); // Y plane, rows [0, H)
-
-    int ccol = x >> chroma_shift.x;
-    int crow = y >> chroma_shift.y;
-    int uv_base = h * tex_width;           // UV plane byte offset
-    int cb = uv_base + crow * uv_row_bytes + ccol * 2;
-    float u = fetch_r(cb);
-    float v = fetch_r(cb + 1);
-
-    // Floor the expanded luma at 0, matching the CPU `yuv` crate's saturating
-    // `(Y - 16)` term: limited-range footroom (Y<16) folds to 0 instead of
-    // going negative. The top end is intentionally NOT capped here — the crate
-    // lets headroom (Y>235) exceed 1.0 and relies on the final per-channel RGB
-    // clamp below, so the GPU must do the same to agree bit-for-bit. No-op for
-    // full range (y_offset=0, y_scale=1).
-    float yp = max((yv - y_offset) * y_scale, 0.0);
-    float up = u - 128.0 / 255.0;
-    float vp = v - 128.0 / 255.0;
-    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
-    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
-    float b = clamp(yp + c_ub * up, 0.0, 1.0);
-    frag = vec4(r, g, b, 1.0);
-}
-"#;
+//   * `chroma_lines`  R8 rows the UV plane advances per image chroma row: 1 for
+//                     NV12/NV16 (W/2 pairs fit one row), 2 for NV24 (W pairs ==
+//                     two grid rows; the wrap is handled by a branchless carry).
+// The shader uses the divide-free 2D-`texelFetch` addressing form shared with
+// the Linux Path B NV shader (`shaders_common::NV_RGBA_FRAGMENT_MACOS`) — no
+// per-pixel integer divide/modulo, which is the software-emulated slow path on
+// Apple GPUs and pathological on Vivante/V3D. The YUV→RGB matrix + range come
+// from the per-tensor colorimetry uniforms, matching the CPU kernels.
+const NV_TO_RGBA_FRAGMENT: &str = super::shaders_common::NV_RGBA_FRAGMENT;
 
 /// RGBA8 source → packed RGBA16F PlanarRgb F16 destination, one draw
 /// call. F32 destinations are intentionally not supported — see the
@@ -489,6 +441,14 @@ pub struct MacosGlProcessor {
     program_yuyv_to_rgba: u32,
     uniform_src: i32,
     uniform_src_size: i32,
+    /// Per-tensor colorimetry uniforms for the YUYV→RGBA program (YUV→RGB
+    /// matrix + range), mirroring the NV→RGBA program and the Linux backends.
+    uniform_yuyv_y_offset: i32,
+    uniform_yuyv_y_scale: i32,
+    uniform_yuyv_c_vr: i32,
+    uniform_yuyv_c_ug: i32,
+    uniform_yuyv_c_vg: i32,
+    uniform_yuyv_c_ub: i32,
     /// Program: GREY (R8 `L008` IOSurface) → RGBA. Shares the `src` sampler
     /// uniform; needs no `src_size`. Also the building block that proves the
     /// R8 IOSurface binding works on ANGLE.
@@ -501,7 +461,7 @@ pub struct MacosGlProcessor {
     uniform_nv_img_size: i32,
     uniform_nv_tex_width: i32,
     uniform_nv_chroma_shift: i32,
-    uniform_nv_uv_row_bytes: i32,
+    uniform_nv_chroma_lines: i32,
     /// Per-tensor colorimetry uniforms for the NV→RGBA program (YUV→RGB
     /// matrix + range), mirroring the Linux Path B NV shader.
     uniform_nv_y_offset: i32,
@@ -671,7 +631,7 @@ impl MacosGlProcessor {
             // Build the per-instance resources behind a scope guard so
             // any error path below cleans up GL allocations rather than
             // leaking them.
-            let program = compile_program(VERTEX_SHADER, YUYV_TO_RGBA_FRAGMENT)?;
+            let program = super::core::compile_program(VERTEX_SHADER, YUYV_TO_RGBA_FRAGMENT)?;
             // From here on, every fallible step must reach Drop-cleanup
             // for `program` if it fails. The simplest pattern: stash
             // resources in `Option<u32>` and let `InstanceCleanup` Drop
@@ -726,14 +686,23 @@ impl MacosGlProcessor {
                     gls::gl::GetUniformLocation(program, c"src_size".as_ptr() as *const _);
                 (loc_src, loc_size)
             };
+            // Per-tensor colorimetry uniforms for the YUYV program (mirrors NV).
+            let uniform_yuyv_y_offset = gls::gl::GetUniformLocation(program, c"y_offset".as_ptr());
+            let uniform_yuyv_y_scale = gls::gl::GetUniformLocation(program, c"y_scale".as_ptr());
+            let uniform_yuyv_c_vr = gls::gl::GetUniformLocation(program, c"c_vr".as_ptr());
+            let uniform_yuyv_c_ug = gls::gl::GetUniformLocation(program, c"c_ug".as_ptr());
+            let uniform_yuyv_c_vg = gls::gl::GetUniformLocation(program, c"c_vg".as_ptr());
+            let uniform_yuyv_c_ub = gls::gl::GetUniformLocation(program, c"c_ub".as_ptr());
 
-            // Fullscreen-quad VBO + VAO.
+            // Fullscreen-quad VBO + VAO. Interleaved [vec3 pos, vec2 texCoord]
+            // per vertex (20 bytes), feeding the shared VERTEX_SHADER (`pos` is
+            // vec3; z=0 for the 2D quad). TRIANGLE_STRIP order: BL, BR, TL, TR.
             #[rustfmt::skip]
-            let quad: [f32; 16] = [
-                -1.0,-1.0,  0.0, 0.0,
-                 1.0,-1.0,  1.0, 0.0,
-                -1.0, 1.0,  0.0, 1.0,
-                 1.0, 1.0,  1.0, 1.0,
+            let quad: [f32; 20] = [
+                -1.0,-1.0, 0.0,  0.0, 0.0,
+                 1.0,-1.0, 0.0,  1.0, 0.0,
+                -1.0, 1.0, 0.0,  0.0, 1.0,
+                 1.0, 1.0, 0.0,  1.0, 1.0,
             ];
             let mut vbo = 0u32;
             let mut vao = 0u32;
@@ -749,9 +718,10 @@ impl MacosGlProcessor {
             gls::gl::GenVertexArrays(1, &mut vao);
             cleanup.vao = Some(vao);
             gls::gl::BindVertexArray(vao);
-            gls::gl::VertexAttribPointer(0, 2, gls::gl::FLOAT, 0, 16, std::ptr::null());
+            // pos: vec3 at offset 0, stride 20; texCoord: vec2 at offset 12.
+            gls::gl::VertexAttribPointer(0, 3, gls::gl::FLOAT, 0, 20, std::ptr::null());
             gls::gl::EnableVertexAttribArray(0);
-            gls::gl::VertexAttribPointer(1, 2, gls::gl::FLOAT, 0, 16, 8 as *const _);
+            gls::gl::VertexAttribPointer(1, 2, gls::gl::FLOAT, 0, 20, 12 as *const _);
             gls::gl::EnableVertexAttribArray(1);
 
             // FBO + two transient texture handles.
@@ -766,26 +736,7 @@ impl MacosGlProcessor {
             cleanup.dst_tex = Some(dst_tex);
             for tex in [src_tex, dst_tex] {
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MIN_FILTER,
-                    gls::gl::NEAREST as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MAG_FILTER,
-                    gls::gl::NEAREST as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_WRAP_S,
-                    gls::gl::CLAMP_TO_EDGE as i32,
-                );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_WRAP_T,
-                    gls::gl::CLAMP_TO_EDGE as i32,
-                );
+                super::core::set_tex_filter_clamp(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
             }
 
             // Construction succeeded — disarm `cleanup` so its Drop
@@ -807,7 +758,7 @@ impl MacosGlProcessor {
             // u8 paths (the framebuffer-completeness check at first use
             // is what surfaces the extension gap).
             let program_rgba8_planar_f16 =
-                compile_program(VERTEX_SHADER, RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT)?;
+                super::core::compile_program(VERTEX_SHADER, RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT)?;
             let uniform_rgba8_to_planar_f16_src =
                 gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"src".as_ptr());
             let uniform_rgba8_to_planar_f16_dst_size =
@@ -820,20 +771,20 @@ impl MacosGlProcessor {
                 gls::gl::GetUniformLocation(program_rgba8_planar_f16, c"pad_color".as_ptr());
 
             // GREY (R8) → RGBA program — also the R8-binding probe.
-            let program_grey = compile_program(VERTEX_SHADER, GREY_TO_RGBA_FRAGMENT)?;
+            let program_grey = super::core::compile_program(VERTEX_SHADER, GREY_TO_RGBA_FRAGMENT)?;
             let uniform_grey_src =
                 gls::gl::GetUniformLocation(program_grey, c"src".as_ptr() as *const _);
 
             // Semi-planar YUV (NV12/NV16/NV24, R8) → RGBA program.
-            let program_nv = compile_program(VERTEX_SHADER, NV_TO_RGBA_FRAGMENT)?;
+            let program_nv = super::core::compile_program(VERTEX_SHADER, NV_TO_RGBA_FRAGMENT)?;
             let uniform_nv_src = gls::gl::GetUniformLocation(program_nv, c"src".as_ptr());
             let uniform_nv_img_size = gls::gl::GetUniformLocation(program_nv, c"img_size".as_ptr());
             let uniform_nv_tex_width =
                 gls::gl::GetUniformLocation(program_nv, c"tex_width".as_ptr());
             let uniform_nv_chroma_shift =
                 gls::gl::GetUniformLocation(program_nv, c"chroma_shift".as_ptr());
-            let uniform_nv_uv_row_bytes =
-                gls::gl::GetUniformLocation(program_nv, c"uv_row_bytes".as_ptr());
+            let uniform_nv_chroma_lines =
+                gls::gl::GetUniformLocation(program_nv, c"chroma_lines".as_ptr());
             let uniform_nv_y_offset = gls::gl::GetUniformLocation(program_nv, c"y_offset".as_ptr());
             let uniform_nv_y_scale = gls::gl::GetUniformLocation(program_nv, c"y_scale".as_ptr());
             let uniform_nv_c_vr = gls::gl::GetUniformLocation(program_nv, c"c_vr".as_ptr());
@@ -845,6 +796,12 @@ impl MacosGlProcessor {
                 program_yuyv_to_rgba: program,
                 uniform_src,
                 uniform_src_size,
+                uniform_yuyv_y_offset,
+                uniform_yuyv_y_scale,
+                uniform_yuyv_c_vr,
+                uniform_yuyv_c_ug,
+                uniform_yuyv_c_vg,
+                uniform_yuyv_c_ub,
                 program_grey_to_rgba: program_grey,
                 uniform_grey_src,
                 program_nv_to_rgba: program_nv,
@@ -852,7 +809,7 @@ impl MacosGlProcessor {
                 uniform_nv_img_size,
                 uniform_nv_tex_width,
                 uniform_nv_chroma_shift,
-                uniform_nv_uv_row_bytes,
+                uniform_nv_chroma_lines,
                 uniform_nv_y_offset,
                 uniform_nv_y_scale,
                 uniform_nv_c_vr,
@@ -1080,30 +1037,12 @@ impl MacosGlProcessor {
         }
         let dst_dtype = DType::F16;
 
-        // Validate and resolve crop rectangles into shader uniforms.
-        // `src_rect_uv` is normalized to the source's full
-        // dimensions; `dst_rect_px` is in single-plane pixel coords.
-        // `pad_color` is normalized [0,1] from the optional u8
-        // `dst_color`. When either rect is None we paint/sample the
-        // whole image — equivalent to a no-op identity transform.
-        crop.check_crop_dims(src_w, src_h, dst_w, dst_h)?;
-        let src_rect_uv = match crop.src_rect {
-            Some(r) => [
-                r.left as f32 / src_w as f32,
-                r.top as f32 / src_h as f32,
-                r.width as f32 / src_w as f32,
-                r.height as f32 / src_h as f32,
-            ],
-            None => [0.0, 0.0, 1.0, 1.0],
-        };
-        let dst_rect_px = match crop.dst_rect {
-            Some(r) => [r.left as f32, r.top as f32, r.width as f32, r.height as f32],
-            None => [0.0, 0.0, dst_w as f32, dst_h as f32],
-        };
-        let pad_color = match crop.dst_color {
-            Some([r, g, b, _]) => [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
-            None => [0.0, 0.0, 0.0],
-        };
+        // Validate and resolve crop rectangles into shader uniforms (shared with
+        // the Linux float path): `src_rect_uv` normalized to source dims,
+        // `dst_rect_px` in single-plane pixel coords, `pad_color` normalized
+        // [0,1]. A None rect samples/paints the whole image (identity).
+        let (src_rect_uv, dst_rect_px, pad_color) =
+            super::core::float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
         let src_pbuf = self.get_or_create_pbuffer(
             d,
@@ -1127,16 +1066,7 @@ impl MacosGlProcessor {
             // PlanarRgb destination is RGBA16F-packed (4 contiguous
             // f16 planar elements per fragment); linear filtering on
             // the source RGBA8 texture is unconditionally supported.
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
-            );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
-            );
+            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.dst_tex);
             let _dst_bound = BoundTexImage::bind(d, dst_pbuf)?;
@@ -1148,8 +1078,7 @@ impl MacosGlProcessor {
                 self.dst_tex,
                 0,
             );
-            let fbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if fbo_status != gls::gl::FRAMEBUFFER_COMPLETE {
+            if let Err(fbo_status) = super::core::check_framebuffer_complete() {
                 return Err(Error::Io(std::io::Error::other(format!(
                     "{dst_dtype:?} PlanarRgb FBO incomplete: 0x{fbo_status:x} — \
                      likely missing float color-buffer extension at runtime"
@@ -1402,8 +1331,7 @@ impl MacosGlProcessor {
                 self.dst_tex,
                 0,
             );
-            let fbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if fbo_status != gls::gl::FRAMEBUFFER_COMPLETE {
+            if let Err(fbo_status) = super::core::check_framebuffer_complete() {
                 return Err(Error::Io(std::io::Error::other(format!(
                     "FBO incomplete: 0x{fbo_status:x}"
                 ))));
@@ -1433,12 +1361,13 @@ impl MacosGlProcessor {
                     // Chroma geometry from the shared single source of truth
                     // (`PixelFormat::chroma_layout`): `shift_x`/`shift_y` select
                     // the sub-sampling, and the UV plane advances
-                    // `uv_rows_per_luma * stride` bytes per chroma row (NV24's
-                    // full-resolution 2*W-byte line == two grid rows).
+                    // `uv_rows_per_luma` R8 rows per image chroma row (NV24's
+                    // full-resolution line == two grid rows; the divide-free
+                    // shader handles the wrap with a branchless carry).
                     let layout = src_fmt
                         .chroma_layout()
                         .expect("NV12/NV16/NV24 always have a chroma layout");
-                    let uv_row_bytes = (layout.uv_rows_per_luma * stride) as i32;
+                    let chroma_lines = layout.uv_rows_per_luma as i32;
                     gls::gl::UseProgram(self.program_nv_to_rgba);
                     gls::gl::Uniform1i(self.uniform_nv_src, 0);
                     gls::gl::Uniform2i(self.uniform_nv_img_size, src_w as i32, src_h as i32);
@@ -1448,7 +1377,7 @@ impl MacosGlProcessor {
                         layout.shift_x as i32,
                         layout.shift_y as i32,
                     );
-                    gls::gl::Uniform1i(self.uniform_nv_uv_row_bytes, uv_row_bytes);
+                    gls::gl::Uniform1i(self.uniform_nv_chroma_lines, chroma_lines);
                     // YUV→RGB matrix + range from the source colorimetry
                     // (mirrors the Linux Path B NV shader; missing axes filled
                     // by the SD/HD height heuristic).
@@ -1476,6 +1405,24 @@ impl MacosGlProcessor {
                     gls::gl::UseProgram(self.program_yuyv_to_rgba);
                     gls::gl::Uniform1i(self.uniform_src, 0);
                     gls::gl::Uniform2f(self.uniform_src_size, src_w as f32, src_h as f32);
+                    // YUV→RGB matrix + range from the source colorimetry
+                    // (mirrors the NV branch above; missing axes filled by the
+                    // SD/HD height heuristic).
+                    let cm = crate::colorimetry::resolve_colorimetry(
+                        src_u8.colorimetry(),
+                        src_u8.height(),
+                    );
+                    let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
+                        cm.encoding
+                            .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                        cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+                    );
+                    gls::gl::Uniform1f(self.uniform_yuyv_y_offset, coeffs.y_offset);
+                    gls::gl::Uniform1f(self.uniform_yuyv_y_scale, coeffs.y_scale);
+                    gls::gl::Uniform1f(self.uniform_yuyv_c_vr, coeffs.c_vr);
+                    gls::gl::Uniform1f(self.uniform_yuyv_c_ug, coeffs.c_ug);
+                    gls::gl::Uniform1f(self.uniform_yuyv_c_vg, coeffs.c_vg);
+                    gls::gl::Uniform1f(self.uniform_yuyv_c_ub, coeffs.c_ub);
                 }
             }
             gls::gl::BindVertexArray(self.vao);
@@ -1618,18 +1565,15 @@ impl ImageProcessorTrait for MacosGlProcessor {
                 "MacosGlProcessor: {src_fmt:?} → {dst_fmt:?} not in the initial GL coverage set"
             )));
         }
-        // The float render-path decision is named once for every platform by
-        // `gl::float_dispatch::FloatRenderPath`; the F16 arm below corresponds
-        // to `FloatRenderPath::IoSurfaceF16Nchw`. It is NOT routed through the
-        // shared `classify_float_render` because (a) a macOS IOSurface tensor
-        // reports `TensorMemory::Dma` (the IOSurface backing shares the `Dma`
-        // slot), so the classifier cannot distinguish it from a Linux DMA-BUF
-        // destination, and (b) this match also dispatches the non-float YUYV
-        // path and a format-specific F16-required error that are not part of
-        // the float decision. Converging it onto the classifier would be a
-        // non-mechanical rewrite of working, ANGLE-tested code we cannot
-        // compile or exercise on the Linux host; the inline match is retained
-        // deliberately. See `gl::float_dispatch` for the shared definition.
+        // macOS owns its float render-path decision: the zero-copy IOSurface
+        // F16 arm below is NOT routed through the shared `classify_float_render`
+        // because (a) a macOS IOSurface tensor reports `TensorMemory::Dma` (the
+        // IOSurface backing shares the `Dma` slot), so the classifier cannot
+        // distinguish it from a Linux DMA-BUF destination, and (b) this match
+        // also dispatches the non-float YUYV path and a format-specific
+        // F16-required error that are not part of the float decision. The shared
+        // `gl::float_dispatch::FloatRenderPath` therefore stays free of any
+        // macOS-only variant; this inline match is the macOS source of truth.
         match (src_fmt, dst_fmt, dst.dtype()) {
             // Zero-copy preprocessing path: RGBA8 → PlanarRgb F16 via
             // RGBA16F-packed IOSurface. F32 is intentionally NOT in the
@@ -1701,100 +1645,3 @@ impl ImageProcessorTrait for MacosGlProcessor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shader helpers
-// ---------------------------------------------------------------------------
-
-unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> Result<u32> {
-    let vs = compile_shader(gls::gl::VERTEX_SHADER, vertex_src)?;
-    // From this point on, `vs` and (later) `fs` and `program` are owned
-    // by the helper and must be cleaned up on any error path. Track them
-    // in an Option and let `ProgramBuild`'s Drop clean up whatever is
-    // still present when we leave the function abnormally.
-    struct ProgramBuild {
-        vs: Option<u32>,
-        fs: Option<u32>,
-        program: Option<u32>,
-    }
-    impl Drop for ProgramBuild {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(p) = self.program {
-                    gls::gl::DeleteProgram(p);
-                }
-                if let Some(s) = self.fs {
-                    gls::gl::DeleteShader(s);
-                }
-                if let Some(s) = self.vs {
-                    gls::gl::DeleteShader(s);
-                }
-            }
-        }
-    }
-    let mut state = ProgramBuild {
-        vs: Some(vs),
-        fs: None,
-        program: None,
-    };
-
-    let fs = compile_shader(gls::gl::FRAGMENT_SHADER, fragment_src)?;
-    state.fs = Some(fs);
-
-    let program = gls::gl::CreateProgram();
-    state.program = Some(program);
-    gls::gl::AttachShader(program, vs);
-    gls::gl::AttachShader(program, fs);
-    gls::gl::LinkProgram(program);
-    let mut ok = 0i32;
-    gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut ok);
-    if ok == 0 {
-        let mut log = [0u8; 4096];
-        let mut len = 0i32;
-        gls::gl::GetProgramInfoLog(
-            program,
-            log.len() as i32,
-            &mut len,
-            log.as_mut_ptr() as *mut _,
-        );
-        // `state` Drop deletes program + fs + vs as we return.
-        return Err(Error::Internal(format!(
-            "program link failed: {}",
-            String::from_utf8_lossy(&log[..len.max(0) as usize])
-        )));
-    }
-
-    // Success: detach shaders + delete them (GL drops them when
-    // unreferenced by any program). Disarm state so it doesn't delete
-    // the program we're returning.
-    gls::gl::DeleteShader(state.vs.take().unwrap());
-    gls::gl::DeleteShader(state.fs.take().unwrap());
-    let program = state.program.take().unwrap();
-    std::mem::forget(state);
-    Ok(program)
-}
-
-unsafe fn compile_shader(kind: u32, src: &str) -> Result<u32> {
-    let shader = gls::gl::CreateShader(kind);
-    let c = CString::new(src).map_err(|e| Error::Internal(format!("shader CString: {e}")))?;
-    let ptr = c.as_ptr();
-    let len = src.len() as i32;
-    gls::gl::ShaderSource(shader, 1, &ptr, &len);
-    gls::gl::CompileShader(shader);
-    let mut ok = 0i32;
-    gls::gl::GetShaderiv(shader, gls::gl::COMPILE_STATUS, &mut ok);
-    if ok == 0 {
-        let mut log = [0u8; 4096];
-        let mut len = 0i32;
-        gls::gl::GetShaderInfoLog(
-            shader,
-            log.len() as i32,
-            &mut len,
-            log.as_mut_ptr() as *mut _,
-        );
-        return Err(Error::Internal(format!(
-            "shader compile failed (kind=0x{kind:x}): {}",
-            String::from_utf8_lossy(&log[..len.max(0) as usize])
-        )));
-    }
-    Ok(shader)
-}

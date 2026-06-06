@@ -685,6 +685,7 @@ version = "0.24.2"
 dependencies = [
  "ctor",
  "dma-heap",
+ "drm-fourcc",
  "edgefirst-bench",
  "edgefirst-codec",
  "edgefirst-decoder",

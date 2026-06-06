@@ -3,7 +3,7 @@
 
 use super::cache::EglCacheKey;
 use super::context::{Egl, GlContext};
-use super::shaders::{check_gl_error, compile_shader_from_str};
+use super::shaders::check_gl_error;
 use khronos_egl as egl;
 use log::error;
 use std::ffi::{c_void, CStr};
@@ -245,73 +245,15 @@ impl Drop for FrameBuffer {
 
 pub(super) struct GlProgram {
     pub(super) id: u32,
-    vertex_id: u32,
-    fragment_id: u32,
 }
 
 impl GlProgram {
     pub(super) fn new(vertex_shader: &str, fragment_shader: &str) -> Result<Self, crate::Error> {
-        let id = unsafe { gls::gl::CreateProgram() };
-        let vertex_id = unsafe { gls::gl::CreateShader(gls::gl::VERTEX_SHADER) };
-        if compile_shader_from_str(vertex_id, vertex_shader, "shader_vert").is_err() {
-            log::debug!("Vertex shader source:\n{}", vertex_shader);
-            unsafe {
-                gls::gl::DeleteShader(vertex_id);
-                gls::gl::DeleteProgram(id);
-            }
-            return Err(crate::Error::OpenGl(format!(
-                "Shader compile error: {vertex_shader}"
-            )));
-        }
-        unsafe {
-            gls::gl::AttachShader(id, vertex_id);
-        }
-
-        let fragment_id = unsafe { gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER) };
-        if compile_shader_from_str(fragment_id, fragment_shader, "shader_frag").is_err() {
-            log::debug!("Fragment shader source:\n{}", fragment_shader);
-            unsafe {
-                gls::gl::DeleteShader(vertex_id);
-                gls::gl::DeleteShader(fragment_id);
-                gls::gl::DeleteProgram(id);
-            }
-            return Err(crate::Error::OpenGl(format!(
-                "Shader compile error: {fragment_shader}"
-            )));
-        }
-
-        unsafe {
-            gls::gl::AttachShader(id, fragment_id);
-            gls::gl::LinkProgram(id);
-
-            let mut link_status = 0;
-            gls::gl::GetProgramiv(id, gls::gl::LINK_STATUS, &raw mut link_status);
-            if link_status == 0 {
-                let mut log_len = 0;
-                gls::gl::GetProgramiv(id, gls::gl::INFO_LOG_LENGTH, &raw mut log_len);
-                let mut log_buf: Vec<u8> = vec![0; log_len as usize];
-                gls::gl::GetProgramInfoLog(
-                    id,
-                    log_len,
-                    std::ptr::null_mut(),
-                    log_buf.as_mut_ptr() as *mut std::ffi::c_char,
-                );
-                let msg = String::from_utf8_lossy(&log_buf);
-                log::error!("Program link failed: {msg}");
-                gls::gl::DeleteShader(vertex_id);
-                gls::gl::DeleteShader(fragment_id);
-                gls::gl::DeleteProgram(id);
-                return Err(crate::Error::OpenGl(format!("Program link error: {msg}")));
-            }
-
-            gls::gl::UseProgram(id);
-        }
-
-        Ok(Self {
-            id,
-            vertex_id,
-            fragment_id,
-        })
+        // Shared compile+link (deletes the shaders after a successful link) —
+        // see `gl::core::compile_program`.
+        let id = unsafe { super::core::compile_program(vertex_shader, fragment_shader)? };
+        unsafe { gls::gl::UseProgram(id) };
+        Ok(Self { id })
     }
 
     pub(super) fn load_uniform_1f(&self, name: &CStr, value: f32) -> Result<(), crate::Error> {
@@ -357,8 +299,6 @@ impl Drop for GlProgram {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             gls::gl::DeleteProgram(self.id);
-            gls::gl::DeleteShader(self.fragment_id);
-            gls::gl::DeleteShader(self.vertex_id);
         }));
     }
 }
