@@ -313,16 +313,11 @@ impl ImageProcessorTrait for G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
-        // G2D renders the whole destination; it has no view()/batch() sub-region
-        // (band) support, so decline a view dst and let the dispatcher fall back
-        // to the CPU backend, which writes the sub-region via offset + parent
-        // stride. (The Linux GL backend implements the DMA band path.)
-        if dst.view_origin().is_some() {
-            return Err(Error::NotSupported(
-                "G2D: destination view()/batch() sub-region not supported (CPU fallback handles it)"
-                    .into(),
-            ));
-        }
+        // A view()/batch() destination needs no special handling here: G2D blits
+        // to the destination's `plane_offset` + parent `row_stride`, so a sub-view
+        // (the tile) lands in its window of the parent buffer natively — the same
+        // mechanism a whole-tensor blit uses. (The cache-key/glViewport batch
+        // path is GL-specific; G2D addresses the tile by offset+stride.)
         let crop = crop.resolve(
             src.width().unwrap_or(0),
             src.height().unwrap_or(0),
@@ -563,7 +558,7 @@ mod g2d_predicate_tests {
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
-    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation};
+    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rotation};
     use edgefirst_tensor::{
         is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
@@ -804,22 +799,17 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
-        let crop = Crop {
-            src_rect: None,
-            dst_rect: Some(Rect {
-                top: 100,
-                left: 100,
-                height: 100,
-                width: 200,
-            }),
-            dst_color: None,
-        };
+        // The destination sub-rectangle is now expressed as a `view()` of the
+        // destination (the old `Crop.dst_rect` was removed); G2D blits into the
+        // view's window via its offset + parent stride. Region is (x=left, y=top,
+        // width, height).
+        let region = crate::Region::new(100, 100, 200, 100);
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
-        let mut reference = TensorDyn::image(
+        let reference = TensorDyn::image(
             dst_width,
             dst_height,
             PixelFormat::Rgb,
@@ -833,7 +823,13 @@ mod g2d_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        cpu_converter.convert(&src, &mut reference, Rotation::None, Flip::None, crop)?;
+        cpu_converter.convert(
+            &src,
+            &mut reference.view(region)?,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
@@ -866,13 +862,13 @@ mod g2d_tests {
             .fill(128);
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
-        let mut g2d_dst_dyn = g2d_dst;
+        let g2d_dst_dyn = g2d_dst;
         g2d_converter.convert(
             &src2_dyn,
-            &mut g2d_dst_dyn,
+            &mut g2d_dst_dyn.view(region)?,
             Rotation::None,
             Flip::None,
-            crop,
+            Crop::no_crop(),
         )?;
         g2d_dst = {
             let mut __t = g2d_dst_dyn.into_u8().unwrap();

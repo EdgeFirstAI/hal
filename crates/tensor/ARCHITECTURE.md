@@ -189,18 +189,18 @@ carrying:
   holding a strong reference.
 
 The image processing backends key their EGL image cache on
-`BufferIdentity.id()` so that the **same tensor object** reused across
-frames hits the cache. A sub-region of a tensor **shares the parent's
-`BufferIdentity`**, so the image backend treats every tile of one batched
-destination as the same imported buffer — it imports a single EGLImage and
-selects the tile with `glViewport`, never a per-offset import. `plane_offset`
-therefore addresses only genuine offset-distinct *imports* (a foreign
-DMA-BUF starting at a non-zero byte offset, or a multi-plane chroma plane),
-**not** batch tiling. Because a view shares the parent's id, reconfiguring the
-parent must not leave a stale GPU import: **`configure_image()` invalidates the
-tensor's cached EGLImage entry** (and records a `last_import_reason` of
-`Reconfigure`) so a reused source buffer re-imports at its new geometry rather
-than returning the previous frame's image. The cache does **not** rescue a pipeline that
+`BufferIdentity.id()` (plus the import geometry — `width`/`height`/`row_stride`/
+`format`) so that the **same tensor object** reused across frames hits the cache.
+A sub-region of a tensor **shares the parent's `BufferIdentity`** and resolves
+the parent's geometry, so the image backend keys every tile of one batched
+destination on that parent — it imports a single EGLImage and selects the tile
+with `glViewport`, never a per-offset import. `plane_offset` therefore addresses
+only genuine offset-distinct *imports* (a foreign DMA-BUF starting at a non-zero
+byte offset, or a multi-plane chroma plane), **not** batch tiling. Because the
+key carries the geometry, reconfiguring a reused source buffer to a new size
+re-keys to a fresh import rather than returning the previous frame's image (a
+`last_import_reason` field recording `Reconfigure` is a planned observability
+addition). The cache does **not** rescue a pipeline that
 re-imports the same DMA-BUF every frame: each `hal_import_image` /
 `hal_tensor_from_fd` call mints a new `BufferIdentity` with a fresh
 ID, so re-imports always miss. The contract is:

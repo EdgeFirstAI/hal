@@ -620,10 +620,11 @@ OpenGL destination-tile obligations:
 run that is O(images) unless bounded. Reuse a fixed-capacity ring of source
 tensors sized to the codec's decode-ahead depth and re-`configure_image()` them so
 the live source EGLImages stay warm and bounded. Reconfiguring a reused buffer
-must re-import at the new geometry: **`configure_image()` invalidates that
-tensor's cached EGLImage entry** (the key is `(BufferIdentity.id, chroma_id)`, so
-without invalidation a reused id would return a *stale* image; `last_import_reason`
-records `Reconfigure`/`NewIdentity`/`Hit`).
+must re-import at the new geometry: because the cache key includes the import
+geometry (`width`/`height`/`row_stride`/`format`) alongside `BufferIdentity.id`
+and `chroma_id`, a buffer reused at a new size **re-keys to a fresh import**
+rather than returning a *stale* image. (A `last_import_reason` field recording
+`Reconfigure`/`NewIdentity`/`Hit` is a planned observability addition.)
 
 Edge contracts (testable invariants):
 
@@ -641,14 +642,17 @@ Edge contracts (testable invariants):
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —
 `src_egl_cache` for source tensors and `dst_egl_cache` for destination
-tensors. Each entry is keyed by the tensor's **`BufferIdentity.id`** (plus
-`chroma_id` for multi-plane sources). A destination tile reuses the parent
-allocation's identity and therefore its single cached EGLImage — the tile is
-selected with `glViewport`/`glScissor`, **not** by importing a new
-offset-keyed EGLImage (see [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert)).
-A `plane_offset` participates in the key only for genuine offset-distinct
-*imports* — a foreign DMA-BUF whose data starts at a non-zero byte offset, or
-a multi-plane chroma plane — never as a batch-tiling mechanism.
+tensors. The full key (`EglCacheKey`) is the tensor's **`BufferIdentity.id`**
+(plus `chroma_id` for multi-plane sources) **and the imported geometry**
+(`width`, `height`, `row_stride`, `format`) — the geometry distinguishes a
+pooled buffer reused at a new size via `configure_image`. A `view()`/`batch()`
+destination keys on its **parent**: it contributes the parent's geometry and
+`plane_offset = 0`, so every sibling tile collapses to the parent's single
+cached EGLImage and is selected with `glViewport`/`glScissor`, **not** by
+importing a new offset-keyed EGLImage (see [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert)).
+A non-zero `plane_offset` participates in the key only for a genuine
+offset-distinct *import* — a foreign DMA-BUF whose data starts past the fd
+origin, or a multi-plane chroma plane — never as a batch-tiling mechanism.
 
 `BufferIdentity` is defined in
 [`crates/tensor/src/lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs)
@@ -1231,7 +1235,7 @@ Python surface to supply colorimetry from the producer's signalling into
 
 | Optimization | Why it matters |
 |--------------|----------------|
-| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. Batch tiles share the parent's `BufferIdentity`, so the destination EGLImage is reused across the tile loop. |
+| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. The EGL image cache is keyed by `BufferIdentity.id`/`chroma_id` plus the import geometry (`width`/`height`/`row_stride`/`format`). New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. Batch tiles key on the parent's identity+geometry, so the destination EGLImage is imported once and reused across the tile loop. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
 | One `ImageProcessor` per pipeline | Each instance owns its OpenGL context, GL thread, and per-thread caches (the EGL display is process-global and shared). Multiple instances still serialize on `GL_MUTEX`, so concurrent use across instances buys nothing. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |

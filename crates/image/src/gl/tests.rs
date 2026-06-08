@@ -5538,7 +5538,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn probe_nv12_packed_letterbox_divergence() {
         use crate::opengl_headless::processor::GLProcessorST;
-        use crate::Rect;
+        use crate::{Fit, Region};
         if !is_dma_available() {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
@@ -5568,11 +5568,15 @@ mod gl_tests {
         let scaled_h = (sh as f32 * scale).round() as usize;
         let pad_x = (model - scaled_w) / 2;
         let pad_y = (model - scaled_h) / 2;
+        // Letterbox is now a resize mode (`Fit::Letterbox`); the backend computes
+        // the aspect-fit placement (pad_x/pad_y/scaled_*) internally via
+        // `Crop::resolve`, so the test no longer hand-builds a destination rect.
         let letterbox = || {
             Crop::new()
                 .with_source(Some(Region::new(0, 0, sw, sh)))
-                .with_dst_rect(Some(Rect::new(pad_x, pad_y, scaled_w, scaled_h)))
-                .with_dst_color(Some([114, 114, 114, 255]))
+                .with_fit(Fit::Letterbox {
+                    pad: [114, 114, 114, 255],
+                })
         };
 
         let gl_packed = |env: &str, crop: Crop, dw: usize, dh: usize| -> Option<(usize, Vec<u8>)> {

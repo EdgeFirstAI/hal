@@ -63,7 +63,7 @@ All `hal_*_free` functions accept `NULL` safely (no-op).
 `struct hal_tensor *` that **shares the parent's `BufferIdentity`** (zero-copy,
 no new GPU import) and is freed independently with `hal_tensor_free` — freeing a
 view does not affect the parent. `hal_region` is a by-value struct
-`{ uint32_t x, y, width, height; }` in pixels (no free). A view is
+`{ size_t x, y, width, height; }` in pixels (no free). A view is
 interchangeable with a tensor at `convert()`: pass `hal_tensor_batch(dst, n)` as
 `dst` to render into batch element *n* — the `convert()` signature is unchanged.
 An out-of-bounds region or `n ≥ N` returns `NULL` with `errno = EINVAL`. These

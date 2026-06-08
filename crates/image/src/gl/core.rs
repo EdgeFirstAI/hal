@@ -30,7 +30,12 @@ unsafe fn compile_shader(kind: u32, src: &str) -> crate::Result<u32> {
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut log_len = 0i32;
-        gls::gl::GetShaderInfoLog(shader, log.len() as i32, &mut log_len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetShaderInfoLog(
+            shader,
+            log.len() as i32,
+            &mut log_len,
+            log.as_mut_ptr() as *mut _,
+        );
         let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
         gls::gl::DeleteShader(shader);
         return Err(Error::OpenGl(format!(
@@ -91,7 +96,12 @@ pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> cr
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut log_len = 0i32;
-        gls::gl::GetProgramInfoLog(program, log.len() as i32, &mut log_len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetProgramInfoLog(
+            program,
+            log.len() as i32,
+            &mut log_len,
+            log.as_mut_ptr() as *mut _,
+        );
         let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
         return Err(Error::OpenGl(format!("program link failed: {msg}")));
     }
@@ -124,8 +134,16 @@ pub(super) unsafe fn set_tex_filter(target: u32, filter: u32) {
 /// Requires a current GL context and a bound texture on `target`.
 pub(super) unsafe fn set_tex_filter_clamp(target: u32, filter: u32) {
     set_tex_filter(target, filter);
-    gls::gl::TexParameteri(target, gls::gl::TEXTURE_WRAP_S, gls::gl::CLAMP_TO_EDGE as i32);
-    gls::gl::TexParameteri(target, gls::gl::TEXTURE_WRAP_T, gls::gl::CLAMP_TO_EDGE as i32);
+    gls::gl::TexParameteri(
+        target,
+        gls::gl::TEXTURE_WRAP_S,
+        gls::gl::CLAMP_TO_EDGE as i32,
+    );
+    gls::gl::TexParameteri(
+        target,
+        gls::gl::TEXTURE_WRAP_T,
+        gls::gl::CLAMP_TO_EDGE as i32,
+    );
 }
 
 /// Check that the currently-bound draw framebuffer is complete.

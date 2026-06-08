@@ -862,10 +862,7 @@ pub unsafe extern "C" fn hal_tensor_view(
     region: crate::image::HalRegion,
 ) -> *mut HalTensor {
     check_null_ret_null!(tensor);
-    let view = try_or_null!(
-        unsafe { &*tensor }.inner.view(region.into()),
-        libc::EINVAL
-    );
+    let view = try_or_null!(unsafe { &*tensor }.inner.view(region.into()), libc::EINVAL);
     Box::into_raw(Box::new(HalTensor { inner: view }))
 }
 
@@ -887,10 +884,7 @@ pub unsafe extern "C" fn hal_tensor_view(
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor, `n >= N`, or tensor is not batched
 #[no_mangle]
-pub unsafe extern "C" fn hal_tensor_batch(
-    tensor: *const HalTensor,
-    n: size_t,
-) -> *mut HalTensor {
+pub unsafe extern "C" fn hal_tensor_batch(tensor: *const HalTensor, n: size_t) -> *mut HalTensor {
     check_null_ret_null!(tensor);
     let view = try_or_null!(unsafe { &*tensor }.inner.batch(n), libc::EINVAL);
     Box::into_raw(Box::new(HalTensor { inner: view }))

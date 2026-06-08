@@ -998,9 +998,21 @@ mod cpu_tests {
         // Destination fill + sub-region render: fill the whole dst with the pad
         // colour, then render the source into the sub-region view.
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
-        converter.convert(&pad, &mut converted_dyn, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &pad,
+            &mut converted_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
         let mut dst_view = converted_dyn.view(Region::new(1, 1, 1, 1))?;
-        converter.convert(&src_dyn, &mut dst_view, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
 
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),
@@ -1022,9 +1034,21 @@ mod cpu_tests {
         let mut converted_dyn = converted;
 
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
-        converter.convert(&pad, &mut converted_dyn, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &pad,
+            &mut converted_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
         let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
-        converter.convert(&src_dyn, &mut dst_view, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
 
         // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
         // resolves it to BT.601 limited (previously a BT.709 hardcode). Red
@@ -1049,9 +1073,21 @@ mod cpu_tests {
         let mut converted_dyn = converted;
 
         let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[200, 200, 200, 255])?;
-        converter.convert(&pad, &mut converted_dyn, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &pad,
+            &mut converted_dyn,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
         let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
-        converter.convert(&src_dyn, &mut dst_view, Rotation::None, Flip::None, Crop::new())?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
+        )?;
 
         assert_eq!(
             converted_dyn.as_u8().unwrap().map()?.as_slice(),

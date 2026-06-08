@@ -1377,7 +1377,9 @@ mod tests {
         }
 
         // A 64-byte window starting at offset 64 must alias the same buffer.
-        let view = parent.subview(64, &[64]).expect("iosurface subview must succeed");
+        let view = parent
+            .subview(64, &[64])
+            .expect("iosurface subview must succeed");
         assert_eq!(
             view.buffer_identity().id(),
             parent.buffer_identity().id(),
@@ -1389,7 +1391,12 @@ mod tests {
         let s = m.as_slice();
         assert_eq!(s.len(), 64, "window exposes exactly its logical length");
         for (i, b) in s.iter().enumerate() {
-            assert_eq!(*b, ((i + 64) & 0xff) as u8, "view byte {i} must be parent[{}]", i + 64);
+            assert_eq!(
+                *b,
+                ((i + 64) & 0xff) as u8,
+                "view byte {i} must be parent[{}]",
+                i + 64
+            );
         }
 
         // Writes through the window land in the parent buffer (zero-copy alias).
@@ -1399,6 +1406,10 @@ mod tests {
             mw.as_mut_slice()[0] = 0xAB;
         }
         let mp = parent.map().expect("remap parent");
-        assert_eq!(mp.as_slice()[64], 0xAB, "write through view is visible in parent");
+        assert_eq!(
+            mp.as_slice()[64],
+            0xAB,
+            "write through view is visible in parent"
+        );
     }
 }
