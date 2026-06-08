@@ -52,6 +52,10 @@ mod dma_import;
 // backends. No gbm/IOSurface types; compiled on both.
 mod core;
 mod float_dispatch;
+// Portable GL render lowering (y-flip viewport, source UV, batch chunk planner).
+// No platform types; compiled on both platforms, consumed by the converged
+// tile/batch renderer. See `render.rs`.
+mod render;
 // PixelFormat -> DRM FourCC mapping via the portable `drm_fourcc` crate (NOT
 // `gbm`). DRM FourCC is a Linux/DMA-BUF concept, so this lives with the other
 // Linux graphics modules; the point is that it carries no `gbm` coupling, so

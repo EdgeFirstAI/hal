@@ -82,6 +82,11 @@ where
     pub shape: Vec<usize>,
     handle: Arc<PboHandle>,
     identity: BufferIdentity,
+    /// Byte offset of this tensor's window into the shared GL buffer. Non-zero
+    /// only for sub-views (`view`/`batch`), which share the `Arc<PboHandle>` and
+    /// `BufferIdentity` and address a sub-region by this offset — mirrors
+    /// `DmaTensor::mmap_offset` / `IoSurfaceTensor::view_offset`.
+    pub(crate) view_offset: usize,
     _marker: PhantomData<T>,
 }
 
@@ -147,6 +152,49 @@ where
                 mapped: AtomicBool::new(false),
             }),
             identity: BufferIdentity::new(),
+            view_offset: 0,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Create a zero-copy sub-region view sharing this PBO's GL buffer (via the
+    /// `Arc<PboHandle>`) and `BufferIdentity`, positioned at `offset_bytes` from
+    /// this tensor's own window with logical `shape`. The GL backend keys the
+    /// import on the shared identity and addresses the window via `glViewport` /
+    /// the staged copy; a CPU map adds `view_offset` to the mapped base. Mirrors
+    /// [`DmaTensor::view`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is mis-aligned for `T`.
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the allocation.
+    pub(crate) fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "PboTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = self
+            .view_offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > self.handle.size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.handle.size,
+            });
+        }
+        Ok(Self {
+            name: self.name.clone(),
+            shape: shape.to_vec(),
+            handle: Arc::clone(&self.handle),
+            identity: self.identity.clone(),
+            view_offset: abs_offset,
             _marker: PhantomData,
         })
     }
@@ -210,6 +258,7 @@ where
             )));
         }
         self.shape = shape.to_vec();
+        self.view_offset = 0;
         Ok(())
     }
 
@@ -280,6 +329,7 @@ where
                     shape: self.shape.clone(),
                     handle: Arc::clone(&self.handle),
                     byte_size_override,
+                    view_offset: self.view_offset,
                     _marker: PhantomData,
                 }))
             }
@@ -318,6 +368,9 @@ where
     /// `row_stride` (set by `Tensor::map()` for strided PBO tensors). Mirrors
     /// `DmaMap::byte_size_override`.
     byte_size_override: Option<usize>,
+    /// Byte offset of the sub-view window into the mapped GL buffer. `as_slice`
+    /// advances the base pointer by this many bytes before exposing the slice.
+    view_offset: usize,
     _marker: PhantomData<T>,
 }
 
@@ -351,12 +404,14 @@ where
 
     fn as_slice(&self) -> &[T] {
         let ptr = self.ptr.lock().expect("Failed to lock PboMap pointer");
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const T, self.slice_len_elems()) }
+        let base = unsafe { (ptr.as_ptr() as *const u8).add(self.view_offset) as *const T };
+        unsafe { std::slice::from_raw_parts(base, self.slice_len_elems()) }
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
         let ptr = self.ptr.lock().expect("Failed to lock PboMap pointer");
-        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, self.slice_len_elems()) }
+        let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.view_offset) as *mut T };
+        unsafe { std::slice::from_raw_parts_mut(base, self.slice_len_elems()) }
     }
 }
 
@@ -413,6 +468,7 @@ where
             shape: self.shape.clone(),
             handle: Arc::clone(&self.handle),
             identity: self.identity.clone(),
+            view_offset: self.view_offset,
             _marker: PhantomData,
         }
     }

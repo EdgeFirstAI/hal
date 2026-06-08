@@ -77,6 +77,16 @@ typedef void *hal_delegate_t;
 #define HAL_FOURCC_MAX_LEN 8
 
 /**
+ * Stretch fit (fill the destination).
+ */
+#define HAL_FIT_STRETCH 0
+
+/**
+ * Letterbox fit (preserve source aspect, pad with `HalCrop::pad`).
+ */
+#define HAL_FIT_LETTERBOX 1
+
+/**
  * Output type for model tensor outputs.
  *
  * Identifies the role of a model output tensor in the decoder pipeline.
@@ -731,57 +741,52 @@ typedef struct hal_detect_box {
 } hal_detect_box;
 
 /**
- * Rectangle structure for defining regions.
+ * Rectangular region (pixels) for a source crop.
  */
-typedef struct hal_rect {
+typedef struct hal_region {
   /**
-   * Left edge (x coordinate)
+   * X coordinate (left edge)
    */
-  size_t left;
+  size_t x;
   /**
-   * Top edge (y coordinate)
+   * Y coordinate (top edge)
    */
-  size_t top;
+  size_t y;
   /**
-   * Width of the rectangle
+   * Width in pixels
    */
   size_t width;
   /**
-   * Height of the rectangle
+   * Height in pixels
    */
   size_t height;
-} hal_rect;
+} hal_region;
 
 /**
- * Crop configuration for image conversion.
+ * Crop configuration for image conversion — **source-side only**.
  *
- * Specifies source crop region, destination placement, and background color.
+ * Destination placement is the destination tensor itself: pass a
+ * `hal_tensor_view` / `hal_tensor_batch` sub-region as the `convert`
+ * destination to render into a tile. This struct selects the source
+ * sub-rectangle and the fit mode.
  */
 typedef struct hal_crop {
   /**
-   * Source rectangle to crop from
+   * Source rectangle to sample from
    */
-  struct hal_rect src_rect;
+  struct hal_region source;
   /**
-   * Destination rectangle to place crop into
+   * Whether `source` is set (else the whole source is sampled)
    */
-  struct hal_rect dst_rect;
+  bool has_source;
   /**
-   * Background color (RGBA)
+   * Fit mode: `HAL_FIT_STRETCH` or `HAL_FIT_LETTERBOX`
    */
-  uint8_t dst_color[4];
+  int32_t fit;
   /**
-   * Whether src_rect is set
+   * Letterbox pad colour (RGBA), used when `fit == HAL_FIT_LETTERBOX`
    */
-  bool has_src_rect;
-  /**
-   * Whether dst_rect is set
-   */
-  bool has_dst_rect;
-  /**
-   * Whether dst_color is set
-   */
-  bool has_dst_color;
+  uint8_t pad[4];
 } hal_crop;
 
 /**
@@ -1670,33 +1675,25 @@ int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
  * @param height Height of the rectangle
  * @return New rectangle structure
  */
-struct hal_rect hal_rect_new(size_t left, size_t top, size_t width, size_t height);
+struct hal_region hal_region_new(size_t x, size_t y, size_t width, size_t height);
 
 /**
- * Create a new default crop configuration.
+ * Create a new default crop configuration (whole source, stretch fit).
  *
- * @return New crop structure with all fields unset
+ * @return New crop structure
  */
 struct hal_crop hal_crop_new(void);
 
 /**
- * Set the source rectangle for a crop configuration.
+ * Set the source sampling region for a crop configuration.
  *
  * @param crop Crop configuration to modify
- * @param rect Source rectangle (can be NULL to clear)
+ * @param region Source region (can be NULL to clear → whole source)
  */
-void hal_crop_set_src_rect(struct hal_crop *crop, const struct hal_rect *rect);
+void hal_crop_set_source(struct hal_crop *crop, const struct hal_region *region);
 
 /**
- * Set the destination rectangle for a crop configuration.
- *
- * @param crop Crop configuration to modify
- * @param rect Destination rectangle (can be NULL to clear)
- */
-void hal_crop_set_dst_rect(struct hal_crop *crop, const struct hal_rect *rect);
-
-/**
- * Set the background color for a crop configuration.
+ * Configure letterbox fit with the given pad colour (RGBA).
  *
  * @param crop Crop configuration to modify
  * @param r Red component (0-255)
@@ -1704,7 +1701,7 @@ void hal_crop_set_dst_rect(struct hal_crop *crop, const struct hal_rect *rect);
  * @param b Blue component (0-255)
  * @param a Alpha component (0-255)
  */
-void hal_crop_set_dst_color(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+void hal_crop_set_letterbox(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
 /**
  * Create a new empty image tensor.
@@ -2837,64 +2834,46 @@ void hal_tensor_cuda_unmap(void *map);
 int hal_tensor_reshape(struct hal_tensor *tensor, const size_t *shape, size_t ndim);
 
 /**
- * Create a zero-copy sub-region view that shares the parent's allocation.
+ * Create a zero-copy rectangular sub-region view of an image tensor — the
+ * destination/source **crop** primitive.
  *
- * The view maps the window `[offset_bytes, offset_bytes + size)` where
- * `size = prod(shape) * element_size`, sharing the parent buffer (`Mem` heap
- * allocation or `Dma` fd) with no copy. N views into one parent can each be
- * mapped (via `hal_tensor_map_create`) and written independently — the basis
- * for assembling a batch into one buffer. `offset_bytes` must be aligned to
- * the element's alignment (its natural alignment, which equals the element
- * size for the supported dtypes) and the window must fit the parent
- * allocation.
+ * `region` is in pixels of the image's leading frame. The returned view shares
+ * the parent's `BufferIdentity` and addresses the sub-rectangle by offset + the
+ * parent's row pitch, so `hal_image_processor_convert()` into the view renders
+ * the sub-rectangle. The parent must be a packed-format image tensor.
  *
  * The returned tensor must be freed with `hal_tensor_free()`. It co-owns the
  * parent buffer (shared `Arc`/fd), so the buffer stays valid as long as any
  * view is alive, even if the parent handle is freed first.
  *
- * @param tensor Parent tensor handle
- * @param offset_bytes Byte offset of the window into the parent allocation
- * @param shape Array of dimension sizes (ndim elements)
- * @param ndim Number of dimensions (1-8)
- * @return New tensor handle viewing the window on success, NULL on error
+ * @param tensor Parent image tensor handle
+ * @param region Sub-rectangle (pixels) into the parent image
+ * @return New tensor handle viewing the sub-rectangle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: NULL tensor/shape, ndim 0 or > 8, offset not element-aligned,
- *   window exceeds the parent allocation, or backing is not Mem/Dma
+ * - EINVAL: NULL tensor, region out of bounds, or tensor is not a packed image
  */
-struct hal_tensor *hal_tensor_subview(const struct hal_tensor *tensor,
-                                      size_t offset_bytes,
-                                      const size_t *shape,
-                                      size_t ndim);
+struct hal_tensor *hal_tensor_view(const struct hal_tensor *tensor, struct hal_region region);
 
 /**
- * Get the byte offset of this tensor's window into its backing allocation.
+ * Borrow batch element `n` of a batched tensor as a zero-copy view.
  *
- * Writes the offset to `*out_offset` (when non-NULL) and returns `true` when
- * the tensor carries a plane offset — e.g. a view from `hal_tensor_subview`.
- * Returns `false` for a whole-buffer tensor (writing `0`) or a NULL tensor.
+ * A batched tensor prepends `N` as the leading dimension over the per-element
+ * image layout (`[N, H, W, C]` packed or `[N, C, H, W]` planar). `batch(n)`
+ * returns element `n` — the contiguous per-element region at byte offset
+ * `n * element_size`, sharing the parent's `BufferIdentity`. `batch(0)` on a
+ * tensor with `N == 1` is equivalent to the whole tensor. This is the
+ * destination primitive for assembling a batch into one buffer.
  *
- * @param tensor Tensor handle
- * @param out_offset Out-param receiving the byte offset (may be NULL to query
- *        presence only)
- * @return true if a plane offset is set, false otherwise
+ * The returned tensor must be freed with `hal_tensor_free()`. It co-owns the
+ * parent buffer, so the buffer stays valid while any element view is alive.
+ *
+ * @param tensor Parent batched tensor handle
+ * @param n Batch element index (`0 <= n < N`)
+ * @return New tensor handle viewing element `n` on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: NULL tensor
+ * - EINVAL: NULL tensor, `n >= N`, or tensor is not batched
  */
-bool hal_tensor_plane_offset(const struct hal_tensor *tensor, size_t *out_offset);
-
-/**
- * Set the byte offset of this tensor's window into its backing allocation.
- *
- * Validated against the allocation when the tensor is mapped. Prefer
- * `hal_tensor_subview()` for sharing one buffer across independent windows.
- *
- * @param tensor Tensor handle
- * @param offset Byte offset into the backing allocation
- * @return 0 on success, -1 on error
- * @par Errors (errno):
- * - EINVAL: NULL tensor
- */
-int hal_tensor_set_plane_offset(struct hal_tensor *tensor, size_t offset);
+struct hal_tensor *hal_tensor_batch(const struct hal_tensor *tensor, size_t n);
 
 /**
  * Attach per-tensor affine quantization metadata to an integer tensor.

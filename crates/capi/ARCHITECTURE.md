@@ -24,7 +24,7 @@ that downstream integrators must follow.
 | Module | Source | Responsibility |
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/lib.rs) | local | crate-wide setup, panic-safe FFI helpers, error reporting |
-| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `hal_plane_descriptor_*` |
+| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
 | [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
 | [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | ~3.2k lines — `hal_decoder_*` create / decode detection / decode segmentation |
 | [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | ~300 lines — `hal_bytetrack_*` create / update / get_active_tracks |
@@ -56,6 +56,20 @@ struct churn — only the function signatures form the stable contract.
 | `hal_delegate_t` | opaque `void *` for delegate DMA-BUF queries | (caller-managed) |
 
 All `hal_*_free` functions accept `NULL` safely (no-op).
+
+### Tensor sub-regions (views / batch tiles)
+
+`hal_tensor_view(t, hal_region)` and `hal_tensor_batch(t, n)` return a new
+`struct hal_tensor *` that **shares the parent's `BufferIdentity`** (zero-copy,
+no new GPU import) and is freed independently with `hal_tensor_free` — freeing a
+view does not affect the parent. `hal_region` is a by-value struct
+`{ uint32_t x, y, width, height; }` in pixels (no free). A view is
+interchangeable with a tensor at `convert()`: pass `hal_tensor_batch(dst, n)` as
+`dst` to render into batch element *n* — the `convert()` signature is unchanged.
+An out-of-bounds region or `n ≥ N` returns `NULL` with `errno = EINVAL`. These
+replace the former `hal_tensor_subview`; `plane_offset` is no longer a public
+sub-region mechanism (it remains an internal import attribute for foreign /
+multi-plane DMA-BUFs).
 
 ## CUDA Zero-Copy
 
@@ -164,6 +178,20 @@ Allocate processor             Reuse same tensors            Free tensors
 Allocate src/dst tensors       Call convert()                Free processor
 (from fd or create_image)      (EGL cache hits)
 ```
+
+### Batched preprocessing (building an N-batch via convert)
+
+To assemble an `[N, …]` model input, allocate the batched destination once via
+`create_image`, then loop: for each source, call
+`hal_image_processor_convert(p, src, hal_tensor_batch(dst, n), …)` to render
+into element *n*. Each call imports its destination at the sub-view's own
+offset+identity and completes independently with `glFinish()`. Create the N
+`hal_tensor_batch` handles once and reuse them across frames, like the tensors
+and the source pool.
+
+**Constraint:** passing a `view`/`batch` of the *same* parent as both `src` and
+`dst` of one `convert()` is undefined (the GL backend binds the whole EGLImage
+as both texture and FBO), even if the rectangles are disjoint.
 
 ### Initialization
 

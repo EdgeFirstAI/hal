@@ -7,7 +7,8 @@ use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{
-        self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Rect, Rotation,
+        self, Crop, Fit, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Region,
+        Rotation,
     },
     tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait},
 };
@@ -1009,24 +1010,28 @@ impl PyImageProcessor {
         Ok(PyImageProcessor(Mutex::new(converter)))
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
     pub fn convert(
         &mut self,
         src: &PyTensor,
         dst: &mut PyTensor,
         rotation: PyRotation,
         flip: PyFlip,
-        src_crop: Option<PyRect>,
-        dst_crop: Option<PyRect>,
-        dst_color: Option<[u8; 4]>,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert").entered();
         let rotation = rotation.into();
         let flip = flip.into();
+        // Destination placement is the destination tensor (use `tensor.view`/
+        // `tensor.batch` for a sub-region); `letterbox` is the pad colour for an
+        // aspect-preserving fit.
         let crop = Crop {
-            src_rect: src_crop.map(|x| x.into()),
-            dst_rect: dst_crop.map(|x| x.into()),
-            dst_color,
+            source: source.map(|x| x.into()),
+            fit: match letterbox {
+                Some(pad) => Fit::Letterbox { pad },
+                None => Fit::Stretch,
+            },
         };
         let mut l = self
             .0
@@ -1445,13 +1450,13 @@ impl From<PyFlip> for Flip {
     }
 }
 
-#[pyclass(name = "Rect", eq, from_py_object)]
+#[pyclass(name = "Region", eq, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PyRect {
+pub struct PyRegion {
     #[pyo3(get, set)]
-    pub left: usize,
+    pub x: usize,
     #[pyo3(get, set)]
-    pub top: usize,
+    pub y: usize,
     #[pyo3(get, set)]
     pub width: usize,
     #[pyo3(get, set)]
@@ -1459,23 +1464,23 @@ pub struct PyRect {
 }
 
 #[pymethods]
-impl PyRect {
+impl PyRegion {
     #[new]
-    pub fn new(left: usize, top: usize, width: usize, height: usize) -> PyRect {
-        PyRect {
-            left,
-            top,
+    pub fn new(x: usize, y: usize, width: usize, height: usize) -> PyRegion {
+        PyRegion {
+            x,
+            y,
             width,
             height,
         }
     }
 }
 
-impl From<PyRect> for Rect {
-    fn from(val: PyRect) -> Self {
-        Rect {
-            left: val.left,
-            top: val.top,
+impl From<PyRegion> for Region {
+    fn from(val: PyRegion) -> Self {
+        Region {
+            x: val.x,
+            y: val.y,
             width: val.width,
             height: val.height,
         }

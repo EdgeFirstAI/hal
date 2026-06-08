@@ -561,8 +561,8 @@ mod gl_tests {
             Some(TensorMemory::Dma),
         )
         .unwrap();
-        let mut view0 = parent.subview(0, &[h, w, 4]).unwrap();
-        let mut view1 = parent.subview(frame, &[h, w, 4]).unwrap();
+        let mut view0 = parent.view(crate::Region::new(0, 0, w, h)).unwrap();
+        let mut view1 = parent.view(crate::Region::new(0, h, w, h)).unwrap();
         assert_eq!(view1.plane_offset(), Some(frame));
 
         convert(&mut gl, &src0, &mut view0);
@@ -1248,21 +1248,11 @@ mod gl_tests {
 
     /// Build a letterbox crop that fits src into dst_w x dst_h, preserving aspect ratio.
     #[cfg(feature = "dma_test_formats")]
-    fn letterbox_crop(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Crop {
-        let src_aspect = src_w as f64 / src_h as f64;
-        let dst_aspect = dst_w as f64 / dst_h as f64;
-        let (new_w, new_h) = if src_aspect > dst_aspect {
-            let new_h = (dst_w as f64 / src_aspect).round() as usize;
-            (dst_w, new_h)
-        } else {
-            let new_w = (dst_h as f64 * src_aspect).round() as usize;
-            (new_w, dst_h)
-        };
-        let left = (dst_w - new_w) / 2;
-        let top = (dst_h - new_h) / 2;
-        Crop::new()
-            .with_dst_rect(Some(crate::Rect::new(left, top, new_w, new_h)))
-            .with_dst_color(Some([114, 114, 114, 255]))
+    fn letterbox_crop(_src_w: usize, _src_h: usize, _dst_w: usize, _dst_h: usize) -> Crop {
+        // Letterbox placement is now computed by the backend from the actual
+        // src/dst dims (identical centred aspect-fit math); the helper just
+        // selects the pad colour.
+        Crop::letterbox([114, 114, 114, 255])
     }
 
     /// Strip alpha from PixelFormat::Rgba bytes → packed PixelFormat::Rgb bytes.
@@ -3742,7 +3732,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Crop only the right (blue) half
-        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(
+        let crop = Crop::new().with_source(Some(crate::Region::new(
             src_w / 2, // left = start of blue region
             0,
             src_w / 2, // width = blue half
@@ -3806,7 +3796,7 @@ mod gl_tests {
 
         // Crop the right half — the left boundary is exactly at the red→blue edge
         let crop =
-            Crop::new().with_src_rect(Some(crate::Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+            Crop::new().with_source(Some(crate::Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
@@ -3852,7 +3842,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Crop only the left (red) half
-        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(0, 0, src_w / 2, src_h)));
+        let crop = Crop::new().with_source(Some(crate::Region::new(0, 0, src_w / 2, src_h)));
 
         if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
@@ -4543,7 +4533,7 @@ mod gl_tests {
     ///   and in-range)
     #[test]
     fn convert_f32_pbo_letterbox_pad_color() {
-        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig, Rect};
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -4600,9 +4590,7 @@ mod gl_tests {
 
         // Letterbox: content lands in columns [2, 6); columns [0, 2) and
         // [6, 8) are padded with the `dst_color`.
-        let crop = Crop::new()
-            .with_dst_rect(Some(Rect::new(2, 0, 4, 4)))
-            .with_dst_color(Some([114, 114, 114, 255]));
+        let crop = Crop::letterbox([114, 114, 114, 255]);
 
         let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
         assert!(
@@ -5582,7 +5570,7 @@ mod gl_tests {
         let pad_y = (model - scaled_h) / 2;
         let letterbox = || {
             Crop::new()
-                .with_src_rect(Some(Rect::new(0, 0, sw, sh)))
+                .with_source(Some(Region::new(0, 0, sw, sh)))
                 .with_dst_rect(Some(Rect::new(pad_x, pad_y, scaled_w, scaled_h)))
                 .with_dst_color(Some([114, 114, 114, 255]))
         };

@@ -21,10 +21,9 @@
 
 mod common;
 
-use common::{calculate_letterbox, format_name, get_test_data, BenchConfig};
+use common::{format_name, get_test_data, BenchConfig};
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rect,
-    Rotation,
+    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Rotation,
 };
 use edgefirst_tensor::{DType, PixelFormat};
 use edgefirst_tensor::{TensorMapTrait, TensorTrait};
@@ -82,11 +81,8 @@ fn run_single_test(backend: ComputeBackend, config: &BenchConfig, result_fd: i32
             }
         };
 
-    let (left, top, new_w, new_h) =
-        calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-    let crop = Crop::new()
-        .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-        .with_dst_color(Some([114, 114, 114, 255]));
+    // Letterbox placement is derived internally by `Crop::resolve`.
+    let crop = Crop::letterbox([114, 114, 114, 255]);
 
     // Stage 1: single iteration
     let start = Instant::now();

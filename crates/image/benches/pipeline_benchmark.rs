@@ -22,9 +22,9 @@
 
 mod common;
 
-use common::{calculate_letterbox, get_test_data, run_bench, BenchConfig, BenchSuite};
+use common::{get_test_data, run_bench, BenchConfig, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
@@ -38,11 +38,7 @@ fn bench_letterbox(configs: &[BenchConfig], proc: &mut ImageProcessor, suite: &m
     println!("\n== Letterbox: Camera -> Model ==\n");
 
     for config in configs {
-        let (left, top, new_w, new_h) =
-            calculate_letterbox(config.in_w, config.in_h, config.out_w, config.out_h);
-        let crop = Crop::new()
-            .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-            .with_dst_color(Some([114, 114, 114, 255]));
+        let crop = Crop::letterbox([114, 114, 114, 255]);
         let throughput = config.throughput();
         let name = format!("letterbox/{}", config.id());
 
@@ -310,10 +306,7 @@ fn bench_letterbox_pipeline(
                 common::format_name(*out_fmt),
             );
 
-            let (left, top, new_w, new_h) = calculate_letterbox(w, h, 640, 640);
-            let crop = Crop::new()
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
+            let crop = Crop::letterbox([114, 114, 114, 255]);
 
             let Ok(src) = proc.create_image(w, h, *in_fmt, DType::U8, None) else {
                 println!("  {:50} [skipped: allocation failed]", name);

@@ -195,6 +195,12 @@ where
     /// CFRetain/CFRelease symmetric regardless of import origin.
     #[allow(dead_code)]
     pub(crate) is_imported: bool,
+    /// Byte offset of this tensor's window into the shared IOSurface. Non-zero
+    /// only for sub-views (`view`/`batch`), which share the surface + identity
+    /// and address a sub-region by this offset — mirrors `DmaTensor::mmap_offset`.
+    /// CPU maps add it to the locked base address; the GL path keys the import
+    /// on the parent identity and renders the sub-region via `glViewport`.
+    pub(crate) view_offset: usize,
 }
 
 unsafe impl<T> Send for IoSurfaceTensor<T> where T: Num + Clone + fmt::Debug + Send + Sync {}
@@ -247,12 +253,18 @@ where
             )));
         }
         self.shape = shape.to_vec();
+        self.view_offset = 0;
         Ok(())
     }
 
     fn map(&self) -> Result<TensorMap<T>> {
         let _span = tracing::trace_span!("tensor.map", memory = "iosurface",).entered();
-        let m = IoSurfaceMap::new(self.surface.clone(), self.shape.clone(), self.buf_size)?;
+        let m = IoSurfaceMap::new(
+            self.surface.clone(),
+            self.shape.clone(),
+            self.buf_size,
+            self.view_offset,
+        )?;
         Ok(TensorMap::IoSurface(m))
     }
 
@@ -329,6 +341,7 @@ where
             buf_size: alloc,
             bytes_per_row,
             is_imported: false,
+            view_offset: 0,
         })
     }
 
@@ -449,6 +462,7 @@ where
             buf_size: alloc,
             bytes_per_row,
             is_imported: false,
+            view_offset: 0,
         })
     }
 
@@ -514,6 +528,52 @@ where
             buf_size: alloc,
             bytes_per_row,
             is_imported: true,
+            view_offset: 0,
+        })
+    }
+
+    /// Create a zero-copy sub-region view sharing this surface (CFRetain via
+    /// the `Arc`-backed `OwnedIoSurface`) and `BufferIdentity`, positioned at
+    /// `offset_bytes` from this tensor's own window with logical `shape`. The
+    /// GL backend keys the IOSurface import on the shared identity and renders
+    /// the sub-region via `glViewport`; a CPU map adds `view_offset` to the
+    /// locked base address. Mirrors [`DmaTensor::view`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is mis-aligned for `T`.
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the surface.
+    pub(crate) fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "IoSurfaceTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = self
+            .view_offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > self.buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.buf_size,
+            });
+        }
+        Ok(Self {
+            name: self.name.clone(),
+            surface: self.surface.clone(),
+            shape: shape.to_vec(),
+            _marker: PhantomData,
+            identity: self.identity.clone(),
+            buf_size: self.buf_size,
+            bytes_per_row: self.bytes_per_row,
+            is_imported: self.is_imported,
+            view_offset: abs_offset,
         })
     }
 
@@ -565,6 +625,7 @@ where
             self.shape.clone(),
             self.buf_size,
             byte_size,
+            self.view_offset,
         )?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -697,8 +758,13 @@ impl<T> IoSurfaceMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    fn new(surface: OwnedIoSurface, shape: Vec<usize>, buf_size: usize) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, None)
+    fn new(
+        surface: OwnedIoSurface,
+        shape: Vec<usize>,
+        buf_size: usize,
+        view_offset: usize,
+    ) -> Result<Self> {
+        Self::new_inner(surface, shape, buf_size, None, view_offset)
     }
 
     /// Lock the surface and expose `byte_size` bytes via `as_slice()` rather
@@ -710,8 +776,9 @@ where
         shape: Vec<usize>,
         buf_size: usize,
         byte_size: usize,
+        view_offset: usize,
     ) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, Some(byte_size))
+        Self::new_inner(surface, shape, buf_size, Some(byte_size), view_offset)
     }
 
     fn new_inner(
@@ -719,6 +786,7 @@ where
         shape: Vec<usize>,
         buf_size: usize,
         byte_size_override: Option<usize>,
+        view_offset: usize,
     ) -> Result<Self> {
         // Default to read-write (options = 0). The read-only path
         // (K_IOSURFACE_LOCK_READ_ONLY) skips a CPU cache flush when the
@@ -739,11 +807,25 @@ where
                 "IOSurfaceGetBaseAddress returned null after lock",
             ))
         })?;
+        // A sub-view window starts `view_offset` bytes into the locked surface.
+        // Advance the exposed base and shrink the remaining-window bound so the
+        // `deref` length check is against the window, not the whole surface.
+        if view_offset > buf_size {
+            // Defensive: `unmap` runs on drop; release the lock we just took.
+            let mut seed: u32 = 0;
+            unsafe { IOSurfaceUnlock(surface.as_ptr(), options, &mut seed) };
+            return Err(Error::InsufficientCapacity {
+                needed: view_offset,
+                capacity: buf_size,
+            });
+        }
+        let base_ptr = NonNull::new(unsafe { base_ptr.as_ptr().byte_add(view_offset) })
+            .expect("offset base within locked surface is non-null");
         Ok(Self {
             surface,
             shape,
             base_ptr,
-            buf_size,
+            buf_size: buf_size - view_offset,
             byte_size_override,
             _marker: PhantomData,
             lock_options: options,
@@ -1274,5 +1356,49 @@ mod tests {
         let ok_shape = [alloc / std::mem::size_of::<u32>()];
         unsafe { IoSurfaceTensor::<u32>::from_surface(surface_ref, &ok_shape, None) }
             .expect("fitting shape should succeed");
+    }
+
+    /// A `subview` of an IOSurface shares the surface + identity and reads its
+    /// own window through the CPU map — the macOS half of the decoder sub-view
+    /// fix (previously this errored with "subview only supported for Mem, Dma,
+    /// and Shm tensors" because the `Dma` arm was Linux-gated).
+    #[test]
+    fn subview_iosurface_shares_identity_and_offsets_map() {
+        use crate::{Tensor, TensorTrait};
+
+        // 256-byte IOSurface filled with a ramp so each byte equals its index.
+        let parent = Tensor::<u8>::new(&[256], Some(TensorMemory::Dma), None).expect("alloc");
+        assert_eq!(parent.memory(), TensorMemory::Dma);
+        {
+            let mut m = parent.map().expect("map parent");
+            for (i, b) in m.as_mut_slice().iter_mut().take(256).enumerate() {
+                *b = (i & 0xff) as u8;
+            }
+        }
+
+        // A 64-byte window starting at offset 64 must alias the same buffer.
+        let view = parent.subview(64, &[64]).expect("iosurface subview must succeed");
+        assert_eq!(
+            view.buffer_identity().id(),
+            parent.buffer_identity().id(),
+            "subview shares the parent BufferIdentity (one GL import)"
+        );
+
+        // The window reads bytes [64, 128) — offset honoured by the CPU map.
+        let m = view.map().expect("map iosurface subview");
+        let s = m.as_slice();
+        assert_eq!(s.len(), 64, "window exposes exactly its logical length");
+        for (i, b) in s.iter().enumerate() {
+            assert_eq!(*b, ((i + 64) & 0xff) as u8, "view byte {i} must be parent[{}]", i + 64);
+        }
+
+        // Writes through the window land in the parent buffer (zero-copy alias).
+        drop(m);
+        {
+            let mut mw = view.map().expect("remap for write");
+            mw.as_mut_slice()[0] = 0xAB;
+        }
+        let mp = parent.map().expect("remap parent");
+        assert_eq!(mp.as_slice()[64], 0xAB, "write through view is visible in parent");
     }
 }

@@ -18,9 +18,9 @@
 
 mod common;
 
-use common::{calculate_letterbox, run_bench, BenchSuite};
+use common::{run_bench, BenchSuite};
 
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorMapTrait, TensorTrait};
 
 const WARMUP: usize = 10;
@@ -63,12 +63,10 @@ fn main() {
     };
 
     // Camera 1280x720 → model 640x640 (the profiler's letterbox geometry).
+    // Placement is now derived by `Crop::resolve` from the src/dst dims.
     let (in_w, in_h) = (1280usize, 720usize);
     let (out_w, out_h) = (640usize, 640usize);
-    let (lx, ly, lw, lh) = calculate_letterbox(in_w, in_h, out_w, out_h);
-    let lb_crop = Crop::new()
-        .with_dst_rect(Some(Rect::new(lx, ly, lw, lh)))
-        .with_dst_color(Some([114, 114, 114, 255]));
+    let lb_crop = Crop::letterbox([114, 114, 114, 255]);
 
     for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
         let src = match proc.create_image(in_w, in_h, fmt, DType::U8, None) {

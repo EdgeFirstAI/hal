@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::colorimetry::effective_colorimetry;
-use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation};
+use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
     TensorTrait,
@@ -97,7 +97,7 @@ impl G2DProcessor {
         dst_dyn: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let _span = tracing::trace_span!(
             "image.convert.g2d",
@@ -193,8 +193,7 @@ impl G2DProcessor {
             }
         }
 
-        crop.check_crop_dyn(src_dyn, dst_dyn)?;
-
+        // Source/placement already validated by `Crop::resolve` at the entry.
         let src = src_dyn.as_u8().unwrap();
         // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
         // The XOR 0x80 post-pass is applied after the blit completes.
@@ -314,6 +313,12 @@ impl ImageProcessorTrait for G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let crop = crop.resolve(
+            src.width().unwrap_or(0),
+            src.height().unwrap_or(0),
+            dst.width().unwrap_or(0),
+            dst.height().unwrap_or(0),
+        )?;
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 

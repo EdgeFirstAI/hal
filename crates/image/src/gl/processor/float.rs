@@ -22,7 +22,7 @@ use drm_fourcc::DrmFourcc;
 
 use super::super::core::float_crop_uniforms;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
-use crate::{Crop, Error, Flip, Rotation};
+use crate::{Error, Flip, ResolvedCrop, Rotation};
 use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
 
 // The float render-path decision (`FloatRenderPath` + `classify_float_render`)
@@ -364,7 +364,7 @@ impl GLProcessorST {
         path: FloatRenderPath,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         // Only the two PBO float paths are implemented here.
         let (internal, client_fmt, gl_type) = match path {
@@ -592,7 +592,7 @@ impl GLProcessorST {
         dst: &mut TensorDyn,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         // Rotation/flip are not implemented by the float shaders.
         if rotation != Rotation::None || flip != Flip::None {

@@ -38,7 +38,8 @@ shutdown quirks of each driver stack.
 
 - [`ImageProcessor`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ImageProcessor.html) — the orchestrator. Owns CPU + G2D + GL backends and dispatches per call.
 - [`ImageProcessorTrait`](https://docs.rs/edgefirst-image/latest/edgefirst_image/trait.ImageProcessorTrait.html) — the convert/draw API common to every backend.
-- [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — geometric parameters; `Crop::letterbox()` preserves aspect ratio.
+- [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — **source-side** geometry: `Crop { source: Option<Region>, fit: Fit }` selects the sampled source sub-rectangle and the fit mode. `Fit = Stretch | Letterbox`; **letterbox** preserves the *source* aspect ratio while filling the requested *destination* shape (padding the remainder). Destination placement is the destination itself (a tensor or a `view`/`batch` of one), never a `Crop` field.
+- **Destination / source regions** (`dst.view(rect)` / `dst.batch(n)`, `src.view(rect)`) — a sub-region of a tensor used to target a batch tile or select a sampling window in `convert()`. The `view`/`batch` primitive is a **raw tensor** concept (it shares the parent's `BufferIdentity` and carries the sub-region — defined in [`crates/tensor/ARCHITECTURE.md` § Views and sub-regions](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#views-and-sub-regions)); the *mechanics* of consuming one live here. A region lowers to `glViewport`/`glScissor` (GL dst), the destination crop (G2D dst), an offset+stride (CPU dst), or `Crop.source` sampling (src). It is render state, not a buffer attribute, so it never re-keys the EGLImage. See [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert).
 - [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`).
 - [`codec::ImageLoad`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/trait.ImageLoad.html) + [`codec::ImageDecoder`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/struct.ImageDecoder.html) — decode JPEG/PNG into a pre-allocated tensor at its native format (JPEG → `Nv12`/`Nv16`/`Nv24` by subsampling, or `Grey`; PNG → `Rgb`/`Rgba`/`Grey`); EXIF orientation is reported in `ImageInfo`, never applied (apply it via `convert()`). [`save_jpeg`](https://docs.rs/edgefirst-image/latest/edgefirst_image/fn.save_jpeg.html) — encode a `u8` tensor to JPEG.
 
@@ -522,14 +523,122 @@ dma-buf/opaque fd as **unsupported on Tegra/Orin** (use the EGLImage interop
 instead); it is left in place for discrete-x86 experimentation but is **not** the
 Jetson path and is not part of the supported contract above.
 
+### Batched preprocessing: building a batch via convert()
+
+Inference engines that support batching expect a single, fully-assembled
+`[N, H, W, C]` (or planar `[N, C, H, W]`) input tensor — not N separate
+buffers stitched together at invoke time. The HAL builds that batch
+**forward**, calling `convert()` once per source image into a distinct *tile*
+of one reused destination tensor, rather than reconstructing it backward from
+per-element sub-views.
+
+```text
+jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─► output ─► decode
+            (codec sets        (glViewport+scissor     (full        (batch-aware:
+             shape/stride/      into dst.batch(n);       batched)     whole-map +
+             format)            each call imports                     ndarray index)
+                                its own offset+id)
+```
+
+- **Source.** The codec decodes an arbitrary-resolution JPEG/PNG into a
+  pre-allocated source tensor whose buffer may be larger than needed, then sets
+  that tensor's `shape`, `row_stride` (GPU-aligned: 64 B embedded, 256 B Nvidia),
+  and `PixelFormat` to match what was decoded (`Nv12`/`Nv16`/`Nv24`/`Grey`, or
+  `Rgb` for PNG). A distinct (dims, stride, format) source legitimately mints a
+  fresh source EGLImage.
+- **Convert into a tile.** A batch is assembled by calling `convert(src,
+  dst.batch(n), …)` (or `dst.view(region)`) once per source image. Each call
+  ends with `glFinish()` and imports its destination at the sub-view's
+  offset+identity. The destination tensor is the same object every iteration;
+  only `glViewport`/`glScissor` move between tiles. On Linux DMA-BUF each tile
+  keys on its own offset+identity so tiles render to their windows without
+  aliasing. `N` is the leading dimension prepended to the base layout (packed
+  `[N,H,W,C]` or planar `[N,C,H,W]`), so a tile is element *n*, contiguous in
+  memory either way (a row-band in the physical render target).
+- **Source sub-rectangle.** `src.view(region)` (equivalently `Crop.source`)
+  selects a sampling window, lowering to `src_rect_uv` — it adjusts UV sampling,
+  not the imported texture, so it does not re-key the source EGLImage.
+- **Letterbox.** Letterbox is a **resize mode** (`Crop { fit: Fit::Letterbox }`),
+  not a placement: it preserves the *source* aspect ratio while filling the
+  requested *destination* shape (the tile, or the whole tensor for `N==1`),
+  padding the remainder. The backend clears the destination region to the
+  background, then renders the aspect-preserved content within it — identically
+  whether the destination is a view/tile or the whole tensor.
+
+A view is **render state, not a buffer attribute**: it carries the parent tensor
+plus a `Region`, shares the parent's `BufferIdentity`, and never enters the
+EGLImage cache key. Per backend:
+
+| Backend | Destination tile lowering | Note |
+|---------|---------------------------|------|
+| OpenGL  | `glViewport`+`glScissor` to the tile rect on the parent FBO/EGLImage | scissor isolates the clear |
+| G2D     | the tile is the destination crop rectangle of the blit | the tile's byte offset/stride must meet G2D's dst alignment, else this tile falls back to CPU |
+| CPU     | a base `offset` + the **parent's** `row_stride` into the parent buffer | the writer strides by the parent pitch, not a tile-local tight stride |
+
+**`convert()` always outputs an RGB-family color (`Grey` / `Rgb` / `Rgba`),
+packed `HWC` or planar `CHW`** — never a YUV/semi-planar layout (chroma is a
+*source* concern only; a YUV destination returns `Error::InvalidFormat`). NPUs
+require packed/aligned inputs and models are trained to match. The `Rgb` output
+uses the "4-into-3" packing trick (four RGB pixels written as three RGBA texels);
+`Grey` renders to `GL_RED` or, for throughput, packs into RGBA like `Rgb`.
+
+**Packed vs planar tiles.** Both are contiguous (`N` is outermost), so a tile is
+a row-band in the *physical render target* either way:
+- **Packed `HWC`** dst: element *n* occupies physical rows `[n·H, (n+1)·H)`; the
+  "4-into-3" packing is horizontal and composes with the vertical band.
+- **Planar `CHW`** dst (e.g. `PlanarRgb` F16): the packer renders into a packed
+  render target (RGBA16F `(W/4, 3H)` per element); element *n*'s slab is the
+  row-band `[n·3H, (n+1)·3H)` of that target. The per-tile pack pass writes into
+  element *n*'s band — the tile viewport/scissor is computed in
+  **packed-render-target** coordinates, not logical `[C,H,W]`.
+
+OpenGL destination-tile obligations:
+
+- **Scissor every clear.** `glViewport` clips the rendered quad but **not**
+  `glClear`. When every tile shares the background, clear the **whole** batched
+  destination **once** before the loop (a full-surface fast-clear); per-tile
+  scissored clears (`glEnable(GL_SCISSOR_TEST)` + `glScissor(tile)`) apply only
+  when tiles differ in background. A clear must never wipe a sibling tile.
+- **Bottom-left y-origin.** GL's viewport origin is bottom-left while images are
+  top-left, so tile *n*'s viewport y is `parent_h − (top + H)` — the same
+  conversion `region_to_viewport` (in `gl/render.rs`) performs.
+- **Sync per call.** Each `convert()` ends with `glFinish()`, so a loop over N
+  tiles incurs N pipeline synchronizations. A future batch engine will render all
+  N tiles into a single import and sync once; today the per-call path is used.
+
+**Source import churn.** Each distinct source re-imports (~100–300 µs); across a
+run that is O(images) unless bounded. Reuse a fixed-capacity ring of source
+tensors sized to the codec's decode-ahead depth and re-`configure_image()` them so
+the live source EGLImages stay warm and bounded. Reconfiguring a reused buffer
+must re-import at the new geometry: **`configure_image()` invalidates that
+tensor's cached EGLImage entry** (the key is `(BufferIdentity.id, chroma_id)`, so
+without invalidation a reused id would return a *stale* image; `last_import_reason`
+records `Reconfigure`/`NewIdentity`/`Hit`).
+
+Edge contracts (testable invariants):
+
+- An out-of-bounds `view(region)` / `batch(n ≥ N)` returns an error, never clamps.
+- Two regions sharing one `BufferIdentity` used as **src and dst** of the same
+  `convert()` is **undefined** (the GL backend binds the whole EGLImage as both
+  texture and FBO), even if their rects are disjoint.
+- `batch(0)` on an `N==1` tensor is observably identical to the whole tensor.
+- Filling tile *n* never alters tile *m≠n* (scissor isolation); unfilled tiles of
+  a partially-assembled batch have undefined contents.
+- Master oracle for every tile: a tile equals a standalone full-buffer
+  `convert()` of the same source into a fresh single-image destination.
+
 ### EGL image cache
 
 The OpenGL backend maintains two independent LRU caches of EGLImages —
 `src_egl_cache` for source tensors and `dst_egl_cache` for destination
-tensors. Each entry is keyed by `(BufferIdentity.id, chroma_id,
-plane_offset)` — the plane offset is part of the key so offset-distinct
-sub-views of one DMA-BUF (e.g. batched render-to-DMA targets) get distinct
-EGLImages instead of all aliasing the offset-0 region.
+tensors. Each entry is keyed by the tensor's **`BufferIdentity.id`** (plus
+`chroma_id` for multi-plane sources). A destination tile reuses the parent
+allocation's identity and therefore its single cached EGLImage — the tile is
+selected with `glViewport`/`glScissor`, **not** by importing a new
+offset-keyed EGLImage (see [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert)).
+A `plane_offset` participates in the key only for genuine offset-distinct
+*imports* — a foreign DMA-BUF whose data starts at a non-zero byte offset, or
+a multi-plane chroma plane — never as a batch-tiling mechanism.
 
 `BufferIdentity` is defined in
 [`crates/tensor/src/lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs)
@@ -566,7 +675,7 @@ Key implications:
   correct DMA-BUF memory.
 - A `glFinish()` is issued at the end of every `convert()`. This guarantees
   GPU reads of source and writes to destination are complete before return,
-  making it safe to chain calls.
+  making it safe to chain calls and to read the destination immediately after.
 
 See [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
 in the project ARCHITECTURE.md for the cross-crate cache story (V4L2
@@ -919,10 +1028,10 @@ optimisation and has enough complexity to justify the overhead — roughly
 
 ```text
 image.convert                                           [user-facing fn, orchestrator]
-│ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip
+│ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip, dst_tile?
 │
 ├── image.convert.gl                                    [OpenGL backend, picked first]
-│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory
+│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, dst_tile?, last_import_reason?
 │   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV* → intermediate RGBA (resize + crop + flip)
 │   ├── image.convert.gl.pack_rgb.pass2_pack            ← intermediate RGBA → packed RGB (3:4 width ratio)
 │   ├── image.convert.gl.nv_to_planar.pass1_rgba        ← Vivante 2-pass: NV12/NV16/NV24 → intermediate RGBA
@@ -958,8 +1067,8 @@ image.materialize_masks                                 [user-facing fn]
 
 | Span                                                   | What is happening inside | Key observations |
 |--------------------------------------------------------|--------------------------|------------------|
-| `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
-| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, optional `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and any `glFinish` at the end. |
+| `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. `dst_tile` (the batch-tile rect / index) is present when the call renders into a destination region rather than the whole tensor. |
+| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. `dst_tile` and `last_import_reason` reveal the tile rect/index and whether the source re-imported. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
 | `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA (the Vivante GC7000UL workaround for the GPU hang on single-pass NV* → PlanarRgb). | Selected automatically when `is_vivante && matches!(src_fmt, Nv12 \| Nv16 \| Nv24) && dst.layout == Planar`. |
@@ -978,8 +1087,6 @@ image.materialize_masks                                 [user-facing fn]
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 
 ## Colorimetry
-
-> **Status:** implemented.
 
 ### The three-axis problem
 
@@ -1110,7 +1217,7 @@ Python surface to supply colorimetry from the producer's signalling into
 
 | Optimization | Why it matters |
 |--------------|----------------|
-| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id, plane_offset)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. |
+| Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. EGL image cache is keyed by `(BufferIdentity.id, chroma_id)`. New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. Batch tiles share the parent's `BufferIdentity`, so the destination EGLImage is reused across the tile loop. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
 | One `ImageProcessor` per pipeline | Each instance owns its OpenGL context, GL thread, and per-thread caches (the EGL display is process-global and shared). Multiple instances still serialize on `GL_MUTEX`, so concurrent use across instances buys nothing. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |

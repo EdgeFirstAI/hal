@@ -426,6 +426,7 @@ quality issue. The decoder math is correct in both cases.
 ## Cross-References
 
 - Project architecture: [../../ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md)
+- Batched output consumption (`N > 1`): the decoder maps the whole output tensor once and indexes each batch element via an ndarray slice — no tensor sub-view. The batched output must be tight (or honor its declared strides) so element *n* is a plain stride offset. See [project `ARCHITECTURE.md` § Batched Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#batched-preprocessing).
 - Image-side mask rendering: [../image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 - Tracker integration: [../tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md)
 - Performance tracing usage: [README.md#performance-tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)

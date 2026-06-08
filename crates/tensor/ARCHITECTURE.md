@@ -15,7 +15,7 @@ straight from a V4L2 camera.
 
 | Module | Source | Responsibility |
 |--------|--------|----------------|
-| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs) | local | Public surface: `Tensor<T>`, `TensorTrait`, `TensorMemory`, `BufferIdentity`, multi-plane composition (`from_planes`) |
+| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs) | local | Public surface: `Tensor<T>`, `TensorTrait`, `TensorMemory`, `BufferIdentity`, `Region` + `view`/`batch` sub-regions, multi-plane composition (`from_planes`) |
 | [`dma.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dma.rs) | local | `DmaTensor<T>` — Linux DMA-BUF allocation via `dma-heap` |
 | [`dmabuf.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dmabuf.rs) | local | `mmap` + `DMA_BUF_IOCTL_SYNC` cache-coherency helpers used by `DmaMap` |
 | [`iosurface.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/iosurface.rs) | local | `IoSurfaceTensor<T>` — macOS IOSurface allocation via raw FFI to the IOSurface + CoreFoundation frameworks (the macOS counterpart to `DmaTensor`) |
@@ -30,6 +30,8 @@ straight from a V4L2 camera.
 
 - [`Tensor<T>`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.Tensor.html) — generic strongly-typed tensor.
 - [`TensorDyn`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.TensorDyn.html) — dtype-erased tensor used by image processing and the C API.
+- **`Region`** — `{ x, y, width, height }` in pixels; the single rectangle type, used by `view`, `Crop` (source sampling), and image geometry. Re-exported by the image and python crates.
+- **`view(region)` / `batch(n)`** — owned, zero-allocation sub-region of a tensor sharing the parent's `BufferIdentity` (replaces the former byte-offset `subview`); `batch(n)` selects element *n* along the leading `N` dimension. Out-of-bounds → error, never clamp. The convert mechanics (GL `glViewport`, etc.) live in the image crate. See [Views and sub-regions](#views-and-sub-regions).
 - [`TensorTrait`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/trait.TensorTrait.html) — common operations across all backends (`shape`, `size`, `map`, `clone_fd`, `buffer_identity`).
 - [`TensorMapTrait`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/trait.TensorMapTrait.html) — RAII map handle giving slice access (and ndarray views with the `ndarray` feature).
 - [`TensorMemory`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.TensorMemory.html) — request a specific backend at construction time.
@@ -75,6 +77,61 @@ Each backend provides its own map type implementing `TensorMapTrait<T>`:
 `TensorMap<T>` implements `Deref<Target=[T]>` and `DerefMut`. With the
 `ndarray` feature enabled, `TensorMapTrait` also provides `view()` /
 `view_mut()` returning ndarray `ArrayView` / `ArrayViewMut`.
+
+### Views and sub-regions
+
+A **view** is a lightweight, zero-allocation sub-region of a tensor. It shares
+the parent's buffer and **`BufferIdentity`** (no new allocation, no new GPU
+import) and addresses a rectangular window of the parent's leading spatial frame:
+
+```rust
+/// The single rectangle type in the workspace. Pixel units of the leading
+/// frame; byte addressing is derived from the parent's effective_row_stride().
+pub struct Region { pub x: usize, pub y: usize, pub width: usize, pub height: usize }
+
+impl Tensor<T> {   // and identically on TensorDyn
+    /// Owned sub-region sharing self's BufferIdentity (an Arc clone — cheap,
+    /// once per view, never per pixel). Composes: a view of a view adds offsets.
+    pub fn view(&self, region: Region) -> Result<Self>;
+    /// Sugar for element `n` along the leading `N` dimension (N prepended to the
+    /// base layout — packed HWC or planar CHW). `batch(0)` on an N==1 tensor is
+    /// byte- and identity-equivalent to the whole tensor.
+    pub fn batch(&self, n: usize) -> Result<Self>;
+}
+```
+
+`view`/`batch` are supported on **every** backend — `Mem`, `Shm`, Linux
+DMA-BUF, macOS IOSurface, and PBO. Each shares its underlying resource (heap
+`Arc`, cloned fd, retained `IOSurfaceRef`, or `Arc<PboHandle>`) and its
+`BufferIdentity`, and carries the window's byte offset so a CPU map of the
+sub-view reads the correct bytes (the IOSurface and PBO offset support is what
+lets a GPU-backed decoder output be sub-viewed without the earlier
+`InvalidOperation("subview only supported for Mem, Dma, and Shm tensors")`).
+
+`view`/`batch` return an **owned** handle (not a borrow) so the value flows
+unchanged through `convert(src, dst, …)`, the C ABI (`hal_tensor *`), and PyO3
+(`#[pyclass]`) without a lifetime parameter rippling across three language
+surfaces. An out-of-bounds region or `n ≥ N` returns an error
+(`Error::RegionOutOfBounds` / `Error::BatchIndexOutOfBounds`) — `view`/`batch`
+never clamp and never panic.
+
+`view`/`batch` are the **only** sub-addressing primitive; they replace the
+former byte-offset `subview`. `plane_offset` is **not** a sub-region mechanism —
+it survives solely as an *import attribute* for genuine foreign or multi-plane
+DMA-BUF imports (a non-zero start byte, or a chroma plane), where it participates
+in the EGL cache key. It is never how a batch tile is selected.
+
+`view`/`batch` are **raw tensor** concepts; the *mechanics* of consuming one for
+GPU work live in the image crate — `convert()` lowers a **destination** view to a
+`glViewport`/`glScissor` into the parent's one render target, and a **source**
+view to a sampling rectangle, never re-keying the EGLImage (see
+[`crates/image/ARCHITECTURE.md` § Batched preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#batched-preprocessing-building-a-batch-via-convert)).
+
+For plain CPU access a consumer maps a view, or maps the parent whole and slices
+the mapped `ArrayView` (the decoder reads batched model outputs this way). The
+Python binding mirrors this with `numpy` + the buffer protocol; the C API exposes
+first-class `hal_tensor_view` / `hal_tensor_batch` handles (it does not make
+callers hand-roll pixel→byte math).
 
 ### Memory selection logic
 
@@ -133,7 +190,17 @@ carrying:
 
 The image processing backends key their EGL image cache on
 `BufferIdentity.id()` so that the **same tensor object** reused across
-frames hits the cache. The cache does **not** rescue a pipeline that
+frames hits the cache. A sub-region of a tensor **shares the parent's
+`BufferIdentity`**, so the image backend treats every tile of one batched
+destination as the same imported buffer — it imports a single EGLImage and
+selects the tile with `glViewport`, never a per-offset import. `plane_offset`
+therefore addresses only genuine offset-distinct *imports* (a foreign
+DMA-BUF starting at a non-zero byte offset, or a multi-plane chroma plane),
+**not** batch tiling. Because a view shares the parent's id, reconfiguring the
+parent must not leave a stale GPU import: **`configure_image()` invalidates the
+tensor's cached EGLImage entry** (and records a `last_import_reason` of
+`Reconfigure`) so a reused source buffer re-imports at its new geometry rather
+than returning the previous frame's image. The cache does **not** rescue a pipeline that
 re-imports the same DMA-BUF every frame: each `hal_import_image` /
 `hal_tensor_from_fd` call mints a new `BufferIdentity` with a fresh
 ID, so re-imports always miss. The contract is:
