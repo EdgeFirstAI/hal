@@ -314,12 +314,7 @@ pub struct HalImageProcessor {
 /// @param height Height of the rectangle
 /// @return New rectangle structure
 #[no_mangle]
-pub extern "C" fn hal_region_new(
-    x: size_t,
-    y: size_t,
-    width: size_t,
-    height: size_t,
-) -> HalRegion {
+pub extern "C" fn hal_region_new(x: size_t, y: size_t, width: size_t, height: size_t) -> HalRegion {
     HalRegion {
         x,
         y,
@@ -859,6 +854,77 @@ pub unsafe extern "C" fn hal_image_processor_convert(
         ),
         libc::EIO
     );
+    0
+}
+
+/// Convert without waiting for the GPU — the batch-preprocessing primitive.
+///
+/// Identical to [`hal_image_processor_convert`](hal_image_processor_convert)
+/// except the OpenGL backend does **not** issue the per-call `glFinish()`. Render
+/// `N` model inputs by looping this over row-band views of one batched
+/// destination (each `dst` a `hal_tensor_view` / `hal_tensor_batch` sub-region of
+/// the same buffer) and then call [`hal_image_processor_flush`] **once**: the
+/// backend imports the destination a single time and renders each tile as a
+/// `glViewport` band, syncing once at flush. The result of a deferred convert is
+/// **not** safe to read on the CPU (or map via CUDA) until `flush` returns
+/// (CUDA map auto-flushes). Non-GL backends complete synchronously and `flush`
+/// is a no-op.
+///
+/// @param processor Image processor handle
+/// @param src Source image tensor
+/// @param dst Destination image tensor (typically a `hal_tensor_view`/`batch` tile)
+/// @param rotation Rotation to apply
+/// @param flip Flip to apply
+/// @param crop Crop configuration (can be NULL for no crop)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/src/dst)
+/// - EIO: Conversion failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_convert_deferred(
+    processor: *mut HalImageProcessor,
+    src: *const HalTensor,
+    dst: *mut HalTensor,
+    rotation: HalRotation,
+    flip: HalFlip,
+    crop: *const HalCrop,
+) -> c_int {
+    check_null!(processor, src, dst);
+
+    let crop_config = if crop.is_null() {
+        Crop::default()
+    } else {
+        unsafe { *crop }.into()
+    };
+
+    try_or_errno!(
+        unsafe { &mut (*processor) }.inner.convert_deferred(
+            &unsafe { &(*src) }.inner,
+            &mut unsafe { &mut (*dst) }.inner,
+            rotation.into(),
+            flip.into(),
+            crop_config,
+        ),
+        libc::EIO
+    );
+    0
+}
+
+/// Complete all deferred converts since the last flush with a single GPU sync.
+///
+/// After this returns, every destination written by
+/// [`hal_image_processor_convert_deferred`] is finished and safe to read back or
+/// `cuda_map`. Backends with no deferred path return success immediately.
+///
+/// @param processor Image processor handle
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor)
+/// - EIO: Flush failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_flush(processor: *mut HalImageProcessor) -> c_int {
+    check_null!(processor);
+    try_or_errno!(unsafe { &mut (*processor) }.inner.flush(), libc::EIO);
     0
 }
 

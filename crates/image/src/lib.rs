@@ -307,13 +307,13 @@ pub use edgefirst_codec as codec;
 #[cfg(test)]
 use edgefirst_decoder::ProtoLayout;
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
+#[doc(inline)]
+pub use edgefirst_tensor::Region;
 #[cfg(any(test, all(target_os = "linux", feature = "opengl")))]
 use edgefirst_tensor::Tensor;
 use edgefirst_tensor::{
     DType, PixelFormat, PixelLayout, TensorDyn, TensorMemory, TensorTrait as _,
 };
-#[doc(inline)]
-pub use edgefirst_tensor::Region;
 use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
@@ -906,6 +906,43 @@ pub trait ImageProcessorTrait {
     /// Sets the colors used for rendering segmentation masks. Up to 20 colors
     /// can be set.
     fn set_class_colors(&mut self, colors: &[[u8; 4]]) -> Result<()>;
+
+    /// Like [`convert`](Self::convert), but does not wait for the GPU to finish.
+    ///
+    /// This is the batch-preprocessing primitive: a caller renders `N` tiles
+    /// into one batched destination by looping
+    /// `convert_deferred(&src[n], &mut dst.batch(n)?, …)` and then calling
+    /// [`flush`](Self::flush) **once**. On the OpenGL backend every deferred
+    /// convert into sibling views of one buffer shares a single EGLImage import
+    /// (the tile is a `glViewport`/`glScissor` ROI into the parent) and skips the
+    /// per-tile `glFinish`; `flush` then issues a single GPU sync. The result of
+    /// a deferred convert is **not** safe to read on the CPU (or map via CUDA)
+    /// until `flush` returns.
+    ///
+    /// The default implementation is eager — it simply calls
+    /// [`convert`](Self::convert), so CPU/G2D and any backend without a deferred
+    /// fast path remain correct (each call completes synchronously and `flush`
+    /// is a no-op).
+    fn convert_deferred(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        self.convert(src, dst, rotation, flip, crop)
+    }
+
+    /// Complete all work enqueued by [`convert_deferred`](Self::convert_deferred)
+    /// since the last flush, issuing a single GPU synchronization.
+    ///
+    /// After this returns, every deferred destination is finished and safe to
+    /// read back or `cuda_map`. Backends with no deferred path (the default)
+    /// return `Ok(())` immediately, since their converts already completed.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Configuration for [`ImageProcessor`] construction.
@@ -2165,6 +2202,54 @@ impl ImageProcessorTrait for ImageProcessor {
         Err(Error::NoConverter)
     }
 
+    fn convert_deferred(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<()> {
+        // Deferred batching is an OpenGL optimization (shared parent EGLImage +
+        // no per-tile glFinish). Route to the GL backend's deferred path when GL
+        // is forced or auto-selectable; on a GL decline fall back to an eager
+        // convert (the auto chain), which is correct everywhere — it completes
+        // synchronously and `flush` stays a no-op for non-GL backends.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(feature = "opengl")]
+        {
+            let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
+            if gl_forced || self.forced_backend.is_none() {
+                if let Some(opengl) = self.opengl.as_mut() {
+                    match opengl.convert_deferred(src, dst, rotation, flip, crop) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            log::trace!("convert_deferred: gl declined: {e}; eager fallback");
+                            // A forced-GL caller gets the GL error, matching
+                            // `convert`'s no-fallback forced-backend contract.
+                            if gl_forced {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.convert(src, dst, rotation, flip, crop)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        let _span = tracing::trace_span!("image.flush").entered();
+        // Only the OpenGL backend defers; flushing it issues the single GPU
+        // sync. CPU/G2D converts already completed, so there is nothing to flush.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(feature = "opengl")]
+        if let Some(opengl) = self.opengl.as_mut() {
+            return opengl.flush();
+        }
+        Ok(())
+    }
+
     fn draw_decoded_masks(
         &mut self,
         dst: &mut TensorDyn,
@@ -2863,6 +2948,98 @@ mod image_tests {
                 None => &name[..name.len() - 3],
             }
         }};
+    }
+
+    /// Master oracle for the view/batch **destination** batch engine: render `N`
+    /// tiles into row-bands of ONE tall destination and assert each band equals
+    /// the same source converted standalone — proving correct band placement and
+    /// that a later tile's letterbox clear / draw never wipes a sibling band. On
+    /// the Linux GL backend the `N` `convert_deferred` calls share ONE parent
+    /// EGLImage import (each tile is a `glViewport`/`glScissor` ROI) and sync
+    /// once at `flush()`; other backends fall back to an eager per-band convert
+    /// (CPU writes via offset + parent stride). Either way the oracle must hold.
+    ///
+    /// Identical source/tile size makes the convert an exact copy, so the
+    /// assertion is backend-agnostic (no GL-vs-CPU resampling drift). Distinct
+    /// solid colors per tile make any sibling wipe a hard failure.
+    #[test]
+    fn batch_view_dst_tiles_match_standalone() {
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — ImageProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+        let n = 3usize;
+        let (w, h) = (32usize, 24usize);
+        let colors: [[u8; 4]; 3] = [[210, 40, 40, 255], [40, 210, 40, 255], [40, 40, 210, 255]];
+        let make_src = |c: [u8; 4]| -> TensorDyn {
+            let bytes: Vec<u8> = c.iter().copied().cycle().take(w * h * 4).collect();
+            load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
+        };
+        // Tall destination: N stacked row-bands. DMA so the Linux GL band path
+        // runs (one parent import + per-tile glViewport); skip if unavailable.
+        let parent = match TensorDyn::image(
+            w,
+            n * h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — tall DMA destination alloc failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        // Deferred batch: one parent import, glViewport/scissor per band, one sync.
+        for (i, &c) in colors.iter().enumerate().take(n) {
+            let mut tile = parent.view(Region::new(0, i * h, w, h)).unwrap();
+            proc.convert_deferred(
+                &make_src(c),
+                &mut tile,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap_or_else(|e| panic!("convert_deferred tile {i}: {e:?}"));
+        }
+        proc.flush().unwrap();
+
+        for (i, &c) in colors.iter().enumerate().take(n) {
+            // Standalone full-buffer convert of the same source = the oracle.
+            let mut solo =
+                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
+                    .unwrap();
+            proc.convert(
+                &make_src(c),
+                &mut solo,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+
+            let band = parent.view(Region::new(0, i * h, w, h)).unwrap();
+            let band_bytes = band.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            let solo_bytes = solo.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            assert_eq!(
+                band_bytes, solo_bytes,
+                "tile {i}: band differs from standalone convert (placement or sibling wipe)"
+            );
+            assert!(
+                band_bytes.chunks_exact(4).all(|p| p == c),
+                "tile {i}: band is not the expected solid color {c:?} (sibling wipe?)"
+            );
+        }
     }
 
     #[test]
@@ -5199,7 +5376,9 @@ mod image_tests {
         let _ = model_w;
         let crop = Crop::new()
             .with_source(Some(Region::new(0, 0, fw, fh)))
-            .with_fit(Fit::Letterbox { pad: [0, 0, 0, 255] });
+            .with_fit(Fit::Letterbox {
+                pad: [0, 0, 0, 255],
+            });
         if let Err(e) =
             ImageProcessorTrait::convert(&mut gpu, &src, &mut dst, Rotation::None, Flip::None, crop)
         {
@@ -6663,9 +6842,8 @@ mod image_tests {
                     .with_encoding(enc)
                     .with_range(edgefirst_tensor::ColorRange::Limited),
             ));
-            let dst =
-                TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem))
-                    .unwrap();
+            let dst = TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem))
+                .unwrap();
             let mut cpu = CPUProcessor::new();
             let (result, _src, dst) = convert_img(
                 &mut cpu,

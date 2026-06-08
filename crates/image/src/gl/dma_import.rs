@@ -7,8 +7,8 @@
 //! from the actual `eglCreateImage` call so that the attribute construction
 //! can be unit-tested without a GPU context.
 
-use edgefirst_tensor::{ColorEncoding, ColorRange, PixelFormat, PixelLayout, Tensor, TensorTrait};
 use drm_fourcc::DrmFourcc;
+use edgefirst_tensor::{ColorEncoding, ColorRange, PixelFormat, PixelLayout, Tensor, TensorTrait};
 use khronos_egl::{self as egl, Attrib};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
@@ -61,8 +61,18 @@ impl DmaImportAttrs {
     /// This extracts all the fd/pitch/offset values that `eglCreateImage`
     /// needs without actually calling EGL.
     pub fn from_tensor(src: &Tensor<u8>, src_fmt: PixelFormat) -> Result<Self, Error> {
-        let src_w = src.width().ok_or(Error::NotAnImage)?;
-        let src_h = src.height().ok_or(Error::NotAnImage)?;
+        // A view()/batch() sub-region imports its PARENT once (the tile is a
+        // glViewport ROI, not its own import): use the parent geometry at
+        // offset 0 so every sibling view shares one EGLImage. A whole tensor
+        // imports its own geometry at its own (possibly foreign) offset.
+        let view_origin = src.view_origin();
+        let (src_w, src_h) = match view_origin {
+            Some(vo) => (vo.parent_width, vo.parent_height),
+            None => (
+                src.width().ok_or(Error::NotAnImage)?,
+                src.height().ok_or(Error::NotAnImage)?,
+            ),
+        };
         let src_channels = src_fmt.channels();
 
         // Resolve the tensor's colorimetry (pure — does not mutate the
@@ -161,7 +171,13 @@ impl DmaImportAttrs {
             }
         });
 
-        let plane0_offset = src.plane_offset().unwrap_or(0);
+        // A view imports its parent at offset 0 (its byte offset becomes the
+        // viewport, never the import base); a whole tensor honors its own offset.
+        let plane0_offset = if view_origin.is_some() {
+            0
+        } else {
+            src.plane_offset().unwrap_or(0)
+        };
 
         // Semi-planar YUV (NV12) carries a second (interleaved CbCr) plane.
         // NV12 (4:2:0): H/2 rows, W bytes/row (W/2 CbCr pairs).

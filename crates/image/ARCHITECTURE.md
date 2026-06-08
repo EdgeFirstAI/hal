@@ -547,14 +547,17 @@ jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─►
   `Rgb` for PNG). A distinct (dims, stride, format) source legitimately mints a
   fresh source EGLImage.
 - **Convert into a tile.** A batch is assembled by calling `convert(src,
-  dst.batch(n), …)` (or `dst.view(region)`) once per source image. Each call
-  ends with `glFinish()` and imports its destination at the sub-view's
-  offset+identity. The destination tensor is the same object every iteration;
-  only `glViewport`/`glScissor` move between tiles. On Linux DMA-BUF each tile
-  keys on its own offset+identity so tiles render to their windows without
-  aliasing. `N` is the leading dimension prepended to the base layout (packed
-  `[N,H,W,C]` or planar `[N,C,H,W]`), so a tile is element *n*, contiguous in
-  memory either way (a row-band in the physical render target).
+  dst.batch(n), …)` (or `dst.view(region)`) once per source image, or — for one
+  import + one sync — `convert_deferred(src, dst.batch(n), …)` in a loop then a
+  single `flush()`. A `view`/`batch` sub-view resolves its **parent**
+  (`view_origin` = parent dims + the tile's origin), so the GL backend keys the
+  destination EGLImage on the **parent** identity+geometry: every sibling tile
+  shares **one** import and is a `glViewport`/`glScissor` band into it (the tile
+  offset is render state, never a cache key). `convert_deferred` defers the
+  per-tile `glFinish`; `flush` issues one `finish_via_fence`. `N` is the leading
+  dimension prepended to the base layout (packed `[N,H,W,C]` or planar
+  `[N,C,H,W]`), so a tile is element *n*, contiguous in memory either way (a
+  row-band in the physical render target).
 - **Source sub-rectangle.** `src.view(region)` (equivalently `Crop.source`)
   selects a sampling window, lowering to `src_rect_uv` — it adjusts UV sampling,
   not the imported texture, so it does not re-key the source EGLImage.
@@ -599,12 +602,19 @@ OpenGL destination-tile obligations:
   destination **once** before the loop (a full-surface fast-clear); per-tile
   scissored clears (`glEnable(GL_SCISSOR_TEST)` + `glScissor(tile)`) apply only
   when tiles differ in background. A clear must never wipe a sibling tile.
-- **Bottom-left y-origin.** GL's viewport origin is bottom-left while images are
-  top-left, so tile *n*'s viewport y is `parent_h − (top + H)` — the same
-  conversion `region_to_viewport` (in `gl/render.rs`) performs.
-- **Sync per call.** Each `convert()` ends with `glFinish()`, so a loop over N
-  tiles incurs N pipeline synchronizations. A future batch engine will render all
-  N tiles into a single import and sync once; today the per-call path is used.
+- **Top-down destination band.** The destination DMA EGLImage is **top-down**:
+  GL framebuffer row 0 maps to memory row 0 (verified on-target — a tile rendered
+  at GL `y` lands in memory band `y`), because the renderer's texcoords already
+  flip the sampled image upright. So tile *n*'s `glViewport`/`glScissor` y is just
+  its top-left `region.y` (= `n·H`), **not** a bottom-left `parent_h − (y+H)`
+  flip. (`gl/render.rs::region_to_viewport` encodes the bottom-left flip for a
+  *bottom-up* surface and is not used by this top-down DMA path.)
+- **Sync once per batch.** A plain `convert()` ends with `glFinish()`, so a loop
+  of N converts incurs N pipeline syncs. `convert_deferred` defers that finish and
+  `flush()` issues a single `finish_via_fence` for the whole batch; the CUDA map
+  path auto-flushes a pending batch before handing the device the buffer. First
+  engine: single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA only — two-pass packed-RGB,
+  planar, and macOS GL fall back to an eager per-tile convert.
 
 **Source import churn.** Each distinct source re-imports (~100–300 µs); across a
 run that is O(images) unless bounded. Reuse a fixed-capacity ring of source
@@ -1045,6 +1055,10 @@ image.convert                                           [user-facing fn, orchest
     ├── image.convert.cpu.format_convert                ← per-pixel format conversion
     │   fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
     └── image.convert.cpu.resize_flip_rotate            ← fast_image_resize + rayon
+
+image.flush                                             [user-facing fn — batch sync]
+└── image.flush.gl                                      ← single finish_via_fence for a deferred batch
+    fields: pending
 
 image.draw_decoded_masks                                [user-facing fn]
 fields: n_detections, n_segmentations

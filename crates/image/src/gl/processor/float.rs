@@ -116,7 +116,7 @@ where
 ///
 /// # Safety
 /// Must be called on the thread owning the current GL context.
-unsafe fn finish_via_fence() {
+pub(super) unsafe fn finish_via_fence() {
     // 1 second, in nanoseconds — generous; a healthy convert completes in well
     // under a millisecond and never reaches the timeout.
     const TIMEOUT_NS: u64 = 1_000_000_000;

@@ -260,6 +260,13 @@ impl TensorDyn {
         dispatch!(self, plane_offset)
     }
 
+    /// The parent-image snapshot if this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. See
+    /// [`Tensor::view_origin`].
+    pub fn view_origin(&self) -> Option<crate::ViewOrigin> {
+        dispatch!(self, view_origin)
+    }
+
     /// Set the byte offset within the DMA-BUF where image data starts.
     pub fn set_plane_offset(&mut self, offset: usize) {
         dispatch!(self, set_plane_offset, offset)

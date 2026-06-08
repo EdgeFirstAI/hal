@@ -313,6 +313,16 @@ impl ImageProcessorTrait for G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        // G2D renders the whole destination; it has no view()/batch() sub-region
+        // (band) support, so decline a view dst and let the dispatcher fall back
+        // to the CPU backend, which writes the sub-region via offset + parent
+        // stride. (The Linux GL backend implements the DMA band path.)
+        if dst.view_origin().is_some() {
+            return Err(Error::NotSupported(
+                "G2D: destination view()/batch() sub-region not supported (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
         let crop = crop.resolve(
             src.width().unwrap_or(0),
             src.height().unwrap_or(0),

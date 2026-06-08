@@ -250,12 +250,15 @@ jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─►
    attributes, so it re-imports when they change — expected per distinct image.
 2. **Convert → tile.** A batch is built by calling `convert()` once per source
    image into a destination sub-view: `convert(src, dst.batch(n), …)` or
-   `convert(src, dst.view(region), …)`. Each call ends with `glFinish()` and
-   imports its destination at the sub-view's offset and identity. The destination
-   tensor and its single imported EGLImage are reused across the loop; only
-   `glViewport`/`glScissor` move. On Linux DMA-BUF each tile keys on its own
-   offset+identity so tiles render to their windows without aliasing. `batch(0)`
-   on an N==1 tensor is byte- and identity-equivalent to the whole tensor.
+   `convert(src, dst.view(region), …)`, or — to render the whole batch as **one
+   import + one sync** — `convert_deferred(src, dst.batch(n), …)` in a loop
+   followed by a single `flush()`. A `view`/`batch` sub-view resolves its
+   **parent** (`view_origin`), so on Linux DMA-BUF the GL backend keys the
+   EGLImage import on the *parent* identity+geometry — every sibling tile shares
+   **one** import and is a `glViewport`/`glScissor` band into it (the offset is
+   render state, never a cache key). `convert_deferred` skips the per-tile
+   `glFinish`; `flush()` issues a single `finish_via_fence`. `batch(0)` on an
+   N==1 tensor is byte- and identity-equivalent to the whole tensor.
 3. **Invoke → decode.** The engine runs on the whole pre-assembled batched
    tensor and returns a batched output. The decoder is batch-aware: it `map()`s
    the whole output once and indexes each element with an ndarray slice — no
@@ -264,9 +267,12 @@ jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─►
 `convert()` always outputs an RGB-family color (`Grey`/`Rgb`/`Rgba`), packed
 `HWC` or planar `CHW` — never YUV. Because `N` is the leading dimension, a tile
 is element *n*, contiguous in memory whichever layout is used (a row-band in the
-physical buffer). A future batch engine will render N tiles into a single import
-via `glViewport`, syncing once after the last tile; today each `convert()` call
-imports its destination independently. The per-backend lowering (GL `glViewport`,
+physical buffer). `convert_deferred` + `flush` render all N tiles into a single
+parent import via `glViewport`, syncing once after the last tile (a plain
+`convert` per tile still works and finishes eagerly). The first batch engine
+covers the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path; two-pass packed-RGB,
+planar, and the macOS GL backend fall back to an eager per-tile convert (correct,
+not yet one-import). The per-backend lowering (GL `glViewport`,
 G2D destination crop, CPU offset+stride) and the cache-key invariant live in
 [`crates/image/ARCHITECTURE.md § Batched preprocessing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#batched-preprocessing-building-a-batch-via-convert).
 The `BufferIdentity`-sharing contract for regions lives in

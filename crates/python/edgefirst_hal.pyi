@@ -1983,6 +1983,39 @@ class ImageProcessor:
         """
         ...
 
+    def convert_deferred(
+        self,
+        src: Tensor,
+        dst: Tensor,
+        rotation: Rotation = Rotation.Rotate0,
+        flip: Flip = Flip.NoFlip,
+        src_crop: Rect | None = None,
+        dst_crop: Rect | None = None,
+        dst_color: List[np.uint8] | None = None,
+    ) -> None:
+        """
+        Convert without waiting for the GPU — the batch-preprocessing primitive.
+
+        Same as ``convert`` but the OpenGL backend skips the per-call ``glFinish``.
+        Render N model inputs by looping this over ``dst.batch(n)`` / ``dst.view(region)``
+        row-bands of one batched destination, then call ``flush()`` once: the
+        backend imports the destination a single time and renders each tile as a
+        ``glViewport`` band, syncing once at flush. A deferred destination is not
+        safe to read (or ``cuda_map``) until ``flush`` returns. Non-GL backends
+        complete synchronously and ``flush`` is a no-op.
+        """
+        ...
+
+    def flush(self) -> None:
+        """
+        Complete all deferred converts since the last flush with a single GPU sync.
+
+        After this returns, every destination written by ``convert_deferred`` is
+        finished and safe to read back or ``cuda_map``. Non-GL backends return
+        immediately.
+        """
+        ...
+
     def create_image(
         self,
         width: int,

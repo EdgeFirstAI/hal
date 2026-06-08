@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use drm_fourcc::DrmFourcc;
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use drm_fourcc::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
@@ -206,6 +206,19 @@ pub struct GLProcessorST {
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
+    /// When `true`, a convert's terminal `glFinish` is skipped so a batch of
+    /// tiles rendered into one shared destination import syncs only once, via a
+    /// single `finish_via_fence` at [`flush`](Self::flush). Set for the duration
+    /// of a single [`convert_deferred`](Self::convert_deferred) and reset
+    /// unconditionally (even on error) so a subsequent standalone `convert` never
+    /// silently returns on an unfinished GPU. Always `false` between calls.
+    pub(super) defer_finish: bool,
+    /// `true` when one or more `convert_deferred` calls have rendered without a
+    /// `glFinish` and a [`flush`](Self::flush) (single `finish_via_fence`) is
+    /// still owed. Read by the CUDA map path to auto-flush before handing the
+    /// device a buffer whose batched render may still be in flight; cleared by
+    /// the flush. See [`flush_pending`](Self::flush_pending).
+    pub(super) pending_flush: bool,
     pub(super) gl_context: GlContext,
 }
 
@@ -328,6 +341,27 @@ impl ImageProcessorTrait for GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
+        // A view()/batch() destination is lowered to a glViewport/scissor band
+        // only on the u8/i8 DMA packed path (see `setup_renderbuffer_dma` +
+        // `convert_to`). For any other GL destination — a non-DMA CPU upload, a
+        // PBO, or a float render target — that lowering does not exist, so
+        // decline and let the dispatcher fall back to the CPU backend, which
+        // writes the sub-region correctly via offset + parent stride.
+        if dst.view_origin().is_some()
+            && !(self.gl_context.transfer_backend.is_dma()
+                && dst.memory() == TensorMemory::Dma
+                && matches!(
+                    dst.dtype(),
+                    edgefirst_tensor::DType::U8 | edgefirst_tensor::DType::I8
+                ))
+        {
+            return Err(Error::NotSupported(
+                "GL view()/batch() destination is supported only for u8/i8 DMA buffers; \
+                 CPU fallback handles other cases"
+                    .into(),
+            ));
+        }
+
         let crop = crop.resolve(
             src.width().unwrap_or(0),
             src.height().unwrap_or(0),
@@ -398,6 +432,33 @@ impl ImageProcessorTrait for GLProcessorST {
             }
             other => other,
         }
+    }
+
+    fn convert_deferred(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<(), crate::Error> {
+        // Render without the terminal `glFinish` (gated in `convert_to` by
+        // `defer_finish`), leaving a single `finish_via_fence` owed at `flush`.
+        // The flag resets unconditionally so a later standalone `convert` always
+        // finishes; only a successful deferred render arms `pending_flush`.
+        self.defer_finish = true;
+        let result = self.convert(src, dst, rotation, flip, crop);
+        self.defer_finish = false;
+        if result.is_ok() {
+            self.pending_flush = true;
+        }
+        result
+    }
+
+    fn flush(&mut self) -> Result<(), crate::Error> {
+        let _span = tracing::trace_span!("image.flush.gl", pending = self.pending_flush).entered();
+        self.flush_pending();
+        Ok(())
     }
 
     fn draw_decoded_masks(
@@ -498,6 +559,22 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
 }
 
 impl GLProcessorST {
+    /// Issue the single batched GPU sync if a `convert_deferred` is still owed,
+    /// then clear the pending flag. No-op when nothing is pending. Used by both
+    /// [`flush`](ImageProcessorTrait::flush) and the CUDA map path (which
+    /// auto-flushes before handing the device a possibly-in-flight buffer).
+    ///
+    /// # Safety contract
+    /// Must run on the GL worker thread that owns the context (it is, being
+    /// driven from the worker loop under `GL_MUTEX`).
+    pub(super) fn flush_pending(&mut self) {
+        if self.pending_flush {
+            // SAFETY: called on the context-owning GL worker thread.
+            unsafe { float::finish_via_fence() };
+            self.pending_flush = false;
+        }
+    }
+
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new(kind)?;
         gls::load_with(|s| {
@@ -758,6 +835,8 @@ impl GLProcessorST {
             nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
+            defer_finish: false,
+            pending_flush: false,
         };
         check_gl_error(function!(), line!())?;
 
@@ -1087,11 +1166,7 @@ impl GLProcessorST {
                     if let Some(buffer_id) = pbo_buffer_id {
                         self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
                     } else {
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            dst_fmt,
-                            ResolvedCrop::no_crop(),
-                        )?;
+                        self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                     }
                     false
                 }
@@ -1107,11 +1182,7 @@ impl GLProcessorST {
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!("draw_decoded_masks: non-DMA fallback (memory={memory:?})");
                 }
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    dst_fmt,
-                    ResolvedCrop::no_crop(),
-                )?;
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                 false
             }
         };
@@ -1298,11 +1369,7 @@ impl GLProcessorST {
                     if let Some(buffer_id) = pbo_buffer_id {
                         self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
                     } else {
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            dst_fmt,
-                            ResolvedCrop::no_crop(),
-                        )?;
+                        self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                     }
                     false
                 }
@@ -1318,11 +1385,7 @@ impl GLProcessorST {
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!("draw_proto_masks: non-DMA fallback (memory={memory:?})");
                 }
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    dst_fmt,
-                    ResolvedCrop::no_crop(),
-                )?;
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                 false
             }
         };
@@ -1667,8 +1730,23 @@ impl GLProcessorST {
             },
         }
 
+        // A view()/batch() destination imported the whole PARENT above (cache key
+        // + `DmaImportAttrs` both pivot on `view_origin`); render this tile into
+        // its band via `glViewport`. A whole tensor fills its full surface. The
+        // matching `glScissor` (so the letterbox clear cannot wipe sibling tiles)
+        // is set in `convert_to`, which owns the clear.
+        //
+        // The destination DMA EGLImage is TOP-DOWN: GL framebuffer row 0 maps to
+        // memory row 0 (verified on-target — a tile at GL `y` lands in memory
+        // band `y`). The renderer's existing texcoord flip keeps the image
+        // upright, so the band's GL viewport `y` is simply `region.y` — NOT the
+        // bottom-left `parent_h - (y+h)` flip (that is for bottom-up surfaces).
+        let (vx, vy, vw, vh) = match dst.view_origin() {
+            Some(vo) => (vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32),
+            None => (0, 0, width, height),
+        };
         unsafe {
-            gls::gl::Viewport(0, 0, width, height);
+            gls::gl::Viewport(vx, vy, vw, vh);
         }
         Ok(())
     }
@@ -1759,6 +1837,21 @@ impl GLProcessorST {
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
         assert!(self.gl_context.transfer_backend.is_dma());
+        // v1 view()/batch() destination support covers only the SINGLE-PASS path
+        // (Rgba/Bgra/Grey, rendered by `convert_to` with the glViewport/scissor
+        // band set in `setup_renderbuffer_dma`). The two-pass packed-RGB and
+        // planar paths reinterpret the destination geometry (`W*3/4 × H`,
+        // `H*3` bands), which the band lowering does not yet handle, so decline a
+        // view dst for those → CPU fallback. (Two-pass band tiling is a follow-up.)
+        if dst.view_origin().is_some()
+            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+        {
+            return Err(crate::Error::NotSupported(
+                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
+                 planar formats (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
         if dst_fmt == PixelFormat::Rgb {
             log::trace!(
                 "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
@@ -1894,6 +1987,57 @@ impl GLProcessorST {
             self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
         };
         if swap_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result
+    }
+
+    /// Render a PBO source into the already-bound destination FBO via
+    /// [`draw_src_texture_from_pbo`](Self::draw_src_texture_from_pbo), applying
+    /// the int8 texture-program swap around the draw so the GPU writes
+    /// XOR-0x80'd values. The PBO draw never reaches the NV (`nv_r8`) or planar
+    /// branch, so this swaps **only** the two packed texture programs — narrower
+    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). Shared by
+    /// `convert_pbo_to_pbo` / `convert_pbo_to_mem`, which differ only in FBO
+    /// setup and readback target, never in this draw. Callers that need the
+    /// letterbox clear biased (glClear bypasses the shader) apply
+    /// [`int8_bias_clear`](Self::int8_bias_clear) to `crop` first; this helper
+    /// does not, since the mem path fills via CPU upload instead.
+    #[allow(clippy::too_many_arguments)]
+    fn render_from_pbo(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        src_buffer_id: u32,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        let render_result = self.draw_src_texture_from_pbo(
+            src,
+            src_fmt,
+            src_buffer_id,
+            dst,
+            dst_fmt,
+            rotation,
+            flip,
+            crop,
+        );
+        if is_int8 {
             std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
             std::mem::swap(
                 &mut self.texture_program_yuv,
@@ -2358,45 +2502,28 @@ impl GLProcessorST {
         // PboMap message back to this GL thread — causing a deadlock.
         self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
 
-        // For int8 output, swap to int8 shader programs so the GPU applies
-        // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
         // Bias letterbox clear color for int8 — glClear bypasses the shader.
         let crop = Self::int8_bias_clear(is_int8, crop);
 
-        // Upload source from PBO and render.
-        // We cannot call convert_to/draw_src_texture directly because they
-        // call src.tensor().map() which sends a message back to THIS thread,
-        // causing a deadlock. Instead, bind the source PBO as UNPACK buffer
-        // and upload to the texture with a NULL pointer — GL reads directly
-        // from the PBO, zero CPU copy.
+        // Upload source from PBO and render (int8 program swap owned by the
+        // shared `render_from_pbo` wrapper). We cannot call
+        // convert_to/draw_src_texture directly because they call
+        // src.tensor().map() which sends a message back to THIS thread, causing
+        // a deadlock. Instead, bind the source PBO as UNPACK buffer and upload
+        // to the texture with a NULL pointer — GL reads directly from the PBO,
+        // zero CPU copy.
         let start = Instant::now();
-        let render_result = self.draw_src_texture_from_pbo(
+        self.render_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
             dst,
             dst_fmt,
+            is_int8,
             rotation,
             flip,
             crop,
-        );
-        // Swap shaders back before checking result
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        )?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
@@ -2723,36 +2850,23 @@ impl GLProcessorST {
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
 
-        // For int8 output, swap to int8 shader programs so the GPU renders
-        // XOR'd values — ReadnPixels then reads already-biased data.
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
+        // Render from the PBO source; the int8 program swap (GPU writes XOR'd
+        // values so ReadnPixels reads already-biased data) is owned by the
+        // shared `render_from_pbo` wrapper. The letterbox fill is handled by the
+        // CPU upload in `setup_renderbuffer_non_dma` above, so no
+        // `int8_bias_clear` is applied here.
         let start = Instant::now();
-        let render_result = self.draw_src_texture_from_pbo(
+        self.render_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
             dst,
             dst_fmt,
+            is_int8,
             rotation,
             flip,
             crop,
-        );
-
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        )?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
 
         // ReadnPixels into Mem dst — data is already int8-biased by the shader.
@@ -2849,6 +2963,33 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         check_gl_error(function!(), line!())?;
+
+        // A view()/batch() destination shares ONE parent EGLImage with its
+        // sibling tiles; the band viewport was set in `setup_renderbuffer_dma`.
+        // Confine this tile's letterbox `glClear` (below) and draw to the same
+        // band via `glScissor` so they cannot wipe a sibling. The RAII guard
+        // disables `SCISSOR_TEST` on every exit (success, `?`, or unwind) so the
+        // next convert/draw starts from a clean state.
+        struct ScissorGuard(bool);
+        impl Drop for ScissorGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { gls::gl::Disable(gls::gl::SCISSOR_TEST) };
+                }
+            }
+        }
+        // Top-down band rect, matching `setup_renderbuffer_dma`'s viewport (the
+        // dst EGLImage is top-down: GL row 0 == memory row 0).
+        let _scissor = match dst.view_origin() {
+            Some(vo) => {
+                unsafe {
+                    gls::gl::Scissor(vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32);
+                    gls::gl::Enable(gls::gl::SCISSOR_TEST);
+                }
+                ScissorGuard(true)
+            }
+            None => ScissorGuard(false),
+        };
 
         let has_crop = crop
             .dst_rect
@@ -3023,9 +3164,14 @@ impl GLProcessorST {
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
 
-        let start = Instant::now();
-        unsafe { gls::gl::Finish() };
-        log::debug!("gl_Finish takes {:?}", start.elapsed());
+        // In a batch (`defer_finish`), skip the per-tile drain so the whole
+        // batch syncs once via `finish_via_fence` in `convert_batch`. Outside a
+        // batch this is the standalone convert's completion point and must run.
+        if !self.defer_finish {
+            let start = Instant::now();
+            unsafe { gls::gl::Finish() };
+            log::debug!("gl_Finish takes {:?}", start.elapsed());
+        }
         check_gl_error(function!(), line!())?;
         Ok(())
     }

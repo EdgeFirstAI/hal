@@ -21,8 +21,11 @@ enum GLProcessorMessage {
         Rotation,
         Flip,
         Crop,
+        bool, // defer: skip the per-tile glFinish (batch); flush syncs once
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Complete any deferred batch render with a single GPU sync.
+    Flush(tokio::sync::oneshot::Sender<Result<(), Error>>),
     SetColors(
         Vec<[u8; 4]>,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -324,6 +327,9 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::ImageConvert(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
+                        GLProcessorMessage::Flush(resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
                         GLProcessorMessage::DrawDecodedMasks(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
@@ -362,13 +368,28 @@ impl GLProcessorThreaded {
                 }
 
                 match msg {
-                    GLProcessorMessage::ImageConvert(src, mut dst, rotation, flip, crop, resp) => {
+                    GLProcessorMessage::ImageConvert(
+                        src,
+                        mut dst,
+                        rotation,
+                        flip,
+                        crop,
+                        defer,
+                        resp,
+                    ) => {
                         // SAFETY: This is safe because the convert() function waits for the resp to
                         // be sent before dropping the borrow for src and dst
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             let src = unsafe { src.ptr.as_ref() };
                             let dst = unsafe { dst.ptr.as_mut() };
-                            gl_converter.convert(src, dst, rotation, flip, crop)
+                            // A deferred convert skips the per-tile glFinish and
+                            // leaves a single sync owed at Flush; an eager convert
+                            // finishes as usual.
+                            if defer {
+                                gl_converter.convert_deferred(src, dst, rotation, flip, crop)
+                            } else {
+                                gl_converter.convert(src, dst, rotation, flip, crop)
+                            }
                         }));
                         let _ = resp.send(match result {
                             Ok(res) => res,
@@ -376,6 +397,20 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during ImageConvert: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
+                    }
+                    GLProcessorMessage::Flush(resp) => {
+                        let result =
+                            std::panic::catch_unwind(AssertUnwindSafe(|| gl_converter.flush()));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during Flush: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -599,6 +634,13 @@ impl GLProcessorThreaded {
                         let _ = resp.send(edgefirst_tensor::gl_register_buffer(buffer_id));
                     }
                     GLProcessorMessage::CudaMap(resource, resp) => {
+                        // Auto-flush: if a batched `convert_deferred` is still
+                        // owed its single GPU sync, complete it before CUDA maps
+                        // the buffer — otherwise the device could read a render
+                        // still in flight. This makes `cuda_map()` correct on a
+                        // batched output with no API change (the caller pays the
+                        // sync it would have owed anyway).
+                        gl_converter.flush_pending();
                         let _ = resp.send(edgefirst_tensor::gl_map_resource(resource));
                     }
                     GLProcessorMessage::CudaUnmap(resource) => {
@@ -665,8 +707,54 @@ impl ImageProcessorTrait for GLProcessorThreaded {
                 rotation,
                 flip,
                 crop,
+                false, // eager: finish per convert
                 err_send,
             ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    fn convert_deferred(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> crate::Result<()> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::ImageConvert(
+                SendablePtr {
+                    ptr: NonNull::from(src),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: NonNull::from(dst),
+                    len: 1,
+                },
+                rotation,
+                flip,
+                crop,
+                true, // defer: skip glFinish; flush() syncs the batch once
+                err_send,
+            ))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    fn flush(&mut self) -> crate::Result<()> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::Flush(err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

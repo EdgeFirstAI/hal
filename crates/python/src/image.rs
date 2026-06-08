@@ -1041,6 +1041,58 @@ impl PyImageProcessor {
         Ok(())
     }
 
+    /// Convert without waiting for the GPU — the batch-preprocessing primitive.
+    ///
+    /// Same as [`convert`](Self::convert) but the OpenGL backend skips the
+    /// per-call `glFinish()`. Render N model inputs by looping this over
+    /// `dst.batch(n)` / `dst.view(region)` row-bands of one batched destination,
+    /// then call [`flush`](Self::flush) once: the backend imports the destination
+    /// a single time and renders each tile as a `glViewport` band, syncing once
+    /// at flush. A deferred destination is not safe to read (or `cuda_map`) until
+    /// `flush` returns. Non-GL backends complete synchronously and `flush` is a
+    /// no-op.
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    pub fn convert_deferred(
+        &mut self,
+        src: &PyTensor,
+        dst: &mut PyTensor,
+        rotation: PyRotation,
+        flip: PyFlip,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
+    ) -> Result<()> {
+        let _span = tracing::trace_span!("python.convert_deferred").entered();
+        let rotation = rotation.into();
+        let flip = flip.into();
+        let crop = Crop {
+            source: source.map(|x| x.into()),
+            fit: match letterbox {
+                Some(pad) => Fit::Letterbox { pad },
+                None => Fit::Stretch,
+            },
+        };
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.convert_deferred(&src.0, &mut dst.0, rotation, flip, crop)?;
+        Ok(())
+    }
+
+    /// Complete all deferred converts since the last flush with a single GPU
+    /// sync. After this returns, every destination written by
+    /// [`convert_deferred`](Self::convert_deferred) is finished and safe to read
+    /// back or `cuda_map`. Non-GL backends return immediately.
+    pub fn flush(&mut self) -> Result<()> {
+        let _span = tracing::trace_span!("python.flush").entered();
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.flush()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (dst, bbox, scores, classes, seg=vec![], background=None, opacity=1.0, letterbox=None, color_mode=PyColorMode::Class))]
     pub fn draw_decoded_masks(

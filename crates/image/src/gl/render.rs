@@ -9,12 +9,14 @@
 //! Three responsibilities live here, each previously open-coded at several call
 //! sites in `processor/mod.rs`:
 //!
-//! 1. **`region_to_viewport`** — the bottom-left y-origin flip. GL's window
-//!    origin is bottom-left; HAL regions are top-left. A destination tile at
-//!    pixel `(x, y)` of size `(w, h)` in a render target `parent_h` rows tall
-//!    maps to viewport `y' = parent_h − (y + h)`. This is the *one* place that
-//!    rule is written; `clear_rect_planar` derived the same flip inline in
-//!    normalised device coordinates (see its `(bottom + 1) / 2 * height` math).
+//! 1. **`region_to_viewport`** — the bottom-left y-origin flip for a *bottom-up*
+//!    render target. GL's window origin is bottom-left; HAL regions are
+//!    top-left. A tile at pixel `(x, y)` of size `(w, h)` in a `parent_h`-row
+//!    target maps to viewport `y' = parent_h − (y + h)`. NOTE: the live Linux
+//!    DMA-BUF destination batch path is **top-down** (GL row 0 == memory row 0,
+//!    verified on-target — the renderer's texcoords already flip the image
+//!    upright), so it uses `region.y` directly and does NOT call this. Kept for a
+//!    future bottom-up surface (e.g. the macOS pbuffer batch path).
 //!
 //! 2. **`source_uv`** — the source sampling rectangle in normalised `[0,1]` UV,
 //!    derived from a `Region`. Mirrors the `src_rect_uv` half of
@@ -27,9 +29,11 @@
 //!    (`glViewport`), never part of the EGL cache key — that is what makes
 //!    "N tiles → 1 import" hold.
 
-// These pure primitives are consumed by the converged `render_tile`/`render_batch`
-// in Step 5+; until then only the unit tests exercise them. The allow is removed
-// when the renderer is wired in.
+// `Viewport`/`source_uv`/`plan_batch`/`BatchPath` stage the chunking follow-up
+// (split a batch that exceeds `GL_MAX_*` into per-chunk imports) and the
+// source-UV/bottom-up-surface paths; the live top-down DMA batch path computes
+// its band viewport inline (see the orientation note above). Until those land,
+// only the unit tests exercise these — drop the allow when they are wired in.
 #![allow(dead_code)]
 
 use crate::Region;
@@ -135,7 +139,15 @@ mod tests {
         // A region covering the whole image maps to the full viewport at (0,0):
         // y_flip = H - (0 + H) = 0.
         let vp = region_to_viewport(region(0, 0, 64, 48), 48);
-        assert_eq!(vp, Viewport { x: 0, y: 0, w: 64, h: 48 });
+        assert_eq!(
+            vp,
+            Viewport {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 48
+            }
+        );
     }
 
     #[test]
@@ -143,14 +155,30 @@ mod tests {
         // Top 16-row band of a 48-tall image: GL y = 48 - (0 + 16) = 32
         // (the top of a top-left image is the HIGH end of bottom-left GL space).
         let vp = region_to_viewport(region(0, 0, 64, 16), 48);
-        assert_eq!(vp, Viewport { x: 0, y: 32, w: 64, h: 16 });
+        assert_eq!(
+            vp,
+            Viewport {
+                x: 0,
+                y: 32,
+                w: 64,
+                h: 16
+            }
+        );
     }
 
     #[test]
     fn viewport_bottom_tile_lands_at_origin() {
         // Bottom 16-row band (y=32): GL y = 48 - (32 + 16) = 0.
         let vp = region_to_viewport(region(0, 32, 64, 16), 48);
-        assert_eq!(vp, Viewport { x: 0, y: 0, w: 64, h: 16 });
+        assert_eq!(
+            vp,
+            Viewport {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 16
+            }
+        );
     }
 
     #[test]
@@ -167,7 +195,15 @@ mod tests {
     #[test]
     fn viewport_x_offset_preserved() {
         let vp = region_to_viewport(region(10, 4, 20, 8), 32);
-        assert_eq!(vp, Viewport { x: 10, y: 32 - 12, w: 20, h: 8 });
+        assert_eq!(
+            vp,
+            Viewport {
+                x: 10,
+                y: 32 - 12,
+                w: 20,
+                h: 8
+            }
+        );
     }
 
     #[test]
@@ -186,7 +222,10 @@ mod tests {
 
     #[test]
     fn source_uv_zero_dims_falls_back_to_identity() {
-        assert_eq!(source_uv(Some(region(0, 0, 1, 1)), 0, 0), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(
+            source_uv(Some(region(0, 0, 1, 1)), 0, 0),
+            [0.0, 0.0, 1.0, 1.0]
+        );
     }
 
     #[test]

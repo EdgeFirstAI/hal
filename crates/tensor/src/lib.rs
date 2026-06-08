@@ -302,9 +302,33 @@ impl Region {
 
     /// True when the region lies fully within a `width` × `height` frame.
     pub fn fits_within(&self, width: usize, height: usize) -> bool {
-        self.x.saturating_add(self.width) <= width
-            && self.y.saturating_add(self.height) <= height
+        self.x.saturating_add(self.width) <= width && self.y.saturating_add(self.height) <= height
     }
+}
+
+/// The parent image a [`view`](Tensor::view)/[`batch`](Tensor::batch) sub-region
+/// was carved from, snapshotted at the time the view was created.
+///
+/// A view shares the parent's `BufferIdentity` and addresses a sub-rectangle of
+/// it. The GL backend keys its EGLImage import on the **parent** geometry (so all
+/// sibling views of one buffer collapse to a single import) and renders each
+/// view as a `glViewport`+`glScissor` ROI at `(x, y, width, height)` within that
+/// parent — the view is render state, never a distinct import. `parent_width`/
+/// `parent_height` are the parent's logical pixel dimensions; `x`/`y` are this
+/// view's top-left origin within the parent (pixels). Nested views compose:
+/// the snapshot always names the **root** parent, with offsets accumulated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewOrigin {
+    /// Logical width of the root parent image, in pixels.
+    pub parent_width: usize,
+    /// Logical height of the root parent image, in pixels. For a `batch(n)` view
+    /// of an `[N, H, W, C]` tensor this is `N * H` (the tiles stack vertically in
+    /// the shared buffer).
+    pub parent_height: usize,
+    /// This view's top-left x origin within the root parent, in pixels.
+    pub x: usize,
+    /// This view's top-left y origin within the root parent, in pixels.
+    pub y: usize,
 }
 
 /// Element type discriminant for runtime type identification.
@@ -1424,6 +1448,11 @@ where
     pub(crate) quantization: Option<Quantization>,
     /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
     colorimetry: Option<crate::Colorimetry>,
+    /// Parent-image snapshot when this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. Lets the GL
+    /// backend key its import on the parent and render the view as a
+    /// `glViewport`/`glScissor` ROI. See [`ViewOrigin`].
+    view_origin: Option<ViewOrigin>,
 }
 
 impl<T> Tensor<T>
@@ -1441,6 +1470,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            view_origin: None,
         }
     }
 
@@ -2241,6 +2271,8 @@ where
             // multiplane data must import each plane independently.
             cuda: None,
             colorimetry: luma.colorimetry,
+            // A composed multiplane tensor is a whole image, not a sub-view.
+            view_origin: None,
         })
     }
 
@@ -2365,6 +2397,14 @@ where
         self.plane_offset
     }
 
+    /// The parent-image snapshot if this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. The GL
+    /// backend keys its import on the parent geometry and renders this view as a
+    /// `glViewport`/`glScissor` ROI at `(x, y, width, height)`. See [`ViewOrigin`].
+    pub fn view_origin(&self) -> Option<ViewOrigin> {
+        self.view_origin
+    }
+
     /// Set the byte offset within the DMA-BUF where image data starts.
     ///
     /// Propagated to `EGL_DMA_BUF_PLANE0_OFFSET_EXT` on GPU import.
@@ -2383,7 +2423,6 @@ where
             _ => {}
         }
     }
-
 
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
     pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
@@ -2530,10 +2569,24 @@ where
         let elem_bytes = elem_count
             .checked_mul(std::mem::size_of::<T>())
             .ok_or(Error::InvalidSize(elem_count))?;
-        let offset = n
-            .checked_mul(elem_bytes)
-            .ok_or(Error::InvalidSize(n))?;
-        self.subview(offset, &elem_shape)
+        let offset = n.checked_mul(elem_bytes).ok_or(Error::InvalidSize(n))?;
+        // For a packed `[N, H, W, C]` tensor the N tiles stack vertically in the
+        // shared buffer, so the GL import sees one `(W, N*H)` parent and each
+        // tile is the row-band at `y = n*H`. Snapshot that parent so the backend
+        // imports once and renders the tile via `glViewport`. Non-packed
+        // (planar/semi-planar) batching keeps the per-slot path for now (planar
+        // NCHW tiling is a separate step); raw tensors have no pixel geometry.
+        let view_origin = match self.format.map(|f| f.layout()) {
+            Some(PixelLayout::Packed) => {
+                let tile_h = elem_shape[0];
+                let tile_w = elem_shape[1];
+                Some(self.compose_view_origin(tile_w, batch * tile_h, 0, n * tile_h))
+            }
+            _ => None,
+        };
+        let mut t = self.subview(offset, &elem_shape)?;
+        t.view_origin = view_origin;
+        Ok(t)
     }
 
     /// Borrow a rectangular spatial sub-region of an image tensor as a
@@ -2598,7 +2651,38 @@ where
             region.width * bpp
         };
         t.set_row_stride_unchecked(view_stride);
+        // Snapshot the parent `(w, h)` so the GL backend imports the parent once
+        // and renders this sub-rect as a `glViewport`/`glScissor` ROI at
+        // `(region.x, region.y)`. Composes when viewing an existing view.
+        t.view_origin = Some(self.compose_view_origin(w, h, region.x, region.y));
         Ok(t)
+    }
+
+    /// Build the [`ViewOrigin`] for a new sub-region of `self`. When `self` is a
+    /// whole tensor the snapshot names `self` as the parent; when `self` is
+    /// already a view, the snapshot keeps the **root** parent and accumulates the
+    /// local origin so nested views still resolve to one import.
+    fn compose_view_origin(
+        &self,
+        parent_width: usize,
+        parent_height: usize,
+        x: usize,
+        y: usize,
+    ) -> ViewOrigin {
+        match self.view_origin {
+            Some(root) => ViewOrigin {
+                parent_width: root.parent_width,
+                parent_height: root.parent_height,
+                x: root.x.saturating_add(x),
+                y: root.y.saturating_add(y),
+            },
+            None => ViewOrigin {
+                parent_width,
+                parent_height,
+                x,
+                y,
+            },
+        }
     }
 
     /// Downcast to PBO tensor reference (for GL backends).
@@ -2651,6 +2735,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            view_origin: None,
         }
     }
 
@@ -2964,10 +3049,7 @@ where
         // self-allocated backing now carries a sub-region concept via `view`, so
         // a non-zero offset is honoured rather than rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
-            let supported = matches!(
-                self.storage,
-                TensorStorage::Mem(_) | TensorStorage::Pbo(_)
-            );
+            let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
             // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF — both
             // apply the offset in their map. (`Dma` is the same variant name on
             // both, hence one `cfg(any(...))` arm rather than two.)
@@ -3941,6 +4023,48 @@ mod tests {
                 &s[i * 12..(i + 1) * 12]
             );
         }
+    }
+
+    #[test]
+    fn view_origin_snapshots_parent_and_composes() {
+        // view() on a whole image snapshots the parent dims + the view's origin.
+        let parent =
+            Tensor::<u8>::image(100, 80, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(
+            parent.view_origin(),
+            None,
+            "whole tensor has no view_origin"
+        );
+        let v = parent.view(Region::new(10, 20, 30, 40)).unwrap();
+        assert_eq!(
+            v.view_origin(),
+            Some(ViewOrigin {
+                parent_width: 100,
+                parent_height: 80,
+                x: 10,
+                y: 20
+            })
+        );
+        // A view of a view keeps the ROOT parent and accumulates the origin.
+        let v2 = v.view(Region::new(5, 5, 10, 10)).unwrap();
+        assert_eq!(
+            v2.view_origin(),
+            Some(ViewOrigin {
+                parent_width: 100,
+                parent_height: 80,
+                x: 15,
+                y: 25
+            }),
+            "nested view composes onto the root parent"
+        );
+    }
+
+    #[test]
+    fn view_origin_none_for_raw_batch() {
+        // A raw (unformatted) batched tensor has no pixel geometry, so batch()
+        // leaves view_origin None (the per-slot path, not the one-import pivot).
+        let parent = Tensor::<u8>::new(&[4, 2, 2, 3], Some(TensorMemory::Mem), None).unwrap();
+        assert_eq!(parent.batch(2).unwrap().view_origin(), None);
     }
 
     #[test]
