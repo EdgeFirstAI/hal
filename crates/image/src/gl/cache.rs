@@ -70,13 +70,17 @@ impl EglCacheKey {
     {
         // A view()/batch() sub-region keys on its PARENT so all siblings of one
         // buffer collapse to a single import; the view's offset is the viewport,
-        // not a key. A whole tensor keys on its own geometry + any genuine
-        // foreign/multi-plane plane_offset.
-        let (width, height, plane_offset) = match img.view_origin() {
-            Some(vo) => (vo.parent_width, vo.parent_height, 0),
+        // not a key. It keys on the parent's `row_stride` (from `view_origin`),
+        // NOT the view's own `effective_row_stride` — a single-row view sets a
+        // tight stride for map-span safety, which would otherwise mis-key it apart
+        // from its multi-row siblings. A whole tensor keys on its own geometry +
+        // any genuine foreign/multi-plane plane_offset.
+        let (width, height, row_stride, plane_offset) = match img.view_origin() {
+            Some(vo) => (vo.parent_width, vo.parent_height, vo.parent_row_stride, 0),
             None => (
                 img.width().unwrap_or(0),
                 img.height().unwrap_or(0),
+                img.effective_row_stride().unwrap_or(0),
                 img.plane_offset().unwrap_or(0),
             ),
         };
@@ -86,7 +90,7 @@ impl EglCacheKey {
             plane_offset,
             width,
             height,
-            row_stride: img.effective_row_stride().unwrap_or(0),
+            row_stride,
             format,
         }
     }

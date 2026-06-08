@@ -1973,13 +1973,18 @@ class ImageProcessor:
         dst: Tensor,
         rotation: Rotation = Rotation.Rotate0,
         flip: Flip = Flip.NoFlip,
-        src_crop: Rect | None = None,
-        dst_crop: Rect | None = None,
-        dst_color: List[np.uint8] | None = None,
+        source: Region | None = None,
+        letterbox: List[np.uint8] | None = None,
     ) -> None:
         """
-        Convert the source image to the destination image format, with optional rotation, flipping, cropping.
-        The fill color can be used for areas outside the destination crop. The fill color is provided as RGBA values.
+        Convert the source image to the destination image format, with optional
+        rotation, flipping, and source crop.
+
+        ``source`` selects a sub-rectangle of the input to sample (whole image if
+        ``None``). The destination shape is the placement — use ``dst.view(region)``
+        / ``dst.batch(n)`` to render into a sub-region. ``letterbox`` is a resize
+        mode: preserve the source aspect ratio and pad the remainder with the given
+        RGBA colour (stretch-to-fill when ``None``).
         """
         ...
 
@@ -1989,9 +1994,8 @@ class ImageProcessor:
         dst: Tensor,
         rotation: Rotation = Rotation.Rotate0,
         flip: Flip = Flip.NoFlip,
-        src_crop: Rect | None = None,
-        dst_crop: Rect | None = None,
-        dst_color: List[np.uint8] | None = None,
+        source: Region | None = None,
+        letterbox: List[np.uint8] | None = None,
     ) -> None:
         """
         Convert without waiting for the GPU — the batch-preprocessing primitive.

@@ -44,8 +44,8 @@ pub enum Error {
         /// Bytes the allocation provides.
         capacity: usize,
     },
-    /// A [`crate::view`]-style sub-region extends past the parent's bounds.
-    /// `view`/`batch` reject rather than clamp.
+    /// A [`crate::Tensor::view`]-style sub-region extends past the parent's
+    /// bounds. `view`/`batch` reject rather than clamp.
     RegionOutOfBounds {
         /// The offending region.
         region: crate::Region,

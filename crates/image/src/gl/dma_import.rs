@@ -160,16 +160,22 @@ impl DmaImportAttrs {
             None
         };
 
-        // Use the tensor's stored stride if set (for externally allocated buffers
-        // with row padding), otherwise compute the tightly-packed pitch.
-        let plane0_pitch = src.effective_row_stride().unwrap_or_else(|| {
-            if src_fmt == PixelFormat::Nv12 {
-                // Luma plane is 1 byte/pixel for NV12 semi-planar YUV.
-                width
-            } else {
-                width * channels
-            }
-        });
+        // A view imports its PARENT, so it pitches on the parent's row stride
+        // (`view_origin`), NOT the view's own `effective_row_stride` (which a
+        // single-row view sets tight). A whole tensor uses its stored stride if
+        // set (externally allocated buffers with row padding), otherwise the
+        // tightly-packed pitch.
+        let plane0_pitch = match view_origin {
+            Some(vo) => vo.parent_row_stride,
+            None => src.effective_row_stride().unwrap_or_else(|| {
+                if src_fmt == PixelFormat::Nv12 {
+                    // Luma plane is 1 byte/pixel for NV12 semi-planar YUV.
+                    width
+                } else {
+                    width * channels
+                }
+            }),
+        };
 
         // A view imports its parent at offset 0 (its byte offset becomes the
         // viewport, never the import base); a whole tensor honors its own offset.

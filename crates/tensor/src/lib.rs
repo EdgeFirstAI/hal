@@ -325,6 +325,12 @@ pub struct ViewOrigin {
     /// of an `[N, H, W, C]` tensor this is `N * H` (the tiles stack vertically in
     /// the shared buffer).
     pub parent_height: usize,
+    /// The parent's row stride in **bytes**. The GL backend keys its EGLImage
+    /// import/cache and pitch on this — NOT on the view's own `row_stride`, which
+    /// a single-row view sets tight (for map-span safety). Using the parent
+    /// stride keeps the import pitch parent-consistent so single-row and
+    /// multi-row sibling views collapse onto the same parent import.
+    pub parent_row_stride: usize,
     /// This view's top-left x origin within the root parent, in pixels.
     pub x: usize,
     /// This view's top-left y origin within the root parent, in pixels.
@@ -2580,7 +2586,11 @@ where
             Some(PixelLayout::Packed) => {
                 let tile_h = elem_shape[0];
                 let tile_w = elem_shape[1];
-                Some(self.compose_view_origin(tile_w, batch * tile_h, 0, n * tile_h))
+                // Per-row pitch of the tall `(W, N*H)` parent — padded stride if
+                // set, else the tight row width. The GL import keys on this.
+                let bpp = elem_shape[2] * std::mem::size_of::<T>();
+                let parent_stride = self.effective_row_stride().unwrap_or(tile_w * bpp);
+                Some(self.compose_view_origin(tile_w, batch * tile_h, parent_stride, 0, n * tile_h))
             }
             _ => None,
         };
@@ -2643,18 +2653,24 @@ where
         let mut t = self.subview(offset, &sub_shape)?;
         // A multi-row sub-rect must advance rows by the PARENT pitch so each row
         // addresses the correct columns. A single-row view uses its own tight
-        // stride — the parent pitch would make the strided map expose a trailing
-        // row that runs past the buffer tail for an offset (x>0 / bottom) view.
+        // stride — the parent pitch would make the strided `map()` (which exposes
+        // `stride × rows`) expose a trailing row that runs past the buffer tail
+        // for an offset (x>0 / bottom) view. The GL backend does NOT rely on this
+        // (single-row-tight) `row_stride`: it reads the parent pitch from
+        // `view_origin.parent_row_stride` so its import/cache pitch stays
+        // parent-consistent for views of any height — see `ViewOrigin`.
         let view_stride = if region.height > 1 {
             stride
         } else {
             region.width * bpp
         };
         t.set_row_stride_unchecked(view_stride);
-        // Snapshot the parent `(w, h)` so the GL backend imports the parent once
-        // and renders this sub-rect as a `glViewport`/`glScissor` ROI at
-        // `(region.x, region.y)`. Composes when viewing an existing view.
-        t.view_origin = Some(self.compose_view_origin(w, h, region.x, region.y));
+        // Snapshot the parent `(w, h, row_stride)` so the GL backend imports the
+        // parent once (keyed on the parent pitch, not this view's possibly-tight
+        // single-row stride) and renders this sub-rect as a `glViewport`/
+        // `glScissor` ROI at `(region.x, region.y)`. Composes when viewing an
+        // existing view.
+        t.view_origin = Some(self.compose_view_origin(w, h, stride, region.x, region.y));
         Ok(t)
     }
 
@@ -2666,6 +2682,7 @@ where
         &self,
         parent_width: usize,
         parent_height: usize,
+        parent_row_stride: usize,
         x: usize,
         y: usize,
     ) -> ViewOrigin {
@@ -2673,12 +2690,14 @@ where
             Some(root) => ViewOrigin {
                 parent_width: root.parent_width,
                 parent_height: root.parent_height,
+                parent_row_stride: root.parent_row_stride,
                 x: root.x.saturating_add(x),
                 y: root.y.saturating_add(y),
             },
             None => ViewOrigin {
                 parent_width,
                 parent_height,
+                parent_row_stride,
                 x,
                 y,
             },
@@ -4041,6 +4060,7 @@ mod tests {
             Some(ViewOrigin {
                 parent_width: 100,
                 parent_height: 80,
+                parent_row_stride: 100 * 4, // tight RGBA pitch
                 x: 10,
                 y: 20
             })
@@ -4052,6 +4072,7 @@ mod tests {
             Some(ViewOrigin {
                 parent_width: 100,
                 parent_height: 80,
+                parent_row_stride: 100 * 4,
                 x: 15,
                 y: 25
             }),
@@ -4296,6 +4317,44 @@ mod tests {
             0xBB,
             "row 1 writes at parent offset 128 + stride"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn view_single_row_snapshots_parent_stride() {
+        // A single-row `view()` keeps a TIGHT `row_stride` for map-span safety,
+        // but its `view_origin` snapshots the PARENT row stride — the GL backend
+        // keys its EGLImage import/pitch on that snapshot (not the view's tight
+        // stride), so single-row and multi-row sibling views collapse onto the
+        // same parent import.
+        let _lock = FD_LOCK.read().unwrap();
+        // 8x4 RGBA with a padded 64-byte row stride (tight row = 8*4 = 32).
+        let parent = match Tensor::<u8>::image_with_stride(
+            8,
+            4,
+            PixelFormat::Rgba,
+            64,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIPPED: DMA not available");
+                return;
+            }
+        };
+        assert_eq!(parent.effective_row_stride(), Some(64));
+        // Bottom row (y=3) at x>0 — the case the tight single-row stride guards.
+        let row = parent.view(Region::new(2, 3, 4, 1)).unwrap();
+        // The view's own stride is tight (4*4 = 16) so its strided map stays in
+        // bounds; the GL-facing parent pitch (64) lives in `view_origin`.
+        assert_eq!(row.effective_row_stride(), Some(16));
+        let vo = row.view_origin().expect("a view carries a view_origin");
+        assert_eq!(
+            vo.parent_row_stride, 64,
+            "GL keys/pitches a view on the parent stride, not its tight one"
+        );
+        // The tight stride keeps map() in-bounds for the bottom / x>0 single row.
+        assert_eq!(row.map().unwrap().as_slice().len(), 16);
     }
 
     #[test]

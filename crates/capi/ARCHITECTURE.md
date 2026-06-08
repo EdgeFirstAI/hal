@@ -184,10 +184,16 @@ Allocate src/dst tensors       Call convert()                Free processor
 To assemble an `[N, …]` model input, allocate the batched destination once via
 `create_image`, then loop: for each source, call
 `hal_image_processor_convert(p, src, hal_tensor_batch(dst, n), …)` to render
-into element *n*. Each call imports its destination at the sub-view's own
-offset+identity and completes independently with `glFinish()`. Create the N
-`hal_tensor_batch` handles once and reuse them across frames, like the tensors
-and the source pool.
+into element *n*. Every `hal_tensor_batch(dst, n)` shares the parent's
+`BufferIdentity`, so on the OpenGL backend the destination EGLImage is imported
+**once** (keyed on the parent identity+geometry) and each tile is placed into it
+with `glViewport`/`glScissor` — the per-tile offset is render state, never a
+separate import. For one import **and** one GPU sync, use
+`hal_image_processor_convert_deferred(p, src, hal_tensor_batch(dst, n), …)` in
+the loop and call `hal_image_processor_flush(p)` **once** at the end (it skips
+the per-tile `glFinish` and issues a single fence; a deferred destination is not
+safe to read until `flush` returns). Create the N `hal_tensor_batch` handles
+once and reuse them across frames, like the tensors and the source pool.
 
 **Constraint:** passing a `view`/`batch` of the *same* parent as both `src` and
 `dst` of one `convert()` is undefined (the GL backend binds the whole EGLImage

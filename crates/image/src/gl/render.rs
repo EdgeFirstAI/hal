@@ -59,7 +59,7 @@ pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
     // of rows *below* the region — `parent_h - (y + h)`. Saturating so a region
     // flush against the bottom edge (or a degenerate over-tall region) yields a
     // non-negative origin rather than wrapping.
-    let y_flipped = parent_h.saturating_sub(region.y + region.height);
+    let y_flipped = parent_h.saturating_sub(region.y.saturating_add(region.height));
     Viewport {
         x: region.x as i32,
         y: y_flipped as i32,
