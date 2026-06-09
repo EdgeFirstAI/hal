@@ -72,7 +72,7 @@ pub mod edgefirst_hal {
         m.add_class::<colorimetry::PyColorimetry>()?;
         m.add_class::<image::PyPixelFormat>()?;
         m.add_class::<image::Normalization>()?;
-        m.add_class::<image::PyRect>()?;
+        m.add_class::<image::PyRegion>()?;
         m.add_class::<image::PyRotation>()?;
         m.add_class::<image::PyFlip>()?;
         m.add_class::<image::PyColorMode>()?;

@@ -99,18 +99,18 @@ static void test_tensor_image_null_handling(void) {
 }
 
 // =============================================================================
-// Rect and Crop Tests
+// Region and Crop Tests
 // =============================================================================
 
-static void test_rect_new(void) {
-    TEST("rect_new");
+static void test_region_new(void) {
+    TEST("region_new");
 
-    struct hal_rect rect = hal_rect_new(10, 20, 100, 200);
+    struct hal_region region = hal_region_new(10, 20, 100, 200);
 
-    ASSERT_EQ(10, rect.left);
-    ASSERT_EQ(20, rect.top);
-    ASSERT_EQ(100, rect.width);
-    ASSERT_EQ(200, rect.height);
+    ASSERT_EQ(10, region.x);
+    ASSERT_EQ(20, region.y);
+    ASSERT_EQ(100, region.width);
+    ASSERT_EQ(200, region.height);
 
     TEST_PASS();
 }
@@ -118,65 +118,48 @@ static void test_rect_new(void) {
 static void test_crop_new(void) {
     TEST("crop_new");
 
+    // Default crop: whole source, stretch fit.
     struct hal_crop crop = hal_crop_new();
 
-    ASSERT_FALSE(crop.has_src_rect);
-    ASSERT_FALSE(crop.has_dst_rect);
-    ASSERT_FALSE(crop.has_dst_color);
+    ASSERT_FALSE(crop.has_source);
+    ASSERT_EQ(HAL_FIT_STRETCH, crop.fit);
 
     TEST_PASS();
 }
 
-static void test_crop_set_src_rect(void) {
-    TEST("crop_set_src_rect");
+static void test_crop_set_source(void) {
+    TEST("crop_set_source");
 
     struct hal_crop crop = hal_crop_new();
-    struct hal_rect rect = hal_rect_new(10, 20, 100, 200);
+    struct hal_region region = hal_region_new(10, 20, 100, 200);
 
-    hal_crop_set_src_rect(&crop, &rect);
+    hal_crop_set_source(&crop, &region);
 
-    ASSERT_TRUE(crop.has_src_rect);
-    ASSERT_EQ(10, crop.src_rect.left);
-    ASSERT_EQ(20, crop.src_rect.top);
-    ASSERT_EQ(100, crop.src_rect.width);
-    ASSERT_EQ(200, crop.src_rect.height);
+    ASSERT_TRUE(crop.has_source);
+    ASSERT_EQ(10, crop.source.x);
+    ASSERT_EQ(20, crop.source.y);
+    ASSERT_EQ(100, crop.source.width);
+    ASSERT_EQ(200, crop.source.height);
 
-    // Clear src_rect
-    hal_crop_set_src_rect(&crop, NULL);
-    ASSERT_FALSE(crop.has_src_rect);
+    // Clear source (NULL) → whole source.
+    hal_crop_set_source(&crop, NULL);
+    ASSERT_FALSE(crop.has_source);
 
     TEST_PASS();
 }
 
-static void test_crop_set_dst_rect(void) {
-    TEST("crop_set_dst_rect");
-
-    struct hal_crop crop = hal_crop_new();
-    struct hal_rect rect = hal_rect_new(0, 0, 320, 240);
-
-    hal_crop_set_dst_rect(&crop, &rect);
-
-    ASSERT_TRUE(crop.has_dst_rect);
-    ASSERT_EQ(0, crop.dst_rect.left);
-    ASSERT_EQ(0, crop.dst_rect.top);
-    ASSERT_EQ(320, crop.dst_rect.width);
-    ASSERT_EQ(240, crop.dst_rect.height);
-
-    TEST_PASS();
-}
-
-static void test_crop_set_dst_color(void) {
-    TEST("crop_set_dst_color");
+static void test_crop_set_letterbox(void) {
+    TEST("crop_set_letterbox");
 
     struct hal_crop crop = hal_crop_new();
 
-    hal_crop_set_dst_color(&crop, 255, 128, 64, 200);
+    hal_crop_set_letterbox(&crop, 255, 128, 64, 200);
 
-    ASSERT_TRUE(crop.has_dst_color);
-    ASSERT_EQ(255, crop.dst_color[0]);
-    ASSERT_EQ(128, crop.dst_color[1]);
-    ASSERT_EQ(64, crop.dst_color[2]);
-    ASSERT_EQ(200, crop.dst_color[3]);
+    ASSERT_EQ(HAL_FIT_LETTERBOX, crop.fit);
+    ASSERT_EQ(255, crop.pad[0]);
+    ASSERT_EQ(128, crop.pad[1]);
+    ASSERT_EQ(64, crop.pad[2]);
+    ASSERT_EQ(200, crop.pad[3]);
 
     TEST_PASS();
 }
@@ -711,12 +694,11 @@ void run_image_tests(void) {
     test_tensor_image_new_invalid();
     test_tensor_image_null_handling();
 
-    // Rect and Crop tests
-    test_rect_new();
+    // Region and Crop tests
+    test_region_new();
     test_crop_new();
-    test_crop_set_src_rect();
-    test_crop_set_dst_rect();
-    test_crop_set_dst_color();
+    test_crop_set_source();
+    test_crop_set_letterbox();
 
     // Image processor tests
     test_image_processor_new();

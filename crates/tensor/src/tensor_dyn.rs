@@ -51,6 +51,27 @@ macro_rules! dispatch {
     };
 }
 
+/// Like [`dispatch!`], but for methods returning `Result<Tensor<T>>`: rewrap the
+/// typed result back into the matching `TensorDyn` variant. Keeps sub-region
+/// fan-out (`batch`, future `view`) to one line instead of an 11-arm match.
+macro_rules! dyn_fanout {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            TensorDyn::U8(t) => t.$method($($arg),*).map(TensorDyn::U8),
+            TensorDyn::I8(t) => t.$method($($arg),*).map(TensorDyn::I8),
+            TensorDyn::U16(t) => t.$method($($arg),*).map(TensorDyn::U16),
+            TensorDyn::I16(t) => t.$method($($arg),*).map(TensorDyn::I16),
+            TensorDyn::U32(t) => t.$method($($arg),*).map(TensorDyn::U32),
+            TensorDyn::I32(t) => t.$method($($arg),*).map(TensorDyn::I32),
+            TensorDyn::U64(t) => t.$method($($arg),*).map(TensorDyn::U64),
+            TensorDyn::I64(t) => t.$method($($arg),*).map(TensorDyn::I64),
+            TensorDyn::F16(t) => t.$method($($arg),*).map(TensorDyn::F16),
+            TensorDyn::F32(t) => t.$method($($arg),*).map(TensorDyn::F32),
+            TensorDyn::F64(t) => t.$method($($arg),*).map(TensorDyn::F64),
+        }
+    };
+}
+
 /// Generate the three downcast methods (ref, mut ref, owned) for one variant.
 macro_rules! downcast_methods {
     ($variant:ident, $ty:ty, $as_name:ident, $as_mut_name:ident, $into_name:ident) => {
@@ -239,38 +260,28 @@ impl TensorDyn {
         dispatch!(self, plane_offset)
     }
 
+    /// The parent-image snapshot if this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. See
+    /// [`Tensor::view_origin`].
+    pub fn view_origin(&self) -> Option<crate::ViewOrigin> {
+        dispatch!(self, view_origin)
+    }
+
     /// Set the byte offset within the DMA-BUF where image data starts.
     pub fn set_plane_offset(&mut self, offset: usize) {
         dispatch!(self, set_plane_offset, offset)
     }
 
-    /// Builder-style: set plane offset, consuming and returning self.
-    pub fn with_plane_offset(mut self, offset: usize) -> Self {
-        self.set_plane_offset(offset);
-        self
+    /// Borrow batch element `n` of a batched tensor (leading `N` dimension) as a
+    /// zero-copy view sharing this tensor's allocation. See [`Tensor::batch`].
+    pub fn batch(&self, n: usize) -> crate::Result<TensorDyn> {
+        dyn_fanout!(self, batch, n)
     }
 
-    /// Create a zero-copy sub-region view of this tensor's backing buffer.
-    ///
-    /// The returned tensor shares this tensor's allocation and maps the window
-    /// `[offset_bytes, offset_bytes + shape.product() * element_size)`. N
-    /// sub-views into one parent can be written independently — the basis for
-    /// assembling a batch into one buffer. Works identically on `Mem` (shared
-    /// `Arc`) and `Dma` (shared fd) backings. See [`Tensor::subview`].
-    pub fn subview(&self, offset_bytes: usize, shape: &[usize]) -> crate::Result<TensorDyn> {
-        match self {
-            Self::U8(t) => t.subview(offset_bytes, shape).map(Self::U8),
-            Self::I8(t) => t.subview(offset_bytes, shape).map(Self::I8),
-            Self::U16(t) => t.subview(offset_bytes, shape).map(Self::U16),
-            Self::I16(t) => t.subview(offset_bytes, shape).map(Self::I16),
-            Self::U32(t) => t.subview(offset_bytes, shape).map(Self::U32),
-            Self::I32(t) => t.subview(offset_bytes, shape).map(Self::I32),
-            Self::U64(t) => t.subview(offset_bytes, shape).map(Self::U64),
-            Self::I64(t) => t.subview(offset_bytes, shape).map(Self::I64),
-            Self::F16(t) => t.subview(offset_bytes, shape).map(Self::F16),
-            Self::F32(t) => t.subview(offset_bytes, shape).map(Self::F32),
-            Self::F64(t) => t.subview(offset_bytes, shape).map(Self::F64),
-        }
+    /// Borrow a rectangular spatial sub-region (the destination/source crop) as
+    /// a zero-copy view sharing this tensor's allocation. See [`Tensor::view`].
+    pub fn view(&self, region: crate::Region) -> crate::Result<TensorDyn> {
+        dyn_fanout!(self, view, region)
     }
 
     /// The CUDA registration for this tensor, if any.
@@ -1141,14 +1152,6 @@ mod tests {
     }
 
     #[test]
-    fn with_plane_offset_builder() {
-        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
-            .unwrap()
-            .with_plane_offset(8192);
-        assert_eq!(t.plane_offset(), Some(8192));
-    }
-
-    #[test]
     fn set_format_clears_plane_offset() {
         let mut t = TensorDyn::new(&[480, 640, 3], DType::U8, None, None).unwrap();
         t.set_format(PixelFormat::Rgb).unwrap();
@@ -1190,17 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn dyn_subview_dispatches_every_dtype() {
-        // `TensorDyn::subview` fans out across all 11 dtype arms; exercise each
-        // so the window maps at its offset and preserves the element type.
-        // Byte offset 8 is aligned for every element type (max align is 8) and
-        // a 4-element window stays in-bounds of the 16-element parent.
+    fn dyn_batch_dispatches_every_dtype() {
+        // `TensorDyn::batch` fans out across all 11 dtype arms via `dyn_fanout!`;
+        // exercise each so element `n` preserves the element type and shape.
+        // A `[N=2, 4]` raw parent: element 1 is the contiguous 4-element window.
         use DType::*;
         for dt in [U8, I8, U16, I16, U32, I32, U64, I64, F16, F32, F64] {
-            let parent = TensorDyn::new(&[16], dt, Some(TensorMemory::Mem), None).unwrap();
-            let view = parent.subview(8, &[4]).unwrap();
-            assert_eq!(view.dtype(), dt, "subview must preserve dtype {dt:?}");
-            assert_eq!(view.plane_offset(), Some(8), "{dt:?}");
+            let parent = TensorDyn::new(&[2, 4], dt, Some(TensorMemory::Mem), None).unwrap();
+            let view = parent.batch(1).unwrap();
+            assert_eq!(view.dtype(), dt, "batch must preserve dtype {dt:?}");
             assert_eq!(view.shape(), &[4], "{dt:?}");
         }
     }

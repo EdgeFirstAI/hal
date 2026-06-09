@@ -61,7 +61,7 @@
 //! Page faults during the hot loop indicate unexpected allocations.
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use std::time::Instant;
 
@@ -70,6 +70,8 @@ const MODEL_H: usize = 640;
 const ITERATIONS: usize = 100;
 
 /// Letterbox geometry: scale to fit, centre in destination.
+/// Retained for reference; placement is now computed by `Crop::letterbox`.
+#[allow(dead_code)]
 fn calculate_letterbox(
     src_w: usize,
     src_h: usize,
@@ -153,12 +155,8 @@ fn bench_pipeline(
         let info = input.load_image(decoder, &image.data).unwrap();
         let t1 = Instant::now();
 
-        let (left, top, new_w, new_h) =
-            calculate_letterbox(info.width, info.height, MODEL_W, MODEL_H);
-        let crop = Crop::new()
-            .with_src_rect(Some(Rect::new(0, 0, info.width, info.height)))
-            .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-            .with_dst_color(Some([114, 114, 114, 255]));
+        let _ = (info.width, info.height);
+        let crop = Crop::letterbox([114, 114, 114, 255]);
 
         proc.convert(input, output, Rotation::None, Flip::None, crop)
             .unwrap();
@@ -288,12 +286,8 @@ fn main() {
     for image in &images {
         for _ in 0..10 {
             let info = input.load_image(&mut decoder, &image.data).unwrap();
-            let (left, top, new_w, new_h) =
-                calculate_letterbox(info.width, info.height, MODEL_W, MODEL_H);
-            let crop = Crop::new()
-                .with_src_rect(Some(Rect::new(0, 0, info.width, info.height)))
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
+            let _ = (info.width, info.height);
+            let crop = Crop::letterbox([114, 114, 114, 255]);
             proc.convert(&input, &mut output_packed, Rotation::None, Flip::None, crop)
                 .unwrap();
         }
@@ -301,12 +295,8 @@ fn main() {
     for image in &images {
         for _ in 0..10 {
             let info = input.load_image(&mut decoder, &image.data).unwrap();
-            let (left, top, new_w, new_h) =
-                calculate_letterbox(info.width, info.height, MODEL_W, MODEL_H);
-            let crop = Crop::new()
-                .with_src_rect(Some(Rect::new(0, 0, info.width, info.height)))
-                .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-                .with_dst_color(Some([114, 114, 114, 255]));
+            let _ = (info.width, info.height);
+            let crop = Crop::letterbox([114, 114, 114, 255]);
             proc.convert(&input, &mut output_planar, Rotation::None, Flip::None, crop)
                 .unwrap();
         }

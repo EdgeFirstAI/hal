@@ -36,19 +36,20 @@ processor = ef.ImageProcessor()
 # memory type (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
 dst = processor.create_image(640, 640, ef.PixelFormat.Rgb)
 
-# Convert with letterbox resize (preserves aspect ratio)
-processor.convert(src, dst)
+# Convert with a letterbox resize (preserves aspect ratio, pads with grey).
+# Omit `letterbox=` to stretch-to-fill instead.
+processor.convert(src, dst, letterbox=[114, 114, 114, 255])
 
-# Access pixel data as a numpy array. Use the context manager + .view()
+# Access pixel data as a numpy array. Use the context manager + .numpy()
 # form — this is the portable pattern that works on both wheel variants.
 import numpy as np
 with dst.map() as m:
-    pixels = np.frombuffer(m.view(), dtype=np.uint8).reshape(dst.shape())
+    pixels = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(dst.shape())
 
 # The shorter `np.frombuffer(dst.map(), ...)` form only works on the
 # abi3-py311 wheel, where `TensorMap` exposes Python's buffer protocol
 # directly. The abi3-py38 compatibility wheel disables `__getbuffer__`,
-# so use `.view()` if your code needs to run on Python 3.8–3.10.
+# so use `.numpy()` if your code needs to run on Python 3.8–3.10.
 ```
 
 ## Role in edgefirst-hal

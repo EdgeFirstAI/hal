@@ -225,6 +225,61 @@ for the validation approach.
 
 ---
 
+## Batched Preprocessing
+
+Inference engines that support batching expect a single, fully-assembled batched
+input tensor. The batch dimension `N` is always the **leading** dimension,
+prepended to whatever layout the base tensor uses — packed `[N, H, W, C]` or
+planar `[N, C, H, W]`. The HAL assembles that batch **forward** — calling
+`convert()` once per source image into a distinct *tile* of one reused
+destination tensor — rather than reconstructing it backward from per-element
+sub-views. This is the primary motivation for the destination-region
+(`view`/`batch`) API.
+
+```
+jpeg/png ─► source ─► convert ─► (batch tile n) ─► invoke ─► output ─► decode
+            codec sets         glViewport into        full         batch-aware:
+            shape/stride/      one reused dst         batched       whole-map +
+            format             tensor                 tensor        ndarray index
+```
+
+1. **Decode → source.** The codec decodes an arbitrary-resolution image into a
+   pre-allocated source tensor (buffer may be oversized) and sets its `shape`,
+   `row_stride` (GPU-aligned — 64 B embedded, 256 B Nvidia), and `PixelFormat`
+   to match the decoded content. The source EGLImage is keyed on these
+   attributes, so it re-imports when they change — expected per distinct image.
+2. **Convert → tile.** A batch is built by calling `convert()` once per source
+   image into a destination sub-view: `convert(src, dst.batch(n), …)` or
+   `convert(src, dst.view(region), …)`, or — to render the whole batch as **one
+   import + one sync** — `convert_deferred(src, dst.batch(n), …)` in a loop
+   followed by a single `flush()`. A `view`/`batch` sub-view resolves its
+   **parent** (`view_origin`), so on Linux DMA-BUF the GL backend keys the
+   EGLImage import on the *parent* identity+geometry — every sibling tile shares
+   **one** import and is a `glViewport`/`glScissor` band into it (the offset is
+   render state, never a cache key). `convert_deferred` skips the per-tile
+   `glFinish`; `flush()` issues a single `finish_via_fence`. `batch(0)` on an
+   N==1 tensor is byte- and identity-equivalent to the whole tensor.
+3. **Invoke → decode.** The engine runs on the whole pre-assembled batched
+   tensor and returns a batched output. The decoder is batch-aware: it `map()`s
+   the whole output once and indexes each element with an ndarray slice — no
+   tensor sub-view needed.
+
+`convert()` always outputs an RGB-family color (`Grey`/`Rgb`/`Rgba`), packed
+`HWC` or planar `CHW` — never YUV. Because `N` is the leading dimension, a tile
+is element *n*, contiguous in memory whichever layout is used (a row-band in the
+physical buffer). `convert_deferred` + `flush` render all N tiles into a single
+parent import via `glViewport`, syncing once after the last tile (a plain
+`convert` per tile still works and finishes eagerly). The first batch engine
+covers the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path; two-pass packed-RGB,
+planar, and the macOS GL backend fall back to an eager per-tile convert (correct,
+not yet one-import). The per-backend lowering (GL `glViewport`,
+G2D destination crop, CPU offset+stride) and the cache-key invariant live in
+[`crates/image/ARCHITECTURE.md § Batched preprocessing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#batched-preprocessing-building-a-batch-via-convert).
+The `BufferIdentity`-sharing contract for regions lives in
+[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#bufferidentity-and-egl-image-caching).
+
+---
+
 ## Design Patterns
 
 The workspace consistently applies a small set of Rust idioms across all

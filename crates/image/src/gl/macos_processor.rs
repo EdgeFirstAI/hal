@@ -47,7 +47,7 @@ use super::platform::macos::MacosPlatform;
 // shader compilation) is inline here. See platform/mod.rs for the seam
 // rationale.
 use super::Egl;
-use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, Result, Rotation};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, ResolvedCrop, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use khronos_egl as egl;
@@ -847,7 +847,7 @@ impl MacosGlProcessor {
         src: &TensorDyn,
         dst: &mut TensorDyn,
         src_fmt: PixelFormat,
-        crop: crate::Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let w = src
             .width()
@@ -942,11 +942,11 @@ impl MacosGlProcessor {
     /// HAL's `image_iosurface_layout` returns `None` for any F32
     /// combination — so the F32 surface allocation would already have
     /// failed before reaching this method.
-    pub fn convert_rgba8_to_planar_float(
+    pub(crate) fn convert_rgba8_to_planar_float(
         &self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        crop: crate::Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let d = shared_display()?;
         let _gl_guard = lock_gl();
@@ -964,7 +964,7 @@ impl MacosGlProcessor {
         d: &SharedAngleDisplay,
         src: &TensorDyn,
         dst: &mut TensorDyn,
-        crop: crate::Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let src_u8 = src
             .as_u8()
@@ -1546,6 +1546,25 @@ impl ImageProcessorTrait for MacosGlProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        // macOS GL does not yet honor a destination sub-region: its render path
+        // targets the whole pbuffer, so a view()/batch() dst would render into
+        // the wrong region. Decline so the dispatcher falls back to the CPU
+        // backend, which writes the sub-region correctly via offset + parent
+        // stride. (The Linux GL backend implements the parent-import +
+        // glViewport/scissor batch path; macOS GL batching is a follow-up.)
+        if dst.view_origin().is_some() {
+            return Err(Error::NotSupported(
+                "MacosGlProcessor: destination view()/batch() sub-region not yet supported \
+                 (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
+        let crop = crop.resolve(
+            src.width().unwrap_or(0),
+            src.height().unwrap_or(0),
+            dst.width().unwrap_or(0),
+            dst.height().unwrap_or(0),
+        )?;
         if !matches!(rotation, Rotation::None) || !matches!(flip, Flip::None) {
             return Err(Error::NotImplemented(
                 "MacosGlProcessor: rotation/flip not yet supported; CPU fallback handles this"
@@ -1644,4 +1663,3 @@ impl ImageProcessorTrait for MacosGlProcessor {
         Ok(())
     }
 }
-

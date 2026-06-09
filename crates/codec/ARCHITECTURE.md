@@ -181,6 +181,15 @@ Free-standing `Tensor::new()` or `Tensor::image()` works but:
 - May not have GPU-aligned pitch (works, but `convert()` may use CPU path)
 - Is never eligible for V4L2 zero-copy (which requires a DMA-backed tensor)
 
+The decoded tensor is the **source** stage of the batched-preprocessing
+pipeline: `convert()` then renders it (resize / letterbox / format) into a
+tile of the batched `[N, …]` model input (packed `NHWC` or planar `NCHW`). A
+decode target reused across frames (a source pool) re-imports correctly because
+`configure_image()` invalidates its cached EGLImage entry — a stable
+`BufferIdentity` with changed geometry must not return the previous frame's GPU
+import. See
+[project `ARCHITECTURE.md` § Batched Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#batched-preprocessing).
+
 ### Tensor Dimensions After Decode
 
 When a smaller image (e.g., 640×480) is decoded into a larger tensor

@@ -4,7 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::colorimetry::effective_colorimetry;
-use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Result, Rotation};
+use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{
     ColorEncoding, ColorRange, Colorimetry, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait,
     TensorTrait,
@@ -97,7 +97,7 @@ impl G2DProcessor {
         dst_dyn: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let _span = tracing::trace_span!(
             "image.convert.g2d",
@@ -193,8 +193,7 @@ impl G2DProcessor {
             }
         }
 
-        crop.check_crop_dyn(src_dyn, dst_dyn)?;
-
+        // Source/placement already validated by `Crop::resolve` at the entry.
         let src = src_dyn.as_u8().unwrap();
         // For i8 destinations, reinterpret as u8 for G2D (same byte layout).
         // The XOR 0x80 post-pass is applied after the blit completes.
@@ -273,6 +272,65 @@ impl G2DProcessor {
             dst_surface.height = crop_rect.height as i32;
         }
 
+        // ── i.MX95 DPU even-dimension workaround ──────────────────────────
+        // The i.MX95 DPU G2D backend garbles a chroma-subsampled blit whose
+        // width or height is odd — it drops the partial trailing chroma sample
+        // and corrupts the ENTIRE output (max_diff ~255); the i.MX8MP Vivante
+        // backend tolerates it. When either side is a chroma-subsampled YUV
+        // format, round BOTH blit rectangles up to even on each *subsampled*
+        // axis so the DPU's chroma geometry is exact. The width pad always lands
+        // in the 64-aligned row stride (both sides). The height pad reads the
+        // source's chroma plane (within its allocation) and writes ONE extra
+        // destination row — applied only when the destination's (page-aligned)
+        // DMA allocation can hold it; otherwise G2D declines so the caller falls
+        // back to GL/CPU, which convert odd dimensions natively. Only the
+        // logical w×h region is consumed downstream, so the padding is unused.
+        let (sx_src, sy_src) = chroma_subsample_shifts(src_fmt);
+        let (sx_dst, sy_dst) = chroma_subsample_shifts(dst_fmt);
+        let pad_w = (sx_src | sx_dst) > 0;
+        let pad_h = (sy_src | sy_dst) > 0;
+        if pad_w || pad_h {
+            let even = |v: i32| v + (v & 1);
+            if pad_h && even(dst_surface.bottom) != dst_surface.bottom {
+                // The padded blit writes one extra destination row. It is safe
+                // only when the blit starts at the destination's top (no crop
+                // placement offset) and the extra row stays within the
+                // destination's DMA mapping. A self-allocated DMA-BUF is mapped
+                // at page granularity, so its strided allocation
+                // (row_bytes × height) is physically backed up to the next page
+                // boundary. Query the runtime page size — aarch64 kernels may use
+                // 16 KiB or 64 KiB pages, and hard-coding 4 KiB would
+                // under-estimate the mapping and needlessly reject a destination
+                // that is in fact page-backed.
+                let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+                    n if n > 0 => n as usize,
+                    _ => 4096,
+                };
+                let row_bytes = dst_surface.stride as usize * dst_fmt.channels();
+                let mapped = (row_bytes * dst_h).next_multiple_of(page);
+                let needed = row_bytes * even(dst_surface.bottom) as usize;
+                if crop.dst_rect.is_some() || needed > mapped {
+                    return Err(Error::NotSupported(format!(
+                        "G2D: odd-height {dst_fmt} destination cannot hold the padding \
+                         row for the i.MX95 DPU even-dimension workaround; deferring to \
+                         GL/CPU"
+                    )));
+                }
+            }
+            if pad_w {
+                src_surface.right = even(src_surface.right);
+                src_surface.width = even(src_surface.width);
+                dst_surface.right = even(dst_surface.right);
+                dst_surface.width = even(dst_surface.width);
+            }
+            if pad_h {
+                src_surface.bottom = even(src_surface.bottom);
+                src_surface.height = even(src_surface.height);
+                dst_surface.bottom = even(dst_surface.bottom);
+                dst_surface.height = even(dst_surface.height);
+            }
+        }
+
         log::trace!("G2D blit: {src_fmt}→{dst_fmt} int8={is_int8_dst}");
         self.g2d.blit(&src_surface, &dst_surface)?;
         self.g2d.finish()?;
@@ -314,6 +372,17 @@ impl ImageProcessorTrait for G2DProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        // A view()/batch() destination needs no special handling here: G2D blits
+        // to the destination's `plane_offset` + parent `row_stride`, so a sub-view
+        // (the tile) lands in its window of the parent buffer natively — the same
+        // mechanism a whole-tensor blit uses. (The cache-key/glViewport batch
+        // path is GL-specific; G2D addresses the tile by offset+stride.)
+        let crop = crop.resolve(
+            src.width().unwrap_or(0),
+            src.height().unwrap_or(0),
+            dst.width().unwrap_or(0),
+            dst.height().unwrap_or(0),
+        )?;
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
@@ -441,6 +510,19 @@ fn draw_empty_frame_g2d(
     Ok(())
 }
 
+/// Chroma subsampling of `fmt` as `(shift_x, shift_y)` — 1 = half resolution on
+/// that axis, 0 = full. Drives the i.MX95 DPU even-dimension workaround: a blit
+/// dimension that the format subsamples must be even or the DPU garbles it.
+fn chroma_subsample_shifts(fmt: PixelFormat) -> (u32, u32) {
+    match fmt.chroma_layout() {
+        Some(cl) => (cl.shift_x, cl.shift_y),
+        // Packed 4:2:2 (YUYV / VYUY) subsample horizontally; all other packed
+        // formats (RGB/RGBA/BGRA/Grey) are full-resolution.
+        None if matches!(fmt, PixelFormat::Yuyv | PixelFormat::Vyuy) => (1, 0),
+        None => (0, 0),
+    }
+}
+
 /// Build a `G2DSurface` from a `Tensor<u8>` that carries pixel-format metadata.
 ///
 /// The tensor must be backed by DMA memory and must have a pixel format set.
@@ -548,11 +630,22 @@ mod g2d_predicate_tests {
 #[allow(deprecated)]
 mod g2d_tests {
     use super::*;
-    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rect, Rotation};
+    use crate::{CPUProcessor, Flip, G2DProcessor, ImageProcessorTrait, Rotation};
     use edgefirst_tensor::{
         is_dma_available, DType, PixelFormat, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
     use image::buffer::ConvertBuffer;
+
+    /// G2D is usable only where `libg2d.so.2` loads — the NXP i.MX boards. On
+    /// V3D/Tegra/x86 the library is absent, so `G2DProcessor::new()` and the
+    /// surface physical-address resolution these tests exercise both fail. DMA
+    /// being available does NOT imply G2D (e.g. rpi5/V3D has DMA but no G2D), so
+    /// these tests must gate on G2D, not just DMA, or they panic/fail on
+    /// non-G2D hardware instead of skipping.
+    #[cfg(target_os = "linux")]
+    fn is_g2d_available() -> bool {
+        G2DProcessor::new().is_ok()
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -789,22 +882,17 @@ mod g2d_tests {
     ) -> Result<(), crate::Error> {
         let dst_width = 600;
         let dst_height = 400;
-        let crop = Crop {
-            src_rect: None,
-            dst_rect: Some(Rect {
-                top: 100,
-                left: 100,
-                height: 100,
-                width: 200,
-            }),
-            dst_color: None,
-        };
+        // The destination sub-rectangle is now expressed as a `view()` of the
+        // destination (the old `Crop.dst_rect` was removed); G2D blits into the
+        // view's window via its offset + parent stride. Region is (x=left, y=top,
+        // width, height).
+        let region = crate::Region::new(100, 100, 200, 100);
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         let mut cpu_converter = CPUProcessor::new();
 
-        let mut reference = TensorDyn::image(
+        let reference = TensorDyn::image(
             dst_width,
             dst_height,
             PixelFormat::Rgb,
@@ -818,7 +906,13 @@ mod g2d_tests {
             .unwrap()
             .as_mut_slice()
             .fill(128);
-        cpu_converter.convert(&src, &mut reference, Rotation::None, Flip::None, crop)?;
+        cpu_converter.convert(
+            &src,
+            &mut reference.view(region)?,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )?;
 
         // Create DMA buffer for G2D input
         let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
@@ -851,13 +945,13 @@ mod g2d_tests {
             .fill(128);
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
-        let mut g2d_dst_dyn = g2d_dst;
+        let g2d_dst_dyn = g2d_dst;
         g2d_converter.convert(
             &src2_dyn,
-            &mut g2d_dst_dyn,
+            &mut g2d_dst_dyn.view(region)?,
             Rotation::None,
             Flip::None,
-            crop,
+            Crop::no_crop(),
         )?;
         g2d_dst = {
             let mut __t = g2d_dst_dyn.into_u8().unwrap();
@@ -985,7 +1079,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgba_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return Ok(());
         }
         // Load PixelFormat::Nv12 source
@@ -1047,7 +1141,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_nv12_to_rgb_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return Ok(());
         }
         // Load PixelFormat::Nv12 source
@@ -1109,7 +1203,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgba_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return Ok(());
         }
         // Load PixelFormat::Yuyv source
@@ -1171,7 +1265,7 @@ mod g2d_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_g2d_yuyv_to_rgb_reference() -> Result<(), crate::Error> {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return Ok(());
         }
         // Load PixelFormat::Yuyv source
@@ -1403,7 +1497,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_no_offset() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         let s = surface_for(640, 480, PixelFormat::Rgba, None, None).unwrap();
@@ -1414,7 +1508,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_with_offset() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1428,7 +1522,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_single_plane_zero_offset() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1443,7 +1537,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_rgba() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         // Default stride: width in pixels = 640
@@ -1457,7 +1551,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_rgb() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         let s_default = surface_for(640, 480, PixelFormat::Rgb, None, None).unwrap();
@@ -1470,7 +1564,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_stride_grey() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         // Grey (Y800) may not be supported by all G2D hardware versions
@@ -1485,7 +1579,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_contiguous_nv12_offset() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         use edgefirst_tensor::TensorMemory;
@@ -1506,7 +1600,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_contiguous_nv12_stride() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         // NV12: 1 byte per pixel for Y. stride 640 bytes = 640 pixels.
@@ -1520,7 +1614,7 @@ mod g2d_tests {
 
     #[test]
     fn g2d_surface_multiplane_nv12_offset() {
-        if !is_dma_available() {
+        if !is_dma_available() || !is_g2d_available() {
             return;
         }
         use edgefirst_tensor::TensorMemory;

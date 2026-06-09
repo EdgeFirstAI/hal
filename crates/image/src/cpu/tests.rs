@@ -6,7 +6,9 @@
 #[allow(deprecated)]
 mod cpu_tests {
 
-    use crate::{CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Result, Rotation};
+    use crate::{
+        CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Region, Result, Rotation,
+    };
     use edgefirst_decoder::DetectBox;
     use edgefirst_tensor::{
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -932,7 +934,7 @@ mod cpu_tests {
             &mut converted_dyn,
             Rotation::None,
             Flip::None,
-            Crop::new().with_src_rect(Some(Rect::new(0, 0, 1, 2))),
+            Crop::new().with_source(Some(Region::new(0, 0, 1, 2))),
         )?;
 
         assert_eq!(
@@ -957,14 +959,17 @@ mod cpu_tests {
             &[200, 128, 200, 128, 200, 128, 200, 128],
         )?;
         let src_dyn = src;
-        let mut converted_dyn = converted;
+        let converted_dyn = converted;
 
+        // Destination crop is now a destination view: render into the top-row
+        // sub-region; the bottom row keeps its pre-fill.
+        let mut dst_view = converted_dyn.view(Region::new(0, 0, 2, 1))?;
         converter.convert(
             &src_dyn,
-            &mut converted_dyn,
+            &mut dst_view,
             Rotation::None,
             Flip::None,
-            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 2, 1))),
+            Crop::new(),
         )?;
 
         // The untagged 2x2 Grey source is below the HD threshold, so the
@@ -990,21 +995,23 @@ mod cpu_tests {
         let src_dyn = src;
         let mut converted_dyn = converted;
 
+        // Destination fill + sub-region render: fill the whole dst with the pad
+        // colour, then render the source into the sub-region view.
+        let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
         converter.convert(
-            &src_dyn,
+            &pad,
             &mut converted_dyn,
             Rotation::None,
             Flip::None,
-            Crop {
-                src_rect: None,
-                dst_rect: Some(Rect {
-                    left: 1,
-                    top: 1,
-                    width: 1,
-                    height: 1,
-                }),
-                dst_color: Some([255, 0, 0, 255]),
-            },
+            Crop::new(),
+        )?;
+        let mut dst_view = converted_dyn.view(Region::new(1, 1, 1, 1))?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
         )?;
 
         assert_eq!(
@@ -1026,21 +1033,21 @@ mod cpu_tests {
         let src_dyn = src;
         let mut converted_dyn = converted;
 
+        let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[255, 0, 0, 255])?;
         converter.convert(
-            &src_dyn,
+            &pad,
             &mut converted_dyn,
             Rotation::None,
             Flip::None,
-            Crop {
-                src_rect: None,
-                dst_rect: Some(Rect {
-                    left: 0,
-                    top: 1,
-                    width: 2,
-                    height: 1,
-                }),
-                dst_color: Some([255, 0, 0, 255]),
-            },
+            Crop::new(),
+        )?;
+        let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
         )?;
 
         // 2x3 YUYV is below the HD threshold, so the colorimetry heuristic
@@ -1065,21 +1072,21 @@ mod cpu_tests {
         let src_dyn = src;
         let mut converted_dyn = converted;
 
+        let pad = load_bytes_to_tensor(1, 1, PixelFormat::Rgba, None, &[200, 200, 200, 255])?;
         converter.convert(
-            &src_dyn,
+            &pad,
             &mut converted_dyn,
             Rotation::None,
             Flip::None,
-            Crop {
-                src_rect: None,
-                dst_rect: Some(Rect {
-                    left: 0,
-                    top: 1,
-                    width: 2,
-                    height: 1,
-                }),
-                dst_color: Some([200, 200, 200, 255]),
-            },
+            Crop::new(),
+        )?;
+        let mut dst_view = converted_dyn.view(Region::new(0, 1, 2, 1))?;
+        converter.convert(
+            &src_dyn,
+            &mut dst_view,
+            Rotation::None,
+            Flip::None,
+            Crop::new(),
         )?;
 
         assert_eq!(
@@ -3211,7 +3218,7 @@ mod cpu_tests {
         let mut cpu = CPUProcessor::default();
 
         // Crop only the right (blue) half
-        let crop = Crop::new().with_src_rect(Some(Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+        let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
 
@@ -3247,7 +3254,7 @@ mod cpu_tests {
         let mut cpu = CPUProcessor::default();
 
         // Crop only the left (red) half
-        let crop = Crop::new().with_src_rect(Some(Rect::new(0, 0, src_w / 2, src_h)));
+        let crop = Crop::new().with_source(Some(Region::new(0, 0, src_w / 2, src_h)));
 
         cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
 
@@ -3284,7 +3291,7 @@ mod cpu_tests {
         let mut cpu = CPUProcessor::default();
 
         // Crop the right half — boundary is exactly at the colour transition
-        let crop = Crop::new().with_src_rect(Some(Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+        let crop = Crop::new().with_source(Some(Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         cpu.convert(&src, &mut dst, Rotation::None, Flip::None, crop)?;
 
@@ -3814,8 +3821,8 @@ mod cpu_tests {
         let frame = 4 * 4 * 3;
         let parent =
             TensorDyn::image(4, 8, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
-        let mut view0 = parent.subview(0, &[4, 4, 3]).unwrap();
-        let mut view1 = parent.subview(frame, &[4, 4, 3]).unwrap();
+        let mut view0 = parent.view(Region::new(0, 0, 4, 4)).unwrap();
+        let mut view1 = parent.view(Region::new(0, 4, 4, 4)).unwrap();
         assert_eq!(view1.plane_offset(), Some(frame));
 
         do_convert(&src0, &mut view0);

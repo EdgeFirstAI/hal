@@ -25,8 +25,8 @@ build matrix lives in
 | Module | Source | Responsibility |
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/lib.rs) | local | `#[pymodule]` registration; module-level docstring |
-| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs) | local | `Tensor`, `PixelFormat`, `DType`; numpy buffer protocol; `from_fd` / `dmabuf_clone` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/image.rs) | local | `ImageProcessor`, `Rect`, `Rotation`, `Flip`; `convert`, `draw_masks`, `draw_decoded_masks`, `import_image` |
+| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs) | local | `Tensor`, `Region`, `PixelFormat`, `DType`; `view`/`batch` sub-regions; numpy buffer protocol; `from_fd` / `dmabuf_clone` |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/image.rs) | local | `ImageProcessor`, `Rotation`, `Flip` (`Region` re-exported from tensor); `convert`, `draw_masks`, `draw_decoded_masks`, `import_image` |
 | [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/decoder.rs) | local | `Decoder`; `decode`, `decode_tracked`, proto-mask APIs |
 | [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tracker.rs) | local | `ByteTrack`; `update`, `get_active_tracks` |
 
@@ -34,11 +34,12 @@ build matrix lives in
 
 | Python class | Wraps | Notes |
 |--------------|-------|-------|
-| `Tensor` | `edgefirst_tensor::TensorDyn` | Buffer protocol is exposed by `TensorMap` (returned by `Tensor.map()`), not by `Tensor` itself. The portable zero-copy pattern is `with t.map() as m: np.frombuffer(m.view(), dtype=...).reshape(t.shape())`. The shorter `np.frombuffer(t.map(), ...)` works only on the abi3-py311 wheel (see § Stable ABI). |
+| `Tensor` | `edgefirst_tensor::TensorDyn` | Buffer protocol is exposed by `TensorMap` (returned by `Tensor.map()`), not by `Tensor` itself. The portable zero-copy pattern is `with t.map() as m: np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())`. The shorter `np.frombuffer(t.map(), ...)` works only on the abi3-py311 wheel (see § Stable ABI). `Tensor.view(region)` / `Tensor.batch(n)` return zero-copy sub-region tensors sharing the parent's identity (e.g. `proc.convert(src, dst.batch(n), ...)`). |
 | `ImageProcessor` | `edgefirst_image::ImageProcessor` | One-per-pipeline; owns the GL thread |
 | `Decoder` | `edgefirst_decoder::Decoder` | Built once from a metadata dict or YAML/JSON string |
 | `ByteTrack` | `edgefirst_tracker::ByteTrack<DetectBox>` | Stable per-track UUIDs |
-| `PixelFormat`, `DType`, `Rotation`, `Flip`, `Rect` | corresponding Rust enums | `repr()` matches Rust naming |
+| `PixelFormat`, `DType`, `Rotation`, `Flip` | corresponding Rust enums | `repr()` matches Rust naming |
+| `Region` | `edgefirst_tensor::Region` (a **struct**, not an enum) | `{x, y, width, height}` in pixels; the single rectangle type, re-exported from tensor; argument to `view`/`Crop.source` |
 | `Tracing` (context manager) | umbrella `trace::start_tracing` / `stop_tracing` | `with hal.Tracing("/tmp/trace.json"): ...` |
 
 ## Internal Architecture
@@ -107,15 +108,17 @@ for the user-facing rule.
 `Tensor.map()` returns a `TensorMap` — a Python context manager
 (`__enter__` / `__exit__`) that wraps the underlying mapped buffer
 and unmaps it on exit. The actual buffer is exposed via
-`TensorMap.view()`, which returns a `memoryview` over the mapped
-memory. For `Mem` and `Dma` backends the view is zero-copy; for
+`TensorMap.numpy()` (the memoryview accessor — named for what it
+returns, and to free the verb `view` for `Tensor.view(region)`
+sub-regions), which returns a `memoryview` over the mapped
+memory. For `Mem` and `Dma` backends the buffer is zero-copy; for
 `Pbo` the GL thread performs a `glMapBufferRange` round-trip via the
 message channel. The `memoryview` carries the right shape, strides,
 and dtype so the typical pattern is:
 
 ```python
 with t.map() as m:
-    arr = np.frombuffer(m.view(), dtype=...).reshape(t.shape())
+    arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())
 ```
 
 The context manager is required because `Pbo` and `Dma` mappings
@@ -149,7 +152,7 @@ relies on the Rust-side `Drop` chain.
 
   ```python
   with t.map() as m:
-      arr = np.frombuffer(m.view(), dtype=...).reshape(t.shape())
+      arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())
   ```
 
   rather than copying with `np.array(t.map(), copy=True)`. The

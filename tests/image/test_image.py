@@ -13,7 +13,6 @@ from edgefirst_hal import (
     PixelFormat,
     Normalization,
     Rotation,
-    Rect,
     Tensor,
     TensorMemory,
 )
@@ -146,7 +145,7 @@ def test_render():
     expected_gl = load_image("testdata/output_render_gl.jpg", "RGBA")
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
         # Threshold 0.95: GPU smoothstep anti-aliasing at mask edges produces
         # small differences across platforms (x86 Mesa vs Vivante GC7000UL),
         # and the background now arrives via an NV12->RGBA conversion that
@@ -165,7 +164,7 @@ def test_rgb_resize():
     dst = converter.create_image(640, 640, PixelFormat.Rgba)
     converter.convert(src, dst)
     with dst.map() as m:
-        n = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        n = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=(640, 640))
         # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
@@ -178,10 +177,12 @@ def test_rgba_to_rgb():
     src.decode_image_file("testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(w, h, PixelFormat.Rgb)
-    converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip, Rect(0, 0, w, h))
+    # Whole-image convert (the former Rect(0,0,w,h) was a no-op crop; the
+    # destination shape is the placement and `source=None` samples the whole src).
+    converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as m:
-        n = np.array(m.view()).reshape((dst.height, dst.width, 3))
+        n = np.array(m.numpy()).reshape((dst.height, dst.width, 3))
         expected = load_image("testdata/zidane.jpg", "RGB")
         # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
@@ -411,13 +412,13 @@ def test_from_fd_dma():
 
     tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
     with tensor.map() as m:
-        np.frombuffer(m.view(), dtype=np.uint8).fill(233)
+        np.frombuffer(m.numpy(), dtype=np.uint8).fill(233)
 
     fd = tensor.fd
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(720, 1280, 4)
+            data = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(720, 1280, 4)
             assert (data == 233).all()
     except Exception:
         os.close(fd)
@@ -431,13 +432,13 @@ def test_from_fd_shm():
 
     tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.SHM)
     with tensor.map() as m:
-        np.frombuffer(m.view(), dtype=np.uint8).fill(233)
+        np.frombuffer(m.numpy(), dtype=np.uint8).fill(233)
 
     fd = tensor.fd
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8).reshape(720, 1280, 4)
+            data = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(720, 1280, 4)
             assert (data == 233).all()
     except Exception:
         os.close(fd)
@@ -453,7 +454,7 @@ def test_create_image():
 
     # Image should be mappable
     with img.map() as m:
-        data = np.frombuffer(m.view(), dtype=np.uint8)
+        data = np.frombuffer(m.numpy(), dtype=np.uint8)
         assert len(data) == 320 * 240 * 4
 
 
@@ -470,7 +471,7 @@ def test_create_image_formats():
         assert img.height == 120
         assert img.format == fmt
         with img.map() as m:
-            data = np.frombuffer(m.view(), dtype=np.uint8)
+            data = np.frombuffer(m.numpy(), dtype=np.uint8)
             assert len(data) == 160 * 120 * channels
 
 
@@ -527,12 +528,12 @@ def test_create_image_roundtrip():
     # Create source via create_image and fill it
     src = converter.create_image(640, 480, PixelFormat.Rgba)
     with src.map() as m:
-        data = np.frombuffer(m.view(), dtype=np.uint8).copy()
+        data = np.frombuffer(m.numpy(), dtype=np.uint8).copy()
         # Fill with a gradient pattern
         data[:] = np.tile(np.arange(256, dtype=np.uint8), len(data) // 256 + 1)[
             : len(data)
         ]
-        m.view()[:] = data
+        m.numpy()[:] = data
 
     # Create destination via create_image
     dst = converter.create_image(320, 240, PixelFormat.Rgba)
@@ -542,7 +543,7 @@ def test_create_image_roundtrip():
 
     # Verify destination has data (not zeros)
     with dst.map() as m:
-        result = np.frombuffer(m.view(), dtype=np.uint8)
+        result = np.frombuffer(m.numpy(), dtype=np.uint8)
         assert result.any(), "Destination is all zeros after roundtrip convert"
 
 
@@ -625,7 +626,7 @@ def test_draw_decoded_masks_empty():
     expected = np.zeros((h, w, 4), dtype=np.uint8)
     bg.normalize_to_numpy(expected)
     with dst.map() as m:
-        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
         assert calculate_similarity_rms_u8(img, expected) > 0.99
 
 
@@ -654,7 +655,7 @@ def test_draw_decoded_masks_multiple_boxes():
     # but verify it didn't crash and image was modified.
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
         # The image should be different from original (boxes drawn on it)
         assert calculate_similarity_rms_u8(img, original) < 0.999
 
@@ -681,7 +682,7 @@ def test_draw_decoded_masks_instance_color_mode():
     # Verify it didn't crash and image was modified
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.view()).reshape((dst.height, dst.width, 4))
+        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
         assert calculate_similarity_rms_u8(img, original) < 0.999
 
 
@@ -708,8 +709,8 @@ def test_draw_decoded_masks_with_opacity():
 
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst_full.map() as m1, dst_half.map() as m2:
-        img_full = np.array(m1.view()).reshape((dst_full.height, dst_full.width, 4))
-        img_half = np.array(m2.view()).reshape((dst_half.height, dst_half.width, 4))
+        img_full = np.array(m1.numpy()).reshape((dst_full.height, dst_full.width, 4))
+        img_half = np.array(m2.numpy()).reshape((dst_half.height, dst_half.width, 4))
         # Half-opacity result should be closer to the original than full-opacity
         sim_full = calculate_similarity_rms_u8(img_full, original)
         sim_half = calculate_similarity_rms_u8(img_half, original)
@@ -737,7 +738,7 @@ outputs:
     data[0, 0, :] = [0.1, 0.1, 0.3, 0.3, 0.9, 2.0]  # box + score + class
     model_output_tensor = Tensor([1, 10, 6], dtype="float32")
     with model_output_tensor.map() as m:
-        buf = np.frombuffer(m.view(), dtype=np.float32).reshape((1, 10, 6))
+        buf = np.frombuffer(m.numpy(), dtype=np.float32).reshape((1, 10, 6))
         buf[:] = data
 
     w, h = _image_size("testdata/giraffe.jpg")
@@ -899,7 +900,7 @@ def test_decode_image_strided_pixel_correctness():
     exact = Tensor.image(w, h, format=PixelFormat.Nv12)
     exact.decode_image_file("testdata/zidane.jpg")
     with exact.map() as m:
-        exact_y = np.frombuffer(m.view(), dtype=np.uint8)[: w * h].reshape(h, w).copy()
+        exact_y = np.frombuffer(m.numpy(), dtype=np.uint8)[: w * h].reshape(h, w).copy()
 
     # Oversized decode (strided — the common real-world path).
     big = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12)
@@ -907,7 +908,7 @@ def test_decode_image_strided_pixel_correctness():
 
     # Extract the decoded luma sub-region via map() and the reported row stride.
     with big.map() as m:
-        raw = np.frombuffer(m.view(), dtype=np.uint8)
+        raw = np.frombuffer(m.numpy(), dtype=np.uint8)
         stride = info.row_stride
         big_y = np.zeros((h, w), dtype=np.uint8)
         for row in range(h):
@@ -968,12 +969,12 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     img.from_numpy(src)
 
     # The mapped buffer must be addressable at the logical size. All
-    # reads must stay inside the `with` block — `m.view()` returns a
+    # reads must stay inside the `with` block — `m.numpy()` returns a
     # zero-copy numpy view that dangles once the TensorMap context
     # exits; touching it afterwards (including via pytest saferepr on
     # assertion failure) segfaults.
     with img.map() as m:
-        raw = np.frombuffer(m.view(), dtype=np.uint8)
+        raw = np.frombuffer(m.numpy(), dtype=np.uint8)
         assert len(raw) == width * height, (
             f"mapped view length {len(raw)} != Image.size {width * height}"
         )

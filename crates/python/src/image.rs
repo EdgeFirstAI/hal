@@ -7,7 +7,8 @@ use crate::tracker::PyTrackInfo;
 use edgefirst_hal::{
     decoder::{BoundingBox, DetectBox, Segmentation},
     image::{
-        self, Crop, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Rect, Rotation,
+        self, Crop, Fit, Flip, ImageProcessorConfig, ImageProcessorTrait, MaskResolution, Region,
+        Rotation,
     },
     tensor::{self as tensor, PixelFormat, TensorDyn, TensorMapTrait, TensorTrait},
 };
@@ -1009,30 +1010,86 @@ impl PyImageProcessor {
         Ok(PyImageProcessor(Mutex::new(converter)))
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, src_crop = None, dst_crop = None, dst_color = None))]
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
     pub fn convert(
         &mut self,
         src: &PyTensor,
         dst: &mut PyTensor,
         rotation: PyRotation,
         flip: PyFlip,
-        src_crop: Option<PyRect>,
-        dst_crop: Option<PyRect>,
-        dst_color: Option<[u8; 4]>,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
     ) -> Result<()> {
         let _span = tracing::trace_span!("python.convert").entered();
         let rotation = rotation.into();
         let flip = flip.into();
+        // Destination placement is the destination tensor (use `tensor.view`/
+        // `tensor.batch` for a sub-region); `letterbox` is the pad colour for an
+        // aspect-preserving fit.
         let crop = Crop {
-            src_rect: src_crop.map(|x| x.into()),
-            dst_rect: dst_crop.map(|x| x.into()),
-            dst_color,
+            source: source.map(|x| x.into()),
+            fit: match letterbox {
+                Some(pad) => Fit::Letterbox { pad },
+                None => Fit::Stretch,
+            },
         };
         let mut l = self
             .0
             .lock()
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
         l.convert(&src.0, &mut dst.0, rotation, flip, crop)?;
+        Ok(())
+    }
+
+    /// Convert without waiting for the GPU — the batch-preprocessing primitive.
+    ///
+    /// Same as [`convert`](Self::convert) but the OpenGL backend skips the
+    /// per-call `glFinish()`. Render N model inputs by looping this over
+    /// `dst.batch(n)` / `dst.view(region)` row-bands of one batched destination,
+    /// then call [`flush`](Self::flush) once: the backend imports the destination
+    /// a single time and renders each tile as a `glViewport` band, syncing once
+    /// at flush. A deferred destination is not safe to read (or `cuda_map`) until
+    /// `flush` returns. Non-GL backends complete synchronously and `flush` is a
+    /// no-op.
+    #[pyo3(signature = (src, dst, rotation = PyRotation::Rotate0, flip = PyFlip::NoFlip, source = None, letterbox = None))]
+    pub fn convert_deferred(
+        &mut self,
+        src: &PyTensor,
+        dst: &mut PyTensor,
+        rotation: PyRotation,
+        flip: PyFlip,
+        source: Option<PyRegion>,
+        letterbox: Option<[u8; 4]>,
+    ) -> Result<()> {
+        let _span = tracing::trace_span!("python.convert_deferred").entered();
+        let rotation = rotation.into();
+        let flip = flip.into();
+        let crop = Crop {
+            source: source.map(|x| x.into()),
+            fit: match letterbox {
+                Some(pad) => Fit::Letterbox { pad },
+                None => Fit::Stretch,
+            },
+        };
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.convert_deferred(&src.0, &mut dst.0, rotation, flip, crop)?;
+        Ok(())
+    }
+
+    /// Complete all deferred converts since the last flush with a single GPU
+    /// sync. After this returns, every destination written by
+    /// [`convert_deferred`](Self::convert_deferred) is finished and safe to read
+    /// back or `cuda_map`. Non-GL backends return immediately.
+    pub fn flush(&mut self) -> Result<()> {
+        let _span = tracing::trace_span!("python.flush").entered();
+        let mut l = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        l.flush()?;
         Ok(())
     }
 
@@ -1445,13 +1502,13 @@ impl From<PyFlip> for Flip {
     }
 }
 
-#[pyclass(name = "Rect", eq, from_py_object)]
+#[pyclass(name = "Region", eq, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PyRect {
+pub struct PyRegion {
     #[pyo3(get, set)]
-    pub left: usize,
+    pub x: usize,
     #[pyo3(get, set)]
-    pub top: usize,
+    pub y: usize,
     #[pyo3(get, set)]
     pub width: usize,
     #[pyo3(get, set)]
@@ -1459,23 +1516,23 @@ pub struct PyRect {
 }
 
 #[pymethods]
-impl PyRect {
+impl PyRegion {
     #[new]
-    pub fn new(left: usize, top: usize, width: usize, height: usize) -> PyRect {
-        PyRect {
-            left,
-            top,
+    pub fn new(x: usize, y: usize, width: usize, height: usize) -> PyRegion {
+        PyRegion {
+            x,
+            y,
             width,
             height,
         }
     }
 }
 
-impl From<PyRect> for Rect {
-    fn from(val: PyRect) -> Self {
-        Rect {
-            left: val.left,
-            top: val.top,
+impl From<PyRegion> for Region {
+    fn from(val: PyRegion) -> Self {
+        Region {
+            x: val.x,
+            y: val.y,
             width: val.width,
             height: val.height,
         }

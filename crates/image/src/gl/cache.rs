@@ -29,17 +29,23 @@ pub(super) struct CachedEglImage {
 /// with the smallest `last_used` value.
 /// Identity + geometry that uniquely determine an imported EGLImage.
 ///
-/// `luma_id` / `chroma_id` are the buffer identities; `plane_offset`
-/// distinguishes sub-region views that share one buffer but start at different
-/// byte offsets (without it, N offset-distinct views of one DMA-BUF collide on
-/// the first EGLImage and every view renders/samples the base region).
+/// `luma_id` / `chroma_id` are the buffer identities.
+///
+/// A `view()`/`batch()` sub-region is a `glViewport`/`glScissor` ROI into its
+/// parent, **not** a distinct import: [`from_tensor`](EglCacheKey::from_tensor)
+/// keys such a tensor on its **parent** geometry (`view_origin`) with
+/// `plane_offset = 0`, so every sibling view of one buffer collapses to a single
+/// EGLImage and the per-tile offset becomes render state (the viewport). The
+/// remaining `plane_offset` use is a non-view tensor that carries a genuine
+/// foreign/multi-plane byte offset (e.g. an externally-imported buffer whose data
+/// starts past the fd origin); those still key distinctly.
 ///
 /// `width` / `height` / `row_stride` / `format` capture the geometry the
-/// EGLImage was imported with. A pooled buffer reused at a different size via
-/// `Tensor::configure_image` (e.g. a 128-wide pool decoding a 96-wide image)
-/// keeps the same identities and `plane_offset`, but needs a fresh import: the
-/// import's pitch/dimensions/fourcc all derive from these fields. Omitting them
-/// reuses the stale-geometry EGLImage and the GPU samples the buffer at the
+/// EGLImage was imported with — the **parent's** for a view. A pooled buffer
+/// reused at a different size via `Tensor::configure_image` (e.g. a 128-wide pool
+/// decoding a 96-wide image) keeps the same identities but needs a fresh import:
+/// the import's pitch/dimensions/fourcc all derive from these fields. Omitting
+/// them reuses the stale-geometry EGLImage and the GPU samples the buffer at the
 /// wrong pitch — deterministically wrong single-threaded, nondeterministic in
 /// parallel, correct only on a heap source (which never takes this path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,17 +64,36 @@ impl EglCacheKey {
     /// Every construction site MUST go through this so the key used to insert
     /// an EGLImage matches the key used to look it up and to gate the texture
     /// binding-skip.
-    pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat) -> Self
+    pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat, for_dst: bool) -> Self
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
+        // A DESTINATION view()/batch() sub-region keys on its PARENT so all
+        // siblings of one buffer collapse to a single import; the view's offset is
+        // the viewport, not a key. It keys on the parent's `row_stride` (from
+        // `view_origin`), NOT the view's own `effective_row_stride` — a single-row
+        // view sets a tight stride for map-span safety, which would otherwise
+        // mis-key it apart from its multi-row siblings. A SOURCE view (or a whole
+        // tensor) keys on its OWN geometry + any genuine foreign/multi-plane
+        // plane_offset — a source view imports its own region (it is sampled, not
+        // rendered into), so it must NOT collapse onto the parent key.
+        let view_origin = if for_dst { img.view_origin() } else { None };
+        let (width, height, row_stride, plane_offset) = match view_origin {
+            Some(vo) => (vo.parent_width, vo.parent_height, vo.parent_row_stride, 0),
+            None => (
+                img.width().unwrap_or(0),
+                img.height().unwrap_or(0),
+                img.effective_row_stride().unwrap_or(0),
+                img.plane_offset().unwrap_or(0),
+            ),
+        };
         Self {
             luma_id: img.buffer_identity().id(),
             chroma_id: img.chroma().map(|t| t.buffer_identity().id()),
-            plane_offset: img.plane_offset().unwrap_or(0),
-            width: img.width().unwrap_or(0),
-            height: img.height().unwrap_or(0),
-            row_stride: img.effective_row_stride().unwrap_or(0),
+            plane_offset,
+            width,
+            height,
+            row_stride,
             format,
         }
     }
@@ -175,18 +200,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_distinguishes_plane_offset() {
-        // Root-cause regression guard (no GPU needed): two sub-region views of
-        // one DMA-BUF share buffer identities but start at different byte
-        // offsets. The cache key must keep them as DISTINCT entries — otherwise
-        // the first (offset-0) EGLImage is reused for every offset and the GPU
-        // renders/samples the base region.
+    fn cache_key_distinguishes_foreign_plane_offset() {
+        // `plane_offset` no longer distinguishes view()/batch() sub-regions —
+        // those key on their parent and collapse (see
+        // `cache_key_collapses_sibling_views`). It survives ONLY for a non-view
+        // tensor carrying a genuine foreign/multi-plane byte offset (e.g. an
+        // externally-imported buffer whose data starts past the fd origin); two
+        // such imports at different offsets must remain DISTINCT entries.
         let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
         let base = key(0xABCD, 0, 64, 64, 64, PixelFormat::Grey);
         let at_offset = key(0xABCD, 4096, 64, 64, 64, PixelFormat::Grey);
         map.insert(base, 1);
         map.insert(at_offset, 2);
-        assert_eq!(map.len(), 2, "offset-distinct views must not collide");
+        assert_eq!(
+            map.len(),
+            2,
+            "offset-distinct foreign imports must not collide"
+        );
         assert_eq!(map.get(&base), Some(&1));
         assert_eq!(map.get(&at_offset), Some(&2));
 
@@ -194,6 +224,46 @@ mod tests {
         map.insert(base, 3);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&base), Some(&3));
+    }
+
+    #[test]
+    fn cache_key_collapses_sibling_views() {
+        // The batch-engine pivot: a view()/batch() sub-region is a
+        // glViewport/scissor ROI into its parent, so sibling views of one buffer
+        // MUST produce the SAME cache key (one shared EGLImage import) and key
+        // identically to the whole parent. The per-tile offset is render state,
+        // never part of the key.
+        use edgefirst_tensor::{Region, Tensor, TensorMemory};
+        let parent =
+            Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let a = parent.view(Region::new(0, 0, 32, 32)).unwrap();
+        let b = parent.view(Region::new(0, 32, 32, 32)).unwrap();
+        // Destinations (`for_dst = true`) collapse onto the parent key.
+        let ka = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, true);
+        let kb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, true);
+        let kp = EglCacheKey::from_tensor(&parent, PixelFormat::Rgba, true);
+        assert_eq!(
+            ka, kb,
+            "sibling dst views collapse to one parent-keyed import"
+        );
+        assert_eq!(ka, kp, "a dst view keys identically to its whole parent");
+        assert_eq!(
+            ka.plane_offset, 0,
+            "a dst view contributes no offset to the key"
+        );
+        assert_eq!((ka.width, ka.height), (64, 64), "keyed on parent geometry");
+
+        // SOURCES (`for_dst = false`) key on their OWN region — a source view is
+        // imported and SAMPLED, not rendered into, so two source views of one
+        // parent must NOT collapse (they'd alias and sample the wrong region).
+        let sa = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, false);
+        let sb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, false);
+        assert_ne!(sa, sb, "source views key on their own region (no collapse)");
+        assert_eq!(
+            (sa.width, sa.height),
+            (32, 32),
+            "a source view keys on its own dimensions"
+        );
     }
 
     #[test]

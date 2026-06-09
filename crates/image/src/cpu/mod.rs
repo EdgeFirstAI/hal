@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, Result, Rotation};
+use crate::{
+    Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, ResolvedCrop, Result, Rotation,
+};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -549,6 +551,12 @@ impl ImageProcessorTrait for CPUProcessor {
         flip: Flip,
         crop: Crop,
     ) -> Result<()> {
+        let crop = crop.resolve(
+            src.width().unwrap_or(0),
+            src.height().unwrap_or(0),
+            dst.width().unwrap_or(0),
+            dst.height().unwrap_or(0),
+        )?;
         self.convert_impl(src, dst, rotation, flip, crop)
     }
 
@@ -624,7 +632,7 @@ impl CPUProcessor {
         dst: &mut TensorDyn,
         rotation: Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let src_fmt = src.format().ok_or(Error::NotAnImage)?;
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
@@ -743,7 +751,7 @@ impl CPUProcessor {
         dst_fmt: PixelFormat,
         rotation: Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
         src_params: ColorParams,
         dst_params: ColorParams,
     ) -> Result<()> {

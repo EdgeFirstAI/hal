@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+use drm_fourcc::DrmFourcc;
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use drm_fourcc::DrmFourcc;
 use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
@@ -22,7 +22,7 @@ use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
-use crate::{Crop, Error, Flip, ImageProcessorTrait, Rect, Rotation, DEFAULT_COLORS};
+use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
 
 /// Linux GL float (F16/F32) preprocessing paths. Declared as a child of
@@ -206,6 +206,19 @@ pub struct GLProcessorST {
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
+    /// When `true`, a convert's terminal `glFinish` is skipped so a batch of
+    /// tiles rendered into one shared destination import syncs only once, via a
+    /// single `finish_via_fence` at [`flush`](Self::flush). Set for the duration
+    /// of a single [`convert_deferred`](Self::convert_deferred) and reset
+    /// unconditionally (even on error) so a subsequent standalone `convert` never
+    /// silently returns on an unfinished GPU. Always `false` between calls.
+    pub(super) defer_finish: bool,
+    /// `true` when one or more `convert_deferred` calls have rendered without a
+    /// `glFinish` and a [`flush`](Self::flush) (single `finish_via_fence`) is
+    /// still owed. Read by the CUDA map path to auto-flush before handing the
+    /// device a buffer whose batched render may still be in flight; cleared by
+    /// the flush. See [`flush_pending`](Self::flush_pending).
+    pub(super) pending_flush: bool,
     pub(super) gl_context: GlContext,
 }
 
@@ -328,7 +341,33 @@ impl ImageProcessorTrait for GLProcessorST {
         flip: Flip,
         crop: Crop,
     ) -> crate::Result<()> {
-        crop.check_crop_dyn(src, dst)?;
+        // A view()/batch() destination is lowered to a glViewport/scissor band
+        // only on the u8/i8 DMA packed path (see `setup_renderbuffer_dma` +
+        // `convert_to`). For any other GL destination — a non-DMA CPU upload, a
+        // PBO, or a float render target — that lowering does not exist, so
+        // decline and let the dispatcher fall back to the CPU backend, which
+        // writes the sub-region correctly via offset + parent stride.
+        if dst.view_origin().is_some()
+            && !(self.gl_context.transfer_backend.is_dma()
+                && dst.memory() == TensorMemory::Dma
+                && matches!(
+                    dst.dtype(),
+                    edgefirst_tensor::DType::U8 | edgefirst_tensor::DType::I8
+                ))
+        {
+            return Err(Error::NotSupported(
+                "GL view()/batch() destination is supported only for u8/i8 DMA buffers; \
+                 CPU fallback handles other cases"
+                    .into(),
+            ));
+        }
+
+        let crop = crop.resolve(
+            src.width().unwrap_or(0),
+            src.height().unwrap_or(0),
+            dst.width().unwrap_or(0),
+            dst.height().unwrap_or(0),
+        )?;
 
         // F16/F32 destination: check for a GL float render path BEFORE the u8
         // extraction functions reject the dtype. When a path is found, dispatch
@@ -393,6 +432,33 @@ impl ImageProcessorTrait for GLProcessorST {
             }
             other => other,
         }
+    }
+
+    fn convert_deferred(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<(), crate::Error> {
+        // Render without the terminal `glFinish` (gated in `convert_to` by
+        // `defer_finish`), leaving a single `finish_via_fence` owed at `flush`.
+        // The flag resets unconditionally so a later standalone `convert` always
+        // finishes; only a successful deferred render arms `pending_flush`.
+        self.defer_finish = true;
+        let result = self.convert(src, dst, rotation, flip, crop);
+        self.defer_finish = false;
+        if result.is_ok() {
+            self.pending_flush = true;
+        }
+        result
+    }
+
+    fn flush(&mut self) -> Result<(), crate::Error> {
+        let _span = tracing::trace_span!("image.flush.gl", pending = self.pending_flush).entered();
+        self.flush_pending();
+        Ok(())
     }
 
     fn draw_decoded_masks(
@@ -493,6 +559,22 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
 }
 
 impl GLProcessorST {
+    /// Issue the single batched GPU sync if a `convert_deferred` is still owed,
+    /// then clear the pending flag. No-op when nothing is pending. Used by both
+    /// [`flush`](ImageProcessorTrait::flush) and the CUDA map path (which
+    /// auto-flushes before handing the device a possibly-in-flight buffer).
+    ///
+    /// # Safety contract
+    /// Must run on the GL worker thread that owns the context (it is, being
+    /// driven from the worker loop under `GL_MUTEX`).
+    pub(super) fn flush_pending(&mut self) {
+        if self.pending_flush {
+            // SAFETY: called on the context-owning GL worker thread.
+            unsafe { float::finish_via_fence() };
+            self.pending_flush = false;
+        }
+    }
+
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new(kind)?;
         gls::load_with(|s| {
@@ -753,6 +835,8 @@ impl GLProcessorST {
             nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
+            defer_finish: false,
+            pending_flush: false,
         };
         check_gl_error(function!(), line!())?;
 
@@ -884,7 +968,7 @@ impl GLProcessorST {
             false,
             Rotation::None,
             Flip::None,
-            Crop::no_crop(),
+            ResolvedCrop::no_crop(),
         ) {
             log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
             return false;
@@ -942,7 +1026,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let _span = tracing::trace_span!(
             "image.convert.gl",
@@ -1082,11 +1166,7 @@ impl GLProcessorST {
                     if let Some(buffer_id) = pbo_buffer_id {
                         self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
                     } else {
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            dst_fmt,
-                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                        )?;
+                        self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                     }
                     false
                 }
@@ -1102,11 +1182,7 @@ impl GLProcessorST {
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!("draw_decoded_masks: non-DMA fallback (memory={memory:?})");
                 }
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    dst_fmt,
-                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?;
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                 false
             }
         };
@@ -1293,11 +1369,7 @@ impl GLProcessorST {
                     if let Some(buffer_id) = pbo_buffer_id {
                         self.setup_renderbuffer_from_pbo(dst, dst_fmt, buffer_id)?;
                     } else {
-                        self.setup_renderbuffer_non_dma(
-                            dst,
-                            dst_fmt,
-                            Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                        )?;
+                        self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                     }
                     false
                 }
@@ -1313,11 +1385,7 @@ impl GLProcessorST {
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!("draw_proto_masks: non-DMA fallback (memory={memory:?})");
                 }
-                self.setup_renderbuffer_non_dma(
-                    dst,
-                    dst_fmt,
-                    Crop::new().with_dst_rect(Some(Rect::new(0, 0, 0, 0))),
-                )?;
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, ResolvedCrop::no_crop())?;
                 false
             }
         };
@@ -1621,7 +1689,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -1662,8 +1730,23 @@ impl GLProcessorST {
             },
         }
 
+        // A view()/batch() destination imported the whole PARENT above (cache key
+        // + `DmaImportAttrs` both pivot on `view_origin`); render this tile into
+        // its band via `glViewport`. A whole tensor fills its full surface. The
+        // matching `glScissor` (so the letterbox clear cannot wipe sibling tiles)
+        // is set in `convert_to`, which owns the clear.
+        //
+        // The destination DMA EGLImage is TOP-DOWN: GL framebuffer row 0 maps to
+        // memory row 0 (verified on-target — a tile at GL `y` lands in memory
+        // band `y`). The renderer's existing texcoord flip keeps the image
+        // upright, so the band's GL viewport `y` is simply `region.y` — NOT the
+        // bottom-left `parent_h - (y+h)` flip (that is for bottom-up surfaces).
+        let (vx, vy, vw, vh) = match dst.view_origin() {
+            Some(vo) => (vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32),
+            None => (0, 0, width, height),
+        };
         unsafe {
-            gls::gl::Viewport(0, 0, width, height);
+            gls::gl::Viewport(vx, vy, vw, vh);
         }
         Ok(())
     }
@@ -1693,7 +1776,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -1751,9 +1834,24 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         assert!(self.gl_context.transfer_backend.is_dma());
+        // v1 view()/batch() destination support covers only the SINGLE-PASS path
+        // (Rgba/Bgra/Grey, rendered by `convert_to` with the glViewport/scissor
+        // band set in `setup_renderbuffer_dma`). The two-pass packed-RGB and
+        // planar paths reinterpret the destination geometry (`W*3/4 × H`,
+        // `H*3` bands), which the band lowering does not yet handle, so decline a
+        // view dst for those → CPU fallback. (Two-pass band tiling is a follow-up.)
+        if dst.view_origin().is_some()
+            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+        {
+            return Err(crate::Error::NotSupported(
+                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
+                 planar formats (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
         if dst_fmt == PixelFormat::Rgb {
             log::trace!(
                 "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
@@ -1844,6 +1942,205 @@ impl GLProcessorST {
         }
     }
 
+    /// Bias a letterbox clear colour by XOR 0x80 for int8 destinations, since
+    /// `glClear` bypasses the shader that otherwise applies the bias. No-op when
+    /// not int8 or when there is no fill colour. Shared by every destination path.
+    fn int8_bias_clear(is_int8: bool, mut crop: ResolvedCrop) -> ResolvedCrop {
+        if is_int8 {
+            if let Some(ref mut color) = crop.dst_color {
+                color[0] ^= 0x80;
+                color[1] ^= 0x80;
+                color[2] ^= 0x80;
+            }
+        }
+        crop
+    }
+
+    /// Render `src` into the already-bound destination FBO as `dst_fmt`,
+    /// dispatching packed vs planar and applying the int8 shader-program swap
+    /// (packed only; the planar shader handles int8 internally). This is the
+    /// converged per-tile draw shared by the non-DMA / PBO / DMA destination
+    /// paths — they differ only in FBO setup and readback, never in this draw.
+    #[allow(clippy::too_many_arguments)]
+    fn render_packed_or_planar(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        let swap_int8 = is_int8 && dst_fmt.layout() != PixelLayout::Planar;
+        if swap_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
+        } else {
+            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
+        };
+        if swap_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result
+    }
+
+    /// Render a PBO source into the already-bound destination FBO via
+    /// [`draw_src_texture_from_pbo`](Self::draw_src_texture_from_pbo), applying
+    /// the int8 texture-program swap around the draw so the GPU writes
+    /// XOR-0x80'd values. The PBO draw never reaches the NV (`nv_r8`) or planar
+    /// branch, so this swaps **only** the two packed texture programs — narrower
+    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). Shared by
+    /// `convert_pbo_to_pbo` / `convert_pbo_to_mem`, which differ only in FBO
+    /// setup and readback target, never in this draw. Callers that need the
+    /// letterbox clear biased (glClear bypasses the shader) apply
+    /// [`int8_bias_clear`](Self::int8_bias_clear) to `crop` first; this helper
+    /// does not, since the mem path fills via CPU upload instead.
+    #[allow(clippy::too_many_arguments)]
+    fn render_from_pbo(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        src_buffer_id: u32,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        let render_result = self.draw_src_texture_from_pbo(
+            src,
+            src_fmt,
+            src_buffer_id,
+            dst,
+            dst_fmt,
+            rotation,
+            flip,
+            crop,
+        );
+        if is_int8 {
+            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
+            std::mem::swap(
+                &mut self.texture_program_yuv,
+                &mut self.texture_int8_program_yuv,
+            );
+        }
+        render_result
+    }
+
+    /// Read the rendered FBO colour attachment (`COLOR_ATTACHMENT0`) into the
+    /// destination, applying the BGRA byte-swap when `dst_fmt` is BGRA. `pbo_id`
+    /// selects the target: `None` reads straight into the mapped Mem tensor (the
+    /// preceding draw has already finished the GPU); `Some(id)` reads into the
+    /// bound PBO PACK buffer and issues a finishing flush so the async transfer
+    /// completes. The converged readback shared by the non-DMA and any-to-PBO
+    /// paths — they differ only in this target selector.
+    fn readback_rendered(
+        &self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        pbo_id: Option<u32>,
+    ) -> crate::Result<()> {
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let dest_format = match dst_fmt {
+            PixelFormat::Rgb => gls::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Grey => gls::gl::RED,
+            _ => {
+                return Err(crate::Error::NotSupported(format!(
+                    "GL readback not supported for {dst_fmt}"
+                )))
+            }
+        };
+        let len = dst.len();
+        match pbo_id {
+            None => unsafe {
+                let mut dst_map = dst.map()?;
+                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                gls::gl::ReadnPixels(
+                    0,
+                    0,
+                    dst_w as i32,
+                    dst_h as i32,
+                    dest_format,
+                    gls::gl::UNSIGNED_BYTE,
+                    len as i32,
+                    dst_map.as_mut_ptr() as *mut c_void,
+                );
+                if dst_fmt == PixelFormat::Bgra {
+                    for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
+                        chunk.swap(0, 2);
+                    }
+                }
+            },
+            Some(buffer_id) => {
+                unsafe {
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    gls::gl::ReadnPixels(
+                        0,
+                        0,
+                        dst_w as i32,
+                        dst_h as i32,
+                        dest_format,
+                        gls::gl::UNSIGNED_BYTE,
+                        len as i32,
+                        std::ptr::null_mut(),
+                    );
+                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    gls::gl::Finish();
+                }
+                // BGRA R↔B swap must map the PBO on the GL thread. Int8 XOR 0x80
+                // is handled in the fragment shader — no CPU map needed.
+                if dst_fmt == PixelFormat::Bgra {
+                    unsafe {
+                        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
+                        let ptr = gls::gl::MapBufferRange(
+                            gls::gl::PIXEL_PACK_BUFFER,
+                            0,
+                            len as isize,
+                            gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                        );
+                        if ptr.is_null() {
+                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            return Err(crate::Error::OpenGl(
+                                "glMapBufferRange returned null for BGRA byte-swap".to_string(),
+                            ));
+                        }
+                        let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, len);
+                        for chunk in slice.chunks_exact_mut(4) {
+                            chunk.swap(0, 2);
+                        }
+                        gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
+                        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                    }
+                }
+            }
+        }
+        check_gl_error(function!(), line!())?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn convert_dest_non_dma(
         &mut self,
@@ -1854,80 +2151,20 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
 
         // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = if is_int8 {
-            let mut crop = crop;
-            if let Some(ref mut color) = crop.dst_color {
-                color[0] ^= 0x80;
-                color[1] ^= 0x80;
-                color[2] ^= 0x80;
-            }
-            crop
-        } else {
-            crop
-        };
-
-        // For int8 non-planar output, swap to int8 shader programs.
-        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
+        let crop = Self::int8_bias_clear(is_int8, crop);
 
         let start = Instant::now();
-        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-        } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-        };
-
-        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
         log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
 
         // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
-        let dest_format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
-            _ => unreachable!(),
-        };
-
-        unsafe {
-            let mut dst_map = dst.map()?;
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                dest_format,
-                gls::gl::UNSIGNED_BYTE,
-                dst.len() as i32,
-                dst_map.as_mut_ptr() as *mut c_void,
-            );
-            if dst_fmt == PixelFormat::Bgra {
-                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
-                    chunk.swap(0, 2);
-                }
-            }
-        }
-        check_gl_error(function!(), line!())?;
+        self.readback_rendered(dst, dst_fmt, None)?;
         log::debug!("Read from framebuffer takes {:?}", start.elapsed());
         Ok(())
     }
@@ -1936,7 +2173,7 @@ impl GLProcessorST {
         &mut self,
         dst: &Tensor<u8>,
         dst_fmt: PixelFormat,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -2241,7 +2478,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let (src_buffer_id, dst_buffer_id) = {
             let src_pbo = src.as_pbo().ok_or_else(|| {
@@ -2265,117 +2502,32 @@ impl GLProcessorST {
         // PboMap message back to this GL thread — causing a deadlock.
         self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
 
-        // For int8 output, swap to int8 shader programs so the GPU applies
-        // XOR 0x80 in the fragment shader — no CPU readback needed for int8.
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
         // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = if is_int8 {
-            let mut crop = crop;
-            if let Some(ref mut color) = crop.dst_color {
-                color[0] ^= 0x80;
-                color[1] ^= 0x80;
-                color[2] ^= 0x80;
-            }
-            crop
-        } else {
-            crop
-        };
+        let crop = Self::int8_bias_clear(is_int8, crop);
 
-        // Upload source from PBO and render.
-        // We cannot call convert_to/draw_src_texture directly because they
-        // call src.tensor().map() which sends a message back to THIS thread,
-        // causing a deadlock. Instead, bind the source PBO as UNPACK buffer
-        // and upload to the texture with a NULL pointer — GL reads directly
-        // from the PBO, zero CPU copy.
+        // Upload source from PBO and render (int8 program swap owned by the
+        // shared `render_from_pbo` wrapper). We cannot call
+        // convert_to/draw_src_texture directly because they call
+        // src.tensor().map() which sends a message back to THIS thread, causing
+        // a deadlock. Instead, bind the source PBO as UNPACK buffer and upload
+        // to the texture with a NULL pointer — GL reads directly from the PBO,
+        // zero CPU copy.
         let start = Instant::now();
-        let render_result = self.draw_src_texture_from_pbo(
+        self.render_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
             dst,
             dst_fmt,
+            is_int8,
             rotation,
             flip,
             crop,
-        );
-        // Swap shaders back before checking result
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        )?;
         log::debug!("PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
-        let dest_format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
-            _ => {
-                return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {dst_fmt}",
-                )))
-            }
-        };
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-
-        unsafe {
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                dest_format,
-                gls::gl::UNSIGNED_BYTE,
-                dst.len() as i32,
-                std::ptr::null_mut(),
-            );
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-            gls::gl::Finish();
-        }
-
-        check_gl_error(function!(), line!())?;
-
-        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
-        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
-        if dst_fmt == PixelFormat::Bgra {
-            unsafe {
-                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
-                let ptr = gls::gl::MapBufferRange(
-                    gls::gl::PIXEL_PACK_BUFFER,
-                    0,
-                    dst.len() as isize,
-                    gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
-                );
-                if ptr.is_null() {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    return Err(crate::Error::OpenGl(
-                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
-                    ));
-                }
-                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                for chunk in slice.chunks_exact_mut(4) {
-                    chunk.swap(0, 2);
-                }
-                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-            }
-            check_gl_error(function!(), line!())?;
-        }
-
+        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
         log::debug!("PBO readback takes {:?}", start_read.elapsed());
         Ok(())
     }
@@ -2395,7 +2547,7 @@ impl GLProcessorST {
         _dst_fmt: PixelFormat,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -2644,7 +2796,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let dst_pbo = dst.as_pbo().ok_or_else(|| {
             crate::Error::OpenGl("convert_any_to_pbo: dst is not a PBO tensor".to_string())
@@ -2661,91 +2813,12 @@ impl GLProcessorST {
         // PboMap message back to this GL thread — causing a deadlock.
         self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
 
-        // For int8 non-planar output, swap to int8 shader programs.
-        // Planar path handles int8 internally via its own int8 shader.
-        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
         let start = Instant::now();
-        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
-            self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-        } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-        };
-
-        if is_int8 && dst_fmt.layout() != PixelLayout::Planar {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
         log::debug!("any-to-PBO render takes {:?}", start.elapsed());
 
         let start_read = Instant::now();
-        let dest_format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
-            _ => {
-                return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {dst_fmt}",
-                )))
-            }
-        };
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        unsafe {
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                dest_format,
-                gls::gl::UNSIGNED_BYTE,
-                dst.len() as i32,
-                std::ptr::null_mut(),
-            );
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-            gls::gl::Finish();
-        }
-        check_gl_error(function!(), line!())?;
-
-        // Handle BGRA R↔B swap if needed (must map PBO on the GL thread).
-        // Int8 XOR 0x80 is handled in the fragment shader — no CPU map needed.
-        if dst_fmt == PixelFormat::Bgra {
-            unsafe {
-                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
-                let ptr = gls::gl::MapBufferRange(
-                    gls::gl::PIXEL_PACK_BUFFER,
-                    0,
-                    dst.len() as isize,
-                    gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
-                );
-                if ptr.is_null() {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    return Err(crate::Error::OpenGl(
-                        "glMapBufferRange returned null for BGRA byte-swap".to_string(),
-                    ));
-                }
-                let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, dst.len());
-                for chunk in slice.chunks_exact_mut(4) {
-                    chunk.swap(0, 2);
-                }
-                gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-                gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-            }
-            check_gl_error(function!(), line!())?;
-        }
-
+        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
         log::debug!("any-to-PBO readback takes {:?}", start_read.elapsed());
         Ok(())
     }
@@ -2763,7 +2836,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let src_pbo = src.as_pbo().ok_or_else(|| {
             crate::Error::OpenGl("convert_pbo_to_mem: src is not a PBO tensor".to_string())
@@ -2777,72 +2850,28 @@ impl GLProcessorST {
 
         self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
 
-        // For int8 output, swap to int8 shader programs so the GPU renders
-        // XOR'd values — ReadnPixels then reads already-biased data.
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-
+        // Render from the PBO source; the int8 program swap (GPU writes XOR'd
+        // values so ReadnPixels reads already-biased data) is owned by the
+        // shared `render_from_pbo` wrapper. The letterbox fill is handled by the
+        // CPU upload in `setup_renderbuffer_non_dma` above, so no
+        // `int8_bias_clear` is applied here.
         let start = Instant::now();
-        let render_result = self.draw_src_texture_from_pbo(
+        self.render_from_pbo(
             src,
             src_fmt,
             src_buffer_id,
             dst,
             dst_fmt,
+            is_int8,
             rotation,
             flip,
             crop,
-        );
-
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result?;
+        )?;
         log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
 
         // ReadnPixels into Mem dst — data is already int8-biased by the shader.
         let start = Instant::now();
-        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
-        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let dest_format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
-            _ => {
-                return Err(crate::Error::NotSupported(format!(
-                    "PBO readback not supported for {dst_fmt}",
-                )))
-            }
-        };
-        unsafe {
-            let mut dst_map = dst.map()?;
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
-                0,
-                0,
-                dst_w as i32,
-                dst_h as i32,
-                dest_format,
-                gls::gl::UNSIGNED_BYTE,
-                dst.len() as i32,
-                dst_map.as_mut_ptr() as *mut c_void,
-            );
-            if dst_fmt == PixelFormat::Bgra {
-                for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
-                    chunk.swap(0, 2);
-                }
-            }
-        }
-        check_gl_error(function!(), line!())?;
+        self.readback_rendered(dst, dst_fmt, None)?;
         log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
         Ok(())
     }
@@ -2927,13 +2956,40 @@ impl GLProcessorST {
         _dst_fmt: PixelFormat,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<(), crate::Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         check_gl_error(function!(), line!())?;
+
+        // A view()/batch() destination shares ONE parent EGLImage with its
+        // sibling tiles; the band viewport was set in `setup_renderbuffer_dma`.
+        // Confine this tile's letterbox `glClear` (below) and draw to the same
+        // band via `glScissor` so they cannot wipe a sibling. The RAII guard
+        // disables `SCISSOR_TEST` on every exit (success, `?`, or unwind) so the
+        // next convert/draw starts from a clean state.
+        struct ScissorGuard(bool);
+        impl Drop for ScissorGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { gls::gl::Disable(gls::gl::SCISSOR_TEST) };
+                }
+            }
+        }
+        // Top-down band rect, matching `setup_renderbuffer_dma`'s viewport (the
+        // dst EGLImage is top-down: GL row 0 == memory row 0).
+        let _scissor = match dst.view_origin() {
+            Some(vo) => {
+                unsafe {
+                    gls::gl::Scissor(vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32);
+                    gls::gl::Enable(gls::gl::SCISSOR_TEST);
+                }
+                ScissorGuard(true)
+            }
+            None => ScissorGuard(false),
+        };
 
         let has_crop = crop
             .dst_rect
@@ -3108,9 +3164,14 @@ impl GLProcessorST {
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
 
-        let start = Instant::now();
-        unsafe { gls::gl::Finish() };
-        log::debug!("gl_Finish takes {:?}", start.elapsed());
+        // In a batch (`defer_finish`), skip the per-tile drain so the whole
+        // batch syncs once via `finish_via_fence` in `convert_batch`. Outside a
+        // batch this is the standalone convert's completion point and must run.
+        if !self.defer_finish {
+            let start = Instant::now();
+            unsafe { gls::gl::Finish() };
+            log::debug!("gl_Finish takes {:?}", start.elapsed());
+        }
         check_gl_error(function!(), line!())?;
         Ok(())
     }
@@ -3125,7 +3186,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<(), crate::Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -3221,7 +3282,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
@@ -3259,7 +3320,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -3389,7 +3450,7 @@ impl GLProcessorST {
         is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> crate::Result<()> {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
@@ -4033,7 +4094,7 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
@@ -4178,7 +4239,7 @@ impl GLProcessorST {
         let chroma_shift_y = layout.shift_y as i32;
         let chroma_lines = layout.uv_rows_per_luma as i32;
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // `nv_r8_program` may have been swapped to the int8 variant by
@@ -4408,7 +4469,9 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<egl::Image, crate::Error> {
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
+        // never collapses onto a destination parent import.
+        let id = EglCacheKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
         if self.nv_r8_egl_cache.sweep() {
@@ -4452,8 +4515,9 @@ impl GLProcessorST {
         &self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
+        for_dst: bool,
     ) -> Result<EglImage, crate::Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt)?;
+        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt, for_dst)?;
         let egl_img_attr = attrs.to_egl_attribs();
         self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }
@@ -4492,8 +4556,9 @@ impl GLProcessorST {
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
-        // (geometry) — see EglCacheKey.
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        // (geometry) — see EglCacheKey. Only a destination view collapses onto
+        // its parent key; a source view keys on its own region.
+        let id = EglCacheKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
 
         // Sweep dead entries opportunistically before looking up.
@@ -4528,8 +4593,11 @@ impl GLProcessorST {
         }
 
         // Create the EGL image BEFORE evicting — if creation fails, we don't
-        // want to have destroyed a valid cache entry for nothing.
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
+        // want to have destroyed a valid cache entry for nothing. Only a
+        // destination view imports its parent (glViewport tiling); a source view
+        // imports its own region (it is sampled, not rendered into).
+        let for_dst = cache == CacheKind::Dst;
+        let egl_image_obj = self.create_image_from_dma2(img, img_fmt, for_dst)?;
 
         // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
         // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
@@ -4589,7 +4657,7 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = EglCacheKey::from_tensor(img, fmt);
+        let id = EglCacheKey::from_tensor(img, fmt, true);
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4667,7 +4735,7 @@ impl GLProcessorST {
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
         // tensor's logical geometry, so `from_tensor` is a consistent key.
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        let id = EglCacheKey::from_tensor(img, img_fmt, true);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }

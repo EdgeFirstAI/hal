@@ -44,6 +44,21 @@ pub enum Error {
         /// Bytes the allocation provides.
         capacity: usize,
     },
+    /// A [`crate::Tensor::view`]-style sub-region extends past the parent's
+    /// bounds. `view`/`batch` reject rather than clamp.
+    RegionOutOfBounds {
+        /// The offending region.
+        region: crate::Region,
+        /// The parent frame `(width, height)` in pixels.
+        bounds: (usize, usize),
+    },
+    /// A `batch(n)` index is `>=` the tensor's leading batch dimension `N`.
+    BatchIndexOutOfBounds {
+        /// The requested element index.
+        index: usize,
+        /// The tensor's leading dimension `N`.
+        batch: usize,
+    },
 }
 
 impl From<std::io::Error> for Error {
@@ -71,6 +86,15 @@ impl std::fmt::Display for Error {
             Error::InsufficientCapacity { needed, capacity } => write!(
                 f,
                 "insufficient tensor capacity: need {needed} bytes, have {capacity}"
+            ),
+            Error::RegionOutOfBounds { region, bounds } => write!(
+                f,
+                "region {region:?} out of bounds for {}x{} frame",
+                bounds.0, bounds.1
+            ),
+            Error::BatchIndexOutOfBounds { index, batch } => write!(
+                f,
+                "batch index {index} out of bounds for batch size {batch}"
             ),
             _ => write!(f, "{self:?}"),
         }

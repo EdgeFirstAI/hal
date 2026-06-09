@@ -466,7 +466,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
     Returns (bgr_640x640, boxes, scores, classes, elapsed_ms_dict).
     """
-    from edgefirst_hal import Tensor, PixelFormat, Rect, Decoder
+    from edgefirst_hal import Tensor, PixelFormat, Decoder
 
     timings = {}
 
@@ -475,19 +475,12 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
     src = Tensor.load(image_path, format=PixelFormat.Rgb)
     timings["load"] = (time.perf_counter() - t0) * 1000
 
-    # 2. Letterbox
+    # 2. Letterbox — `letterbox=` is the resize mode: preserve aspect ratio,
+    # centre the scaled image in the 640x640 destination, pad with grey. The
+    # backend computes the placement (the old manual dst_crop rect is gone).
     t0 = time.perf_counter()
-    scale = min(640 / src.width, 640 / src.height)
-    nw, nh = int(src.width * scale), int(src.height * scale)
-    px, py = (640 - nw) // 2, (640 - nh) // 2
-
     dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
-    processor.convert(
-        src,
-        dst_rgb,
-        dst_crop=Rect(px, py, nw, nh),
-        dst_color=[114, 114, 114, 255],
-    )
+    processor.convert(src, dst_rgb, letterbox=[114, 114, 114, 255])
 
     input_data = np.zeros((1, 640, 640, 3), dtype=np.uint8)
     dst_rgb.normalize_to_numpy(input_data[0])
@@ -530,7 +523,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
 
     Returns elapsed_ms_dict (no visual output — uses HAL's built-in colors).
     """
-    from edgefirst_hal import Tensor, PixelFormat, Rect, Decoder
+    from edgefirst_hal import Tensor, PixelFormat, Decoder
 
     timings = {}
 
@@ -539,13 +532,9 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["load"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    scale = min(640 / src.width, 640 / src.height)
-    nw, nh = int(src.width * scale), int(src.height * scale)
-    px, py = (640 - nw) // 2, (640 - nh) // 2
     dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
-    processor.convert(
-        src, dst_rgb, dst_crop=Rect(px, py, nw, nh), dst_color=[114, 114, 114, 255]
-    )
+    # `letterbox=` preserves aspect ratio and pads to the 640x640 destination.
+    processor.convert(src, dst_rgb, letterbox=[114, 114, 114, 255])
     input_data = np.zeros((1, 640, 640, 3), dtype=np.uint8)
     dst_rgb.normalize_to_numpy(input_data[0])
     timings["letterbox"] = (time.perf_counter() - t0) * 1000

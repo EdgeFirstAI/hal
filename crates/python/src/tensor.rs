@@ -793,24 +793,35 @@ impl PyTensor {
         Ok(self.0.reshape(&shape)?)
     }
 
-    /// Create a zero-copy sub-region view that shares this tensor's allocation.
+    /// Zero-copy rectangular sub-region view of an image tensor — the
+    /// destination/source **crop** primitive.
     ///
-    /// The view maps the window ``[offset_bytes, offset_bytes + size)`` where
-    /// ``size = prod(shape) * element_size``, sharing the parent buffer (``Mem``
-    /// heap allocation or ``Dma`` fd) with **no copy**. N views into one parent
-    /// can be mapped and written independently — the basis for assembling a
-    /// batch into a single buffer. ``offset_bytes`` must be aligned to the
-    /// element's alignment (its natural alignment, which equals the element
-    /// size for the supported dtypes) and the window must fit the parent
-    /// allocation.
+    /// ``region`` is in pixels of the image's leading frame. The returned view
+    /// shares the parent's buffer (and ``BufferIdentity``) with **no copy**,
+    /// addressing the sub-rectangle by offset + the parent's row pitch.
+    /// ``convert(src, dst.view(region), ...)`` renders into that sub-rectangle.
+    /// The parent must be a packed-format image tensor.
     ///
-    /// The returned tensor exposes the same surface as any other tensor —
-    /// :meth:`map` (NumPy buffer protocol), :meth:`from_numpy`, ``fd`` — so a
-    /// view reads and writes through NumPy exactly like the base API. The
-    /// window's byte offset is reported by :attr:`plane_offset`.
-    #[pyo3(signature = (offset_bytes, shape))]
-    fn subview(&self, offset_bytes: usize, shape: Vec<usize>) -> Result<Self> {
-        let view = self.0.subview(offset_bytes, &shape)?;
+    /// The view exposes the same surface as any other tensor —
+    /// :meth:`map` (NumPy buffer protocol), :meth:`from_numpy`, ``fd``.
+    #[pyo3(signature = (region))]
+    fn view(&self, region: crate::image::PyRegion) -> Result<Self> {
+        let view = self.0.view(region.into())?;
+        Ok(PyTensor(view))
+    }
+
+    /// Borrow batch element ``n`` of a batched tensor as a zero-copy view.
+    ///
+    /// A batched tensor prepends ``N`` as the leading dimension over the
+    /// per-element image layout (``[N, H, W, C]`` packed or ``[N, C, H, W]``
+    /// planar). ``batch(n)`` returns element ``n`` — the contiguous per-element
+    /// region at byte offset ``n * element_size``, sharing the parent's buffer.
+    /// ``batch(0)`` on a tensor with ``N == 1`` is equivalent to the whole
+    /// tensor. This is the destination primitive for assembling a batch into a
+    /// single buffer.
+    #[pyo3(signature = (n))]
+    fn batch(&self, n: usize) -> Result<Self> {
+        let view = self.0.batch(n)?;
         Ok(PyTensor(view))
     }
 
@@ -1045,23 +1056,6 @@ impl PyTensor {
     #[getter]
     fn row_stride(&self) -> Option<usize> {
         self.0.effective_row_stride()
-    }
-
-    /// Byte offset of this tensor's window into its backing allocation.
-    ///
-    /// ``None`` for a whole-buffer tensor; the sub-region start for a view
-    /// created via :meth:`subview` (or after :meth:`set_plane_offset`).
-    #[getter]
-    fn plane_offset(&self) -> Option<usize> {
-        self.0.plane_offset()
-    }
-
-    /// Set the byte offset of this tensor's window into its backing allocation.
-    ///
-    /// Validated against the allocation when the tensor is mapped. Prefer
-    /// :meth:`subview` for sharing one buffer across independent windows.
-    fn set_plane_offset(&mut self, offset: usize) {
-        self.0.set_plane_offset(offset);
     }
 
     /// Whether this image uses a planar pixel layout.
@@ -1486,7 +1480,12 @@ impl PyTensorMap {
         self.mapped = None; // Release the mapped buffer
     }
 
-    fn view(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Zero-copy NumPy ``memoryview`` over the mapped buffer.
+    ///
+    /// Renamed from ``view`` so ``view`` now names the tensor-level sub-region
+    /// primitive (:meth:`Tensor.view`); this map accessor returns the raw
+    /// host-memory view of the mapped bytes.
+    fn numpy(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         if self.mapped.is_none() {
             return Err(PyBufferError::new_err("Buffer not mapped"));
         }

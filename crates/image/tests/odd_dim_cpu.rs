@@ -12,7 +12,7 @@
 //! All cells run under the default feature set (no `dma_test_formats` flag).
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rect, Rotation};
+use edgefirst_image::{CPUProcessor, Crop, Flip, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
@@ -784,21 +784,9 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
     let mut dec = ImageDecoder::new();
     src.load_image(&mut dec, &jpeg).unwrap();
 
-    // Fit 789×384 into 640×640: scale = 640/789, scaled_h = round(384*640/789)
-    let scale = 640.0f32 / 789.0f32;
-    let scaled_h = (h as f32 * scale).round() as usize;
-    let pad_top = (640 - scaled_h) / 2;
-    let dst_rect = Rect {
-        left: 0,
-        top: pad_top,
-        width: 640,
-        height: scaled_h,
-    };
-    let crop = Crop {
-        src_rect: None,
-        dst_rect: Some(dst_rect),
-        dst_color: Some([114, 114, 114, 255]),
-    };
+    // Letterbox 789×384 into 640×640 — the backend computes the centred band.
+    let _ = h;
+    let crop = Crop::letterbox([114, 114, 114, 255]);
 
     let src_dyn = TensorDyn::from(src);
     let mut dst_dyn = TensorDyn::image(

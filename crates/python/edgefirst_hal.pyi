@@ -873,42 +873,37 @@ class Tensor:
     def reshape(self, shape: list[int]) -> None: ...
     """Reshape the tensor to the given shape. The total number of elements must remain the same."""
 
-    def subview(self, offset_bytes: int, shape: list[int]) -> Tensor:
-        """Create a zero-copy sub-region view sharing this tensor's allocation.
+    def view(self, region: Region) -> Tensor:
+        """Zero-copy rectangular sub-region view — the source/destination crop.
 
-        The view maps the window ``[offset_bytes, offset_bytes + size)`` where
-        ``size = prod(shape) * element_size``, sharing the parent buffer (``Mem``
-        heap or ``Dma`` fd) with no copy. N views into one parent can be mapped
-        and written independently — the basis for assembling a batch into one
-        buffer. ``offset_bytes`` must be aligned to the element's alignment
-        (its natural alignment, which equals the element size for the supported
-        dtypes) and the window must fit the parent allocation.
-
-        The returned tensor exposes the full tensor surface (``map()`` with the
-        NumPy buffer protocol, ``from_numpy()``, ``fd``); its byte offset is
-        reported by :attr:`plane_offset`.
+        ``region`` is in pixels of the image's leading frame. The view shares
+        the parent's buffer (and ``BufferIdentity``) with no copy, addressing
+        the sub-rectangle by offset + the parent's row pitch.
+        ``convert(src, dst.view(region), ...)`` renders into that sub-rectangle.
+        The parent must be a packed-format image tensor.
 
         Args:
-            offset_bytes: Byte offset of the window into the parent allocation.
-            shape: Logical shape of the view.
+            region: Sub-rectangle (pixels) into the parent image.
 
         Returns:
-            A new ``Tensor`` viewing the requested window.
+            A new ``Tensor`` viewing the requested sub-rectangle.
         """
 
-    @property
-    def plane_offset(self) -> int | None:
-        """Byte offset of this tensor's window into its backing allocation.
+    def batch(self, n: int) -> Tensor:
+        """Borrow batch element ``n`` of a batched tensor as a zero-copy view.
 
-        ``None`` for a whole-buffer tensor; the sub-region start for a view
-        created via :meth:`subview` (or after :meth:`set_plane_offset`).
-        """
+        A batched tensor prepends ``N`` as the leading dimension over the
+        per-element image layout (``[N, H, W, C]`` packed or ``[N, C, H, W]``
+        planar). ``batch(n)`` returns element ``n`` — the contiguous per-element
+        region at byte offset ``n * element_size``, sharing the parent's buffer.
+        ``batch(0)`` on a tensor with ``N == 1`` is equivalent to the whole
+        tensor.
 
-    def set_plane_offset(self, offset: int) -> None:
-        """Set the byte offset of this tensor's window into its backing allocation.
+        Args:
+            n: Batch element index (``0 <= n < N``).
 
-        Validated against the allocation when the tensor is mapped. Prefer
-        :meth:`subview` for sharing one buffer across independent windows.
+        Returns:
+            A new ``Tensor`` viewing element ``n``.
         """
 
     def set_format(self, format: PixelFormat) -> None:
@@ -1348,7 +1343,7 @@ class Tensor:
 
 class TensorMap:
     def unmap(self) -> None: ...
-    def view(self) -> memoryview: ...
+    def numpy(self) -> memoryview: ...
     def __repr__(self) -> str: ...
     def __len__(self) -> int: ...
     def __getitem__(self, index: int) -> object: ...
@@ -1634,14 +1629,16 @@ class Rotation(enum.Enum):
         """Get the Rotation enum variant corresponding to the specified angle in degrees clockwise. Valid angles are 0, 90, 180, and 270."""
         ...
 
-class Rect:
-    """A crop rectangle defined by its top-left corner (left, top) and its dimensions (width, height)."""
+class Region:
+    """A rectangular sub-region (pixels) defined by its top-left corner (x, y)
+    and dimensions (width, height). Used for ``Tensor.view(region)`` and the
+    source crop of ``convert``."""
 
-    def __init__(self, left: int, top: int, width: int, height: int): ...
+    def __init__(self, x: int, y: int, width: int, height: int): ...
     @property
-    def left(self) -> int: ...
+    def x(self) -> int: ...
     @property
-    def top(self) -> int: ...
+    def y(self) -> int: ...
     @property
     def width(self) -> int: ...
     @property
@@ -1976,13 +1973,50 @@ class ImageProcessor:
         dst: Tensor,
         rotation: Rotation = Rotation.Rotate0,
         flip: Flip = Flip.NoFlip,
-        src_crop: Rect | None = None,
-        dst_crop: Rect | None = None,
-        dst_color: List[np.uint8] | None = None,
+        source: Region | None = None,
+        letterbox: List[np.uint8] | None = None,
     ) -> None:
         """
-        Convert the source image to the destination image format, with optional rotation, flipping, cropping.
-        The fill color can be used for areas outside the destination crop. The fill color is provided as RGBA values.
+        Convert the source image to the destination image format, with optional
+        rotation, flipping, and source crop.
+
+        ``source`` selects a sub-rectangle of the input to sample (whole image if
+        ``None``). The destination shape is the placement — use ``dst.view(region)``
+        / ``dst.batch(n)`` to render into a sub-region. ``letterbox`` is a resize
+        mode: preserve the source aspect ratio and pad the remainder with the given
+        RGBA colour (stretch-to-fill when ``None``).
+        """
+        ...
+
+    def convert_deferred(
+        self,
+        src: Tensor,
+        dst: Tensor,
+        rotation: Rotation = Rotation.Rotate0,
+        flip: Flip = Flip.NoFlip,
+        source: Region | None = None,
+        letterbox: List[np.uint8] | None = None,
+    ) -> None:
+        """
+        Convert without waiting for the GPU — the batch-preprocessing primitive.
+
+        Same as ``convert`` but the OpenGL backend skips the per-call ``glFinish``.
+        Render N model inputs by looping this over ``dst.batch(n)`` / ``dst.view(region)``
+        row-bands of one batched destination, then call ``flush()`` once: the
+        backend imports the destination a single time and renders each tile as a
+        ``glViewport`` band, syncing once at flush. A deferred destination is not
+        safe to read (or ``cuda_map``) until ``flush`` returns. Non-GL backends
+        complete synchronously and ``flush`` is a no-op.
+        """
+        ...
+
+    def flush(self) -> None:
+        """
+        Complete all deferred converts since the last flush with a single GPU sync.
+
+        After this returns, every destination written by ``convert_deferred`` is
+        finished and safe to read back or ``cuda_map``. Non-GL backends return
+        immediately.
         """
         ...
 

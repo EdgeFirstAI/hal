@@ -273,6 +273,70 @@ impl PlaneDescriptor {
     }
 }
 
+/// A rectangular sub-region of a tensor's leading spatial frame, in pixels.
+///
+/// `Region` is the single rectangle type in the workspace: the argument to
+/// [`Tensor::view`], the source sampling window in the image crate's `Crop`,
+/// and the geometry the image backend lowers to a `glViewport` (a destination
+/// tile) or a sampling rectangle (a source). Coordinates are pixel/element
+/// units of the leading spatial axes; byte addressing is derived from the
+/// parent's row stride, not stored here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Region {
+    /// Create a region at `(x, y)` spanning `width` × `height` pixels.
+    pub fn new(x: usize, y: usize, width: usize, height: usize) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// True when the region lies fully within a `width` × `height` frame.
+    pub fn fits_within(&self, width: usize, height: usize) -> bool {
+        self.x.saturating_add(self.width) <= width && self.y.saturating_add(self.height) <= height
+    }
+}
+
+/// The parent image a [`view`](Tensor::view)/[`batch`](Tensor::batch) sub-region
+/// was carved from, snapshotted at the time the view was created.
+///
+/// A view shares the parent's `BufferIdentity` and addresses a sub-rectangle of
+/// it. The GL backend keys its EGLImage import on the **parent** geometry (so all
+/// sibling views of one buffer collapse to a single import) and renders each
+/// view as a `glViewport`+`glScissor` ROI at `(x, y, width, height)` within that
+/// parent — the view is render state, never a distinct import. `parent_width`/
+/// `parent_height` are the parent's logical pixel dimensions; `x`/`y` are this
+/// view's top-left origin within the parent (pixels). Nested views compose:
+/// the snapshot always names the **root** parent, with offsets accumulated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewOrigin {
+    /// Logical width of the root parent image, in pixels.
+    pub parent_width: usize,
+    /// Logical height of the root parent image, in pixels. For a `batch(n)` view
+    /// of an `[N, H, W, C]` tensor this is `N * H` (the tiles stack vertically in
+    /// the shared buffer).
+    pub parent_height: usize,
+    /// The parent's row stride in **bytes**. The GL backend keys its EGLImage
+    /// import/cache and pitch on this — NOT on the view's own `row_stride`, which
+    /// a single-row view sets tight (for map-span safety). Using the parent
+    /// stride keeps the import pitch parent-consistent so single-row and
+    /// multi-row sibling views collapse onto the same parent import.
+    pub parent_row_stride: usize,
+    /// This view's top-left x origin within the root parent, in pixels.
+    pub x: usize,
+    /// This view's top-left y origin within the root parent, in pixels.
+    pub y: usize,
+}
+
 /// Element type discriminant for runtime type identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -1390,6 +1454,11 @@ where
     pub(crate) quantization: Option<Quantization>,
     /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
     colorimetry: Option<crate::Colorimetry>,
+    /// Parent-image snapshot when this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. Lets the GL
+    /// backend key its import on the parent and render the view as a
+    /// `glViewport`/`glScissor` ROI. See [`ViewOrigin`].
+    view_origin: Option<ViewOrigin>,
 }
 
 impl<T> Tensor<T>
@@ -1407,6 +1476,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            view_origin: None,
         }
     }
 
@@ -2008,9 +2078,28 @@ where
         self.storage.set_logical_shape(&shape)?;
         self.set_format(format)?; // clears any stale row_stride
 
-        // Preserve the backing's physical row pitch when it is wider than the
-        // natural (tightly-packed) row for this format — the physical-grid /
-        // logical-ROI decoupling for reused pool tensors.
+        // Restore the correct row pitch for the new geometry. A DMA buffer of
+        // ANY layout, and a semi-planar buffer on any backing, MUST carry a
+        // 64-byte-aligned pitch: Mali/Vivante reject a DMA-BUF EGLImage whose
+        // row pitch is not 64-aligned (`EGL_BAD_ALLOC` / `EGL_BAD_ACCESS`), and
+        // semi-planar chroma-offset math assumes it. This mirrors the pitch
+        // `Tensor::image()` allocates, so a recycled pool buffer imports
+        // identically to a fresh one — without it a `configure_image()`'d packed
+        // buffer (e.g. Y800 96-wide → tight pitch 96) failed convert() on
+        // imx95/imx8mp via the texture-upload fallback while the fresh oracle
+        // (aligned 128) succeeded. Packed/planar on host-only memory (Mem/Shm)
+        // keep the tight pitch so flat CPU consumers stay unaffected — matching
+        // `image()`'s `host_stride` rule.
+        let elem = std::mem::size_of::<T>();
+        let channels = format.channels();
+        let (min_stride, total_rows) = match format.layout() {
+            PixelLayout::SemiPlanar => (width.next_multiple_of(2) * elem, shape[0]),
+            PixelLayout::Packed => (width * channels * elem, height),
+            PixelLayout::Planar => (width * elem, channels * height),
+        };
+        let needs_align = self.storage.memory() == TensorMemory::Dma
+            || format.layout() == PixelLayout::SemiPlanar;
+
         let active_stride = if let Some(pitch) = self.storage.backing_row_stride() {
             // macOS IOSurface: use the surface's native pitch.
             let natural = self.effective_row_stride().unwrap_or(0);
@@ -2020,26 +2109,18 @@ where
             } else {
                 natural
             }
-        } else if format.layout() == PixelLayout::SemiPlanar {
-            // For self-allocated SemiPlanar tensors (Mem/Shm on any platform,
-            // DMA on Linux), restore the correct 64-byte-aligned stride so the
-            // buffer is fully exploited.
-            //
+        } else if needs_align {
             // Priority:
             //   1. Prior stride (pool reuse): if the pre-existing stride is
-            //      64-aligned, >= even(width), and fits the allocation, keep it.
-            //      This is the hot-loop reuse case (large pool, small image).
-            //   2. Compute fresh 64-aligned stride for the current width.
-            let elem = std::mem::size_of::<T>();
-            let min_stride = width.next_multiple_of(2) * elem;
+            //      64-aligned, >= this layout's minimum row, and fits the
+            //      allocation, keep it. This is the hot-loop reuse case (large
+            //      pool, small image).
+            //   2. Compute a fresh 64-aligned stride for the current width.
             let aligned = min_stride.next_multiple_of(64);
-            let total_h = shape[0];
             let capacity = self.storage.capacity_bytes();
 
             let candidate = if let Some(ps) = prior_stride {
-                // Keep the prior stride only when it still satisfies the current
-                // minimum (even(width)) and the allocation can hold it.
-                if ps >= min_stride && ps % 64 == 0 && ps * total_h <= capacity {
+                if ps >= min_stride && ps % 64 == 0 && ps * total_rows <= capacity {
                     ps
                 } else {
                     aligned
@@ -2048,7 +2129,7 @@ where
                 aligned
             };
 
-            if candidate * total_h <= capacity {
+            if candidate * total_rows <= capacity {
                 self.set_row_stride_unchecked(candidate);
                 candidate
             } else {
@@ -2059,12 +2140,11 @@ where
             self.effective_row_stride().unwrap_or(0)
         };
 
-        // For semi-planar formats, ensure the active stride fits the allocation.
-        // A pool reconfigured to a wider image than its backing would silently
-        // SIGBUS on any subsequent map/write — catch it here instead.
-        if format.layout() == PixelLayout::SemiPlanar && active_stride > 0 {
-            let total_h = shape[0];
-            let needed = active_stride * total_h;
+        // Ensure the active stride fits the allocation. A pool reconfigured to a
+        // wider image than its backing would silently SIGBUS on any subsequent
+        // map/write — catch it here instead.
+        if needs_align && active_stride > 0 {
+            let needed = active_stride * total_rows;
             let capacity = self.storage.capacity_bytes();
             if needed > capacity {
                 return Err(Error::InsufficientCapacity { needed, capacity });
@@ -2207,6 +2287,8 @@ where
             // multiplane data must import each plane independently.
             cuda: None,
             colorimetry: luma.colorimetry,
+            // A composed multiplane tensor is a whole image, not a sub-view.
+            view_origin: None,
         })
     }
 
@@ -2331,6 +2413,14 @@ where
         self.plane_offset
     }
 
+    /// The parent-image snapshot if this tensor is a [`view`](Self::view)/
+    /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. The GL
+    /// backend keys its import on the parent geometry and renders this view as a
+    /// `glViewport`/`glScissor` ROI at `(x, y, width, height)`. See [`ViewOrigin`].
+    pub fn view_origin(&self) -> Option<ViewOrigin> {
+        self.view_origin
+    }
+
     /// Set the byte offset within the DMA-BUF where image data starts.
     ///
     /// Propagated to `EGL_DMA_BUF_PLANE0_OFFSET_EXT` on GPU import.
@@ -2348,13 +2438,6 @@ where
             TensorStorage::Dma(ref mut dma) => dma.mmap_offset = offset,
             _ => {}
         }
-    }
-
-    /// Builder-style variant of [`set_plane_offset`](Self::set_plane_offset),
-    /// consuming and returning `self`.
-    pub fn with_plane_offset(mut self, offset: usize) -> Self {
-        self.set_plane_offset(offset);
-        self
     }
 
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
@@ -2397,7 +2480,7 @@ where
     ///   if `offset_bytes` is not a multiple of `align_of::<T>()`.
     /// - [`Error::InsufficientCapacity`] / [`Error::InvalidSize`] if the window
     ///   exceeds the parent allocation.
-    pub fn subview(&self, offset_bytes: usize, shape: &[usize]) -> Result<Tensor<T>> {
+    pub(crate) fn subview(&self, offset_bytes: usize, shape: &[usize]) -> Result<Tensor<T>> {
         // Offset is absolute into the backing allocation: a sub-view of a
         // sub-view composes by adding this tensor's own offset.
         let abs_offset = self
@@ -2411,11 +2494,14 @@ where
                 offset_bytes,
                 shape,
             )?)),
-            #[cfg(target_os = "linux")]
+            // macOS `Dma` is the IOSurface, Linux `Dma` is the DMA-BUF — both
+            // expose `view(offset, shape)` sharing the resource AND
+            // BufferIdentity (unlike `from_fd`/`from_surface`, which mint a fresh
+            // identity). The GL backend keys the import on the shared identity so
+            // offset-distinct sub-views of one buffer reuse a single import and
+            // address their window via `glViewport`.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             TensorStorage::Dma(parent) => {
-                // Shares the parent's fd AND BufferIdentity (unlike from_fd,
-                // which mints a fresh identity) so offset-distinct views of one
-                // DMA-BUF are cached per (identity, offset) in the GL backend.
                 Tensor::wrap(TensorStorage::Dma(parent.view(offset_bytes, shape)?))
             }
             #[cfg(unix)]
@@ -2428,10 +2514,11 @@ where
                     shape,
                 )?))
             }
-            _ => {
-                return Err(Error::InvalidOperation(
-                    "subview only supported for Mem, Dma, and Shm tensors".into(),
-                ))
+            TensorStorage::Pbo(parent) => {
+                // Shares the GL buffer handle (via the PBO's `Arc`) and
+                // BufferIdentity; the window is addressed by offset on the
+                // staged copy / read-back, mirroring the other backings.
+                Tensor::wrap(TensorStorage::Pbo(parent.view(offset_bytes, shape)?))
             }
         };
         // Inherit the parent's image metadata so the view is a ready-to-use
@@ -2453,6 +2540,178 @@ where
             t.set_plane_offset(abs_offset);
         }
         Ok(t)
+    }
+
+    /// Borrow batch element `n` of a batched tensor as a zero-copy view.
+    ///
+    /// A batched tensor prepends `N` as the leading dimension over the
+    /// per-element image layout (`[N, H, W, C]` packed or `[N, C, H, W]`
+    /// planar) — `N` is over the whole per-element block regardless of
+    /// `HWC`/`CHW`. `batch(n)` returns element `n`: the contiguous per-element
+    /// region at byte offset `n * element_size`, sharing the parent's
+    /// `BufferIdentity` and inheriting its format / row stride / colorimetry.
+    /// `batch(0)` on a tensor with `N == 1` is equivalent to the whole tensor.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::BatchIndexOutOfBounds`] if `n >= N`.
+    /// - [`Error::InvalidShape`] if the tensor is not batched (a formatted
+    ///   tensor whose rank lacks the leading `N`, or an empty shape).
+    pub fn batch(&self, n: usize) -> Result<Tensor<T>> {
+        let shape = self.shape();
+        // With a format we know the exact per-element rank, so a missing leading
+        // `N` is a misuse we reject rather than silently treating a spatial dim
+        // as the batch. Raw tensors take shape[0] as `N` by contract.
+        if let Some(fmt) = self.format {
+            let elem_rank = match fmt.layout() {
+                PixelLayout::SemiPlanar => 2,
+                _ => 3,
+            };
+            if shape.len() != elem_rank + 1 {
+                return Err(Error::InvalidShape(format!(
+                    "batch(): tensor is not batched ({fmt:?} expects a leading N over a \
+                     {elem_rank}-D element, got shape {shape:?})"
+                )));
+            }
+        }
+        let batch = *shape
+            .first()
+            .ok_or_else(|| Error::InvalidShape("batch(): empty shape".into()))?;
+        if n >= batch {
+            return Err(Error::BatchIndexOutOfBounds { index: n, batch });
+        }
+        let elem_shape: Vec<usize> = shape[1..].to_vec();
+        let elem_count: usize = elem_shape.iter().product();
+        let elem_bytes = elem_count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(Error::InvalidSize(elem_count))?;
+        let offset = n.checked_mul(elem_bytes).ok_or(Error::InvalidSize(n))?;
+        // For a packed `[N, H, W, C]` tensor the N tiles stack vertically in the
+        // shared buffer, so the GL import sees one `(W, N*H)` parent and each
+        // tile is the row-band at `y = n*H`. Snapshot that parent so the backend
+        // imports once and renders the tile via `glViewport`. Non-packed
+        // (planar/semi-planar) batching keeps the per-slot path for now (planar
+        // NCHW tiling is a separate step); raw tensors have no pixel geometry.
+        let view_origin = match self.format.map(|f| f.layout()) {
+            Some(PixelLayout::Packed) => {
+                let tile_h = elem_shape[0];
+                let tile_w = elem_shape[1];
+                // Per-row pitch of the tall `(W, N*H)` parent — padded stride if
+                // set, else the tight row width. The GL import keys on this.
+                let bpp = elem_shape[2] * std::mem::size_of::<T>();
+                let parent_stride = self.effective_row_stride().unwrap_or(tile_w * bpp);
+                Some(self.compose_view_origin(tile_w, batch * tile_h, parent_stride, 0, n * tile_h))
+            }
+            _ => None,
+        };
+        let mut t = self.subview(offset, &elem_shape)?;
+        t.view_origin = view_origin;
+        Ok(t)
+    }
+
+    /// Borrow a rectangular spatial sub-region of an image tensor as a
+    /// zero-copy view — the **destination/source crop** primitive.
+    ///
+    /// `region` is in pixels of the image's leading frame. The returned view
+    /// shares the parent's `BufferIdentity` and addresses the sub-rectangle by
+    /// offset + the **parent's** row pitch (so each row lands at the correct
+    /// columns). `convert(src, &mut dst.view(rect), …)` renders into that
+    /// sub-rectangle of `dst`; a letterbox fit then clears the view and renders
+    /// the aspect-preserved content into its inner region. `view`/`batch`/the
+    /// whole tensor are the one coherent destination model — there is no
+    /// separate `dst_rect`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RegionOutOfBounds`] if `region` exceeds the image bounds.
+    /// - [`Error::InvalidOperation`] if the tensor is not a packed-format image
+    ///   (planar/semi-planar spatial sub-rects are not a single strided window;
+    ///   use [`batch`](Self::batch) for batched planar tensors).
+    pub fn view(&self, region: Region) -> Result<Tensor<T>> {
+        let fmt = self.format.ok_or_else(|| {
+            Error::InvalidOperation("view() requires a formatted image tensor".into())
+        })?;
+        if fmt.layout() != PixelLayout::Packed {
+            return Err(Error::InvalidOperation(format!(
+                "view() supports packed formats only (got {fmt:?}); use batch(n) for batched \
+                 planar tensors"
+            )));
+        }
+        let w = self
+            .width()
+            .ok_or_else(|| Error::InvalidOperation("view(): tensor has no image width".into()))?;
+        let h = self
+            .height()
+            .ok_or_else(|| Error::InvalidOperation("view(): tensor has no image height".into()))?;
+        if !region.fits_within(w, h) {
+            return Err(Error::RegionOutOfBounds {
+                region,
+                bounds: (w, h),
+            });
+        }
+        let elem = std::mem::size_of::<T>();
+        let bpp = fmt.channels() * elem;
+        let stride = self.effective_row_stride().unwrap_or(w * bpp);
+        let offset = region
+            .y
+            .checked_mul(stride)
+            .and_then(|yo| yo.checked_add(region.x.checked_mul(bpp)?))
+            .ok_or(Error::InvalidSize(region.y))?;
+        let sub_shape = fmt
+            .image_shape(region.width, region.height)
+            .ok_or_else(|| Error::InvalidShape(format!("view(): invalid shape for {fmt:?}")))?;
+        let mut t = self.subview(offset, &sub_shape)?;
+        // A multi-row sub-rect must advance rows by the PARENT pitch so each row
+        // addresses the correct columns. A single-row view uses its own tight
+        // stride — the parent pitch would make the strided `map()` (which exposes
+        // `stride × rows`) expose a trailing row that runs past the buffer tail
+        // for an offset (x>0 / bottom) view. The GL backend does NOT rely on this
+        // (single-row-tight) `row_stride`: it reads the parent pitch from
+        // `view_origin.parent_row_stride` so its import/cache pitch stays
+        // parent-consistent for views of any height — see `ViewOrigin`.
+        let view_stride = if region.height > 1 {
+            stride
+        } else {
+            region.width * bpp
+        };
+        t.set_row_stride_unchecked(view_stride);
+        // Snapshot the parent `(w, h, row_stride)` so the GL backend imports the
+        // parent once (keyed on the parent pitch, not this view's possibly-tight
+        // single-row stride) and renders this sub-rect as a `glViewport`/
+        // `glScissor` ROI at `(region.x, region.y)`. Composes when viewing an
+        // existing view.
+        t.view_origin = Some(self.compose_view_origin(w, h, stride, region.x, region.y));
+        Ok(t)
+    }
+
+    /// Build the [`ViewOrigin`] for a new sub-region of `self`. When `self` is a
+    /// whole tensor the snapshot names `self` as the parent; when `self` is
+    /// already a view, the snapshot keeps the **root** parent and accumulates the
+    /// local origin so nested views still resolve to one import.
+    fn compose_view_origin(
+        &self,
+        parent_width: usize,
+        parent_height: usize,
+        parent_row_stride: usize,
+        x: usize,
+        y: usize,
+    ) -> ViewOrigin {
+        match self.view_origin {
+            Some(root) => ViewOrigin {
+                parent_width: root.parent_width,
+                parent_height: root.parent_height,
+                parent_row_stride: root.parent_row_stride,
+                x: root.x.saturating_add(x),
+                y: root.y.saturating_add(y),
+            },
+            None => ViewOrigin {
+                parent_width,
+                parent_height,
+                parent_row_stride,
+                x,
+                y,
+            },
+        }
     }
 
     /// Downcast to PBO tensor reference (for GL backends).
@@ -2505,6 +2764,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            view_origin: None,
         }
     }
 
@@ -2767,10 +3027,13 @@ where
                 // DMA-BUF — so a strided CPU view is sound and zero-copy.
                 #[cfg(target_os = "macos")]
                 TensorStorage::Dma(io) => {
-                    if total_bytes > io.buf_size {
+                    // A sub-view's window is `buf_size − view_offset`; the strided
+                    // span must fit the window, not the whole surface.
+                    let available = io.buf_size.saturating_sub(io.view_offset);
+                    if total_bytes > available {
                         return Err(Error::InsufficientCapacity {
                             needed: total_bytes,
-                            capacity: io.buf_size,
+                            capacity: available,
                         });
                     }
                     return io.map_with_byte_size(total_bytes);
@@ -2782,11 +3045,12 @@ where
                     // can iterate rows via `effective_row_stride()` without
                     // running past the slice — the logical `pbo.map()` view would
                     // stop after `shape.product()` and lose bytes past row 0.
-                    let capacity = pbo.capacity_bytes();
-                    if total_bytes > capacity {
+                    // A sub-view's window is `capacity − view_offset`.
+                    let available = pbo.capacity_bytes().saturating_sub(pbo.view_offset);
+                    if total_bytes > available {
                         return Err(Error::InsufficientCapacity {
                             needed: total_bytes,
-                            capacity,
+                            capacity: available,
                         });
                     }
                     return pbo.map_with_byte_size(total_bytes);
@@ -2808,19 +3072,23 @@ where
             }
         }
         // Offset tensors are supported for storages that apply the offset
-        // inside their own `map()`: DMA (`DmaMap` adjusts the mmap range), Mem
-        // (`MemMap` adjusts the slice base), and Shm (`ShmMap` adjusts the slice
-        // base). Other backings have no sub-region concept, so a non-zero
-        // offset is rejected.
+        // inside their own `map()`: DMA (`DmaMap`/IOSurface adjust the mapped
+        // base), Mem (`MemMap` adjusts the slice base), Shm (`ShmMap` adjusts
+        // the slice base), and PBO (the staged copy starts at the offset). Every
+        // self-allocated backing now carries a sub-region concept via `view`, so
+        // a non-zero offset is honoured rather than rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
-            let supported = matches!(self.storage, TensorStorage::Mem(_));
-            #[cfg(target_os = "linux")]
+            let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
+            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF — both
+            // apply the offset in their map. (`Dma` is the same variant name on
+            // both, hence one `cfg(any(...))` arm rather than two.)
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
             #[cfg(unix)]
             let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
             if !supported {
                 return Err(Error::InvalidOperation(
-                    "plane offset only supported for DMA, Mem, and Shm tensors".into(),
+                    "plane offset only supported for DMA, Mem, Shm, and PBO tensors".into(),
                 ));
             }
         }
@@ -3761,6 +4029,97 @@ mod tests {
     }
 
     #[test]
+    fn batch_partitions_leading_dim() {
+        // Raw [4,2,2,3] u8 batched tensor: 4 elements of 12 bytes each. batch(n)
+        // yields element n at offset n*12, sharing the parent buffer (zero-copy).
+        let parent = Tensor::<u8>::new(&[4, 2, 2, 3], Some(TensorMemory::Mem), None).unwrap();
+        for i in 0..4u8 {
+            let e = parent.batch(i as usize).expect("batch element");
+            assert_eq!(e.shape(), &[2, 2, 3]);
+            // A batch element shares the parent's BufferIdentity.
+            assert_eq!(e.buffer_identity().id(), parent.buffer_identity().id());
+            for b in e.map().unwrap().as_mut_slice() {
+                *b = i + 1;
+            }
+        }
+        // Each element occupies its own 12-byte band of the parent.
+        let whole = parent.map().unwrap();
+        let s = whole.as_slice();
+        for i in 0..4usize {
+            assert!(
+                s[i * 12..(i + 1) * 12].iter().all(|&b| b == (i as u8 + 1)),
+                "band {i} not partitioned: {:?}",
+                &s[i * 12..(i + 1) * 12]
+            );
+        }
+    }
+
+    #[test]
+    fn view_origin_snapshots_parent_and_composes() {
+        // view() on a whole image snapshots the parent dims + the view's origin.
+        let parent =
+            Tensor::<u8>::image(100, 80, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        assert_eq!(
+            parent.view_origin(),
+            None,
+            "whole tensor has no view_origin"
+        );
+        let v = parent.view(Region::new(10, 20, 30, 40)).unwrap();
+        assert_eq!(
+            v.view_origin(),
+            Some(ViewOrigin {
+                parent_width: 100,
+                parent_height: 80,
+                parent_row_stride: 100 * 4, // tight RGBA pitch
+                x: 10,
+                y: 20
+            })
+        );
+        // A view of a view keeps the ROOT parent and accumulates the origin.
+        let v2 = v.view(Region::new(5, 5, 10, 10)).unwrap();
+        assert_eq!(
+            v2.view_origin(),
+            Some(ViewOrigin {
+                parent_width: 100,
+                parent_height: 80,
+                parent_row_stride: 100 * 4,
+                x: 15,
+                y: 25
+            }),
+            "nested view composes onto the root parent"
+        );
+    }
+
+    #[test]
+    fn view_origin_none_for_raw_batch() {
+        // A raw (unformatted) batched tensor has no pixel geometry, so batch()
+        // leaves view_origin None (the per-slot path, not the one-import pivot).
+        let parent = Tensor::<u8>::new(&[4, 2, 2, 3], Some(TensorMemory::Mem), None).unwrap();
+        assert_eq!(parent.batch(2).unwrap().view_origin(), None);
+    }
+
+    #[test]
+    fn batch_rejects_out_of_bounds_index() {
+        let parent = Tensor::<u8>::new(&[4, 2, 2, 3], Some(TensorMemory::Mem), None).unwrap();
+        match parent.batch(4) {
+            Err(Error::BatchIndexOutOfBounds { index, batch }) => {
+                assert_eq!((index, batch), (4, 4));
+            }
+            other => panic!("expected BatchIndexOutOfBounds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_zero_on_unit_n_is_whole() {
+        // N == 1: batch(0) is the whole per-element block at offset 0 (no plane_offset).
+        let parent = Tensor::<u8>::new(&[1, 2, 2, 3], Some(TensorMemory::Mem), None).unwrap();
+        let e = parent.batch(0).unwrap();
+        assert_eq!(e.shape(), &[2, 2, 3]);
+        assert_eq!(e.plane_offset(), None);
+        assert_eq!(e.buffer_identity().id(), parent.buffer_identity().id());
+    }
+
+    #[test]
     fn mem_subview_rejects_unaligned_offset() {
         // f32 has align 4; a byte offset of 2 cannot back a valid `*const f32`.
         let parent = Tensor::<f32>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
@@ -3968,6 +4327,44 @@ mod tests {
             0xBB,
             "row 1 writes at parent offset 128 + stride"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn view_single_row_snapshots_parent_stride() {
+        // A single-row `view()` keeps a TIGHT `row_stride` for map-span safety,
+        // but its `view_origin` snapshots the PARENT row stride — the GL backend
+        // keys its EGLImage import/pitch on that snapshot (not the view's tight
+        // stride), so single-row and multi-row sibling views collapse onto the
+        // same parent import.
+        let _lock = FD_LOCK.read().unwrap();
+        // 8x4 RGBA with a padded 64-byte row stride (tight row = 8*4 = 32).
+        let parent = match Tensor::<u8>::image_with_stride(
+            8,
+            4,
+            PixelFormat::Rgba,
+            64,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIPPED: DMA not available");
+                return;
+            }
+        };
+        assert_eq!(parent.effective_row_stride(), Some(64));
+        // Bottom row (y=3) at x>0 — the case the tight single-row stride guards.
+        let row = parent.view(Region::new(2, 3, 4, 1)).unwrap();
+        // The view's own stride is tight (4*4 = 16) so its strided map stays in
+        // bounds; the GL-facing parent pitch (64) lives in `view_origin`.
+        assert_eq!(row.effective_row_stride(), Some(16));
+        let vo = row.view_origin().expect("a view carries a view_origin");
+        assert_eq!(
+            vo.parent_row_stride, 64,
+            "GL keys/pitches a view on the parent stride, not its tight one"
+        );
+        // The tight stride keeps map() in-bounds for the bottom / x>0 single row.
+        assert_eq!(row.map().unwrap().as_slice().len(), 16);
     }
 
     #[test]

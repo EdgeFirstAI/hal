@@ -18,10 +18,10 @@
 
 mod common;
 
-use common::{calculate_letterbox, run_bench, BenchSuite};
+use common::{run_bench, BenchSuite};
 
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rect, Rotation};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn};
 
 const WARMUP: usize = 10;
@@ -115,12 +115,8 @@ fn bench_decode_convert(
 
     for img in TEST_IMAGES {
         let data = load_image_data(img.filename);
-        let (left, top, new_w, new_h) =
-            calculate_letterbox(img.width, img.height, MODEL_W, MODEL_H);
-        let crop = Crop::new()
-            .with_src_rect(Some(Rect::new(0, 0, img.width, img.height)))
-            .with_dst_rect(Some(Rect::new(left, top, new_w, new_h)))
-            .with_dst_color(Some([114, 114, 114, 255]));
+        // Full-source letterbox: placement derived internally by `Crop::resolve`.
+        let crop = Crop::letterbox([114, 114, 114, 255]);
 
         // Warmup all paths
         for _ in 0..WARMUP {

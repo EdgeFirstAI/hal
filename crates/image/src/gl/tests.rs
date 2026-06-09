@@ -561,8 +561,8 @@ mod gl_tests {
             Some(TensorMemory::Dma),
         )
         .unwrap();
-        let mut view0 = parent.subview(0, &[h, w, 4]).unwrap();
-        let mut view1 = parent.subview(frame, &[h, w, 4]).unwrap();
+        let mut view0 = parent.view(crate::Region::new(0, 0, w, h)).unwrap();
+        let mut view1 = parent.view(crate::Region::new(0, h, w, h)).unwrap();
         assert_eq!(view1.plane_offset(), Some(frame));
 
         convert(&mut gl, &src0, &mut view0);
@@ -1248,21 +1248,11 @@ mod gl_tests {
 
     /// Build a letterbox crop that fits src into dst_w x dst_h, preserving aspect ratio.
     #[cfg(feature = "dma_test_formats")]
-    fn letterbox_crop(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Crop {
-        let src_aspect = src_w as f64 / src_h as f64;
-        let dst_aspect = dst_w as f64 / dst_h as f64;
-        let (new_w, new_h) = if src_aspect > dst_aspect {
-            let new_h = (dst_w as f64 / src_aspect).round() as usize;
-            (dst_w, new_h)
-        } else {
-            let new_w = (dst_h as f64 * src_aspect).round() as usize;
-            (new_w, dst_h)
-        };
-        let left = (dst_w - new_w) / 2;
-        let top = (dst_h - new_h) / 2;
-        Crop::new()
-            .with_dst_rect(Some(crate::Rect::new(left, top, new_w, new_h)))
-            .with_dst_color(Some([114, 114, 114, 255]))
+    fn letterbox_crop(_src_w: usize, _src_h: usize, _dst_w: usize, _dst_h: usize) -> Crop {
+        // Letterbox placement is now computed by the backend from the actual
+        // src/dst dims (identical centred aspect-fit math); the helper just
+        // selects the pad colour.
+        Crop::letterbox([114, 114, 114, 255])
     }
 
     /// Strip alpha from PixelFormat::Rgba bytes → packed PixelFormat::Rgb bytes.
@@ -2035,6 +2025,16 @@ mod gl_tests {
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
         assert!(src_multiplane.as_u8().unwrap().is_multiplane());
 
+        // Pin BOTH sources to the SAME conversion path (ExternalSampler) so this
+        // test isolates multiplane IMPORT correctness from path *selection*.
+        // Under `auto` the contiguous single-plane source takes ShaderR8 (exact
+        // in-shader YUV→RGB) while multiplane is forced to ExternalSampler
+        // (driver YUV, ~6/255 off on Vivante) — a benchmark-driven split
+        // (ExternalSampler ≈10× faster on Vivante), not an import bug. With both
+        // on ExternalSampler, two imports of identical bytes must yield identical
+        // pixels on every GPU, so the compare is byte-exact on all DMA boards.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Convert contiguous
@@ -2077,18 +2077,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare pixel-for-pixel (should be identical — same data, different import path)
+        // Same bytes, two import paths, one conversion path → byte-identical.
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
         let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - contiguous vs multiplane NV12 take different GPU paths off Vivante \
-                 (single-plane Path B vs multiplane Path A); equality returns once Path B handles \
-                 multiplane.",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
@@ -2152,6 +2143,12 @@ mod gl_tests {
             .with_stride(stride)
             .with_offset(y_size);
 
+        // Force both the same-fd multiplane and contiguous sources onto the
+        // ExternalSampler path so the comparison tests import correctness, not
+        // path selection (see test_multiplane_nv12_to_rgba_opengl for the
+        // benchmark-driven rationale). Byte-exact on every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let proc = crate::ImageProcessor::new().unwrap();
         let src = proc
             .import_image(
@@ -2214,16 +2211,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare: same-fd multiplane and contiguous must produce identical pixels
+        // Same-fd multiplane and contiguous must produce identical pixels.
         let map_same = dst_same_fd.as_u8().unwrap().map().unwrap();
         let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_same.as_slice(), map_contig.as_slice(), 0);
     }
 
@@ -2236,6 +2226,11 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
+
+        // Pin both sources to ExternalSampler so the packed-RGB letterbox compare
+        // tests multiplane import correctness, not path selection (see
+        // test_multiplane_nv12_to_rgba_opengl). Byte-exact on every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -2294,13 +2289,6 @@ mod gl_tests {
 
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
         let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
@@ -2313,6 +2301,13 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
+
+        // Pin both sources to ExternalSampler. Critical for int8: the XOR-0x80
+        // packing amplifies any path-selection color delta straddling 0x80 into a
+        // ~250-unit byte diff (e.g. 126↔132 → 254↔2), so the two sources MUST
+        // share one conversion path. This tests multiplane import correctness;
+        // see test_multiplane_nv12_to_rgba_opengl for the benchmark rationale.
+        let _nv_path = NvPathEnvGuard::set("sampler");
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -2378,13 +2373,6 @@ mod gl_tests {
         let multi_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(map_multi.as_slice().as_ptr().cast(), map_multi.len())
         };
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (int8 amplifies the delta)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
 
@@ -3412,6 +3400,12 @@ mod gl_tests {
             return;
         }
 
+        // Pin both the true-multiplane (separate fds) and contiguous sources to
+        // ExternalSampler so the compare tests import correctness, not path
+        // selection (see test_multiplane_nv12_to_rgba_opengl). Byte-exact on
+        // every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
         let height: usize = 720;
@@ -3510,16 +3504,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare: true multiplane and contiguous must produce identical pixels
+        // True multiplane and contiguous must produce identical pixels.
         let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
         let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_multi.as_slice(), map_contig.as_slice(), 0);
     }
 
@@ -3742,7 +3729,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Crop only the right (blue) half
-        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(
+        let crop = Crop::new().with_source(Some(crate::Region::new(
             src_w / 2, // left = start of blue region
             0,
             src_w / 2, // width = blue half
@@ -3806,7 +3793,7 @@ mod gl_tests {
 
         // Crop the right half — the left boundary is exactly at the red→blue edge
         let crop =
-            Crop::new().with_src_rect(Some(crate::Rect::new(src_w / 2, 0, src_w / 2, src_h)));
+            Crop::new().with_source(Some(crate::Region::new(src_w / 2, 0, src_w / 2, src_h)));
 
         if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
@@ -3852,7 +3839,7 @@ mod gl_tests {
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Crop only the left (red) half
-        let crop = Crop::new().with_src_rect(Some(crate::Rect::new(0, 0, src_w / 2, src_h)));
+        let crop = Crop::new().with_source(Some(crate::Region::new(0, 0, src_w / 2, src_h)));
 
         if let Err(e) = gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop) {
             // Vivante GL rejects RGB source textures. The src_rect no-bleed crop
@@ -4543,7 +4530,7 @@ mod gl_tests {
     ///   and in-range)
     #[test]
     fn convert_f32_pbo_letterbox_pad_color() {
-        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig, Rect};
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -4600,9 +4587,7 @@ mod gl_tests {
 
         // Letterbox: content lands in columns [2, 6); columns [0, 2) and
         // [6, 8) are padded with the `dst_color`.
-        let crop = Crop::new()
-            .with_dst_rect(Some(Rect::new(2, 0, 4, 4)))
-            .with_dst_color(Some([114, 114, 114, 255]));
+        let crop = Crop::letterbox([114, 114, 114, 255]);
 
         let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop);
         assert!(
@@ -5550,7 +5535,7 @@ mod gl_tests {
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn probe_nv12_packed_letterbox_divergence() {
         use crate::opengl_headless::processor::GLProcessorST;
-        use crate::Rect;
+        use crate::{Fit, Region};
         if !is_dma_available() {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
@@ -5580,11 +5565,15 @@ mod gl_tests {
         let scaled_h = (sh as f32 * scale).round() as usize;
         let pad_x = (model - scaled_w) / 2;
         let pad_y = (model - scaled_h) / 2;
+        // Letterbox is now a resize mode (`Fit::Letterbox`); the backend computes
+        // the aspect-fit placement (pad_x/pad_y/scaled_*) internally via
+        // `Crop::resolve`, so the test no longer hand-builds a destination rect.
         let letterbox = || {
             Crop::new()
-                .with_src_rect(Some(Rect::new(0, 0, sw, sh)))
-                .with_dst_rect(Some(Rect::new(pad_x, pad_y, scaled_w, scaled_h)))
-                .with_dst_color(Some([114, 114, 114, 255]))
+                .with_source(Some(Region::new(0, 0, sw, sh)))
+                .with_fit(Fit::Letterbox {
+                    pad: [114, 114, 114, 255],
+                })
         };
 
         let gl_packed = |env: &str, crop: Crop, dw: usize, dh: usize| -> Option<(usize, Vec<u8>)> {

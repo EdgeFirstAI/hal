@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Crop, Error, Flip, FunctionTimer, Rect, Result, Rotation};
+use crate::{Error, Flip, FunctionTimer, Rect, ResolvedCrop, Result, Rotation};
 use edgefirst_tensor::{PixelFormat, Tensor, TensorMapTrait, TensorTrait};
 use ndarray::{ArrayView3, ArrayViewMut3, Axis};
 use rayon::iter::IndexedParallelIterator;
@@ -68,7 +68,7 @@ impl CPUProcessor {
         fmt: PixelFormat,
         rotation: Rotation,
         flip: Flip,
-        crop: Crop,
+        crop: ResolvedCrop,
     ) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();

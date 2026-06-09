@@ -14,8 +14,8 @@ use edgefirst_codec::{CodecError, ImageDecoder, ImageLoad};
 use edgefirst_decoder::{DetectBox, Segmentation};
 #[allow(deprecated)]
 use edgefirst_image::{
-    save_jpeg, ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig,
-    ImageProcessorTrait, MaskResolution, Rect, Rotation,
+    save_jpeg, ComputeBackend, Crop, Fit, Flip, ImageProcessor, ImageProcessorConfig,
+    ImageProcessorTrait, MaskResolution, Region, Rotation,
 };
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorDyn, TensorMemory};
 use edgefirst_tracker::TrackInfo;
@@ -227,72 +227,70 @@ impl From<HalColorMode> for edgefirst_image::ColorMode {
     }
 }
 
-/// Rectangle structure for defining regions.
+/// Rectangular region (pixels) for a source crop.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HalRect {
-    /// Left edge (x coordinate)
-    pub left: size_t,
-    /// Top edge (y coordinate)
-    pub top: size_t,
-    /// Width of the rectangle
+pub struct HalRegion {
+    /// X coordinate (left edge)
+    pub x: size_t,
+    /// Y coordinate (top edge)
+    pub y: size_t,
+    /// Width in pixels
     pub width: size_t,
-    /// Height of the rectangle
+    /// Height in pixels
     pub height: size_t,
 }
 
-impl From<HalRect> for Rect {
-    fn from(rect: HalRect) -> Self {
-        Rect::new(rect.left, rect.top, rect.width, rect.height)
+impl From<HalRegion> for Region {
+    fn from(r: HalRegion) -> Self {
+        Region::new(r.x, r.y, r.width, r.height)
     }
 }
 
-/// Crop configuration for image conversion.
+/// Stretch fit (fill the destination).
+pub const HAL_FIT_STRETCH: i32 = 0;
+/// Letterbox fit (preserve source aspect, pad with `HalCrop::pad`).
+pub const HAL_FIT_LETTERBOX: i32 = 1;
+
+/// Crop configuration for image conversion — **source-side only**.
 ///
-/// Specifies source crop region, destination placement, and background color.
+/// Destination placement is the destination tensor itself: pass a
+/// `hal_tensor_view` / `hal_tensor_batch` sub-region as the `convert`
+/// destination to render into a tile. This struct selects the source
+/// sub-rectangle and the fit mode.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HalCrop {
-    /// Source rectangle to crop from
-    pub src_rect: HalRect,
-    /// Destination rectangle to place crop into
-    pub dst_rect: HalRect,
-    /// Background color (RGBA)
-    pub dst_color: [u8; 4],
-    /// Whether src_rect is set
-    pub has_src_rect: bool,
-    /// Whether dst_rect is set
-    pub has_dst_rect: bool,
-    /// Whether dst_color is set
-    pub has_dst_color: bool,
+    /// Source rectangle to sample from
+    pub source: HalRegion,
+    /// Whether `source` is set (else the whole source is sampled)
+    pub has_source: bool,
+    /// Fit mode: `HAL_FIT_STRETCH` or `HAL_FIT_LETTERBOX`
+    pub fit: i32,
+    /// Letterbox pad colour (RGBA), used when `fit == HAL_FIT_LETTERBOX`
+    pub pad: [u8; 4],
 }
 
 impl Default for HalCrop {
     fn default() -> Self {
         Self {
-            src_rect: HalRect::default(),
-            dst_rect: HalRect::default(),
-            dst_color: [0, 0, 0, 255],
-            has_src_rect: false,
-            has_dst_rect: false,
-            has_dst_color: false,
+            source: HalRegion::default(),
+            has_source: false,
+            fit: HAL_FIT_STRETCH,
+            pad: [0, 0, 0, 255],
         }
     }
 }
 
 impl From<HalCrop> for Crop {
     fn from(crop: HalCrop) -> Self {
-        let mut result = Crop::default();
-        if crop.has_src_rect {
-            result = result.with_src_rect(Some(crop.src_rect.into()));
-        }
-        if crop.has_dst_rect {
-            result = result.with_dst_rect(Some(crop.dst_rect.into()));
-        }
-        if crop.has_dst_color {
-            result = result.with_dst_color(Some(crop.dst_color));
-        }
-        result
+        let source = crop.has_source.then(|| crop.source.into());
+        let fit = if crop.fit == HAL_FIT_LETTERBOX {
+            Fit::Letterbox { pad: crop.pad }
+        } else {
+            Fit::Stretch
+        };
+        Crop { source, fit }
     }
 }
 
@@ -308,75 +306,51 @@ pub struct HalImageProcessor {
 // Rect and Crop Helper Functions
 // ============================================================================
 
-/// Create a new rectangle.
+/// Create a new region.
 ///
-/// @param left Left edge (x coordinate)
-/// @param top Top edge (y coordinate)
-/// @param width Width of the rectangle
-/// @param height Height of the rectangle
-/// @return New rectangle structure
+/// @param x Left edge (x coordinate)
+/// @param y Top edge (y coordinate)
+/// @param width Width of the region
+/// @param height Height of the region
+/// @return New region structure
 #[no_mangle]
-pub extern "C" fn hal_rect_new(
-    left: size_t,
-    top: size_t,
-    width: size_t,
-    height: size_t,
-) -> HalRect {
-    HalRect {
-        left,
-        top,
+pub extern "C" fn hal_region_new(x: size_t, y: size_t, width: size_t, height: size_t) -> HalRegion {
+    HalRegion {
+        x,
+        y,
         width,
         height,
     }
 }
 
-/// Create a new default crop configuration.
+/// Create a new default crop configuration (whole source, stretch fit).
 ///
-/// @return New crop structure with all fields unset
+/// @return New crop structure
 #[no_mangle]
 pub extern "C" fn hal_crop_new() -> HalCrop {
     HalCrop::default()
 }
 
-/// Set the source rectangle for a crop configuration.
+/// Set the source sampling region for a crop configuration.
 ///
 /// @param crop Crop configuration to modify
-/// @param rect Source rectangle (can be NULL to clear)
+/// @param region Source region (can be NULL to clear → whole source)
 #[no_mangle]
-pub unsafe extern "C" fn hal_crop_set_src_rect(crop: *mut HalCrop, rect: *const HalRect) {
+pub unsafe extern "C" fn hal_crop_set_source(crop: *mut HalCrop, region: *const HalRegion) {
     if crop.is_null() {
         return;
     }
     unsafe {
-        if rect.is_null() {
-            (*crop).has_src_rect = false;
+        if region.is_null() {
+            (*crop).has_source = false;
         } else {
-            (*crop).src_rect = *rect;
-            (*crop).has_src_rect = true;
+            (*crop).source = *region;
+            (*crop).has_source = true;
         }
     }
 }
 
-/// Set the destination rectangle for a crop configuration.
-///
-/// @param crop Crop configuration to modify
-/// @param rect Destination rectangle (can be NULL to clear)
-#[no_mangle]
-pub unsafe extern "C" fn hal_crop_set_dst_rect(crop: *mut HalCrop, rect: *const HalRect) {
-    if crop.is_null() {
-        return;
-    }
-    unsafe {
-        if rect.is_null() {
-            (*crop).has_dst_rect = false;
-        } else {
-            (*crop).dst_rect = *rect;
-            (*crop).has_dst_rect = true;
-        }
-    }
-}
-
-/// Set the background color for a crop configuration.
+/// Configure letterbox fit with the given pad colour (RGBA).
 ///
 /// @param crop Crop configuration to modify
 /// @param r Red component (0-255)
@@ -384,13 +358,13 @@ pub unsafe extern "C" fn hal_crop_set_dst_rect(crop: *mut HalCrop, rect: *const 
 /// @param b Blue component (0-255)
 /// @param a Alpha component (0-255)
 #[no_mangle]
-pub unsafe extern "C" fn hal_crop_set_dst_color(crop: *mut HalCrop, r: u8, g: u8, b: u8, a: u8) {
+pub unsafe extern "C" fn hal_crop_set_letterbox(crop: *mut HalCrop, r: u8, g: u8, b: u8, a: u8) {
     if crop.is_null() {
         return;
     }
     unsafe {
-        (*crop).dst_color = [r, g, b, a];
-        (*crop).has_dst_color = true;
+        (*crop).fit = HAL_FIT_LETTERBOX;
+        (*crop).pad = [r, g, b, a];
     }
 }
 
@@ -880,6 +854,77 @@ pub unsafe extern "C" fn hal_image_processor_convert(
         ),
         libc::EIO
     );
+    0
+}
+
+/// Convert without waiting for the GPU — the batch-preprocessing primitive.
+///
+/// Identical to [`hal_image_processor_convert`](hal_image_processor_convert)
+/// except the OpenGL backend does **not** issue the per-call `glFinish()`. Render
+/// `N` model inputs by looping this over row-band views of one batched
+/// destination (each `dst` a `hal_tensor_view` / `hal_tensor_batch` sub-region of
+/// the same buffer) and then call [`hal_image_processor_flush`] **once**: the
+/// backend imports the destination a single time and renders each tile as a
+/// `glViewport` band, syncing once at flush. The result of a deferred convert is
+/// **not** safe to read on the CPU (or map via CUDA) until `flush` returns
+/// (CUDA map auto-flushes). Non-GL backends complete synchronously and `flush`
+/// is a no-op.
+///
+/// @param processor Image processor handle
+/// @param src Source image tensor
+/// @param dst Destination image tensor (typically a `hal_tensor_view`/`batch` tile)
+/// @param rotation Rotation to apply
+/// @param flip Flip to apply
+/// @param crop Crop configuration (can be NULL for no crop)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/src/dst)
+/// - EIO: Conversion failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_convert_deferred(
+    processor: *mut HalImageProcessor,
+    src: *const HalTensor,
+    dst: *mut HalTensor,
+    rotation: HalRotation,
+    flip: HalFlip,
+    crop: *const HalCrop,
+) -> c_int {
+    check_null!(processor, src, dst);
+
+    let crop_config = if crop.is_null() {
+        Crop::default()
+    } else {
+        unsafe { *crop }.into()
+    };
+
+    try_or_errno!(
+        unsafe { &mut (*processor) }.inner.convert_deferred(
+            &unsafe { &(*src) }.inner,
+            &mut unsafe { &mut (*dst) }.inner,
+            rotation.into(),
+            flip.into(),
+            crop_config,
+        ),
+        libc::EIO
+    );
+    0
+}
+
+/// Complete all deferred converts since the last flush with a single GPU sync.
+///
+/// After this returns, every destination written by
+/// [`hal_image_processor_convert_deferred`] is finished and safe to read back or
+/// `cuda_map`. Backends with no deferred path return success immediately.
+///
+/// @param processor Image processor handle
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor)
+/// - EIO: Flush failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_flush(processor: *mut HalImageProcessor) -> c_int {
+    check_null!(processor);
+    try_or_errno!(unsafe { &mut (*processor) }.inner.flush(), libc::EIO);
     0
 }
 
@@ -1919,74 +1964,51 @@ mod tests {
     }
 
     #[test]
-    fn test_rect_and_crop() {
-        let rect = hal_rect_new(10, 20, 100, 200);
-        assert_eq!(rect.left, 10);
-        assert_eq!(rect.top, 20);
-        assert_eq!(rect.width, 100);
-        assert_eq!(rect.height, 200);
+    fn test_region_and_crop() {
+        let region = hal_region_new(10, 20, 100, 200);
+        assert_eq!(region.x, 10);
+        assert_eq!(region.y, 20);
+        assert_eq!(region.width, 100);
+        assert_eq!(region.height, 200);
 
         unsafe {
             let mut crop = hal_crop_new();
-            assert!(!crop.has_src_rect);
-            assert!(!crop.has_dst_rect);
-            assert!(!crop.has_dst_color);
+            assert!(!crop.has_source);
+            assert_eq!(crop.fit, HAL_FIT_STRETCH);
 
-            hal_crop_set_src_rect(&mut crop, &rect);
-            assert!(crop.has_src_rect);
-            assert_eq!(crop.src_rect.left, 10);
+            hal_crop_set_source(&mut crop, &region);
+            assert!(crop.has_source);
+            assert_eq!(crop.source.x, 10);
 
-            hal_crop_set_dst_color(&mut crop, 255, 128, 0, 255);
-            assert!(crop.has_dst_color);
-            assert_eq!(crop.dst_color, [255, 128, 0, 255]);
+            hal_crop_set_letterbox(&mut crop, 255, 128, 0, 255);
+            assert_eq!(crop.fit, HAL_FIT_LETTERBOX);
+            assert_eq!(crop.pad, [255, 128, 0, 255]);
         }
     }
 
     #[test]
-    fn test_crop_dst_rect() {
-        unsafe {
-            let rect = hal_rect_new(50, 60, 200, 300);
-            let mut crop = hal_crop_new();
-
-            hal_crop_set_dst_rect(&mut crop, &rect);
-            assert!(crop.has_dst_rect);
-            assert_eq!(crop.dst_rect.left, 50);
-            assert_eq!(crop.dst_rect.top, 60);
-            assert_eq!(crop.dst_rect.width, 200);
-            assert_eq!(crop.dst_rect.height, 300);
-        }
-    }
-
-    #[test]
-    fn test_crop_set_null_rect() {
+    fn test_crop_set_null_source() {
         unsafe {
             let mut crop = hal_crop_new();
-
-            // Setting NULL rect should be no-op
-            hal_crop_set_src_rect(&mut crop, std::ptr::null());
-            assert!(!crop.has_src_rect);
-
-            hal_crop_set_dst_rect(&mut crop, std::ptr::null());
-            assert!(!crop.has_dst_rect);
+            // Setting NULL source is a no-op (whole source).
+            hal_crop_set_source(&mut crop, std::ptr::null());
+            assert!(!crop.has_source);
         }
     }
 
     #[test]
     fn test_crop_conversion_to_rust() {
         let mut crop = hal_crop_new();
-        let rect = hal_rect_new(10, 20, 100, 200);
+        let region = hal_region_new(10, 20, 100, 200);
 
         unsafe {
-            hal_crop_set_src_rect(&mut crop, &rect);
-            hal_crop_set_dst_rect(&mut crop, &rect);
-            hal_crop_set_dst_color(&mut crop, 255, 0, 0, 255);
+            hal_crop_set_source(&mut crop, &region);
+            hal_crop_set_letterbox(&mut crop, 255, 0, 0, 255);
         }
 
-        // Convert to Rust Crop and check
         let rust_crop: Crop = crop.into();
-        assert!(rust_crop.src_rect.is_some());
-        assert!(rust_crop.dst_rect.is_some());
-        assert!(rust_crop.dst_color.is_some());
+        assert!(rust_crop.source.is_some());
+        assert!(matches!(rust_crop.fit, Fit::Letterbox { pad } if pad == [255, 0, 0, 255]));
     }
 
     #[test]

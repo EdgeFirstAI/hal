@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
+  C API, Python): render `N` model inputs into row-band views of one batched
+  destination as **one GPU import + one sync**. Loop
+  `convert_deferred(src, &mut dst.batch(n), …)` then call `flush()` once. A
+  `view()`/`batch()` destination resolves its **parent** (the new
+  `Tensor::view_origin()` snapshot), so the OpenGL backend keys the destination
+  EGLImage on the parent identity+geometry — every sibling tile shares a single
+  import and renders to its band via `glViewport`/`glScissor` (the tile offset is
+  render state, never a cache key). `convert_deferred` skips the per-tile
+  `glFinish`; `flush` issues one `finish_via_fence`; the CUDA `cuda_map` path
+  auto-flushes a pending batch before mapping, so device reads never see an
+  in-flight render. Non-GL backends (CPU/G2D) run an eager per-tile convert and
+  treat `flush` as a no-op. C API: `hal_image_processor_convert_deferred()` /
+  `hal_image_processor_flush()`; Python: `ImageProcessor.convert_deferred()` /
+  `.flush()`. **v1 scope:** the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path;
+  two-pass packed-`Rgb`, planar, non-DMA/PBO/float GL, G2D, and macOS GL decline a
+  view destination and fall back to the CPU backend (correct via offset + parent
+  stride). Validated on-target (rpi5/V3D, orin-nano/CUDA, i.MX95, i.MX8MP/Vivante).
 - **GPU NV12/NV16/NV24 conversion on non-DMA (heap/PBO) backends**
   (`edgefirst-image`): the in-shader R8 (`ShaderR8`) path now also runs when
   DMA-BUF EGLImage import is unavailable (e.g. NVIDIA Jetson Orin) by uploading
@@ -351,12 +369,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without `/dev/dma_heap`), where reconfiguring the `3·H` GREY pool to a smaller
   `NV12`/`NV16`/`NV24` shape failed with a `ShapeMismatch`. DMA-backed pools were
   unaffected.
-- GPU and heap sub-region views now honor `plane_offset`. The OpenGL EGLImage
-  cache key includes the plane offset, so offset-distinct views of one DMA-BUF
-  no longer alias the offset-0 image (previously every view rendered/sampled the
-  base region — capping batched render-to-DMA-BUF). Heap (`Mem`) tensors map
-  correctly at non-zero offsets, and the shared backing uses interior-mutable
-  cells so disjoint sub-views carry correct write provenance.
+- GPU and heap sub-region views (`view()`/`batch()`) render to their windows
+  without aliasing. The OpenGL EGLImage import keys on the view's **parent**
+  identity+geometry, so all sibling views of one DMA-BUF share a single import and
+  each renders to its sub-rect via `glViewport`/`glScissor` — the tile offset is
+  render state, not part of the cache key — which is what enables one-import
+  batched render-to-DMA-BUF (see `convert_deferred`/`flush` above). Heap (`Mem`)
+  tensors map correctly at non-zero offsets, and the shared backing uses
+  interior-mutable cells so disjoint sub-views carry correct write provenance.
 - Odd-height NV12 from the V4L2 hardware JPEG decoder no longer drops its last
   chroma row (the MMAP copy used `final_h / 2`; now `ceil(final_h / 2)`).
 - **NV12 odd-dimension support.** The JPEG decoder previously rejected any

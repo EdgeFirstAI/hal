@@ -8,7 +8,7 @@
 //! so the shared GL render logic has one definition. Compiled on every platform
 //! (the `gl` module is feature-gated on `opengl`, not on the OS).
 
-use crate::{Crop, Error};
+use crate::{Error, ResolvedCrop};
 use std::ffi::CString;
 
 /// Compile a GLSL shader of `kind` from source; returns the shader id.
@@ -30,7 +30,12 @@ unsafe fn compile_shader(kind: u32, src: &str) -> crate::Result<u32> {
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut log_len = 0i32;
-        gls::gl::GetShaderInfoLog(shader, log.len() as i32, &mut log_len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetShaderInfoLog(
+            shader,
+            log.len() as i32,
+            &mut log_len,
+            log.as_mut_ptr() as *mut _,
+        );
         let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
         gls::gl::DeleteShader(shader);
         return Err(Error::OpenGl(format!(
@@ -91,7 +96,12 @@ pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> cr
     if ok == 0 {
         let mut log = [0u8; 4096];
         let mut log_len = 0i32;
-        gls::gl::GetProgramInfoLog(program, log.len() as i32, &mut log_len, log.as_mut_ptr() as *mut _);
+        gls::gl::GetProgramInfoLog(
+            program,
+            log.len() as i32,
+            &mut log_len,
+            log.as_mut_ptr() as *mut _,
+        );
         let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
         return Err(Error::OpenGl(format!("program link failed: {msg}")));
     }
@@ -124,8 +134,16 @@ pub(super) unsafe fn set_tex_filter(target: u32, filter: u32) {
 /// Requires a current GL context and a bound texture on `target`.
 pub(super) unsafe fn set_tex_filter_clamp(target: u32, filter: u32) {
     set_tex_filter(target, filter);
-    gls::gl::TexParameteri(target, gls::gl::TEXTURE_WRAP_S, gls::gl::CLAMP_TO_EDGE as i32);
-    gls::gl::TexParameteri(target, gls::gl::TEXTURE_WRAP_T, gls::gl::CLAMP_TO_EDGE as i32);
+    gls::gl::TexParameteri(
+        target,
+        gls::gl::TEXTURE_WRAP_S,
+        gls::gl::CLAMP_TO_EDGE as i32,
+    );
+    gls::gl::TexParameteri(
+        target,
+        gls::gl::TEXTURE_WRAP_T,
+        gls::gl::CLAMP_TO_EDGE as i32,
+    );
 }
 
 /// Check that the currently-bound draw framebuffer is complete.
@@ -153,7 +171,7 @@ pub(super) unsafe fn check_framebuffer_complete() -> Result<(), u32> {
 /// single-plane pixel coords; `pad_color` is normalized `[0,1]`. When a rect is
 /// `None` the whole image is sampled/painted (identity transform).
 pub(super) fn float_crop_uniforms(
-    crop: &Crop,
+    crop: &ResolvedCrop,
     src_w: usize,
     src_h: usize,
     dst_w: usize,
@@ -184,12 +202,12 @@ pub(super) fn float_crop_uniforms(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::float_crop_uniforms;
-    use crate::{Crop, Rect};
+    use crate::{Rect, ResolvedCrop};
 
     #[test]
     fn identity_crop_is_full_image() {
         let (src_uv, dst_px, pad) =
-            float_crop_uniforms(&Crop::no_crop(), 640, 480, 320, 240).unwrap();
+            float_crop_uniforms(&ResolvedCrop::no_crop(), 640, 480, 320, 240).unwrap();
         assert_eq!(src_uv, [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(dst_px, [0.0, 0.0, 320.0, 240.0]);
         assert_eq!(pad, [0.0, 0.0, 0.0]);
@@ -197,9 +215,9 @@ mod tests {
 
     #[test]
     fn src_rect_normalizes_to_source_dims() {
-        let crop = Crop {
+        let crop = ResolvedCrop {
             src_rect: Some(Rect::new(160, 120, 320, 240)),
-            ..Crop::no_crop()
+            ..ResolvedCrop::no_crop()
         };
         let (src_uv, _, _) = float_crop_uniforms(&crop, 640, 480, 320, 240).unwrap();
         assert_eq!(src_uv, [0.25, 0.25, 0.5, 0.5]);
@@ -207,10 +225,10 @@ mod tests {
 
     #[test]
     fn dst_rect_is_pixel_coords_and_pad_color_normalizes() {
-        let crop = Crop {
+        let crop = ResolvedCrop {
             dst_rect: Some(Rect::new(10, 20, 100, 50)),
             dst_color: Some([255, 128, 0, 255]),
-            ..Crop::no_crop()
+            ..ResolvedCrop::no_crop()
         };
         let (_, dst_px, pad) = float_crop_uniforms(&crop, 640, 480, 320, 240).unwrap();
         assert_eq!(dst_px, [10.0, 20.0, 100.0, 50.0]);
@@ -220,9 +238,9 @@ mod tests {
     #[test]
     fn out_of_bounds_src_rect_errors() {
         // src_rect exceeds the source extent → check_crop_dims rejects it first.
-        let crop = Crop {
+        let crop = ResolvedCrop {
             src_rect: Some(Rect::new(6, 0, 4, 4)), // 6 + 4 = 10 > src_w = 8
-            ..Crop::no_crop()
+            ..ResolvedCrop::no_crop()
         };
         let err = float_crop_uniforms(&crop, 8, 8, 8, 8).unwrap_err();
         assert!(
