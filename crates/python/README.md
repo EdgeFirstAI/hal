@@ -36,8 +36,9 @@ processor = ef.ImageProcessor()
 # memory type (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
 dst = processor.create_image(640, 640, ef.PixelFormat.Rgb)
 
-# Convert with letterbox resize (preserves aspect ratio)
-processor.convert(src, dst)
+# Convert with a letterbox resize (preserves aspect ratio, pads with grey).
+# Omit `letterbox=` to stretch-to-fill instead.
+processor.convert(src, dst, letterbox=[114, 114, 114, 255])
 
 # Access pixel data as a numpy array. Use the context manager + .numpy()
 # form — this is the portable pattern that works on both wheel variants.

@@ -60,12 +60,21 @@ impl DmaImportAttrs {
     ///
     /// This extracts all the fd/pitch/offset values that `eglCreateImage`
     /// needs without actually calling EGL.
-    pub fn from_tensor(src: &Tensor<u8>, src_fmt: PixelFormat) -> Result<Self, Error> {
-        // A view()/batch() sub-region imports its PARENT once (the tile is a
-        // glViewport ROI, not its own import): use the parent geometry at
-        // offset 0 so every sibling view shares one EGLImage. A whole tensor
-        // imports its own geometry at its own (possibly foreign) offset.
-        let view_origin = src.view_origin();
+    pub fn from_tensor(
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        for_dst: bool,
+    ) -> Result<Self, Error> {
+        // The parent-import collapse is a DESTINATION technique: a dst tile is a
+        // `glViewport` ROI into one parent EGLImage, so a `view()`/`batch()` dst
+        // imports the parent geometry at offset 0 and every sibling shares it. A
+        // SOURCE view must import its OWN region instead — otherwise it would
+        // import the parent but `convert()` would sample using the view's
+        // dimensions, reading the wrong region (source cropping is the view's
+        // region, lowered to sampling UVs). So only honor `view_origin` for
+        // destinations; a whole tensor (or any source) imports its own geometry
+        // at its own (possibly foreign) offset.
+        let view_origin = if for_dst { src.view_origin() } else { None };
         let (src_w, src_h) = match view_origin {
             Some(vo) => (vo.parent_width, vo.parent_height),
             None => (
@@ -463,6 +472,64 @@ mod tests {
         )
     }
 
+    /// A SOURCE view imports its OWN region (own dims + offset) so `convert()`
+    /// samples the right pixels; a DESTINATION view imports the PARENT (the tile
+    /// is a `glViewport` ROI). Guards the `for_dst` distinction — without it a
+    /// source view would import the parent but sample using the view's dims,
+    /// reading the wrong region.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn from_tensor_source_view_imports_own_region_dst_imports_parent() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: from_tensor_source_view... - DMA not available");
+            return;
+        }
+        // 64x64 RGBA with a padded 320-byte stride (tight row = 64*4 = 256).
+        let parent = match Tensor::<u8>::image_with_stride(
+            64,
+            64,
+            PixelFormat::Rgba,
+            320,
+            Some(TensorMemory::Dma),
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("SKIPPED: image_with_stride DMA unavailable");
+                return;
+            }
+        };
+        let view = parent
+            .view(edgefirst_tensor::Region::new(8, 8, 32, 16))
+            .unwrap();
+
+        // SOURCE (for_dst = false): import the view's OWN region.
+        let s = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, false).unwrap();
+        assert_eq!(
+            (s.width, s.height),
+            (32, 16),
+            "source view imports its own dimensions"
+        );
+        assert_eq!(
+            s.plane0_offset,
+            8 * 320 + 8 * 4,
+            "source view imports at its own byte offset"
+        );
+        assert_eq!(s.plane0_pitch, 320, "source view keeps the parent pitch");
+
+        // DESTINATION (for_dst = true): import the PARENT.
+        let d = DmaImportAttrs::from_tensor(&view, PixelFormat::Rgba, true).unwrap();
+        assert_eq!(
+            (d.width, d.height),
+            (64, 64),
+            "dest view imports the parent dimensions"
+        );
+        assert_eq!(
+            d.plane0_offset, 0,
+            "dest view imports the parent at offset 0"
+        );
+        assert_eq!(d.plane0_pitch, 320, "dest view imports at the parent pitch");
+    }
+
     /// True multiplane: separate DMA-BUFs for Y and UV (libcamera style).
     ///
     /// Verifies that plane0_fd and plane1.fd are different raw fds pointing
@@ -499,7 +566,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, Some(chroma_pd), width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
 
         // plane0 and plane1 should have DIFFERENT fds (separate DMA-BUFs)
         let p1 = attrs.plane1.as_ref().expect("NV12 must have plane1");
@@ -561,7 +628,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, Some(chroma_pd), width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
         let p1 = attrs.plane1.as_ref().expect("NV12 must have plane1");
 
         // plane0 and plane1 have DIFFERENT raw fds (each is a dup), but
@@ -607,7 +674,7 @@ mod tests {
             .unwrap()
             .with_stride(stride);
         let t66 = import_nv12(luma_pd, None, 66, height).unwrap();
-        let attrs = DmaImportAttrs::from_tensor(t66.as_u8().unwrap(), PixelFormat::Nv12)
+        let attrs = DmaImportAttrs::from_tensor(t66.as_u8().unwrap(), PixelFormat::Nv12, false)
             .expect("even-but-not-4-aligned NV12 width must import after the %4→%2 relaxation");
         assert_eq!(attrs.width, 66);
 
@@ -617,7 +684,8 @@ mod tests {
             .with_stride(stride);
         if let Ok(t65) = import_nv12(luma_pd2, None, 65, height) {
             assert!(
-                DmaImportAttrs::from_tensor(t65.as_u8().unwrap(), PixelFormat::Nv12).is_err(),
+                DmaImportAttrs::from_tensor(t65.as_u8().unwrap(), PixelFormat::Nv12, false)
+                    .is_err(),
                 "odd-width NV12 must still be rejected by the even-width gate"
             );
         }
@@ -651,7 +719,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, None, width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
         let p1 = attrs.plane1.as_ref().expect("NV12 must have plane1");
 
         // Contiguous: plane1_fd must be the EXACT SAME raw fd as plane0
@@ -699,7 +767,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, None, width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
         let p1 = attrs.plane1.as_ref().unwrap();
 
         // UV offset must use stride, not width
@@ -750,7 +818,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, Some(chroma_pd), width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
         let p1 = attrs.plane1.as_ref().unwrap();
 
         assert_eq!(attrs.plane0_pitch, luma_stride);
@@ -796,7 +864,7 @@ mod tests {
         let tensor = import_nv12(luma_pd, Some(chroma_pd), width, height).unwrap();
         let tensor_u8 = tensor.as_u8().unwrap();
 
-        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12).unwrap();
+        let attrs = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false).unwrap();
         let p1 = attrs.plane1.as_ref().unwrap();
 
         assert_eq!(attrs.plane0_offset, luma_offset);
@@ -846,7 +914,7 @@ mod tests {
         let tensor_u8 = tensor.as_u8().unwrap();
 
         // from_tensor must detect that the chroma offset exceeds the buffer
-        let err = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12);
+        let err = DmaImportAttrs::from_tensor(tensor_u8, PixelFormat::Nv12, false);
         assert!(
             err.is_err(),
             "from_tensor must reject chroma offset {y_size} on a {y_size}-byte buffer"
@@ -1164,12 +1232,13 @@ mod tests {
                     return;
                 }
             };
-            let attrs = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgba).unwrap_or_else(|e| {
-                panic!(
-                    "RGBA width {w} must pass the pre-check; got {e}. \
+            let attrs =
+                DmaImportAttrs::from_tensor(&t, PixelFormat::Rgba, false).unwrap_or_else(|e| {
+                    panic!(
+                        "RGBA width {w} must pass the pre-check; got {e}. \
                      Width%4 is not required for 4-bpp packed formats."
-                )
-            });
+                    )
+                });
             assert_eq!(attrs.width, w);
             assert_eq!(attrs.plane0_pitch, aligned);
         }
@@ -1200,7 +1269,7 @@ mod tests {
                 return;
             }
         };
-        DmaImportAttrs::from_tensor(&t, PixelFormat::Bgra)
+        DmaImportAttrs::from_tensor(&t, PixelFormat::Bgra, false)
             .expect("BGRA width 375 must pass the pre-check");
     }
 
@@ -1218,7 +1287,7 @@ mod tests {
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
-        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgb)
+        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgb, false)
             .expect_err("RGB width 375 must still be rejected");
         match err {
             crate::Error::NotSupported(msg) => {
@@ -1239,7 +1308,7 @@ mod tests {
             Some(edgefirst_tensor::TensorMemory::Mem),
         )
         .unwrap();
-        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey)
+        let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey, false)
             .expect_err("Grey width 375 must still be rejected");
         assert!(matches!(err, crate::Error::NotSupported(_)));
     }

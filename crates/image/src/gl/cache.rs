@@ -64,18 +64,21 @@ impl EglCacheKey {
     /// Every construction site MUST go through this so the key used to insert
     /// an EGLImage matches the key used to look it up and to gate the texture
     /// binding-skip.
-    pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat) -> Self
+    pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat, for_dst: bool) -> Self
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        // A view()/batch() sub-region keys on its PARENT so all siblings of one
-        // buffer collapse to a single import; the view's offset is the viewport,
-        // not a key. It keys on the parent's `row_stride` (from `view_origin`),
-        // NOT the view's own `effective_row_stride` — a single-row view sets a
-        // tight stride for map-span safety, which would otherwise mis-key it apart
-        // from its multi-row siblings. A whole tensor keys on its own geometry +
-        // any genuine foreign/multi-plane plane_offset.
-        let (width, height, row_stride, plane_offset) = match img.view_origin() {
+        // A DESTINATION view()/batch() sub-region keys on its PARENT so all
+        // siblings of one buffer collapse to a single import; the view's offset is
+        // the viewport, not a key. It keys on the parent's `row_stride` (from
+        // `view_origin`), NOT the view's own `effective_row_stride` — a single-row
+        // view sets a tight stride for map-span safety, which would otherwise
+        // mis-key it apart from its multi-row siblings. A SOURCE view (or a whole
+        // tensor) keys on its OWN geometry + any genuine foreign/multi-plane
+        // plane_offset — a source view imports its own region (it is sampled, not
+        // rendered into), so it must NOT collapse onto the parent key.
+        let view_origin = if for_dst { img.view_origin() } else { None };
+        let (width, height, row_stride, plane_offset) = match view_origin {
             Some(vo) => (vo.parent_width, vo.parent_height, vo.parent_row_stride, 0),
             None => (
                 img.width().unwrap_or(0),
@@ -235,16 +238,32 @@ mod tests {
             Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
         let a = parent.view(Region::new(0, 0, 32, 32)).unwrap();
         let b = parent.view(Region::new(0, 32, 32, 32)).unwrap();
-        let ka = EglCacheKey::from_tensor(&a, PixelFormat::Rgba);
-        let kb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba);
-        let kp = EglCacheKey::from_tensor(&parent, PixelFormat::Rgba);
-        assert_eq!(ka, kb, "sibling views collapse to one parent-keyed import");
-        assert_eq!(ka, kp, "a view keys identically to its whole parent");
+        // Destinations (`for_dst = true`) collapse onto the parent key.
+        let ka = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, true);
+        let kb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, true);
+        let kp = EglCacheKey::from_tensor(&parent, PixelFormat::Rgba, true);
+        assert_eq!(
+            ka, kb,
+            "sibling dst views collapse to one parent-keyed import"
+        );
+        assert_eq!(ka, kp, "a dst view keys identically to its whole parent");
         assert_eq!(
             ka.plane_offset, 0,
-            "a view contributes no offset to the key"
+            "a dst view contributes no offset to the key"
         );
         assert_eq!((ka.width, ka.height), (64, 64), "keyed on parent geometry");
+
+        // SOURCES (`for_dst = false`) key on their OWN region — a source view is
+        // imported and SAMPLED, not rendered into, so two source views of one
+        // parent must NOT collapse (they'd alias and sample the wrong region).
+        let sa = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, false);
+        let sb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, false);
+        assert_ne!(sa, sb, "source views key on their own region (no collapse)");
+        assert_eq!(
+            (sa.width, sa.height),
+            (32, 32),
+            "a source view keys on its own dimensions"
+        );
     }
 
     #[test]

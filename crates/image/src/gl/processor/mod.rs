@@ -1689,7 +1689,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -1776,7 +1776,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt);
+        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -3282,7 +3282,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
@@ -4094,7 +4094,7 @@ impl GLProcessorST {
         rotation_offset: usize,
         flip: Flip,
     ) -> Result<(), Error> {
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
@@ -4239,7 +4239,7 @@ impl GLProcessorST {
         let chroma_shift_y = layout.shift_y as i32;
         let chroma_lines = layout.uv_rows_per_luma as i32;
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt);
+        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // `nv_r8_program` may have been swapped to the int8 variant by
@@ -4469,7 +4469,9 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
     ) -> Result<egl::Image, crate::Error> {
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
+        // never collapses onto a destination parent import.
+        let id = EglCacheKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
         if self.nv_r8_egl_cache.sweep() {
@@ -4513,8 +4515,9 @@ impl GLProcessorST {
         &self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
+        for_dst: bool,
     ) -> Result<EglImage, crate::Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt)?;
+        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt, for_dst)?;
         let egl_img_attr = attrs.to_egl_attribs();
         self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }
@@ -4553,8 +4556,9 @@ impl GLProcessorST {
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
-        // (geometry) — see EglCacheKey.
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        // (geometry) — see EglCacheKey. Only a destination view collapses onto
+        // its parent key; a source view keys on its own region.
+        let id = EglCacheKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
 
         // Sweep dead entries opportunistically before looking up.
@@ -4589,8 +4593,11 @@ impl GLProcessorST {
         }
 
         // Create the EGL image BEFORE evicting — if creation fails, we don't
-        // want to have destroyed a valid cache entry for nothing.
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt)?;
+        // want to have destroyed a valid cache entry for nothing. Only a
+        // destination view imports its parent (glViewport tiling); a source view
+        // imports its own region (it is sampled, not rendered into).
+        let for_dst = cache == CacheKind::Dst;
+        let egl_image_obj = self.create_image_from_dma2(img, img_fmt, for_dst)?;
 
         // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
         // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
@@ -4650,7 +4657,7 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = EglCacheKey::from_tensor(img, fmt);
+        let id = EglCacheKey::from_tensor(img, fmt, true);
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4728,7 +4735,7 @@ impl GLProcessorST {
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
         // tensor's logical geometry, so `from_tensor` is a consistent key.
-        let id = EglCacheKey::from_tensor(img, img_fmt);
+        let id = EglCacheKey::from_tensor(img, img_fmt, true);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }

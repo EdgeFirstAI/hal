@@ -2078,9 +2078,28 @@ where
         self.storage.set_logical_shape(&shape)?;
         self.set_format(format)?; // clears any stale row_stride
 
-        // Preserve the backing's physical row pitch when it is wider than the
-        // natural (tightly-packed) row for this format — the physical-grid /
-        // logical-ROI decoupling for reused pool tensors.
+        // Restore the correct row pitch for the new geometry. A DMA buffer of
+        // ANY layout, and a semi-planar buffer on any backing, MUST carry a
+        // 64-byte-aligned pitch: Mali/Vivante reject a DMA-BUF EGLImage whose
+        // row pitch is not 64-aligned (`EGL_BAD_ALLOC` / `EGL_BAD_ACCESS`), and
+        // semi-planar chroma-offset math assumes it. This mirrors the pitch
+        // `Tensor::image()` allocates, so a recycled pool buffer imports
+        // identically to a fresh one — without it a `configure_image()`'d packed
+        // buffer (e.g. Y800 96-wide → tight pitch 96) failed convert() on
+        // imx95/imx8mp via the texture-upload fallback while the fresh oracle
+        // (aligned 128) succeeded. Packed/planar on host-only memory (Mem/Shm)
+        // keep the tight pitch so flat CPU consumers stay unaffected — matching
+        // `image()`'s `host_stride` rule.
+        let elem = std::mem::size_of::<T>();
+        let channels = format.channels();
+        let (min_stride, total_rows) = match format.layout() {
+            PixelLayout::SemiPlanar => (width.next_multiple_of(2) * elem, shape[0]),
+            PixelLayout::Packed => (width * channels * elem, height),
+            PixelLayout::Planar => (width * elem, channels * height),
+        };
+        let needs_align = self.storage.memory() == TensorMemory::Dma
+            || format.layout() == PixelLayout::SemiPlanar;
+
         let active_stride = if let Some(pitch) = self.storage.backing_row_stride() {
             // macOS IOSurface: use the surface's native pitch.
             let natural = self.effective_row_stride().unwrap_or(0);
@@ -2090,26 +2109,18 @@ where
             } else {
                 natural
             }
-        } else if format.layout() == PixelLayout::SemiPlanar {
-            // For self-allocated SemiPlanar tensors (Mem/Shm on any platform,
-            // DMA on Linux), restore the correct 64-byte-aligned stride so the
-            // buffer is fully exploited.
-            //
+        } else if needs_align {
             // Priority:
             //   1. Prior stride (pool reuse): if the pre-existing stride is
-            //      64-aligned, >= even(width), and fits the allocation, keep it.
-            //      This is the hot-loop reuse case (large pool, small image).
-            //   2. Compute fresh 64-aligned stride for the current width.
-            let elem = std::mem::size_of::<T>();
-            let min_stride = width.next_multiple_of(2) * elem;
+            //      64-aligned, >= this layout's minimum row, and fits the
+            //      allocation, keep it. This is the hot-loop reuse case (large
+            //      pool, small image).
+            //   2. Compute a fresh 64-aligned stride for the current width.
             let aligned = min_stride.next_multiple_of(64);
-            let total_h = shape[0];
             let capacity = self.storage.capacity_bytes();
 
             let candidate = if let Some(ps) = prior_stride {
-                // Keep the prior stride only when it still satisfies the current
-                // minimum (even(width)) and the allocation can hold it.
-                if ps >= min_stride && ps % 64 == 0 && ps * total_h <= capacity {
+                if ps >= min_stride && ps % 64 == 0 && ps * total_rows <= capacity {
                     ps
                 } else {
                     aligned
@@ -2118,7 +2129,7 @@ where
                 aligned
             };
 
-            if candidate * total_h <= capacity {
+            if candidate * total_rows <= capacity {
                 self.set_row_stride_unchecked(candidate);
                 candidate
             } else {
@@ -2129,12 +2140,11 @@ where
             self.effective_row_stride().unwrap_or(0)
         };
 
-        // For semi-planar formats, ensure the active stride fits the allocation.
-        // A pool reconfigured to a wider image than its backing would silently
-        // SIGBUS on any subsequent map/write — catch it here instead.
-        if format.layout() == PixelLayout::SemiPlanar && active_stride > 0 {
-            let total_h = shape[0];
-            let needed = active_stride * total_h;
+        // Ensure the active stride fits the allocation. A pool reconfigured to a
+        // wider image than its backing would silently SIGBUS on any subsequent
+        // map/write — catch it here instead.
+        if needs_align && active_stride > 0 {
+            let needed = active_stride * total_rows;
             let capacity = self.storage.capacity_bytes();
             if needed > capacity {
                 return Err(Error::InsufficientCapacity { needed, capacity });

@@ -2025,6 +2025,16 @@ mod gl_tests {
         let src_multiplane = load_multiplane_nv12_dma(1280, 720, nv12_bytes);
         assert!(src_multiplane.as_u8().unwrap().is_multiplane());
 
+        // Pin BOTH sources to the SAME conversion path (ExternalSampler) so this
+        // test isolates multiplane IMPORT correctness from path *selection*.
+        // Under `auto` the contiguous single-plane source takes ShaderR8 (exact
+        // in-shader YUV→RGB) while multiplane is forced to ExternalSampler
+        // (driver YUV, ~6/255 off on Vivante) — a benchmark-driven split
+        // (ExternalSampler ≈10× faster on Vivante), not an import bug. With both
+        // on ExternalSampler, two imports of identical bytes must yield identical
+        // pixels on every GPU, so the compare is byte-exact on all DMA boards.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let mut gl = GLProcessorThreaded::new(None).unwrap();
 
         // Convert contiguous
@@ -2067,18 +2077,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare pixel-for-pixel (should be identical — same data, different import path)
+        // Same bytes, two import paths, one conversion path → byte-identical.
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
         let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - contiguous vs multiplane NV12 take different GPU paths off Vivante \
-                 (single-plane Path B vs multiplane Path A); equality returns once Path B handles \
-                 multiplane.",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
@@ -2142,6 +2143,12 @@ mod gl_tests {
             .with_stride(stride)
             .with_offset(y_size);
 
+        // Force both the same-fd multiplane and contiguous sources onto the
+        // ExternalSampler path so the comparison tests import correctness, not
+        // path selection (see test_multiplane_nv12_to_rgba_opengl for the
+        // benchmark-driven rationale). Byte-exact on every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let proc = crate::ImageProcessor::new().unwrap();
         let src = proc
             .import_image(
@@ -2204,16 +2211,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare: same-fd multiplane and contiguous must produce identical pixels
+        // Same-fd multiplane and contiguous must produce identical pixels.
         let map_same = dst_same_fd.as_u8().unwrap().map().unwrap();
         let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_same.as_slice(), map_contig.as_slice(), 0);
     }
 
@@ -2226,6 +2226,11 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
+
+        // Pin both sources to ExternalSampler so the packed-RGB letterbox compare
+        // tests multiplane import correctness, not path selection (see
+        // test_multiplane_nv12_to_rgba_opengl). Byte-exact on every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -2284,13 +2289,6 @@ mod gl_tests {
 
         let map_contig = dst_contig_dyn.as_u8().unwrap().map().unwrap();
         let map_multi = dst_multi_dyn.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_contig.as_slice(), map_multi.as_slice(), 0);
     }
 
@@ -2303,6 +2301,13 @@ mod gl_tests {
             eprintln!("SKIPPED: {} - DMA not available", function!());
             return;
         }
+
+        // Pin both sources to ExternalSampler. Critical for int8: the XOR-0x80
+        // packing amplifies any path-selection color delta straddling 0x80 into a
+        // ~250-unit byte diff (e.g. 126↔132 → 254↔2), so the two sources MUST
+        // share one conversion path. This tests multiplane import correctness;
+        // see test_multiplane_nv12_to_rgba_opengl for the benchmark rationale.
+        let _nv_path = NvPathEnvGuard::set("sampler");
 
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
 
@@ -2368,13 +2373,6 @@ mod gl_tests {
         let multi_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(map_multi.as_slice().as_ptr().cast(), map_multi.len())
         };
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (int8 amplifies the delta)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
 
@@ -3402,6 +3400,12 @@ mod gl_tests {
             return;
         }
 
+        // Pin both the true-multiplane (separate fds) and contiguous sources to
+        // ExternalSampler so the compare tests import correctness, not path
+        // selection (see test_multiplane_nv12_to_rgba_opengl). Byte-exact on
+        // every DMA board.
+        let _nv_path = NvPathEnvGuard::set("sampler");
+
         let nv12_bytes: &[u8] = &edgefirst_bench::testdata::read("camera720p.nv12");
         let width: usize = 1280;
         let height: usize = 720;
@@ -3500,16 +3504,9 @@ mod gl_tests {
         )
         .unwrap();
 
-        // Compare: true multiplane and contiguous must produce identical pixels
+        // True multiplane and contiguous must produce identical pixels.
         let map_multi = dst_multi.as_u8().unwrap().map().unwrap();
         let map_contig = dst_contig.as_u8().unwrap().map().unwrap();
-        if !gl.is_vivante() {
-            eprintln!(
-                "SKIPPED: {} - NV12 path A/B split off Vivante (see rgba variant)",
-                function!()
-            );
-            return;
-        }
         assert_pixels_match(map_multi.as_slice(), map_contig.as_slice(), 0);
     }
 
