@@ -298,10 +298,16 @@ impl G2DProcessor {
                 // destination's DMA mapping. A self-allocated DMA-BUF is mapped
                 // at page granularity, so its strided allocation
                 // (row_bytes × height) is physically backed up to the next page
-                // boundary; 4096 is the minimum page size on every target, a
-                // conservative lower bound that never over-allows.
+                // boundary. Query the runtime page size — aarch64 kernels may use
+                // 16 KiB or 64 KiB pages, and hard-coding 4 KiB would
+                // under-estimate the mapping and needlessly reject a destination
+                // that is in fact page-backed.
+                let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+                    n if n > 0 => n as usize,
+                    _ => 4096,
+                };
                 let row_bytes = dst_surface.stride as usize * dst_fmt.channels();
-                let mapped = (row_bytes * dst_h).next_multiple_of(4096);
+                let mapped = (row_bytes * dst_h).next_multiple_of(page);
                 let needed = row_bytes * even(dst_surface.bottom) as usize;
                 if crop.dst_rect.is_some() || needed > mapped {
                     return Err(Error::NotSupported(format!(

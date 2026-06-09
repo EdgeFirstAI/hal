@@ -100,31 +100,12 @@ static void result_print(const bench_result *r) {
 // Letterbox crop helpers
 // ============================================================================
 
-// Compute the letterbox destination rectangle that fits src into dst while
-// preserving aspect ratio. Matches the Rust calculate_letterbox() logic.
-static void calculate_letterbox(size_t src_w, size_t src_h,
-                                size_t dst_w, size_t dst_h,
-                                size_t *out_left, size_t *out_top,
-                                size_t *out_w, size_t *out_h) {
-    double scale_w = (double)dst_w / (double)src_w;
-    double scale_h = (double)dst_h / (double)src_h;
-    double scale   = (scale_w < scale_h) ? scale_w : scale_h;
-
-    *out_w = (size_t)(src_w * scale);
-    *out_h = (size_t)(src_h * scale);
-    *out_left = (dst_w - *out_w) / 2;
-    *out_top  = (dst_h - *out_h) / 2;
-}
-
-// Build a letterbox crop for the standard SRC -> DST sizes.
+// Build a letterbox crop: the HAL preserves the source aspect ratio and pads
+// the destination with the given colour. Placement into the destination is
+// computed internally from the src/dst sizes — no manual rectangle.
 static struct hal_crop make_letterbox_crop(void) {
-    size_t left, top, new_w, new_h;
-    calculate_letterbox(SRC_W, SRC_H, DST_W, DST_H, &left, &top, &new_w, &new_h);
-
     struct hal_crop crop = hal_crop_new();
-    struct hal_rect rect = hal_rect_new(left, top, new_w, new_h);
-    hal_crop_set_dst_rect(&crop, &rect);
-    hal_crop_set_dst_color(&crop, 114, 114, 114, 255);
+    hal_crop_set_letterbox(&crop, 114, 114, 114, 255);
     return crop;
 }
 

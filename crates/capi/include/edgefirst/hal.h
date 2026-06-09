@@ -1667,13 +1667,13 @@ int hal_decoder_decode_tracked(const struct hal_decoder *decoder,
                                struct hal_track_info_list **out_tracks);
 
 /**
- * Create a new rectangle.
+ * Create a new region.
  *
- * @param left Left edge (x coordinate)
- * @param top Top edge (y coordinate)
- * @param width Width of the rectangle
- * @param height Height of the rectangle
- * @return New rectangle structure
+ * @param x Left edge (x coordinate)
+ * @param y Top edge (y coordinate)
+ * @param width Width of the region
+ * @param height Height of the region
+ * @return New region structure
  */
 struct hal_region hal_region_new(size_t x, size_t y, size_t width, size_t height);
 

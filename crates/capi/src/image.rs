@@ -306,13 +306,13 @@ pub struct HalImageProcessor {
 // Rect and Crop Helper Functions
 // ============================================================================
 
-/// Create a new rectangle.
+/// Create a new region.
 ///
-/// @param left Left edge (x coordinate)
-/// @param top Top edge (y coordinate)
-/// @param width Width of the rectangle
-/// @param height Height of the rectangle
-/// @return New rectangle structure
+/// @param x Left edge (x coordinate)
+/// @param y Top edge (y coordinate)
+/// @param width Width of the region
+/// @param height Height of the region
+/// @return New region structure
 #[no_mangle]
 pub extern "C" fn hal_region_new(x: size_t, y: size_t, width: size_t, height: size_t) -> HalRegion {
     HalRegion {
