@@ -29,13 +29,6 @@
 //!    (`glViewport`), never part of the EGL cache key — that is what makes
 //!    "N tiles → 1 import" hold.
 
-// `Viewport`/`source_uv`/`plan_batch`/`BatchPath` stage the chunking follow-up
-// (split a batch that exceeds `GL_MAX_*` into per-chunk imports) and the
-// source-UV/bottom-up-surface paths; the live top-down DMA batch path computes
-// its band viewport inline (see the orientation note above). Until those land,
-// only the unit tests exercise these — drop the allow when they are wired in.
-#![allow(dead_code)]
-
 use crate::Region;
 use edgefirst_tensor::{PixelFormat, PixelLayout, TensorMemory};
 
@@ -128,13 +121,33 @@ pub(super) struct Viewport {
     pub(super) h: i32,
 }
 
+/// Lower a destination tile to its GL band rectangle on the live Linux
+/// DMA-BUF path, which is **top-down** (GL framebuffer row 0 == memory row 0,
+/// verified on-target): the band's GL `y` is simply `region.y`, with no
+/// bottom-left flip — the renderer's texcoord flip keeps the image upright.
+/// The single home for the orientation convention: BOTH the band `glViewport`
+/// (`bind_dst` setup) and the matching `glScissor` (letterbox-clear
+/// confinement in `convert_to`) lower through here so they can never
+/// disagree. [`region_to_viewport`] is the bottom-up twin for a future
+/// bottom-left-origin surface (e.g. the macOS pbuffer batch path).
+#[inline]
+pub(super) fn region_to_viewport_top_down(region: Region) -> Viewport {
+    Viewport {
+        x: region.x as i32,
+        y: region.y as i32,
+        w: region.width as i32,
+        h: region.height as i32,
+    }
+}
+
 /// Lower a top-left `region` of an image `parent_h` rows tall to a bottom-left
 /// GL viewport. The horizontal axis is unchanged; the vertical axis is flipped
 /// so the region's *top* edge maps to the correct GL row.
 ///
-/// This is the single source of the y-origin convention for the converged
-/// renderer — a destination tile, a letterbox inner box, and a whole-image
-/// render all lower through here.
+/// Staged for the first bottom-left-origin render target (macOS pbuffer batch
+/// path, PR-A); the live Linux DMA-BUF path is top-down and uses
+/// [`region_to_viewport_top_down`]. Until then only the unit tests call this.
+#[allow(dead_code)]
 pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
     // Bottom-left origin: the GL y of the region's top-left corner is the number
     // of rows *below* the region — `parent_h - (y + h)`. Saturating so a region
@@ -154,6 +167,11 @@ pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
 /// `[0, 0, 1, 1]`. Matches the `src_rect_uv` produced by
 /// [`crate::gl::core::float_crop_uniforms`] so the converged renderer and the
 /// float path agree on source addressing.
+///
+/// Staged for the source-view sampling path (the u8 renderer still computes
+/// its `RegionOfInterest` corners inline); until wired, only the unit tests
+/// call this.
+#[allow(dead_code)]
 pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [f32; 4] {
     match region {
         Some(r) if src_w > 0 && src_h > 0 => [
@@ -174,6 +192,10 @@ pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [
 /// batch is split into chunks of `tiles_per_chunk`, one import per chunk.
 /// `PerTileImport` is the degenerate floor (a single tile already too large to
 /// batch) — equivalent to the legacy per-call path.
+/// Staged for the `GL_MAX_*` chunking follow-up (split an over-limit batch
+/// into per-chunk imports); until wired into `convert_batch`, only the unit
+/// tests exercise this and [`plan_batch`].
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchPath {
     OneImport,
@@ -191,6 +213,7 @@ pub(super) enum BatchPath {
 /// * `n_tiles · rows_per_tile ≤ max_rows`  → `OneImport`
 /// * `rows_per_tile ≤ max_rows < n·rows`   → `Chunked(max_rows / rows_per_tile)`
 /// * `rows_per_tile > max_rows`            → `PerTileImport`
+#[allow(dead_code)]
 pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) -> BatchPath {
     if rows_per_tile == 0 || n_tiles == 0 {
         return BatchPath::OneImport;
@@ -213,6 +236,25 @@ mod tests {
 
     fn region(x: usize, y: usize, w: usize, h: usize) -> Region {
         Region::new(x, y, w, h)
+    }
+
+    #[test]
+    fn viewport_top_down_is_identity() {
+        // The live DMA path is top-down: GL y == memory row y, no flip. Three
+        // stacked 16-row tiles keep their memory order in GL coordinates.
+        let ys: Vec<i32> = (0..3)
+            .map(|n| region_to_viewport_top_down(region(0, n * 16, 64, 16)).y)
+            .collect();
+        assert_eq!(ys, vec![0, 16, 32]);
+        assert_eq!(
+            region_to_viewport_top_down(region(10, 4, 20, 8)),
+            Viewport {
+                x: 10,
+                y: 4,
+                w: 20,
+                h: 8
+            }
+        );
     }
 
     #[test]

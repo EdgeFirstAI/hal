@@ -1902,19 +1902,22 @@ impl GLProcessorST {
         // + `DmaImportAttrs` both pivot on `view_origin`); render this tile into
         // its band via `glViewport`. A whole tensor fills its full surface. The
         // matching `glScissor` (so the letterbox clear cannot wipe sibling tiles)
-        // is set in `convert_to`, which owns the clear.
-        //
-        // The destination DMA EGLImage is TOP-DOWN: GL framebuffer row 0 maps to
-        // memory row 0 (verified on-target — a tile at GL `y` lands in memory
-        // band `y`). The renderer's existing texcoord flip keeps the image
-        // upright, so the band's GL viewport `y` is simply `region.y` — NOT the
-        // bottom-left `parent_h - (y+h)` flip (that is for bottom-up surfaces).
-        let (vx, vy, vw, vh) = match dst.view_origin() {
-            Some(vo) => (vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32),
-            None => (0, 0, width, height),
+        // is set in `convert_to`, which owns the clear — both lower the band
+        // through `region_to_viewport_top_down`, the single home for the
+        // verified top-down orientation of the dst DMA EGLImage.
+        let vp = match dst.view_origin() {
+            Some(vo) => super::render::region_to_viewport_top_down(crate::Region::new(
+                vo.x, vo.y, dst_w, dst_h,
+            )),
+            None => super::render::Viewport {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
         };
         unsafe {
-            gls::gl::Viewport(vx, vy, vw, vh);
+            gls::gl::Viewport(vp.x, vp.y, vp.w, vp.h);
         }
         Ok(())
     }
@@ -2778,12 +2781,16 @@ impl GLProcessorST {
                 }
             }
         }
-        // Top-down band rect, matching `setup_renderbuffer_dma`'s viewport (the
-        // dst EGLImage is top-down: GL row 0 == memory row 0).
+        // Band rect via `region_to_viewport_top_down` — the SAME lowering as
+        // the band viewport in `bind_dst`'s setup, so scissor and viewport can
+        // never disagree on the orientation convention.
         let _scissor = match dst.view_origin() {
             Some(vo) => {
+                let vp = super::render::region_to_viewport_top_down(crate::Region::new(
+                    vo.x, vo.y, dst_w, dst_h,
+                ));
                 unsafe {
-                    gls::gl::Scissor(vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32);
+                    gls::gl::Scissor(vp.x, vp.y, vp.w, vp.h);
                     gls::gl::Enable(gls::gl::SCISSOR_TEST);
                 }
                 ScissorGuard(true)
