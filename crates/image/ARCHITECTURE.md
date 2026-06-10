@@ -436,12 +436,18 @@ that tells the engine what completes the convert.
 | `TexturePbo` | PBO | offscreen texture seeded from the PBO via UNPACK | `glReadnPixels` into the PBO PACK binding |
 | `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadnPixels` into the mapped tensor |
 
-A single `convert_dest_texture` drives both texture lowerings (the former
-`convert_pbo_to_pbo` / `convert_any_to_pbo` / `convert_pbo_to_mem` /
-`convert_dest_non_dma` quartet); the source side independently picks the PBO
-UNPACK upload or the CPU texture upload. The DMA two-pass paths (packed RGB,
-NV→planar) still branch inside `convert_dest_dma` ahead of the full engine
-collapse.
+One `convert_via_engine` executes every u8/i8 convert: the pure plan table
+`render::plan_convert(src_fmt, dst_fmt, lowering)` picks `SinglePass`,
+`TwoPassPackedRgb` (zero-copy packed RGB needs an RGBA-reinterpret second
+pass), or `TwoPassNvPlanar` (NV→planar through the full `select_nv_path`
+machinery; also the Vivante single-pass GPU-hang workaround). Single-pass
+converts share the same `bind_dst → render → readback` body for every
+src/dst memory combination — the source side independently picks the PBO
+UNPACK upload or the CPU texture upload. The two-pass functions survive as
+render strategies, not duplicated dispatch. Both decision tables
+(`lower_dst`, `plan_convert`) are host-tested in `render.rs` with no GL
+dependency, so a new platform changes capability *inputs*, never the
+tables.
 
 **Why the PBO lowering never maps:** the GL thread must not call
 `tensor.map()` on a PBO image — that sends a `PboMap` message back to the
@@ -1056,6 +1062,7 @@ image.convert                                           [user-facing fn, orchest
 │
 ├── image.convert.gl                                    [OpenGL backend, picked first]
 │   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, dst_tile?, last_import_reason?
+│   ├── image.convert.gl.engine                         ← plan + destination lowering for the convert ({plan, lowering, src_pbo})
 │   ├── image.convert.gl.egl_import                     ← one actual eglCreateImageKHR (cache MISS only; zero in steady state)
 │   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV* → intermediate RGBA (resize + crop + flip)
 │   ├── image.convert.gl.pack_rgb.pass2_pack            ← intermediate RGBA → packed RGB (3:4 width ratio)
@@ -1098,6 +1105,7 @@ image.materialize_masks                                 [user-facing fn]
 |--------------------------------------------------------|--------------------------|------------------|
 | `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. `dst_tile` (the batch-tile rect / index) is present when the call renders into a destination region rather than the whole tensor. |
 | `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. `dst_tile` and `last_import_reason` reveal the tile rect/index and whether the source re-imported. |
+| `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
 | `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behavior observable: a steady-state frame loop over a fixed buffer pool must emit ZERO of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
