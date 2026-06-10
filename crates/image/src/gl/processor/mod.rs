@@ -110,6 +110,63 @@ impl DstReadback {
     }
 }
 
+/// Uniform locations for one `nv_r8` program variant, resolved once at link
+/// time — `glGetUniformLocation` is a per-call string lookup in the driver
+/// and the NV draw previously issued 12 per frame.
+#[derive(Clone, Copy)]
+struct NvUniformLocs {
+    img_size: i32,
+    tex_width: i32,
+    chroma_shift: i32,
+    chroma_lines: i32,
+    y_offset: i32,
+    y_scale: i32,
+    c_vr: i32,
+    c_ug: i32,
+    c_vg: i32,
+    c_ub: i32,
+}
+
+/// Per-program uniform state for one `nv_r8` variant. Uniform values are
+/// per-program GL state and persist across draws, so the constant sampler
+/// binding (`src` = unit 0) is uploaded once at resolve time and
+/// `last_colorimetry` lets the draw skip re-uploading the six YUV-matrix
+/// floats while the source's (encoding, range) is unchanged.
+struct NvUniformState {
+    locs: NvUniformLocs,
+    last_colorimetry: Option<(
+        edgefirst_tensor::ColorEncoding,
+        edgefirst_tensor::ColorRange,
+    )>,
+}
+
+impl NvUniformState {
+    fn resolve(program: &GlProgram) -> Self {
+        unsafe {
+            gls::gl::UseProgram(program.id);
+            let loc =
+                |name: &std::ffi::CStr| gls::gl::GetUniformLocation(program.id, name.as_ptr());
+            // Constant: the NV shaders always sample `src` from unit 0.
+            gls::gl::Uniform1i(loc(c"src"), 0);
+            NvUniformState {
+                locs: NvUniformLocs {
+                    img_size: loc(c"img_size"),
+                    tex_width: loc(c"tex_width"),
+                    chroma_shift: loc(c"chroma_shift"),
+                    chroma_lines: loc(c"chroma_lines"),
+                    y_offset: loc(c"y_offset"),
+                    y_scale: loc(c"y_scale"),
+                    c_vr: loc(c"c_vr"),
+                    c_ug: loc(c"c_ug"),
+                    c_vg: loc(c"c_vg"),
+                    c_ub: loc(c"c_ub"),
+                },
+                last_colorimetry: None,
+            }
+        }
+    }
+}
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
@@ -229,6 +286,10 @@ pub struct GLProcessorST {
     nv_r8_program: GlProgram,
     /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 with int8 XOR 0x80 bias.
     nv_r8_int8_program: GlProgram,
+    /// Link-time uniform locations + colorimetry-upload skip for `nv_r8_program`.
+    nv_r8_uniforms: NvUniformState,
+    /// Same for `nv_r8_int8_program`.
+    nv_r8_int8_uniforms: NvUniformState,
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
@@ -755,6 +816,15 @@ impl GLProcessorST {
             generate_vertex_shader(),
             generate_nv_to_rgba_int8_shader_2d(),
         )?;
+        // Resolve uniform locations once at link time (the NV draw is per-frame)
+        // and upload the constant sampler bindings while the programs are fresh:
+        // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
+        let nv_r8_uniforms = NvUniformState::resolve(&nv_r8_program);
+        let nv_r8_int8_uniforms = NvUniformState::resolve(&nv_r8_int8_program);
+        packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
+        packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
+        texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
+        texture_program_planar_int8_2d.load_uniform_1i(c"tex", 0)?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -862,6 +932,8 @@ impl GLProcessorST {
             proto_ssbo_size: 0,
             nv_r8_program,
             nv_r8_int8_program,
+            nv_r8_uniforms,
+            nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
@@ -3260,11 +3332,7 @@ impl GLProcessorST {
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
         }
 
-        // Set uniform: tex = TEXTURE1 (intermediate RGBA texture)
-        unsafe {
-            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
-            gls::gl::Uniform1i(loc_tex, 1);
-        }
+        // (`tex` = unit 1 is constant per program, uploaded at link time.)
 
         // Draw full-viewport quad to pack RGBA→RGB
         self.draw_fullscreen_quad()?;
@@ -3676,10 +3744,7 @@ impl GLProcessorST {
             gls::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
-            // Set tex uniform to unit 0
-            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
-            gls::gl::Uniform1i(loc_tex, 0);
-
+            // (`tex` = unit 0 is constant per program, uploaded at link time.)
             check_gl_error(function!(), line!())?;
 
             let y_centers = if alpha {
@@ -4100,6 +4165,29 @@ impl GLProcessorST {
             self.nv_r8_program.id
         };
 
+        // YUV→RGB matrix + range, resolved from the source tensor's
+        // colorimetry (missing axes filled by the SD/HD height heuristic).
+        // Path B applies the matrix in-shader, so it is colorimetry-correct
+        // on every GPU regardless of EGL color-hint support.
+        let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+        let colorimetry = (
+            cm.encoding
+                .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+            cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+        );
+        let state = if is_int8 {
+            &mut self.nv_r8_int8_uniforms
+        } else {
+            &mut self.nv_r8_uniforms
+        };
+        let locs = state.locs;
+        // Uniform values persist per program: re-upload the six matrix floats
+        // only when this program's (encoding, range) actually changed. The
+        // marker is recorded AFTER the draw succeeds — an error between here
+        // and the upload must not leave a "already uploaded" claim for values
+        // that never reached the program.
+        let upload_colorimetry = state.last_colorimetry != Some(colorimetry);
+
         unsafe {
             gls::gl::UseProgram(prog_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
@@ -4176,57 +4264,22 @@ impl GLProcessorST {
                 }
             }
 
-            // Set uniforms (img_size, tex_width, chroma_shift, chroma_lines).
-            let loc_img_size = gls::gl::GetUniformLocation(prog_id, c"img_size".as_ptr());
-            gls::gl::Uniform2i(loc_img_size, src_w as i32, src_h as i32);
+            // Per-source uniforms through link-time-cached locations (the
+            // `src` sampler binding is constant and uploaded at resolve time).
+            gls::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
+            gls::gl::Uniform1i(locs.tex_width, tex_width);
+            gls::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
+            gls::gl::Uniform1i(locs.chroma_lines, chroma_lines);
 
-            let loc_tex_width = gls::gl::GetUniformLocation(prog_id, c"tex_width".as_ptr());
-            gls::gl::Uniform1i(loc_tex_width, tex_width);
-
-            let loc_chroma_shift = gls::gl::GetUniformLocation(prog_id, c"chroma_shift".as_ptr());
-            gls::gl::Uniform2i(loc_chroma_shift, chroma_shift_x, chroma_shift_y);
-
-            let loc_chroma_lines = gls::gl::GetUniformLocation(prog_id, c"chroma_lines".as_ptr());
-            gls::gl::Uniform1i(loc_chroma_lines, chroma_lines);
-
-            // YUV→RGB matrix + range, resolved from the source tensor's
-            // colorimetry (missing axes filled by the SD/HD height heuristic).
-            // Path B applies the matrix in-shader, so it is colorimetry-correct
-            // on every GPU regardless of EGL color-hint support.
-            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
-            let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
-                cm.encoding
-                    .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
-                cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"y_offset".as_ptr()),
-                coeffs.y_offset,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"y_scale".as_ptr()),
-                coeffs.y_scale,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_vr".as_ptr()),
-                coeffs.c_vr,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_ug".as_ptr()),
-                coeffs.c_ug,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_vg".as_ptr()),
-                coeffs.c_vg,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_ub".as_ptr()),
-                coeffs.c_ub,
-            );
-
-            // Bind sampler to unit 0.
-            let loc_src = gls::gl::GetUniformLocation(prog_id, c"src".as_ptr());
-            gls::gl::Uniform1i(loc_src, 0);
+            if upload_colorimetry {
+                let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
+                gls::gl::Uniform1f(locs.y_offset, coeffs.y_offset);
+                gls::gl::Uniform1f(locs.y_scale, coeffs.y_scale);
+                gls::gl::Uniform1f(locs.c_vr, coeffs.c_vr);
+                gls::gl::Uniform1f(locs.c_ug, coeffs.c_ug);
+                gls::gl::Uniform1f(locs.c_vg, coeffs.c_vg);
+                gls::gl::Uniform1f(locs.c_ub, coeffs.c_ub);
+            }
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
@@ -4299,6 +4352,16 @@ impl GLProcessorST {
             );
         }
         check_gl_error(function!(), line!())?;
+        // The draw (and its colorimetry upload, when taken) succeeded — only
+        // now record the program's uploaded (encoding, range).
+        if upload_colorimetry {
+            let state = if is_int8 {
+                &mut self.nv_r8_int8_uniforms
+            } else {
+                &mut self.nv_r8_uniforms
+            };
+            state.last_colorimetry = Some(colorimetry);
+        }
         Ok(())
     }
 
