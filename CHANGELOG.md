@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ColorimetryMode` (`Fast` | `Exact`) + `EDGEFIRST_COLORIMETRY`**
+  (`edgefirst-image`): the colorimetry/performance trade-off is now an
+  explicit knob. `ImageProcessorConfig::colorimetry` (default
+  `ColorimetryMode::Fast`, issue #106 policy) or the
+  `EDGEFIRST_COLORIMETRY=fast|exact` environment variable (which takes
+  precedence and pins the mode for the processor's lifetime). **Behavior
+  change on Vivante (i.MX 8M Plus):** under `auto`, single-plane 4-aligned
+  NV12 sources now take the hardware external sampler for *every*
+  colorimetry by default (~12× faster: 2.5 ms vs 29 ms at 720p; the
+  driver applies its fixed BT.601-limited matrix, approximate for
+  non-BT.601-limited sources). `ColorimetryMode::Exact` restores the
+  previous behavior (sampler only when the driver matrix matches the
+  source exactly, colorimetry-exact in-shader matrix otherwise). All other
+  GPUs are unaffected — the exact in-shader path is already the fast path
+  there.
 - **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
   C API, Python): render `N` model inputs into row-band views of one batched
   destination as **one GPU import + one sync**. Loop

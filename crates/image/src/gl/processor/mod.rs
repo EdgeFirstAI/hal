@@ -238,7 +238,7 @@ pub struct GLProcessorST {
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
-    is_vivante: bool,
+    pub(super) is_vivante: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -298,6 +298,11 @@ pub struct GLProcessorST {
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
+    /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
+    colorimetry_mode: crate::ColorimetryMode,
+    /// `true` when `EDGEFIRST_COLORIMETRY` pinned the mode for this
+    /// processor's lifetime — `set_colorimetry_mode` then logs and keeps it.
+    colorimetry_env_pinned: bool,
     /// When `true`, a convert's terminal `glFinish` is skipped so a batch of
     /// tiles rendered into one shared destination import syncs only once, via a
     /// single `finish_via_fence` at [`flush`](Self::flush). Set for the duration
@@ -875,6 +880,29 @@ impl GLProcessorST {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
         }
 
+        // Colorimetry/performance trade-off. The env var pins the mode for the
+        // processor's lifetime (set_colorimetry_mode logs and keeps it);
+        // otherwise the config default is Fast (issue #106 policy) and
+        // `set_colorimetry_mode` may change it.
+        let colorimetry_env = match std::env::var("EDGEFIRST_COLORIMETRY") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "exact" => Some(crate::ColorimetryMode::Exact),
+                "fast" => Some(crate::ColorimetryMode::Fast),
+                "" => None,
+                other => {
+                    log::warn!(
+                        "EDGEFIRST_COLORIMETRY={other:?} not recognised \
+                         (expected fast|exact), ignoring"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if let Some(mode) = colorimetry_env {
+            log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
+        }
+
         let mut converter = GLProcessorST {
             gl_context,
             texture_program,
@@ -938,6 +966,8 @@ impl GLProcessorST {
             nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
+            colorimetry_mode: colorimetry_env.unwrap_or_default(),
+            colorimetry_env_pinned: colorimetry_env.is_some(),
             defer_finish: false,
             pending_flush: false,
         };
@@ -1116,6 +1146,24 @@ impl GLProcessorST {
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) {
         self.int8_interpolation_mode = mode;
         log::debug!("Int8 interpolation mode set to {:?}", mode);
+    }
+
+    /// Sets the colorimetry/performance trade-off (see
+    /// [`crate::ColorimetryMode`]). When `EDGEFIRST_COLORIMETRY` pinned the
+    /// mode at construction, the env value wins: this logs and keeps it.
+    pub fn set_colorimetry_mode(&mut self, mode: crate::ColorimetryMode) {
+        if self.colorimetry_env_pinned {
+            if mode != self.colorimetry_mode {
+                log::info!(
+                    "ColorimetryMode::{mode:?} requested but EDGEFIRST_COLORIMETRY pins \
+                     {:?} — keeping the env override",
+                    self.colorimetry_mode
+                );
+            }
+            return;
+        }
+        self.colorimetry_mode = mode;
+        log::debug!("Colorimetry mode set to {:?}", mode);
     }
 
     /// Snapshot the EGLImage cache counters (src, dst, NV R8).
@@ -2789,30 +2837,41 @@ impl GLProcessorST {
                     NvConvertPath::ShaderR8
                 }
             }
-            // Auto: prefer the portable, colorimetry-exact in-shader ShaderR8.
+            // Auto: prefer the portable, colorimetry-exact in-shader ShaderR8
+            // wherever it is also the fast path (Mali, V3D, Tegra — shader and
+            // sampler are comparable there, so exactness is free).
             //
             // EXCEPTION — Vivante (i.MX 8MP): the texelFetch shader is ~12×
             // slower than the hardware samplerExternalOES (on-target benchmark:
-            // NV12 720p convert 29ms shader vs 2.5ms sampler), and Vivante's
-            // fixed BT.601-limited sampler matrix MATCHES the reference for
-            // BT.601-limited sources (Phase 2 probe: ≤1 vs CPU). So for
-            // single-plane NV12 that is BT.601-limited and 4-aligned (the
-            // sampler import constraint), prefer ExternalSampler on Vivante.
-            // Full-range / BT.709 on Vivante still take ShaderR8 (slow but
-            // colorimetry-correct — the driver would apply the wrong matrix).
+            // NV12 720p convert 29ms shader vs 2.5ms sampler). For single-plane
+            // 4-aligned NV12 (the sampler import constraint) the pick follows
+            // the HIGH-PERFORMANCE-default policy (issue #106):
+            //
+            // * `ColorimetryMode::Fast` (default): take the sampler for EVERY
+            //   colorimetry — the driver applies its fixed BT.601-limited
+            //   matrix, which is exact for BT.601-limited sources (Phase 2
+            //   probe: ≤1 vs CPU) and approximate for the rest.
+            // * `ColorimetryMode::Exact` (config/env opt-in): take the sampler
+            //   only when the driver matrix MATCHES the source's resolved
+            //   (encoding, range); everything else renders through the exact
+            //   in-shader matrix, at Vivante's 12× cost.
             NvPathPref::Auto => {
-                let vivante_sampler_fast_path = src_fmt == PixelFormat::Nv12
+                let vivante_sampler_usable = src_fmt == PixelFormat::Nv12
                     && self.is_vivante
-                    && src.width().is_some_and(|w| w.is_multiple_of(4))
-                    && {
-                        let cm = crate::colorimetry::resolve_colorimetry(
-                            src.colorimetry(),
-                            src.height(),
-                        );
-                        cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
-                            && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
+                    && src.width().is_some_and(|w| w.is_multiple_of(4));
+                let take_sampler = vivante_sampler_usable
+                    && match self.colorimetry_mode {
+                        crate::ColorimetryMode::Fast => true,
+                        crate::ColorimetryMode::Exact => {
+                            let cm = crate::colorimetry::resolve_colorimetry(
+                                src.colorimetry(),
+                                src.height(),
+                            );
+                            cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
+                                && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
+                        }
                     };
-                if vivante_sampler_fast_path {
+                if take_sampler {
                     NvConvertPath::ExternalSampler
                 } else {
                     NvConvertPath::ShaderR8

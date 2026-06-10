@@ -357,10 +357,16 @@ YUV→RGB on every backend is driven by the source tensor's per-tensor
   EGL-hint support (verified on Vivante GC7000UL, Mali-G310, V3D).
 - **Path A** (`samplerExternalOES`, driver YUV) sets the matching EGL
   `YUV_COLOR_SPACE_HINT` / `SAMPLE_RANGE_HINT` from the resolved colorimetry.
-  Because hint-ignoring drivers (Vivante) would otherwise apply a fixed
-  BT.601-limited matrix, **single-plane NV12 with non-default colorimetry
-  (full-range, or non-BT.601) is forced to Path B** so the exact matrix always
-  applies; only multiplane NV12 (which Path B cannot import) stays on Path A.
+  Hint-ignoring drivers (Vivante) apply a fixed BT.601-limited matrix
+  regardless. How `auto` weighs that against Vivante's ~12× Path-B cost is
+  the **`ColorimetryMode`** knob (`ImageProcessorConfig::colorimetry`, env
+  `EDGEFIRST_COLORIMETRY`; issue #106 policy): the default **`Fast`** keeps
+  single-plane 4-aligned NV12 on Path A for every colorimetry (approximate
+  matrix for non-BT.601-limited sources), while the **`Exact`** opt-in
+  forces non-matching colorimetries to Path B so the exact matrix always
+  applies. Multiplane NV12 (which Path B cannot import) stays on Path A in
+  both modes, as does every non-Vivante GPU's Path-B preference (exact is
+  already the fast path there).
 - Packed **YUYV/VYUY**: the **macOS** YUYV shader threads the same six
   colorimetry uniforms as the NV path (`yuv_to_rgb_coeffs`), so an untagged
   720p source resolves to BT.709 limited and matches the camera fixture (~0.997

@@ -5478,10 +5478,120 @@ mod gl_tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    struct ColorimetryEnvGuard;
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl ColorimetryEnvGuard {
+        fn set(v: &str) -> Self {
+            std::env::set_var("EDGEFIRST_COLORIMETRY", v);
+            ColorimetryEnvGuard
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl Drop for ColorimetryEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_COLORIMETRY");
+        }
+    }
+
+    /// HIGH-PERFORMANCE-default colorimetry policy (issue #106): under `auto`
+    /// a non-BT.601-limited single-plane NV12 DMA source takes the hardware
+    /// sampler on Vivante in the default [`ColorimetryMode::Fast`] (~12×
+    /// faster, driver's approximate fixed matrix) and the exact in-shader
+    /// path under the [`ColorimetryMode::Exact`] opt-in. On every other GPU
+    /// the in-shader path IS the fast path, so both modes pick it. Also pins:
+    /// BT.601-limited sources keep the sampler under Exact on Vivante (the
+    /// driver matrix matches exactly), and `EDGEFIRST_COLORIMETRY` wins over
+    /// the setter.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn colorimetry_mode_policy_nv12_auto() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::ColorimetryMode;
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        let (w, h) = (64usize, 64usize);
+        let mut nv12 = vec![128u8; w * h * 3 / 2];
+        nv12[..w * h].fill(100);
+        let make_src = |enc: ColorEncoding, range: ColorRange| {
+            let mut src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &nv12).unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default().with_encoding(enc).with_range(range),
+            ));
+            src
+        };
+        let src_709 = make_src(ColorEncoding::Bt709, ColorRange::Full);
+        let src_601 = make_src(ColorEncoding::Bt601, ColorRange::Limited);
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut path_for = |gl: &mut GLProcessorST, src: &TensorDyn| {
+            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            gl.last_nv_convert_path
+        };
+
+        // Fast (default): sampler on Vivante regardless of colorimetry,
+        // in-shader matrix everywhere else.
+        let expect_fast = if gl.is_vivante {
+            NvConvertPath::ExternalSampler
+        } else {
+            NvConvertPath::ShaderR8
+        };
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            expect_fast,
+            "Fast mode, BT.709-full NV12"
+        );
+
+        // Exact opt-in: the approximate sampler is off the table for a
+        // non-matching colorimetry — in-shader matrix everywhere…
+        gl.set_colorimetry_mode(ColorimetryMode::Exact);
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "Exact mode, BT.709-full NV12"
+        );
+        // …but a BT.601-limited source matches the Vivante driver matrix
+        // exactly, so the sampler carve-out survives Exact mode.
+        assert_eq!(
+            path_for(&mut gl, &src_601),
+            expect_fast,
+            "Exact mode, BT.601-limited NV12"
+        );
+
+        // EDGEFIRST_COLORIMETRY pins the mode for the processor's lifetime:
+        // a Fast request on an exact-pinned processor is kept at Exact.
+        drop(gl);
+        let _env = ColorimetryEnvGuard::set("exact");
+        let mut gl = GLProcessorST::new(None).unwrap();
+        gl.set_colorimetry_mode(ColorimetryMode::Fast);
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "env-pinned Exact must override set_colorimetry_mode(Fast)"
+        );
+    }
+
     /// `EDGEFIRST_NV_CONVERT_PATH` selects the NV12 GPU conversion path.
     ///
-    /// - `auto` (default) and `shader` → `ShaderR8` (single-plane NV12 prefers
-    ///   the portable in-shader path).
+    /// - `auto` (default) follows the `ColorimetryMode::Fast` policy:
+    ///   `ExternalSampler` on Vivante (12× faster), `ShaderR8` everywhere
+    ///   else (the exact path is already the fast path). The full policy
+    ///   matrix is covered by `colorimetry_mode_policy_nv12_auto`.
+    /// - `shader` → `ShaderR8` always.
     /// - `sampler` → the driver `ExternalSampler` path is selected; the actual
     ///   recorded path is `ExternalSampler` on success or `Cpu` if the driver
     ///   rejects the NV12 EGLImage import — never `ShaderR8`.
@@ -5500,7 +5610,7 @@ mod gl_tests {
             bytes.push(80); // Cr
         }
 
-        let run = |env: Option<&str>| -> Option<NvConvertPath> {
+        let run = |env: Option<&str>| -> Option<(NvConvertPath, bool)> {
             // The env var is read once in `GLProcessorST::new`; the guard sets it
             // for exactly that construction and removes it on drop (panic-safe).
             let gl = {
@@ -5517,10 +5627,9 @@ mod gl_tests {
             };
             let mut src =
                 load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
-            // Tag full-range so the Vivante Auto carve-out (BT.601-LIMITED only)
-            // does NOT engage — keeps `auto → ShaderR8` deterministic on every
-            // platform, including Vivante (where BT.601-limited NV12 would
-            // otherwise correctly prefer ExternalSampler; see select_nv_path).
+            // Tag full-range (not BT.601-limited) so the `auto` leg exercises
+            // the colorimetry-mode policy: the default Fast mode still takes
+            // the sampler on Vivante, ShaderR8 everywhere else.
             src.set_colorimetry(Some(
                 edgefirst_tensor::Colorimetry::default()
                     .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
@@ -5531,24 +5640,29 @@ mod gl_tests {
                     .unwrap();
             gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
-            Some(gl.last_nv_convert_path)
+            Some((gl.last_nv_convert_path, gl.is_vivante))
         };
 
-        if let Some(p) = run(None) {
+        if let Some((p, is_vivante)) = run(None) {
+            let expect = if is_vivante {
+                // ColorimetryMode::Fast default: the 12×-faster sampler.
+                NvConvertPath::ExternalSampler
+            } else {
+                NvConvertPath::ShaderR8
+            };
             assert_eq!(
-                p,
-                NvConvertPath::ShaderR8,
-                "auto default: single-plane full-range NV12 must prefer ShaderR8"
+                p, expect,
+                "auto default: single-plane full-range NV12 policy pick"
             );
         }
-        if let Some(p) = run(Some("shader")) {
+        if let Some((p, _)) = run(Some("shader")) {
             assert_eq!(
                 p,
                 NvConvertPath::ShaderR8,
                 "forced shader must use ShaderR8"
             );
         }
-        if let Some(p) = run(Some("sampler")) {
+        if let Some((p, _)) = run(Some("sampler")) {
             assert_ne!(
                 p,
                 NvConvertPath::ShaderR8,
@@ -5672,6 +5786,12 @@ mod gl_tests {
                 return;
             }
         };
+        // This test pins the EXACT pipeline (in-shader matrix matching the
+        // CPU reference at chroma edges), so it opts into
+        // ColorimetryMode::Exact — under the default Fast policy a Vivante
+        // board would legitimately take the approximate driver sampler
+        // (covered by colorimetry_mode_policy_nv12_auto).
+        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
         let mut src =
             load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
         tag(&mut src);
@@ -5688,7 +5808,7 @@ mod gl_tests {
         assert_eq!(
             gl.last_nv_convert_path,
             NvConvertPath::ShaderR8,
-            "NV12→PlanarRgb must use the ShaderR8 two-pass (select_nv_path), not the driver sampler"
+            "NV12→PlanarRgb in Exact mode must use the ShaderR8 two-pass, not the driver sampler"
         );
 
         // Correctness: matches the CPU planar reference (the sampler did not).
