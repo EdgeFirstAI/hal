@@ -2253,8 +2253,8 @@ impl GLProcessorST {
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             gls::gl::TexImage2D(
@@ -2385,8 +2385,8 @@ impl GLProcessorST {
         self.convert_fbo.bind();
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             // Upload existing PBO content to the render texture.
@@ -2631,8 +2631,8 @@ impl GLProcessorST {
             }
 
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
@@ -3403,6 +3403,11 @@ impl GLProcessorST {
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
                     gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    // Raw re-target bypasses bind_egl_image's key tracking:
+                    // drop the cached key so a later bind_egl_image on this
+                    // texture cannot "reuse" a binding this call replaced
+                    // (silent write into the wrong destination buffer).
+                    self.render_texture.invalidate_egl_binding();
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
                         gls::gl::COLOR_ATTACHMENT0,
@@ -3437,6 +3442,13 @@ impl GLProcessorST {
 
         // Draw full-viewport quad to pack RGBA→RGB
         self.draw_fullscreen_quad()?;
+
+        // Pass 2 bound the intermediate on TEXTURE1; restore unit 0 as the
+        // active unit. Draw/setup sites select their unit before binding, but
+        // the processor-wide invariant between operations is "unit 0 active" —
+        // leaking unit 1 here is what broke the second heap-source convert
+        // (GL_INVALID_VALUE upload into the wrong texture).
+        unsafe { gls::gl::ActiveTexture(gls::gl::TEXTURE0) };
 
         unsafe { gls::gl::Finish() };
         check_gl_error(function!(), line!())?;
@@ -3679,8 +3691,8 @@ impl GLProcessorST {
                 &self.texture_program_planar
             };
             gls::gl::UseProgram(program.id);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
             gls::gl::TexParameteri(
                 texture_target,
@@ -3949,8 +3961,8 @@ impl GLProcessorST {
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
@@ -4082,8 +4094,8 @@ impl GLProcessorST {
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(self.texture_program_yuv.id);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for

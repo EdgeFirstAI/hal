@@ -388,7 +388,7 @@ mod gl_tests {
 
         // NV12 pool (the camera-pipeline shape): Y plane + neutral chroma.
         let mut bytes = vec![100u8; w * h];
-        bytes.extend(std::iter::repeat(128u8).take(w * h / 2));
+        bytes.extend(std::iter::repeat_n(128u8, w * h / 2));
         let pool: Vec<TensorDyn> = (0..POOL)
             .map(|_| {
                 load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap()
@@ -426,6 +426,107 @@ mod gl_tests {
             "expected at least {FRAMES} cache hits over the loop, got {gained} \
              (warm={warm:?} steady={steady:?})"
         );
+    }
+
+    /// Regression test for the repeat-convert GL_INVALID_VALUE (0x501) state
+    /// leak: heap-RGBA source → two-pass packed RGB → DMA destination succeeded
+    /// on the FIRST convert and failed on the SECOND on Vivante/Mali/V3D alike.
+    ///
+    /// Root cause: `convert_to_packed_rgb` pass 2 exits with `ActiveTexture`
+    /// left at TEXTURE1 and the destination EGLImage texture bound on unit 0,
+    /// while `draw_src_texture` issued `BindTexture` BEFORE `ActiveTexture` —
+    /// binding the camera texture to the leaked unit and then uploading the
+    /// 1280×720 source into the 640×640 destination texture via the
+    /// `TexSubImage2D` fast path → GL_INVALID_VALUE. Driver-independent GLES
+    /// semantics, hence identical on all dmabuf GPUs.
+    ///
+    /// The loop runs each dtype cell several times (not just twice) and pins
+    /// byte-identical output across iterations, so any texture-unit state leak
+    /// between converts surfaces either as an error or as a pixel diff.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn repeat_convert_rgba_mem_to_rgb_dma() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut renderer = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        // Deterministic RGBA gradient source in plain heap memory (the cell's
+        // defining property: NOT DMA, so the source goes through the
+        // draw_src_texture CPU-upload path).
+        let (src_w, src_h) = (1280usize, 720usize);
+        let mut bytes = vec![0u8; src_w * src_h * 4];
+        for (i, px) in bytes.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 256) as u8;
+            px[1] = ((i / 256) % 256) as u8;
+            px[2] = ((i / 65536) % 256) as u8;
+            px[3] = 255;
+        }
+        let src = load_raw_image(
+            src_w,
+            src_h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            &bytes,
+        )
+        .unwrap();
+
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+        for dtype in [DType::U8, DType::I8] {
+            let mut dst = match TensorDyn::image(
+                640,
+                640,
+                PixelFormat::Rgb,
+                dtype,
+                Some(TensorMemory::Dma),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("SKIPPED cell {dtype:?}: DMA RGB dst unavailable: {e}");
+                    continue;
+                }
+            };
+            let mut first: Option<Vec<u8>> = None;
+            for round in 0..4 {
+                renderer
+                    .convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "rgba@mem->rgb.{dtype:?}@dma convert #{} failed: {e} \
+                             (repeat-convert state leak — see 0x501 regression)",
+                            round + 1
+                        )
+                    });
+                let out: Vec<u8> = match dtype {
+                    DType::I8 => dst
+                        .as_i8()
+                        .unwrap()
+                        .map()
+                        .unwrap()
+                        .as_slice()
+                        .iter()
+                        .map(|&v| v as u8)
+                        .collect(),
+                    _ => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                };
+                match &first {
+                    None => first = Some(out),
+                    Some(reference) => assert_eq!(
+                        reference,
+                        &out,
+                        "rgba@mem->rgb.{dtype:?}@dma convert #{} output diverged from #1",
+                        round + 1
+                    ),
+                }
+            }
+        }
     }
 
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
