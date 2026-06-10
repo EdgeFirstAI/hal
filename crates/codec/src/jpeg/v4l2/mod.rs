@@ -354,7 +354,7 @@ impl V4l2Context {
         // SAFETY: type_ selects the multi-planar variant.
         let mut cap = *unsafe { cfmt.pix_mp() };
 
-        let kind = format::classify(cap.pixelformat).ok_or_else(|| {
+        let mut kind = format::classify(cap.pixelformat).ok_or_else(|| {
             DecodeErr::Unsupported(format!(
                 "capture format {} unsupported",
                 ioctl::fourcc_str(cap.pixelformat)
@@ -365,6 +365,62 @@ impl V4l2Context {
                 "capture colorimetry (cs={}, enc={}, quant={}) not BT.601 full-range",
                 cap.colorspace, cap.ycbcr_enc, cap.quantization
             )));
+        }
+
+        // The mxc-jpeg driver (and equivalent SoC decoders) select their native
+        // CAPTURE format from the JPEG's chroma subsampling: a 4:4:4 JPEG yields
+        // YUV3 (packed 4:4:4). Because NV24 (semi-planar 4:4:4) and NV12 (4:2:0)
+        // are both acceptable pipeline outputs, negotiate NV12 via S_FMT so the
+        // hardware downconverts 4:4:4→4:2:0 rather than handing the CPU a packed
+        // YUV3 buffer it can't write directly into a semi-planar tensor.
+        // S_FMT must happen before REQBUFS CAPTURE; this is the only safe window
+        // (after G_FMT, before REQBUFS).
+        if matches!(kind, CapKind::Yuv444Packed)
+            && matches!(output_fmt, PixelFormat::Nv12 | PixelFormat::Nv24)
+        {
+            let mut nfmt = ioctl::v4l2_format {
+                type_: CAP,
+                ..Default::default()
+            };
+            // SAFETY: mplane variant.
+            {
+                let p = unsafe { nfmt.pix_mp() };
+                p.width = cap.width;
+                p.height = cap.height;
+                p.pixelformat = ioctl::V4L2_PIX_FMT_NV12;
+                p.field = ioctl::V4L2_FIELD_NONE;
+                p.colorspace = cap.colorspace;
+                p.ycbcr_enc = cap.ycbcr_enc;
+                p.quantization = cap.quantization;
+                p.xfer_func = cap.xfer_func;
+                p.num_planes = 1;
+            }
+            // SAFETY: valid format; best-effort — if refused, cap/kind stay YUV3
+            // and collect() falls back to CPU for this image.
+            let _ = unsafe { ioctl::vidioc_s_fmt(fd, &mut nfmt) };
+            let mut gfmt = ioctl::v4l2_format {
+                type_: CAP,
+                ..Default::default()
+            };
+            // SAFETY: valid format for G_FMT.
+            if unsafe { ioctl::vidioc_g_fmt(fd, &mut gfmt) }.is_ok() {
+                // SAFETY: mplane variant.
+                let got = *unsafe { gfmt.pix_mp() };
+                if let Some(new_kind) = format::classify(got.pixelformat) {
+                    if matches!(new_kind, CapKind::Nv12) {
+                        log::debug!(
+                            "v4l2: negotiated 4:4:4 CAPTURE from YUV3 to NV12 (hardware 4:4:4→4:2:0)"
+                        );
+                        cap = got;
+                        kind = new_kind;
+                    } else {
+                        log::debug!(
+                            "v4l2: driver kept {} for 4:4:4 JPEG — will deinterleave to NV24",
+                            ioctl::fourcc_str(got.pixelformat)
+                        );
+                    }
+                }
+            }
         }
 
         // Save the driver's natural CAPTURE format so a failed zero-copy probe
@@ -513,8 +569,8 @@ impl V4l2Context {
     }
 
     /// Queue the CAPTURE buffer, wait for the decode, dequeue both buffers, and
-    /// copy the decoded native planes (NV12/GREY) into `dst`. Shared by the
-    /// build and reuse paths.
+    /// copy the decoded pixels into `dst`. Handles NV12/NV12M, GREY, and YUV3
+    /// (4:4:4 packed → NV24 deinterleave). Shared by the build and reuse paths.
     fn collect<T: ImagePixel>(
         &mut self,
         dst: &mut Tensor<T>,
@@ -530,15 +586,6 @@ impl V4l2Context {
                 .as_ref()
                 .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
             (s.cap.num_planes, s.dmabuf)
-        };
-
-        let info = ImageInfo {
-            width: final_w,
-            height: final_h,
-            format: output_fmt,
-            row_stride: dst_stride,
-            rotation_degrees: 0,
-            flip_horizontal: false,
         };
 
         if dmabuf {
@@ -563,7 +610,16 @@ impl V4l2Context {
             dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
             // Decoded pixels are in the tensor's DMA buffer; the consumer's
             // `Tensor::map()` issues the cache sync on read.
-            return Ok(info);
+            // DMABUF only fires when output_fmt is Nv12|Grey (want_zc check),
+            // so actual == requested and no dst reconfiguration is needed.
+            return Ok(ImageInfo {
+                width: final_w,
+                height: final_h,
+                format: output_fmt,
+                row_stride: dst_stride,
+                rotation_degrees: 0,
+                flip_horizontal: false,
+            });
         }
 
         // MMAP path: queue the driver buffer, decode, copy planes out.
@@ -576,13 +632,59 @@ impl V4l2Context {
         dqbuf_output(fd).map_err(|e| DecodeErr::Reset(format!("DQBUF OUTPUT: {e}")))?;
 
         // Resolve the decoded planes. Greyscale → Y only; NV12/NV12M → Y +
-        // interleaved CbCr. 4:4:4 YUV3 → native NV12 is left to the CPU.
+        // interleaved CbCr. YUV3 (4:4:4 packed) → deinterleave to NV24 below.
         let stream = self
             .stream
             .as_ref()
             .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
         let cap = &stream.cap;
         let y_stride = cap.luma_stride;
+
+        // YUV3 → NV24: the mxc-jpeg driver outputs 4:4:4 JPEGs as packed
+        // [Y,Cb,Cr] triples (V4L2_PIX_FMT_YUV24). Deinterleave into the
+        // semi-planar NV24 layout expected by the tensor and downstream convert.
+        // NV24 UV addressing: Cb at [final_h*dst + y*2*dst + x*2],
+        // Cr at [... + x*2 + 1] — matches the MCU writer in mcu.rs exactly.
+        if matches!(cap.kind, CapKind::Yuv444Packed) {
+            if !matches!(output_fmt, PixelFormat::Nv24) {
+                return Err(DecodeErr::Unsupported(format!(
+                    "4:4:4 YUV3 capture but output format is {output_fmt:?} (expected Nv24)"
+                )));
+            }
+            let packed = cap.maps[0].as_slice();
+            let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
+            let dst_bytes: &mut [T] = &mut map;
+            // SAFETY: NV24 is u8; JPEG entry guarantees T == u8.
+            let d: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dst_bytes.as_mut_ptr() as *mut u8,
+                    dst_bytes.len(),
+                )
+            };
+            let uv_base = final_h * dst_stride;
+            for y in 0..final_h {
+                let src_row = y * y_stride;
+                let dst_y_row = y * dst_stride;
+                let dst_uv_row = uv_base + y * 2 * dst_stride;
+                for x in 0..final_w {
+                    let s = src_row + x * 3;
+                    d[dst_y_row + x] = packed[s];
+                    let u = dst_uv_row + x * 2;
+                    d[u] = packed[s + 1];
+                    d[u + 1] = packed[s + 2];
+                }
+            }
+            drop(map);
+            return Ok(ImageInfo {
+                width: final_w,
+                height: final_h,
+                format: PixelFormat::Nv24,
+                row_stride: dst_stride,
+                rotation_degrees: 0,
+                flip_horizontal: false,
+            });
+        }
+
         let (y_plane, chroma): (&[u8], Option<(&[u8], usize)>) = match (&cap.kind, cap.num_planes) {
             (CapKind::Nv12, n) if n >= 2 => (
                 cap.maps[0].as_slice(),
@@ -594,12 +696,26 @@ impl V4l2Context {
                 (&m[..ys], Some((&m[ys..], cap.luma_stride)))
             }
             (CapKind::Grey, _) => (cap.maps[0].as_slice(), None),
-            (CapKind::Yuv444Packed, _) => {
-                return Err(DecodeErr::Unsupported(
-                    "4:4:4 YUV3 capture → native NV12 not handled on hardware; using CPU".into(),
-                ));
-            }
+            (CapKind::Yuv444Packed, _) => unreachable!("handled above"),
         };
+
+        // Derive the format actually written from what hardware produced.
+        // For platforms where rebuild_stream negotiated NV12 for a Nv24 request
+        // (output_fmt=Nv24, cap.kind=Nv12), reconfigure dst so tensor and data
+        // stay consistent.
+        let actual_fmt = match &cap.kind {
+            CapKind::Grey => PixelFormat::Grey,
+            CapKind::Nv12 => PixelFormat::Nv12,
+            CapKind::Yuv444Packed => unreachable!("handled above"),
+        };
+        if actual_fmt != output_fmt {
+            // The tensor was configured for output_fmt (e.g. Nv24) by the
+            // caller; reconfigure it to match what we're about to write.
+            // The underlying allocation is always large enough because Nv24 is
+            // the largest per-pixel format the caller pre-allocates for.
+            dst.configure_image(final_w, final_h, actual_fmt)
+                .map_err(|e| DecodeErr::Fatal(e.into()))?;
+        }
 
         let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
         let dst_bytes: &mut [T] = &mut map;
@@ -609,7 +725,7 @@ impl V4l2Context {
         };
 
         // Crop to the logical image (the CAPTURE buffer is MCU-rounded up).
-        match output_fmt {
+        match actual_fmt {
             PixelFormat::Grey => {
                 for y in 0..final_h {
                     let s = y * y_stride;
@@ -654,7 +770,14 @@ impl V4l2Context {
         }
         drop(map);
 
-        Ok(info)
+        Ok(ImageInfo {
+            width: final_w,
+            height: final_h,
+            format: actual_fmt,
+            row_stride: dst_stride,
+            rotation_degrees: 0,
+            flip_horizontal: false,
+        })
     }
 
     /// Stop both queues and release their buffer pools, dropping the stream.
