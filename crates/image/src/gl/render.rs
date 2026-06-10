@@ -37,7 +37,7 @@
 #![allow(dead_code)]
 
 use crate::Region;
-use edgefirst_tensor::TensorMemory;
+use edgefirst_tensor::{PixelFormat, PixelLayout, TensorMemory};
 
 /// How a convert's destination is realized on the GPU — the pure half of the
 /// destination lowering (`bind_dst` in `processor/mod.rs` performs the GL
@@ -66,6 +66,57 @@ pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLow
         TensorMemory::Pbo => DstLowering::TexturePbo,
         _ => DstLowering::TextureMem,
     }
+}
+
+/// How a convert renders — the pure plan half of the engine
+/// (`convert_via_engine` in `processor/mod.rs` executes it). Exactly one
+/// plan per (source format, destination format, destination lowering)
+/// triple; the two-pass plans exist only for zero-copy destinations, whose
+/// buffers GL cannot write in the requested layout in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConvertPlan {
+    /// One render pass into the bound destination target (packed via the
+    /// texture shaders, planar via the planar shader), then the lowering's
+    /// readback (none for zero-copy).
+    SinglePass,
+    /// Zero-copy packed-RGB: pass 1 renders RGBA into an intermediate
+    /// texture, pass 2 packs it into the destination reinterpreted as
+    /// RGBA8 at `W*3/4 × H` (GL has no 3-byte render format).
+    TwoPassPackedRgb,
+    /// Zero-copy NV*→planar: pass 1 converts NV*→RGBA through the full
+    /// `select_nv_path` machinery (colorimetry-exact ShaderR8 + Vivante
+    /// carve-out), pass 2 deinterleaves RGBA into the planar destination.
+    /// Also the Vivante GC7000UL single-pass GPU-hang workaround
+    /// (EDGEAI-1180).
+    TwoPassNvPlanar,
+}
+
+/// Decide the render plan. Pure (src format, dst format, dst lowering) →
+/// plan; capability differences arrive via the lowering, never as platform
+/// branches here.
+pub(super) fn plan_convert(
+    src_fmt: PixelFormat,
+    dst_fmt: PixelFormat,
+    lowering: DstLowering,
+) -> ConvertPlan {
+    if lowering != DstLowering::ZeroCopy {
+        // Texture destinations always render once and read back; packed RGB
+        // and planar layouts are handled by the readback format / planar
+        // shader, not by reinterpreting the destination buffer.
+        return ConvertPlan::SinglePass;
+    }
+    if dst_fmt == PixelFormat::Rgb {
+        return ConvertPlan::TwoPassPackedRgb;
+    }
+    if dst_fmt.layout() == PixelLayout::Planar
+        && matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        )
+    {
+        return ConvertPlan::TwoPassNvPlanar;
+    }
+    ConvertPlan::SinglePass
 }
 
 /// A GL viewport / scissor rectangle in **pixels**, bottom-left origin.
@@ -286,6 +337,55 @@ mod tests {
     fn plan_batch_degenerate_inputs() {
         assert_eq!(plan_batch(0, 64, 2048), BatchPath::OneImport);
         assert_eq!(plan_batch(4, 0, 2048), BatchPath::OneImport);
+    }
+
+    #[test]
+    fn plan_convert_full_table() {
+        use DstLowering::*;
+        use PixelFormat::*;
+        let nv = [Nv12, Nv16, Nv24];
+        let non_nv = [Rgba, Bgra, Grey, Yuyv];
+        // Zero-copy: packed RGB always two-pass; NV→planar two-pass; the rest
+        // single-pass (incl. non-NV → planar, which the planar shader handles
+        // in one pass).
+        for src in nv.iter().chain(&non_nv) {
+            assert_eq!(
+                plan_convert(*src, Rgb, ZeroCopy),
+                ConvertPlan::TwoPassPackedRgb,
+                "{src:?}->Rgb zero-copy"
+            );
+        }
+        for src in nv {
+            assert_eq!(
+                plan_convert(src, PlanarRgb, ZeroCopy),
+                ConvertPlan::TwoPassNvPlanar
+            );
+            assert_eq!(
+                plan_convert(src, PlanarRgba, ZeroCopy),
+                ConvertPlan::TwoPassNvPlanar
+            );
+            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+        }
+        for src in non_nv {
+            assert_eq!(
+                plan_convert(src, PlanarRgb, ZeroCopy),
+                ConvertPlan::SinglePass
+            );
+            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+        }
+        // Texture lowerings: ALWAYS single-pass, for every format pair — the
+        // two-pass plans only exist to write zero-copy buffers in-place.
+        for lowering in [TextureMem, TexturePbo] {
+            for src in nv.iter().chain(&non_nv) {
+                for dst in [Rgba, Bgra, Rgb, PlanarRgb, Grey] {
+                    assert_eq!(
+                        plan_convert(*src, dst, lowering),
+                        ConvertPlan::SinglePass,
+                        "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

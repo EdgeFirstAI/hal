@@ -990,8 +990,9 @@ impl GLProcessorST {
             }
         };
 
-        // Run the full DMA-buf EGLImage render pipeline
-        if let Err(e) = self.convert_dest_dma(
+        // Run the full DMA-buf EGLImage render pipeline (RGBA→RGBA DMA is a
+        // single-pass zero-copy plan through the engine).
+        if let Err(e) = self.convert_via_engine(
             &mut dst,
             PixelFormat::Rgba,
             &src,
@@ -1001,7 +1002,7 @@ impl GLProcessorST {
             Flip::None,
             ResolvedCrop::no_crop(),
         ) {
-            log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
+            log::info!("verify_dma_buf_roundtrip: convert failed: {e}");
             return false;
         }
 
@@ -1122,28 +1123,114 @@ impl GLProcessorST {
             self.gl_context.transfer_backend,
         );
 
-        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
-            super::render::DstLowering::ZeroCopy => {
-                log::trace!("GL path: DMA (zero-copy EGLImage)");
-                let res = self
-                    .convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-                log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
-                res
+        self.convert_via_engine(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop)
+    }
+
+    /// The single u8/i8 convert engine: classify the destination
+    /// ([`super::render::lower_dst`]), pick the render plan
+    /// ([`super::render::plan_convert`]), then `bind_dst` → render →
+    /// readback. The two-pass plans delegate to their render strategies;
+    /// every single-pass convert — DMA, Mem, or PBO on either side — runs
+    /// the same code.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_via_engine(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        let lowering =
+            super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory());
+        let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+        let _span = tracing::trace_span!(
+            "image.convert.gl.engine",
+            ?plan,
+            ?lowering,
+            src_pbo = src.memory() == TensorMemory::Pbo,
+        )
+        .entered();
+
+        // v1 view()/batch() destination support covers only the single-pass
+        // PACKED zero-copy path (the glViewport/scissor band set in
+        // bind_dst). Packed RGB and every planar layout reinterpret the
+        // destination geometry (`W*3/4 × H`, `H*3` bands), which the band
+        // lowering does not yet handle, so a view destination declines them
+        // → CPU fallback. (Band tiling for those is a follow-up.)
+        if dst.view_origin().is_some()
+            && lowering == super::render::DstLowering::ZeroCopy
+            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+        {
+            return Err(crate::Error::NotSupported(
+                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
+                 planar formats (CPU fallback handles it)"
+                    .into(),
+            ));
+        }
+
+        match plan {
+            super::render::ConvertPlan::TwoPassPackedRgb => {
+                return self.convert_to_packed_rgb(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
             }
-            lowering => {
-                log::trace!(
-                    "GL path: texture target ({lowering:?}, src={:?} dst={:?})",
-                    src.memory(),
-                    dst.memory()
-                );
-                let start = Instant::now();
-                let res = self.convert_dest_texture(
-                    dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop,
-                );
-                log::debug!("convert_dest_texture takes {:?}", start.elapsed());
-                res
+            super::render::ConvertPlan::TwoPassNvPlanar => {
+                return self.convert_nv_to_planar_two_pass(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
+            }
+            super::render::ConvertPlan::SinglePass => {}
+        }
+
+        let target = self.bind_dst(dst, dst_fmt, crop)?;
+
+        // Bias the letterbox clear colour for int8 on every lowering: the
+        // fragment shader XORs rendered pixels and no readback un-biases,
+        // so the glClear'd letterbox region must be pre-biased.
+        let crop = Self::int8_bias_clear(is_int8, crop);
+
+        let start = Instant::now();
+        match src.as_pbo() {
+            Some(src_pbo) => {
+                // A PBO source uploads via its UNPACK binding — mapping it on
+                // the GL thread would deadlock on the Pbo message round-trip.
+                if src_pbo.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert from a mapped PBO tensor".to_string(),
+                    ));
+                }
+                let src_buffer_id = src_pbo.buffer_id();
+                self.draw_src_texture_from_pbo(
+                    src,
+                    src_fmt,
+                    src_buffer_id,
+                    dst,
+                    dst_fmt,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                )?;
+            }
+            None => {
+                self.render_packed_or_planar(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )?;
             }
         }
+        log::debug!("engine render ({plan:?}) takes {:?}", start.elapsed());
+
+        if let DstTarget::Texture { readback } = target {
+            // Data is already int8-biased by the shader — readback copies bytes.
+            let start = Instant::now();
+            self.readback_rendered(dst, dst_fmt, readback.pbo_id())?;
+            log::debug!("engine readback takes {:?}", start.elapsed());
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1905,90 +1992,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn convert_dest_dma(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        assert!(self.gl_context.transfer_backend.is_dma());
-        // v1 view()/batch() destination support covers only the SINGLE-PASS path
-        // (Rgba/Bgra/Grey, rendered by `convert_to` with the glViewport/scissor
-        // band set in `setup_renderbuffer_dma`). The two-pass packed-RGB and
-        // planar paths reinterpret the destination geometry (`W*3/4 × H`,
-        // `H*3` bands), which the band lowering does not yet handle, so decline a
-        // view dst for those → CPU fallback. (Two-pass band tiling is a follow-up.)
-        if dst.view_origin().is_some()
-            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
-        {
-            return Err(crate::Error::NotSupported(
-                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
-                 planar formats (CPU fallback handles it)"
-                    .into(),
-            ));
-        }
-        if dst_fmt == PixelFormat::Rgb {
-            log::trace!(
-                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
-                 (RGBA intermediate + packed_rgba8{}shader)",
-                if is_int8 { "_int8_" } else { "_" }
-            );
-            self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-        } else if dst_fmt.layout() == PixelLayout::Planar {
-            // All NV12/NV16/NV24 → Planar go through the two-pass pipeline
-            // (NV*→RGBA8 intermediate → RGBA→PlanarRgb), because the intermediate
-            // pass delegates to `convert_to`, which routes NV* through
-            // `select_nv_path` — giving planar output the SAME colorimetry-exact
-            // `ShaderR8` path (and Vivante carve-out, and multiplane→ExternalSampler)
-            // as the packed path. The old single-pass `convert_to_planar` binds
-            // `samplerExternalOES` directly (driver YUV→RGB): colorimetry-wrong on
-            // hint-ignoring/bilinear-chroma drivers for NV12, and has NO sampler
-            // path at all for NV16/NV24. Two-pass also subsumes the Vivante NV12
-            // single-pass GPU hang (EDGEAI-1180).
-            if matches!(
-                src_fmt,
-                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-            ) {
-                log::trace!(
-                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass planar \
-                     (RGBA intermediate + planar_2d{}shader; select_nv_path-driven)",
-                    if is_int8 { "_int8_" } else { "_" }
-                );
-                self.convert_nv_to_planar_two_pass(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
-                )
-            } else {
-                log::trace!(
-                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
-                     (renderbuffer + planar{}shader)",
-                    if is_int8 { "_int8_" } else { "_" }
-                );
-                self.bind_dst(dst, dst_fmt, crop)?;
-                // Bias letterbox clear color for int8 — glClear bypasses the shader.
-                let crop = Self::int8_bias_clear(is_int8, crop);
-                self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-            }
-        } else {
-            log::trace!(
-                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
-                 (renderbuffer, {}shader)",
-                if is_int8 { "int8 " } else { "standard " }
-            );
-            self.bind_dst(dst, dst_fmt, crop)?;
-            // The draws select their int8 (XOR 0x80) program variants from
-            // `is_int8`; the letterbox clear bypasses the shader so its fill
-            // colour is pre-biased here.
-            let crop = Self::int8_bias_clear(is_int8, crop);
-            self.convert_to(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-        }
-    }
-
     /// Bias a letterbox clear colour by XOR 0x80 for int8 destinations, since
     /// `glClear` bypasses the shader that otherwise applies the bias. No-op when
     /// not int8 or when there is no fill colour. Shared by every destination path.
@@ -2118,80 +2121,6 @@ impl GLProcessorST {
             }
         }
         check_gl_error(function!(), line!())?;
-        Ok(())
-    }
-
-    /// Convert into any non-zero-copy destination — the single texture-target
-    /// flow shared by every (src memory) × (dst memory ∈ {Mem, Shm, Pbo})
-    /// combination: `bind_dst` → render → `readback_rendered`. Replaces the
-    /// former `convert_dest_non_dma` / `convert_pbo_to_pbo` /
-    /// `convert_any_to_pbo` / `convert_pbo_to_mem` quartet, which differed
-    /// only in FBO setup (now owned by `bind_dst`) and readback target (now
-    /// carried by [`DstTarget`]).
-    ///
-    /// Source binding is the one src-dependent piece: a PBO source uploads
-    /// via its UNPACK binding (mapping it on the GL thread would deadlock on
-    /// the Pbo message round-trip); everything else takes the CPU texture
-    /// upload inside `render_packed_or_planar`.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_dest_texture(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let DstTarget::Texture { readback } = self.bind_dst(dst, dst_fmt, crop)? else {
-            return Err(crate::Error::OpenGl(
-                "convert_dest_texture: bind_dst lowered to a zero-copy target".to_string(),
-            ));
-        };
-
-        // Bias the letterbox clear colour for int8 on EVERY texture-target
-        // path: the fragment shader XORs rendered pixels and the readback
-        // never un-biases, so the glClear'd letterbox region must be
-        // pre-biased regardless of which memory the source or destination
-        // lives in. (The former any→PBO and PBO→Mem paths skipped this,
-        // leaving their int8 letterbox fill 0x80 off.)
-        let crop = Self::int8_bias_clear(is_int8, crop);
-
-        let start = Instant::now();
-        match src.as_pbo() {
-            Some(src_pbo) => {
-                if src_pbo.is_mapped() {
-                    return Err(crate::Error::OpenGl(
-                        "Cannot convert from a mapped PBO tensor".to_string(),
-                    ));
-                }
-                let src_buffer_id = src_pbo.buffer_id();
-                self.draw_src_texture_from_pbo(
-                    src,
-                    src_fmt,
-                    src_buffer_id,
-                    dst,
-                    dst_fmt,
-                    is_int8,
-                    rotation,
-                    flip,
-                    crop,
-                )?;
-            }
-            None => {
-                self.render_packed_or_planar(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
-                )?;
-            }
-        }
-        log::debug!("texture-target render takes {:?}", start.elapsed());
-
-        // Data is already int8-biased by the shader — readback copies bytes.
-        let start = Instant::now();
-        self.readback_rendered(dst, dst_fmt, readback.pbo_id())?;
-        log::debug!("texture-target readback takes {:?}", start.elapsed());
         Ok(())
     }
 
