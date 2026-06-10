@@ -1264,6 +1264,7 @@ impl GLProcessorST {
                     },
                     0,
                     crate::Flip::None,
+                    false,
                 )?;
             } else {
                 // Non-DMA background: upload bg pixels into the
@@ -1458,6 +1459,7 @@ impl GLProcessorST {
                     },
                     0,
                     crate::Flip::None,
+                    false,
                 )?;
             } else {
                 self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
@@ -1979,30 +1981,11 @@ impl GLProcessorST {
                 if is_int8 { "int8 " } else { "standard " }
             );
             self.bind_dst(dst, dst_fmt, crop)?;
-            // For int8 output, swap to int8 shader programs that apply XOR 0x80
-            // in the fragment shader — zero CPU readback.
-            if is_int8 {
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
-                // Path B int8: swap nv_r8_program ↔ nv_r8_int8_program so that
-                // draw_nv_texture_2d picks up the bias shader automatically.
-                std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                // Bias the letterbox clear color since glClear bypasses the shader.
-                let crop = Self::int8_bias_clear(true, crop);
-                let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
-                std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                result
-            } else {
-                self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-            }
+            // The draws select their int8 (XOR 0x80) program variants from
+            // `is_int8`; the letterbox clear bypasses the shader so its fill
+            // colour is pre-biased here.
+            let crop = Self::int8_bias_clear(is_int8, crop);
+            self.convert_to(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         }
     }
 
@@ -2021,10 +2004,10 @@ impl GLProcessorST {
     }
 
     /// Render `src` into the already-bound destination FBO as `dst_fmt`,
-    /// dispatching packed vs planar and applying the int8 shader-program swap
-    /// (packed only; the planar shader handles int8 internally). This is the
-    /// converged per-tile draw shared by the non-DMA / PBO / DMA destination
-    /// paths — they differ only in FBO setup and readback, never in this draw.
+    /// dispatching packed vs planar; the draws select their int8 program
+    /// variants from `is_int8` at draw time. This is the converged per-tile
+    /// draw shared by the texture and DMA destination paths — they differ
+    /// only in FBO setup and readback, never in this draw.
     #[allow(clippy::too_many_arguments)]
     fn render_packed_or_planar(
         &mut self,
@@ -2037,76 +2020,11 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let swap_int8 = is_int8 && dst_fmt.layout() != PixelLayout::Planar;
-        if swap_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+        if dst_fmt.layout() == PixelLayout::Planar {
             self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-        };
-        if swap_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.convert_to(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         }
-        render_result
-    }
-
-    /// Render a PBO source into the already-bound destination FBO via
-    /// [`draw_src_texture_from_pbo`](Self::draw_src_texture_from_pbo), applying
-    /// the int8 texture-program swap around the draw so the GPU writes
-    /// XOR-0x80'd values. The PBO draw never reaches the NV (`nv_r8`) or planar
-    /// branch, so this swaps **only** the two packed texture programs — narrower
-    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). The
-    /// PBO-source arm of `convert_dest_texture`, which owns the
-    /// [`int8_bias_clear`](Self::int8_bias_clear) on `crop` (glClear bypasses
-    /// the shader); this helper never biases.
-    #[allow(clippy::too_many_arguments)]
-    fn render_from_pbo(
-        &mut self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        src_buffer_id: u32,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        let render_result = self.draw_src_texture_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            rotation,
-            flip,
-            crop,
-        );
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result
     }
 
     /// Read the rendered FBO colour attachment (`COLOR_ATTACHMENT0`) into the
@@ -2250,7 +2168,7 @@ impl GLProcessorST {
                     ));
                 }
                 let src_buffer_id = src_pbo.buffer_id();
-                self.render_from_pbo(
+                self.draw_src_texture_from_pbo(
                     src,
                     src_fmt,
                     src_buffer_id,
@@ -2584,6 +2502,7 @@ impl GLProcessorST {
         src_buffer_id: u32,
         dst: &Tensor<u8>,
         _dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
@@ -2656,7 +2575,12 @@ impl GLProcessorST {
                 }
             }
 
-            gls::gl::UseProgram(self.texture_program.id);
+            // Draw-time program selection (see draw_src_texture).
+            gls::gl::UseProgram(if is_int8 {
+                self.texture_int8_program.id
+            } else {
+                self.texture_program.id
+            });
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
@@ -2900,6 +2824,7 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         dst: &Tensor<u8>,
         _dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
@@ -3012,6 +2937,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                     }
                     Err(e) => {
@@ -3036,6 +2962,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                         log::debug!("draw_src_texture takes {:?}", start.elapsed());
                     }
@@ -3058,6 +2985,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                     }
                     Err(e) => {
@@ -3078,6 +3006,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                         log::debug!("draw_src_texture takes {:?}", start.elapsed());
                     }
@@ -3096,7 +3025,16 @@ impl GLProcessorST {
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
             self.last_nv_convert_path = NvConvertPath::ShaderR8;
-            self.draw_nv_texture_2d(src, src_fmt, None, src_roi, dst_roi, rotation_offset, flip)?;
+            self.draw_nv_texture_2d(
+                src,
+                src_fmt,
+                None,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+                is_int8,
+            )?;
         } else {
             // Non-DMA source, non-NV (or multiplane NV): CPU texture-upload path.
             if matches!(
@@ -3106,7 +3044,15 @@ impl GLProcessorST {
                 self.last_nv_convert_path = NvConvertPath::Cpu;
             }
             let start = Instant::now();
-            self.draw_src_texture(src, src_fmt, src_roi, dst_roi, rotation_offset, flip)?;
+            self.draw_src_texture(
+                src,
+                src_fmt,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+                is_int8,
+            )?;
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
 
@@ -3304,7 +3250,9 @@ impl GLProcessorST {
         // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate).
         // It uses dst only for width/height in ROI coordinate math.
         // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
-        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
+        // applied once, by pass 2's packing shader.
+        self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop)?;
         drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
@@ -3449,7 +3397,9 @@ impl GLProcessorST {
         // Note: dst_fmt is passed but ignored (_dst_fmt in convert_to's signature) — the actual
         // output format is RGBA because we bound packed_rgb_fbo above. dst is used only for
         // width/height in ROI coordinate math.
-        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
+        // applied once, by pass 2's planar deinterleave shader.
+        self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop)?;
         drop(_pass1);
 
         // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
@@ -3870,6 +3820,7 @@ impl GLProcessorST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_src_texture(
         &mut self,
         src: &Tensor<u8>,
@@ -3878,6 +3829,7 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -3892,8 +3844,16 @@ impl GLProcessorST {
                 )));
             }
         };
+        // Draw-time program selection: the int8 program is the same shader
+        // plus the XOR-0x80 bias, selected here instead of swap-and-restore
+        // around the render.
+        let program_id = if is_int8 {
+            self.texture_int8_program.id
+        } else {
+            self.texture_program.id
+        };
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
@@ -4020,13 +3980,20 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
+        // Draw-time program selection (see draw_src_texture).
+        let program_id = if is_int8 {
+            self.texture_int8_program_yuv.id
+        } else {
+            self.texture_program_yuv.id
+        };
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
-            gls::gl::UseProgram(self.texture_program_yuv.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
@@ -4145,6 +4112,7 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -4169,10 +4137,15 @@ impl GLProcessorST {
         let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
-        // `nv_r8_program` may have been swapped to the int8 variant by
-        // `convert_dest_dma` for int8 destinations — always use the current
-        // `nv_r8_program` slot (consistent with the texture_program_yuv swap).
-        let prog_id = self.nv_r8_program.id;
+        // Draw-time program selection: the int8 NV program is the same shader
+        // plus the XOR-0x80 bias. Selected here for EVERY destination lowering
+        // (the old swap scheme only covered DMA destinations, leaving the
+        // heap-source int8 NV output un-biased on texture destinations).
+        let prog_id = if is_int8 {
+            self.nv_r8_int8_program.id
+        } else {
+            self.nv_r8_program.id
+        };
 
         unsafe {
             gls::gl::UseProgram(prog_id);

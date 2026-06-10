@@ -529,6 +529,106 @@ mod gl_tests {
         }
     }
 
+    /// The int8 variant of every draw must differ from the u8 variant by
+    /// exactly XOR 0x80 on the colour channels — the int8 fragment shaders
+    /// are the u8 shaders plus the bias, nothing else (alpha passes through).
+    ///
+    /// Catches the texture-destination program-selection gap: the heap-source
+    /// NV12 (ShaderR8 upload) int8 convert rendered through the UN-biased NV
+    /// program (only the DMA destination path swapped `nv_r8_program`),
+    /// producing u8-semantics bytes in an i8 tensor — 0x80 off on every
+    /// channel. DMA-independent: runs on any Linux GL including llvmpipe.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn int8_mem_convert_is_xor_biased_u8() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut renderer = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        // Gradient luma + off-neutral chroma so the bias is exercised across
+        // values straddling 0x80 (where a missing bias is a ~128 byte diff).
+        let (w, h) = (64usize, 48usize);
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        for row in 0..h {
+            for col in 0..w {
+                nv12[row * w + col] = ((row * 255) / h) as u8;
+            }
+        }
+        for i in 0..w * h / 4 {
+            nv12[w * h + 2 * i] = 110; // Cb
+            nv12[w * h + 2 * i + 1] = 150; // Cr
+        }
+        let src = load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+
+        // RGBA must convert everywhere the NV upload path exists; RGB-format
+        // readback is implementation-defined in GLES (V3D rejects it with
+        // GL_INVALID_OPERATION — the cell was absent from rpi5's PR-0 matrix
+        // baseline too), so a failing RGB cell skips rather than fails.
+        let mut validated = 0usize;
+        'fmt: for fmt in [PixelFormat::Rgb, PixelFormat::Rgba] {
+            let mut out = [Vec::new(), Vec::new()];
+            for (slot, dtype) in [(0, DType::U8), (1, DType::I8)] {
+                let mut dst = TensorDyn::image(w, h, fmt, dtype, Some(TensorMemory::Mem)).unwrap();
+                if let Err(e) =
+                    renderer.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                {
+                    if fmt == PixelFormat::Rgba {
+                        panic!("nv12@mem -> rgba.{dtype:?}@mem must be supported: {e}");
+                    }
+                    eprintln!("SKIPPED cell nv12@mem -> {fmt}.{dtype:?}@mem: {e}");
+                    continue 'fmt;
+                }
+                out[slot] = match dtype {
+                    DType::I8 => dst
+                        .as_i8()
+                        .unwrap()
+                        .map()
+                        .unwrap()
+                        .as_slice()
+                        .iter()
+                        .map(|&v| v as u8)
+                        .collect(),
+                    _ => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                };
+            }
+            let channels = fmt.channels();
+            let mut diffs = 0usize;
+            for (i, (&u, &b)) in out[0].iter().zip(out[1].iter()).enumerate() {
+                let expect = if channels == 4 && i % 4 == 3 {
+                    u
+                } else {
+                    u ^ 0x80
+                };
+                // ±1 LSB: the int8 shader's explicit floor(v*255+0.5)+128
+                // quantization double-rounds against the driver's own
+                // float→unorm8 store, shifting ~2% of bytes by one on some
+                // GPUs (seen on Vivante). A missing bias is a ~128 diff, so
+                // the tolerance keeps full sensitivity to the real bug.
+                if (b as i16 - expect as i16).abs() > 1 {
+                    diffs += 1;
+                    if diffs <= 5 {
+                        eprintln!("byte {i}: u8={u:#04x} i8={b:#04x} expected {expect:#04x}");
+                    }
+                }
+            }
+            assert_eq!(
+                diffs, 0,
+                "nv12@mem -> {fmt}: i8 output is not the XOR-0x80 bias of the u8 output \
+                 ({diffs} bytes differ beyond ±1 — un-biased int8 NV program?)"
+            );
+            validated += 1;
+        }
+        assert!(validated >= 1, "no format validated the int8 NV bias");
+    }
+
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
