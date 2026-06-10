@@ -517,6 +517,202 @@ fn bench_draw_proto_masks_forced_opengl(suite: &mut BenchSuite) {
 }
 
 // =============================================================================
+// draw_proto_masks/gl/<dtype>: per-dtype GL proto-render cells
+//
+// One named cell per GL proto-render variant × detection count, so the dtype
+// fan-out collapse (proto_dispatch refactor) has a before/after number for
+// every lowering it touches: i8 (compute-transpose / CPU repack), the int8
+// interpolation-mode sweep (Nearest / Bilinear / TwoPass dequant), f32
+// (R32F upload, or the f16 fallback on GPUs without float-linear), and
+// f16-native (RGBA16F packing). Reuses `build_proto_dtypes` to widen the
+// embedded i8 fixture, so no new testdata is required.
+// =============================================================================
+
+/// Tile the decoded detections and coefficient rows out to `count`, so the
+/// per-detection quad cost is measured at realistic detection counts even
+/// though the fixture's NMS yields only a couple of boxes. Coefficient rows
+/// cycle the decoded rows (dtype and quantization preserved); protos are
+/// rebuilt verbatim.
+fn tile_proto_data(
+    detect: &[DetectBox],
+    proto: &ProtoData,
+    count: usize,
+) -> (Vec<DetectBox>, ProtoData) {
+    let det: Vec<DetectBox> = detect.iter().copied().cycle().take(count).collect();
+
+    // Cycle the leading (row) axis of a flat tensor buffer out to `count`
+    // rows, returning the new data + shape. Plain slices keep this free of
+    // `Tensor<T>`'s trait bounds.
+    fn cycle_rows<T: Copy>(s: &[T], shape: &[usize], count: usize) -> (Vec<T>, Vec<usize>) {
+        let row = shape[1..].iter().product::<usize>();
+        let rows = shape[0];
+        let mut out = Vec::with_capacity(count * row);
+        for i in 0..count {
+            let r = i % rows;
+            out.extend_from_slice(&s[r * row..(r + 1) * row]);
+        }
+        let mut new_shape = shape.to_vec();
+        new_shape[0] = count;
+        (out, new_shape)
+    }
+
+    let coeffs = match &proto.mask_coefficients {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            let (d, s) = cycle_rows(m.as_slice(), TensorTrait::shape(t), count);
+            TensorDyn::F32(Tensor::from_slice(&d, &s).unwrap())
+        }
+        TensorDyn::F16(t) => {
+            let m = t.map().unwrap();
+            let (d, s) = cycle_rows(m.as_slice(), TensorTrait::shape(t), count);
+            TensorDyn::F16(Tensor::from_slice(&d, &s).unwrap())
+        }
+        TensorDyn::I8(t) => {
+            let m = t.map().unwrap();
+            let (d, s) = cycle_rows(m.as_slice(), TensorTrait::shape(t), count);
+            drop(m);
+            let mut nt = Tensor::<i8>::from_slice(&d, &s).unwrap();
+            if let Some(q) = t.quantization() {
+                nt.set_quantization(q.clone()).unwrap();
+            }
+            TensorDyn::I8(nt)
+        }
+        other => panic!("unsupported coeff dtype for tiling: {:?}", other.dtype()),
+    };
+
+    let protos = match &proto.protos {
+        TensorDyn::F32(t) => {
+            let m = t.map().unwrap();
+            TensorDyn::F32(Tensor::from_slice(m.as_slice(), TensorTrait::shape(t)).unwrap())
+        }
+        TensorDyn::F16(t) => {
+            let m = t.map().unwrap();
+            TensorDyn::F16(Tensor::from_slice(m.as_slice(), TensorTrait::shape(t)).unwrap())
+        }
+        TensorDyn::I8(t) => {
+            let mut nt = {
+                let m = t.map().unwrap();
+                Tensor::<i8>::from_slice(m.as_slice(), TensorTrait::shape(t)).unwrap()
+            };
+            if let Some(q) = t.quantization() {
+                nt.set_quantization(q.clone()).unwrap();
+            }
+            TensorDyn::I8(nt)
+        }
+        other => panic!("unsupported proto dtype for tiling: {:?}", other.dtype()),
+    };
+
+    (
+        det,
+        ProtoData {
+            mask_coefficients: coeffs,
+            protos,
+            layout: proto.layout,
+        },
+    )
+}
+
+fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
+    println!("\n== draw_proto_masks/gl: per-dtype proto-render cells ==\n");
+
+    // SAFETY: set_var is not thread-safe, but benchmarks are single-threaded.
+    unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "opengl") };
+    let proc = ImageProcessor::new();
+    unsafe { std::env::remove_var("EDGEFIRST_FORCE_BACKEND") };
+    let Ok(mut proc) = proc else {
+        println!("  [skipped: OpenGL ImageProcessor creation failed]");
+        return;
+    };
+
+    let (detect, proto_i8) = decode_proto_data();
+    if detect.is_empty() {
+        println!("  [skipped: no detections from fixture]");
+        return;
+    }
+    let (proto_f32, proto_f16) = build_proto_dtypes(&detect, &proto_i8);
+    println!("  {} detections decoded from fixture\n", detect.len());
+
+    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
+    else {
+        println!("  [skipped: destination allocation failed]");
+        return;
+    };
+
+    let mut run_cell = |proc: &mut ImageProcessor,
+                        dst: &mut TensorDyn,
+                        name: &str,
+                        det: &[DetectBox],
+                        proto: &ProtoData| {
+        if let Err(e) = proc.draw_proto_masks(dst, det, proto, Default::default()) {
+            println!("  {name:50} [unsupported: {e}]");
+            return;
+        }
+        let r = run_bench(name, WARMUP, ITERATIONS, || {
+            proc.draw_proto_masks(dst, det, proto, Default::default())
+                .unwrap();
+        });
+        r.print_summary();
+        suite.record(&r);
+    };
+
+    for count in [8usize, 32] {
+        // Tile the fixture's detections/coefficients out to `count` so the
+        // per-detection quad loop is measured at realistic counts.
+        let (det, proto_i8_n) = tile_proto_data(&detect, &proto_i8, count);
+        let (_, proto_f32_n) = tile_proto_data(&detect, &proto_f32, count);
+        let (_, proto_f16_n) = tile_proto_data(&detect, &proto_f16, count);
+        let det = &det[..];
+        run_cell(
+            &mut proc,
+            &mut dst,
+            &format!("draw_proto_masks/gl/f32/n{count}"),
+            det,
+            &proto_f32_n,
+        );
+        run_cell(
+            &mut proc,
+            &mut dst,
+            &format!("draw_proto_masks/gl/f16/n{count}"),
+            det,
+            &proto_f16_n,
+        );
+
+        // Int8 interpolation-mode sweep (Linux GL only — the mode setter is
+        // a Linux-GL API; macOS records the default-mode i8 cell below).
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        {
+            use edgefirst_image::Int8InterpolationMode;
+            for (mode, tag) in [
+                (Int8InterpolationMode::Nearest, "nearest"),
+                (Int8InterpolationMode::Bilinear, "bilinear"),
+                (Int8InterpolationMode::TwoPass, "two_pass"),
+            ] {
+                if proc.set_int8_interpolation_mode(mode).is_err() {
+                    continue;
+                }
+                run_cell(
+                    &mut proc,
+                    &mut dst,
+                    &format!("draw_proto_masks/gl/i8_{tag}/n{count}"),
+                    det,
+                    &proto_i8_n,
+                );
+            }
+            // Restore the default for any later benchmark sections.
+            let _ = proc.set_int8_interpolation_mode(Int8InterpolationMode::Bilinear);
+        }
+        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        run_cell(
+            &mut proc,
+            &mut dst,
+            &format!("draw_proto_masks/gl/i8/n{count}"),
+            det,
+            &proto_i8_n,
+        );
+    }
+}
+
+// =============================================================================
 // draw_decoded_masks: pre-decoded mask overlay
 // =============================================================================
 
@@ -814,6 +1010,7 @@ fn main() {
     bench_draw_decoded_masks(&mut proc, &mut suite);
     bench_draw_proto_masks(&mut proc, &mut suite);
     bench_draw_proto_masks_forced_opengl(&mut suite);
+    bench_draw_proto_masks_gl_dtypes(&mut suite);
     bench_hybrid_materialize_and_draw(&mut proc, &mut suite);
 
     suite.finish();

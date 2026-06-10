@@ -54,6 +54,8 @@ enum GLProcessorMessage {
         Int8InterpolationMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Snapshot the EGLImage cache counters (steady-state import assertions).
+    EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
     PboCreate(
         usize, // buffer size in bytes
         tokio::sync::oneshot::Sender<Result<u32, Error>>,
@@ -342,6 +344,9 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::SetInt8Interpolation(_, resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
+                        GLProcessorMessage::EglCacheStats(resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
                         GLProcessorMessage::PboCreate(_, resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
@@ -526,6 +531,21 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during SetInt8Interpolation: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
+                    }
+                    GLProcessorMessage::EglCacheStats(resp) => {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            Ok(gl_converter.egl_cache_stats())
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during EglCacheStats: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -865,6 +885,24 @@ impl GLProcessorThreaded {
             .blocking_send(GLProcessorMessage::SetInt8Interpolation(mode, err_send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Snapshot the EGLImage cache counters (src, dst, NV R8) from the GL
+    /// thread. Steady-state tests capture this after warmup and after an
+    /// N-frame loop over a fixed buffer pool and assert
+    /// [`total_misses`](super::cache::GlCacheStats::total_misses) stays flat —
+    /// any increase means a convert re-imported a buffer it should have found
+    /// cached (the cache-behavior equality gate for GL refactors).
+    pub fn egl_cache_stats(&self) -> Result<super::cache::GlCacheStats, Error> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::EglCacheStats(send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())
         })?
     }

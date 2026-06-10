@@ -361,6 +361,73 @@ mod gl_tests {
         Ok(img)
     }
 
+    /// Steady-state import gate: an N-frame convert loop over a fixed pool of
+    /// DMA source buffers into one DMA destination must perform ZERO new
+    /// EGLImage imports after the pool has been seen once — every later
+    /// convert is a cache hit on all caches (src/dst/NV R8). The import
+    /// count, not latency, is the regression signal that pins EGLImage cache
+    /// behavior across GL refactors: a refactor that re-imports per frame
+    /// passes every pixel-equality test but fails this one.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn dma_pool_steady_state_zero_imports() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut renderer = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let (w, h) = (128usize, 96usize);
+        const POOL: usize = 3;
+        const FRAMES: usize = 300;
+
+        // NV12 pool (the camera-pipeline shape): Y plane + neutral chroma.
+        let mut bytes = vec![100u8; w * h];
+        bytes.extend(std::iter::repeat(128u8).take(w * h / 2));
+        let pool: Vec<TensorDyn> = (0..POOL)
+            .map(|_| {
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap()
+            })
+            .collect();
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+
+        // Warmup: two passes over the pool import every buffer once.
+        for src in pool.iter().cycle().take(POOL * 2) {
+            renderer
+                .convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let warm = renderer.egl_cache_stats().unwrap();
+
+        for src in pool.iter().cycle().take(FRAMES) {
+            renderer
+                .convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let steady = renderer.egl_cache_stats().unwrap();
+
+        assert_eq!(
+            warm.total_misses(),
+            steady.total_misses(),
+            "steady-state loop performed new EGLImage imports: warm={warm:?} steady={steady:?}"
+        );
+        let hits = |s: &crate::opengl_headless::cache::GlCacheStats| {
+            s.src.hits + s.dst.hits + s.nv_r8.hits
+        };
+        let gained = hits(&steady) - hits(&warm);
+        assert!(
+            gained >= FRAMES as u64,
+            "expected at least {FRAMES} cache hits over the loop, got {gained} \
+             (warm={warm:?} steady={steady:?})"
+        );
+    }
+
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]

@@ -17,7 +17,7 @@ use std::time::Instant;
 use super::cache::CachedEglImage;
 use super::EglDisplayKind;
 
-use super::cache::{CacheKind, EglCacheKey, EglImageCache};
+use super::cache::{CacheKind, EglCacheKey, EglImageCache, GlCacheStats};
 use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
@@ -1012,6 +1012,19 @@ impl GLProcessorST {
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) {
         self.int8_interpolation_mode = mode;
         log::debug!("Int8 interpolation mode set to {:?}", mode);
+    }
+
+    /// Snapshot the EGLImage cache counters (src, dst, NV R8).
+    ///
+    /// Steady-state tests capture this after warmup and after an N-frame
+    /// loop and assert `total_misses()` stays flat — the cache-behavior
+    /// equality gate for GL refactors.
+    pub(crate) fn egl_cache_stats(&self) -> GlCacheStats {
+        GlCacheStats {
+            src: self.src_egl_cache.stats(),
+            dst: self.dst_egl_cache.stats(),
+            nv_r8: self.nv_r8_egl_cache.stats(),
+        }
     }
 
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
@@ -4527,6 +4540,11 @@ impl GLProcessorST {
         target: egl::Enum,
         attrib_list: &[Attrib],
     ) -> Result<EglImage, Error> {
+        // Every EGLImage creation funnels through here (DMA-BUF, NV R8, RGB
+        // renderbuffer paths), so one span = one actual `eglCreateImageKHR`.
+        // Steady-state frame loops must show ZERO of these after warmup — the
+        // span count is the observable for cache-behavior equality gates.
+        let _span = tracing::trace_span!("image.convert.gl.egl_import", target).entered();
         let image = GlContext::egl_create_image_with_fallback(
             &self.gl_context.egl,
             self.gl_context.display,

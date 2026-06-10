@@ -83,6 +83,8 @@ mod threaded;
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
+#[cfg(target_os = "linux")]
+pub use cache::{CacheStats, GlCacheStats};
 #[cfg(target_os = "macos")]
 pub use macos_processor::MacosGlProcessor;
 #[cfg(target_os = "linux")]
