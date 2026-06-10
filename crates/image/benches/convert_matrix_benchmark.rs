@@ -189,18 +189,35 @@ fn main() {
                             continue; // resolved cell already measured
                         }
 
-                        if let Err(e) =
+                        // Probe twice: some driver bugs only appear on the
+                        // REPEAT convert of a cell (e.g. Mali GL_INVALID_VALUE
+                        // on the second heap-RGBA -> DMA-RGB convert), and a
+                        // single-shot probe would misclassify them as a panic
+                        // inside the timing loop.
+                        if let Err(e) = (0..2).try_for_each(|_| {
                             proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
-                        {
+                        }) {
                             println!("  {name:55} [unsupported: {e}]");
                             continue;
                         }
-                        let r = run_bench(&name, WARMUP, ITERATIONS, || {
-                            proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
-                                .unwrap();
-                        });
-                        r.print_summary_with_throughput(src_bytes(src_fmt));
-                        suite.record(&r);
+                        // Isolate the timing loop: a mid-loop convert failure
+                        // marks THIS cell failed and the matrix continues —
+                        // one broken cell must not cost the whole baseline.
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_bench(&name, WARMUP, ITERATIONS, || {
+                                proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop)
+                                    .unwrap();
+                            })
+                        }));
+                        match r {
+                            Ok(r) => {
+                                r.print_summary_with_throughput(src_bytes(src_fmt));
+                                suite.record(&r);
+                            }
+                            Err(_) => {
+                                println!("  {name:55} [FAILED mid-loop — see stderr]");
+                            }
+                        }
                     }
                 }
             }
