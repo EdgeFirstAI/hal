@@ -4261,6 +4261,107 @@ mod gl_tests {
         assert_eq!(dma_f16_packed_layout(320, 240), Some((80, 720, 640)));
     }
 
+    /// The int8 letterbox clear colour must be pre-biased (XOR 0x80) on EVERY
+    /// destination lowering: the int8 fragment shader biases rendered pixels
+    /// and the readback never adjusts the glClear'd letterbox region. The
+    /// former any→PBO and PBO→Mem paths skipped the bias, leaving their int8
+    /// letterbox fill 0x80 off versus the Mem→Mem result. Pin every PBO
+    /// src/dst combination's output byte-identical to the Mem→Mem oracle.
+    /// Runs only where image allocation resolves to PBO (Orin / PBO-transfer
+    /// targets); skipped elsewhere.
+    #[test]
+    fn pbo_int8_letterbox_matches_mem_oracle() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        let (sw, sh) = (64usize, 48usize);
+        let probe = proc
+            .create_image(sw, sh, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if probe.memory() != TensorMemory::Pbo {
+            eprintln!(
+                "SKIPPED: {} - target does not allocate PBO images",
+                function!()
+            );
+            return;
+        }
+
+        let fill = |t: &TensorDyn| {
+            let mut map = t.as_u8().unwrap().map().unwrap();
+            for (i, px) in map.as_mut_slice().chunks_exact_mut(4).enumerate() {
+                px[0] = (i % 251) as u8;
+                px[1] = (i % 199) as u8;
+                px[2] = (i % 127) as u8;
+                px[3] = 255;
+            }
+        };
+        let src_pbo = probe;
+        fill(&src_pbo);
+        let src_mem = proc
+            .create_image(
+                sw,
+                sh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+            )
+            .unwrap();
+        fill(&src_mem);
+
+        // 64×48 → 96×96 letterbox: 96×72 inner box, glClear'd bands above and
+        // below — the region whose int8 bias the PBO paths used to drop.
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+        // Explicit `Some(Pbo)` requests are rejected (PBO backing exists only
+        // through auto-resolution), so the PBO destination is requested as
+        // `None` and the resolved memory asserted instead.
+        let mut convert_to_bytes = |src: &TensorDyn, dst_mem: TensorMemory, label: &str| {
+            let dst_req = match dst_mem {
+                TensorMemory::Pbo => None,
+                other => Some(other),
+            };
+            let mut dst = proc
+                .create_image(96, 96, PixelFormat::Rgb, DType::I8, dst_req)
+                .unwrap();
+            assert_eq!(dst.memory(), dst_mem, "{label}: dst backing not honoured");
+            proc.convert(src, &mut dst, Rotation::None, Flip::None, lb)
+                .unwrap_or_else(|e| panic!("{label} convert failed: {e}"));
+            dst.as_i8()
+                .unwrap()
+                .map()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .map(|&v| v as u8)
+                .collect::<Vec<u8>>()
+        };
+
+        let oracle = convert_to_bytes(&src_mem, TensorMemory::Mem, "mem->mem");
+        for (src, src_name) in [(&src_mem, "mem"), (&src_pbo, "pbo")] {
+            for dst_mem in [TensorMemory::Mem, TensorMemory::Pbo] {
+                let label = format!("{src_name}->{dst_mem:?}");
+                let out = convert_to_bytes(src, dst_mem, &label);
+                assert_eq!(
+                    oracle, out,
+                    "{label}: int8 letterbox output diverged from mem->mem oracle"
+                );
+            }
+        }
+    }
+
     /// On-GPU round-trip: RGBA8 → F32 NHWC `[H,W,3]` PBO via the GL float
     /// render path. Forces the OpenGL backend (no CPU fallback) so the test
     /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so

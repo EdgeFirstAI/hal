@@ -79,6 +79,37 @@ pub(super) enum NvPathPref {
     ForceShader,
 }
 
+/// Bound destination render target for one convert, produced by
+/// [`GLProcessorST::bind_dst`]. The GL counterpart of
+/// [`super::render::DstLowering`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstTarget {
+    /// The destination buffer itself is the FBO colour attachment (EGLImage
+    /// renderbuffer or texture): the render writes it directly, no readback.
+    ZeroCopyImage,
+    /// Offscreen texture render target; `readback` copies the result out.
+    Texture { readback: DstReadback },
+}
+
+/// How a [`DstTarget::Texture`] render reaches the destination tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstReadback {
+    /// `glReadnPixels` straight into the mapped Mem tensor.
+    Mem,
+    /// `glReadnPixels` into this destination PBO's PACK binding.
+    Pbo(u32),
+}
+
+impl DstReadback {
+    /// The PBO id in the `Option` shape `readback_rendered` consumes.
+    fn pbo_id(self) -> Option<u32> {
+        match self {
+            DstReadback::Mem => None,
+            DstReadback::Pbo(id) => Some(id),
+        }
+    }
+}
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
@@ -1091,34 +1122,28 @@ impl GLProcessorST {
             self.gl_context.transfer_backend,
         );
 
-        if self.gl_context.transfer_backend.is_dma() && dst.memory() == TensorMemory::Dma {
-            log::trace!("GL path: DMA (zero-copy EGLImage)");
-            let res =
-                self.convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-            log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
-            return res;
+        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
+            super::render::DstLowering::ZeroCopy => {
+                log::trace!("GL path: DMA (zero-copy EGLImage)");
+                let res = self
+                    .convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+                log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
+                res
+            }
+            lowering => {
+                log::trace!(
+                    "GL path: texture target ({lowering:?}, src={:?} dst={:?})",
+                    src.memory(),
+                    dst.memory()
+                );
+                let start = Instant::now();
+                let res = self.convert_dest_texture(
+                    dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop,
+                );
+                log::debug!("convert_dest_texture takes {:?}", start.elapsed());
+                res
+            }
         }
-        if src.memory() == TensorMemory::Pbo && dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: PBO-to-PBO");
-            return self
-                .convert_pbo_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        }
-        if dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: any-to-PBO (src={:?})", src.memory());
-            return self
-                .convert_any_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        }
-        if src.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: PBO-to-mem");
-            return self
-                .convert_pbo_to_mem(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        }
-        log::trace!("GL path: non-DMA (CPU upload/readback)");
-        let start = Instant::now();
-        let res =
-            self.convert_dest_non_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
-        res
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1687,6 +1712,47 @@ impl GLProcessorST {
         self.nv_r8_texture.invalidate_egl_binding();
     }
 
+    /// Classify and bind the destination render target — the single entry
+    /// point absorbing the per-memory `setup_renderbuffer_*` fan-out. The
+    /// pure classification lives in [`super::render::lower_dst`]; this
+    /// performs the GL work and tells the caller what completes the convert.
+    fn bind_dst(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+        crop: ResolvedCrop,
+    ) -> crate::Result<DstTarget> {
+        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
+            super::render::DstLowering::ZeroCopy => {
+                self.setup_renderbuffer_dma(dst, dst_fmt)?;
+                Ok(DstTarget::ZeroCopyImage)
+            }
+            super::render::DstLowering::TexturePbo => {
+                let dst_pbo = dst.as_pbo().ok_or_else(|| {
+                    crate::Error::OpenGl(
+                        "bind_dst: PBO-lowered destination is not a PBO tensor".to_string(),
+                    )
+                })?;
+                if dst_pbo.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert to a mapped PBO tensor".to_string(),
+                    ));
+                }
+                let id = dst_pbo.buffer_id();
+                self.setup_renderbuffer_from_pbo(dst, dst_fmt, id)?;
+                Ok(DstTarget::Texture {
+                    readback: DstReadback::Pbo(id),
+                })
+            }
+            super::render::DstLowering::TextureMem => {
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+                Ok(DstTarget::Texture {
+                    readback: DstReadback::Mem,
+                })
+            }
+        }
+    }
+
     fn setup_renderbuffer_dma(
         &mut self,
         dst: &Tensor<u8>,
@@ -1901,19 +1967,9 @@ impl GLProcessorST {
                      (renderbuffer + planar{}shader)",
                     if is_int8 { "_int8_" } else { "_" }
                 );
-                self.setup_renderbuffer_dma(dst, dst_fmt)?;
+                self.bind_dst(dst, dst_fmt, crop)?;
                 // Bias letterbox clear color for int8 — glClear bypasses the shader.
-                let crop = if is_int8 {
-                    let mut crop = crop;
-                    if let Some(ref mut color) = crop.dst_color {
-                        color[0] ^= 0x80;
-                        color[1] ^= 0x80;
-                        color[2] ^= 0x80;
-                    }
-                    crop
-                } else {
-                    crop
-                };
+                let crop = Self::int8_bias_clear(is_int8, crop);
                 self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
             }
         } else {
@@ -1922,7 +1978,7 @@ impl GLProcessorST {
                  (renderbuffer, {}shader)",
                 if is_int8 { "int8 " } else { "standard " }
             );
-            self.setup_renderbuffer_dma(dst, dst_fmt)?;
+            self.bind_dst(dst, dst_fmt, crop)?;
             // For int8 output, swap to int8 shader programs that apply XOR 0x80
             // in the fragment shader — zero CPU readback.
             if is_int8 {
@@ -1935,12 +1991,7 @@ impl GLProcessorST {
                 // draw_nv_texture_2d picks up the bias shader automatically.
                 std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
                 // Bias the letterbox clear color since glClear bypasses the shader.
-                let mut crop = crop;
-                if let Some(ref mut color) = crop.dst_color {
-                    color[0] ^= 0x80;
-                    color[1] ^= 0x80;
-                    color[2] ^= 0x80;
-                }
+                let crop = Self::int8_bias_clear(true, crop);
                 let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
                 std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
                 std::mem::swap(
@@ -2014,12 +2065,10 @@ impl GLProcessorST {
     /// the int8 texture-program swap around the draw so the GPU writes
     /// XOR-0x80'd values. The PBO draw never reaches the NV (`nv_r8`) or planar
     /// branch, so this swaps **only** the two packed texture programs — narrower
-    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). Shared by
-    /// `convert_pbo_to_pbo` / `convert_pbo_to_mem`, which differ only in FBO
-    /// setup and readback target, never in this draw. Callers that need the
-    /// letterbox clear biased (glClear bypasses the shader) apply
-    /// [`int8_bias_clear`](Self::int8_bias_clear) to `crop` first; this helper
-    /// does not, since the mem path fills via CPU upload instead.
+    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). The
+    /// PBO-source arm of `convert_dest_texture`, which owns the
+    /// [`int8_bias_clear`](Self::int8_bias_clear) on `crop` (glClear bypasses
+    /// the shader); this helper never biases.
     #[allow(clippy::too_many_arguments)]
     fn render_from_pbo(
         &mut self,
@@ -2154,8 +2203,20 @@ impl GLProcessorST {
         Ok(())
     }
 
+    /// Convert into any non-zero-copy destination — the single texture-target
+    /// flow shared by every (src memory) × (dst memory ∈ {Mem, Shm, Pbo})
+    /// combination: `bind_dst` → render → `readback_rendered`. Replaces the
+    /// former `convert_dest_non_dma` / `convert_pbo_to_pbo` /
+    /// `convert_any_to_pbo` / `convert_pbo_to_mem` quartet, which differed
+    /// only in FBO setup (now owned by `bind_dst`) and readback target (now
+    /// carried by [`DstTarget`]).
+    ///
+    /// Source binding is the one src-dependent piece: a PBO source uploads
+    /// via its UNPACK binding (mapping it on the GL thread would deadlock on
+    /// the Pbo message round-trip); everything else takes the CPU texture
+    /// upload inside `render_packed_or_planar`.
     #[allow(clippy::too_many_arguments)]
-    fn convert_dest_non_dma(
+    fn convert_dest_texture(
         &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
@@ -2166,19 +2227,53 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+        let DstTarget::Texture { readback } = self.bind_dst(dst, dst_fmt, crop)? else {
+            return Err(crate::Error::OpenGl(
+                "convert_dest_texture: bind_dst lowered to a zero-copy target".to_string(),
+            ));
+        };
 
-        // Bias letterbox clear color for int8 — glClear bypasses the shader.
+        // Bias the letterbox clear colour for int8 on EVERY texture-target
+        // path: the fragment shader XORs rendered pixels and the readback
+        // never un-biases, so the glClear'd letterbox region must be
+        // pre-biased regardless of which memory the source or destination
+        // lives in. (The former any→PBO and PBO→Mem paths skipped this,
+        // leaving their int8 letterbox fill 0x80 off.)
         let crop = Self::int8_bias_clear(is_int8, crop);
 
         let start = Instant::now();
-        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
+        match src.as_pbo() {
+            Some(src_pbo) => {
+                if src_pbo.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert from a mapped PBO tensor".to_string(),
+                    ));
+                }
+                let src_buffer_id = src_pbo.buffer_id();
+                self.render_from_pbo(
+                    src,
+                    src_fmt,
+                    src_buffer_id,
+                    dst,
+                    dst_fmt,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                )?;
+            }
+            None => {
+                self.render_packed_or_planar(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )?;
+            }
+        }
+        log::debug!("texture-target render takes {:?}", start.elapsed());
 
-        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
+        // Data is already int8-biased by the shader — readback copies bytes.
         let start = Instant::now();
-        self.readback_rendered(dst, dst_fmt, None)?;
-        log::debug!("Read from framebuffer takes {:?}", start.elapsed());
+        self.readback_rendered(dst, dst_fmt, readback.pbo_id())?;
+        log::debug!("texture-target readback takes {:?}", start.elapsed());
         Ok(())
     }
 
@@ -2476,75 +2571,6 @@ impl GLProcessorST {
         )
     }
 
-    /// Convert between two PBO-backed images.
-    ///
-    /// Source PBO is bound as `GL_PIXEL_UNPACK_BUFFER` for zero-copy texture upload
-    /// (avoids `tensor.map()` to prevent GL-thread deadlocks). Destination uses
-    /// `GL_PIXEL_PACK_BUFFER` for zero-copy readback into the PBO.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_pbo_to_pbo(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let (src_buffer_id, dst_buffer_id) = {
-            let src_pbo = src.as_pbo().ok_or_else(|| {
-                crate::Error::OpenGl("convert_pbo_to_pbo: src is not a PBO tensor".to_string())
-            })?;
-            let dst_pbo = dst.as_pbo().ok_or_else(|| {
-                crate::Error::OpenGl("convert_pbo_to_pbo: dst is not a PBO tensor".to_string())
-            })?;
-
-            if src_pbo.is_mapped() || dst_pbo.is_mapped() {
-                return Err(crate::Error::OpenGl(
-                    "Cannot convert PBO tensors while they are mapped".to_string(),
-                ));
-            }
-
-            (src_pbo.buffer_id(), dst_pbo.buffer_id())
-        };
-
-        // Use PBO-as-UNPACK to set up the framebuffer render texture.
-        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
-        // PboMap message back to this GL thread — causing a deadlock.
-        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
-
-        // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = Self::int8_bias_clear(is_int8, crop);
-
-        // Upload source from PBO and render (int8 program swap owned by the
-        // shared `render_from_pbo` wrapper). We cannot call
-        // convert_to/draw_src_texture directly because they call
-        // src.tensor().map() which sends a message back to THIS thread, causing
-        // a deadlock. Instead, bind the source PBO as UNPACK buffer and upload
-        // to the texture with a NULL pointer — GL reads directly from the PBO,
-        // zero CPU copy.
-        let start = Instant::now();
-        self.render_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            is_int8,
-            rotation,
-            flip,
-            crop,
-        )?;
-        log::debug!("PBO render takes {:?}", start.elapsed());
-
-        let start_read = Instant::now();
-        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
-        log::debug!("PBO readback takes {:?}", start_read.elapsed());
-        Ok(())
-    }
-
     /// Upload source image from a PBO and render to the current framebuffer.
     /// This is the PBO equivalent of draw_src_texture — instead of mapping
     /// the tensor to CPU and calling glTexImage2D with a data pointer, we
@@ -2793,99 +2819,6 @@ impl GLProcessorST {
         }
 
         check_gl_error(function!(), line!())?;
-        Ok(())
-    }
-
-    /// Convert any source (Mem/DMA) to a PBO destination.
-    /// Source is uploaded via normal texture path (maps tensor for CPU upload).
-    /// Destination readback uses PBO PACK binding (no map on GL thread).
-    #[allow(clippy::too_many_arguments)]
-    fn convert_any_to_pbo(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let dst_pbo = dst.as_pbo().ok_or_else(|| {
-            crate::Error::OpenGl("convert_any_to_pbo: dst is not a PBO tensor".to_string())
-        })?;
-        if dst_pbo.is_mapped() {
-            return Err(crate::Error::OpenGl(
-                "Cannot convert to a mapped PBO tensor".to_string(),
-            ));
-        }
-        let dst_buffer_id = dst_pbo.buffer_id();
-
-        // Use PBO-as-UNPACK to set up the framebuffer render texture.
-        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
-        // PboMap message back to this GL thread — causing a deadlock.
-        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
-
-        let start = Instant::now();
-        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        log::debug!("any-to-PBO render takes {:?}", start.elapsed());
-
-        let start_read = Instant::now();
-        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
-        log::debug!("any-to-PBO readback takes {:?}", start_read.elapsed());
-        Ok(())
-    }
-
-    /// Convert a PBO source to a non-PBO (Mem) destination.
-    /// Source is uploaded via PBO UNPACK binding (no map on GL thread).
-    /// Destination readback uses normal ReadnPixels into mapped Mem tensor.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_pbo_to_mem(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let src_pbo = src.as_pbo().ok_or_else(|| {
-            crate::Error::OpenGl("convert_pbo_to_mem: src is not a PBO tensor".to_string())
-        })?;
-        if src_pbo.is_mapped() {
-            return Err(crate::Error::OpenGl(
-                "Cannot convert from a mapped PBO tensor".to_string(),
-            ));
-        }
-        let src_buffer_id = src_pbo.buffer_id();
-
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-
-        // Render from the PBO source; the int8 program swap (GPU writes XOR'd
-        // values so ReadnPixels reads already-biased data) is owned by the
-        // shared `render_from_pbo` wrapper. The letterbox fill is handled by the
-        // CPU upload in `setup_renderbuffer_non_dma` above, so no
-        // `int8_bias_clear` is applied here.
-        let start = Instant::now();
-        self.render_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            is_int8,
-            rotation,
-            flip,
-            crop,
-        )?;
-        log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
-
-        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
-        let start = Instant::now();
-        self.readback_rendered(dst, dst_fmt, None)?;
-        log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
         Ok(())
     }
 
@@ -3520,7 +3453,7 @@ impl GLProcessorST {
         drop(_pass1);
 
         // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
-        // setup_renderbuffer_dma rebinds convert_fbo with the DMA destination EGLImage,
+        // bind_dst rebinds convert_fbo with the DMA destination EGLImage,
         // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
         // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
         let _pass2 = tracing::trace_span!(
@@ -3529,7 +3462,7 @@ impl GLProcessorST {
             dst_h
         )
         .entered();
-        self.setup_renderbuffer_dma(dst, dst_fmt)?;
+        self.bind_dst(dst, dst_fmt, crop)?;
 
         // Pass 2 is a fullscreen blit from the intermediate to the planar
         // destination. Pass 1 (convert_to above) already placed the image
@@ -3541,9 +3474,9 @@ impl GLProcessorST {
         // a second time. Observed downstream as bounding boxes compressed by
         // exactly (content/canvas) in the padded dimension on i.MX 8M Plus.
         //
-        // The int8 clear-color bias that lived here is gone with the clear:
-        // pass 1 performed all letterbox fills, and pass 2's shader applies
-        // the int8 bias itself (is_int8 flag on the draw below).
+        // No int8 bias-clear here either: pass 2 performs no clear, and the
+        // planar deinterleave shader applies the int8 bias itself (is_int8
+        // flag on the draw below).
         let dst_roi = RegionOfInterest {
             left: -1.,
             top: 1.,

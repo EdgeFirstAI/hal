@@ -37,6 +37,36 @@
 #![allow(dead_code)]
 
 use crate::Region;
+use edgefirst_tensor::TensorMemory;
+
+/// How a convert's destination is realized on the GPU — the pure half of the
+/// destination lowering (`bind_dst` in `processor/mod.rs` performs the GL
+/// work). One lowering per *destination memory class*, never per platform:
+/// platform differences surface as the `zero_copy_import` capability bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DstLowering {
+    /// The destination buffer itself becomes the FBO colour attachment
+    /// (EGLImage renderbuffer/texture today, IOSurface pbuffer after the
+    /// platform seam). The render writes the buffer directly — no readback.
+    ZeroCopy,
+    /// Offscreen texture render target, read back into the mapped tensor.
+    TextureMem,
+    /// Offscreen texture render target, read back into the destination PBO's
+    /// PACK binding (the tensor must never be mapped on the GL thread).
+    TexturePbo,
+}
+
+/// Classify the destination lowering from the platform's zero-copy import
+/// capability and the destination's memory class. A DMA destination without
+/// import support (e.g. dma-heap present but `EGL_EXT_image_dma_buf_import`
+/// missing) degrades to the mapped texture path rather than failing.
+pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLowering {
+    match dst_mem {
+        TensorMemory::Dma if zero_copy_import => DstLowering::ZeroCopy,
+        TensorMemory::Pbo => DstLowering::TexturePbo,
+        _ => DstLowering::TextureMem,
+    }
+}
 
 /// A GL viewport / scissor rectangle in **pixels**, bottom-left origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,5 +286,22 @@ mod tests {
     fn plan_batch_degenerate_inputs() {
         assert_eq!(plan_batch(0, 64, 2048), BatchPath::OneImport);
         assert_eq!(plan_batch(4, 0, 2048), BatchPath::OneImport);
+    }
+
+    #[test]
+    fn lower_dst_full_table() {
+        use TensorMemory::*;
+        // With zero-copy import: only a DMA destination is zero-copy; PBO
+        // keeps its PACK readback; Mem/Shm read back through the map.
+        assert_eq!(lower_dst(true, Dma), DstLowering::ZeroCopy);
+        assert_eq!(lower_dst(true, Pbo), DstLowering::TexturePbo);
+        assert_eq!(lower_dst(true, Mem), DstLowering::TextureMem);
+        assert_eq!(lower_dst(true, Shm), DstLowering::TextureMem);
+        // Without import support a DMA destination degrades to the mapped
+        // texture path (dma-heap without EGL dma_buf_import) — never an error.
+        assert_eq!(lower_dst(false, Dma), DstLowering::TextureMem);
+        assert_eq!(lower_dst(false, Pbo), DstLowering::TexturePbo);
+        assert_eq!(lower_dst(false, Mem), DstLowering::TextureMem);
+        assert_eq!(lower_dst(false, Shm), DstLowering::TextureMem);
     }
 }

@@ -417,33 +417,37 @@ HWC→CHW proto-tensor repack on the GPU. Enable it with
 implementation logs a warning and falls back to CPU repack transparently —
 no API changes.
 
-### PBO convert dispatch
+### Destination lowering (`bind_dst`)
 
-When `convert()` is called with PBO-backed images, the GL thread must not
-call `tensor.map()` on those images — that would send a message back to
-itself and deadlock. The convert path dispatches to specialized methods:
+Every u8/i8 `convert()` lowers its destination through one seam: the pure
+classifier `render::lower_dst(zero_copy_import, dst_memory)` picks the
+lowering and `bind_dst()` performs the GL work, returning a `DstTarget`
+that tells the engine what completes the convert.
 
-| Source → Destination | Method |
-|---------------------|--------|
-| DMA → DMA | `convert_dest_dma` (EGLImage on both sides) |
-| PBO → PBO | `convert_pbo_to_pbo` (UNPACK + PACK) |
-| Mem/DMA → PBO | `convert_any_to_pbo` (texture + PACK) |
-| PBO → Mem | `convert_pbo_to_mem` (UNPACK + ReadnPixels) |
-| Mem/DMA → Mem/DMA | `convert_dest_non_dma` (texture + memcpy) |
+| Lowering | Destination | Render target | Completion |
+|----------|-------------|---------------|------------|
+| `ZeroCopy` | DMA (with EGL dma_buf import) | dst's own EGLImage (renderbuffer on Mali, texture-FBO elsewhere) | none — render writes the buffer |
+| `TexturePbo` | PBO | offscreen texture seeded from the PBO via UNPACK | `glReadnPixels` into the PBO PACK binding |
+| `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadnPixels` into the mapped tensor |
 
-**PBO destination renderbuffer setup:** When the destination is a PBO tensor
-and the shader needs a pre-initialized renderbuffer (e.g., for letterbox
-padding), the code must use `setup_renderbuffer_from_pbo()` — **never**
-`setup_renderbuffer_non_dma()`. The latter calls `dst.map()`, which sends a
-`PboMap` message to the GL thread via the channel. Since we are already
-executing on the GL thread (processing an `ImageConvert` message), this
-deadlocks. `setup_renderbuffer_from_pbo()` avoids this by binding the PBO as
-`GL_PIXEL_UNPACK_BUFFER` and loading data with `glTexImage2D(NULL)`, which
-reads directly from the PBO without any channel round-trip.
+A single `convert_dest_texture` drives both texture lowerings (the former
+`convert_pbo_to_pbo` / `convert_any_to_pbo` / `convert_pbo_to_mem` /
+`convert_dest_non_dma` quartet); the source side independently picks the PBO
+UNPACK upload or the CPU texture upload. The DMA two-pass paths (packed RGB,
+NV→planar) still branch inside `convert_dest_dma` ahead of the full engine
+collapse.
 
-`convert_pbo_to_mem()` is not affected because its destination is a Mem
-tensor, so `dst.map()` is a direct memory operation with no GL thread
-message.
+**Why the PBO lowering never maps:** the GL thread must not call
+`tensor.map()` on a PBO image — that sends a `PboMap` message back to the
+GL thread itself and deadlocks. `bind_dst` therefore seeds the render
+texture by binding the PBO as `GL_PIXEL_UNPACK_BUFFER` and calling
+`glTexImage2D(NULL)` (GL reads directly from the PBO), and the readback
+targets the PACK binding. Mem tensors map directly — no channel round-trip
+— so the `TextureMem` lowering may map freely.
+
+**Int8 letterbox bias is lowering-independent:** the int8 fragment shader
+XORs rendered pixels with 0x80 and no readback un-biases, so the letterbox
+clear colour is pre-biased (`int8_bias_clear`) on every lowering alike.
 
 ### CUDA registration of the float PBO
 
