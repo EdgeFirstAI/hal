@@ -3181,7 +3181,16 @@ impl GLProcessorST {
         // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
         // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
         // applied once, by pass 2's packing shader.
-        self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop)?;
+        //
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples the
+        // finished intermediate, and the convert syncs once at pass 2's end.
+        // The flag restores before `?` so an error cannot leak defer state.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        self.defer_finish = saved_defer;
+        pass1?;
         drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
@@ -3328,7 +3337,15 @@ impl GLProcessorST {
         // width/height in ROI coordinate math.
         // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
         // applied once, by pass 2's planar deinterleave shader.
-        self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop)?;
+        //
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples the
+        // finished intermediate, and the convert syncs once at pass 2's end.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        self.defer_finish = saved_defer;
+        pass1?;
         drop(_pass1);
 
         // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
