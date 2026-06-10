@@ -330,6 +330,12 @@ pub use opengl_headless::MacosGlProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
+// EGLImage cache counter snapshots (diagnostics): see
+// `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
+// `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
+#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::{CacheStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
 
 mod colorimetry;
@@ -6055,6 +6061,69 @@ mod image_tests {
         let second: Vec<u8> = dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
 
         assert_eq!(first, second, "cache-hit conversion must be deterministic");
+    }
+
+    /// Steady-state import gate (macOS half of the Linux
+    /// `dma_pool_steady_state_zero_imports` test): an N-frame convert loop
+    /// over a fixed pool of IOSurface tensors must create ZERO new EGL
+    /// pbuffers after the pool has been seen once — pbuffer-cache misses
+    /// stay flat while hits grow. Counter-based hardening of
+    /// `test_macos_gl_pbuffer_cache_reuses_surfaces` above: a refactor that
+    /// re-imports per frame passes the pixel-equality test but fails this.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_macos_gl_pbuffer_cache_steady_state() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+
+        let (w, h) = (64usize, 32usize);
+        const POOL: usize = 3;
+        const FRAMES: usize = 100;
+
+        let yuyv = vec![128u8; w * h * 2];
+        let pool: Vec<TensorDyn> = (0..POOL)
+            .map(|_| {
+                load_bytes_to_tensor(w, h, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
+                    .unwrap()
+            })
+            .collect();
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+
+        // Warmup: two passes over the pool import every surface once.
+        for src in pool.iter().cycle().take(POOL * 2) {
+            proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let (warm_hits, warm_misses, warm_entries) = proc.pbuf_cache_stats();
+
+        for src in pool.iter().cycle().take(FRAMES) {
+            proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let (hits, misses, entries) = proc.pbuf_cache_stats();
+
+        assert_eq!(
+            warm_misses, misses,
+            "steady-state loop created new EGL pbuffers \
+             (warm: {warm_hits}h/{warm_misses}m/{warm_entries}e, \
+             steady: {hits}h/{misses}m/{entries}e)"
+        );
+        assert_eq!(warm_entries, entries, "pbuffer cache entry count drifted");
+        assert!(
+            hits - warm_hits >= FRAMES as u64,
+            "expected at least {FRAMES} pbuffer cache hits over the loop, got {}",
+            hits - warm_hits
+        );
     }
 
     #[test]

@@ -91,6 +91,14 @@ name = "decode_pipeline_benchmark"
 harness = false
 
 [[bench]]
+name = "convert_matrix_benchmark"
+harness = false
+
+[[bench]]
+name = "batch_convert_benchmark"
+harness = false
+
+[[bench]]
 name = "opencv_benchmark"
 harness = false
 required-features = ["opencv"]

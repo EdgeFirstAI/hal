@@ -99,6 +99,37 @@ impl EglCacheKey {
     }
 }
 
+/// Snapshot of one EGLImage cache's hit/miss counters.
+///
+/// The counters themselves have always existed (logged at `Drop`); this
+/// snapshot makes them **assertable**: steady-state tests capture stats after
+/// warmup and after an N-frame loop and require `misses` to stay flat — any
+/// increase means a convert re-imported a buffer it should have found cached,
+/// which is the cache-behavior equality gate for GL refactors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: usize,
+}
+
+/// Combined snapshot of every EGLImage cache on the GL processor
+/// (source, destination, and the Path-B NV R8 source cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlCacheStats {
+    pub src: CacheStats,
+    pub dst: CacheStats,
+    pub nv_r8: CacheStats,
+}
+
+impl GlCacheStats {
+    /// Total imports performed (cache misses) across all caches — the number
+    /// steady-state loops assert stays flat.
+    pub fn total_misses(&self) -> u64 {
+        self.src.misses + self.dst.misses + self.nv_r8.misses
+    }
+}
+
 pub(super) struct EglImageCache {
     pub(super) entries: std::collections::HashMap<EglCacheKey, CachedEglImage>,
     pub(super) capacity: usize,
@@ -116,6 +147,15 @@ impl EglImageCache {
             hits: 0,
             misses: 0,
             access_counter: 0,
+        }
+    }
+
+    /// Snapshot the hit/miss counters for steady-state assertions.
+    pub(super) fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            entries: self.entries.len(),
         }
     }
 
