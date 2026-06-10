@@ -5572,6 +5572,39 @@ mod gl_tests {
             "Exact mode, BT.601-limited NV12"
         );
 
+        // A Grey destination must NEVER take the sampler, in either mode and
+        // for any colorimetry: samplerExternalOES → R8 render target wedges
+        // the Vivante GC7000UL (EDGEAI-1180 hang class; found when the Fast
+        // policy first routed nv12@dma→grey@dma to the sampler). ShaderR8 on
+        // every GPU. NOTE: this leg HANGS the board rather than failing if
+        // the gate regresses — keep it last-resort observable via the suite
+        // timeout.
+        let mut grey_dst =
+            TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut grey_path = |gl: &mut GLProcessorST, src: &TensorDyn| {
+            gl.convert(
+                src,
+                &mut grey_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            gl.last_nv_convert_path
+        };
+        gl.set_colorimetry_mode(ColorimetryMode::Fast);
+        assert_eq!(
+            grey_path(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "Fast mode, BT.709 NV12 → Grey must avoid the sampler (R8 target)"
+        );
+        gl.set_colorimetry_mode(ColorimetryMode::Exact);
+        assert_eq!(
+            grey_path(&mut gl, &src_601),
+            NvConvertPath::ShaderR8,
+            "Exact mode, BT.601-limited NV12 → Grey must avoid the sampler (R8 target)"
+        );
+
         // EDGEFIRST_COLORIMETRY pins the mode for the processor's lifetime:
         // a Fast request on an exact-pinned processor is kept at Exact.
         drop(gl);

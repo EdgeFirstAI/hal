@@ -2809,7 +2809,17 @@ impl GLProcessorST {
     ///   covers single-plane NV12/NV16/NV24 but NOT true-multiplane NV12.
     /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) is wired for
     ///   NV12 only (incl. multiplane); NV16/NV24 have no sampler path.
-    fn select_nv_path(&self, src: &Tensor<u8>, src_fmt: PixelFormat) -> NvConvertPath {
+    ///
+    /// `render_fmt` is the format of the render target this draw writes
+    /// (Rgb/PlanarRgb arrive here only as the LOGICAL format of a two-pass
+    /// convert whose pass 1 renders an RGBA intermediate; the only R8 render
+    /// target reachable with an NV source is a single-pass Grey destination).
+    fn select_nv_path(
+        &self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        render_fmt: PixelFormat,
+    ) -> NvConvertPath {
         // `ShaderR8` (R8 texelFetch) only applies to SINGLE-PLANE semi-planar
         // NV12/NV16/NV24. Everything else routed through this picker —
         // RGBA/Grey/YUYV/RGB and true-multiplane NV12 — uses the
@@ -2827,7 +2837,18 @@ impl GLProcessorST {
         match self.nv_path_pref {
             NvPathPref::ForceShader => NvConvertPath::ShaderR8,
             NvPathPref::ForceSampler => {
-                if src_fmt == PixelFormat::Nv12 {
+                if src_fmt == PixelFormat::Nv12
+                    && self.is_vivante
+                    && render_fmt == PixelFormat::Grey
+                {
+                    // See the Auto-arm comment: sampler → R8 target wedges the
+                    // GC7000UL. Refuse the force rather than hang the GPU.
+                    log::warn!(
+                        "EDGEFIRST_NV_CONVERT_PATH=sampler refused for NV12→Grey on Vivante \
+                         (samplerExternalOES → R8 render target hangs the GPU); using shader"
+                    );
+                    NvConvertPath::ShaderR8
+                } else if src_fmt == PixelFormat::Nv12 {
                     NvConvertPath::ExternalSampler
                 } else {
                     log::warn!(
@@ -2856,8 +2877,16 @@ impl GLProcessorST {
             //   (encoding, range); everything else renders through the exact
             //   in-shader matrix, at Vivante's 12× cost.
             NvPathPref::Auto => {
+                // NEVER pair the external sampler with an R8 (Grey) render
+                // target on Vivante: samplerExternalOES → R8 attachment wedges
+                // the GC7000UL (the EDGEAI-1180 hang class — found when the
+                // Fast policy first routed nv12@dma→grey@dma to the sampler;
+                // the GPU hangs unrecoverably mid-draw). This gate applies in
+                // BOTH colorimetry modes: the old BT.601-limited carve-out had
+                // the same latent hang, just unreachable with HD sources.
                 let vivante_sampler_usable = src_fmt == PixelFormat::Nv12
                     && self.is_vivante
+                    && render_fmt != PixelFormat::Grey
                     && src.width().is_some_and(|w| w.is_multiple_of(4));
                 let take_sampler = vivante_sampler_usable
                     && match self.colorimetry_mode {
@@ -2985,7 +3014,7 @@ impl GLProcessorST {
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
             // single-plane NV12/NV16/NV24, using the driver ExternalSampler only
             // for true-multiplane NV12 (which ShaderR8 cannot import).
-            let chosen = self.select_nv_path(src, src_fmt);
+            let chosen = self.select_nv_path(src, src_fmt, _dst_fmt);
 
             if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
