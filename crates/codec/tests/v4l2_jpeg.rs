@@ -100,8 +100,9 @@ fn v4l2_parity_nv12() {
         has_video_device()
     );
     let jpeg = testdata("zidane.jpg");
-    let cpu = decode(&jpeg, 1280, 720, PixelFormat::Nv12, true);
-    let hw = decode(&jpeg, 1280, 720, PixelFormat::Nv12, false);
+    let info = peek_info(&jpeg).unwrap();
+    let cpu = decode(&jpeg, info.width, info.height, PixelFormat::Nv12, true);
+    let hw = decode(&jpeg, info.width, info.height, PixelFormat::Nv12, false);
     assert_close(&cpu, &hw, "nv12");
 }
 
@@ -109,8 +110,9 @@ fn v4l2_parity_nv12() {
 fn v4l2_parity_grey() {
     // grey.jpg is a greyscale JPEG → decodes to a single-plane Grey buffer.
     let jpeg = testdata("grey.jpg");
-    let cpu = decode(&jpeg, 1024, 681, PixelFormat::Grey, true);
-    let hw = decode(&jpeg, 1024, 681, PixelFormat::Grey, false);
+    let info = peek_info(&jpeg).unwrap();
+    let cpu = decode(&jpeg, info.width, info.height, PixelFormat::Grey, true);
+    let hw = decode(&jpeg, info.width, info.height, PixelFormat::Grey, false);
     assert_close(&cpu, &hw, "grey");
 }
 

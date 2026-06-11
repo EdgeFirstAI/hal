@@ -220,6 +220,12 @@ struct Stream {
     /// must not share a CAPTURE configuration (the driver would stall waiting
     /// for a format change).
     out_fmt: PixelFormat,
+    /// Destination row pitch this session was configured for. Part of the
+    /// reuse key for zero-copy: `S_FMT` baked this pitch into the CAPTURE
+    /// format, so a same-geometry destination with a different stride must
+    /// reconfigure. The scratch target copies out at the caller's stride
+    /// every frame and ignores this.
+    dst_stride: usize,
     /// Allocated OUTPUT plane size; a larger JPEG forces a full rebuild.
     out_sizeimage: u32,
     /// Mapped OUTPUT (coded) buffer — the JPEG is copied in here each frame.
@@ -287,15 +293,20 @@ impl V4l2Context {
 
         // Reuse requires identical geometry AND native format (a same-sized
         // JPEG with different subsampling changes the CAPTURE format and would
-        // stall the driver), plus a target the new destination supports —
-        // zero-copy needs a DMA destination; Scratch takes anything.
+        // stall the driver), plus a target the new destination supports:
+        // zero-copy needs a DMA destination at the exact pitch the CAPTURE
+        // format was configured with; Scratch copies out at the caller's
+        // stride each frame, so any destination fits.
         let reuse = matches!(
             &self.stream,
             Some(s) if s.jpeg_w == final_w as u32
                 && s.jpeg_h == final_h as u32
                 && s.out_fmt == output_fmt
                 && s.out_sizeimage >= needed
-                && (dma_capable || !matches!(s.cap.target, CaptureTarget::DstDma))
+                && match s.cap.target {
+                    CaptureTarget::DstDma => dma_capable && s.dst_stride == dst_stride,
+                    CaptureTarget::Scratch => true,
+                }
         );
         // Reconfigure keeps the OUTPUT buffer and re-imports the CAPTURE
         // buffers; only the OUTPUT capacity gates it.
@@ -376,6 +387,9 @@ impl V4l2Context {
         dma_capable: bool,
         needed: u32,
     ) -> Result<(), DecodeErr> {
+        let _span =
+            tracing::trace_span!("codec.decode_jpeg.v4l2_rebuild", w = final_w, h = final_h)
+                .entered();
         self.drop_stream();
         let fd = self.device.fd();
         const OUT: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -441,6 +455,7 @@ impl V4l2Context {
             jpeg_w: final_w as u32,
             jpeg_h: final_h as u32,
             out_fmt: output_fmt,
+            dst_stride,
             out_sizeimage: olen.min(u32::MAX as usize) as u32,
             out_map,
             cap,
@@ -466,6 +481,12 @@ impl V4l2Context {
         dst_capacity: usize,
         dma_capable: bool,
     ) -> Result<(), DecodeErr> {
+        let _span = tracing::trace_span!(
+            "codec.decode_jpeg.v4l2_reconfigure",
+            w = final_w,
+            h = final_h
+        )
+        .entered();
         let fd = self.device.fd();
         const CAP: u32 = ioctl::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 
@@ -510,6 +531,7 @@ impl V4l2Context {
         stream.jpeg_w = final_w as u32;
         stream.jpeg_h = final_h as u32;
         stream.out_fmt = output_fmt;
+        stream.dst_stride = dst_stride;
         stream.cap = cap;
         Ok(())
     }
@@ -635,6 +657,17 @@ impl V4l2Context {
 
         let mut dst_dma = false;
         if want_zc {
+            // MCU(16)-aligned logical dims mean the driver's MCU-padded
+            // CAPTURE geometry equals them — the invariant the zero-copy
+            // sizeimage math and the tensor layout both rely on.
+            debug_assert_eq!(
+                cap0.height as usize, final_h,
+                "zero-copy requires the MCU-padded CAPTURE height to equal the image height"
+            );
+            debug_assert_eq!(
+                cap0.width as usize, final_w,
+                "zero-copy requires the MCU-padded CAPTURE width to equal the image width"
+            );
             // Request a SINGLE-PLANE contiguous CAPTURE at the tensor pitch:
             // the whole NV12 (Y+CbCr) / GREY image becomes one fd at offset 0.
             // The driver's default NV12M is two *non-contiguous* planes, which
@@ -675,6 +708,8 @@ impl V4l2Context {
             let cap_zc = *unsafe { gfmt.pix_mp() };
             let ok = cap_zc.pixelformat == target_fourcc
                 && cap_zc.num_planes == 1
+                && cap_zc.width as usize == final_w
+                && cap_zc.height as usize == final_h
                 && cap_zc.plane_fmt[0].bytesperline as usize == dst_stride
                 && dst_capacity >= cap_zc.plane_fmt[0].sizeimage as usize;
             if ok {
@@ -835,6 +870,11 @@ impl V4l2Context {
                 .ok_or_else(|| DecodeErr::Reset("no stream".into()))?;
             matches!(s.cap.target, CaptureTarget::DstDma)
         };
+        let _span = tracing::trace_span!(
+            "codec.decode_jpeg.v4l2_collect",
+            target = if is_dst_dma { "dst_dma" } else { "scratch" },
+        )
+        .entered();
 
         if is_dst_dma {
             // Zero-copy: import the tensor's dmabuf fd as the CAPTURE buffer
@@ -967,6 +1007,15 @@ fn write_planes<T: ImagePixel>(
     final_h: usize,
     dst_stride: usize,
 ) -> Result<ImageInfo, DecodeErr> {
+    let _span = tracing::trace_span!(
+        "codec.decode_jpeg.v4l2_copy_out",
+        kind = match cap.kind {
+            CapKind::Yuv444Packed => "yuv24_to_nv24",
+            CapKind::Nv12 => "nv12",
+            CapKind::Grey => "grey",
+        },
+    )
+    .entered();
     let y_stride = cap.luma_stride;
 
     // YUV3 → NV24: the mxc-jpeg driver outputs 4:4:4 JPEGs as packed
