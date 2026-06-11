@@ -6,7 +6,8 @@
 //! The codec emits native `NV12`/`GREY`/`NV24`; the hardware decode path copies
 //! decoded planes into the tensor (no colour conversion). 4:2:0 JPEGs decode to
 //! `NV12`/`NV12M` (Y + CbCr copied through), greyscale to `GREY` (Y through),
-//! and 4:4:4 JPEGs (`YUV3`) are deinterleaved to `NV24` in the MMAP copy step.
+//! and 4:4:4 JPEGs (`YUV3`) are deinterleaved to `NV24` in the scratch
+//! copy-out step (zero-copy is NV12/GREY only).
 
 use super::ioctl;
 

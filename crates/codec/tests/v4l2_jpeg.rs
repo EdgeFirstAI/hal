@@ -328,9 +328,9 @@ fn v4l2_zero_copy_dma_nv12() {
     // Zero-copy: decode into a DMA-backed NV12 tensor. On a target with a JPEG
     // M2M device + dma_heap, the hardware decodes straight into the tensor
     // (V4L2_MEMORY_DMABUF import, no plane copy); the result must match the
-    // MMAP/copy path byte-for-byte (same hardware decode). Skips cleanly where
-    // DMA allocation is unavailable (no dma_heap on this host). zidane is
-    // 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
+    // scratch copy-out path byte-for-byte (same hardware decode). Skips
+    // cleanly where DMA allocation is unavailable (no dma_heap on this host).
+    // zidane is 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
     let jpeg = testdata("zidane.jpg");
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut dma = match Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Dma)) {
@@ -361,7 +361,8 @@ fn v4l2_zero_copy_dma_nv12() {
         }
     }
 
-    // Reference: MMAP/copy path through the same backend (hardware on-target).
+    // Reference: scratch copy-out path through the same backend (hardware
+    // on-target — the Mem-tensor destination is ineligible for zero-copy).
     let reference = decode(&jpeg, w, h, PixelFormat::Nv12, false);
     assert_close(&reference, &zc, "zero-copy-dma");
 }

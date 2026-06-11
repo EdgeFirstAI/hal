@@ -36,11 +36,6 @@ impl Mmap {
         Ok(Self { ptr, len })
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr/len describe a valid mapping owned by this Mmap.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.len) }
-    }
-
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: ptr/len describe a valid mapping uniquely owned here.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.len) }

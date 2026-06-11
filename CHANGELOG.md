@@ -9,18 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **DMABUF-first V4L2 hardware JPEG decode** (`edgefirst-codec`): the CAPTURE
-  queue now imports DMA buffers instead of allocating MMAP buffers, so a
-  geometry change costs ~1 ms of ioctls instead of a ~110 ms kernel buffer
-  reallocation. Three decode targets, tried in order: zero-copy into the
-  destination DMA tensor (MCU-aligned NV12/GREY), a persistent codec-owned DMA
-  scratch with copy-out (NEON YUV24→NV24 deinterleave for 4:4:4), and the
-  legacy MMAP path where no dma_heap exists. The OUTPUT (coded) buffer is
-  allocated once with headroom and survives geometry changes. i.MX95, COCO val
-  5K (~1000 distinct resolutions): decode mean 128.7 ms → 7.0 ms, 2.5× faster
-  than the CPU decoder; raw hardware throughput ~350 FPS at 720p
-  (`probe_decode_throughput`). New `v4l2_scan` example flags images that
-  decode slowly through the hardware path.
+- **DMABUF V4L2 hardware JPEG decode** (`edgefirst-codec`): the CAPTURE queue
+  now imports DMA buffers instead of allocating MMAP buffers, so a geometry
+  change costs ~1 ms of ioctls instead of a ~110 ms kernel buffer
+  reallocation. Two decode targets, tried in order: zero-copy into the
+  destination DMA tensor (MCU-aligned NV12/GREY), or a persistent codec-owned
+  DMA scratch with copy-out (NEON YUV24→NV24 deinterleave for 4:4:4). The
+  OUTPUT (coded) buffer is allocated once with headroom and survives geometry
+  changes. Hardware decode requires DMA buffer allocation (dma_heap), in line
+  with the HAL's DMABUF-centric design; platforms without it use the CPU
+  decoder. i.MX95, COCO val 5K (~1000 distinct resolutions): decode mean
+  128.7 ms → 7.0 ms, 2.5× faster than the CPU decoder; raw hardware
+  throughput ~350 FPS at 720p (`probe_decode_throughput`). New `v4l2_scan`
+  example flags images that decode slowly through the hardware path.
 
 - **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
   C API, Python): render `N` model inputs into row-band views of one batched
