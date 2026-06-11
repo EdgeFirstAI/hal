@@ -5143,69 +5143,6 @@ impl GLProcessorST {
     /// suitable for upload to a GL_TEXTURE_2D_ARRAY with GL_RGBA16F.
     ///
     /// Returns `(repacked_bytes, num_layers)` where each layer is H*W*4 half-floats.
-    fn repack_protos_to_rgba_f16(protos: ndarray::ArrayView3<'_, f32>) -> (Vec<u8>, usize) {
-        let (height, width, num_protos) = protos.dim();
-        let num_layers = num_protos.div_ceil(4);
-        // Each layer is H*W*4 half-floats, each half-float is 2 bytes
-        let layer_stride = height * width * 4;
-        let mut buf = vec![0u16; layer_stride * num_layers];
-
-        for y in 0..height {
-            for x in 0..width {
-                for k in 0..num_layers * 4 {
-                    let val = if k < num_protos {
-                        half::f16::from_f32(protos[[y, x, k]])
-                    } else {
-                        half::f16::ZERO
-                    };
-                    let layer = k / 4;
-                    let channel = k % 4;
-                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
-                }
-            }
-        }
-
-        // Reinterpret u16 buffer as bytes
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
-        };
-        (byte_buf, num_layers)
-    }
-
-    /// Native-f16 variant of [`Self::repack_protos_to_rgba_f16`]: shuffles
-    /// already-f16 protos into RGBA-layer order without the f32→f16
-    /// conversion step. Used when the decoder produced an fp16 proto
-    /// tensor — `TensorDyn::F16` in the current [`ProtoData`] representation
-    /// — from an fp16 inference engine.
-    fn repack_protos_f16_to_rgba_f16(
-        protos: ndarray::ArrayView3<'_, half::f16>,
-    ) -> (Vec<u8>, usize) {
-        let (height, width, num_protos) = protos.dim();
-        let num_layers = num_protos.div_ceil(4);
-        let layer_stride = height * width * 4;
-        let mut buf = vec![0u16; layer_stride * num_layers];
-
-        for y in 0..height {
-            for x in 0..width {
-                for k in 0..num_layers * 4 {
-                    let val = if k < num_protos {
-                        protos[[y, x, k]]
-                    } else {
-                        half::f16::ZERO
-                    };
-                    let layer = k / 4;
-                    let channel = k % 4;
-                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
-                }
-            }
-        }
-
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
-        };
-        (byte_buf, num_layers)
-    }
-
     /// Render YOLO proto segmentation masks using the fused GPU pipeline.
     ///
     /// Dispatches on the proto tensor's runtime dtype via
@@ -5637,14 +5574,7 @@ impl GLProcessorST {
             }
         } else {
             // === GLES 3.0 fallback: CPU repack ===
-            let mut tex_data = vec![0i8; height * width * num_protos];
-            for k in 0..num_protos {
-                for y in 0..height {
-                    for x in 0..width {
-                        tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
-                    }
-                }
-            }
+            let tex_data = super::proto_dispatch::repack_layers(protos);
 
             self.upload_proto_texture(
                 texture_target,
@@ -5871,14 +5801,7 @@ impl GLProcessorST {
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         // Repack protos to layer-first layout: (num_protos, H, W)
-        let mut tex_data = vec![0.0f32; height * width * num_protos];
-        for k in 0..num_protos {
-            for y in 0..height {
-                for x in 0..width {
-                    tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
-                }
-            }
-        }
+        let tex_data = super::proto_dispatch::repack_layers(protos_f32);
 
         self.upload_proto_texture(
             texture_target,
@@ -5922,7 +5845,8 @@ impl GLProcessorST {
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
-        let (tex_data, _) = Self::repack_protos_to_rgba_f16(protos_f32);
+        let (tex_data, _) =
+            super::proto_dispatch::repack_rgba_f16_layers(protos_f32, half::f16::from_f32);
 
         self.upload_proto_texture(
             texture_target,
@@ -5967,7 +5891,7 @@ impl GLProcessorST {
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
         let num_layers = num_protos.div_ceil(4);
-        let (tex_data, _) = Self::repack_protos_f16_to_rgba_f16(protos_f16);
+        let (tex_data, _) = super::proto_dispatch::repack_rgba_f16_layers(protos_f16, |v| v);
 
         self.upload_proto_texture(
             texture_target,

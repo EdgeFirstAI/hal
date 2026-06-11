@@ -143,6 +143,58 @@ pub(super) fn plan_proto(
     Ok(plan)
 }
 
+/// HWC → layer-first repack: one proto per texture layer
+/// (`out[k][y][x] = in[y][x][k]`). Monomorphized per element type — the
+/// int8 (R8I) and f32 (R32F) upload paths share this exact transpose.
+pub(super) fn repack_layers<T: Copy + Default>(protos: ndarray::ArrayView3<'_, T>) -> Vec<T> {
+    let (height, width, num_protos) = protos.dim();
+    let mut out = vec![T::default(); height * width * num_protos];
+    for k in 0..num_protos {
+        for y in 0..height {
+            for x in 0..width {
+                out[k * height * width + y * width + x] = protos[[y, x, k]];
+            }
+        }
+    }
+    out
+}
+
+/// HWC → RGBA16F-packed layers: 4 protos per layer, zero-padded tail
+/// channels when `num_protos % 4 != 0`. Returns the raw f16 bits as bytes
+/// plus the layer count. `conv` is monomorphized per source dtype — the
+/// f32 fallback narrows (`f16::from_f32`), the native-f16 path passes
+/// through; protos are never widened to f32 (doubles upload bytes).
+pub(super) fn repack_rgba_f16_layers<S: Copy>(
+    protos: ndarray::ArrayView3<'_, S>,
+    conv: impl Fn(S) -> half::f16,
+) -> (Vec<u8>, usize) {
+    let (height, width, num_protos) = protos.dim();
+    let num_layers = num_protos.div_ceil(4);
+    // Each layer is H*W*4 half-floats, each half-float is 2 bytes.
+    let layer_stride = height * width * 4;
+    let mut buf = vec![0u16; layer_stride * num_layers];
+
+    for y in 0..height {
+        for x in 0..width {
+            for k in 0..num_layers * 4 {
+                let val = if k < num_protos {
+                    conv(protos[[y, x, k]])
+                } else {
+                    half::f16::ZERO
+                };
+                let layer = k / 4;
+                let channel = k % 4;
+                buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
+            }
+        }
+    }
+
+    // Reinterpret the u16 buffer as bytes for the GL upload.
+    let byte_buf =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec() };
+    (byte_buf, num_layers)
+}
+
 /// Widen integer mask coefficients to the f32 the GL shaders consume,
 /// applying per-tensor dequantization. `None` quantization is a plain
 /// cast. Per-channel modes are rejected with the dispatcher's original
@@ -267,6 +319,57 @@ mod tests {
                 "{dtype:?}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn repack_layers_transposes_hwc_to_layer_first() {
+        // 2x2x3 HWC: value encodes (y, x, k) as y*100 + x*10 + k.
+        let data: Vec<i32> = (0..2 * 2 * 3)
+            .map(|i| {
+                let (y, x, k) = (i / 6, (i / 3) % 2, i % 3);
+                y * 100 + x * 10 + k
+            })
+            .collect();
+        let view = ndarray::ArrayView3::from_shape((2, 2, 3), &data).unwrap();
+        let out = repack_layers(view);
+        // out[k][y][x]
+        assert_eq!(out.len(), 12);
+        for k in 0..3 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    assert_eq!(out[k * 4 + y * 2 + x] as usize, y * 100 + x * 10 + k);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repack_rgba_f16_layers_packs_quads_and_zero_pads_tail() {
+        // 1x2x6 HWC → 2 RGBA layers; 6 protos fill layer 0 fully and half
+        // of layer 1 (channels 2,3 of every pixel zero-padded).
+        let data: Vec<f32> = (0..2 * 6).map(|i| i as f32).collect();
+        let view = ndarray::ArrayView3::from_shape((1, 2, 6), &data).unwrap();
+        let (bytes, num_layers) = repack_rgba_f16_layers(view, half::f16::from_f32);
+        assert_eq!(num_layers, 2);
+        let halves: Vec<half::f16> = bytes
+            .chunks_exact(2)
+            .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+            .collect();
+        let layer_stride = 2 * 4; // H*W*4 per layer
+        for x in 0..2 {
+            for k in 0..8 {
+                let expected = if k < 6 { (x * 6 + k) as f32 } else { 0.0 };
+                let got = halves[(k / 4) * layer_stride + x * 4 + (k % 4)].to_f32();
+                assert_eq!(got, expected, "x={x} k={k}");
+            }
+        }
+
+        // Native-f16 identity conversion produces the identical packing.
+        let data_f16: Vec<half::f16> = data.iter().map(|v| half::f16::from_f32(*v)).collect();
+        let view_f16 = ndarray::ArrayView3::from_shape((1, 2, 6), &data_f16).unwrap();
+        let (bytes_native, layers_native) = repack_rgba_f16_layers(view_f16, |v| v);
+        assert_eq!(layers_native, 2);
+        assert_eq!(bytes_native, bytes);
     }
 
     #[test]
