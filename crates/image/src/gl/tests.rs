@@ -537,9 +537,11 @@ mod gl_tests {
     /// NV12 (ShaderR8 upload) int8 convert rendered through the UN-biased NV
     /// program (only the DMA destination path swapped `nv_r8_program`),
     /// producing u8-semantics bytes in an i8 tensor — 0x80 off on every
-    /// channel. DMA-independent: runs on any Linux GL including llvmpipe.
+    /// channel. Needs no DMA at runtime (Mem src/dst — runs on llvmpipe,
+    /// whose coverage lane enables the feature); the `dma_test_formats`
+    /// gate only matches the `load_raw_image` helper's.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn int8_mem_convert_is_xor_biased_u8() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2659,8 +2661,10 @@ mod gl_tests {
     /// destinations — GL has no planar texture destination, so the Mem legs
     /// pin the backend `ImageProcessor` resolves instead (CPU fallback),
     /// guarding the whole dispatch surface against the bug class.
+    /// (`dma_test_formats` gate matches the helpers it uses; the Mem legs
+    /// still run on the llvmpipe coverage lane, which enables the feature.)
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn letterbox_nv_to_planar_content_band_geometry() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
