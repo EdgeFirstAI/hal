@@ -8401,6 +8401,102 @@ mod image_tests {
         });
     }
 
+    /// SPIKE (P0, lock-scoping): heavy multi-processor oracle stress for the
+    /// on-board legs of the GL serialization spike. Run explicitly:
+    ///   EDGEFIRST_GL_SERIALIZE=lifecycle [EDGEFIRST_GL_IMAGE_LOCK=1] \
+    ///     <test binary> spike_parallel_processors_oracle --ignored
+    /// 4 processors × 4 threads × barrier × 200 NV12 720p → RGB 640 letterbox
+    /// converts (DMA where available); every output must byte-match the
+    /// thread's own pre-barrier sequential oracle from the same processor.
+    #[test]
+    #[ignore = "P0 lock-scoping spike — run explicitly on boards with EDGEFIRST_GL_SERIALIZE legs"]
+    fn spike_parallel_processors_oracle() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        const N: usize = 4;
+        const ROUNDS: usize = 200;
+        const TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _lock = acquire_env_lock();
+        let (tx, rx) = mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            let barrier = Arc::new(Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
+                            panic!("ImageProcessor::new() failed on thread {i}: {e}")
+                        });
+                        let (w, h) = (1280usize, 720usize);
+                        let mem = if edgefirst_tensor::is_dma_available() {
+                            Some(TensorMemory::Dma)
+                        } else {
+                            Some(TensorMemory::Mem)
+                        };
+
+                        // Per-thread-distinct synthetic NV12 so cross-wired
+                        // GL state between processors shows up as a byte diff.
+                        let src = proc
+                            .create_image(w, h, PixelFormat::Nv12, DType::U8, mem)
+                            .unwrap();
+                        {
+                            let t = src.as_u8().unwrap();
+                            let mut m = t.map().unwrap();
+                            let s = m.as_mut_slice();
+                            for (j, b) in s[..w * h].iter_mut().enumerate() {
+                                *b = ((i * 37 + j) % 200 + 16) as u8;
+                            }
+                            for b in &mut s[w * h..] {
+                                *b = (96 + i * 16) as u8;
+                            }
+                        }
+                        let lb = Crop::letterbox([114, 114, 114, 255]);
+
+                        let convert_once = |proc: &mut ImageProcessor| -> Vec<u8> {
+                            let mut dst = proc
+                                .create_image(640, 640, PixelFormat::Rgb, DType::U8, mem)
+                                .unwrap();
+                            proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                                .unwrap_or_else(|e| {
+                                    panic!("convert failed on thread {i}: {e}")
+                                });
+                            let t = dst.as_u8().unwrap();
+                            let m = t.map().unwrap();
+                            m.as_slice().to_vec()
+                        };
+
+                        let oracle = convert_once(&mut proc);
+                        barrier.wait();
+                        for round in 0..ROUNDS {
+                            let out = convert_once(&mut proc);
+                            let diffs =
+                                oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
+                            assert!(
+                                diffs == 0,
+                                "thread {i} round {round}: {diffs}/{} bytes diverged \
+                                 from the pre-barrier oracle",
+                                oracle.len()
+                            );
+                        }
+                    })
+                })
+                .collect();
+
+            for (i, h) in handles.into_iter().enumerate() {
+                h.join()
+                    .unwrap_or_else(|e| panic!("spike thread {i} panicked: {e:?}"));
+            }
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(TIMEOUT).unwrap_or_else(|_| {
+            panic!("spike_parallel_processors_oracle timed out after {TIMEOUT:?}")
+        });
+    }
+
     // =========================================================================
     // F16 / F32 auto-chain fallback integration tests
     // =========================================================================

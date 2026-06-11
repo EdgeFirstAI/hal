@@ -315,12 +315,20 @@ impl GLProcessorThreaded {
                 gl_converter.is_vivante(),
             )));
             let mut poisoned = false;
+            // SPIKE (P0, throwaway): `EDGEFIRST_GL_SERIALIZE=lifecycle` skips
+            // the per-message global lock (creation/teardown stay locked) to
+            // measure multi-processor parallelism on non-Vivante boards.
+            let serialize_per_msg = std::env::var("EDGEFIRST_GL_SERIALIZE")
+                .map(|v| v != "lifecycle")
+                .unwrap_or(true);
             while let Some(msg) = recv.blocking_recv() {
                 // Serialize all GL operations across GLProcessorST instances.
                 // See `GL_MUTEX` doc comment in context.rs for rationale.
-                let _guard = super::context::GL_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _guard = serialize_per_msg.then(|| {
+                    super::context::GL_MUTEX
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                });
 
                 // After a panic, the GL context is in an undefined state. Reject
                 // all subsequent messages with an error rather than risking wrong

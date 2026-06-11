@@ -4548,6 +4548,8 @@ impl GLProcessorST {
         // Steady-state frame loops must show ZERO of these after warmup — the
         // span count is the observable for cache-behavior equality gates.
         let _span = tracing::trace_span!("image.convert.gl.egl_import", target).entered();
+        // SPIKE (P0): optional dedicated lock for the create leg.
+        let _image_guard = super::context::image_lifecycle_guard();
         let image = GlContext::egl_create_image_with_fallback(
             &self.gl_context.egl,
             self.gl_context.display,

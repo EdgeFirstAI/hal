@@ -44,6 +44,24 @@ static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 /// through this mutex rather than executed in parallel.
 pub(super) static GL_MUTEX: Mutex<()> = Mutex::new(());
 
+/// SPIKE (P0, throwaway): dedicated short lock for EGLImage create/destroy,
+/// env-gated by `EDGEFIRST_GL_IMAGE_LOCK=1`. A separate mutex (NOT
+/// `GL_MUTEX`) because in Full-serialization mode the worker already holds
+/// `GL_MUTEX` when creating images — re-locking it would deadlock.
+static EGL_IMAGE_MUTEX: Mutex<()> = Mutex::new(());
+
+/// SPIKE (P0): returns a guard for EGLImage lifecycle ops when the
+/// `EDGEFIRST_GL_IMAGE_LOCK=1` leg is active, else `None`.
+pub(super) fn image_lifecycle_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        std::env::var("EDGEFIRST_GL_IMAGE_LOCK")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
+    on.then(|| EGL_IMAGE_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Shared EGL display — created once, reused by all `GlContext` instances.
 ///
 /// On Vivante galcore (i.MX8M Plus), opening multiple DRM fds causes
