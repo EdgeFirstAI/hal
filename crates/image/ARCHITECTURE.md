@@ -805,12 +805,23 @@ every output pixel.
 
 #### Shader variants
 
-| Variant | Proto storage | Interpolation |
-|---------|---------------|---------------|
-| int8-nearest | `R8I` quantized | Nearest neighbor |
-| int8-bilinear | `R8I` quantized | Manual 4-tap bilinear |
-| f32 | `R32F` float | Hardware `GL_LINEAR` |
-| f16 | `R16F` half | Hardware `GL_LINEAR` |
+The variant is chosen by the pure `proto_dispatch::plan_proto` table —
+`(proto dtype, layout, compute availability, GL_OES_texture_float_linear,
+int8 interpolation mode) → ProtoPlan { upload, program, count_uniform }`
+— host-tested exhaustively, the same shape as `render::plan_convert` and
+`float_dispatch::classify_float_render`. All uploads land in one shared
+immutable `TexStorage3D` array recreated on any (dims, internal-format)
+change (`ensure_proto_texture`).
+
+| Plan (upload / program) | Proto storage | Interpolation | Notes |
+|---------|---------------|---------------|-------|
+| `I8CpuRepack` / int8-nearest | `R8I` quantized | Nearest `texelFetch` | |
+| `I8CpuRepack` / int8-bilinear | `R8I` quantized | Manual 4-tap bilinear | Default int8 mode. |
+| `I8Compute` / (any int8 program) | `R8I` data via SSBO → `R32I` | As selected | GLES 3.1 compute HWC→CHW repack; opt-in via `EDGEFIRST_PROTO_COMPUTE=1`. |
+| `I8…` / int8-two-pass | dequant render → `RGBA16F` | Hardware `GL_LINEAR` | Dequant pass into a persistent, dims-gated FBO texture; tail layer zero-guarded for `num_protos % 4 != 0`. |
+| `F32R32f` / f32 | `R32F` float | Hardware `GL_LINEAR` | Requires `GL_OES_texture_float_linear`. |
+| `F32ToRgba16f` / f16 | `RGBA16F` (4 protos/layer) | Hardware `GL_LINEAR` | Capability fallback when float-linear is absent (force for testing: `EDGEFIRST_GL_NO_FLOAT_LINEAR=1`). |
+| `F16Rgba16f` / f16 | `RGBA16F` (4 protos/layer) | Hardware `GL_LINEAR` | Native-f16 protos; never widened to f32. |
 
 Control quantized proto interpolation via
 `processor.set_int8_interpolation_mode(...)`.
@@ -1116,6 +1127,7 @@ image.materialize_masks                                 [user-facing fn]
 | `image.convert.cpu.format_convert`                     | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
 | `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
 | `image.draw_decoded_masks`                             | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
+| `image.draw.gl.proto`                                  | The fused GL proto-segmentation render: proto texture upload + per-detection quad draws. The `upload` / `program` fields record the `ProtoPlan` chosen by the pure `proto_dispatch::plan_proto` table (e.g. `I8CpuRepack`/`Int8Bilinear`, `F32R32f`/`F32`, `F16Rgba16f`/`F16`), alongside `dtype`, `num_protos`, and `detections`. | Filter by `upload` to isolate one upload strategy's latency. Steady-state at fixed proto dims re-uploads via `TexSubImage3D` into the immutable `TexStorage3D` allocation (the `ensure_proto_texture` gate); re-allocation happens only on dims/format churn. |
 | `image.materialize_masks`                              | Wrapper around the four `kernel_*` spans, paired with letterbox inversion and bbox-clipped row iteration. `mode = "proto"` returns proto-resolution masks; `mode = "scaled"` resamples to `(width, height)`. | Use the proto-resolution mode when you only need IoU computation against ground truth at the proto grid (the default Ultralytics evaluation mode). |
 | `image.materialize_masks.kernel_i8`                    | Fused i8 dequant + i8 × i8 → i32 matmul + sigmoid at proto resolution. NEON FP16 on aarch64. | The fastest path; avoids producing an intermediate f32 protos buffer. |
 | `image.materialize_masks.kernel_i16xi8`                | i16 coeff dequant + i16 × i8 → i32 matmul. Used when mask coefficients are stored at i16. | Preserves the i16 dynamic range that an i8 coeff dequant would lose. |

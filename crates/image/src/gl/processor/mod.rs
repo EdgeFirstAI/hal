@@ -224,8 +224,17 @@ pub struct GLProcessorST {
     /// Persistent FBO for the two-pass int8 dequant render — previously a
     /// fresh `FrameBuffer::new()` per call.
     proto_dequant_fbo: FrameBuffer,
+    /// Per-detection quad uniform locations, `(program_id, mask_coeff,
+    /// class_index)`, re-resolved only when the bound proto program
+    /// changes. `Cell` because the resolving call sites hold `&self`
+    /// borrows of the program; id 0 = unresolved.
+    proto_quad_locs: std::cell::Cell<(u32, i32, i32)>,
     /// Compute shader program for HWC→CHW proto repack (GLES 3.1 only).
     proto_repack_compute_program: Option<u32>,
+    /// `(width, height, num_protos)` uniform locations for the compute
+    /// program, resolved once at compile — previously three
+    /// GetUniformLocation string lookups per dispatch.
+    proto_compute_locs: (i32, i32, i32),
     /// SSBO for proto data upload (compute shader path).
     proto_ssbo: u32,
     /// Current allocated size of proto SSBO in bytes (0 = not allocated).
@@ -950,6 +959,7 @@ impl GLProcessorST {
             proto_dequant_texture,
             proto_dequant_tex_dims: (0, 0, 0, 0),
             proto_dequant_fbo: FrameBuffer::new(),
+            proto_quad_locs: std::cell::Cell::new((0, -1, -1)),
             vertex_buffer,
             texture_buffer,
             convert_fbo: FrameBuffer::new(),
@@ -973,6 +983,7 @@ impl GLProcessorST {
             cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
             proto_tex_dims: (0, 0, 0, 0),
             proto_repack_compute_program: None,
+            proto_compute_locs: (-1, -1, -1),
             proto_ssbo: 0,
             proto_ssbo_size: 0,
             nv_r8_program,
@@ -1001,6 +1012,13 @@ impl GLProcessorST {
                 Ok(program) => {
                     log::info!("Proto repack compute shader compiled successfully");
                     converter.proto_repack_compute_program = Some(program);
+                    unsafe {
+                        converter.proto_compute_locs = (
+                            gls::gl::GetUniformLocation(program, c"width".as_ptr()),
+                            gls::gl::GetUniformLocation(program, c"height".as_ptr()),
+                            gls::gl::GetUniformLocation(program, c"num_protos".as_ptr()),
+                        );
+                    }
                     let mut ssbo = 0u32;
                     unsafe { gls::gl::GenBuffers(1, &mut ssbo) };
                     converter.proto_ssbo = ssbo;
@@ -5215,6 +5233,19 @@ impl GLProcessorST {
             self.int8_interpolation_mode,
         )?;
 
+        // The proto render's span — the path previously had none (only a
+        // FunctionTimer wall-clock at the draw_proto_masks entry). Plan
+        // fields make the chosen upload/program visible in traces.
+        let _span = tracing::trace_span!(
+            "image.draw.gl.proto",
+            dtype = ?proto_data.protos.dtype(),
+            upload = ?plan.upload,
+            program = ?plan.program,
+            num_protos,
+            detections = detect.len(),
+        )
+        .entered();
+
         // Coefficient slice for the GL uniform upload path. The shaders
         // consume f32 regardless of source dtype, but we hold the F32 case
         // as a borrowed slice (no allocation) and only widen for F16. The
@@ -5375,6 +5406,19 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
 
+        // Resolve the per-detection uniform locations once per program
+        // switch — `load_uniform_*` is a driver string lookup plus a
+        // redundant UseProgram, and this loop previously paid both twice
+        // per detection per frame. The caller has already bound `program`.
+        let (cached_id, mut loc_coeff, mut loc_class) = self.proto_quad_locs.get();
+        if cached_id != program.id {
+            unsafe {
+                loc_coeff = gls::gl::GetUniformLocation(program.id, c"mask_coeff".as_ptr());
+                loc_class = gls::gl::GetUniformLocation(program.id, c"class_index".as_ptr());
+            }
+            self.proto_quad_locs.set((program.id, loc_coeff, loc_class));
+        }
+
         // Stride the flat `mask_coefficients` buffer by `num_protos` so we
         // get one slice per detection. `chunks_exact` requires the total
         // length to be a multiple of `num_protos`; the dispatcher already
@@ -5390,8 +5434,10 @@ impl GLProcessorST {
                 packed_coeff[i / 4][i % 4] = *val;
             }
 
-            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
-            program.load_uniform_1i(c"class_index", color_index as i32)?;
+            unsafe {
+                gls::gl::Uniform4fv(loc_coeff, 8, packed_coeff.as_ptr() as *const f32);
+                gls::gl::Uniform1i(loc_class, color_index as i32);
+            }
 
             let dst_roi = RegionOfInterest {
                 left: cvt_screen_coord(det.bbox.xmin),
@@ -5514,8 +5560,7 @@ impl GLProcessorST {
             // Allocate as R32I (imageStore-compatible; the int8 fragment
             // shaders read integers identically from R8I or R32I via
             // texelFetch). Immutable storage + binding handled by the gate.
-            if self.ensure_proto_texture(texture_target, gls::gl::R32I, width, height, num_protos)
-            {
+            if self.ensure_proto_texture(texture_target, gls::gl::R32I, width, height, num_protos) {
                 Self::set_proto_tex_params(texture_target, gls::gl::NEAREST);
             }
 
@@ -5551,11 +5596,9 @@ impl GLProcessorST {
                     gls::gl::R32I,
                 );
 
-                // Dispatch compute
+                // Dispatch compute (uniform locations resolved at compile)
                 gls::gl::UseProgram(compute_program);
-                let loc_w = gls::gl::GetUniformLocation(compute_program, c"width".as_ptr());
-                let loc_h = gls::gl::GetUniformLocation(compute_program, c"height".as_ptr());
-                let loc_np = gls::gl::GetUniformLocation(compute_program, c"num_protos".as_ptr());
+                let (loc_w, loc_h, loc_np) = self.proto_compute_locs;
                 gls::gl::Uniform1i(loc_w, width as i32);
                 gls::gl::Uniform1i(loc_h, height as i32);
                 gls::gl::Uniform1i(loc_np, num_protos as i32);
@@ -5600,12 +5643,11 @@ impl GLProcessorST {
         match plan.program {
             super::proto_dispatch::ProtoProgram::Int8Nearest
             | super::proto_dispatch::ProtoProgram::Int8Bilinear => {
-                let program =
-                    if plan.program == super::proto_dispatch::ProtoProgram::Int8Nearest {
-                        &self.proto_segmentation_int8_nearest_program
-                    } else {
-                        &self.proto_segmentation_int8_bilinear_program
-                    };
+                let program = if plan.program == super::proto_dispatch::ProtoProgram::Int8Nearest {
+                    &self.proto_segmentation_int8_nearest_program
+                } else {
+                    &self.proto_segmentation_int8_bilinear_program
+                };
                 gls::use_program(program.id);
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
@@ -6002,14 +6044,7 @@ impl GLProcessorST {
         *texture = Texture::new();
         gls::bind_texture(target, texture.id);
         unsafe {
-            gls::gl::TexStorage3D(
-                target,
-                1,
-                internal_fmt,
-                w as i32,
-                h as i32,
-                layers as i32,
-            );
+            gls::gl::TexStorage3D(target, 1, internal_fmt, w as i32, h as i32, layers as i32);
         }
         *tex_dims = dims;
         true
