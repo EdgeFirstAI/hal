@@ -674,11 +674,23 @@ impl GLProcessorST {
 
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
         let gl_context = GlContext::new(kind)?;
-        gls::load_with(|s| {
-            gl_context
-                .egl
-                .get_proc_address(s)
-                .map_or(std::ptr::null(), |p| p as *const _)
+        // Load the GL function pointers exactly once per process (the same
+        // pattern as macOS's GL_LOADED). `gls` bindings are gl_generator
+        // `static mut` function-pointer tables, so re-running `load_with` on
+        // every processor construction is a data race the moment another
+        // processor's worker thread is calling GL without holding `GL_MUTEX`
+        // — a prerequisite for scoping the per-message lock to Vivante.
+        // Once-loading is also semantically right: the pointers come from the
+        // process-global shared EGL display, so every context resolves the
+        // same addresses.
+        static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        GL_LOADED.get_or_init(|| {
+            gls::load_with(|s| {
+                gl_context
+                    .egl
+                    .get_proc_address(s)
+                    .map_or(std::ptr::null(), |p| p as *const _)
+            });
         });
 
         let (
