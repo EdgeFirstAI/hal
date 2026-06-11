@@ -79,6 +79,10 @@ name = "mask_benchmark"
 harness = false
 
 [[bench]]
+name = "parallel_processors_benchmark"
+harness = false
+
+[[bench]]
 name = "mask_decode_benchmark"
 harness = false
 
