@@ -11,7 +11,7 @@ mod gl_tests {
         probe_egl_displays, Crop, EglDisplayKind, Flip, GLProcessorThreaded, ImageProcessorTrait,
         Rotation,
     };
-    use edgefirst_decoder::DetectBox;
+    use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout};
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::is_dma_available;
     use edgefirst_tensor::{
@@ -2839,14 +2839,57 @@ mod gl_tests {
     /// bilinear interpolation (GPU vs CPU) and mask threshold rounding.
     #[test]
     fn test_proto_fused_vs_hybrid_ssim() {
-        use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, Nms};
-
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
             return;
         }
 
-        // Load cached YOLOv8 seg model outputs as TensorDyn::I8 inputs.
+        let (output_boxes, proto_data) = decode_yolov8_proto_fixture();
+
+        // Materialize masks on CPU for the hybrid path
+        let cpu_proc = crate::CPUProcessor::new();
+        let segmentation = cpu_proc
+            .materialize_segmentations(&output_boxes, &proto_data, None)
+            .unwrap();
+
+        // Create two identical RGBA canvases
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        let mut dst_hybrid = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+        let mut dst_fused = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+
+        // Render via hybrid path (pre-decoded masks)
+        gl.draw_decoded_masks(
+            &mut dst_hybrid,
+            &output_boxes,
+            &segmentation,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Render via fused GL proto path
+        gl.draw_proto_masks(
+            &mut dst_fused,
+            &output_boxes,
+            &proto_data,
+            Default::default(),
+        )
+        .unwrap();
+
+        // Compare — threshold 0.90 to allow bilinear interpolation differences
+        // between GPU proto rendering and CPU materialization
+        compare_images(&dst_hybrid, &dst_fused, 0.90, function!());
+    }
+
+    /// Decode the cached YOLOv8-seg fixture outputs (int8 boxes + protos)
+    /// into post-NMS detections and the int8 `ProtoData`. Shared scaffolding
+    /// for every proto-rendering test.
+    fn decode_yolov8_proto_fixture() -> (Vec<DetectBox>, ProtoData) {
+        use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, Nms};
+
         let boxes_raw: &[u8] = &edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
@@ -2894,43 +2937,332 @@ mod gl_tests {
             .expect("decode_proto must succeed")
             .expect("yolov8-seg config produces ProtoData");
         assert!(!output_boxes.is_empty(), "No detections from model");
+        (output_boxes, proto_data)
+    }
 
-        // Materialize masks on CPU for the hybrid path
-        let cpu_proc = crate::CPUProcessor::new();
-        let segmentation = cpu_proc
-            .materialize_segmentations(&output_boxes, &proto_data, None)
+    /// Build F32 and F16 `ProtoData` by dequantizing the int8 fixture — the
+    /// same synthesis the mask bench uses for its float dtype cells.
+    fn proto_fixture_as_float(proto_i8: &ProtoData, n_det: usize) -> (ProtoData, ProtoData) {
+        use half::f16;
+
+        let (protos_f32, proto_shape) = match &proto_i8.protos {
+            TensorDyn::I8(t) => {
+                let shape = t.shape().to_vec();
+                let q = t.quantization().expect("i8 protos must carry quant");
+                let scale = q.scale()[0];
+                let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+                let m = t.map().unwrap();
+                let v: Vec<f32> = m
+                    .as_slice()
+                    .iter()
+                    .map(|v| (*v as f32 - zp) * scale)
+                    .collect();
+                (v, shape)
+            }
+            other => panic!("expected i8 protos in fixture, got {other:?}"),
+        };
+        let num_protos = *proto_shape.last().unwrap();
+
+        let coeffs_f32: Vec<f32> = match &proto_i8.mask_coefficients {
+            TensorDyn::F32(t) => t.map().unwrap().as_slice().to_vec(),
+            TensorDyn::F16(t) => t
+                .map()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .map(|v: &f16| v.to_f32())
+                .collect(),
+            TensorDyn::I8(t) => {
+                let q = t
+                    .quantization()
+                    .expect("i8 mask coefficients must carry quant");
+                let scale = q.scale()[0];
+                let zp = q.zero_point().map(|z| z[0]).unwrap_or(0) as f32;
+                let m = t.map().unwrap();
+                m.as_slice()
+                    .iter()
+                    .map(|v| (*v as f32 - zp) * scale)
+                    .collect()
+            }
+            other => panic!("unexpected coefficient dtype {other:?}"),
+        };
+        let coeff_shape = [n_det, num_protos];
+
+        let proto_f32 = ProtoData {
+            mask_coefficients: TensorDyn::F32(
+                Tensor::<f32>::from_slice(&coeffs_f32, &coeff_shape).unwrap(),
+            ),
+            protos: TensorDyn::F32(Tensor::<f32>::from_slice(&protos_f32, &proto_shape).unwrap()),
+            layout: ProtoLayout::Nhwc,
+        };
+
+        let protos_f16: Vec<f16> = protos_f32.iter().map(|v| f16::from_f32(*v)).collect();
+        let coeffs_f16: Vec<f16> = coeffs_f32.iter().map(|v| f16::from_f32(*v)).collect();
+        let proto_f16 = ProtoData {
+            mask_coefficients: TensorDyn::F16(
+                Tensor::<f16>::from_slice(&coeffs_f16, &coeff_shape).unwrap(),
+            ),
+            protos: TensorDyn::F16(Tensor::<f16>::from_slice(&protos_f16, &proto_shape).unwrap()),
+            layout: ProtoLayout::Nhwc,
+        };
+
+        (proto_f32, proto_f16)
+    }
+
+    /// Keep only the first `keep` proto layers (and matching coefficients)
+    /// of an F32 `ProtoData` — HWC layout, so channels are sliced per pixel.
+    fn slice_proto_layers_f32(pd: &ProtoData, keep: usize, n_det: usize) -> ProtoData {
+        let (protos, shape) = match &pd.protos {
+            TensorDyn::F32(t) => (t.map().unwrap().as_slice().to_vec(), t.shape().to_vec()),
+            other => panic!("expected f32 protos, got {other:?}"),
+        };
+        let (h, w, c) = (shape[0], shape[1], shape[2]);
+        assert!(keep <= c);
+        let mut sliced = Vec::with_capacity(h * w * keep);
+        for px in protos.chunks_exact(c) {
+            sliced.extend_from_slice(&px[..keep]);
+        }
+        let coeffs = match &pd.mask_coefficients {
+            TensorDyn::F32(t) => t.map().unwrap().as_slice().to_vec(),
+            other => panic!("expected f32 coefficients, got {other:?}"),
+        };
+        let mut sliced_coeffs = Vec::with_capacity(n_det * keep);
+        for det in coeffs.chunks_exact(c) {
+            sliced_coeffs.extend_from_slice(&det[..keep]);
+        }
+        ProtoData {
+            mask_coefficients: TensorDyn::F32(
+                Tensor::<f32>::from_slice(&sliced_coeffs, &[n_det, keep]).unwrap(),
+            ),
+            protos: TensorDyn::F32(Tensor::<f32>::from_slice(&sliced, &[h, w, keep]).unwrap()),
+            layout: ProtoLayout::Nhwc,
+        }
+    }
+
+    /// Render the fused GL proto path into a fresh 640x640 RGBA canvas.
+    fn render_proto_to_rgba(
+        gl: &mut GLProcessorThreaded,
+        boxes: &[DetectBox],
+        pd: &ProtoData,
+    ) -> TensorDyn {
+        let mut dst = TensorDyn::from(
+            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        );
+        gl.draw_proto_masks(&mut dst, boxes, pd, Default::default())
             .unwrap();
+        dst
+    }
 
-        // Create two identical RGBA canvases
+    /// Forces `has_float_linear` off for processors created in scope —
+    /// makes the f32→f16-repack proto fallback reachable on float-linear
+    /// GPUs (no CI lane has a GPU without the extension).
+    struct FloatLinearEnvGuard;
+    impl FloatLinearEnvGuard {
+        fn set() -> Self {
+            std::env::set_var("EDGEFIRST_GL_NO_FLOAT_LINEAR", "1");
+            FloatLinearEnvGuard
+        }
+    }
+    impl Drop for FloatLinearEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_GL_NO_FLOAT_LINEAR");
+        }
+    }
+
+    /// Opts processors created in scope into the GLES 3.1 compute-shader
+    /// proto repack (otherwise env-gated off — it has zero coverage without
+    /// this).
+    struct ProtoComputeEnvGuard;
+    impl ProtoComputeEnvGuard {
+        fn set() -> Self {
+            std::env::set_var("EDGEFIRST_PROTO_COMPUTE", "1");
+            ProtoComputeEnvGuard
+        }
+    }
+    impl Drop for ProtoComputeEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_PROTO_COMPUTE");
+        }
+    }
+
+    /// The float proto-render paths must agree with the int8 fused reference:
+    /// F32 (R32F, hardware bilinear where float-linear exists) and F16-native
+    /// (RGBA16F packed) render the SAME dequantized data, so int8-vs-f32 may
+    /// differ only by quantization + interpolation (default int8 mode is
+    /// shader bilinear ≈ hardware bilinear), and f32-vs-f16 only by f16
+    /// rounding. Before this test the three float variants had no direct
+    /// coverage at all.
+    #[test]
+    fn proto_float_dtypes_match_int8_reference() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+        let (proto_f32, proto_f16) = proto_fixture_as_float(&proto_i8, boxes.len());
+
         let mut gl = GLProcessorThreaded::new(None).unwrap();
-        let mut dst_hybrid = TensorDyn::from(
-            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
+        let dst_i8 = render_proto_to_rgba(&mut gl, &boxes, &proto_i8);
+        let dst_f32 = render_proto_to_rgba(&mut gl, &boxes, &proto_f32);
+        let dst_f16 = render_proto_to_rgba(&mut gl, &boxes, &proto_f16);
+
+        compare_images(&dst_i8, &dst_f32, 0.90, function!());
+        compare_images(&dst_f32, &dst_f16, 0.98, function!());
+    }
+
+    /// The `!has_float_linear` f32 arm repacks F32 protos into RGBA16F and
+    /// renders through the f16 shader — a capability fallback no CI lane's
+    /// GPU exercises naturally. Force the capability off and pin the
+    /// fallback's output against the native R32F render: same data, only
+    /// RGBA16F precision and packing differ.
+    #[test]
+    fn proto_f32_no_float_linear_fallback_matches() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+        let (proto_f32, _) = proto_fixture_as_float(&proto_i8, boxes.len());
+
+        let dst_native = {
+            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_f32)
+        };
+        let dst_fallback = {
+            let _guard = FloatLinearEnvGuard::set();
+            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_f32)
+        };
+
+        compare_images(&dst_native, &dst_fallback, 0.98, function!());
+    }
+
+    /// The GLES 3.1 compute-shader HWC→CHW proto repack must produce the
+    /// same masks as the CPU repack — only the transposition strategy
+    /// differs, not the data or sampling. The compute path is env-gated
+    /// (EDGEFIRST_PROTO_COMPUTE=1); where the GPU lacks GLES 3.1 compute the
+    /// guard is a no-op and both renders take the CPU repack (still a valid,
+    /// if vacuous, comparison).
+    #[test]
+    fn proto_compute_repack_matches_cpu_repack() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+
+        let dst_cpu_repack = {
+            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
+        };
+        let dst_compute = {
+            let _guard = ProtoComputeEnvGuard::set();
+            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
+        };
+
+        compare_images(&dst_cpu_repack, &dst_compute, 0.99, function!());
+    }
+
+    /// All three int8 proto interpolation modes must agree on the rendered
+    /// masks: Bilinear (shader-computed weights) and TwoPass (dequant to
+    /// RGBA16F + hardware GL_LINEAR) sample the same data with equivalent
+    /// filtering, and Nearest only loses the sub-texel blend. TwoPass had
+    /// no test on any lane before this — it is the path with the cached
+    /// dequant FBO, the gated immutable dequant texture, and the shared
+    /// fullscreen quad. Switching modes on ONE processor also exercises
+    /// per-draw plan changes against the persistent proto/dequant textures.
+    #[test]
+    fn proto_int8_interpolation_modes_agree() {
+        use crate::Int8InterpolationMode;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        let mut render_mode = |mode: Int8InterpolationMode| {
+            gl.set_int8_interpolation_mode(mode).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
+        };
+        let bilinear = render_mode(Int8InterpolationMode::Bilinear);
+        let two_pass = render_mode(Int8InterpolationMode::TwoPass);
+        let nearest = render_mode(Int8InterpolationMode::Nearest);
+        // And back to bilinear on the same processor: must reproduce the
+        // first render despite the dequant texture/FBO created in between.
+        let bilinear_again = render_mode(Int8InterpolationMode::Bilinear);
+
+        // Measured actuals: Vivante GC7000UL >= 0.95; Mali G310 = 0.8153 —
+        // a PRE-EXISTING driver filtering delta (bit-identical score on the
+        // pre-refactor build), believed to be Mali's coarser fixed-point
+        // f16 texture interpolation. 0.80 still catches structural
+        // breakage: the broken compute-repack upload scored ~0.77.
+        compare_images(&bilinear, &two_pass, 0.80, function!());
+        compare_images(&bilinear, &nearest, 0.90, function!());
+        let a = bilinear.as_u8().unwrap().map().unwrap();
+        let b = bilinear_again.as_u8().unwrap().map().unwrap();
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "bilinear render diverged after mode churn"
         );
-        let mut dst_fused = TensorDyn::from(
-            edgefirst_tensor::Tensor::<u8>::image(640, 640, PixelFormat::Rgba, None).unwrap(),
-        );
+    }
 
-        // Render via hybrid path (pre-decoded masks)
-        gl.draw_decoded_masks(
-            &mut dst_hybrid,
-            &output_boxes,
-            &segmentation,
-            Default::default(),
-        )
-        .unwrap();
+    /// Proto texture uploads must stay correct across dims/format churn on
+    /// ONE processor: int8 (R8I) → f32 (R32F, same dims — internal-format
+    /// churn) → f32 with 30 layers (layer-count churn, deliberately not a
+    /// multiple of 4) → int8 again. Each render must byte-match a fresh
+    /// processor rendering the same input once. This is the regression test
+    /// for the proto dims gate: a gate keyed on dims-without-ifmt, or a
+    /// SubImage3D into a stale allocation, breaks one of these legs.
+    #[test]
+    fn proto_dims_and_format_churn_uploads_correctly() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+        let (proto_f32, _) = proto_fixture_as_float(&proto_i8, boxes.len());
+        let proto_f32_30 = slice_proto_layers_f32(&proto_f32, 30, boxes.len());
 
-        // Render via fused GL proto path
-        gl.draw_proto_masks(
-            &mut dst_fused,
-            &output_boxes,
-            &proto_data,
-            Default::default(),
-        )
-        .unwrap();
+        let oracle = |pd: &ProtoData| {
+            let mut gl = GLProcessorThreaded::new(None).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, pd)
+        };
+        let oracle_i8 = oracle(&proto_i8);
+        let oracle_f32 = oracle(&proto_f32);
+        let oracle_f32_30 = oracle(&proto_f32_30);
 
-        // Compare — threshold 0.90 to allow bilinear interpolation differences
-        // between GPU proto rendering and CPU materialization
-        compare_images(&dst_hybrid, &dst_fused, 0.90, function!());
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+        for (step, (pd, expected)) in [
+            (&proto_i8, &oracle_i8),
+            (&proto_f32, &oracle_f32),
+            (&proto_f32_30, &oracle_f32_30),
+            (&proto_i8, &oracle_i8),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let out = render_proto_to_rgba(&mut gl, &boxes, pd);
+            let a = expected.as_u8().unwrap().map().unwrap();
+            let b = out.as_u8().unwrap().map().unwrap();
+            let (a, b) = (a.as_slice(), b.as_slice());
+            let diffs = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            let max_diff = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                diffs == 0,
+                "churn step {step}: {diffs}/{} bytes diverged from the \
+                 fresh-processor oracle (max |diff| {max_diff})",
+                a.len()
+            );
+        }
     }
 
     // =========================================================================

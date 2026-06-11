@@ -489,8 +489,17 @@ void main() {
     vec4 result;
     for (int c = 0; c < 4; c++) {
         int layer = base_layer + c;
-        float raw = float(texelFetch(proto_tex, ivec3(ix, iy, layer), 0).r);
-        result[c] = raw * proto_scale + proto_scaled_zp;
+        // Tail guard: when num_protos % 4 != 0 the last output layer's
+        // trailing channels have no source proto. texelFetch beyond the
+        // array depth is undefined in GLSL ES (a NaN there would survive
+        // the zero coefficients downstream: NaN * 0 = NaN), so emit an
+        // explicit zero proto instead.
+        if (layer < tex_size.z) {
+            float raw = float(texelFetch(proto_tex, ivec3(ix, iy, layer), 0).r);
+            result[c] = raw * proto_scale + proto_scaled_zp;
+        } else {
+            result[c] = 0.0;
+        }
     }
     color = result;
 }

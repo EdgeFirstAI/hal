@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **GL proto-mask texture lifecycle** (`edgefirst-image`): two latent bugs
+  with one root cause. (1) The experimental GLES 3.1 compute-shader proto
+  repack (`EDGEFIRST_PROTO_COMPUTE=1`) rendered garbage masks on every
+  conformant driver — `glBindImageTexture` requires immutable-format
+  textures in ES 3.1, so its `imageStore` writes never landed. (2)
+  Alternating proto dtypes (int8 ↔ float) on one processor raised
+  `GL_INVALID_VALUE`: the float paths re-allocated the shared proto
+  texture without updating the dims gate, so the next int8 upload wrote
+  into an incompatible allocation. Proto textures are now immutable
+  `TexStorage3D` allocations recreated on any dims/format change, which
+  also gives the f32/f16 paths the re-upload fast path they lacked (they
+  re-ran `glTexImage3D` on every call) and fixes an undefined
+  `texelFetch` past the array depth in the int8 two-pass dequant shader
+  when `num_protos % 4 != 0`.
+
+### Changed
+
+- **Issue #106 closed — imx8mp GL drift reclaimed and documented**:
+  `image_benchmark` regains the same-size 1080p RGBA→BGRA / RGBA→GREY
+  cells as permanent drift sentinels, verified back at the v0.15.0
+  numbers on imx8mp (7.7 / 7.9 ms, from 13.8 / 14.9 ms at the
+  2026-06-09 drift capture). BENCHMARKS.md's GL convert, letterbox, and
+  mask tables are re-collected on the convergence engine with per-table
+  capture notes (imx95 YUYV→RGB 1080p halved to 5.7 ms; the mask hybrid
+  path is ~3× faster than the stale v0.15.0 figures).
+- **GL proto-segmentation render internals** (`edgefirst-image`): the
+  per-dtype render variants collapsed into one plan-driven path selected
+  by a pure, host-tested decision table (`proto_dispatch::plan_proto`).
+  The int8 two-pass dequant target and FBO are now persistent and
+  dims-gated instead of re-created per call, and per-detection /
+  per-dispatch uniform locations are cached instead of looked up by
+  string each draw. New `image.draw.gl.proto` tracing span records the
+  chosen upload strategy and program. No public API change; outputs are
+  unchanged (pinned by new cross-dtype, fallback, compute, churn, and
+  interpolation-mode regression tests).
+
 ### Added
 
 - **`ColorimetryMode` (`Fast` | `Exact`) + `EDGEFIRST_COLORIMETRY`**

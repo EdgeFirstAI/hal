@@ -302,6 +302,23 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
             CAMERA_1080P_RGBA.as_slice(),
             4,
         ),
+        // RGBA→BGRA and RGBA→GREY are the issue #106 drift sentinels: the
+        // 2026-06 capture found them +79%/+91% over the v0.15.0 doc numbers
+        // on Vivante while other boards held, and the cells had meanwhile
+        // dropped out of this bench — keep them measurable so same-size
+        // swizzle/extraction drift can never go unnoticed again.
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Bgra,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
+        (
+            PixelFormat::Rgba,
+            PixelFormat::Grey,
+            CAMERA_1080P_RGBA.as_slice(),
+            4,
+        ),
         (
             PixelFormat::Rgba,
             PixelFormat::PlanarRgb,

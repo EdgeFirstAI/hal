@@ -110,6 +110,15 @@ impl DstReadback {
     }
 }
 
+/// Borrowed proto data for the layered-float render plans: the
+/// dispatcher's dtype arm keeps the `TensorMap` alive and hands the typed
+/// view down to `render_proto_layers`, which matches it against
+/// `ProtoPlan::upload`.
+enum ProtoLayersData<'a> {
+    F32(ndarray::ArrayView3<'a, f32>),
+    F16(ndarray::ArrayView3<'a, half::f16>),
+}
+
 /// Uniform locations for one `nv_r8` program variant, resolved once at link
 /// time — `glGetUniformLocation` is a per-call string lookup in the driver
 /// and the NV draw previously issued 12 per frame.
@@ -209,8 +218,23 @@ pub struct GLProcessorST {
     int8_interpolation_mode: Int8InterpolationMode,
     /// Intermediate FBO texture for two-pass int8 dequant path.
     proto_dequant_texture: Texture,
+    /// Allocated dequant texture dims for the recreate-on-change gate:
+    /// (w, h, layers, internal_fmt). Mirrors `proto_tex_dims`.
+    proto_dequant_tex_dims: (usize, usize, usize, u32),
+    /// Persistent FBO for the two-pass int8 dequant render — previously a
+    /// fresh `FrameBuffer::new()` per call.
+    proto_dequant_fbo: FrameBuffer,
+    /// Per-detection quad uniform locations, `(program_id, mask_coeff,
+    /// class_index)`, re-resolved only when the bound proto program
+    /// changes. `Cell` because the resolving call sites hold `&self`
+    /// borrows of the program; id 0 = unresolved.
+    proto_quad_locs: std::cell::Cell<(u32, i32, i32)>,
     /// Compute shader program for HWC→CHW proto repack (GLES 3.1 only).
     proto_repack_compute_program: Option<u32>,
+    /// `(width, height, num_protos)` uniform locations for the compute
+    /// program, resolved once at compile — previously three
+    /// GetUniformLocation string lookups per dispatch.
+    proto_compute_locs: (i32, i32, i32),
     /// SSBO for proto data upload (compute shader path).
     proto_ssbo: u32,
     /// Current allocated size of proto SSBO in bytes (0 = not allocated).
@@ -933,6 +957,9 @@ impl GLProcessorST {
             supports_f16_color,
             int8_interpolation_mode: Int8InterpolationMode::Bilinear,
             proto_dequant_texture,
+            proto_dequant_tex_dims: (0, 0, 0, 0),
+            proto_dequant_fbo: FrameBuffer::new(),
+            proto_quad_locs: std::cell::Cell::new((0, -1, -1)),
             vertex_buffer,
             texture_buffer,
             convert_fbo: FrameBuffer::new(),
@@ -956,6 +983,7 @@ impl GLProcessorST {
             cached_opacity: f32::NAN, // sentinel: forces first set_opacity_uniform to initialize all shaders
             proto_tex_dims: (0, 0, 0, 0),
             proto_repack_compute_program: None,
+            proto_compute_locs: (-1, -1, -1),
             proto_ssbo: 0,
             proto_ssbo_size: 0,
             nv_r8_program,
@@ -984,6 +1012,13 @@ impl GLProcessorST {
                 Ok(program) => {
                     log::info!("Proto repack compute shader compiled successfully");
                     converter.proto_repack_compute_program = Some(program);
+                    unsafe {
+                        converter.proto_compute_locs = (
+                            gls::gl::GetUniformLocation(program, c"width".as_ptr()),
+                            gls::gl::GetUniformLocation(program, c"height".as_ptr()),
+                            gls::gl::GetUniformLocation(program, c"num_protos".as_ptr()),
+                        );
+                    }
                     let mut ssbo = 0u32;
                     unsafe { gls::gl::GenBuffers(1, &mut ssbo) };
                     converter.proto_ssbo = ssbo;
@@ -1881,7 +1916,19 @@ impl GLProcessorST {
             }
         }
 
-        let has_float_linear = extensions.contains("GL_OES_texture_float_linear");
+        // EDGEFIRST_GL_NO_FLOAT_LINEAR=1 forces the capability off so the
+        // f32→f16-repack proto fallback (taken only on GPUs lacking the
+        // extension) is reachable on float-linear-capable lanes — no CI lane
+        // has such a GPU, so without the override the fallback arm has zero
+        // coverage anywhere.
+        let force_no_float_linear = std::env::var("EDGEFIRST_GL_NO_FLOAT_LINEAR")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let has_float_linear =
+            extensions.contains("GL_OES_texture_float_linear") && !force_no_float_linear;
+        if force_no_float_linear {
+            log::info!("GL_OES_texture_float_linear forced OFF via EDGEFIRST_GL_NO_FLOAT_LINEAR");
+        }
         log::debug!("GL_OES_texture_float_linear: {has_float_linear}");
 
         let has_bgra = extensions.contains("GL_EXT_texture_format_BGRA8888");
@@ -5131,69 +5178,6 @@ impl GLProcessorST {
     /// suitable for upload to a GL_TEXTURE_2D_ARRAY with GL_RGBA16F.
     ///
     /// Returns `(repacked_bytes, num_layers)` where each layer is H*W*4 half-floats.
-    fn repack_protos_to_rgba_f16(protos: ndarray::ArrayView3<'_, f32>) -> (Vec<u8>, usize) {
-        let (height, width, num_protos) = protos.dim();
-        let num_layers = num_protos.div_ceil(4);
-        // Each layer is H*W*4 half-floats, each half-float is 2 bytes
-        let layer_stride = height * width * 4;
-        let mut buf = vec![0u16; layer_stride * num_layers];
-
-        for y in 0..height {
-            for x in 0..width {
-                for k in 0..num_layers * 4 {
-                    let val = if k < num_protos {
-                        half::f16::from_f32(protos[[y, x, k]])
-                    } else {
-                        half::f16::ZERO
-                    };
-                    let layer = k / 4;
-                    let channel = k % 4;
-                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
-                }
-            }
-        }
-
-        // Reinterpret u16 buffer as bytes
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
-        };
-        (byte_buf, num_layers)
-    }
-
-    /// Native-f16 variant of [`Self::repack_protos_to_rgba_f16`]: shuffles
-    /// already-f16 protos into RGBA-layer order without the f32→f16
-    /// conversion step. Used when the decoder produced an fp16 proto
-    /// tensor — `TensorDyn::F16` in the current [`ProtoData`] representation
-    /// — from an fp16 inference engine.
-    fn repack_protos_f16_to_rgba_f16(
-        protos: ndarray::ArrayView3<'_, half::f16>,
-    ) -> (Vec<u8>, usize) {
-        let (height, width, num_protos) = protos.dim();
-        let num_layers = num_protos.div_ceil(4);
-        let layer_stride = height * width * 4;
-        let mut buf = vec![0u16; layer_stride * num_layers];
-
-        for y in 0..height {
-            for x in 0..width {
-                for k in 0..num_layers * 4 {
-                    let val = if k < num_protos {
-                        protos[[y, x, k]]
-                    } else {
-                        half::f16::ZERO
-                    };
-                    let layer = k / 4;
-                    let channel = k % 4;
-                    buf[layer * layer_stride + y * width * 4 + x * 4 + channel] = val.to_bits();
-                }
-            }
-        }
-
-        let byte_buf = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2).to_vec()
-        };
-        (byte_buf, num_layers)
-    }
-
     /// Render YOLO proto segmentation masks using the fused GPU pipeline.
     ///
     /// Dispatches on the proto tensor's runtime dtype via
@@ -5238,6 +5222,30 @@ impl GLProcessorST {
         }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
 
+        // Pure path decision: upload strategy × program × count uniform.
+        // Rejects NCHW layouts and unsupported proto dtypes up front (the
+        // caller falls back to the CPU path on NotSupported).
+        let plan = super::proto_dispatch::plan_proto(
+            proto_data.protos.dtype(),
+            proto_data.layout,
+            self.proto_repack_compute_program.is_some(),
+            self.has_float_linear,
+            self.int8_interpolation_mode,
+        )?;
+
+        // The proto render's span — the path previously had none (only a
+        // FunctionTimer wall-clock at the draw_proto_masks entry). Plan
+        // fields make the chosen upload/program visible in traces.
+        let _span = tracing::trace_span!(
+            "image.draw.gl.proto",
+            dtype = ?proto_data.protos.dtype(),
+            upload = ?plan.upload,
+            program = ?plan.program,
+            num_protos,
+            detections = detect.len(),
+        )
+        .entered();
+
         // Coefficient slice for the GL uniform upload path. The shaders
         // consume f32 regardless of source dtype, but we hold the F32 case
         // as a borrowed slice (no allocation) and only widen for F16. The
@@ -5266,49 +5274,23 @@ impl GLProcessorST {
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
                 mc_map_i8 = t.map()?;
-                coeff_dequant = if let Some(q) = t.quantization() {
-                    use edgefirst_tensor::QuantMode;
-                    let (scale, zp) = match q.mode() {
-                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
-                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        other => {
-                            return Err(crate::Error::NotSupported(format!(
-                                "I8 mask_coefficients quantization mode {other:?} not supported on GL seg path"
-                            )));
-                        }
-                    };
-                    mc_map_i8
-                        .as_slice()
-                        .iter()
-                        .map(|&v| (v as f32 - zp) * scale)
-                        .collect()
-                } else {
-                    mc_map_i8.as_slice().iter().map(|&v| v as f32).collect()
-                };
+                let quant = t.quantization();
+                coeff_dequant = super::proto_dispatch::dequant_coeffs(
+                    mc_map_i8.as_slice(),
+                    quant.as_ref().map(|q| q.mode()),
+                    "I8",
+                )?;
                 &coeff_dequant[..]
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
                 let mc_map_i16 = t.map()?;
-                coeff_dequant = if let Some(q) = t.quantization() {
-                    use edgefirst_tensor::QuantMode;
-                    let (scale, zp) = match q.mode() {
-                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
-                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        other => {
-                            return Err(crate::Error::NotSupported(format!(
-                                "I16 mask_coefficients quantization mode {other:?} not supported on GL seg path"
-                            )));
-                        }
-                    };
-                    mc_map_i16
-                        .as_slice()
-                        .iter()
-                        .map(|&v| (v as f32 - zp) * scale)
-                        .collect()
-                } else {
-                    mc_map_i16.as_slice().iter().map(|&v| v as f32).collect()
-                };
+                let quant = t.quantization();
+                coeff_dequant = super::proto_dispatch::dequant_coeffs(
+                    mc_map_i16.as_slice(),
+                    quant.as_ref().map(|q| q.mode()),
+                    "I16",
+                )?;
                 &coeff_dequant[..]
             }
             other => {
@@ -5317,17 +5299,6 @@ impl GLProcessorST {
                 )));
             }
         };
-
-        // The GL shader upload path assumes NHWC layout for ArrayView3 creation.
-        // NCHW protos would require a transpose to NHWC before texture upload —
-        // return NotSupported so the caller falls back to the CPU path.
-        if proto_data.layout == ProtoLayout::Nchw {
-            return Err(crate::Error::NotSupported(
-                "GL segmentation path does not yet support NCHW proto layout; \
-                 caller should use CPU fallback"
-                    .into(),
-            ));
-        }
 
         // Each proto-dtype arm holds its `TensorMap` for the duration of the
         // GL upload and passes an `ArrayView3` borrowed from the mapped slice
@@ -5360,6 +5331,7 @@ impl GLProcessorST {
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
                 let quantization = edgefirst_decoder::Quantization::new(scale, zp);
                 self.render_proto_segmentation_int8(
+                    plan,
                     detect,
                     coeff_slice,
                     protos_view,
@@ -5379,29 +5351,17 @@ impl GLProcessorST {
                     m.as_slice(),
                 )
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
-                if self.has_float_linear {
-                    self.render_proto_segmentation_f32(
-                        detect,
-                        coeff_slice,
-                        protos_view,
-                        height,
-                        width,
-                        num_protos,
-                        texture_target,
-                        color_mode,
-                    )?;
-                } else {
-                    self.render_proto_segmentation_f16(
-                        detect,
-                        coeff_slice,
-                        protos_view,
-                        height,
-                        width,
-                        num_protos,
-                        texture_target,
-                        color_mode,
-                    )?;
-                }
+                self.render_proto_layers(
+                    plan,
+                    detect,
+                    coeff_slice,
+                    ProtoLayersData::F32(protos_view),
+                    height,
+                    width,
+                    num_protos,
+                    texture_target,
+                    color_mode,
+                )?;
             }
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
@@ -5411,10 +5371,11 @@ impl GLProcessorST {
                     m.as_slice(),
                 )
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
-                self.render_proto_segmentation_f16_native(
+                self.render_proto_layers(
+                    plan,
                     detect,
                     coeff_slice,
-                    protos_view,
+                    ProtoLayersData::F16(protos_view),
                     height,
                     width,
                     num_protos,
@@ -5445,6 +5406,19 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
 
+        // Resolve the per-detection uniform locations once per program
+        // switch — `load_uniform_*` is a driver string lookup plus a
+        // redundant UseProgram, and this loop previously paid both twice
+        // per detection per frame. The caller has already bound `program`.
+        let (cached_id, mut loc_coeff, mut loc_class) = self.proto_quad_locs.get();
+        if cached_id != program.id {
+            unsafe {
+                loc_coeff = gls::gl::GetUniformLocation(program.id, c"mask_coeff".as_ptr());
+                loc_class = gls::gl::GetUniformLocation(program.id, c"class_index".as_ptr());
+            }
+            self.proto_quad_locs.set((program.id, loc_coeff, loc_class));
+        }
+
         // Stride the flat `mask_coefficients` buffer by `num_protos` so we
         // get one slice per detection. `chunks_exact` requires the total
         // length to be a multiple of `num_protos`; the dispatcher already
@@ -5460,8 +5434,10 @@ impl GLProcessorST {
                 packed_coeff[i / 4][i % 4] = *val;
             }
 
-            program.load_uniform_4fv(c"mask_coeff", &packed_coeff)?;
-            program.load_uniform_1i(c"class_index", color_index as i32)?;
+            unsafe {
+                gls::gl::Uniform4fv(loc_coeff, 8, packed_coeff.as_ptr() as *const f32);
+                gls::gl::Uniform1i(loc_class, color_index as i32);
+            }
 
             let dst_roi = RegionOfInterest {
                 left: cvt_screen_coord(det.bbox.xmin),
@@ -5541,11 +5517,12 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Int8 proto path: upload raw i8 protos as `GL_R8I`, dispatch by
-    /// interpolation mode.
+    /// Int8 proto path: upload raw i8 protos per `plan.upload`, render per
+    /// `plan.program`.
     #[allow(clippy::too_many_arguments)]
     fn render_proto_segmentation_int8(
         &mut self,
+        plan: super::proto_dispatch::ProtoPlan,
         detect: &[DetectBox],
         mask_coefficients: &[f32],
         protos: ndarray::ArrayView3<'_, i8>,
@@ -5556,61 +5533,35 @@ impl GLProcessorST {
         texture_target: u32,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
-        // Upload raw int8 protos as R8I texture array (1 proto per layer)
-        gls::bind_texture(texture_target, self.proto_texture.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-
         // Protos are (H, W, num_protos) in row-major HWC. The GL texture
         // needs layer-first CHW (one proto per layer).
-        if let Some(compute_program) = self.proto_repack_compute_program {
+        if plan.upload == super::proto_dispatch::ProtoUpload::I8Compute {
+            let compute_program = self.proto_repack_compute_program.ok_or_else(|| {
+                crate::Error::InvalidShape(
+                    "plan selected I8Compute without a compiled compute program".into(),
+                )
+            })?;
             // === GLES 3.1 compute shader path ===
             // Upload HWC data as-is to SSBO, let GPU transpose via compute.
             // Fall through to CPU repack if proto array is non-contiguous.
-            let data = match protos.as_slice() {
+            let mut data = match protos.as_slice() {
                 Some(s) => std::borrow::Cow::Borrowed(s),
                 None => std::borrow::Cow::Owned(protos.iter().copied().collect()),
             };
-            // Pad to 4-byte boundary for SSBO int[] alignment
-            let data_bytes = (data.len() + 3) & !3;
+            // Pad to a 4-byte boundary for SSBO int[] alignment — by copying,
+            // not by over-reading past the slice end.
+            if data.len() % 4 != 0 {
+                let mut owned = data.into_owned();
+                owned.resize(owned.len().next_multiple_of(4), 0);
+                data = std::borrow::Cow::Owned(owned);
+            }
+            let data_bytes = data.len();
 
-            // Allocate texture as R32I (required for imageStore in compute).
-            // Fragment shaders using isampler2DArray read integers correctly
-            // from either R8I or R32I via texelFetch.
-            let dims = (width, height, num_protos, gls::gl::R32I);
-            if dims != self.proto_tex_dims {
-                gls::tex_image3d::<i32>(
-                    texture_target,
-                    0,
-                    gls::gl::R32I as i32,
-                    width as i32,
-                    height as i32,
-                    num_protos as i32,
-                    0,
-                    gls::gl::RED_INTEGER,
-                    gls::gl::INT,
-                    None,
-                );
-                self.proto_tex_dims = dims;
+            // Allocate as R32I (imageStore-compatible; the int8 fragment
+            // shaders read integers identically from R8I or R32I via
+            // texelFetch). Immutable storage + binding handled by the gate.
+            if self.ensure_proto_texture(texture_target, gls::gl::R32I, width, height, num_protos) {
+                Self::set_proto_tex_params(texture_target, gls::gl::NEAREST);
             }
 
             unsafe {
@@ -5645,11 +5596,9 @@ impl GLProcessorST {
                     gls::gl::R32I,
                 );
 
-                // Dispatch compute
+                // Dispatch compute (uniform locations resolved at compile)
                 gls::gl::UseProgram(compute_program);
-                let loc_w = gls::gl::GetUniformLocation(compute_program, c"width".as_ptr());
-                let loc_h = gls::gl::GetUniformLocation(compute_program, c"height".as_ptr());
-                let loc_np = gls::gl::GetUniformLocation(compute_program, c"num_protos".as_ptr());
+                let (loc_w, loc_h, loc_np) = self.proto_compute_locs;
                 gls::gl::Uniform1i(loc_w, width as i32);
                 gls::gl::Uniform1i(loc_h, height as i32);
                 gls::gl::Uniform1i(loc_np, num_protos as i32);
@@ -5673,14 +5622,7 @@ impl GLProcessorST {
             }
         } else {
             // === GLES 3.0 fallback: CPU repack ===
-            let mut tex_data = vec![0i8; height * width * num_protos];
-            for k in 0..num_protos {
-                for y in 0..height {
-                    for x in 0..width {
-                        tex_data[k * height * width + y * width + x] = protos[[y, x, k]];
-                    }
-                }
-            }
+            let tex_data = super::proto_dispatch::repack_layers(protos);
 
             self.upload_proto_texture(
                 texture_target,
@@ -5690,6 +5632,7 @@ impl GLProcessorST {
                 num_protos,
                 gls::gl::RED_INTEGER,
                 gls::gl::BYTE,
+                gls::gl::NEAREST,
                 &tex_data,
             );
         }
@@ -5697,9 +5640,14 @@ impl GLProcessorST {
         let proto_scale = quantization.scale;
         let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
 
-        match self.int8_interpolation_mode {
-            Int8InterpolationMode::Nearest => {
-                let program = &self.proto_segmentation_int8_nearest_program;
+        match plan.program {
+            super::proto_dispatch::ProtoProgram::Int8Nearest
+            | super::proto_dispatch::ProtoProgram::Int8Bilinear => {
+                let program = if plan.program == super::proto_dispatch::ProtoProgram::Int8Nearest {
+                    &self.proto_segmentation_int8_nearest_program
+                } else {
+                    &self.proto_segmentation_int8_bilinear_program
+                };
                 gls::use_program(program.id);
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
@@ -5712,21 +5660,7 @@ impl GLProcessorST {
                     color_mode,
                 )?;
             }
-            Int8InterpolationMode::Bilinear => {
-                let program = &self.proto_segmentation_int8_bilinear_program;
-                gls::use_program(program.id);
-                program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-                program.load_uniform_1f(c"proto_scale", proto_scale)?;
-                program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
-                self.render_proto_detection_quads(
-                    program,
-                    detect,
-                    mask_coefficients,
-                    num_protos,
-                    color_mode,
-                )?;
-            }
-            Int8InterpolationMode::TwoPass => {
+            super::proto_dispatch::ProtoProgram::Int8TwoPass => {
                 self.render_proto_int8_two_pass(
                     detect,
                     mask_coefficients,
@@ -5738,6 +5672,11 @@ impl GLProcessorST {
                     color_mode,
                 )?;
             }
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "proto program {other:?} is not an int8 program"
+                )));
+            }
         }
 
         Ok(())
@@ -5747,7 +5686,7 @@ impl GLProcessorST {
     /// existing f16 shader using GL_LINEAR.
     #[allow(clippy::too_many_arguments)]
     fn render_proto_int8_two_pass(
-        &self,
+        &mut self,
         detect: &[DetectBox],
         mask_coefficients: &[f32],
         quantization: &edgefirst_decoder::Quantization,
@@ -5768,41 +5707,21 @@ impl GLProcessorST {
             (fbo as u32, vp)
         };
 
-        // Pass 1: Dequantize int8 → RGBA16F texture via framebuffer
-        let dequant_fbo = FrameBuffer::new();
-        gls::bind_texture(texture_target, self.proto_dequant_texture.id);
-        gls::tex_image3d::<u8>(
+        // Pass 1: Dequantize int8 → RGBA16F texture via the persistent
+        // dequant FBO. The render target is gated like the proto texture
+        // (recreate-on-change immutable storage) instead of a fresh
+        // TexImage3D per call.
+        if Self::ensure_immutable_tex_array(
+            &mut self.proto_dequant_texture,
+            &mut self.proto_dequant_tex_dims,
             texture_target,
-            0,
-            gls::gl::RGBA16F as i32,
-            width as i32,
-            height as i32,
-            num_layers as i32,
-            0,
-            gls::gl::RGBA,
-            gls::gl::HALF_FLOAT,
-            None,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
+            gls::gl::RGBA16F,
+            width,
+            height,
+            num_layers,
+        ) {
+            Self::set_proto_tex_params(texture_target, gls::gl::LINEAR);
+        }
 
         let proto_scale = quantization.scale;
         let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
@@ -5818,7 +5737,7 @@ impl GLProcessorST {
 
         // Render each RGBA16F layer (4 protos per layer)
         for layer in 0..num_layers {
-            dequant_fbo.bind();
+            self.proto_dequant_fbo.bind();
             unsafe {
                 gls::gl::FramebufferTextureLayer(
                     gls::gl::FRAMEBUFFER,
@@ -5830,41 +5749,10 @@ impl GLProcessorST {
                 gls::gl::Viewport(0, 0, width as i32, height as i32);
             }
             dequant_program.load_uniform_1i(c"base_layer", (layer * 4) as i32)?;
-
-            // Full-screen quad
-            unsafe {
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-                let verts: [f32; 12] = [
-                    -1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0,
-                ];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
-                    0,
-                    (size_of::<f32>() * 12) as isize,
-                    verts.as_ptr() as *const c_void,
-                );
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-                let tc: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
-                    0,
-                    (size_of::<f32>() * 8) as isize,
-                    tc.as_ptr() as *const c_void,
-                );
-                let idx: [u32; 4] = [0, 1, 2, 3];
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
-                    4,
-                    gls::gl::UNSIGNED_INT,
-                    idx.as_ptr() as *const c_void,
-                );
-            }
+            self.draw_fullscreen_quad()?;
         }
 
-        // Drop the dequant FBO (its Drop unbinds to 0) and restore the caller's.
-        drop(dequant_fbo);
+        // Restore the caller's FBO and viewport.
         unsafe {
             gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
             gls::gl::Viewport(
@@ -5892,214 +5780,102 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// F32 proto path: upload as `GL_R32F` with `GL_LINEAR` filtering.
+    /// One render for every layered-float proto plan — F32→R32F native,
+    /// F32→RGBA16F fallback, and native F16→RGBA16F — driven entirely by
+    /// the [`ProtoPlan`](super::proto_dispatch::ProtoPlan): upload strategy
+    /// picks the repack + texture format, `plan.program` the sampler
+    /// program, `plan.count_uniform` the layer-count uniform. Replaces the
+    /// three per-dtype `render_proto_segmentation_{f32,f16,f16_native}`
+    /// bodies that differed only in those three choices.
     #[allow(clippy::too_many_arguments)]
-    fn render_proto_segmentation_f32(
-        &self,
+    fn render_proto_layers(
+        &mut self,
+        plan: super::proto_dispatch::ProtoPlan,
         detect: &[DetectBox],
         mask_coefficients: &[f32],
-        protos_f32: ndarray::ArrayView3<'_, f32>,
+        data: ProtoLayersData<'_>,
         height: usize,
         width: usize,
         num_protos: usize,
         texture_target: u32,
         color_mode: crate::ColorMode,
     ) -> crate::Result<()> {
-        let program = &self.proto_segmentation_f32_program;
-        gls::use_program(program.id);
-        gls::bind_texture(texture_target, self.proto_texture.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
+        use super::proto_dispatch::{CountUniform, ProtoProgram, ProtoUpload};
 
-        // Repack protos to layer-first layout: (num_protos, H, W)
-        let mut tex_data = vec![0.0f32; height * width * num_protos];
-        for k in 0..num_protos {
-            for y in 0..height {
-                for x in 0..width {
-                    tex_data[k * height * width + y * width + x] = protos_f32[[y, x, k]];
-                }
+        let num_layers = num_protos.div_ceil(4);
+        match (plan.upload, &data) {
+            (ProtoUpload::F32R32f, ProtoLayersData::F32(v)) => {
+                // Repack protos to layer-first layout: (num_protos, H, W)
+                let tex_data = super::proto_dispatch::repack_layers(*v);
+                self.upload_proto_texture(
+                    texture_target,
+                    gls::gl::R32F,
+                    width,
+                    height,
+                    num_protos,
+                    gls::gl::RED,
+                    gls::gl::FLOAT,
+                    gls::gl::LINEAR,
+                    &tex_data,
+                );
+            }
+            (ProtoUpload::F32ToRgba16f, ProtoLayersData::F32(v)) => {
+                let (tex_data, _) =
+                    super::proto_dispatch::repack_rgba_f16_layers(*v, half::f16::from_f32);
+                self.upload_proto_texture(
+                    texture_target,
+                    gls::gl::RGBA16F,
+                    width,
+                    height,
+                    num_layers,
+                    gls::gl::RGBA,
+                    gls::gl::HALF_FLOAT,
+                    gls::gl::LINEAR,
+                    &tex_data,
+                );
+            }
+            (ProtoUpload::F16Rgba16f, ProtoLayersData::F16(v)) => {
+                let (tex_data, _) = super::proto_dispatch::repack_rgba_f16_layers(*v, |x| x);
+                self.upload_proto_texture(
+                    texture_target,
+                    gls::gl::RGBA16F,
+                    width,
+                    height,
+                    num_layers,
+                    gls::gl::RGBA,
+                    gls::gl::HALF_FLOAT,
+                    gls::gl::LINEAR,
+                    &tex_data,
+                );
+            }
+            (upload, _) => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "proto upload {upload:?} incompatible with the provided proto data"
+                )));
             }
         }
 
-        gls::tex_image3d(
-            texture_target,
-            0,
-            gls::gl::R32F as i32,
-            width as i32,
-            height as i32,
-            num_protos as i32,
-            0,
-            gls::gl::RED,
-            gls::gl::FLOAT,
-            Some(&tex_data),
-        );
-
-        program.load_uniform_1i(c"num_protos", num_protos as i32)?;
-        self.render_proto_detection_quads(
-            program,
-            detect,
-            mask_coefficients,
-            num_protos,
-            color_mode,
-        )?;
-
-        Ok(())
-    }
-
-    /// F16 fallback path: repack f32 protos to RGBA16F and use existing
-    /// f16 shader with GL_LINEAR. Used when GL_OES_texture_float_linear
-    /// is not available.
-    #[allow(clippy::too_many_arguments)]
-    fn render_proto_segmentation_f16(
-        &self,
-        detect: &[DetectBox],
-        mask_coefficients: &[f32],
-        protos_f32: ndarray::ArrayView3<'_, f32>,
-        height: usize,
-        width: usize,
-        num_protos: usize,
-        texture_target: u32,
-        color_mode: crate::ColorMode,
-    ) -> crate::Result<()> {
-        let num_layers = num_protos.div_ceil(4);
-        let (tex_data, _) = Self::repack_protos_to_rgba_f16(protos_f32);
-
-        let program = &self.proto_segmentation_program;
+        let program = match plan.program {
+            ProtoProgram::F32 => &self.proto_segmentation_f32_program,
+            ProtoProgram::F16 => &self.proto_segmentation_program,
+            other => {
+                return Err(crate::Error::InvalidShape(format!(
+                    "proto program {other:?} is not a layered-float program"
+                )));
+            }
+        };
         gls::use_program(program.id);
-        gls::bind_texture(texture_target, self.proto_texture.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-
-        gls::tex_image3d(
-            texture_target,
-            0,
-            gls::gl::RGBA16F as i32,
-            width as i32,
-            height as i32,
-            num_layers as i32,
-            0,
-            gls::gl::RGBA,
-            gls::gl::HALF_FLOAT,
-            Some(&tex_data),
-        );
-
-        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
+        match plan.count_uniform {
+            CountUniform::NumProtos => program.load_uniform_1i(c"num_protos", num_protos as i32)?,
+            CountUniform::NumLayers => program.load_uniform_1i(c"num_layers", num_layers as i32)?,
+        }
         self.render_proto_detection_quads(
             program,
             detect,
             mask_coefficients,
             num_protos,
             color_mode,
-        )?;
-
-        Ok(())
-    }
-
-    /// Native-f16 variant of [`Self::render_proto_segmentation_f16`]: uploads
-    /// protos that are already in half-precision directly into `RGBA16F`
-    /// without a f32→f16 conversion pass. Used for `TensorDyn::F16` proto
-    /// tensors produced by fp16 inference engines.
-    #[allow(clippy::too_many_arguments)]
-    fn render_proto_segmentation_f16_native(
-        &self,
-        detect: &[DetectBox],
-        mask_coefficients: &[f32],
-        protos_f16: ndarray::ArrayView3<'_, half::f16>,
-        height: usize,
-        width: usize,
-        num_protos: usize,
-        texture_target: u32,
-        color_mode: crate::ColorMode,
-    ) -> crate::Result<()> {
-        let num_layers = num_protos.div_ceil(4);
-        let (tex_data, _) = Self::repack_protos_f16_to_rgba_f16(protos_f16);
-
-        let program = &self.proto_segmentation_program;
-        gls::use_program(program.id);
-        gls::bind_texture(texture_target, self.proto_texture.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-
-        gls::tex_image3d(
-            texture_target,
-            0,
-            gls::gl::RGBA16F as i32,
-            width as i32,
-            height as i32,
-            num_layers as i32,
-            0,
-            gls::gl::RGBA,
-            gls::gl::HALF_FLOAT,
-            Some(&tex_data),
-        );
-
-        program.load_uniform_1i(c"num_layers", num_layers as i32)?;
-        self.render_proto_detection_quads(
-            program,
-            detect,
-            mask_coefficients,
-            num_protos,
-            color_mode,
-        )?;
-
-        Ok(())
+        )
     }
 
     fn render_segmentation(
@@ -6207,8 +5983,90 @@ impl GLProcessorST {
         }
     }
 
-    /// Upload data to the proto `GL_TEXTURE_2D_ARRAY`, using `glTexSubImage3D`
-    /// when the texture dimensions haven't changed (avoids driver reallocation).
+    /// Ensure the shared proto `GL_TEXTURE_2D_ARRAY` uses immutable storage and
+    /// is recreated when dimensions or internal format change.
+    #[allow(clippy::too_many_arguments)]
+    /// Ensure `proto_texture` is an immutable-storage (`TexStorage3D`) array
+    /// of exactly `(w, h, layers, internal_fmt)`, recreating the texture
+    /// object on any change, and bind it on `TEXTURE0`. Returns `true` when
+    /// recreated (sampler params reset with the object and must be
+    /// re-applied by the caller).
+    ///
+    /// Immutable storage is what makes the compute path's
+    /// `BindImageTexture` legal — ES 3.1 requires it, and `imageStore` into
+    /// a `TexImage3D`-allocated texture silently writes nowhere on
+    /// conformant drivers (Vivante and Mali both rendered garbage masks).
+    /// Recreate-on-change is what keeps the `(dims, internal_fmt)` gate
+    /// honest when renders alternate proto dtypes on one processor: the
+    /// previous `TexImage3D` scheme left `proto_tex_dims` stale after a
+    /// float upload re-allocated the shared texture, so the next int8
+    /// upload `TexSubImage3D`'d into an R32F allocation → GL_INVALID_VALUE
+    /// (0x501). Both found by the proto churn/compute regression tests.
+    fn ensure_proto_texture(
+        &mut self,
+        target: u32,
+        internal_fmt: u32,
+        w: usize,
+        h: usize,
+        layers: usize,
+    ) -> bool {
+        Self::ensure_immutable_tex_array(
+            &mut self.proto_texture,
+            &mut self.proto_tex_dims,
+            target,
+            internal_fmt,
+            w,
+            h,
+            layers,
+        )
+    }
+
+    /// The shared immutable-array allocation gate behind
+    /// [`Self::ensure_proto_texture`] — also used by the two-pass dequant
+    /// target, which keeps its own texture/dims pair.
+    fn ensure_immutable_tex_array(
+        texture: &mut Texture,
+        tex_dims: &mut (usize, usize, usize, u32),
+        target: u32,
+        internal_fmt: u32,
+        w: usize,
+        h: usize,
+        layers: usize,
+    ) -> bool {
+        let dims = (w, h, layers, internal_fmt);
+        gls::active_texture(gls::gl::TEXTURE0);
+        if dims == *tex_dims {
+            gls::bind_texture(target, texture.id);
+            return false;
+        }
+        // Immutable storage cannot be re-specified: recreate the object
+        // (the old one is deleted by Texture's Drop).
+        *texture = Texture::new();
+        gls::bind_texture(target, texture.id);
+        unsafe {
+            gls::gl::TexStorage3D(target, 1, internal_fmt, w as i32, h as i32, layers as i32);
+        }
+        *tex_dims = dims;
+        true
+    }
+
+    /// Apply the proto texture sampler params (`filter` + CLAMP_TO_EDGE).
+    /// Needed (only) after [`Self::ensure_proto_texture`] recreates the
+    /// object; params are per-texture state.
+    fn set_proto_tex_params(target: u32, filter: u32) {
+        unsafe { super::core::set_tex_filter(target, filter) };
+        gls::tex_parameteri(
+            target,
+            gls::gl::TEXTURE_WRAP_S,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+        gls::tex_parameteri(
+            target,
+            gls::gl::TEXTURE_WRAP_T,
+            gls::gl::CLAMP_TO_EDGE as i32,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upload_proto_texture<T: Copy>(
         &mut self,
@@ -6219,39 +6077,26 @@ impl GLProcessorST {
         layers: usize,
         format: u32,
         dtype: u32,
+        filter: u32,
         data: &[T],
     ) {
-        let dims = (w, h, layers, internal_fmt);
-        if dims == self.proto_tex_dims {
-            unsafe {
-                gls::gl::TexSubImage3D(
-                    target,
-                    0,
-                    0,
-                    0,
-                    0,
-                    w as i32,
-                    h as i32,
-                    layers as i32,
-                    format,
-                    dtype,
-                    data.as_ptr() as *const std::ffi::c_void,
-                );
-            }
-        } else {
-            gls::tex_image3d(
+        if self.ensure_proto_texture(target, internal_fmt, w, h, layers) {
+            Self::set_proto_tex_params(target, filter);
+        }
+        unsafe {
+            gls::gl::TexSubImage3D(
                 target,
                 0,
-                internal_fmt as i32,
+                0,
+                0,
+                0,
                 w as i32,
                 h as i32,
                 layers as i32,
-                0,
                 format,
                 dtype,
-                Some(data),
+                data.as_ptr() as *const std::ffi::c_void,
             );
-            self.proto_tex_dims = dims;
         }
     }
 
