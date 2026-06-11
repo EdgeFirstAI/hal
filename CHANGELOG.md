@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DMABUF-first V4L2 hardware JPEG decode** (`edgefirst-codec`): the CAPTURE
+  queue now imports DMA buffers instead of allocating MMAP buffers, so a
+  geometry change costs ~1 ms of ioctls instead of a ~110 ms kernel buffer
+  reallocation. Three decode targets, tried in order: zero-copy into the
+  destination DMA tensor (MCU-aligned NV12/GREY), a persistent codec-owned DMA
+  scratch with copy-out (NEON YUV24→NV24 deinterleave for 4:4:4), and the
+  legacy MMAP path where no dma_heap exists. The OUTPUT (coded) buffer is
+  allocated once with headroom and survives geometry changes. i.MX95, COCO val
+  5K (~1000 distinct resolutions): decode mean 128.7 ms → 7.0 ms, 2.5× faster
+  than the CPU decoder; raw hardware throughput ~350 FPS at 720p
+  (`probe_decode_throughput`). New `v4l2_scan` example flags images that
+  decode slowly through the hardware path.
+
 - **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
   C API, Python): render `N` model inputs into row-band views of one batched
   destination as **one GPU import + one sync**. Loop
@@ -282,6 +295,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain public.
 
 ### Fixed
+
+- **V4L2: JPEGs with embedded-thumbnail metadata no longer wedge `mxc-jpeg`**
+  (`edgefirst-codec`). The i.MX bitstream parser does not length-skip APPn
+  segments, so an APP13 (Photoshop IRB) carrying a nested thumbnail JPEG
+  stalled the hardware until the 2 s decode timeout (deterministic on COCO val
+  `000000122046.jpg`). Metadata segments — except JFIF APP0 and Adobe APP14 —
+  are now stripped while staging the bitstream into the OUTPUT buffer.
 
 - **macOS YUYV→RGBA now honors per-tensor colorimetry** (`edgefirst-image`).
   The macOS ANGLE YUYV shader baked BT.601 full-range coefficients into GLSL;
