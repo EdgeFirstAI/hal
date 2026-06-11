@@ -8401,16 +8401,17 @@ mod image_tests {
         });
     }
 
-    /// SPIKE (P0, lock-scoping): heavy multi-processor oracle stress for the
-    /// on-board legs of the GL serialization spike. Run explicitly:
-    ///   EDGEFIRST_GL_SERIALIZE=lifecycle [EDGEFIRST_GL_IMAGE_LOCK=1] \
-    ///     <test binary> spike_parallel_processors_oracle --ignored
-    /// 4 processors × 4 threads × barrier × 200 NV12 720p → RGB 640 letterbox
+    /// Heavy on-demand stressor for the GL serialization policy: 4
+    /// processors × 4 threads × barrier × 200 NV12 720p → RGB 640 letterbox
     /// converts (DMA where available); every output must byte-match the
     /// thread's own pre-barrier sequential oracle from the same processor.
+    /// Ignored by default (heavy; board tool — the CI-weight version is
+    /// `test_parallel_processors_unique_outputs`). Run explicitly, optionally
+    /// pinning the policy via EDGEFIRST_GL_SERIALIZE=full|lifecycle:
+    ///   <test binary> stress_parallel_processors_oracle --ignored
     #[test]
-    #[ignore = "P0 lock-scoping spike — run explicitly on boards with EDGEFIRST_GL_SERIALIZE legs"]
-    fn spike_parallel_processors_oracle() {
+    #[ignore = "heavy on-demand GL-parallelism stressor; run explicitly on boards"]
+    fn stress_parallel_processors_oracle() {
         use std::sync::{mpsc, Arc, Barrier};
         use std::time::Duration;
 
@@ -8487,13 +8488,13 @@ mod image_tests {
 
             for (i, h) in handles.into_iter().enumerate() {
                 h.join()
-                    .unwrap_or_else(|e| panic!("spike thread {i} panicked: {e:?}"));
+                    .unwrap_or_else(|e| panic!("stressor thread {i} panicked: {e:?}"));
             }
             let _ = tx.send(());
         });
 
         rx.recv_timeout(TIMEOUT).unwrap_or_else(|_| {
-            panic!("spike_parallel_processors_oracle timed out after {TIMEOUT:?}")
+            panic!("stress_parallel_processors_oracle timed out after {TIMEOUT:?}")
         });
     }
 

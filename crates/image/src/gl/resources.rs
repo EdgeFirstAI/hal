@@ -23,7 +23,7 @@ impl Drop for EglImage {
         }
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SPIKE (P0): optional dedicated lock for the destroy leg.
+            // Display-level EGL op — same dedicated lock as creation.
             let _image_guard = super::context::image_lifecycle_guard();
             let e =
                 GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);

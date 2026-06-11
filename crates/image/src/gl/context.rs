@@ -21,45 +21,60 @@ use std::{
 /// EGL cleanup, and dlclose can unmap memory still referenced by the driver.
 static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 
-/// Global mutex that serializes **all** OpenGL and EGL operations across
-/// every `GLProcessorST` instance in the process.
+/// Global mutex serializing GL/EGL **lifecycle** operations across every
+/// `GLProcessorST` instance in the process — and, on Vivante only, every
+/// per-message operation as well.
 ///
-/// Some GPU drivers (notably Vivante `galcore` on i.MX8M Plus) are not
-/// thread-safe for concurrent EGL/GL calls, even when each thread targets
-/// an independent EGL display and context. Concurrent access can corrupt
-/// driver-internal state, leading to deadlocks or SIGSEGV inside kernel
-/// ioctls. Broadcom V3D exhibits a milder variant where concurrent
-/// `eglTerminate` breaks display ref-counting.
+/// The Vivante `galcore` driver (i.MX 8M Plus) is not thread-safe for
+/// concurrent EGL/GL calls, even when each thread targets an independent
+/// context: concurrent access corrupts driver-internal state (deadlocks or
+/// SIGSEGV inside kernel ioctls). On Vivante the worker therefore acquires
+/// this mutex for **every** message (`SerializationPolicy::Full`) — the
+/// pre-2026-06 behavior for all platforms.
 ///
-/// This mutex is acquired by `GLProcessorThreaded` for **every** operation
-/// on its dedicated GL thread:
-/// - Initialization (`GLProcessorST::new` — EGL init, shader compilation,
-///   DMA-BUF verification)
-/// - Every message dispatch (convert, draw, PBO create/download, etc.)
+/// Everywhere else (Mali, V3D, Tegra, llvmpipe, ANGLE) the per-message
+/// acquisition is skipped (`SerializationPolicy::LifecycleOnly`): each
+/// `GLProcessorThreaded` owns a dedicated worker thread and its own EGL
+/// context held current for the thread's life, and the EGL spec requires
+/// concurrent contexts on distinct threads to work. The P0 spike (2026-06,
+/// 4 processors × barrier × 200-convert oracle stress, 5 reps per leg)
+/// validated this clean on Mali G310, V3D, and Tegra/Orin. Multiple
+/// `ImageProcessor` instances now genuinely execute GL work in parallel on
+/// those platforms.
+///
+/// What ALWAYS stays under this mutex, on every platform:
+/// - Initialization (`GLProcessorST::new` — EGL display probe/init, context
+///   creation, shader compilation, DMA-BUF verification)
 /// - Teardown (`GLProcessorST::drop` → `GlContext::drop`)
 ///
-/// This ensures that only one GL thread interacts with the GPU driver at
-/// any given time. Multiple `ImageProcessor` instances remain usable from
-/// different application threads — their GL commands are simply serialized
-/// through this mutex rather than executed in parallel.
+/// These are rare, cheap-to-serialize events that cover driver bring-up
+/// races. NOTE: the known Vivante concurrent-multi-processor double-free
+/// (see `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS`) is NOT prevented by any
+/// locking — it reproduces with full serialization and appears to live in
+/// driver thread-exit TLS destructors; the test skip remains necessary.
+///
+/// Override: `EDGEFIRST_GL_SERIALIZE=full|lifecycle` forces the policy —
+/// `full` is the escape hatch for unknown-bad drivers, `lifecycle` forces
+/// parallelism (e.g. Vivante experiments). Unset = per-driver default.
 pub(super) static GL_MUTEX: Mutex<()> = Mutex::new(());
 
-/// SPIKE (P0, throwaway): dedicated short lock for EGLImage create/destroy,
-/// env-gated by `EDGEFIRST_GL_IMAGE_LOCK=1`. A separate mutex (NOT
-/// `GL_MUTEX`) because in Full-serialization mode the worker already holds
-/// `GL_MUTEX` when creating images — re-locking it would deadlock.
+/// Dedicated short lock serializing EGLImage create/destroy across
+/// processors (a separate mutex from `GL_MUTEX`: in `Full` policy the
+/// worker already holds `GL_MUTEX` when creating images, and `std::sync::
+/// Mutex` is not reentrant).
+///
+/// `eglCreateImageKHR`/`eglDestroyImageKHR` are display-level operations
+/// the EGL spec requires to be thread-safe, but this module's premise is
+/// embedded drivers violating the spec. The P0 spike ran Mali/V3D/Tegra
+/// clean WITHOUT this lock (5 reps each), so it is likely removable; it is
+/// kept because the steady-state cost is zero — image creation is
+/// cache-miss-only (one import per buffer after warmup, pinned by the
+/// `image.convert.gl.egl_import` span gates).
 static EGL_IMAGE_MUTEX: Mutex<()> = Mutex::new(());
 
-/// SPIKE (P0): returns a guard for EGLImage lifecycle ops when the
-/// `EDGEFIRST_GL_IMAGE_LOCK=1` leg is active, else `None`.
-pub(super) fn image_lifecycle_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ENABLED.get_or_init(|| {
-        std::env::var("EDGEFIRST_GL_IMAGE_LOCK")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    });
-    on.then(|| EGL_IMAGE_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+/// Acquire the EGLImage lifecycle lock (see [`EGL_IMAGE_MUTEX`]).
+pub(super) fn image_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> {
+    EGL_IMAGE_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Shared EGL display — created once, reused by all `GlContext` instances.
