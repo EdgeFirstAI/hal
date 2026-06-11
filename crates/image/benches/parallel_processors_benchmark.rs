@@ -114,12 +114,11 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 let mut dst = proc
                     .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, DType::U8, mem)
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
-                let convert_once =
-                    |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
-                        proc.convert(&src, dst, Rotation::None, Flip::None, crop)
-                            .map_err(|e| format!("convert failed: {e}"))?;
-                        Ok(())
-                    };
+                let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
+                    proc.convert(&src, dst, Rotation::None, Flip::None, crop)
+                        .map_err(|e| format!("convert failed: {e}"))?;
+                    Ok(())
+                };
 
                 for _ in 0..WARMUP_CONVERTS {
                     convert_once(&mut proc, &mut dst)?;
@@ -150,9 +149,7 @@ fn main() {
     let mut suite = BenchSuite::from_args();
 
     println!("== Parallel ImageProcessor throughput scaling ==");
-    println!(
-        "   window = {WINDOW:?}/cell, warmup = {WARMUP_CONVERTS} converts/proc\n"
-    );
+    println!("   window = {WINDOW:?}/cell, warmup = {WARMUP_CONVERTS} converts/proc\n");
 
     for cell in CELLS {
         let mut base_rate: Option<f64> = None;

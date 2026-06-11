@@ -8475,9 +8475,7 @@ mod image_tests {
                                 .create_image(320, 320, PixelFormat::Rgba, DType::U8, mem)
                                 .unwrap();
                             proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
-                                .unwrap_or_else(|e| {
-                                    panic!("convert failed on thread {i}: {e}")
-                                });
+                                .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
                             let t = dst.as_u8().unwrap();
                             let m = t.map().unwrap();
                             m.as_slice().to_vec()
@@ -8487,8 +8485,7 @@ mod image_tests {
                         barrier.wait();
                         for round in 0..ROUNDS {
                             let out = convert_once(&mut proc);
-                            let diffs =
-                                oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
+                            let diffs = oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
                             assert!(
                                 diffs == 0,
                                 "thread {i} round {round}: {diffs}/{} bytes diverged \
@@ -8573,9 +8570,7 @@ mod image_tests {
                                 .create_image(640, 640, PixelFormat::Rgb, DType::U8, mem)
                                 .unwrap();
                             proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
-                                .unwrap_or_else(|e| {
-                                    panic!("convert failed on thread {i}: {e}")
-                                });
+                                .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
                             let t = dst.as_u8().unwrap();
                             let m = t.map().unwrap();
                             m.as_slice().to_vec()
@@ -8585,8 +8580,7 @@ mod image_tests {
                         barrier.wait();
                         for round in 0..ROUNDS {
                             let out = convert_once(&mut proc);
-                            let diffs =
-                                oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
+                            let diffs = oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
                             assert!(
                                 diffs == 0,
                                 "thread {i} round {round}: {diffs}/{} bytes diverged \

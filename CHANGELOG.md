@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Parallel `ImageProcessor` execution on non-Vivante GPUs**
+  (`edgefirst-image`): the process-global GL lock is now a per-driver
+  serialization policy. On Vivante (i.MX 8M Plus) every operation still
+  serializes globally (the galcore driver is not thread-safe across
+  contexts); on Mali, V3D, Tegra, llvmpipe — and any platform without a
+  known-bad driver — multiple `ImageProcessor` instances now genuinely
+  execute GPU work in parallel, each on its own dedicated thread and GL
+  context. Measured aggregate scaling for a 720p NV12→RGB letterbox:
+  Mali G310 S(4)=2.05, V3D S(4)=1.16, Tegra S(4)=1.17 (Vivante flat by
+  design). `EDGEFIRST_GL_SERIALIZE=full|lifecycle` overrides the policy
+  (`full` also mitigates a measured Tegra context-switch collapse on
+  degenerate tiny-convert multi-processor workloads). New
+  `parallel_processors_benchmark` and a cross-wire-sensitive parallel
+  correctness test demonstrate and pin the behavior; processor
+  creation/teardown and EGLImage create/destroy remain briefly
+  serialized on every platform.
 - **`ColorimetryMode` (`Fast` | `Exact`) + `EDGEFIRST_COLORIMETRY`**
   (`edgefirst-image`): the colorimetry/performance trade-off is now an
   explicit knob. `ImageProcessorConfig::colorimetry` (default
