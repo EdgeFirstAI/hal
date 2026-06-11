@@ -2644,6 +2644,191 @@ mod gl_tests {
         assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
 
+    /// Regression for the two-pass double letterbox (PR #107): pass 2 of the
+    /// zero-copy NV→planar plan re-applied `dst_rect`, mapping the
+    /// already-letterboxed intermediate into the content sub-region a second
+    /// time and shrinking the image by the letterbox content fraction twice.
+    ///
+    /// A synthetic grey NV12 frame letterboxed 1280x720 → 640x640 must place
+    /// content rows at exactly [140, 500); the double-applied bug squeezed
+    /// them to ~[218, 422). Probing rows just inside the correct band (150 /
+    /// 490) is therefore a deterministic kill-shot with no oracle tolerance
+    /// to hide behind — and it equally catches the inverse bug (letterbox
+    /// dropped entirely: pad rows would hold content). Covers PlanarRgb /
+    /// PlanarRgba × u8 / i8 × Dma (the GL TwoPassNvPlanar plan) and Mem
+    /// destinations — GL has no planar texture destination, so the Mem legs
+    /// pin the backend `ImageProcessor` resolves instead (CPU fallback),
+    /// guarding the whole dispatch surface against the bug class.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn letterbox_nv_to_planar_content_band_geometry() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        // Synthetic NV12: Y=200, U=V=128 is neutral grey, so BT.601 vs BT.709
+        // coefficients cancel and the converted RGB is ~200 (full range) to
+        // ~214 (limited): comfortably above the 114 pad in every colorimetry
+        // mode. Threshold at >=170 content / <=140 pad.
+        let (sw, sh) = (1280usize, 720usize);
+        let mut nv12 = vec![0u8; sw * sh * 3 / 2];
+        nv12[..sw * sh].fill(200);
+        nv12[sw * sh..].fill(128);
+        let src_mem = if is_dma_available() {
+            Some(TensorMemory::Dma)
+        } else {
+            Some(TensorMemory::Mem)
+        };
+        let src = load_raw_image(sw, sh, PixelFormat::Nv12, src_mem, &nv12).unwrap();
+
+        // 1280x720 → 640x640: scale 0.5, content 640x360 centred → rows
+        // [140, 500). Probe ≥10 px from the boundary to stay clear of
+        // bilinear edge blending.
+        const CONTENT_ROWS: [usize; 3] = [150, 320, 490];
+        const PAD_ROWS: [usize; 4] = [0, 130, 510, 639];
+        let (dw, dh) = (640usize, 640usize);
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+
+        let mut dst_memories = vec![TensorMemory::Mem];
+        if is_dma_available() {
+            dst_memories.push(TensorMemory::Dma);
+        }
+        for dst_mem in dst_memories {
+            for dst_fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+                for dtype in [DType::U8, DType::I8] {
+                    let label = format!("nv12->{dst_fmt}.{dtype:?}@{dst_mem:?}");
+                    let mut dst = proc
+                        .create_image(dw, dh, dst_fmt, dtype, Some(dst_mem))
+                        .unwrap();
+                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                        .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+
+                    // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
+                    // share one set of thresholds.
+                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
+                    let bytes: Vec<u8> = match dtype {
+                        DType::U8 => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                        _ => dst
+                            .as_i8()
+                            .unwrap()
+                            .map()
+                            .unwrap()
+                            .as_slice()
+                            .iter()
+                            .map(|&v| v as u8 ^ unbias)
+                            .collect(),
+                    };
+
+                    // Only the three colour planes — the alpha plane is 255
+                    // everywhere (content and pad) and is bias-exempt.
+                    for plane in 0..3 {
+                        let plane_base = plane * dh * dw;
+                        for row in CONTENT_ROWS {
+                            for col in (5..dw - 5).step_by(13) {
+                                let v = bytes[plane_base + row * dw + col];
+                                assert!(
+                                    v >= 170,
+                                    "{label}: plane {plane} row {row} col {col} = {v}, \
+                                     expected content (>=170) — letterbox content band \
+                                     misplaced (double-letterbox regression?)"
+                                );
+                            }
+                        }
+                        for row in PAD_ROWS {
+                            for col in (5..dw - 5).step_by(13) {
+                                let v = bytes[plane_base + row * dw + col];
+                                assert!(
+                                    v <= 140,
+                                    "{label}: plane {plane} row {row} col {col} = {v}, \
+                                     expected pad (<=140) — content leaked into the \
+                                     letterbox band"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Letterboxed PixelFormat::Nv12 → planar against the verified RGBA
+    /// reference: the same processor letterboxes camera NV12 720p → RGBA
+    /// 640x640, the reference is channel-split on the CPU, and the GL planar
+    /// output (PlanarRgb@Dma — the TwoPassNvPlanar plan) must match it.
+    /// PlanarRgb@Dma is the only planar destination the GL engine accepts:
+    /// `check_dst_format_supported` rejects PlanarRgba outright and Mem has
+    /// no planar texture destination. Catches placement, scale, and content
+    /// drift in the two-pass plan at full resolution — the per-pixel
+    /// complement to the content-band geometry probe above.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn letterbox_nv12_to_planar_matches_rgba_reference() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+
+        let crop = letterbox_crop(1280, 720, 640, 640);
+        let (dw, dh) = (640usize, 640usize);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Reference: the verified packed-RGBA letterbox path.
+        let mut dst_rgba = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(&src, &mut dst_rgba, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let rgba = dst_rgba.as_u8().unwrap().map().unwrap();
+        let rgba = rgba.as_slice();
+
+        // Channel-split the RGBA reference into the planar layout.
+        let mut expected = vec![0u8; 3 * dh * dw];
+        for (i, px) in rgba.chunks_exact(4).enumerate() {
+            for (plane, &channel) in px.iter().take(3).enumerate() {
+                expected[plane * dh * dw + i] = channel;
+            }
+        }
+        let mut dst = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Dma: convert failed: {e}"));
+        let map = dst.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(&expected, map.as_slice(), 1);
+    }
+
     /// Compare fused GL proto rendering against hybrid (CPU materialize + GL overlay).
     ///
     /// Both paths should produce visually similar output. Differences arise from
