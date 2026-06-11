@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Issue #106 closed — imx8mp GL drift reclaimed and documented**:
+  `image_benchmark` regains the same-size 1080p RGBA→BGRA / RGBA→GREY
+  cells as permanent drift sentinels, verified back at the v0.15.0
+  numbers on imx8mp (7.7 / 7.9 ms, from 13.8 / 14.9 ms at the
+  2026-06-09 drift capture). BENCHMARKS.md's GL convert, letterbox, and
+  mask tables are re-collected on the convergence engine with per-table
+  capture notes (imx95 YUYV→RGB 1080p halved to 5.7 ms; the mask hybrid
+  path is ~3× faster than the stale v0.15.0 figures).
 - **GL proto-segmentation render internals** (`edgefirst-image`): the
   per-dtype render variants collapsed into one plan-driven path selected
   by a pure, host-tested decision table (`proto_dispatch::plan_proto`).

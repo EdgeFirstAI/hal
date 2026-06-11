@@ -336,7 +336,11 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 
 ## Benchmark Results
 
-**Data collected:** March 30, 2026 (v0.15.0, per-texture EGL binding optimization)
+**Data collected:** March 30, 2026 (v0.15.0, per-texture EGL binding
+optimization) unless a section states otherwise — the GL convert,
+letterbox, and mask-rendering tables were re-collected June 2026 after
+the GL convergence engine (PR #109/#110, issue #106); each carries its
+own capture note.
 
 ### Buffer Infrastructure
 
@@ -410,19 +414,23 @@ macOS when you need a backing tensor that the GL backend can also import.**
 
 ### Image Preprocessing: Letterbox Pipeline (Camera → Model Input)
 
+**GL rows re-collected:** June 2026 (GL convergence engine, PR #109/#110;
+median of 3 runs × n=100, `pipeline_benchmark`). G2D/CPU rows are the
+v0.15.0 capture (those backends were not changed).
+
 **1080p → 640×640:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | YUYV→8BPi | NV12→RGBA | VYUY→RGBA |
 |----------|---------|--------|-----------|----------|-----------|-----------|-----------|
 | imx8mp-frdm | G2D | DMA | 2.7 ms | 4.0 ms | — | 4.1 ms | — |
-| imx8mp-frdm | GL | DMA | 1.7 ms | 11.8 ms | — | 3.5 ms | — |
+| imx8mp-frdm | GL | DMA | 1.8 ms | 11.3 ms | — | 3.2 ms | — |
 | imx8mp-frdm | CPU | Heap | 17.4 ms | 17.6 ms | — | 33.9 ms | 17.5 ms |
 | imx95-frdm | G2D | DMA | 3.9 ms | 4.6 ms | — | 3.7 ms | — |
-| imx95-frdm | GL | DMA | 1.2 ms | 3.3 ms | — | 1.5 ms | — |
+| imx95-frdm | GL | DMA | 1.2 ms | 2.6 ms | — | 1.2 ms | — |
 | imx95-frdm | CPU | Heap | 14.5 ms | 14.9 ms | — | 16.6 ms | 14.5 ms |
-| rpi5-hailo | GL | DMA | 3.3 ms | 4.1 ms | — | 1.2 ms | — |
+| rpi5-hailo | GL | DMA | 3.3 ms | 4.0 ms | — | 1.2 ms | — |
 | rpi5-hailo | CPU | Heap | 7.6 ms | 7.2 ms | — | 8.1 ms | 7.6 ms |
-| jetson-orin-nano | GL | DMA | — | — | — | — | — |
+| jetson-orin-nano | GL | PBO | 4.3 ms | 4.6 ms | — | 4.3 ms | — |
 | jetson-orin-nano | CPU | Heap | 6.1 ms | 5.9 ms | — | 5.3 ms | 6.2 ms |
 | x86-desktop | CPU | Heap | 3.0 ms | 1.5 ms | — | 1.8 ms | 5.4 ms |
 | mbp-m2-max | CPU | Heap | 1.5 ms | 1.7 ms | 2.0 ms | 1.3 ms | — |
@@ -446,23 +454,37 @@ macOS when you need a backing tensor that the GL backend can also import.**
 
 ### Format Conversion (Same Size, No Resize)
 
+**imx8mp/imx95 GL rows re-collected:** June 11, 2026
+(`image_benchmark`, PR #110 head, n=100). This closes the issue #106
+drift: the 2026-06-09 capture had imx8mp RGBA→BGRA at 13.8 ms (+79%)
+and RGBA→GREY at 14.9 ms (+91%) versus this table; the GL convergence
+engine (PR #109) reclaimed both to the v0.15.0 numbers, and the
+RGBA→BGRA / RGBA→GREY cells are now permanent `image_benchmark`
+sentinels so same-size drift cannot go unmeasured again. Orin YUYV GL
+cells are the 2026-06-10 PR #109 capture; remaining GL cells and all
+G2D/CPU rows are the v0.15.0 capture.
+
 **1080p → 1080p:**
 
 | Platform | Compute | Buffer | YUYV→RGBA | YUYV→RGB | NV12→RGBA | RGB→RGBA | RGBA→BGRA | RGBA→GREY |
 |----------|---------|--------|-----------|----------|-----------|----------|-----------|-----------|
 | imx8mp-frdm | G2D | DMA | 6.0 ms | 10.5 ms | 6.3 ms | — | — | — |
-| imx8mp-frdm | GL | DMA | 7.2 ms | 49.9 ms | 6.1 ms | — | 7.7 ms | 7.8 ms |
+| imx8mp-frdm | GL | DMA | 7.3 ms | 49.0 ms | 6.1 ms | — | 7.7 ms | 7.9 ms |
 | imx8mp-frdm | CPU | Heap | 13.5 ms | 11.8 ms | 25.7 ms | 13.7 ms | 30.2 ms | 10.0 ms |
 | imx95-frdm | G2D | DMA | 4.6 ms | 4.3 ms | 4.5 ms | — | — | — |
-| imx95-frdm | GL | DMA | 3.1 ms | 11.8 ms | 3.2 ms | — | 3.1 ms | 2.9 ms |
+| imx95-frdm | GL | DMA | 3.0 ms | 5.7 ms | 3.2 ms | — | 3.1 ms | 2.2 ms |
 | imx95-frdm | CPU | Heap | 12.4 ms | 11.0 ms | 16.1 ms | 11.1 ms | 24.8 ms | 9.0 ms |
 | rpi5-hailo | GL | DMA | 7.2 ms | 10.4 ms | 5.4 ms | — | 8.4 ms | 6.2 ms |
 | rpi5-hailo | CPU | Heap | 6.8 ms | 5.4 ms | 8.0 ms | 6.6 ms | 12.2 ms | 2.5 ms |
-| jetson-orin-nano | GL | DMA | — | — | — | 1.5 ms | 4.2 ms | 1.5 ms |
+| jetson-orin-nano | GL | PBO | 2.3 ms | 2.2 ms | — | 1.5 ms | 4.2 ms | 1.5 ms |
 | jetson-orin-nano | CPU | Heap | 3.0 ms | 2.8 ms | 2.1 ms | 789 us | 3.2 ms | 1.4 ms |
 | x86-desktop | CPU | Heap | 516 us | 559 us | 256 us | 261 us | 758 us | 219 us |
 | mbp-m2-max | GL | IOSurface | 409 us | — | — | — | — | — |
 | mbp-m2-max | CPU | Heap | 541 us | 499 us | 329 us | 141 us | 784 us | 314 us |
+
+The imx8mp YUYV→RGB / RGBA→RGB cells (~49 ms) are the Vivante two-pass
+packed-RGB path (GL has no 3-byte render format); imx95 YUYV→RGB halved
+versus v0.15.0 (11.8 → 5.7 ms) from the engine's single-finish two-pass.
 
 The macOS GL row only covers YUYV→RGBA today; other format pairs fall
 through to CPU. Even with that single working pair the speedup is **1.3×**
@@ -693,42 +715,48 @@ done
 
 ### Mask Rendering
 
+**Data re-collected:** June 11, 2026 (GL proto-dispatch convergence;
+median of 3 runs × n=100; imx8mp/imx95/rpi5 at PR #110 head,
+jetson-orin-nano at PR #109 head). CPU / x86 / macOS rows retain the
+v0.15.0 capture — those paths are measured by the batched-GEMM tables
+below.
+
 **640×640 RGBA destination, ~2 detections (YOLOv8n-seg):**
 
 | Platform | Compute | Buffer | draw_decoded_masks (pre-decoded) | draw_proto_masks (fused) | hybrid_materialize_and_draw |
 |----------|---------|--------|-------------------------------|------------------------|---------------------------|
-| imx8mp-frdm | GL | DMA | 2.4 ms | 276 ms | 19.5 ms |
+| imx8mp-frdm | GL | DMA | 2.7 ms | 274 ms | 6.1 ms |
 | imx8mp-frdm | CPU | Heap | 5.3 ms | 77.8 ms | 8.3 ms |
-| imx95-frdm | GL | DMA | 1.9 ms | 26.0 ms | 5.6 ms |
+| imx95-frdm | GL | DMA | 1.2 ms | 24.4 ms | 4.8 ms |
 | imx95-frdm | CPU | Heap | 5.3 ms | 76.2 ms | 8.4 ms |
-| rpi5-hailo | GL | DMA | 1.5 ms | 8.0 ms | 5.6 ms |
+| rpi5-hailo | GL | DMA | 1.3 ms | 7.7 ms | 2.4 ms |
 | rpi5-hailo | CPU | Heap | 885 us | 14.5 ms | 1.7 ms |
-| jetson-orin-nano | GL | DMA | 556 us | 3.0 ms | 1.7 ms |
+| jetson-orin-nano | GL | DMA | 518 us | 3.0 ms | 1.4 ms |
 | jetson-orin-nano | CPU | Heap | 873 us | 22.1 ms | 1.9 ms |
 | x86-desktop | CPU | Heap | 648 us | 5.1 ms | 635 us |
 | mbp-m2-max | CPU | Heap | 215 us | 6.9 ms | 419 us |
 
 **Hybrid Path Comparison (CPU materialize + GL overlay vs fused GPU):**
 
-The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms. The auto-selection in `ImageProcessor::draw_proto_masks()` prefers the hybrid path when both CPU and OpenGL backends are available.
+The hybrid path decodes masks on CPU (`materialize_segmentations`) then overlays via GL (`draw_decoded_masks`). This is faster than fused GPU `draw_proto_masks` on all tested platforms — dramatically so on Vivante, whose fragment scheduling falls off a cliff on the per-quad sigmoid work (see the eager-materialize guidance in `crates/image/ARCHITECTURE.md`). The auto-selection in `ImageProcessor::draw_proto_masks()` prefers the hybrid path when both CPU and OpenGL backends are available. The hybrid column is ~3× faster than the v0.15.0 capture across the boards thanks to the v0.22 batched-GEMM materialise.
 
 **New in v0.15.0:** The `materialize_masks()` API exposes the CPU materialization step as a first-class operation, enabling a three-stage pipeline (`decode_proto` → `materialize_masks` → `draw_decoded_masks`) where users can inspect, export, or fork the intermediate masks for analytics before rendering. Mask values are continuous sigmoid confidence (u8 0-255), not binary thresholded.
 
 | Platform | Full GPU (GL draw_proto_masks) | Hybrid (GL) | Speedup | Auto draw_proto_masks |
 |----------|-------------------------------|-------------|---------|----------------------|
-| imx8mp-frdm | 276 ms | 19.5 ms | **14.2×** | 4.2 ms |
-| imx95-frdm | 26.0 ms | 5.6 ms | **4.6×** | 4.2 ms |
-| rpi5-hailo | 8.0 ms | 5.6 ms | **1.4×** | 2.0 ms |
-| jetson-orin-nano | 3.0 ms | 1.7 ms | **1.8×** | 1.1 ms |
+| imx8mp-frdm | 274 ms | 6.1 ms | **44.9×** | 4.0 ms |
+| imx95-frdm | 24.4 ms | 4.8 ms | **5.1×** | 3.7 ms |
+| rpi5-hailo | 7.7 ms | 2.4 ms | **3.2×** | 1.6 ms |
+| jetson-orin-nano | 3.0 ms | 1.4 ms | **2.1×** | 1.2 ms |
 
 **Mask Decode Cost (CPU-only, measured in mask_benchmark):**
 
 | Platform | Proto Decode (NMS+coefficients) | Full Materialize (NMS+coefficients+pixels) |
 |----------|-------------------------------|-------------------------------------------|
-| imx8mp-frdm | 1.5 ms | 4.9 ms |
-| imx95-frdm | 1.2 ms | 4.3 ms |
-| rpi5-hailo | 376 us | 1.4 ms |
-| jetson-orin-nano | 440 us | 1.6 ms |
+| imx8mp-frdm | 916 us | 4.0 ms |
+| imx95-frdm | 712 us | 3.6 ms |
+| rpi5-hailo | 186 us | 1.2 ms |
+| jetson-orin-nano | 194 us | 1.1 ms |
 | x86-desktop | 381 us | 903 us |
 | mbp-m2-max | 222 us | 862 us |
 
