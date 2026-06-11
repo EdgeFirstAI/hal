@@ -3519,56 +3519,25 @@ impl GLProcessorST {
         .entered();
         self.setup_renderbuffer_dma(dst, dst_fmt)?;
 
-        // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = if is_int8 {
-            let mut crop = crop;
-            if let Some(ref mut color) = crop.dst_color {
-                color[0] ^= 0x80;
-                color[1] ^= 0x80;
-                color[2] ^= 0x80;
-            }
-            crop
-        } else {
-            crop
+        // Pass 2 is a fullscreen blit from the intermediate to the planar
+        // destination. Pass 1 (convert_to above) already placed the image
+        // content at the correct letterbox position within the intermediate
+        // AND filled the padding region with the requested dst_color.
+        // Re-applying the dst_rect crop here would map the full intermediate
+        // (whose content is already correctly placed) into only the content
+        // sub-region, shrinking the image by the letterbox content fraction
+        // a second time. Observed downstream as bounding boxes compressed by
+        // exactly (content/canvas) in the padded dimension on i.MX 8M Plus.
+        //
+        // The int8 clear-color bias that lived here is gone with the clear:
+        // pass 1 performed all letterbox fills, and pass 2's shader applies
+        // the int8 bias itself (is_int8 flag on the draw below).
+        let dst_roi = RegionOfInterest {
+            left: -1.,
+            top: 1.,
+            right: 1.,
+            bottom: -1.,
         };
-
-        // Letterbox fill: clear planar regions outside the destination rect
-        let cvt_screen_coord = |normalized: f32| normalized * 2.0 - 1.0;
-        let dst_roi = if let Some(rect) = crop.dst_rect {
-            RegionOfInterest {
-                left: cvt_screen_coord(rect.left as f32 / dst_w as f32),
-                top: cvt_screen_coord((rect.top + rect.height) as f32 / dst_h as f32),
-                right: cvt_screen_coord((rect.left + rect.width) as f32 / dst_w as f32),
-                bottom: cvt_screen_coord(rect.top as f32 / dst_h as f32),
-            }
-        } else {
-            RegionOfInterest {
-                left: -1.,
-                top: 1.,
-                right: 1.,
-                bottom: -1.,
-            }
-        };
-
-        let has_crop = crop
-            .dst_rect
-            .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
-        if has_crop {
-            if let Some(dst_color) = crop.dst_color {
-                self.clear_rect_planar(
-                    dst_w,
-                    dst_h,
-                    dst_roi,
-                    [
-                        dst_color[0] as f32 / 255.0,
-                        dst_color[1] as f32 / 255.0,
-                        dst_color[2] as f32 / 255.0,
-                        dst_color[3] as f32 / 255.0,
-                    ],
-                    alpha,
-                )?;
-            }
-        }
 
         self.draw_intermediate_to_rgb_planar(dst_roi, alpha, is_int8)?;
 
