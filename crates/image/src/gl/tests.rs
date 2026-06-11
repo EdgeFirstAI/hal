@@ -3164,6 +3164,52 @@ mod gl_tests {
         compare_images(&dst_cpu_repack, &dst_compute, 0.99, function!());
     }
 
+    /// All three int8 proto interpolation modes must agree on the rendered
+    /// masks: Bilinear (shader-computed weights) and TwoPass (dequant to
+    /// RGBA16F + hardware GL_LINEAR) sample the same data with equivalent
+    /// filtering, and Nearest only loses the sub-texel blend. TwoPass had
+    /// no test on any lane before this — it is the path with the cached
+    /// dequant FBO, the gated immutable dequant texture, and the shared
+    /// fullscreen quad. Switching modes on ONE processor also exercises
+    /// per-draw plan changes against the persistent proto/dequant textures.
+    #[test]
+    fn proto_int8_interpolation_modes_agree() {
+        use crate::Int8InterpolationMode;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let (boxes, proto_i8) = decode_yolov8_proto_fixture();
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        let mut render_mode = |mode: Int8InterpolationMode| {
+            gl.set_int8_interpolation_mode(mode).unwrap();
+            render_proto_to_rgba(&mut gl, &boxes, &proto_i8)
+        };
+        let bilinear = render_mode(Int8InterpolationMode::Bilinear);
+        let two_pass = render_mode(Int8InterpolationMode::TwoPass);
+        let nearest = render_mode(Int8InterpolationMode::Nearest);
+        // And back to bilinear on the same processor: must reproduce the
+        // first render despite the dequant texture/FBO created in between.
+        let bilinear_again = render_mode(Int8InterpolationMode::Bilinear);
+
+        // Measured actuals: Vivante GC7000UL >= 0.95; Mali G310 = 0.8153 —
+        // a PRE-EXISTING driver filtering delta (bit-identical score on the
+        // pre-refactor build), believed to be Mali's coarser fixed-point
+        // f16 texture interpolation. 0.80 still catches structural
+        // breakage: the broken compute-repack upload scored ~0.77.
+        compare_images(&bilinear, &two_pass, 0.80, function!());
+        compare_images(&bilinear, &nearest, 0.90, function!());
+        let a = bilinear.as_u8().unwrap().map().unwrap();
+        let b = bilinear_again.as_u8().unwrap().map().unwrap();
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "bilinear render diverged after mode churn"
+        );
+    }
+
     /// Proto texture uploads must stay correct across dims/format churn on
     /// ONE processor: int8 (R8I) → f32 (R32F, same dims — internal-format
     /// churn) → f32 with 30 layers (layer-count churn, deliberately not a
