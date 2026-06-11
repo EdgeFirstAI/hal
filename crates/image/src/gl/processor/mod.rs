@@ -5983,8 +5983,8 @@ impl GLProcessorST {
         }
     }
 
-    /// Upload data to the proto `GL_TEXTURE_2D_ARRAY`, using `glTexSubImage3D`
-    /// when the texture dimensions haven't changed (avoids driver reallocation).
+    /// Ensure the shared proto `GL_TEXTURE_2D_ARRAY` uses immutable storage and
+    /// is recreated when dimensions or internal format change.
     #[allow(clippy::too_many_arguments)]
     /// Ensure `proto_texture` is an immutable-storage (`TexStorage3D`) array
     /// of exactly `(w, h, layers, internal_fmt)`, recreating the texture
