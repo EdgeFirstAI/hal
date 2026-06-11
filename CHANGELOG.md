@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source exactly, colorimetry-exact in-shader matrix otherwise). All other
   GPUs are unaffected — the exact in-shader path is already the fast path
   there.
+- **DMABUF V4L2 hardware JPEG decode** (`edgefirst-codec`): the CAPTURE queue
+  now imports DMA buffers instead of allocating MMAP buffers, so a geometry
+  change costs ~1 ms of ioctls instead of a ~110 ms kernel buffer
+  reallocation. Two decode targets, tried in order: zero-copy into the
+  destination DMA tensor (MCU-aligned NV12/GREY), or a persistent codec-owned
+  DMA scratch with copy-out (NEON YUV24→NV24 deinterleave for 4:4:4). The
+  OUTPUT (coded) buffer is allocated once with headroom and survives geometry
+  changes. Hardware decode requires DMA buffer allocation (dma_heap), in line
+  with the HAL's DMABUF-centric design; platforms without it use the CPU
+  decoder. i.MX95, COCO val 5K (~1000 distinct resolutions): decode mean
+  128.7 ms → 7.0 ms, 2.5× faster than the CPU decoder; raw hardware
+  throughput ~350 FPS at 720p (`probe_decode_throughput`). New `v4l2_scan`
+  example flags images that decode slowly through the hardware path.
 - **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
   C API, Python): render `N` model inputs into row-band views of one batched
   destination as **one GPU import + one sync**. Loop
@@ -117,13 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     exposing `.device_ptr` and `.size`.
   Validated on Jetson Orin-nano (O5/O6/O8) on L4T R36.4 / CUDA 12.6 / TRT 10.3
   (numeric max\_err 0.00024 vs CPU reference) and desktop RTX 3090.
-
 - **imx8mp coverage flush-guard** (`edgefirst_tensor::covguard`) — a
   `SIGABRT` handler compiled in under `-Cinstrument-coverage` that flushes
   the LLVM profile to disk before re-raising the signal. Prevents coverage
   loss on the i.MX 8M Plus CI lane where the Vivante EGL driver calls
   `abort()` during process shutdown.
-
 - **F16 zero-copy preprocessing on macOS via ANGLE + RGBA16F-packed
   IOSurface.** RGBA8 input → PlanarRgb F16 output runs end-to-end on
   the GPU and writes directly into an IOSurface that ORT consumes as
@@ -297,6 +308,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain public.
 
 ### Fixed
+
+- **V4L2: JPEGs with embedded-thumbnail metadata no longer wedge `mxc-jpeg`**
+  (`edgefirst-codec`). The i.MX bitstream parser does not length-skip APPn
+  segments, so an APP13 (Photoshop IRB) carrying a nested thumbnail JPEG
+  stalled the hardware until the 2 s decode timeout (deterministic on COCO val
+  `000000122046.jpg`). Metadata segments — except JFIF APP0 and Adobe APP14 —
+  are now stripped while staging the bitstream into the OUTPUT buffer.
 
 - **macOS YUYV→RGBA now honors per-tensor colorimetry** (`edgefirst-image`).
   The macOS ANGLE YUYV shader baked BT.601 full-range coefficients into GLSL;

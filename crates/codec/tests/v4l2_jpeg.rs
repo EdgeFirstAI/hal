@@ -100,8 +100,9 @@ fn v4l2_parity_nv12() {
         has_video_device()
     );
     let jpeg = testdata("zidane.jpg");
-    let cpu = decode(&jpeg, 1280, 720, PixelFormat::Nv12, true);
-    let hw = decode(&jpeg, 1280, 720, PixelFormat::Nv12, false);
+    let info = peek_info(&jpeg).unwrap();
+    let cpu = decode(&jpeg, info.width, info.height, PixelFormat::Nv12, true);
+    let hw = decode(&jpeg, info.width, info.height, PixelFormat::Nv12, false);
     assert_close(&cpu, &hw, "nv12");
 }
 
@@ -109,8 +110,9 @@ fn v4l2_parity_nv12() {
 fn v4l2_parity_grey() {
     // grey.jpg is a greyscale JPEG → decodes to a single-plane Grey buffer.
     let jpeg = testdata("grey.jpg");
-    let cpu = decode(&jpeg, 1024, 681, PixelFormat::Grey, true);
-    let hw = decode(&jpeg, 1024, 681, PixelFormat::Grey, false);
+    let info = peek_info(&jpeg).unwrap();
+    let cpu = decode(&jpeg, info.width, info.height, PixelFormat::Grey, true);
+    let hw = decode(&jpeg, info.width, info.height, PixelFormat::Grey, false);
     assert_close(&cpu, &hw, "grey");
 }
 
@@ -174,14 +176,163 @@ fn v4l2_geometry_change_rebuilds() {
     }
 }
 
+/// Decode `jpeg` into a `fmt` tensor and extract the tight native buffer,
+/// honouring the tensor's (possibly 64-aligned) row stride. Unlike [`decode`]
+/// this is correct for widths that are not stride-aligned and for `Nv24`.
+fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2: bool) -> Vec<u8> {
+    if disable_v4l2 {
+        std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
+    } else {
+        std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    }
+    let mut tensor = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut decoder = ImageDecoder::new();
+    let info = tensor.load_image(&mut decoder, jpeg).unwrap();
+    assert_eq!((info.width, info.height), (w, h));
+    let stride = info.row_stride;
+    let map = tensor.map().unwrap();
+    let px: &[u8] = &map;
+    let mut out = Vec::new();
+    // Y plane (all formats).
+    for y in 0..h {
+        out.extend_from_slice(&px[y * stride..y * stride + w]);
+    }
+    match info.format {
+        PixelFormat::Nv12 => {
+            // ceil(h/2) chroma rows of even(w) interleaved CbCr bytes.
+            let uv_base = h * stride;
+            let cw = w.next_multiple_of(2);
+            for cy in 0..h.div_ceil(2) {
+                let s = uv_base + cy * stride;
+                out.extend_from_slice(&px[s..s + cw]);
+            }
+        }
+        PixelFormat::Nv24 => {
+            // One 2w-byte interleaved CbCr run per luma row, each run placed
+            // two stride-rows apart (uv_rows_per_luma = 2).
+            let uv_base = h * stride;
+            for y in 0..h {
+                let s = uv_base + y * 2 * stride;
+                out.extend_from_slice(&px[s..s + 2 * w]);
+            }
+        }
+        PixelFormat::Grey => {}
+        other => panic!("unexpected decode format {other:?}"),
+    }
+    out
+}
+
+#[test]
+fn v4l2_geometry_change_reconfigures() {
+    // Alternating geometries through ONE persistent decoder must take the
+    // cheap DMABUF reconfigure path (on hardware) and stay pixel-correct on
+    // every frame. Compares each frame against the CPU reference.
+    let z = testdata("zidane.jpg");
+    let g = testdata("giraffe.jpg");
+    let cpu_z = decode_tight(&z, 1280, 720, PixelFormat::Nv12, true);
+    let cpu_g = decode_tight(&g, 640, 640, PixelFormat::Nv12, true);
+
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    let mut decoder = ImageDecoder::new();
+    for i in 0..10 {
+        for (jpeg, w, h, cpu, label) in [
+            (&z, 1280usize, 720usize, &cpu_z, "zidane"),
+            (&g, 640, 640, &cpu_g, "giraffe"),
+        ] {
+            let mut t =
+                Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+            let info = t.load_image(&mut decoder, jpeg).unwrap();
+            assert_eq!((info.width, info.height), (w, h));
+            let stride = info.row_stride;
+            let map = t.map().unwrap();
+            let px: &[u8] = &map;
+            let mut hw = Vec::with_capacity(w * h * 3 / 2);
+            for y in 0..h {
+                hw.extend_from_slice(&px[y * stride..y * stride + w]);
+            }
+            let uv_base = h * stride;
+            for cy in 0..h / 2 {
+                hw.extend_from_slice(&px[uv_base + cy * stride..uv_base + cy * stride + w]);
+            }
+            assert_close(cpu, &hw, &format!("{label} round {i}"));
+        }
+    }
+}
+
+#[test]
+fn v4l2_yuv444_nv24() {
+    // 4:4:4 JPEG → packed YUV3 capture on mxc-jpeg → NV24 deinterleave (the
+    // scratch path on hardware). Must match the CPU decoder's native NV24.
+    let jpeg = testdata("zidane_444.jpg");
+    let cpu = decode_tight(&jpeg, 1280, 720, PixelFormat::Nv24, true);
+    let hw = decode_tight(&jpeg, 1280, 720, PixelFormat::Nv24, false);
+    assert_close(&cpu, &hw, "yuv444-nv24");
+}
+
+#[test]
+fn v4l2_non_mcu_dims() {
+    // Non-MCU-aligned (odd) dimensions are ineligible for zero-copy and must
+    // decode correctly through the copy paths, cropped from the MCU-padded
+    // CAPTURE buffer.
+    for (name, w, h, fmt) in [
+        ("coco_420_odd.jpg", 500usize, 375usize, PixelFormat::Nv12),
+        ("coco_444_odd.jpg", 307, 461, PixelFormat::Nv24),
+        ("jaguar_444.jpg", 789, 384, PixelFormat::Nv24),
+    ] {
+        let jpeg = testdata(name);
+        let cpu = decode_tight(&jpeg, w, h, fmt, true);
+        let hw = decode_tight(&jpeg, w, h, fmt, false);
+        assert_close(&cpu, &hw, name);
+    }
+}
+
+#[test]
+fn v4l2_reconfigure_loop_stable() {
+    // Many geometry + subsampling changes through one decoder: the stream must
+    // stay healthy (no wedge, no decode garbage) and must not leak fds.
+    let images: Vec<(Vec<u8>, usize, usize, PixelFormat)> = vec![
+        (testdata("zidane.jpg"), 1280, 720, PixelFormat::Nv12),
+        (testdata("coco_420_odd.jpg"), 500, 375, PixelFormat::Nv12),
+        (testdata("zidane_444.jpg"), 1280, 720, PixelFormat::Nv24),
+        (testdata("giraffe.jpg"), 640, 640, PixelFormat::Nv12),
+        (testdata("coco_444_odd.jpg"), 307, 461, PixelFormat::Nv24),
+    ];
+    let fd_count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    let mut decoder = ImageDecoder::new();
+    // Warm-up pass establishes the device fd and the persistent allocations.
+    for (jpeg, w, h, fmt) in &images {
+        let mut t = Tensor::<u8>::image(*w, *h, *fmt, Some(TensorMemory::Mem)).unwrap();
+        t.load_image(&mut decoder, jpeg).unwrap();
+    }
+    let baseline = fd_count();
+    for round in 0..5 {
+        for (jpeg, w, h, fmt) in &images {
+            let mut t = Tensor::<u8>::image(*w, *h, *fmt, Some(TensorMemory::Mem)).unwrap();
+            let info = t.load_image(&mut decoder, jpeg).unwrap();
+            assert_eq!((info.width, info.height), (*w, *h), "round {round}");
+            let map = t.map().unwrap();
+            let px: &[u8] = &map;
+            let nonzero = px[..info.width].iter().filter(|&&v| v != 0).count();
+            assert!(nonzero > 0, "blank first row for {w}x{h} round {round}");
+        }
+    }
+    let after = fd_count();
+    assert!(
+        after <= baseline + 1,
+        "fd leak across reconfigures: {baseline} -> {after}"
+    );
+}
+
 #[test]
 fn v4l2_zero_copy_dma_nv12() {
     // Zero-copy: decode into a DMA-backed NV12 tensor. On a target with a JPEG
     // M2M device + dma_heap, the hardware decodes straight into the tensor
     // (V4L2_MEMORY_DMABUF import, no plane copy); the result must match the
-    // MMAP/copy path byte-for-byte (same hardware decode). Skips cleanly where
-    // DMA allocation is unavailable (no dma_heap on this host). zidane is
-    // 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
+    // scratch copy-out path byte-for-byte (same hardware decode). Skips
+    // cleanly where DMA allocation is unavailable (no dma_heap on this host).
+    // zidane is 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
     let jpeg = testdata("zidane.jpg");
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut dma = match Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Dma)) {
@@ -212,7 +363,8 @@ fn v4l2_zero_copy_dma_nv12() {
         }
     }
 
-    // Reference: MMAP/copy path through the same backend (hardware on-target).
+    // Reference: scratch copy-out path through the same backend (hardware
+    // on-target — the Mem-tensor destination is ineligible for zero-copy).
     let reference = decode(&jpeg, w, h, PixelFormat::Nv12, false);
     assert_close(&reference, &zc, "zero-copy-dma");
 }
