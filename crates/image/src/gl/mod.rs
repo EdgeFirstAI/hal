@@ -52,6 +52,10 @@ mod dma_import;
 // backends. No gbm/IOSurface types; compiled on both.
 mod core;
 mod float_dispatch;
+// Pure decision table for the proto-segmentation render path (upload
+// strategy × program × count uniform). No GL types; host-tested
+// exhaustively. See `proto_dispatch.rs`.
+mod proto_dispatch;
 // Portable GL render lowering (y-flip viewport, source UV, batch chunk planner).
 // No platform types; compiled on both platforms, consumed by the converged
 // tile/batch renderer. See `render.rs`.

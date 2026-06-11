@@ -5250,6 +5250,17 @@ impl GLProcessorST {
         }
         let texture_target = gls::gl::TEXTURE_2D_ARRAY;
 
+        // Pure path decision: upload strategy × program × count uniform.
+        // Rejects NCHW layouts and unsupported proto dtypes up front (the
+        // caller falls back to the CPU path on NotSupported).
+        let plan = super::proto_dispatch::plan_proto(
+            proto_data.protos.dtype(),
+            proto_data.layout,
+            self.proto_repack_compute_program.is_some(),
+            self.has_float_linear,
+            self.int8_interpolation_mode,
+        )?;
+
         // Coefficient slice for the GL uniform upload path. The shaders
         // consume f32 regardless of source dtype, but we hold the F32 case
         // as a borrowed slice (no allocation) and only widen for F16. The
@@ -5278,49 +5289,23 @@ impl GLProcessorST {
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
                 mc_map_i8 = t.map()?;
-                coeff_dequant = if let Some(q) = t.quantization() {
-                    use edgefirst_tensor::QuantMode;
-                    let (scale, zp) = match q.mode() {
-                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
-                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        other => {
-                            return Err(crate::Error::NotSupported(format!(
-                                "I8 mask_coefficients quantization mode {other:?} not supported on GL seg path"
-                            )));
-                        }
-                    };
-                    mc_map_i8
-                        .as_slice()
-                        .iter()
-                        .map(|&v| (v as f32 - zp) * scale)
-                        .collect()
-                } else {
-                    mc_map_i8.as_slice().iter().map(|&v| v as f32).collect()
-                };
+                let quant = t.quantization();
+                coeff_dequant = super::proto_dispatch::dequant_coeffs(
+                    mc_map_i8.as_slice(),
+                    quant.as_ref().map(|q| q.mode()),
+                    "I8",
+                )?;
                 &coeff_dequant[..]
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
                 let mc_map_i16 = t.map()?;
-                coeff_dequant = if let Some(q) = t.quantization() {
-                    use edgefirst_tensor::QuantMode;
-                    let (scale, zp) = match q.mode() {
-                        QuantMode::PerTensor { scale, zero_point } => (scale, zero_point as f32),
-                        QuantMode::PerTensorSymmetric { scale } => (scale, 0.0),
-                        other => {
-                            return Err(crate::Error::NotSupported(format!(
-                                "I16 mask_coefficients quantization mode {other:?} not supported on GL seg path"
-                            )));
-                        }
-                    };
-                    mc_map_i16
-                        .as_slice()
-                        .iter()
-                        .map(|&v| (v as f32 - zp) * scale)
-                        .collect()
-                } else {
-                    mc_map_i16.as_slice().iter().map(|&v| v as f32).collect()
-                };
+                let quant = t.quantization();
+                coeff_dequant = super::proto_dispatch::dequant_coeffs(
+                    mc_map_i16.as_slice(),
+                    quant.as_ref().map(|q| q.mode()),
+                    "I16",
+                )?;
                 &coeff_dequant[..]
             }
             other => {
@@ -5329,17 +5314,6 @@ impl GLProcessorST {
                 )));
             }
         };
-
-        // The GL shader upload path assumes NHWC layout for ArrayView3 creation.
-        // NCHW protos would require a transpose to NHWC before texture upload —
-        // return NotSupported so the caller falls back to the CPU path.
-        if proto_data.layout == ProtoLayout::Nchw {
-            return Err(crate::Error::NotSupported(
-                "GL segmentation path does not yet support NCHW proto layout; \
-                 caller should use CPU fallback"
-                    .into(),
-            ));
-        }
 
         // Each proto-dtype arm holds its `TensorMap` for the duration of the
         // GL upload and passes an `ArrayView3` borrowed from the mapped slice
@@ -5391,28 +5365,36 @@ impl GLProcessorST {
                     m.as_slice(),
                 )
                 .map_err(|e| crate::Error::InvalidShape(format!("{e}")))?;
-                if self.has_float_linear {
-                    self.render_proto_segmentation_f32(
-                        detect,
-                        coeff_slice,
-                        protos_view,
-                        height,
-                        width,
-                        num_protos,
-                        texture_target,
-                        color_mode,
-                    )?;
-                } else {
-                    self.render_proto_segmentation_f16(
-                        detect,
-                        coeff_slice,
-                        protos_view,
-                        height,
-                        width,
-                        num_protos,
-                        texture_target,
-                        color_mode,
-                    )?;
+                match plan.upload {
+                    super::proto_dispatch::ProtoUpload::F32R32f => {
+                        self.render_proto_segmentation_f32(
+                            detect,
+                            coeff_slice,
+                            protos_view,
+                            height,
+                            width,
+                            num_protos,
+                            texture_target,
+                            color_mode,
+                        )?;
+                    }
+                    super::proto_dispatch::ProtoUpload::F32ToRgba16f => {
+                        self.render_proto_segmentation_f16(
+                            detect,
+                            coeff_slice,
+                            protos_view,
+                            height,
+                            width,
+                            num_protos,
+                            texture_target,
+                            color_mode,
+                        )?;
+                    }
+                    other => {
+                        return Err(crate::Error::InvalidShape(format!(
+                            "plan_proto returned {other:?} for F32 protos"
+                        )));
+                    }
                 }
             }
             DType::F16 => {
