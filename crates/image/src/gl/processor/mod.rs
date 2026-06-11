@@ -79,6 +79,94 @@ pub(super) enum NvPathPref {
     ForceShader,
 }
 
+/// Bound destination render target for one convert, produced by
+/// [`GLProcessorST::bind_dst`]. The GL counterpart of
+/// [`super::render::DstLowering`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstTarget {
+    /// The destination buffer itself is the FBO colour attachment (EGLImage
+    /// renderbuffer or texture): the render writes it directly, no readback.
+    ZeroCopyImage,
+    /// Offscreen texture render target; `readback` copies the result out.
+    Texture { readback: DstReadback },
+}
+
+/// How a [`DstTarget::Texture`] render reaches the destination tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstReadback {
+    /// `glReadnPixels` straight into the mapped Mem tensor.
+    Mem,
+    /// `glReadnPixels` into this destination PBO's PACK binding.
+    Pbo(u32),
+}
+
+impl DstReadback {
+    /// The PBO id in the `Option` shape `readback_rendered` consumes.
+    fn pbo_id(self) -> Option<u32> {
+        match self {
+            DstReadback::Mem => None,
+            DstReadback::Pbo(id) => Some(id),
+        }
+    }
+}
+
+/// Uniform locations for one `nv_r8` program variant, resolved once at link
+/// time — `glGetUniformLocation` is a per-call string lookup in the driver
+/// and the NV draw previously issued 12 per frame.
+#[derive(Clone, Copy)]
+struct NvUniformLocs {
+    img_size: i32,
+    tex_width: i32,
+    chroma_shift: i32,
+    chroma_lines: i32,
+    y_offset: i32,
+    y_scale: i32,
+    c_vr: i32,
+    c_ug: i32,
+    c_vg: i32,
+    c_ub: i32,
+}
+
+/// Per-program uniform state for one `nv_r8` variant. Uniform values are
+/// per-program GL state and persist across draws, so the constant sampler
+/// binding (`src` = unit 0) is uploaded once at resolve time and
+/// `last_colorimetry` lets the draw skip re-uploading the six YUV-matrix
+/// floats while the source's (encoding, range) is unchanged.
+struct NvUniformState {
+    locs: NvUniformLocs,
+    last_colorimetry: Option<(
+        edgefirst_tensor::ColorEncoding,
+        edgefirst_tensor::ColorRange,
+    )>,
+}
+
+impl NvUniformState {
+    fn resolve(program: &GlProgram) -> Self {
+        unsafe {
+            gls::gl::UseProgram(program.id);
+            let loc =
+                |name: &std::ffi::CStr| gls::gl::GetUniformLocation(program.id, name.as_ptr());
+            // Constant: the NV shaders always sample `src` from unit 0.
+            gls::gl::Uniform1i(loc(c"src"), 0);
+            NvUniformState {
+                locs: NvUniformLocs {
+                    img_size: loc(c"img_size"),
+                    tex_width: loc(c"tex_width"),
+                    chroma_shift: loc(c"chroma_shift"),
+                    chroma_lines: loc(c"chroma_lines"),
+                    y_offset: loc(c"y_offset"),
+                    y_scale: loc(c"y_scale"),
+                    c_vr: loc(c"c_vr"),
+                    c_ug: loc(c"c_ug"),
+                    c_vg: loc(c"c_vg"),
+                    c_ub: loc(c"c_ub"),
+                },
+                last_colorimetry: None,
+            }
+        }
+    }
+}
+
 /// OpenGL single-threaded image converter.
 pub struct GLProcessorST {
     camera_eglimage_texture: Texture,
@@ -150,7 +238,7 @@ pub struct GLProcessorST {
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
-    is_vivante: bool,
+    pub(super) is_vivante: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -198,6 +286,10 @@ pub struct GLProcessorST {
     nv_r8_program: GlProgram,
     /// Path B shader: NV12/NV16/NV24 R8 → RGBA8 with int8 XOR 0x80 bias.
     nv_r8_int8_program: GlProgram,
+    /// Link-time uniform locations + colorimetry-upload skip for `nv_r8_program`.
+    nv_r8_uniforms: NvUniformState,
+    /// Same for `nv_r8_int8_program`.
+    nv_r8_int8_uniforms: NvUniformState,
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
@@ -206,6 +298,11 @@ pub struct GLProcessorST {
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
+    /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
+    colorimetry_mode: crate::ColorimetryMode,
+    /// `true` when `EDGEFIRST_COLORIMETRY` pinned the mode for this
+    /// processor's lifetime — `set_colorimetry_mode` then logs and keeps it.
+    colorimetry_env_pinned: bool,
     /// When `true`, a convert's terminal `glFinish` is skipped so a batch of
     /// tiles rendered into one shared destination import syncs only once, via a
     /// single `finish_via_fence` at [`flush`](Self::flush). Set for the duration
@@ -724,6 +821,15 @@ impl GLProcessorST {
             generate_vertex_shader(),
             generate_nv_to_rgba_int8_shader_2d(),
         )?;
+        // Resolve uniform locations once at link time (the NV draw is per-frame)
+        // and upload the constant sampler bindings while the programs are fresh:
+        // pass-2 packing samples the intermediate on unit 1, planar-2d on unit 0.
+        let nv_r8_uniforms = NvUniformState::resolve(&nv_r8_program);
+        let nv_r8_int8_uniforms = NvUniformState::resolve(&nv_r8_int8_program);
+        packed_rgba8_program_2d.load_uniform_1i(c"tex", 1)?;
+        packed_rgba8_int8_program_2d.load_uniform_1i(c"tex", 1)?;
+        texture_program_planar_2d.load_uniform_1i(c"tex", 0)?;
+        texture_program_planar_int8_2d.load_uniform_1i(c"tex", 0)?;
 
         let camera_eglimage_texture = Texture::new();
         let camera_normal_texture = Texture::new();
@@ -772,6 +878,29 @@ impl GLProcessorST {
         };
         if nv_path_pref != NvPathPref::Auto {
             log::info!("EDGEFIRST_NV_CONVERT_PATH override: {nv_path_pref:?}");
+        }
+
+        // Colorimetry/performance trade-off. The env var pins the mode for the
+        // processor's lifetime (set_colorimetry_mode logs and keeps it);
+        // otherwise the config default is Fast (issue #106 policy) and
+        // `set_colorimetry_mode` may change it.
+        let colorimetry_env = match std::env::var("EDGEFIRST_COLORIMETRY") {
+            Ok(v) => match v.to_ascii_lowercase().as_str() {
+                "exact" => Some(crate::ColorimetryMode::Exact),
+                "fast" => Some(crate::ColorimetryMode::Fast),
+                "" => None,
+                other => {
+                    log::warn!(
+                        "EDGEFIRST_COLORIMETRY={other:?} not recognised \
+                         (expected fast|exact), ignoring"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        if let Some(mode) = colorimetry_env {
+            log::info!("EDGEFIRST_COLORIMETRY override: {mode:?}");
         }
 
         let mut converter = GLProcessorST {
@@ -831,10 +960,14 @@ impl GLProcessorST {
             proto_ssbo_size: 0,
             nv_r8_program,
             nv_r8_int8_program,
+            nv_r8_uniforms,
+            nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
+            colorimetry_mode: colorimetry_env.unwrap_or_default(),
+            colorimetry_env_pinned: colorimetry_env.is_some(),
             defer_finish: false,
             pending_flush: false,
         };
@@ -959,8 +1092,9 @@ impl GLProcessorST {
             }
         };
 
-        // Run the full DMA-buf EGLImage render pipeline
-        if let Err(e) = self.convert_dest_dma(
+        // Run the full DMA-buf EGLImage render pipeline (RGBA→RGBA DMA is a
+        // single-pass zero-copy plan through the engine).
+        if let Err(e) = self.convert_via_engine(
             &mut dst,
             PixelFormat::Rgba,
             &src,
@@ -970,7 +1104,7 @@ impl GLProcessorST {
             Flip::None,
             ResolvedCrop::no_crop(),
         ) {
-            log::info!("verify_dma_buf_roundtrip: convert_dest_dma failed: {e}");
+            log::info!("verify_dma_buf_roundtrip: convert failed: {e}");
             return false;
         }
 
@@ -1012,6 +1146,24 @@ impl GLProcessorST {
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) {
         self.int8_interpolation_mode = mode;
         log::debug!("Int8 interpolation mode set to {:?}", mode);
+    }
+
+    /// Sets the colorimetry/performance trade-off (see
+    /// [`crate::ColorimetryMode`]). When `EDGEFIRST_COLORIMETRY` pinned the
+    /// mode at construction, the env value wins: this logs and keeps it.
+    pub fn set_colorimetry_mode(&mut self, mode: crate::ColorimetryMode) {
+        if self.colorimetry_env_pinned {
+            if mode != self.colorimetry_mode {
+                log::info!(
+                    "ColorimetryMode::{mode:?} requested but EDGEFIRST_COLORIMETRY pins \
+                     {:?} — keeping the env override",
+                    self.colorimetry_mode
+                );
+            }
+            return;
+        }
+        self.colorimetry_mode = mode;
+        log::debug!("Colorimetry mode set to {:?}", mode);
     }
 
     /// Snapshot the EGLImage cache counters (src, dst, NV R8).
@@ -1091,34 +1243,114 @@ impl GLProcessorST {
             self.gl_context.transfer_backend,
         );
 
-        if self.gl_context.transfer_backend.is_dma() && dst.memory() == TensorMemory::Dma {
-            log::trace!("GL path: DMA (zero-copy EGLImage)");
-            let res =
-                self.convert_dest_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-            log::trace!("GL DMA result: {}", if res.is_ok() { "ok" } else { "err" });
-            return res;
+        self.convert_via_engine(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop)
+    }
+
+    /// The single u8/i8 convert engine: classify the destination
+    /// ([`super::render::lower_dst`]), pick the render plan
+    /// ([`super::render::plan_convert`]), then `bind_dst` → render →
+    /// readback. The two-pass plans delegate to their render strategies;
+    /// every single-pass convert — DMA, Mem, or PBO on either side — runs
+    /// the same code.
+    #[allow(clippy::too_many_arguments)]
+    fn convert_via_engine(
+        &mut self,
+        dst: &mut Tensor<u8>,
+        dst_fmt: PixelFormat,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        let lowering =
+            super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory());
+        let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
+        let _span = tracing::trace_span!(
+            "image.convert.gl.engine",
+            ?plan,
+            ?lowering,
+            src_pbo = src.memory() == TensorMemory::Pbo,
+        )
+        .entered();
+
+        // v1 view()/batch() destination support covers only the single-pass
+        // PACKED zero-copy path (the glViewport/scissor band set in
+        // bind_dst). Packed RGB and every planar layout reinterpret the
+        // destination geometry (`W*3/4 × H`, `H*3` bands), which the band
+        // lowering does not yet handle, so a view destination declines them
+        // → CPU fallback. (Band tiling for those is a follow-up.)
+        if dst.view_origin().is_some()
+            && lowering == super::render::DstLowering::ZeroCopy
+            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
+        {
+            return Err(crate::Error::NotSupported(
+                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
+                 planar formats (CPU fallback handles it)"
+                    .into(),
+            ));
         }
-        if src.memory() == TensorMemory::Pbo && dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: PBO-to-PBO");
-            return self
-                .convert_pbo_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
+
+        match plan {
+            super::render::ConvertPlan::TwoPassPackedRgb => {
+                return self.convert_to_packed_rgb(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
+            }
+            super::render::ConvertPlan::TwoPassNvPlanar => {
+                return self.convert_nv_to_planar_two_pass(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )
+            }
+            super::render::ConvertPlan::SinglePass => {}
         }
-        if dst.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: any-to-PBO (src={:?})", src.memory());
-            return self
-                .convert_any_to_pbo(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        }
-        if src.memory() == TensorMemory::Pbo {
-            log::trace!("GL path: PBO-to-mem");
-            return self
-                .convert_pbo_to_mem(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        }
-        log::trace!("GL path: non-DMA (CPU upload/readback)");
+
+        let target = self.bind_dst(dst, dst_fmt, crop)?;
+
+        // Bias the letterbox clear colour for int8 on every lowering: the
+        // fragment shader XORs rendered pixels and no readback un-biases,
+        // so the glClear'd letterbox region must be pre-biased.
+        let crop = Self::int8_bias_clear(is_int8, crop);
+
         let start = Instant::now();
-        let res =
-            self.convert_dest_non_dma(dst, dst_fmt, src, src_fmt, is_int8, rotation, flip, crop);
-        log::debug!("convert_dest_non_dma takes {:?}", start.elapsed());
-        res
+        match src.as_pbo() {
+            Some(src_pbo) => {
+                // A PBO source uploads via its UNPACK binding — mapping it on
+                // the GL thread would deadlock on the Pbo message round-trip.
+                if src_pbo.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert from a mapped PBO tensor".to_string(),
+                    ));
+                }
+                let src_buffer_id = src_pbo.buffer_id();
+                self.draw_src_texture_from_pbo(
+                    src,
+                    src_fmt,
+                    src_buffer_id,
+                    dst,
+                    dst_fmt,
+                    is_int8,
+                    rotation,
+                    flip,
+                    crop,
+                )?;
+            }
+            None => {
+                self.render_packed_or_planar(
+                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
+                )?;
+            }
+        }
+        log::debug!("engine render ({plan:?}) takes {:?}", start.elapsed());
+
+        if let DstTarget::Texture { readback } = target {
+            // Data is already int8-biased by the shader — readback copies bytes.
+            let start = Instant::now();
+            self.readback_rendered(dst, dst_fmt, readback.pbo_id())?;
+            log::debug!("engine readback takes {:?}", start.elapsed());
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1239,6 +1471,7 @@ impl GLProcessorST {
                     },
                     0,
                     crate::Flip::None,
+                    false,
                 )?;
             } else {
                 // Non-DMA background: upload bg pixels into the
@@ -1433,6 +1666,7 @@ impl GLProcessorST {
                     },
                     0,
                     crate::Flip::None,
+                    false,
                 )?;
             } else {
                 self.upload_pixels_to_render_texture(bg, bg_fmt, dst_w, dst_h)?;
@@ -1687,6 +1921,47 @@ impl GLProcessorST {
         self.nv_r8_texture.invalidate_egl_binding();
     }
 
+    /// Classify and bind the destination render target — the single entry
+    /// point absorbing the per-memory `setup_renderbuffer_*` fan-out. The
+    /// pure classification lives in [`super::render::lower_dst`]; this
+    /// performs the GL work and tells the caller what completes the convert.
+    fn bind_dst(
+        &mut self,
+        dst: &Tensor<u8>,
+        dst_fmt: PixelFormat,
+        crop: ResolvedCrop,
+    ) -> crate::Result<DstTarget> {
+        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
+            super::render::DstLowering::ZeroCopy => {
+                self.setup_renderbuffer_dma(dst, dst_fmt)?;
+                Ok(DstTarget::ZeroCopyImage)
+            }
+            super::render::DstLowering::TexturePbo => {
+                let dst_pbo = dst.as_pbo().ok_or_else(|| {
+                    crate::Error::OpenGl(
+                        "bind_dst: PBO-lowered destination is not a PBO tensor".to_string(),
+                    )
+                })?;
+                if dst_pbo.is_mapped() {
+                    return Err(crate::Error::OpenGl(
+                        "Cannot convert to a mapped PBO tensor".to_string(),
+                    ));
+                }
+                let id = dst_pbo.buffer_id();
+                self.setup_renderbuffer_from_pbo(dst, dst_fmt, id)?;
+                Ok(DstTarget::Texture {
+                    readback: DstReadback::Pbo(id),
+                })
+            }
+            super::render::DstLowering::TextureMem => {
+                self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
+                Ok(DstTarget::Texture {
+                    readback: DstReadback::Mem,
+                })
+            }
+        }
+    }
+
     fn setup_renderbuffer_dma(
         &mut self,
         dst: &Tensor<u8>,
@@ -1747,19 +2022,22 @@ impl GLProcessorST {
         // + `DmaImportAttrs` both pivot on `view_origin`); render this tile into
         // its band via `glViewport`. A whole tensor fills its full surface. The
         // matching `glScissor` (so the letterbox clear cannot wipe sibling tiles)
-        // is set in `convert_to`, which owns the clear.
-        //
-        // The destination DMA EGLImage is TOP-DOWN: GL framebuffer row 0 maps to
-        // memory row 0 (verified on-target — a tile at GL `y` lands in memory
-        // band `y`). The renderer's existing texcoord flip keeps the image
-        // upright, so the band's GL viewport `y` is simply `region.y` — NOT the
-        // bottom-left `parent_h - (y+h)` flip (that is for bottom-up surfaces).
-        let (vx, vy, vw, vh) = match dst.view_origin() {
-            Some(vo) => (vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32),
-            None => (0, 0, width, height),
+        // is set in `convert_to`, which owns the clear — both lower the band
+        // through `region_to_viewport_top_down`, the single home for the
+        // verified top-down orientation of the dst DMA EGLImage.
+        let vp = match dst.view_origin() {
+            Some(vo) => super::render::region_to_viewport_top_down(crate::Region::new(
+                vo.x, vo.y, dst_w, dst_h,
+            )),
+            None => super::render::Viewport {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
         };
         unsafe {
-            gls::gl::Viewport(vx, vy, vw, vh);
+            gls::gl::Viewport(vp.x, vp.y, vp.w, vp.h);
         }
         Ok(())
     }
@@ -1837,124 +2115,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn convert_dest_dma(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        assert!(self.gl_context.transfer_backend.is_dma());
-        // v1 view()/batch() destination support covers only the SINGLE-PASS path
-        // (Rgba/Bgra/Grey, rendered by `convert_to` with the glViewport/scissor
-        // band set in `setup_renderbuffer_dma`). The two-pass packed-RGB and
-        // planar paths reinterpret the destination geometry (`W*3/4 × H`,
-        // `H*3` bands), which the band lowering does not yet handle, so decline a
-        // view dst for those → CPU fallback. (Two-pass band tiling is a follow-up.)
-        if dst.view_origin().is_some()
-            && (dst_fmt == PixelFormat::Rgb || dst_fmt.layout() == PixelLayout::Planar)
-        {
-            return Err(crate::Error::NotSupported(
-                "GL view()/batch() destination not yet supported for two-pass packed-RGB / \
-                 planar formats (CPU fallback handles it)"
-                    .into(),
-            ));
-        }
-        if dst_fmt == PixelFormat::Rgb {
-            log::trace!(
-                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass packed RGB \
-                 (RGBA intermediate + packed_rgba8{}shader)",
-                if is_int8 { "_int8_" } else { "_" }
-            );
-            self.convert_to_packed_rgb(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-        } else if dst_fmt.layout() == PixelLayout::Planar {
-            // All NV12/NV16/NV24 → Planar go through the two-pass pipeline
-            // (NV*→RGBA8 intermediate → RGBA→PlanarRgb), because the intermediate
-            // pass delegates to `convert_to`, which routes NV* through
-            // `select_nv_path` — giving planar output the SAME colorimetry-exact
-            // `ShaderR8` path (and Vivante carve-out, and multiplane→ExternalSampler)
-            // as the packed path. The old single-pass `convert_to_planar` binds
-            // `samplerExternalOES` directly (driver YUV→RGB): colorimetry-wrong on
-            // hint-ignoring/bilinear-chroma drivers for NV12, and has NO sampler
-            // path at all for NV16/NV24. Two-pass also subsumes the Vivante NV12
-            // single-pass GPU hang (EDGEAI-1180).
-            if matches!(
-                src_fmt,
-                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
-            ) {
-                log::trace!(
-                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → two-pass planar \
-                     (RGBA intermediate + planar_2d{}shader; select_nv_path-driven)",
-                    if is_int8 { "_int8_" } else { "_" }
-                );
-                self.convert_nv_to_planar_two_pass(
-                    src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop,
-                )
-            } else {
-                log::trace!(
-                    "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → planar output \
-                     (renderbuffer + planar{}shader)",
-                    if is_int8 { "_int8_" } else { "_" }
-                );
-                self.setup_renderbuffer_dma(dst, dst_fmt)?;
-                // Bias letterbox clear color for int8 — glClear bypasses the shader.
-                let crop = if is_int8 {
-                    let mut crop = crop;
-                    if let Some(ref mut color) = crop.dst_color {
-                        color[0] ^= 0x80;
-                        color[1] ^= 0x80;
-                        color[2] ^= 0x80;
-                    }
-                    crop
-                } else {
-                    crop
-                };
-                self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
-            }
-        } else {
-            log::trace!(
-                "GL DMA dispatch: {src_fmt}→{dst_fmt} int8={is_int8} → single-pass EGLImage \
-                 (renderbuffer, {}shader)",
-                if is_int8 { "int8 " } else { "standard " }
-            );
-            self.setup_renderbuffer_dma(dst, dst_fmt)?;
-            // For int8 output, swap to int8 shader programs that apply XOR 0x80
-            // in the fragment shader — zero CPU readback.
-            if is_int8 {
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
-                // Path B int8: swap nv_r8_program ↔ nv_r8_int8_program so that
-                // draw_nv_texture_2d picks up the bias shader automatically.
-                std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                // Bias the letterbox clear color since glClear bypasses the shader.
-                let mut crop = crop;
-                if let Some(ref mut color) = crop.dst_color {
-                    color[0] ^= 0x80;
-                    color[1] ^= 0x80;
-                    color[2] ^= 0x80;
-                }
-                let result = self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop);
-                std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-                std::mem::swap(
-                    &mut self.texture_program_yuv,
-                    &mut self.texture_int8_program_yuv,
-                );
-                std::mem::swap(&mut self.nv_r8_program, &mut self.nv_r8_int8_program);
-                result
-            } else {
-                self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-            }
-        }
-    }
-
     /// Bias a letterbox clear colour by XOR 0x80 for int8 destinations, since
     /// `glClear` bypasses the shader that otherwise applies the bias. No-op when
     /// not int8 or when there is no fill colour. Shared by every destination path.
@@ -1970,10 +2130,10 @@ impl GLProcessorST {
     }
 
     /// Render `src` into the already-bound destination FBO as `dst_fmt`,
-    /// dispatching packed vs planar and applying the int8 shader-program swap
-    /// (packed only; the planar shader handles int8 internally). This is the
-    /// converged per-tile draw shared by the non-DMA / PBO / DMA destination
-    /// paths — they differ only in FBO setup and readback, never in this draw.
+    /// dispatching packed vs planar; the draws select their int8 program
+    /// variants from `is_int8` at draw time. This is the converged per-tile
+    /// draw shared by the texture and DMA destination paths — they differ
+    /// only in FBO setup and readback, never in this draw.
     #[allow(clippy::too_many_arguments)]
     fn render_packed_or_planar(
         &mut self,
@@ -1986,78 +2146,11 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let swap_int8 = is_int8 && dst_fmt.layout() != PixelLayout::Planar;
-        if swap_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        let render_result = if dst_fmt.layout() == PixelLayout::Planar {
+        if dst_fmt.layout() == PixelLayout::Planar {
             self.convert_to_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         } else {
-            self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)
-        };
-        if swap_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
+            self.convert_to(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)
         }
-        render_result
-    }
-
-    /// Render a PBO source into the already-bound destination FBO via
-    /// [`draw_src_texture_from_pbo`](Self::draw_src_texture_from_pbo), applying
-    /// the int8 texture-program swap around the draw so the GPU writes
-    /// XOR-0x80'd values. The PBO draw never reaches the NV (`nv_r8`) or planar
-    /// branch, so this swaps **only** the two packed texture programs — narrower
-    /// than [`render_packed_or_planar`](Self::render_packed_or_planar). Shared by
-    /// `convert_pbo_to_pbo` / `convert_pbo_to_mem`, which differ only in FBO
-    /// setup and readback target, never in this draw. Callers that need the
-    /// letterbox clear biased (glClear bypasses the shader) apply
-    /// [`int8_bias_clear`](Self::int8_bias_clear) to `crop` first; this helper
-    /// does not, since the mem path fills via CPU upload instead.
-    #[allow(clippy::too_many_arguments)]
-    fn render_from_pbo(
-        &mut self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        src_buffer_id: u32,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        let render_result = self.draw_src_texture_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            rotation,
-            flip,
-            crop,
-        );
-        if is_int8 {
-            std::mem::swap(&mut self.texture_program, &mut self.texture_int8_program);
-            std::mem::swap(
-                &mut self.texture_program_yuv,
-                &mut self.texture_int8_program_yuv,
-            );
-        }
-        render_result
     }
 
     /// Read the rendered FBO colour attachment (`COLOR_ATTACHMENT0`) into the
@@ -2154,34 +2247,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn convert_dest_non_dma(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-
-        // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = Self::int8_bias_clear(is_int8, crop);
-
-        let start = Instant::now();
-        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        log::debug!("Draw to framebuffer takes {:?}", start.elapsed());
-
-        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
-        let start = Instant::now();
-        self.readback_rendered(dst, dst_fmt, None)?;
-        log::debug!("Read from framebuffer takes {:?}", start.elapsed());
-        Ok(())
-    }
-
     fn setup_renderbuffer_non_dma(
         &mut self,
         dst: &Tensor<u8>,
@@ -2253,8 +2318,8 @@ impl GLProcessorST {
         };
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             gls::gl::TexImage2D(
@@ -2385,8 +2450,8 @@ impl GLProcessorST {
         self.convert_fbo.bind();
         unsafe {
             gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
 
             // Upload existing PBO content to the render texture.
@@ -2476,75 +2541,6 @@ impl GLProcessorST {
         )
     }
 
-    /// Convert between two PBO-backed images.
-    ///
-    /// Source PBO is bound as `GL_PIXEL_UNPACK_BUFFER` for zero-copy texture upload
-    /// (avoids `tensor.map()` to prevent GL-thread deadlocks). Destination uses
-    /// `GL_PIXEL_PACK_BUFFER` for zero-copy readback into the PBO.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_pbo_to_pbo(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let (src_buffer_id, dst_buffer_id) = {
-            let src_pbo = src.as_pbo().ok_or_else(|| {
-                crate::Error::OpenGl("convert_pbo_to_pbo: src is not a PBO tensor".to_string())
-            })?;
-            let dst_pbo = dst.as_pbo().ok_or_else(|| {
-                crate::Error::OpenGl("convert_pbo_to_pbo: dst is not a PBO tensor".to_string())
-            })?;
-
-            if src_pbo.is_mapped() || dst_pbo.is_mapped() {
-                return Err(crate::Error::OpenGl(
-                    "Cannot convert PBO tensors while they are mapped".to_string(),
-                ));
-            }
-
-            (src_pbo.buffer_id(), dst_pbo.buffer_id())
-        };
-
-        // Use PBO-as-UNPACK to set up the framebuffer render texture.
-        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
-        // PboMap message back to this GL thread — causing a deadlock.
-        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
-
-        // Bias letterbox clear color for int8 — glClear bypasses the shader.
-        let crop = Self::int8_bias_clear(is_int8, crop);
-
-        // Upload source from PBO and render (int8 program swap owned by the
-        // shared `render_from_pbo` wrapper). We cannot call
-        // convert_to/draw_src_texture directly because they call
-        // src.tensor().map() which sends a message back to THIS thread, causing
-        // a deadlock. Instead, bind the source PBO as UNPACK buffer and upload
-        // to the texture with a NULL pointer — GL reads directly from the PBO,
-        // zero CPU copy.
-        let start = Instant::now();
-        self.render_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            is_int8,
-            rotation,
-            flip,
-            crop,
-        )?;
-        log::debug!("PBO render takes {:?}", start.elapsed());
-
-        let start_read = Instant::now();
-        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
-        log::debug!("PBO readback takes {:?}", start_read.elapsed());
-        Ok(())
-    }
-
     /// Upload source image from a PBO and render to the current framebuffer.
     /// This is the PBO equivalent of draw_src_texture — instead of mapping
     /// the tensor to CPU and calling glTexImage2D with a data pointer, we
@@ -2558,6 +2554,7 @@ impl GLProcessorST {
         src_buffer_id: u32,
         dst: &Tensor<u8>,
         _dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
@@ -2630,9 +2627,14 @@ impl GLProcessorST {
                 }
             }
 
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            // Draw-time program selection (see draw_src_texture).
+            gls::gl::UseProgram(if is_int8 {
+                self.texture_int8_program.id
+            } else {
+                self.texture_program.id
+            });
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
@@ -2796,99 +2798,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Convert any source (Mem/DMA) to a PBO destination.
-    /// Source is uploaded via normal texture path (maps tensor for CPU upload).
-    /// Destination readback uses PBO PACK binding (no map on GL thread).
-    #[allow(clippy::too_many_arguments)]
-    fn convert_any_to_pbo(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let dst_pbo = dst.as_pbo().ok_or_else(|| {
-            crate::Error::OpenGl("convert_any_to_pbo: dst is not a PBO tensor".to_string())
-        })?;
-        if dst_pbo.is_mapped() {
-            return Err(crate::Error::OpenGl(
-                "Cannot convert to a mapped PBO tensor".to_string(),
-            ));
-        }
-        let dst_buffer_id = dst_pbo.buffer_id();
-
-        // Use PBO-as-UNPACK to set up the framebuffer render texture.
-        // `setup_renderbuffer_non_dma` would call `dst.map()` which sends a
-        // PboMap message back to this GL thread — causing a deadlock.
-        self.setup_renderbuffer_from_pbo(dst, dst_fmt, dst_buffer_id)?;
-
-        let start = Instant::now();
-        self.render_packed_or_planar(src, src_fmt, dst, dst_fmt, is_int8, rotation, flip, crop)?;
-        log::debug!("any-to-PBO render takes {:?}", start.elapsed());
-
-        let start_read = Instant::now();
-        self.readback_rendered(dst, dst_fmt, Some(dst_buffer_id))?;
-        log::debug!("any-to-PBO readback takes {:?}", start_read.elapsed());
-        Ok(())
-    }
-
-    /// Convert a PBO source to a non-PBO (Mem) destination.
-    /// Source is uploaded via PBO UNPACK binding (no map on GL thread).
-    /// Destination readback uses normal ReadnPixels into mapped Mem tensor.
-    #[allow(clippy::too_many_arguments)]
-    fn convert_pbo_to_mem(
-        &mut self,
-        dst: &mut Tensor<u8>,
-        dst_fmt: PixelFormat,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        is_int8: bool,
-        rotation: crate::Rotation,
-        flip: Flip,
-        crop: ResolvedCrop,
-    ) -> crate::Result<()> {
-        let src_pbo = src.as_pbo().ok_or_else(|| {
-            crate::Error::OpenGl("convert_pbo_to_mem: src is not a PBO tensor".to_string())
-        })?;
-        if src_pbo.is_mapped() {
-            return Err(crate::Error::OpenGl(
-                "Cannot convert from a mapped PBO tensor".to_string(),
-            ));
-        }
-        let src_buffer_id = src_pbo.buffer_id();
-
-        self.setup_renderbuffer_non_dma(dst, dst_fmt, crop)?;
-
-        // Render from the PBO source; the int8 program swap (GPU writes XOR'd
-        // values so ReadnPixels reads already-biased data) is owned by the
-        // shared `render_from_pbo` wrapper. The letterbox fill is handled by the
-        // CPU upload in `setup_renderbuffer_non_dma` above, so no
-        // `int8_bias_clear` is applied here.
-        let start = Instant::now();
-        self.render_from_pbo(
-            src,
-            src_fmt,
-            src_buffer_id,
-            dst,
-            dst_fmt,
-            is_int8,
-            rotation,
-            flip,
-            crop,
-        )?;
-        log::debug!("PBO-to-mem render takes {:?}", start.elapsed());
-
-        // ReadnPixels into Mem dst — data is already int8-biased by the shader.
-        let start = Instant::now();
-        self.readback_rendered(dst, dst_fmt, None)?;
-        log::debug!("PBO-to-mem readback takes {:?}", start.elapsed());
-        Ok(())
-    }
-
     /// Pick the NV* GPU conversion path for `src`/`src_fmt`, honoring the
     /// `EDGEFIRST_NV_CONVERT_PATH` preference. Returns the path to *attempt*;
     /// the caller maps an EGLImage-creation error to the [`NvConvertPath::Cpu`]
@@ -2900,7 +2809,17 @@ impl GLProcessorST {
     ///   covers single-plane NV12/NV16/NV24 but NOT true-multiplane NV12.
     /// - [`NvConvertPath::ExternalSampler`] (samplerExternalOES) is wired for
     ///   NV12 only (incl. multiplane); NV16/NV24 have no sampler path.
-    fn select_nv_path(&self, src: &Tensor<u8>, src_fmt: PixelFormat) -> NvConvertPath {
+    ///
+    /// `render_fmt` is the format of the render target this draw writes
+    /// (Rgb/PlanarRgb arrive here only as the LOGICAL format of a two-pass
+    /// convert whose pass 1 renders an RGBA intermediate; the only R8 render
+    /// target reachable with an NV source is a single-pass Grey destination).
+    fn select_nv_path(
+        &self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        render_fmt: PixelFormat,
+    ) -> NvConvertPath {
         // `ShaderR8` (R8 texelFetch) only applies to SINGLE-PLANE semi-planar
         // NV12/NV16/NV24. Everything else routed through this picker —
         // RGBA/Grey/YUYV/RGB and true-multiplane NV12 — uses the
@@ -2918,7 +2837,18 @@ impl GLProcessorST {
         match self.nv_path_pref {
             NvPathPref::ForceShader => NvConvertPath::ShaderR8,
             NvPathPref::ForceSampler => {
-                if src_fmt == PixelFormat::Nv12 {
+                if src_fmt == PixelFormat::Nv12
+                    && self.is_vivante
+                    && render_fmt == PixelFormat::Grey
+                {
+                    // See the Auto-arm comment: sampler → R8 target wedges the
+                    // GC7000UL. Refuse the force rather than hang the GPU.
+                    log::warn!(
+                        "EDGEFIRST_NV_CONVERT_PATH=sampler refused for NV12→Grey on Vivante \
+                         (samplerExternalOES → R8 render target hangs the GPU); using shader"
+                    );
+                    NvConvertPath::ShaderR8
+                } else if src_fmt == PixelFormat::Nv12 {
                     NvConvertPath::ExternalSampler
                 } else {
                     log::warn!(
@@ -2928,30 +2858,49 @@ impl GLProcessorST {
                     NvConvertPath::ShaderR8
                 }
             }
-            // Auto: prefer the portable, colorimetry-exact in-shader ShaderR8.
+            // Auto: prefer the portable, colorimetry-exact in-shader ShaderR8
+            // wherever it is also the fast path (Mali, V3D, Tegra — shader and
+            // sampler are comparable there, so exactness is free).
             //
             // EXCEPTION — Vivante (i.MX 8MP): the texelFetch shader is ~12×
             // slower than the hardware samplerExternalOES (on-target benchmark:
-            // NV12 720p convert 29ms shader vs 2.5ms sampler), and Vivante's
-            // fixed BT.601-limited sampler matrix MATCHES the reference for
-            // BT.601-limited sources (Phase 2 probe: ≤1 vs CPU). So for
-            // single-plane NV12 that is BT.601-limited and 4-aligned (the
-            // sampler import constraint), prefer ExternalSampler on Vivante.
-            // Full-range / BT.709 on Vivante still take ShaderR8 (slow but
-            // colorimetry-correct — the driver would apply the wrong matrix).
+            // NV12 720p convert 29ms shader vs 2.5ms sampler). For single-plane
+            // 4-aligned NV12 (the sampler import constraint) the pick follows
+            // the HIGH-PERFORMANCE-default policy (issue #106):
+            //
+            // * `ColorimetryMode::Fast` (default): take the sampler for EVERY
+            //   colorimetry — the driver applies its fixed BT.601-limited
+            //   matrix, which is exact for BT.601-limited sources (Phase 2
+            //   probe: ≤1 vs CPU) and approximate for the rest.
+            // * `ColorimetryMode::Exact` (config/env opt-in): take the sampler
+            //   only when the driver matrix MATCHES the source's resolved
+            //   (encoding, range); everything else renders through the exact
+            //   in-shader matrix, at Vivante's 12× cost.
             NvPathPref::Auto => {
-                let vivante_sampler_fast_path = src_fmt == PixelFormat::Nv12
+                // NEVER pair the external sampler with an R8 (Grey) render
+                // target on Vivante: samplerExternalOES → R8 attachment wedges
+                // the GC7000UL (the EDGEAI-1180 hang class — found when the
+                // Fast policy first routed nv12@dma→grey@dma to the sampler;
+                // the GPU hangs unrecoverably mid-draw). This gate applies in
+                // BOTH colorimetry modes: the old BT.601-limited carve-out had
+                // the same latent hang, just unreachable with HD sources.
+                let vivante_sampler_usable = src_fmt == PixelFormat::Nv12
                     && self.is_vivante
-                    && src.width().is_some_and(|w| w.is_multiple_of(4))
-                    && {
-                        let cm = crate::colorimetry::resolve_colorimetry(
-                            src.colorimetry(),
-                            src.height(),
-                        );
-                        cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
-                            && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
+                    && render_fmt != PixelFormat::Grey
+                    && src.width().is_some_and(|w| w.is_multiple_of(4));
+                let take_sampler = vivante_sampler_usable
+                    && match self.colorimetry_mode {
+                        crate::ColorimetryMode::Fast => true,
+                        crate::ColorimetryMode::Exact => {
+                            let cm = crate::colorimetry::resolve_colorimetry(
+                                src.colorimetry(),
+                                src.height(),
+                            );
+                            cm.encoding == Some(edgefirst_tensor::ColorEncoding::Bt601)
+                                && cm.range == Some(edgefirst_tensor::ColorRange::Limited)
+                        }
                     };
-                if vivante_sampler_fast_path {
+                if take_sampler {
                     NvConvertPath::ExternalSampler
                 } else {
                     NvConvertPath::ShaderR8
@@ -2967,6 +2916,7 @@ impl GLProcessorST {
         src_fmt: PixelFormat,
         dst: &Tensor<u8>,
         _dst_fmt: PixelFormat,
+        is_int8: bool,
         rotation: crate::Rotation,
         flip: Flip,
         crop: ResolvedCrop,
@@ -2991,12 +2941,16 @@ impl GLProcessorST {
                 }
             }
         }
-        // Top-down band rect, matching `setup_renderbuffer_dma`'s viewport (the
-        // dst EGLImage is top-down: GL row 0 == memory row 0).
+        // Band rect via `region_to_viewport_top_down` — the SAME lowering as
+        // the band viewport in `bind_dst`'s setup, so scissor and viewport can
+        // never disagree on the orientation convention.
         let _scissor = match dst.view_origin() {
             Some(vo) => {
+                let vp = super::render::region_to_viewport_top_down(crate::Region::new(
+                    vo.x, vo.y, dst_w, dst_h,
+                ));
                 unsafe {
-                    gls::gl::Scissor(vo.x as i32, vo.y as i32, dst_w as i32, dst_h as i32);
+                    gls::gl::Scissor(vp.x, vp.y, vp.w, vp.h);
                     gls::gl::Enable(gls::gl::SCISSOR_TEST);
                 }
                 ScissorGuard(true)
@@ -3060,7 +3014,7 @@ impl GLProcessorST {
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
             // single-plane NV12/NV16/NV24, using the driver ExternalSampler only
             // for true-multiplane NV12 (which ShaderR8 cannot import).
-            let chosen = self.select_nv_path(src, src_fmt);
+            let chosen = self.select_nv_path(src, src_fmt, _dst_fmt);
 
             if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
@@ -3079,6 +3033,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                     }
                     Err(e) => {
@@ -3103,6 +3058,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                         log::debug!("draw_src_texture takes {:?}", start.elapsed());
                     }
@@ -3125,6 +3081,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                     }
                     Err(e) => {
@@ -3145,6 +3102,7 @@ impl GLProcessorST {
                             dst_roi,
                             rotation_offset,
                             flip,
+                            is_int8,
                         )?;
                         log::debug!("draw_src_texture takes {:?}", start.elapsed());
                     }
@@ -3163,7 +3121,16 @@ impl GLProcessorST {
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
             self.last_nv_convert_path = NvConvertPath::ShaderR8;
-            self.draw_nv_texture_2d(src, src_fmt, None, src_roi, dst_roi, rotation_offset, flip)?;
+            self.draw_nv_texture_2d(
+                src,
+                src_fmt,
+                None,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+                is_int8,
+            )?;
         } else {
             // Non-DMA source, non-NV (or multiplane NV): CPU texture-upload path.
             if matches!(
@@ -3173,7 +3140,15 @@ impl GLProcessorST {
                 self.last_nv_convert_path = NvConvertPath::Cpu;
             }
             let start = Instant::now();
-            self.draw_src_texture(src, src_fmt, src_roi, dst_roi, rotation_offset, flip)?;
+            self.draw_src_texture(
+                src,
+                src_fmt,
+                src_roi,
+                dst_roi,
+                rotation_offset,
+                flip,
+                is_int8,
+            )?;
             log::debug!("draw_src_texture takes {:?}", start.elapsed());
         }
 
@@ -3371,7 +3346,18 @@ impl GLProcessorST {
         // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate).
         // It uses dst only for width/height in ROI coordinate math.
         // Handles: source binding (DMA EGLImage or upload), crop, letterbox, rotation, flip.
-        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
+        // applied once, by pass 2's packing shader.
+        //
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples the
+        // finished intermediate, and the convert syncs once at pass 2's end.
+        // The flag restores before `?` so an error cannot leak defer state.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        self.defer_finish = saved_defer;
+        pass1?;
         drop(_pass1);
 
         // --- Pass 2: Pack intermediate RGBA → RGB DMA destination ---
@@ -3403,6 +3389,11 @@ impl GLProcessorST {
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
                     gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    // Raw re-target bypasses bind_egl_image's key tracking:
+                    // drop the cached key so a later bind_egl_image on this
+                    // texture cannot "reuse" a binding this call replaced
+                    // (silent write into the wrong destination buffer).
+                    self.render_texture.invalidate_egl_binding();
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
                         gls::gl::COLOR_ATTACHMENT0,
@@ -3429,14 +3420,17 @@ impl GLProcessorST {
             super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
         }
 
-        // Set uniform: tex = TEXTURE1 (intermediate RGBA texture)
-        unsafe {
-            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
-            gls::gl::Uniform1i(loc_tex, 1);
-        }
+        // (`tex` = unit 1 is constant per program, uploaded at link time.)
 
         // Draw full-viewport quad to pack RGBA→RGB
         self.draw_fullscreen_quad()?;
+
+        // Pass 2 bound the intermediate on TEXTURE1; restore unit 0 as the
+        // active unit. Draw/setup sites select their unit before binding, but
+        // the processor-wide invariant between operations is "unit 0 active" —
+        // leaking unit 1 here is what broke the second heap-source convert
+        // (GL_INVALID_VALUE upload into the wrong texture).
+        unsafe { gls::gl::ActiveTexture(gls::gl::TEXTURE0) };
 
         unsafe { gls::gl::Finish() };
         check_gl_error(function!(), line!())?;
@@ -3504,11 +3498,21 @@ impl GLProcessorST {
         // Note: dst_fmt is passed but ignored (_dst_fmt in convert_to's signature) — the actual
         // output format is RGBA because we bound packed_rgb_fbo above. dst is used only for
         // width/height in ROI coordinate math.
-        self.convert_to(src, src_fmt, dst, dst_fmt, rotation, flip, crop)?;
+        // Pass 1 renders UN-biased (is_int8 = false): the int8 XOR-0x80 bias is
+        // applied once, by pass 2's planar deinterleave shader.
+        //
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples the
+        // finished intermediate, and the convert syncs once at pass 2's end.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to(src, src_fmt, dst, dst_fmt, false, rotation, flip, crop);
+        self.defer_finish = saved_defer;
+        pass1?;
         drop(_pass1);
 
         // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
-        // setup_renderbuffer_dma rebinds convert_fbo with the DMA destination EGLImage,
+        // bind_dst rebinds convert_fbo with the DMA destination EGLImage,
         // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
         // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
         let _pass2 = tracing::trace_span!(
@@ -3517,7 +3521,7 @@ impl GLProcessorST {
             dst_h
         )
         .entered();
-        self.setup_renderbuffer_dma(dst, dst_fmt)?;
+        self.bind_dst(dst, dst_fmt, crop)?;
 
         // Pass 2 is a fullscreen blit from the intermediate to the planar
         // destination. Pass 1 (convert_to above) already placed the image
@@ -3529,9 +3533,9 @@ impl GLProcessorST {
         // a second time. Observed downstream as bounding boxes compressed by
         // exactly (content/canvas) in the padded dimension on i.MX 8M Plus.
         //
-        // The int8 clear-color bias that lived here is gone with the clear:
-        // pass 1 performed all letterbox fills, and pass 2's shader applies
-        // the int8 bias itself (is_int8 flag on the draw below).
+        // No int8 bias-clear here either: pass 2 performs no clear, and the
+        // planar deinterleave shader applies the int8 bias itself (is_int8
+        // flag on the draw below).
         let dst_roi = RegionOfInterest {
             left: -1.,
             top: 1.,
@@ -3679,8 +3683,8 @@ impl GLProcessorST {
                 &self.texture_program_planar
             };
             gls::gl::UseProgram(program.id);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
             gls::gl::TexParameteri(
                 texture_target,
@@ -3828,10 +3832,7 @@ impl GLProcessorST {
             gls::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
-            // Set tex uniform to unit 0
-            let loc_tex = gls::gl::GetUniformLocation(program.id, c"tex".as_ptr());
-            gls::gl::Uniform1i(loc_tex, 0);
-
+            // (`tex` = unit 0 is constant per program, uploaded at link time.)
             check_gl_error(function!(), line!())?;
 
             let y_centers = if alpha {
@@ -3925,6 +3926,7 @@ impl GLProcessorST {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_src_texture(
         &mut self,
         src: &Tensor<u8>,
@@ -3933,6 +3935,7 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -3947,10 +3950,18 @@ impl GLProcessorST {
                 )));
             }
         };
+        // Draw-time program selection: the int8 program is the same shader
+        // plus the XOR-0x80 bias, selected here instead of swap-and-restore
+        // around the render.
+        let program_id = if is_int8 {
+            self.texture_int8_program.id
+        } else {
+            self.texture_program.id
+        };
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
@@ -4075,15 +4086,22 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
+        // Draw-time program selection (see draw_src_texture).
+        let program_id = if is_int8 {
+            self.texture_int8_program_yuv.id
+        } else {
+            self.texture_program_yuv.id
+        };
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
-            gls::gl::UseProgram(self.texture_program_yuv.id);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
+            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for
@@ -4200,6 +4218,7 @@ impl GLProcessorST {
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
+        is_int8: bool,
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
@@ -4224,10 +4243,38 @@ impl GLProcessorST {
         let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
-        // `nv_r8_program` may have been swapped to the int8 variant by
-        // `convert_dest_dma` for int8 destinations — always use the current
-        // `nv_r8_program` slot (consistent with the texture_program_yuv swap).
-        let prog_id = self.nv_r8_program.id;
+        // Draw-time program selection: the int8 NV program is the same shader
+        // plus the XOR-0x80 bias. Selected here for EVERY destination lowering
+        // (the old swap scheme only covered DMA destinations, leaving the
+        // heap-source int8 NV output un-biased on texture destinations).
+        let prog_id = if is_int8 {
+            self.nv_r8_int8_program.id
+        } else {
+            self.nv_r8_program.id
+        };
+
+        // YUV→RGB matrix + range, resolved from the source tensor's
+        // colorimetry (missing axes filled by the SD/HD height heuristic).
+        // Path B applies the matrix in-shader, so it is colorimetry-correct
+        // on every GPU regardless of EGL color-hint support.
+        let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+        let colorimetry = (
+            cm.encoding
+                .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+            cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+        );
+        let state = if is_int8 {
+            &mut self.nv_r8_int8_uniforms
+        } else {
+            &mut self.nv_r8_uniforms
+        };
+        let locs = state.locs;
+        // Uniform values persist per program: re-upload the six matrix floats
+        // only when this program's (encoding, range) actually changed. The
+        // marker is recorded AFTER the draw succeeds — an error between here
+        // and the upload must not leave a "already uploaded" claim for values
+        // that never reached the program.
+        let upload_colorimetry = state.last_colorimetry != Some(colorimetry);
 
         unsafe {
             gls::gl::UseProgram(prog_id);
@@ -4305,57 +4352,22 @@ impl GLProcessorST {
                 }
             }
 
-            // Set uniforms (img_size, tex_width, chroma_shift, chroma_lines).
-            let loc_img_size = gls::gl::GetUniformLocation(prog_id, c"img_size".as_ptr());
-            gls::gl::Uniform2i(loc_img_size, src_w as i32, src_h as i32);
+            // Per-source uniforms through link-time-cached locations (the
+            // `src` sampler binding is constant and uploaded at resolve time).
+            gls::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
+            gls::gl::Uniform1i(locs.tex_width, tex_width);
+            gls::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
+            gls::gl::Uniform1i(locs.chroma_lines, chroma_lines);
 
-            let loc_tex_width = gls::gl::GetUniformLocation(prog_id, c"tex_width".as_ptr());
-            gls::gl::Uniform1i(loc_tex_width, tex_width);
-
-            let loc_chroma_shift = gls::gl::GetUniformLocation(prog_id, c"chroma_shift".as_ptr());
-            gls::gl::Uniform2i(loc_chroma_shift, chroma_shift_x, chroma_shift_y);
-
-            let loc_chroma_lines = gls::gl::GetUniformLocation(prog_id, c"chroma_lines".as_ptr());
-            gls::gl::Uniform1i(loc_chroma_lines, chroma_lines);
-
-            // YUV→RGB matrix + range, resolved from the source tensor's
-            // colorimetry (missing axes filled by the SD/HD height heuristic).
-            // Path B applies the matrix in-shader, so it is colorimetry-correct
-            // on every GPU regardless of EGL color-hint support.
-            let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
-            let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
-                cm.encoding
-                    .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
-                cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"y_offset".as_ptr()),
-                coeffs.y_offset,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"y_scale".as_ptr()),
-                coeffs.y_scale,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_vr".as_ptr()),
-                coeffs.c_vr,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_ug".as_ptr()),
-                coeffs.c_ug,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_vg".as_ptr()),
-                coeffs.c_vg,
-            );
-            gls::gl::Uniform1f(
-                gls::gl::GetUniformLocation(prog_id, c"c_ub".as_ptr()),
-                coeffs.c_ub,
-            );
-
-            // Bind sampler to unit 0.
-            let loc_src = gls::gl::GetUniformLocation(prog_id, c"src".as_ptr());
-            gls::gl::Uniform1i(loc_src, 0);
+            if upload_colorimetry {
+                let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
+                gls::gl::Uniform1f(locs.y_offset, coeffs.y_offset);
+                gls::gl::Uniform1f(locs.y_scale, coeffs.y_scale);
+                gls::gl::Uniform1f(locs.c_vr, coeffs.c_vr);
+                gls::gl::Uniform1f(locs.c_ug, coeffs.c_ug);
+                gls::gl::Uniform1f(locs.c_vg, coeffs.c_vg);
+                gls::gl::Uniform1f(locs.c_ub, coeffs.c_ub);
+            }
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
@@ -4428,6 +4440,16 @@ impl GLProcessorST {
             );
         }
         check_gl_error(function!(), line!())?;
+        // The draw (and its colorimetry upload, when taken) succeeded — only
+        // now record the program's uploaded (encoding, range).
+        if upload_colorimetry {
+            let state = if is_int8 {
+                &mut self.nv_r8_int8_uniforms
+            } else {
+                &mut self.nv_r8_uniforms
+            };
+            state.last_colorimetry = Some(colorimetry);
+        }
         Ok(())
     }
 

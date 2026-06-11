@@ -125,12 +125,18 @@ nearest-like and also matches CPU.
 | imx8mp-frdm | Vivante GC7000UL | **2.5 ms** | **29.2 ms** | **Sampler** (shader ~12× slower; sampler also correct here) |
 | jetson-orin-nano | Tegra (NVIDIA) | 2.4 ms | 2.1 ms | **Shader** (R8 upload; no DMA-buf import) |
 
-**`auto` policy:** prefer `ShaderR8` (portable, colorimetry-exact) everywhere
-**except** single-plane, BT.601-limited, even-and-4-aligned NV12 on **Vivante**,
-where `ExternalSampler` is both ~12× faster and colorimetry-correct. Full-range /
-BT.709 sources on Vivante still take `ShaderR8` (slower but correct — the fixed
-driver matrix would be wrong). `EDGEFIRST_NV_CONVERT_PATH` overrides this for
-benchmarking and platform bring-up.
+**`auto` policy (HIGH-PERFORMANCE default, issue #106):** prefer `ShaderR8`
+(portable, colorimetry-exact) wherever it is also the fast path — every GPU
+above except Vivante. On **Vivante**, single-plane 4-aligned NV12 takes
+`ExternalSampler` for **every** colorimetry in the default
+`ColorimetryMode::Fast`: the driver applies its fixed BT.601-limited matrix,
+which is exact for BT.601-limited sources and approximate for the rest — the
+12× speed gap (2.5 ms vs 29 ms) is the trade. Opt in to exactness with
+`ImageProcessorConfig::colorimetry = ColorimetryMode::Exact` or
+`EDGEFIRST_COLORIMETRY=exact`: the sampler is then used only when the driver
+matrix matches the source's resolved (encoding, range) exactly.
+`EDGEFIRST_NV_CONVERT_PATH` still force-overrides the path for benchmarking
+and platform bring-up.
 
 Source-width constraint for the `Sampler` (NV12 EGLImage) path: **even width**
 (4:2:0 chroma is W/2). The import uses the 64-byte-aligned row pitch, so widths

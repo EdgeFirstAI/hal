@@ -29,14 +29,88 @@
 //!    (`glViewport`), never part of the EGL cache key — that is what makes
 //!    "N tiles → 1 import" hold.
 
-// `Viewport`/`source_uv`/`plan_batch`/`BatchPath` stage the chunking follow-up
-// (split a batch that exceeds `GL_MAX_*` into per-chunk imports) and the
-// source-UV/bottom-up-surface paths; the live top-down DMA batch path computes
-// its band viewport inline (see the orientation note above). Until those land,
-// only the unit tests exercise these — drop the allow when they are wired in.
-#![allow(dead_code)]
-
 use crate::Region;
+use edgefirst_tensor::{PixelFormat, PixelLayout, TensorMemory};
+
+/// How a convert's destination is realized on the GPU — the pure half of the
+/// destination lowering (`bind_dst` in `processor/mod.rs` performs the GL
+/// work). One lowering per *destination memory class*, never per platform:
+/// platform differences surface as the `zero_copy_import` capability bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DstLowering {
+    /// The destination buffer itself becomes the FBO colour attachment
+    /// (EGLImage renderbuffer/texture today, IOSurface pbuffer after the
+    /// platform seam). The render writes the buffer directly — no readback.
+    ZeroCopy,
+    /// Offscreen texture render target, read back into the mapped tensor.
+    TextureMem,
+    /// Offscreen texture render target, read back into the destination PBO's
+    /// PACK binding (the tensor must never be mapped on the GL thread).
+    TexturePbo,
+}
+
+/// Classify the destination lowering from the platform's zero-copy import
+/// capability and the destination's memory class. A DMA destination without
+/// import support (e.g. dma-heap present but `EGL_EXT_image_dma_buf_import`
+/// missing) degrades to the mapped texture path rather than failing.
+pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLowering {
+    match dst_mem {
+        TensorMemory::Dma if zero_copy_import => DstLowering::ZeroCopy,
+        TensorMemory::Pbo => DstLowering::TexturePbo,
+        _ => DstLowering::TextureMem,
+    }
+}
+
+/// How a convert renders — the pure plan half of the engine
+/// (`convert_via_engine` in `processor/mod.rs` executes it). Exactly one
+/// plan per (source format, destination format, destination lowering)
+/// triple; the two-pass plans exist only for zero-copy destinations, whose
+/// buffers GL cannot write in the requested layout in one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConvertPlan {
+    /// One render pass into the bound destination target (packed via the
+    /// texture shaders, planar via the planar shader), then the lowering's
+    /// readback (none for zero-copy).
+    SinglePass,
+    /// Zero-copy packed-RGB: pass 1 renders RGBA into an intermediate
+    /// texture, pass 2 packs it into the destination reinterpreted as
+    /// RGBA8 at `W*3/4 × H` (GL has no 3-byte render format).
+    TwoPassPackedRgb,
+    /// Zero-copy NV*→planar: pass 1 converts NV*→RGBA through the full
+    /// `select_nv_path` machinery (colorimetry-exact ShaderR8 + Vivante
+    /// carve-out), pass 2 deinterleaves RGBA into the planar destination.
+    /// Also the Vivante GC7000UL single-pass GPU-hang workaround
+    /// (EDGEAI-1180).
+    TwoPassNvPlanar,
+}
+
+/// Decide the render plan. Pure (src format, dst format, dst lowering) →
+/// plan; capability differences arrive via the lowering, never as platform
+/// branches here.
+pub(super) fn plan_convert(
+    src_fmt: PixelFormat,
+    dst_fmt: PixelFormat,
+    lowering: DstLowering,
+) -> ConvertPlan {
+    if lowering != DstLowering::ZeroCopy {
+        // Texture destinations always render once and read back; packed RGB
+        // and planar layouts are handled by the readback format / planar
+        // shader, not by reinterpreting the destination buffer.
+        return ConvertPlan::SinglePass;
+    }
+    if dst_fmt == PixelFormat::Rgb {
+        return ConvertPlan::TwoPassPackedRgb;
+    }
+    if dst_fmt.layout() == PixelLayout::Planar
+        && matches!(
+            src_fmt,
+            PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+        )
+    {
+        return ConvertPlan::TwoPassNvPlanar;
+    }
+    ConvertPlan::SinglePass
+}
 
 /// A GL viewport / scissor rectangle in **pixels**, bottom-left origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +121,33 @@ pub(super) struct Viewport {
     pub(super) h: i32,
 }
 
+/// Lower a destination tile to its GL band rectangle on the live Linux
+/// DMA-BUF path, which is **top-down** (GL framebuffer row 0 == memory row 0,
+/// verified on-target): the band's GL `y` is simply `region.y`, with no
+/// bottom-left flip — the renderer's texcoord flip keeps the image upright.
+/// The single home for the orientation convention: BOTH the band `glViewport`
+/// (`bind_dst` setup) and the matching `glScissor` (letterbox-clear
+/// confinement in `convert_to`) lower through here so they can never
+/// disagree. [`region_to_viewport`] is the bottom-up twin for a future
+/// bottom-left-origin surface (e.g. the macOS pbuffer batch path).
+#[inline]
+pub(super) fn region_to_viewport_top_down(region: Region) -> Viewport {
+    Viewport {
+        x: region.x as i32,
+        y: region.y as i32,
+        w: region.width as i32,
+        h: region.height as i32,
+    }
+}
+
 /// Lower a top-left `region` of an image `parent_h` rows tall to a bottom-left
 /// GL viewport. The horizontal axis is unchanged; the vertical axis is flipped
 /// so the region's *top* edge maps to the correct GL row.
 ///
-/// This is the single source of the y-origin convention for the converged
-/// renderer — a destination tile, a letterbox inner box, and a whole-image
-/// render all lower through here.
+/// Staged for the first bottom-left-origin render target (macOS pbuffer batch
+/// path, PR-A); the live Linux DMA-BUF path is top-down and uses
+/// [`region_to_viewport_top_down`]. Until then only the unit tests call this.
+#[allow(dead_code)]
 pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
     // Bottom-left origin: the GL y of the region's top-left corner is the number
     // of rows *below* the region — `parent_h - (y + h)`. Saturating so a region
@@ -73,6 +167,11 @@ pub(super) fn region_to_viewport(region: Region, parent_h: usize) -> Viewport {
 /// `[0, 0, 1, 1]`. Matches the `src_rect_uv` produced by
 /// [`crate::gl::core::float_crop_uniforms`] so the converged renderer and the
 /// float path agree on source addressing.
+///
+/// Staged for the source-view sampling path (the u8 renderer still computes
+/// its `RegionOfInterest` corners inline); until wired, only the unit tests
+/// call this.
+#[allow(dead_code)]
 pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [f32; 4] {
     match region {
         Some(r) if src_w > 0 && src_h > 0 => [
@@ -93,6 +192,10 @@ pub(super) fn source_uv(region: Option<Region>, src_w: usize, src_h: usize) -> [
 /// batch is split into chunks of `tiles_per_chunk`, one import per chunk.
 /// `PerTileImport` is the degenerate floor (a single tile already too large to
 /// batch) — equivalent to the legacy per-call path.
+/// Staged for the `GL_MAX_*` chunking follow-up (split an over-limit batch
+/// into per-chunk imports); until wired into `convert_batch`, only the unit
+/// tests exercise this and [`plan_batch`].
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BatchPath {
     OneImport,
@@ -110,6 +213,7 @@ pub(super) enum BatchPath {
 /// * `n_tiles · rows_per_tile ≤ max_rows`  → `OneImport`
 /// * `rows_per_tile ≤ max_rows < n·rows`   → `Chunked(max_rows / rows_per_tile)`
 /// * `rows_per_tile > max_rows`            → `PerTileImport`
+#[allow(dead_code)]
 pub(super) fn plan_batch(n_tiles: usize, rows_per_tile: usize, max_rows: usize) -> BatchPath {
     if rows_per_tile == 0 || n_tiles == 0 {
         return BatchPath::OneImport;
@@ -132,6 +236,25 @@ mod tests {
 
     fn region(x: usize, y: usize, w: usize, h: usize) -> Region {
         Region::new(x, y, w, h)
+    }
+
+    #[test]
+    fn viewport_top_down_is_identity() {
+        // The live DMA path is top-down: GL y == memory row y, no flip. Three
+        // stacked 16-row tiles keep their memory order in GL coordinates.
+        let ys: Vec<i32> = (0..3)
+            .map(|n| region_to_viewport_top_down(region(0, n * 16, 64, 16)).y)
+            .collect();
+        assert_eq!(ys, vec![0, 16, 32]);
+        assert_eq!(
+            region_to_viewport_top_down(region(10, 4, 20, 8)),
+            Viewport {
+                x: 10,
+                y: 4,
+                w: 20,
+                h: 8
+            }
+        );
     }
 
     #[test]
@@ -256,5 +379,71 @@ mod tests {
     fn plan_batch_degenerate_inputs() {
         assert_eq!(plan_batch(0, 64, 2048), BatchPath::OneImport);
         assert_eq!(plan_batch(4, 0, 2048), BatchPath::OneImport);
+    }
+
+    #[test]
+    fn plan_convert_full_table() {
+        use DstLowering::*;
+        use PixelFormat::*;
+        let nv = [Nv12, Nv16, Nv24];
+        let non_nv = [Rgba, Bgra, Grey, Yuyv];
+        // Zero-copy: packed RGB always two-pass; NV→planar two-pass; the rest
+        // single-pass (incl. non-NV → planar, which the planar shader handles
+        // in one pass).
+        for src in nv.iter().chain(&non_nv) {
+            assert_eq!(
+                plan_convert(*src, Rgb, ZeroCopy),
+                ConvertPlan::TwoPassPackedRgb,
+                "{src:?}->Rgb zero-copy"
+            );
+        }
+        for src in nv {
+            assert_eq!(
+                plan_convert(src, PlanarRgb, ZeroCopy),
+                ConvertPlan::TwoPassNvPlanar
+            );
+            assert_eq!(
+                plan_convert(src, PlanarRgba, ZeroCopy),
+                ConvertPlan::TwoPassNvPlanar
+            );
+            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+        }
+        for src in non_nv {
+            assert_eq!(
+                plan_convert(src, PlanarRgb, ZeroCopy),
+                ConvertPlan::SinglePass
+            );
+            assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
+        }
+        // Texture lowerings: ALWAYS single-pass, for every format pair — the
+        // two-pass plans only exist to write zero-copy buffers in-place.
+        for lowering in [TextureMem, TexturePbo] {
+            for src in nv.iter().chain(&non_nv) {
+                for dst in [Rgba, Bgra, Rgb, PlanarRgb, Grey] {
+                    assert_eq!(
+                        plan_convert(*src, dst, lowering),
+                        ConvertPlan::SinglePass,
+                        "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_dst_full_table() {
+        use TensorMemory::*;
+        // With zero-copy import: only a DMA destination is zero-copy; PBO
+        // keeps its PACK readback; Mem/Shm read back through the map.
+        assert_eq!(lower_dst(true, Dma), DstLowering::ZeroCopy);
+        assert_eq!(lower_dst(true, Pbo), DstLowering::TexturePbo);
+        assert_eq!(lower_dst(true, Mem), DstLowering::TextureMem);
+        assert_eq!(lower_dst(true, Shm), DstLowering::TextureMem);
+        // Without import support a DMA destination degrades to the mapped
+        // texture path (dma-heap without EGL dma_buf_import) — never an error.
+        assert_eq!(lower_dst(false, Dma), DstLowering::TextureMem);
+        assert_eq!(lower_dst(false, Pbo), DstLowering::TexturePbo);
+        assert_eq!(lower_dst(false, Mem), DstLowering::TextureMem);
+        assert_eq!(lower_dst(false, Shm), DstLowering::TextureMem);
     }
 }

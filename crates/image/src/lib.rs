@@ -981,6 +981,38 @@ pub struct ImageProcessorConfig {
     /// - [`ComputeBackend::Cpu`]: init CPU only
     /// - [`ComputeBackend::Auto`]: existing env-var-driven selection
     pub backend: ComputeBackend,
+
+    /// Colorimetry/performance trade-off for `convert()` (see
+    /// [`ColorimetryMode`]). Defaults to [`ColorimetryMode::Fast`]. The
+    /// `EDGEFIRST_COLORIMETRY` environment variable (`fast` | `exact`)
+    /// overrides this setting when present.
+    pub colorimetry: ColorimetryMode,
+}
+
+/// How `convert()` trades colorimetric exactness against speed on platforms
+/// where the exact path is expensive.
+///
+/// Today this affects one decision: NV12 sources on Vivante GC7000UL
+/// (i.MX 8M Plus), where the hardware external sampler converts ~12× faster
+/// than the colorimetry-exact in-shader matrix (2.5 ms vs 29 ms at 720p)
+/// but applies the driver's fixed BT.601-limited matrix regardless of the
+/// source's tagged colorimetry. Platforms where the exact path is already
+/// the fastest correct path (Mali, V3D, Tegra, ANGLE) behave identically in
+/// both modes.
+///
+/// Override at runtime with `EDGEFIRST_COLORIMETRY=fast|exact` (takes
+/// precedence over the config field), or per-source by forcing a path with
+/// `EDGEFIRST_NV_CONVERT_PATH`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColorimetryMode {
+    /// Prefer the fastest path whose output is correct-enough video RGB
+    /// (default; issue #106 policy). On Vivante, NV12 takes the hardware
+    /// sampler even when the source is not BT.601-limited.
+    #[default]
+    Fast,
+    /// Prefer bit-exact colorimetry everywhere: the fast path is used only
+    /// when it matches the source's resolved (encoding, range) exactly.
+    Exact,
 }
 
 /// Compute backend selection for [`ImageProcessor`].
@@ -1239,7 +1271,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         forced_backend: None,
-                    });
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -1344,7 +1377,8 @@ impl ImageProcessor {
                             g2d: None,
                             opengl: Some(opengl),
                             forced_backend: Some(ForcedBackend::OpenGl),
-                        })
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
                     }
                     #[cfg(target_os = "macos")]
                     #[cfg(feature = "opengl")]
@@ -1452,7 +1486,37 @@ impl ImageProcessor {
             #[cfg(feature = "opengl")]
             opengl,
             forced_backend: None,
-        })
+        }
+        .apply_colorimetry_mode(config.colorimetry))
+    }
+
+    /// Apply the configured [`ColorimetryMode`] to whichever backend honours
+    /// it (currently the Linux GL backend); no-op elsewhere. Constructor
+    /// plumbing for [`ImageProcessorConfig::colorimetry`].
+    fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
+        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        {
+            let mut me = self;
+            if let Err(e) = me.set_colorimetry_mode(_mode) {
+                log::warn!("Failed to apply ColorimetryMode::{_mode:?}: {e:?}");
+            }
+            me
+        }
+        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        self
+    }
+
+    /// Sets the colorimetry/performance trade-off (see [`ColorimetryMode`])
+    /// on the OpenGL backend. No-op if OpenGL is not available. The
+    /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
+    /// it is set, this call logs and keeps the env-selected mode.
+    #[cfg(target_os = "linux")]
+    #[cfg(feature = "opengl")]
+    pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
+        if let Some(ref mut gl) = self.opengl {
+            gl.set_colorimetry_mode(mode)?;
+        }
+        Ok(())
     }
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL

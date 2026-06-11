@@ -56,7 +56,13 @@ def _image_size(path):
         return im.size  # (width, height)
 
 
-def test_flip():
+def test_flip(monkeypatch):
+    # This test's oracle is PIL's exact JPEG decode, so it opts into
+    # colorimetry-exact conversion. The default ColorimetryMode is Fast
+    # (issue #106): on Vivante it routes every NV12 colorimetry through the
+    # external sampler's fixed conversion (~12x faster), which lands ~0.965
+    # against this oracle.
+    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     # JPEG decodes to its native NV12; convert downstream produces RGBA.
     src = Tensor.image(w, h, format=PixelFormat.Nv12)
@@ -156,7 +162,9 @@ def test_render():
         )
 
 
-def test_rgb_resize():
+def test_rgb_resize(monkeypatch):
+    # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
+    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12)
     src.decode_image_file("testdata/zidane.jpg")
@@ -170,7 +178,9 @@ def test_rgb_resize():
         assert calculate_similarity_rms_u8(n, expected) > 0.98
 
 
-def test_rgba_to_rgb():
+def test_rgba_to_rgb(monkeypatch):
+    # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
+    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     # Decode the JPEG to native NV12, then convert to RGB (3-channel) output.
     src = Tensor.image(w, h, format=PixelFormat.Nv12)
@@ -980,14 +990,21 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
         )
 
 
-def test_convert_honors_tagged_colorimetry():
+def test_convert_honors_tagged_colorimetry(monkeypatch):
     """convert() must honor the source tensor's tagged colorimetry (QA F11).
 
     The same NV12 bytes decoded as BT.601 full-range vs BT.709 limited-range
     must produce visibly different RGB pixels — proving the HAL threads the
     per-source colorimetry tag through the conversion instead of applying one
     hardcoded YUV matrix/range.
+
+    Exact tag honoring is the ColorimetryMode::Exact contract, opted into
+    here via EDGEFIRST_COLORIMETRY. The Fast default (issue #106)
+    deliberately collapses colorimetries into the external sampler's fixed
+    conversion on Vivante (~12x faster); non-Vivante GPUs honor tags in both
+    modes.
     """
+    monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = 1280, 720
     nv12 = np.fromfile("testdata/zidane.nv12", dtype=np.uint8).reshape(h * 3 // 2, w)
     converter = ImageProcessor()

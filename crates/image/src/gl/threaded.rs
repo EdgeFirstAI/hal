@@ -54,6 +54,11 @@ enum GLProcessorMessage {
         Int8InterpolationMode,
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Set the colorimetry/performance trade-off (`ColorimetryMode`).
+    SetColorimetryMode(
+        crate::ColorimetryMode,
+        tokio::sync::oneshot::Sender<Result<(), Error>>,
+    ),
     /// Snapshot the EGLImage cache counters (steady-state import assertions).
     EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
     PboCreate(
@@ -344,6 +349,9 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::SetInt8Interpolation(_, resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
+                        GLProcessorMessage::SetColorimetryMode(_, resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
                         GLProcessorMessage::EglCacheStats(resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
@@ -515,6 +523,22 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during SetColors: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
+                    }
+                    GLProcessorMessage::SetColorimetryMode(mode, resp) => {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            gl_converter.set_colorimetry_mode(mode);
+                            Ok(())
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during SetColorimetryMode: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -873,6 +897,22 @@ impl ImageProcessorTrait for GLProcessorThreaded {
 }
 
 impl GLProcessorThreaded {
+    /// Sets the colorimetry/performance trade-off (see
+    /// [`crate::ColorimetryMode`]). The `EDGEFIRST_COLORIMETRY` environment
+    /// variable takes precedence — when set, this call logs and keeps the
+    /// env-selected mode.
+    pub fn set_colorimetry_mode(&mut self, mode: crate::ColorimetryMode) -> Result<(), Error> {
+        let (err_send, err_recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::SetColorimetryMode(mode, err_send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        err_recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
     /// Sets the interpolation mode for int8 proto textures.
     pub fn set_int8_interpolation_mode(
         &mut self,

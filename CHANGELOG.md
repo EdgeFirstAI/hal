@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ColorimetryMode` (`Fast` | `Exact`) + `EDGEFIRST_COLORIMETRY`**
+  (`edgefirst-image`): the colorimetry/performance trade-off is now an
+  explicit knob. `ImageProcessorConfig::colorimetry` (default
+  `ColorimetryMode::Fast`, issue #106 policy) or the
+  `EDGEFIRST_COLORIMETRY=fast|exact` environment variable (which takes
+  precedence and pins the mode for the processor's lifetime). **Behavior
+  change on Vivante (i.MX 8M Plus):** under `auto`, single-plane 4-aligned
+  NV12 sources now take the hardware external sampler for *every*
+  colorimetry by default (~12× faster: 2.5 ms vs 29 ms at 720p; the
+  driver applies its fixed BT.601-limited matrix, approximate for
+  non-BT.601-limited sources). `ColorimetryMode::Exact` restores the
+  previous behavior (sampler only when the driver matrix matches the
+  source exactly, colorimetry-exact in-shader matrix otherwise). All other
+  GPUs are unaffected — the exact in-shader path is already the fast path
+  there.
 - **DMABUF V4L2 hardware JPEG decode** (`edgefirst-codec`): the CAPTURE queue
   now imports DMA buffers instead of allocating MMAP buffers, so a geometry
   change costs ~1 ms of ioctls instead of a ~110 ms kernel buffer
@@ -22,7 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   128.7 ms → 7.0 ms, 2.5× faster than the CPU decoder; raw hardware
   throughput ~350 FPS at 720p (`probe_decode_throughput`). New `v4l2_scan`
   example flags images that decode slowly through the hardware path.
-
 - **Batched preprocessing — `convert_deferred()` + `flush()`** (`edgefirst-image`,
   C API, Python): render `N` model inputs into row-band views of one batched
   destination as **one GPU import + one sync**. Loop
@@ -116,13 +130,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     exposing `.device_ptr` and `.size`.
   Validated on Jetson Orin-nano (O5/O6/O8) on L4T R36.4 / CUDA 12.6 / TRT 10.3
   (numeric max\_err 0.00024 vs CPU reference) and desktop RTX 3090.
-
 - **imx8mp coverage flush-guard** (`edgefirst_tensor::covguard`) — a
   `SIGABRT` handler compiled in under `-Cinstrument-coverage` that flushes
   the LLVM profile to disk before re-raising the signal. Prevents coverage
   loss on the i.MX 8M Plus CI lane where the Vivante EGL driver calls
   `abort()` during process shutdown.
-
 - **F16 zero-copy preprocessing on macOS via ANGLE + RGBA16F-packed
   IOSurface.** RGBA8 input → PlanarRgb F16 output runs end-to-end on
   the GPU and writes directly into an IOSurface that ORT consumes as

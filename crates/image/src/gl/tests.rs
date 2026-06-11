@@ -388,7 +388,7 @@ mod gl_tests {
 
         // NV12 pool (the camera-pipeline shape): Y plane + neutral chroma.
         let mut bytes = vec![100u8; w * h];
-        bytes.extend(std::iter::repeat(128u8).take(w * h / 2));
+        bytes.extend(std::iter::repeat_n(128u8, w * h / 2));
         let pool: Vec<TensorDyn> = (0..POOL)
             .map(|_| {
                 load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap()
@@ -426,6 +426,209 @@ mod gl_tests {
             "expected at least {FRAMES} cache hits over the loop, got {gained} \
              (warm={warm:?} steady={steady:?})"
         );
+    }
+
+    /// Regression test for the repeat-convert GL_INVALID_VALUE (0x501) state
+    /// leak: heap-RGBA source → two-pass packed RGB → DMA destination succeeded
+    /// on the FIRST convert and failed on the SECOND on Vivante/Mali/V3D alike.
+    ///
+    /// Root cause: `convert_to_packed_rgb` pass 2 exits with `ActiveTexture`
+    /// left at TEXTURE1 and the destination EGLImage texture bound on unit 0,
+    /// while `draw_src_texture` issued `BindTexture` BEFORE `ActiveTexture` —
+    /// binding the camera texture to the leaked unit and then uploading the
+    /// 1280×720 source into the 640×640 destination texture via the
+    /// `TexSubImage2D` fast path → GL_INVALID_VALUE. Driver-independent GLES
+    /// semantics, hence identical on all dmabuf GPUs.
+    ///
+    /// The loop runs each dtype cell several times (not just twice) and pins
+    /// byte-identical output across iterations, so any texture-unit state leak
+    /// between converts surfaces either as an error or as a pixel diff.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn repeat_convert_rgba_mem_to_rgb_dma() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut renderer = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        // Deterministic RGBA gradient source in plain heap memory (the cell's
+        // defining property: NOT DMA, so the source goes through the
+        // draw_src_texture CPU-upload path).
+        let (src_w, src_h) = (1280usize, 720usize);
+        let mut bytes = vec![0u8; src_w * src_h * 4];
+        for (i, px) in bytes.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 256) as u8;
+            px[1] = ((i / 256) % 256) as u8;
+            px[2] = ((i / 65536) % 256) as u8;
+            px[3] = 255;
+        }
+        let src = load_raw_image(
+            src_w,
+            src_h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            &bytes,
+        )
+        .unwrap();
+
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+        for dtype in [DType::U8, DType::I8] {
+            let mut dst = match TensorDyn::image(
+                640,
+                640,
+                PixelFormat::Rgb,
+                dtype,
+                Some(TensorMemory::Dma),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("SKIPPED cell {dtype:?}: DMA RGB dst unavailable: {e}");
+                    continue;
+                }
+            };
+            let mut first: Option<Vec<u8>> = None;
+            for round in 0..4 {
+                renderer
+                    .convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "rgba@mem->rgb.{dtype:?}@dma convert #{} failed: {e} \
+                             (repeat-convert state leak — see 0x501 regression)",
+                            round + 1
+                        )
+                    });
+                let out: Vec<u8> = match dtype {
+                    DType::I8 => dst
+                        .as_i8()
+                        .unwrap()
+                        .map()
+                        .unwrap()
+                        .as_slice()
+                        .iter()
+                        .map(|&v| v as u8)
+                        .collect(),
+                    _ => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                };
+                match &first {
+                    None => first = Some(out),
+                    Some(reference) => assert_eq!(
+                        reference,
+                        &out,
+                        "rgba@mem->rgb.{dtype:?}@dma convert #{} output diverged from #1",
+                        round + 1
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The int8 variant of every draw must differ from the u8 variant by
+    /// exactly XOR 0x80 on the colour channels — the int8 fragment shaders
+    /// are the u8 shaders plus the bias, nothing else (alpha passes through).
+    ///
+    /// Catches the texture-destination program-selection gap: the heap-source
+    /// NV12 (ShaderR8 upload) int8 convert rendered through the UN-biased NV
+    /// program (only the DMA destination path swapped `nv_r8_program`),
+    /// producing u8-semantics bytes in an i8 tensor — 0x80 off on every
+    /// channel. Needs no DMA at runtime (Mem src/dst — runs on llvmpipe,
+    /// whose coverage lane enables the feature); the `dma_test_formats`
+    /// gate only matches the `load_raw_image` helper's.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn int8_mem_convert_is_xor_biased_u8() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut renderer = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        // Gradient luma + off-neutral chroma so the bias is exercised across
+        // values straddling 0x80 (where a missing bias is a ~128 byte diff).
+        let (w, h) = (64usize, 48usize);
+        let mut nv12 = vec![0u8; w * h * 3 / 2];
+        for row in 0..h {
+            for col in 0..w {
+                nv12[row * w + col] = ((row * 255) / h) as u8;
+            }
+        }
+        for i in 0..w * h / 4 {
+            nv12[w * h + 2 * i] = 110; // Cb
+            nv12[w * h + 2 * i + 1] = 150; // Cr
+        }
+        let src = load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem), &nv12).unwrap();
+
+        // RGBA must convert everywhere the NV upload path exists; RGB-format
+        // readback is implementation-defined in GLES (V3D rejects it with
+        // GL_INVALID_OPERATION — the cell was absent from rpi5's PR-0 matrix
+        // baseline too), so a failing RGB cell skips rather than fails.
+        let mut validated = 0usize;
+        'fmt: for fmt in [PixelFormat::Rgb, PixelFormat::Rgba] {
+            let mut out = [Vec::new(), Vec::new()];
+            for (slot, dtype) in [(0, DType::U8), (1, DType::I8)] {
+                let mut dst = TensorDyn::image(w, h, fmt, dtype, Some(TensorMemory::Mem)).unwrap();
+                if let Err(e) =
+                    renderer.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                {
+                    if fmt == PixelFormat::Rgba {
+                        panic!("nv12@mem -> rgba.{dtype:?}@mem must be supported: {e}");
+                    }
+                    eprintln!("SKIPPED cell nv12@mem -> {fmt}.{dtype:?}@mem: {e}");
+                    continue 'fmt;
+                }
+                out[slot] = match dtype {
+                    DType::I8 => dst
+                        .as_i8()
+                        .unwrap()
+                        .map()
+                        .unwrap()
+                        .as_slice()
+                        .iter()
+                        .map(|&v| v as u8)
+                        .collect(),
+                    _ => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                };
+            }
+            let channels = fmt.channels();
+            let mut diffs = 0usize;
+            for (i, (&u, &b)) in out[0].iter().zip(out[1].iter()).enumerate() {
+                let expect = if channels == 4 && i % 4 == 3 {
+                    u
+                } else {
+                    u ^ 0x80
+                };
+                // ±1 LSB: the int8 shader's explicit floor(v*255+0.5)+128
+                // quantization double-rounds against the driver's own
+                // float→unorm8 store, shifting ~2% of bytes by one on some
+                // GPUs (seen on Vivante). A missing bias is a ~128 diff, so
+                // the tolerance keeps full sensitivity to the real bug.
+                if (b as i16 - expect as i16).abs() > 1 {
+                    diffs += 1;
+                    if diffs <= 5 {
+                        eprintln!("byte {i}: u8={u:#04x} i8={b:#04x} expected {expect:#04x}");
+                    }
+                }
+            }
+            assert_eq!(
+                diffs, 0,
+                "nv12@mem -> {fmt}: i8 output is not the XOR-0x80 bias of the u8 output \
+                 ({diffs} bytes differ beyond ±1 — un-biased int8 NV program?)"
+            );
+            validated += 1;
+        }
+        assert!(validated >= 1, "no format validated the int8 NV bias");
     }
 
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
@@ -2443,6 +2646,193 @@ mod gl_tests {
         assert_pixels_match(contig_bytes, multi_bytes, 0);
     }
 
+    /// Regression for the two-pass double letterbox (PR #107): pass 2 of the
+    /// zero-copy NV→planar plan re-applied `dst_rect`, mapping the
+    /// already-letterboxed intermediate into the content sub-region a second
+    /// time and shrinking the image by the letterbox content fraction twice.
+    ///
+    /// A synthetic grey NV12 frame letterboxed 1280x720 → 640x640 must place
+    /// content rows at exactly [140, 500); the double-applied bug squeezed
+    /// them to ~[218, 422). Probing rows just inside the correct band (150 /
+    /// 490) is therefore a deterministic kill-shot with no oracle tolerance
+    /// to hide behind — and it equally catches the inverse bug (letterbox
+    /// dropped entirely: pad rows would hold content). Covers PlanarRgb /
+    /// PlanarRgba × u8 / i8 × Dma (the GL TwoPassNvPlanar plan) and Mem
+    /// destinations — GL has no planar texture destination, so the Mem legs
+    /// pin the backend `ImageProcessor` resolves instead (CPU fallback),
+    /// guarding the whole dispatch surface against the bug class.
+    /// (`dma_test_formats` gate matches the helpers it uses; the Mem legs
+    /// still run on the llvmpipe coverage lane, which enables the feature.)
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn letterbox_nv_to_planar_content_band_geometry() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        // Synthetic NV12: Y=200, U=V=128 is neutral grey, so BT.601 vs BT.709
+        // coefficients cancel and the converted RGB is ~200 (full range) to
+        // ~214 (limited): comfortably above the 114 pad in every colorimetry
+        // mode. Threshold at >=170 content / <=140 pad.
+        let (sw, sh) = (1280usize, 720usize);
+        let mut nv12 = vec![0u8; sw * sh * 3 / 2];
+        nv12[..sw * sh].fill(200);
+        nv12[sw * sh..].fill(128);
+        let src_mem = if is_dma_available() {
+            Some(TensorMemory::Dma)
+        } else {
+            Some(TensorMemory::Mem)
+        };
+        let src = load_raw_image(sw, sh, PixelFormat::Nv12, src_mem, &nv12).unwrap();
+
+        // 1280x720 → 640x640: scale 0.5, content 640x360 centred → rows
+        // [140, 500). Probe ≥10 px from the boundary to stay clear of
+        // bilinear edge blending.
+        const CONTENT_ROWS: [usize; 3] = [150, 320, 490];
+        const PAD_ROWS: [usize; 4] = [0, 130, 510, 639];
+        let (dw, dh) = (640usize, 640usize);
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+
+        let mut dst_memories = vec![TensorMemory::Mem];
+        if is_dma_available() {
+            dst_memories.push(TensorMemory::Dma);
+        }
+        for dst_mem in dst_memories {
+            for dst_fmt in [PixelFormat::PlanarRgb, PixelFormat::PlanarRgba] {
+                for dtype in [DType::U8, DType::I8] {
+                    let label = format!("nv12->{dst_fmt}.{dtype:?}@{dst_mem:?}");
+                    let mut dst = proc
+                        .create_image(dw, dh, dst_fmt, dtype, Some(dst_mem))
+                        .unwrap();
+                    proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                        .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+
+                    // Raw bytes; undo the int8 XOR-0x80 bias so both dtypes
+                    // share one set of thresholds.
+                    let unbias = if dtype == DType::I8 { 0x80u8 } else { 0 };
+                    let bytes: Vec<u8> = match dtype {
+                        DType::U8 => dst.as_u8().unwrap().map().unwrap().as_slice().to_vec(),
+                        _ => dst
+                            .as_i8()
+                            .unwrap()
+                            .map()
+                            .unwrap()
+                            .as_slice()
+                            .iter()
+                            .map(|&v| v as u8 ^ unbias)
+                            .collect(),
+                    };
+
+                    // Only the three colour planes — the alpha plane is 255
+                    // everywhere (content and pad) and is bias-exempt.
+                    for plane in 0..3 {
+                        let plane_base = plane * dh * dw;
+                        for row in CONTENT_ROWS {
+                            for col in (5..dw - 5).step_by(13) {
+                                let v = bytes[plane_base + row * dw + col];
+                                assert!(
+                                    v >= 170,
+                                    "{label}: plane {plane} row {row} col {col} = {v}, \
+                                     expected content (>=170) — letterbox content band \
+                                     misplaced (double-letterbox regression?)"
+                                );
+                            }
+                        }
+                        for row in PAD_ROWS {
+                            for col in (5..dw - 5).step_by(13) {
+                                let v = bytes[plane_base + row * dw + col];
+                                assert!(
+                                    v <= 140,
+                                    "{label}: plane {plane} row {row} col {col} = {v}, \
+                                     expected pad (<=140) — content leaked into the \
+                                     letterbox band"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Letterboxed PixelFormat::Nv12 → planar against the verified RGBA
+    /// reference: the same processor letterboxes camera NV12 720p → RGBA
+    /// 640x640, the reference is channel-split on the CPU, and the GL planar
+    /// output (PlanarRgb@Dma — the TwoPassNvPlanar plan) must match it.
+    /// PlanarRgb@Dma is the only planar destination the GL engine accepts:
+    /// `check_dst_format_supported` rejects PlanarRgba outright and Mem has
+    /// no planar texture destination. Catches placement, scale, and content
+    /// drift in the two-pass plan at full resolution — the per-pixel
+    /// complement to the content-band geometry probe above.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn letterbox_nv12_to_planar_matches_rgba_reference() {
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+
+        let src = load_raw_image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+
+        let crop = letterbox_crop(1280, 720, 640, 640);
+        let (dw, dh) = (640usize, 640usize);
+        let mut gl = GLProcessorThreaded::new(None).unwrap();
+
+        // Reference: the verified packed-RGBA letterbox path.
+        let mut dst_rgba = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(&src, &mut dst_rgba, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let rgba = dst_rgba.as_u8().unwrap().map().unwrap();
+        let rgba = rgba.as_slice();
+
+        // Channel-split the RGBA reference into the planar layout.
+        let mut expected = vec![0u8; 3 * dh * dw];
+        for (i, px) in rgba.chunks_exact(4).enumerate() {
+            for (plane, &channel) in px.iter().take(3).enumerate() {
+                expected[plane * dh * dw + i] = channel;
+            }
+        }
+        let mut dst = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap_or_else(|e| panic!("nv12->PlanarRgb@Dma: convert failed: {e}"));
+        let map = dst.as_u8().unwrap().map().unwrap();
+        assert_pixels_match(&expected, map.as_slice(), 1);
+    }
+
     /// Compare fused GL proto rendering against hybrid (CPU materialize + GL overlay).
     ///
     /// Both paths should produce visually similar output. Differences arise from
@@ -4160,6 +4550,107 @@ mod gl_tests {
         assert_eq!(dma_f16_packed_layout(320, 240), Some((80, 720, 640)));
     }
 
+    /// The int8 letterbox clear colour must be pre-biased (XOR 0x80) on EVERY
+    /// destination lowering: the int8 fragment shader biases rendered pixels
+    /// and the readback never adjusts the glClear'd letterbox region. The
+    /// former any→PBO and PBO→Mem paths skipped the bias, leaving their int8
+    /// letterbox fill 0x80 off versus the Mem→Mem result. Pin every PBO
+    /// src/dst combination's output byte-identical to the Mem→Mem oracle.
+    /// Runs only where image allocation resolves to PBO (Orin / PBO-transfer
+    /// targets); skipped elsewhere.
+    #[test]
+    fn pbo_int8_letterbox_matches_mem_oracle() {
+        use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - OpenGL backend unavailable: {e}", function!());
+                return;
+            }
+        };
+
+        let (sw, sh) = (64usize, 48usize);
+        let probe = proc
+            .create_image(sw, sh, PixelFormat::Rgba, DType::U8, None)
+            .unwrap();
+        if probe.memory() != TensorMemory::Pbo {
+            eprintln!(
+                "SKIPPED: {} - target does not allocate PBO images",
+                function!()
+            );
+            return;
+        }
+
+        let fill = |t: &TensorDyn| {
+            let mut map = t.as_u8().unwrap().map().unwrap();
+            for (i, px) in map.as_mut_slice().chunks_exact_mut(4).enumerate() {
+                px[0] = (i % 251) as u8;
+                px[1] = (i % 199) as u8;
+                px[2] = (i % 127) as u8;
+                px[3] = 255;
+            }
+        };
+        let src_pbo = probe;
+        fill(&src_pbo);
+        let src_mem = proc
+            .create_image(
+                sw,
+                sh,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+            )
+            .unwrap();
+        fill(&src_mem);
+
+        // 64×48 → 96×96 letterbox: 96×72 inner box, glClear'd bands above and
+        // below — the region whose int8 bias the PBO paths used to drop.
+        let lb = Crop::letterbox([114, 114, 114, 255]);
+        // Explicit `Some(Pbo)` requests are rejected (PBO backing exists only
+        // through auto-resolution), so the PBO destination is requested as
+        // `None` and the resolved memory asserted instead.
+        let mut convert_to_bytes = |src: &TensorDyn, dst_mem: TensorMemory, label: &str| {
+            let dst_req = match dst_mem {
+                TensorMemory::Pbo => None,
+                other => Some(other),
+            };
+            let mut dst = proc
+                .create_image(96, 96, PixelFormat::Rgb, DType::I8, dst_req)
+                .unwrap();
+            assert_eq!(dst.memory(), dst_mem, "{label}: dst backing not honoured");
+            proc.convert(src, &mut dst, Rotation::None, Flip::None, lb)
+                .unwrap_or_else(|e| panic!("{label} convert failed: {e}"));
+            dst.as_i8()
+                .unwrap()
+                .map()
+                .unwrap()
+                .as_slice()
+                .iter()
+                .map(|&v| v as u8)
+                .collect::<Vec<u8>>()
+        };
+
+        let oracle = convert_to_bytes(&src_mem, TensorMemory::Mem, "mem->mem");
+        for (src, src_name) in [(&src_mem, "mem"), (&src_pbo, "pbo")] {
+            for dst_mem in [TensorMemory::Mem, TensorMemory::Pbo] {
+                let label = format!("{src_name}->{dst_mem:?}");
+                let out = convert_to_bytes(src, dst_mem, &label);
+                assert_eq!(
+                    oracle, out,
+                    "{label}: int8 letterbox output diverged from mem->mem oracle"
+                );
+            }
+        }
+    }
+
     /// On-GPU round-trip: RGBA8 → F32 NHWC `[H,W,3]` PBO via the GL float
     /// render path. Forces the OpenGL backend (no CPU fallback) so the test
     /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
@@ -5176,10 +5667,153 @@ mod gl_tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    struct ColorimetryEnvGuard;
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl ColorimetryEnvGuard {
+        fn set(v: &str) -> Self {
+            std::env::set_var("EDGEFIRST_COLORIMETRY", v);
+            ColorimetryEnvGuard
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    impl Drop for ColorimetryEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("EDGEFIRST_COLORIMETRY");
+        }
+    }
+
+    /// HIGH-PERFORMANCE-default colorimetry policy (issue #106): under `auto`
+    /// a non-BT.601-limited single-plane NV12 DMA source takes the hardware
+    /// sampler on Vivante in the default [`ColorimetryMode::Fast`] (~12×
+    /// faster, driver's approximate fixed matrix) and the exact in-shader
+    /// path under the [`ColorimetryMode::Exact`] opt-in. On every other GPU
+    /// the in-shader path IS the fast path, so both modes pick it. Also pins:
+    /// BT.601-limited sources keep the sampler under Exact on Vivante (the
+    /// driver matrix matches exactly), and `EDGEFIRST_COLORIMETRY` wins over
+    /// the setter.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    fn colorimetry_mode_policy_nv12_auto() {
+        use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
+        use crate::ColorimetryMode;
+        use edgefirst_tensor::{ColorEncoding, ColorRange, Colorimetry};
+
+        if !is_dma_available() {
+            eprintln!("SKIPPED: {} - DMA not available", function!());
+            return;
+        }
+        let mut gl = match GLProcessorST::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+
+        let (w, h) = (64usize, 64usize);
+        let mut nv12 = vec![128u8; w * h * 3 / 2];
+        nv12[..w * h].fill(100);
+        let make_src = |enc: ColorEncoding, range: ColorRange| {
+            let mut src =
+                load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &nv12).unwrap();
+            src.set_colorimetry(Some(
+                Colorimetry::default().with_encoding(enc).with_range(range),
+            ));
+            src
+        };
+        let src_709 = make_src(ColorEncoding::Bt709, ColorRange::Full);
+        let src_601 = make_src(ColorEncoding::Bt601, ColorRange::Limited);
+        let mut dst =
+            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut path_for = |gl: &mut GLProcessorST, src: &TensorDyn| {
+            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            gl.last_nv_convert_path
+        };
+
+        // Fast (default): sampler on Vivante regardless of colorimetry,
+        // in-shader matrix everywhere else.
+        let expect_fast = if gl.is_vivante {
+            NvConvertPath::ExternalSampler
+        } else {
+            NvConvertPath::ShaderR8
+        };
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            expect_fast,
+            "Fast mode, BT.709-full NV12"
+        );
+
+        // Exact opt-in: the approximate sampler is off the table for a
+        // non-matching colorimetry — in-shader matrix everywhere…
+        gl.set_colorimetry_mode(ColorimetryMode::Exact);
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "Exact mode, BT.709-full NV12"
+        );
+        // …but a BT.601-limited source matches the Vivante driver matrix
+        // exactly, so the sampler carve-out survives Exact mode.
+        assert_eq!(
+            path_for(&mut gl, &src_601),
+            expect_fast,
+            "Exact mode, BT.601-limited NV12"
+        );
+
+        // A Grey destination must NEVER take the sampler, in either mode and
+        // for any colorimetry: samplerExternalOES → R8 render target wedges
+        // the Vivante GC7000UL (EDGEAI-1180 hang class; found when the Fast
+        // policy first routed nv12@dma→grey@dma to the sampler). ShaderR8 on
+        // every GPU. NOTE: this leg HANGS the board rather than failing if
+        // the gate regresses — keep it last-resort observable via the suite
+        // timeout.
+        let mut grey_dst =
+            TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut grey_path = |gl: &mut GLProcessorST, src: &TensorDyn| {
+            gl.convert(
+                src,
+                &mut grey_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .unwrap();
+            gl.last_nv_convert_path
+        };
+        gl.set_colorimetry_mode(ColorimetryMode::Fast);
+        assert_eq!(
+            grey_path(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "Fast mode, BT.709 NV12 → Grey must avoid the sampler (R8 target)"
+        );
+        gl.set_colorimetry_mode(ColorimetryMode::Exact);
+        assert_eq!(
+            grey_path(&mut gl, &src_601),
+            NvConvertPath::ShaderR8,
+            "Exact mode, BT.601-limited NV12 → Grey must avoid the sampler (R8 target)"
+        );
+
+        // EDGEFIRST_COLORIMETRY pins the mode for the processor's lifetime:
+        // a Fast request on an exact-pinned processor is kept at Exact.
+        drop(gl);
+        let _env = ColorimetryEnvGuard::set("exact");
+        let mut gl = GLProcessorST::new(None).unwrap();
+        gl.set_colorimetry_mode(ColorimetryMode::Fast);
+        assert_eq!(
+            path_for(&mut gl, &src_709),
+            NvConvertPath::ShaderR8,
+            "env-pinned Exact must override set_colorimetry_mode(Fast)"
+        );
+    }
+
     /// `EDGEFIRST_NV_CONVERT_PATH` selects the NV12 GPU conversion path.
     ///
-    /// - `auto` (default) and `shader` → `ShaderR8` (single-plane NV12 prefers
-    ///   the portable in-shader path).
+    /// - `auto` (default) follows the `ColorimetryMode::Fast` policy:
+    ///   `ExternalSampler` on Vivante (12× faster), `ShaderR8` everywhere
+    ///   else (the exact path is already the fast path). The full policy
+    ///   matrix is covered by `colorimetry_mode_policy_nv12_auto`.
+    /// - `shader` → `ShaderR8` always.
     /// - `sampler` → the driver `ExternalSampler` path is selected; the actual
     ///   recorded path is `ExternalSampler` on success or `Cpu` if the driver
     ///   rejects the NV12 EGLImage import — never `ShaderR8`.
@@ -5198,7 +5832,7 @@ mod gl_tests {
             bytes.push(80); // Cr
         }
 
-        let run = |env: Option<&str>| -> Option<NvConvertPath> {
+        let run = |env: Option<&str>| -> Option<(NvConvertPath, bool)> {
             // The env var is read once in `GLProcessorST::new`; the guard sets it
             // for exactly that construction and removes it on drop (panic-safe).
             let gl = {
@@ -5215,10 +5849,9 @@ mod gl_tests {
             };
             let mut src =
                 load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
-            // Tag full-range so the Vivante Auto carve-out (BT.601-LIMITED only)
-            // does NOT engage — keeps `auto → ShaderR8` deterministic on every
-            // platform, including Vivante (where BT.601-limited NV12 would
-            // otherwise correctly prefer ExternalSampler; see select_nv_path).
+            // Tag full-range (not BT.601-limited) so the `auto` leg exercises
+            // the colorimetry-mode policy: the default Fast mode still takes
+            // the sampler on Vivante, ShaderR8 everywhere else.
             src.set_colorimetry(Some(
                 edgefirst_tensor::Colorimetry::default()
                     .with_encoding(edgefirst_tensor::ColorEncoding::Bt709)
@@ -5229,24 +5862,29 @@ mod gl_tests {
                     .unwrap();
             gl.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
-            Some(gl.last_nv_convert_path)
+            Some((gl.last_nv_convert_path, gl.is_vivante))
         };
 
-        if let Some(p) = run(None) {
+        if let Some((p, is_vivante)) = run(None) {
+            let expect = if is_vivante {
+                // ColorimetryMode::Fast default: the 12×-faster sampler.
+                NvConvertPath::ExternalSampler
+            } else {
+                NvConvertPath::ShaderR8
+            };
             assert_eq!(
-                p,
-                NvConvertPath::ShaderR8,
-                "auto default: single-plane full-range NV12 must prefer ShaderR8"
+                p, expect,
+                "auto default: single-plane full-range NV12 policy pick"
             );
         }
-        if let Some(p) = run(Some("shader")) {
+        if let Some((p, _)) = run(Some("shader")) {
             assert_eq!(
                 p,
                 NvConvertPath::ShaderR8,
                 "forced shader must use ShaderR8"
             );
         }
-        if let Some(p) = run(Some("sampler")) {
+        if let Some((p, _)) = run(Some("sampler")) {
             assert_ne!(
                 p,
                 NvConvertPath::ShaderR8,
@@ -5370,6 +6008,12 @@ mod gl_tests {
                 return;
             }
         };
+        // This test pins the EXACT pipeline (in-shader matrix matching the
+        // CPU reference at chroma edges), so it opts into
+        // ColorimetryMode::Exact — under the default Fast policy a Vivante
+        // board would legitimately take the approximate driver sampler
+        // (covered by colorimetry_mode_policy_nv12_auto).
+        gl.set_colorimetry_mode(crate::ColorimetryMode::Exact);
         let mut src =
             load_raw_image(w, h, PixelFormat::Nv12, Some(TensorMemory::Dma), &bytes).unwrap();
         tag(&mut src);
@@ -5386,7 +6030,7 @@ mod gl_tests {
         assert_eq!(
             gl.last_nv_convert_path,
             NvConvertPath::ShaderR8,
-            "NV12→PlanarRgb must use the ShaderR8 two-pass (select_nv_path), not the driver sampler"
+            "NV12→PlanarRgb in Exact mode must use the ShaderR8 two-pass, not the driver sampler"
         );
 
         // Correctness: matches the CPU planar reference (the sampler did not).
