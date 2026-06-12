@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux GL float (F16/F32) preprocessing paths.
+//! GL float (F16/F32) preprocessing paths (Linux DMA-BUF + macOS IOSurface
+//! zero-copy targets, Tegra PBO targets).
 //!
 //! This is a child module of [`super`] (`gl::processor`) so the
 //! `impl GLProcessorST` block here can access the parent's PRIVATE fields
@@ -11,10 +12,13 @@
 //!
 //! Items grouped here:
 //! * [`float_render_support`] — reportable float-render capability.
-//! * [`dma_f16_packed_layout`] — Linux DMA packed-surface geometry (thin
+//! * [`dma_f16_packed_layout`] — packed zero-copy surface geometry (thin
 //!   wrapper over [`edgefirst_tensor::packed_rgba16f_layout`]).
 //! * The [`GLProcessorST`] float render methods: `convert_float_to_pbo`,
-//!   `convert_float_to_zero_copy`, `upload_float_src`, `draw_float_quad`.
+//!   `convert_float_to_zero_copy`, `render_float_to_zero_copy_tail` (the
+//!   dst-import/draw half, shared with the fused NV→PlanarF16 two-pass —
+//!   its source is the GPU-resident intermediate texture),
+//!   `upload_float_src`, `draw_float_quad`.
 
 use std::ffi::{c_void, CStr};
 

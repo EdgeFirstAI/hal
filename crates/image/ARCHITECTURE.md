@@ -725,6 +725,23 @@ direct RGBA → PlanarRgb. The two-pass path is selected automatically when
 Planar`; the function is `convert_nv_to_planar_two_pass`. No API changes
 required from callers.
 
+**Multi-pass invariant.** Every multi-pass GL flow keeps its intermediate
+GPU-resident — a pass renders into an engine-internal texture that the
+next pass samples; a pass never reads back so a later pass can re-upload.
+The four pass-structured flows and their intermediates:
+
+| Flow | Intermediate | Sync between passes |
+|---|---|---|
+| `convert_to_packed_rgb` | `packed_rgb_intermediate_tex` | none (same-context ordering) |
+| `convert_nv_to_planar_two_pass` (Vivante) | `packed_rgb_intermediate_tex` | none |
+| `convert_nv_to_planar_float_two_pass` | `packed_rgb_intermediate_tex` | none (one fence at end) |
+| `render_proto_int8_two_pass` | `proto_dequant_texture` (RGBA16F array, persistent FBO) | none |
+
+`glReadPixels` appears only at **endpoints** (a heap/PBO destination the
+caller handed us); uploads appear only at **ingestion** (a tensor source
+the caller handed us). Anything between source bind and destination
+write stays on the GPU.
+
 ## Mask Rendering
 
 YOLO segmentation models produce **proto masks** (shared basis at reduced
