@@ -1008,7 +1008,8 @@ when the worker starts:
 | Driver | Policy | Effect |
 |---|---|---|
 | Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behavior on every platform). |
-| Mali/Panfrost, V3D, Tegra, llvmpipe | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
+| Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
+| Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 
 Override with `EDGEFIRST_GL_SERIALIZE=full|lifecycle` — `full` is the
 escape hatch for unknown-bad drivers (or tiny-convert-heavy

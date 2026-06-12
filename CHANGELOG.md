@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Virtualized GPUs get the Full GL serialization policy**
+  (`edgefirst-image`): on paravirtual Metal (e.g. GitHub's macOS CI
+  runners, macOS VMs) concurrent GL across per-processor contexts
+  mis-renders — parallel converts produced 60–86% diverged output
+  bytes against each processor's own sequential oracle. Renderers
+  matching `Paravirtual`/`virtio` in `GL_RENDERER` now serialize
+  per-message like Vivante (`EDGEFIRST_GL_SERIALIZE=lifecycle`
+  overrides); real Apple GPUs keep full parallelism. Surfaced by the
+  parallel-correctness gate once the `glReadnPixels` fix below made
+  its converts genuinely GPU-executed on macOS.
+
 - **GL readbacks on macOS used an ES 3.2-only entry point**
   (`edgefirst-image`): every heap-destination readback called
   `glReadnPixels`, which ANGLE/Metal (ES 3.0) rejects with

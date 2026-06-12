@@ -266,6 +266,12 @@ pub struct GLProcessorST {
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
+    /// Whether the GPU is a virtualized/paravirtual device (GL_RENDERER).
+    /// Concurrent GL across contexts mis-renders on paravirtual Metal
+    /// (observed on macOS CI runners: parallel processors produce ~60-86%
+    /// diverged output bytes); such devices get the Full serialization
+    /// policy, like Vivante.
+    is_virtual_gpu: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -709,6 +715,45 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
     is_software_renderer && !override_enabled
 }
 
+/// GL_RENDERER-derived driver traits that feed per-driver policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RendererTraits {
+    /// Verisilicon/Vivante core — GPU-hang workarounds + Full serialization.
+    vivante: bool,
+    /// Software rasterizer (llvmpipe/softpipe/swrast) — rejected unless the
+    /// coverage-lane override is set.
+    software: bool,
+    /// Virtualized/paravirtual GPU — concurrent GL across contexts
+    /// mis-renders (observed: Apple Paravirtual device on macOS CI runners);
+    /// gets the Full serialization policy.
+    virtual_gpu: bool,
+}
+
+/// Capability probe results from a freshly-current GL context
+/// (`gl_check_support`): extension-derived feature flags plus the
+/// GL_RENDERER-derived driver traits.
+struct GlSupport {
+    has_float_linear: bool,
+    has_bgra: bool,
+    renderer: RendererTraits,
+    supports_f32_color: bool,
+    supports_f16_color: bool,
+}
+
+/// Classify a GL_RENDERER string into driver-policy traits. Pure —
+/// unit-testable without a GL context.
+fn classify_renderer(renderer: &str) -> RendererTraits {
+    let lower = renderer.to_ascii_lowercase();
+    RendererTraits {
+        vivante: lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore"),
+        software: lower.contains("llvmpipe")
+            || lower.contains("softpipe")
+            || lower.contains("swrast")
+            || lower.contains("software rasterizer"),
+        virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
+    }
+}
+
 impl GLProcessorST {
     /// Issue the single batched GPU sync if a `convert_deferred` is still owed,
     /// then clear the pending flag. No-op when nothing is pending. Used by both
@@ -738,14 +783,18 @@ impl GLProcessorST {
         // eglGetProcAddress; macOS loaded at shared-display init already.
         Platform::load_gl_once(&gl_context);
 
-        let (
+        let GlSupport {
             has_float_linear,
             has_bgra,
-            is_vivante,
-            is_software_renderer,
+            renderer:
+                RendererTraits {
+                    vivante: is_vivante,
+                    software: is_software_renderer,
+                    virtual_gpu: is_virtual_gpu,
+                },
             supports_f32_color,
             supports_f16_color,
-        ) = Self::gl_check_support()?;
+        } = Self::gl_check_support()?;
 
         // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
         // implementations that are slower and less capable than our native CPU
@@ -1049,6 +1098,7 @@ impl GLProcessorST {
             dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
             is_vivante,
+            is_virtual_gpu,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -1927,37 +1977,30 @@ impl GLProcessorST {
         }
     }
 
-    /// Query GL capabilities and detect GPU vendor/renderer type.
-    ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer,
-    /// supports_f32_color, supports_f16_color)`. The two float-color flags
-    /// report whether the GPU can render to F32 / F16 color attachments
-    /// (independent extensions: a configuration may have one but not the
-    /// other). On this Linux backend they are forward-compat capability
-    /// probes surfaced via `RenderDtypeSupport`; the macOS IOSurface path
-    /// is the only render destination that consumes float dtypes today.
-    fn gl_check_support() -> Result<(bool, bool, bool, bool, bool, bool), crate::Error> {
+    /// Query GL capabilities and detect GPU vendor/renderer type — see
+    /// [`GlSupport`]. The two float-color flags report whether the GPU can
+    /// render to F32 / F16 color attachments (independent extensions: a
+    /// configuration may have one but not the other), surfaced via
+    /// `RenderDtypeSupport`.
+    fn gl_check_support() -> Result<GlSupport, crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
         }
 
-        // Detect GPU vendor and software renderers via GL_RENDERER string.
-        let (is_vivante, is_software_renderer) = gls::get_string(gls::gl::RENDERER)
+        // Detect GPU vendor / software / virtualized renderers via GL_RENDERER.
+        let traits = gls::get_string(gls::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
-                let lower = r.to_ascii_lowercase();
-                let vivante = lower.contains("vivante")
-                    || lower.contains("gc7000")
-                    || lower.contains("galcore");
-                let software = lower.contains("llvmpipe")
-                    || lower.contains("softpipe")
-                    || lower.contains("swrast")
-                    || lower.contains("software rasterizer");
-                (vivante, software)
+                classify_renderer(&r)
             })
-            .unwrap_or((false, false));
+            .unwrap_or_default();
+        let RendererTraits {
+            vivante: is_vivante,
+            software: is_software_renderer,
+            virtual_gpu: is_virtual_gpu,
+        } = traits;
         if is_vivante {
             log::warn!(
                 "Vivante GPU detected — NV12 → planar RGB conversions will use \
@@ -1969,6 +2012,15 @@ impl GLProcessorST {
                 "Software OpenGL renderer detected — GPU backend will be disabled. \
                  Image processing will use the CPU backend instead. \
                  Check EGL ICD configuration if a hardware GPU is expected."
+            );
+        }
+        if is_virtual_gpu {
+            log::warn!(
+                "Virtualized GPU detected — concurrent GL across contexts \
+                 mis-renders on paravirtual Metal (observed on macOS CI \
+                 runners); processors will serialize per-message (Full \
+                 policy, same as Vivante). Override with \
+                 EDGEFIRST_GL_SERIALIZE=lifecycle."
             );
         }
 
@@ -2029,14 +2081,13 @@ impl GLProcessorST {
         log::debug!("GL_EXT_color_buffer_float: {supports_f32_color}");
         log::debug!("GL_EXT_color_buffer_half_float: {supports_f16_color}");
 
-        Ok((
+        Ok(GlSupport {
             has_float_linear,
             has_bgra,
-            is_vivante,
-            is_software_renderer,
+            renderer: traits,
             supports_f32_color,
             supports_f16_color,
-        ))
+        })
     }
 
     /// Invalidate EGL binding state on all destination textures.
@@ -6445,7 +6496,10 @@ impl GLProcessorST {
         super::platform::PlatformCaps {
             transfer_backend: self.gl_context.transfer_backend,
             render_dtypes: self.supported_render_dtypes(),
-            serialize_gl: self.is_vivante(),
+            // Full per-message serialization where concurrent GL across
+            // contexts is unsafe: Vivante/galcore (driver races) and
+            // virtualized GPUs (paravirtual Metal mis-renders).
+            serialize_gl: self.is_vivante() || self.is_virtual_gpu,
             external_oes: Platform::EXTERNAL_OES,
         }
     }
@@ -6478,5 +6532,43 @@ mod tests {
         // A hardware renderer is never rejected, override or not.
         assert!(!should_reject_software_gl(false, false));
         assert!(!should_reject_software_gl(false, true));
+    }
+
+    // Real GL_RENDERER strings from the fleet: classification drives the
+    // Vivante workarounds, the software-GL rejection, and the Full
+    // serialization policy (Vivante + virtualized GPUs).
+    #[test]
+    fn classify_renderer_fleet_strings() {
+        use super::{classify_renderer, RendererTraits};
+        let real_gpu = RendererTraits::default();
+
+        // imx8mp (Vivante GC7000UL)
+        let t = classify_renderer("Vivante GC7000UL");
+        assert!(t.vivante && !t.software && !t.virtual_gpu);
+        // Apple Silicon via ANGLE (developer machines)
+        assert_eq!(
+            classify_renderer(
+                "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, \
+                 Version 26.4.1 (Build 25E253))"
+            ),
+            real_gpu
+        );
+        // Mali / V3D / Tegra: plain hardware
+        assert_eq!(classify_renderer("Mali-G310"), real_gpu);
+        assert_eq!(classify_renderer("V3D 7.1"), real_gpu);
+        assert_eq!(
+            classify_renderer("NVIDIA Tegra Orin (nvgpu)/integrated"),
+            real_gpu
+        );
+        // Mesa software rasterizer (CI coverage lane)
+        let t = classify_renderer("llvmpipe (LLVM 15.0.7, 256 bits)");
+        assert!(t.software && !t.vivante && !t.virtual_gpu);
+        // GitHub macOS runner: virtualized Metal — concurrent GL across
+        // contexts mis-renders there; must select the Full policy.
+        let t = classify_renderer(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, \
+             Version 15.7.7 (Build 24G720))",
+        );
+        assert!(t.virtual_gpu && !t.software && !t.vivante);
     }
 }

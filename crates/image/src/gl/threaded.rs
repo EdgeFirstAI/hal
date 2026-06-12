@@ -339,11 +339,24 @@ impl GLProcessorThreaded {
                 }
             );
             while let Some(msg) = recv.blocking_recv() {
+                // Full policy: one processor's message at a time, process-wide.
+                // Linux locks GL_MUTEX (messages must also exclude the locked
+                // lifecycle operations — on Vivante a convert racing a context
+                // bring-up is part of the driver bug class). macOS has no
+                // lifecycle lock (ANGLE serializes display entry points
+                // internally), so message-vs-message exclusion suffices —
+                // needed on virtualized GPUs, where concurrent GL across
+                // contexts mis-renders (paravirtual Metal, macOS CI runners).
                 #[cfg(target_os = "linux")]
                 let _guard = serialize_per_msg.then(|| {
                     super::context::GL_MUTEX
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
+                });
+                #[cfg(target_os = "macos")]
+                let _guard = serialize_per_msg.then(|| {
+                    static MSG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                    MSG_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
                 });
 
                 // After a panic, the GL context is in an undefined state. Reject
