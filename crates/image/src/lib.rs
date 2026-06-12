@@ -8401,6 +8401,209 @@ mod image_tests {
         });
     }
 
+    /// THE parallel-processors demonstration test: 4 ImageProcessors on 4
+    /// threads, each with its own GL context and worker, converting
+    /// per-thread-DISTINCT synthetic inputs concurrently (barrier-released);
+    /// every output must byte-match the thread's own pre-barrier sequential
+    /// oracle from the same processor. On LifecycleOnly platforms (Mali,
+    /// V3D, Tegra, llvmpipe, macOS) the converts genuinely overlap on the
+    /// GPU; on Vivante they serialize via the Full policy and the test still
+    /// must pass. Distinct inputs make any cross-processor state leakage
+    /// (wrong texture, wrong context, clobbered upload) visible as a byte
+    /// diff rather than a coincidental match — proven by a scratch
+    /// cross-wire run (neighbor's input post-oracle) failing on every
+    /// thread with ~53% of bytes diverged.
+    ///
+    /// Skipped under EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS like
+    /// `test_multiple_image_processors_separate_threads`: the galcore driver
+    /// can abort intermittently on concurrent multi-processor lifecycles
+    /// regardless of locking (P0 spike: reproduces fully serialized).
+    #[test]
+    fn test_parallel_processors_unique_outputs() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        const N: usize = 4;
+        const ROUNDS: usize = 25;
+        const TIMEOUT: Duration = Duration::from_secs(60);
+
+        if std::env::var_os("EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS").is_some() {
+            eprintln!(
+                "SKIPPED: test_parallel_processors_unique_outputs — known Vivante \
+                 GC7000UL concurrent-multi-processor driver abort \
+                 (EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS set)"
+            );
+            return;
+        }
+
+        let _lock = acquire_env_lock();
+        let (tx, rx) = mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            let barrier = Arc::new(Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
+                            panic!("ImageProcessor::new() failed on thread {i}: {e}")
+                        });
+                        // CI-weight geometry (llvmpipe renders on the CPU).
+                        let (w, h) = (640usize, 480usize);
+                        let mem = if edgefirst_tensor::is_dma_available() {
+                            Some(TensorMemory::Dma)
+                        } else {
+                            Some(TensorMemory::Mem)
+                        };
+                        let src = proc
+                            .create_image(w, h, PixelFormat::Nv12, DType::U8, mem)
+                            .unwrap();
+                        {
+                            let t = src.as_u8().unwrap();
+                            let mut m = t.map().unwrap();
+                            let s = m.as_mut_slice();
+                            for (j, b) in s[..w * h].iter_mut().enumerate() {
+                                *b = ((i * 53 + j) % 200 + 16) as u8;
+                            }
+                            for b in &mut s[w * h..] {
+                                *b = (80 + i * 24) as u8;
+                            }
+                        }
+                        let lb = Crop::letterbox([114, 114, 114, 255]);
+                        let convert_once = |proc: &mut ImageProcessor| -> Vec<u8> {
+                            let mut dst = proc
+                                .create_image(320, 320, PixelFormat::Rgba, DType::U8, mem)
+                                .unwrap();
+                            proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                                .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
+                            let t = dst.as_u8().unwrap();
+                            let m = t.map().unwrap();
+                            m.as_slice().to_vec()
+                        };
+
+                        let oracle = convert_once(&mut proc);
+                        barrier.wait();
+                        for round in 0..ROUNDS {
+                            let out = convert_once(&mut proc);
+                            let diffs = oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
+                            assert!(
+                                diffs == 0,
+                                "thread {i} round {round}: {diffs}/{} bytes diverged \
+                                 from this processor's own oracle — cross-processor \
+                                 GL state leakage under parallel execution",
+                                oracle.len()
+                            );
+                        }
+                    })
+                })
+                .collect();
+
+            for (i, h) in handles.into_iter().enumerate() {
+                h.join()
+                    .unwrap_or_else(|e| panic!("parallel thread {i} panicked: {e:?}"));
+            }
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(TIMEOUT).unwrap_or_else(|_| {
+            panic!("test_parallel_processors_unique_outputs timed out after {TIMEOUT:?}")
+        });
+    }
+
+    /// Heavy on-demand stressor for the GL serialization policy: 4
+    /// processors × 4 threads × barrier × 200 NV12 720p → RGB 640 letterbox
+    /// converts (DMA where available); every output must byte-match the
+    /// thread's own pre-barrier sequential oracle from the same processor.
+    /// Ignored by default (heavy; board tool — the CI-weight version is
+    /// `test_parallel_processors_unique_outputs`). Run explicitly, optionally
+    /// pinning the policy via EDGEFIRST_GL_SERIALIZE=full|lifecycle:
+    ///   <test binary> stress_parallel_processors_oracle --ignored
+    #[test]
+    #[ignore = "heavy on-demand GL-parallelism stressor; run explicitly on boards"]
+    fn stress_parallel_processors_oracle() {
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::Duration;
+
+        const N: usize = 4;
+        const ROUNDS: usize = 200;
+        const TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _lock = acquire_env_lock();
+        let (tx, rx) = mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            let barrier = Arc::new(Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let mut proc = ImageProcessor::new().unwrap_or_else(|e| {
+                            panic!("ImageProcessor::new() failed on thread {i}: {e}")
+                        });
+                        let (w, h) = (1280usize, 720usize);
+                        let mem = if edgefirst_tensor::is_dma_available() {
+                            Some(TensorMemory::Dma)
+                        } else {
+                            Some(TensorMemory::Mem)
+                        };
+
+                        // Per-thread-distinct synthetic NV12 so cross-wired
+                        // GL state between processors shows up as a byte diff.
+                        let src = proc
+                            .create_image(w, h, PixelFormat::Nv12, DType::U8, mem)
+                            .unwrap();
+                        {
+                            let t = src.as_u8().unwrap();
+                            let mut m = t.map().unwrap();
+                            let s = m.as_mut_slice();
+                            for (j, b) in s[..w * h].iter_mut().enumerate() {
+                                *b = ((i * 37 + j) % 200 + 16) as u8;
+                            }
+                            for b in &mut s[w * h..] {
+                                *b = (96 + i * 16) as u8;
+                            }
+                        }
+                        let lb = Crop::letterbox([114, 114, 114, 255]);
+
+                        let convert_once = |proc: &mut ImageProcessor| -> Vec<u8> {
+                            let mut dst = proc
+                                .create_image(640, 640, PixelFormat::Rgb, DType::U8, mem)
+                                .unwrap();
+                            proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
+                                .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
+                            let t = dst.as_u8().unwrap();
+                            let m = t.map().unwrap();
+                            m.as_slice().to_vec()
+                        };
+
+                        let oracle = convert_once(&mut proc);
+                        barrier.wait();
+                        for round in 0..ROUNDS {
+                            let out = convert_once(&mut proc);
+                            let diffs = oracle.iter().zip(&out).filter(|(a, b)| a != b).count();
+                            assert!(
+                                diffs == 0,
+                                "thread {i} round {round}: {diffs}/{} bytes diverged \
+                                 from the pre-barrier oracle",
+                                oracle.len()
+                            );
+                        }
+                    })
+                })
+                .collect();
+
+            for (i, h) in handles.into_iter().enumerate() {
+                h.join()
+                    .unwrap_or_else(|e| panic!("stressor thread {i} panicked: {e:?}"));
+            }
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(TIMEOUT).unwrap_or_else(|_| {
+            panic!("stress_parallel_processors_oracle timed out after {TIMEOUT:?}")
+        });
+    }
+
     // =========================================================================
     // F16 / F32 auto-chain fallback integration tests
     // =========================================================================

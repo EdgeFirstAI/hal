@@ -315,12 +315,32 @@ impl GLProcessorThreaded {
                 gl_converter.is_vivante(),
             )));
             let mut poisoned = false;
+            // Per-message serialization policy: Full on Vivante (galcore is
+            // not thread-safe for concurrent GL across contexts),
+            // LifecycleOnly everywhere else — multiple processors then run
+            // GL work in parallel, each on its own thread + context. See the
+            // GL_MUTEX doc comment in context.rs. EDGEFIRST_GL_SERIALIZE
+            // overrides per-driver defaults (full = escape hatch for
+            // unknown-bad drivers; lifecycle = force-parallel).
+            let serialize_per_msg = match std::env::var("EDGEFIRST_GL_SERIALIZE").as_deref() {
+                Ok("full") => true,
+                Ok("lifecycle") => false,
+                _ => gl_converter.is_vivante(),
+            };
+            log::debug!(
+                "GL serialization policy: {}",
+                if serialize_per_msg {
+                    "Full (per-message global lock)"
+                } else {
+                    "LifecycleOnly (parallel across processors)"
+                }
+            );
             while let Some(msg) = recv.blocking_recv() {
-                // Serialize all GL operations across GLProcessorST instances.
-                // See `GL_MUTEX` doc comment in context.rs for rationale.
-                let _guard = super::context::GL_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let _guard = serialize_per_msg.then(|| {
+                    super::context::GL_MUTEX
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                });
 
                 // After a panic, the GL context is in an undefined state. Reject
                 // all subsequent messages with an error rather than risking wrong

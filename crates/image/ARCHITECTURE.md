@@ -985,59 +985,79 @@ wrapper (`ManuallyDrop`), and the shared EGL display
 the OS reclaims them at exit. GPU contexts, DMA buffers, and G2D
 contexts are released eagerly by their `Drop` impls.
 
-## GL Command Serialization (GL_MUTEX)
+## GL Concurrency Model (serialization policy)
 
-Multiple `ImageProcessor` instances can coexist in the same process. EGL
-and OpenGL ES specify that independent contexts on separate threads should
-not interfere, but several embedded GPU drivers violate this:
+Multiple `ImageProcessor` instances coexist in one process, each owning a
+dedicated GL worker thread and its own EGL context (held current for the
+thread's life) on the process-global shared display. Whether those
+workers execute GPU work **in parallel** is a per-driver policy decided
+when the worker starts:
 
-- **Vivante `galcore` (i.MX 8M Plus)** — concurrent `eglInitialize`,
-  `eglCreateContext`, DMA-BUF import ioctls, and `eglTerminate` from
-  multiple threads corrupt driver-internal state. Causes SIGSEGV (null
-  pointer at offset `0x18` in `galcore` ioctl) and futex deadlocks.
-- **Broadcom V3D 7.1.10.2 (Raspberry Pi 5)** — concurrent `eglTerminate`
-  breaks ref-counting, causing `EGL(NotInitialized)` on surviving
-  contexts; subsequent GL operations fail with `GL_INVALID_OPERATION`.
-- **ARM Mali-G310 (i.MX 95)** — Panfrost handles concurrent EGL/GL
-  correctly. No issues observed.
+| Driver | Policy | Effect |
+|---|---|---|
+| Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behavior on every platform). |
+| Mali/Panfrost, V3D, Tegra, llvmpipe | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 
-### Solution
+Override with `EDGEFIRST_GL_SERIALIZE=full|lifecycle` — `full` is the
+escape hatch for unknown-bad drivers (or tiny-convert-heavy
+multi-processor workloads on Tegra, below); `lifecycle` forces
+parallelism for experiments.
 
-A global `GL_MUTEX` (`std::sync::Mutex<()>` in
-[`crates/image/src/gl/context.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/context.rs))
-serializes **all** EGL and GL operations across every `GLProcessorST`
-instance. Acquired in three places:
+### Why Vivante serializes
 
-1. **Initialization** — wraps `GLProcessorST::new()` (display creation,
+EGL/GLES specify that independent contexts on separate threads must not
+interfere; Vivante `galcore` violates this — concurrent `eglInitialize`,
+`eglCreateContext`, DMA-BUF import ioctls, and runtime GL from multiple
+threads corrupt driver-internal state (SIGSEGV at offset `0x18` in
+`galcore` ioctl, futex deadlocks). Separately, concurrent multi-processor
+*lifecycles* can abort intermittently (`double free or corruption`) even
+when fully serialized — the 2026-06 lock-scoping spike reproduced it
+under `Full` policy, implicating driver thread-exit TLS destructors that
+no userspace lock can order. That known bug keeps the
+`EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS` test skip.
+
+### What stays globally serialized everywhere
+
+1. **Initialization** — `GLProcessorST::new()` (display probe/creation,
    context setup, shader compilation, DMA-BUF roundtrip verification).
-2. **Message dispatch** — wraps every incoming GL-thread message
-   (convert, draw masks, PBO create/download, etc.) so only one GL thread
-   executes driver calls at a time.
-3. **Teardown** — wraps `GLProcessorST::drop()` → `GlContext::drop()`
-   so `eglDestroyContext` (and `eglMakeCurrent(EGL_NO_CONTEXT)`) are
-   serialized. The shared display is never terminated, so teardown
-   does not race against display state.
+   Also makes the once-per-process GL function-pointer load race-free.
+2. **Teardown** — `GLProcessorST::drop()` → `GlContext::drop()`
+   (`eglDestroyContext` serialization; V3D historically broke display
+   ref-counting on concurrent `eglTerminate`, which the HAL additionally
+   avoids by never terminating the shared display).
+3. **EGLImage create/destroy** — a dedicated short `EGL_IMAGE_MUTEX`
+   (display-level EGL ops; a separate mutex because `Full`-policy
+   workers already hold `GL_MUTEX` at creation time). Zero steady-state
+   cost: imports are cache-miss-only after warmup.
 
-The mutex uses `unwrap_or_else(|e| e.into_inner())` to recover from
-poisoning: if a prior GL operation panicked, subsequent operations on
-other instances can still proceed rather than propagating a poison error.
+All mutexes recover from poisoning via `unwrap_or_else(into_inner)` so a
+panicked instance does not poison the others.
 
-### Performance implications
+### Measured scaling (parallel_processors_benchmark, 2026-06)
 
-All GL operations are serialized — no concurrent GPU execution across
-`ImageProcessor` instances. Acceptable because:
+`S(n)` = aggregate throughput with `n` processors ÷ single-processor
+baseline, NV12 720p → RGB 640×640 letterbox (DMA):
 
-- The primary use case (edge AI inference pipelines) typically uses a
-  single processor per pipeline. Multiple instances exist mainly in test
-  scenarios.
-- GPU operations are I/O-bound on embedded targets; mutex overhead
-  (microseconds) is negligible compared to DMA transfers and shader
-  execution (milliseconds).
-- The alternative (concurrent GPU access) crashes on Vivante.
+| Board | S(2) | S(4) | Notes |
+|---|---|---|---|
+| imx95 (Mali G310) | 2.00 | 2.05 | near-ideal until GPU saturates |
+| rpi5 (V3D) | 1.16 | 1.16 | V3D saturates ≈750 conv/s |
+| orin (Tegra) | 1.08 | 1.17 | |
+| imx8mp (Vivante, `Full`) | 1.03 | 1.04 | flat by design |
 
-Future work could relax to init/teardown-only serialization on drivers
-known to be safe for concurrent runtime ops (e.g. Mali), but the current
-approach prioritizes correctness across all targets.
+Dispatch-dominated 64×64 converts additionally show rpi5 S(4)=2.24 and
+imx95 S(4)=1.52 — but **Tegra collapses on that degenerate cell**
+(S(2)=0.26): per-convert syncs force GPU context switches between active
+contexts and the ~0.45 ms switch cost dwarfs sub-100 µs converts
+(corroborated: `EDGEFIRST_GL_SERIALIZE=full` restores the cell to 0.83).
+Realistic converts scale positively on the same board; use the `full`
+override if a deployment really does hammer tiny converts from many
+processors on Tegra.
+
+Correctness under parallelism is pinned by
+`test_parallel_processors_unique_outputs` (4 processors × distinct
+inputs × barrier × per-processor oracles, run on every lane) and the
+ignored on-demand `stress_parallel_processors_oracle` board tool.
 
 ## Tracing Spans
 
@@ -1269,7 +1289,7 @@ Python surface to supply colorimetry from the producer's signalling into
 |--------------|----------------|
 | Reuse tensors across frames | Each new tensor allocates a fresh `BufferIdentity`. The EGL image cache is keyed by `BufferIdentity.id`/`chroma_id` plus the import geometry (`width`/`height`/`row_stride`/`format`). New ID → cache miss → full `eglCreateImageKHR` import (~100–300 µs). Hold tensors alive. Batch tiles key on the parent's identity+geometry, so the destination EGLImage is imported once and reused across the tile loop. |
 | Allocate via `create_image()` | The processor selects DMA-buf, PBO, or heap based on the runtime GPU probe at `new()` time. Bypassing with `Tensor::new(memory=...)` forces a slow transfer path on every `convert()`. |
-| One `ImageProcessor` per pipeline | Each instance owns its OpenGL context, GL thread, and per-thread caches (the EGL display is process-global and shared). Multiple instances still serialize on `GL_MUTEX`, so concurrent use across instances buys nothing. |
+| One `ImageProcessor` per pipeline; more pipelines = more processors | Each instance owns its OpenGL context, dedicated GL thread, and per-thread caches (the EGL display is process-global and shared). On Mali, V3D, Tegra, and llvmpipe, instances execute GPU work **in parallel** (see "GL Concurrency Model" — measured up to S(4)=2.05 aggregate scaling on Mali); only Vivante serializes across instances. Within one instance, work is serialized on its own thread — share a processor across threads only behind your own queue. |
 | Native CPU feature builds (Rule 6) | A build-time concern. `RUSTFLAGS` controls whether the f16 mask kernel at [`crates/image/src/cpu/masks.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/cpu/masks.rs) compiles to native widening instructions or to the soft-float `__extendhfsf2` helper. Distributed binaries stay on triple baseline ISA; benchmark hosts opt in via `RUSTFLAGS` overrides. |
 
 See the [Optimization Guide](https://github.com/EdgeFirstAI/hal/blob/main/README.md#optimization-guide)
