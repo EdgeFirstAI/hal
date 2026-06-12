@@ -6333,25 +6333,20 @@ impl GLProcessorST {
         let h = src.height().ok_or(Error::NotAnImage)?;
         let _span = tracing::trace_span!("image.convert.gl.nv_to_planar_float", w, h).entered();
 
-        // Reuse (or allocate) the intermediate: zero-copy where the
-        // platform allocates it (IOSurface/DMA), heap otherwise.
+        // Reuse (or allocate) the intermediate. Heap (not zero-copy)
+        // deliberately: pass 2 uploads its source from a CPU map, and
+        // mapping a buffer the GPU just rendered is not cache-coherent on
+        // Mali/V3D; the pass-1 readback into heap is coherent everywhere.
+        // Zero-copy pass chaining needs a float-path SOURCE import
+        // (tracked follow-up).
         if !matches!(&self.float_two_pass_intermediate, Some((iw, ih, _)) if *iw == w && *ih == h) {
             let interm = TensorDyn::image(
                 w,
                 h,
                 PixelFormat::Rgba,
                 edgefirst_tensor::DType::U8,
-                Some(TensorMemory::Dma),
-            )
-            .or_else(|_| {
-                TensorDyn::image(
-                    w,
-                    h,
-                    PixelFormat::Rgba,
-                    edgefirst_tensor::DType::U8,
-                    Some(TensorMemory::Mem),
-                )
-            })?;
+                Some(TensorMemory::Mem),
+            )?;
             self.float_two_pass_intermediate = Some((w, h, interm));
         }
         let (iw, ih, mut interm) = self

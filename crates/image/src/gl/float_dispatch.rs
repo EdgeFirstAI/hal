@@ -16,12 +16,10 @@
 //! render targets: a macOS IOSurface tensor reports `TensorMemory::Dma`
 //! (IOSurface shares the `Dma` memory slot), so the same
 //! `(Rgba, PlanarRgb, F16, Dma)` tuple that selects the Linux DMA-BUF render
-//! selects the IOSurface render once the engine runs on macOS — which buffer
-//! object backs the render is the platform seam's business
-//! (`GlPlatform::import_buffer`), not the classifier's. Until the legacy
-//! `macos_processor` is deleted, its inline `(src, dst, dtype)` match remains
-//! the macOS dispatch; this classifier is the single definition both
-//! converge on.
+//! selects the IOSurface render on macOS — which buffer object backs the
+//! render is the platform seam's business (`GlPlatform::import_buffer`),
+//! not the classifier's. The unified engine runs on both platforms, and
+//! this classifier is its single float-path dispatch.
 //!
 //! No GL/EGL/gbm types appear in this module — it matches purely on
 //! [`edgefirst_tensor`] pixel/dtype/memory enums plus the reported

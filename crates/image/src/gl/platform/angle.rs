@@ -377,7 +377,8 @@ impl GlPlatform for AngleClientBuffer {
         _handle: egl::Surface,
     ) -> Result<()> {
         Err(Error::NotSupported(
-            "renderbuffer import targets are not available on ANGLE/Metal              (EDGEFIRST_OPENGL_RENDERSURFACE has no effect on macOS)"
+            "renderbuffer import targets are not available on ANGLE/Metal \
+             (EDGEFIRST_OPENGL_RENDERSURFACE has no effect on macOS)"
                 .into(),
         ))
     }
