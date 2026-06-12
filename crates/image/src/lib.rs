@@ -3613,8 +3613,12 @@ mod image_tests {
     #[test]
     #[cfg(feature = "opengl")]
     fn gl_backend_available_canary() {
-        if std::env::var_os("HAL_TEST_REQUIRE_GL").is_none_or(|v| v != "1") {
-            eprintln!("SKIPPED: {} — HAL_TEST_REQUIRE_GL unset", function!());
+        let require_gl = std::env::var("HAL_TEST_REQUIRE_GL").is_ok_and(|v| v == "1");
+        if !require_gl {
+            eprintln!(
+                "SKIPPED: {} — HAL_TEST_REQUIRE_GL is not set to 1",
+                function!()
+            );
             return;
         }
         #[cfg(target_os = "macos")]
