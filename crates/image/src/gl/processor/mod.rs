@@ -697,7 +697,11 @@ impl GLProcessorST {
     }
 
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
-        let gl_context = GlContext::new(kind)?;
+        // Display bring-up goes through the platform seam — the contract a
+        // future platform (Windows/ANGLE) implements instead of forking this
+        // engine. On Linux this delegates straight to `GlContext::new`.
+        let gl_context =
+            <super::platform::Platform as super::platform::GlPlatform>::init_display(kind)?;
         // Load the GL function pointers exactly once per process (the same
         // pattern as macOS's GL_LOADED). `gls` bindings are gl_generator
         // `static mut` function-pointer tables, so re-running `load_with` on
@@ -6222,6 +6226,18 @@ impl GLProcessorST {
             self.supports_f32_color,
             self.supports_f16_color,
         )
+    }
+
+    /// Assemble the immutable capability surface for this processor.
+    /// Captured ONCE by the dispatch wrapper at worker startup (before its
+    /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
+    /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
+    pub(super) fn platform_caps(&self) -> super::platform::PlatformCaps {
+        super::platform::PlatformCaps {
+            transfer_backend: self.gl_context.transfer_backend,
+            render_dtypes: self.supported_render_dtypes(),
+            serialize_gl: self.is_vivante(),
+        }
     }
 }
 

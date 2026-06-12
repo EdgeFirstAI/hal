@@ -257,14 +257,10 @@ pub struct GLProcessorThreaded {
 
     // This is only None when the converter is being dropped.
     sender: Option<Sender<GLProcessorMessage>>,
-    transfer_backend: TransferBackend,
-    /// Float render dtype support, probed at construction time and
-    /// adjusted for Vivante GC7000UL (whose float readback is 170-320 ms).
-    render_dtype_support: crate::RenderDtypeSupport,
-    /// Whether the GPU is Vivante (GL_RENDERER), cached at construction.
-    /// Read only by `dma_test_formats` on-target tests today.
-    #[allow(dead_code)]
-    is_vivante: bool,
+    /// Immutable capability surface (transfer backend, float render
+    /// support, serialization policy), captured once from the worker at
+    /// construction. See `PlatformCaps` in `platform/mod.rs`.
+    caps: super::platform::PlatformCaps,
 }
 
 unsafe impl Send for GLProcessorThreaded {}
@@ -309,23 +305,23 @@ impl GLProcessorThreaded {
                     return;
                 }
             };
-            let _ = create_ctx_send.send(Ok((
-                gl_converter.gl_context.transfer_backend,
-                gl_converter.supported_render_dtypes(),
-                gl_converter.is_vivante(),
-            )));
+            // Capability surface captured ONCE before the message loop —
+            // immutable for the worker's life, never re-probed per message.
+            let caps = gl_converter.platform_caps();
+            let _ = create_ctx_send.send(Ok(caps));
             let mut poisoned = false;
-            // Per-message serialization policy: Full on Vivante (galcore is
-            // not thread-safe for concurrent GL across contexts),
-            // LifecycleOnly everywhere else — multiple processors then run
-            // GL work in parallel, each on its own thread + context. See the
-            // GL_MUTEX doc comment in context.rs. EDGEFIRST_GL_SERIALIZE
-            // overrides per-driver defaults (full = escape hatch for
-            // unknown-bad drivers; lifecycle = force-parallel).
+            // Per-message serialization policy: Full where the platform
+            // demands it (`caps.serialize_gl` — Vivante/galcore is not
+            // thread-safe for concurrent GL across contexts), LifecycleOnly
+            // everywhere else — multiple processors then run GL work in
+            // parallel, each on its own thread + context. See the GL_MUTEX
+            // doc comment in context.rs. EDGEFIRST_GL_SERIALIZE overrides
+            // per-driver defaults (full = escape hatch for unknown-bad
+            // drivers; lifecycle = force-parallel).
             let serialize_per_msg = match std::env::var("EDGEFIRST_GL_SERIALIZE").as_deref() {
                 Ok("full") => true,
                 Ok("lifecycle") => false,
-                _ => gl_converter.is_vivante(),
+                _ => caps.serialize_gl,
             };
             log::debug!(
                 "GL serialization policy: {}",
@@ -725,23 +721,20 @@ impl GLProcessorThreaded {
         // let handle = tokio::task::spawn(func());
         let handle = std::thread::spawn(func);
 
-        let (transfer_backend, render_dtype_support, is_vivante) =
-            match create_ctx_recv.blocking_recv() {
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(Error::Internal(
-                        "GL converter error messaging closed without update".to_string(),
-                    ));
-                }
-                Ok(Ok((tb, rds, viv))) => (tb, rds, viv),
-            };
+        let caps = match create_ctx_recv.blocking_recv() {
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(Error::Internal(
+                    "GL converter error messaging closed without update".to_string(),
+                ));
+            }
+            Ok(Ok(caps)) => caps,
+        };
 
         Ok(Self {
             handle: Some(handle),
             sender: Some(send),
-            transfer_backend,
-            render_dtype_support,
-            is_vivante,
+            caps,
         })
     }
 }
@@ -1091,14 +1084,7 @@ impl GLProcessorThreaded {
 
     /// Returns the active transfer backend.
     pub(crate) fn transfer_backend(&self) -> TransferBackend {
-        self.transfer_backend
-    }
-
-    /// Whether the GPU is a Vivante core (GL_RENDERER), cached at construction.
-    /// Tests use this to gate Vivante-only NV12 path properties.
-    #[allow(dead_code)]
-    pub(crate) fn is_vivante(&self) -> bool {
-        self.is_vivante
+        self.caps.transfer_backend
     }
 
     /// Report which float dtypes the GPU can render to.
@@ -1108,7 +1094,7 @@ impl GLProcessorThreaded {
     /// GL float destinations impractical; `ImageProcessor::convert()` falls
     /// back to CPU float output (normalized to `[0, 1]`) for these targets.
     pub(crate) fn supported_render_dtypes(&self) -> crate::RenderDtypeSupport {
-        self.render_dtype_support
+        self.caps.render_dtypes
     }
 }
 
