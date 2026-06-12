@@ -353,14 +353,12 @@ jobs:
         # test_yuyv_to_rgba_opengl_macos integration test silently
         # skips and the entire GL backend ships untested in CI.
         run: |
-          set -euxo pipefail
-          brew tap startergo/gn
-          brew tap startergo/angle
-          brew install startergo/angle/angle
-          ANGLE_DIR="$(brew --prefix angle)/lib"
-          codesign --force --sign - "$ANGLE_DIR/libEGL.dylib"
-          codesign --force --sign - "$ANGLE_DIR/libGLESv2.dylib"
-          echo "ANGLE installed at $ANGLE_DIR"
+          # NEGATIVE TEST (draft PR only — DO NOT MERGE): ANGLE install
+          # disabled entirely to prove gl_backend_available_canary turns
+          # this lane red instead of green-with-silent-GL-skips. (The
+          # earlier resign-only variant passed: macOS 15 runners do not
+          # enforce library validation on unsigned-ANGLE dlopen.)
+          echo "ANGLE deliberately NOT installed"
 
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
