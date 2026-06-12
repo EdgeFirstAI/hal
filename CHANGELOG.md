@@ -19,10 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exists on both platforms (ignored with a debug log on macOS), and
   `set_colorimetry_mode` / `set_int8_interpolation_mode` /
   `CacheStats` / `GlCacheStats` / `EglDisplayKind` are available on
-  macOS. The legacy zero-copy IOSurface conversion paths (YUYV/NV→RGBA,
-  NV→PlanarRgb F16) migrate onto the engine within this release; until
-  that lands in the next entries, those specific conversions fall back
-  to CPU on macOS.
+  macOS. The IOSurface conversion paths run zero-copy through the
+  engine (sources attach as `TEXTURE_2D`; YUYV via a portable
+  `sampler2D` shader), and macOS inherits the engine's full conversion
+  matrix — resize/letterbox for every format pair, rotation/flip, int8,
+  masks — where the legacy backend was same-size YUYV/NV→RGBA only.
+  Measured parallel scaling on Apple Silicon: NV12→RGBA zero-copy
+  S(2)=1.62 / S(4)=3.16, F16 model-input path S(2)=1.52 / S(4)=3.13.
+
+### Added
+
+- **Fused NV12/NV16/NV24 → PlanarRgb F16 GL convert** (`edgefirst-image`):
+  the model-input conversion (YUV source → letterboxed planar F16
+  tensor) now runs as two GL passes inside one `convert()` call on every
+  platform with F16 render support — macOS IOSurface and Linux DMA-BUF
+  alike (previously macOS-only via the legacy backend, CPU on Linux).
+  Guarded by a cross-platform oracle against the CPU reference and a
+  backend assertion that proves the GL engine did the work.
 
 ### Fixed
 

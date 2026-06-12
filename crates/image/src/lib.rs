@@ -319,17 +319,11 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
 #[cfg(feature = "opengl")]
+pub use opengl_headless::EglDisplayKind;
+#[cfg(feature = "opengl")]
 pub use opengl_headless::GLProcessorThreaded;
 #[cfg(feature = "opengl")]
 pub use opengl_headless::Int8InterpolationMode;
-// The legacy macOS shared-context processor is no longer part of the
-// public API (BREAKING — `ImageProcessor` now drives the unified
-// `GLProcessorThreaded` on macOS); it remains compiled for its
-// regression tests until the remaining conversions migrate.
-#[cfg(feature = "opengl")]
-pub use opengl_headless::EglDisplayKind;
-#[cfg(all(test, target_os = "macos", feature = "opengl"))]
-use opengl_headless::MacosGlProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
@@ -5252,13 +5246,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_grey_r8_iosurface_to_rgba_opengl_macos() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5321,7 +5312,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_two_pass_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5402,7 +5393,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_two_pass_pool_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5474,7 +5465,7 @@ mod image_tests {
         assert!(any_half, "expected ~0.5 grey samples in the letterbox band");
     }
 
-    /// Mirrors the orchestrator: the `MacosGlProcessor` is created on one thread
+    /// Mirrors the orchestrator: the GL processor is created on one thread
     /// and `convert()` is called from a *different* thread (the profiler's
     /// Pre-processing worker). Reproduces (or rules out) the GL-context /
     /// `glFinish` cross-thread hang seen in the live pipeline. A 20 s watchdog
@@ -5556,7 +5547,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv_to_planar_f16_varying_sizes_no_leak_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5650,13 +5641,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_nv16_nv24_to_rgba_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5778,13 +5766,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv_to_rgba_larger_pool_surface_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5923,11 +5908,11 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl_macos() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?}). \
+                    "SKIPPED: {} — GL engine init failed ({e:?}). \
                      Install ANGLE via `brew install startergo/angle/angle` \
                      and re-sign per README.md § macOS GPU Acceleration to \
                      run this test.",
@@ -6003,13 +5988,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl_macos_multi_resolution() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6076,13 +6058,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_macos_gl_pbuffer_cache_reuses_surfaces() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6142,13 +6121,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_macos_gl_pbuffer_cache_steady_state() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6172,25 +6148,24 @@ mod image_tests {
             proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
         }
-        let (warm_hits, warm_misses, warm_entries) = proc.pbuf_cache_stats();
+        let warm = proc.egl_cache_stats().unwrap();
 
         for src in pool.iter().cycle().take(FRAMES) {
             proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
         }
-        let (hits, misses, entries) = proc.pbuf_cache_stats();
+        let steady = proc.egl_cache_stats().unwrap();
 
         assert_eq!(
-            warm_misses, misses,
-            "steady-state loop created new EGL pbuffers \
-             (warm: {warm_hits}h/{warm_misses}m/{warm_entries}e, \
-             steady: {hits}h/{misses}m/{entries}e)"
+            warm.total_misses(),
+            steady.total_misses(),
+            "steady-state loop created new imports (warm {warm:?}, steady {steady:?})"
         );
-        assert_eq!(warm_entries, entries, "pbuffer cache entry count drifted");
+        let hits = |s: &GlCacheStats| s.src.hits + s.dst.hits + s.nv_r8.hits;
         assert!(
-            hits - warm_hits >= FRAMES as u64,
-            "expected at least {FRAMES} pbuffer cache hits over the loop, got {}",
-            hits - warm_hits
+            hits(&steady) - hits(&warm) >= FRAMES as u64,
+            "expected at least {FRAMES} import-cache hits over the loop, got {}",
+            hits(&steady) - hits(&warm)
         );
     }
 

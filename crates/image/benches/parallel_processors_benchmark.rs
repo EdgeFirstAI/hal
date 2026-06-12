@@ -52,7 +52,7 @@ struct Cell {
     use_dma: bool,
 }
 
-const CELLS: [Cell; 2] = [
+const CELLS: [Cell; 4] = [
     Cell {
         tag: "gpu_bound",
         src_fmt: PixelFormat::Nv12,
@@ -75,11 +75,38 @@ const CELLS: [Cell; 2] = [
         letterbox: false,
         use_dma: false,
     },
+    // macOS-meaningful zero-copy cells (IOSurface src+dst): RGBA dst —
+    // PlanarRgb-u8 dsts are Linux-only — and the profiler's F16 hot
+    // path. Skip cleanly where unsupported (the per-cell error prints).
+    Cell {
+        tag: "gpu_bound_rgba",
+        src_fmt: PixelFormat::Nv12,
+        src_w: 1280,
+        src_h: 720,
+        dst_fmt: PixelFormat::Rgba,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
+    Cell {
+        tag: "f16_zero_copy",
+        src_fmt: PixelFormat::Nv12,
+        src_w: 1280,
+        src_h: 720,
+        dst_fmt: PixelFormat::PlanarRgb,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
 ];
 
 /// Run one (cell, n_procs) configuration; returns per-thread convert counts.
 fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
-    let mem = if cell.use_dma && edgefirst_tensor::is_dma_available() {
+    // Zero-copy probe covers IOSurface on macOS too — is_dma_available()
+    // is false there and would silently measure CPU-heap converts.
+    let mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
         Some(TensorMemory::Dma)
     } else {
         Some(TensorMemory::Mem)
@@ -111,8 +138,13 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 // Pre-allocate and REUSE the destination: real pipelines pool
                 // buffers, and per-iteration allocation would measure the
                 // allocator (PBO/DMA churn) instead of convert dispatch.
+                let dst_dtype = if cell.tag == "f16_zero_copy" {
+                    DType::F16
+                } else {
+                    DType::U8
+                };
                 let mut dst = proc
-                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, DType::U8, mem)
+                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, dst_dtype, mem)
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
                 let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
                     proc.convert(&src, dst, Rotation::None, Flip::None, crop)
