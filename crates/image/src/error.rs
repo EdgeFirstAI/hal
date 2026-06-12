@@ -22,11 +22,9 @@ pub enum Error {
     /// Two tensor arguments that must be distinct reference the same
     /// underlying buffer (e.g. `dst` and `background` in a draw call).
     AliasedBuffers(String),
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     EGL(khronos_egl::Error),
     GLVersion(String),
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     EGLLoad(khronos_egl::LoadError<libloading::Error>),
     #[cfg(target_os = "linux")]
@@ -99,7 +97,6 @@ impl From<edgefirst_tensor::Error> for Error {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 impl From<khronos_egl::Error> for Error {
     fn from(err: khronos_egl::Error) -> Self {
@@ -107,7 +104,6 @@ impl From<khronos_egl::Error> for Error {
     }
 }
 
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 impl From<khronos_egl::LoadError<libloading::Error>> for Error {
     fn from(err: khronos_egl::LoadError<libloading::Error>) -> Self {

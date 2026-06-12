@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux GL float (F16/F32) preprocessing paths.
+//! GL float (F16/F32) preprocessing paths (Linux DMA-BUF + macOS IOSurface
+//! zero-copy targets, Tegra PBO targets).
 //!
 //! This is a child module of [`super`] (`gl::processor`) so the
 //! `impl GLProcessorST` block here can access the parent's PRIVATE fields
@@ -11,16 +12,18 @@
 //!
 //! Items grouped here:
 //! * [`float_render_support`] — reportable float-render capability.
-//! * [`dma_f16_packed_layout`] — Linux DMA packed-surface geometry (thin
+//! * [`dma_f16_packed_layout`] — packed zero-copy surface geometry (thin
 //!   wrapper over [`edgefirst_tensor::packed_rgba16f_layout`]).
 //! * The [`GLProcessorST`] float render methods: `convert_float_to_pbo`,
-//!   `convert_float_to_dma`, `upload_float_src`, `draw_float_quad`.
+//!   `convert_float_to_zero_copy`, `render_float_to_zero_copy_tail` (the
+//!   dst-import/draw half, shared with the fused NV→PlanarF16 two-pass —
+//!   its source is the GPU-resident intermediate texture),
+//!   `upload_float_src`, `draw_float_quad`.
 
 use std::ffi::{c_void, CStr};
 
-use drm_fourcc::DrmFourcc;
-
 use super::super::core::float_crop_uniforms;
+use super::super::platform::GlPlatform;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Error, Flip, ResolvedCrop, Rotation};
 use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
@@ -350,7 +353,7 @@ impl GLProcessorST {
     ///   contiguous planar f16 elements per texel; readback is
     ///   `(RGBA, HALF_FLOAT)`.
     ///
-    /// [`FloatRenderPath::DmaF16Nchw`] and [`FloatRenderPath::None`] are not
+    /// [`FloatRenderPath::ZeroCopyF16Nchw`] and [`FloatRenderPath::None`] are not
     /// handled here — they return `NotSupported` so `convert()` falls back to
     /// CPU. Likewise,
     /// non-`Rgba` sources and any rotation/flip fall back: the
@@ -370,7 +373,7 @@ impl GLProcessorST {
         let (internal, client_fmt, gl_type) = match path {
             FloatRenderPath::PboF32Nhwc => (gls::gl::R32F, gls::gl::RED, gls::gl::FLOAT),
             FloatRenderPath::PboF16Nchw => (gls::gl::RGBA16F, gls::gl::RGBA, gls::gl::HALF_FLOAT),
-            FloatRenderPath::DmaF16Nchw | FloatRenderPath::None => {
+            FloatRenderPath::ZeroCopyF16Nchw | FloatRenderPath::None => {
                 return Err(crate::Error::NotSupported(
                     "GL float render-to-PBO: only PBO F32 NHWC / F16 NCHW are implemented; \
                      using CPU fallback"
@@ -402,7 +405,6 @@ impl GLProcessorST {
         // Destination dimensions and PBO buffer id, by dtype.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let dst_len = dst.size() / dst.dtype().size();
         let dst_buffer_id = match dst {
             TensorDyn::F32(t) => float_pbo_buffer_id(t)?,
             TensorDyn::F16(t) => float_pbo_buffer_id(t)?,
@@ -552,14 +554,16 @@ impl GLProcessorST {
             // ── Readback into the destination PBO ──
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
             gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
+            // Plain ReadPixels — glReadnPixels is ES 3.2-only and rejected by
+            // ANGLE/Metal's ES 3.0 contexts (see `readback_rendered`). The PBO
+            // PACK binding bounds the write.
+            gls::gl::ReadPixels(
                 0,
                 0,
                 packed_w as i32,
                 packed_h as i32,
                 client_fmt,
                 gl_type,
-                (dst_len * dst.dtype().size()) as i32,
                 std::ptr::null_mut(),
             );
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -586,7 +590,7 @@ impl GLProcessorST {
     /// the RGBA16F dma-buf import (e.g. Vivante, desktop NVIDIA) or returns an
     /// incomplete FBO, returns `Err(NotSupported)` so `convert()` degrades
     /// gracefully to the CPU. Never panics.
-    pub(super) fn convert_float_to_dma(
+    pub(super) fn convert_float_to_zero_copy(
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,
@@ -614,45 +618,15 @@ impl GLProcessorST {
         let src_w = src_u8.width().ok_or(Error::NotAnImage)?;
         let src_h = src_u8.height().ok_or(Error::NotAnImage)?;
 
-        // Destination must be an F16 PlanarRgb DMA tensor.
+        // Destination geometry for the crop uniforms; the full destination
+        // validation (PlanarRgb, F16, zero-copy) happens in the shared tail.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
-        if dst_fmt != PixelFormat::PlanarRgb {
-            return Err(crate::Error::NotSupported(format!(
-                "GL float render-to-DMA: dst format must be PlanarRgb, got {dst_fmt:?}; \
-                 using CPU fallback"
-            )));
-        }
-        let dst_f16 = match dst {
-            TensorDyn::F16(t) => t,
-            other => {
-                return Err(crate::Error::NotSupported(format!(
-                    "GL float render-to-DMA: dst dtype must be F16, got {:?}; using CPU fallback",
-                    other.dtype()
-                )));
-            }
-        };
-        if dst_f16.as_dma().is_none() {
-            return Err(crate::Error::NotSupported(
-                "GL float render-to-DMA: dst is not a DMA tensor; using CPU fallback".to_string(),
-            ));
-        }
-
-        // Packed RGBA16F surface geometry; requires W % 4 == 0.
-        let (surface_w, surface_h, _pitch) = dma_f16_packed_layout(dst_w as u32, dst_h as u32)
-            .ok_or_else(|| {
-                crate::Error::NotSupported(format!(
-                    "GL float render-to-DMA: F16 NCHW requires width divisible by 4, \
-                     got {dst_w}; using CPU fallback"
-                ))
-            })?;
 
         // Crop uniforms — identical contract to the F16 PBO path.
         let (src_rect_uv, dst_rect_px, pad_color) =
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
-        let program_id = self.float_f16_nchw_program.id;
         let src_tex_id = self.camera_normal_texture.id;
 
         // PBO sources upload via GL_PIXEL_UNPACK_BUFFER (no map() — avoids a
@@ -674,6 +648,61 @@ impl GLProcessorST {
             src_pbo_id,
             src_cpu_pixels.as_deref(),
         );
+        drop(src_cpu_pixels);
+
+        self.render_float_to_zero_copy_tail(src_tex_id, src_rect_uv, dst_rect_px, pad_color, dst)
+    }
+
+    /// The destination half of the zero-copy F16 render: import the RGBA16F
+    /// zero-copy destination, attach it to the FBO, and pack `src_tex_id`
+    /// (an RGBA8 texture already holding the source pixels) through the
+    /// packed-NCHW float shader. Shared by [`convert_float_to_zero_copy`]
+    /// (which uploads its tensor source first) and the fused NV→PlanarF16
+    /// two-pass (whose pass 1 rendered into an engine-internal texture —
+    /// the pixels never visit the host).
+    pub(super) fn render_float_to_zero_copy_tail(
+        &mut self,
+        src_tex_id: u32,
+        src_rect_uv: [f32; 4],
+        dst_rect_px: [f32; 4],
+        pad_color: [f32; 3],
+        dst: &mut TensorDyn,
+    ) -> crate::Result<()> {
+        // Destination must be an F16 PlanarRgb zero-copy tensor.
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
+        if dst_fmt != PixelFormat::PlanarRgb {
+            return Err(crate::Error::NotSupported(format!(
+                "GL float render-to-DMA: dst format must be PlanarRgb, got {dst_fmt:?}; \
+                 using CPU fallback"
+            )));
+        }
+        let dst_f16 = match dst {
+            TensorDyn::F16(t) => t,
+            other => {
+                return Err(crate::Error::NotSupported(format!(
+                    "GL float render-to-DMA: dst dtype must be F16, got {:?}; using CPU fallback",
+                    other.dtype()
+                )));
+            }
+        };
+        if dst_f16.memory() != edgefirst_tensor::TensorMemory::Dma {
+            return Err(crate::Error::NotSupported(
+                "GL float render-to-DMA: dst is not a zero-copy GPU buffer; using CPU fallback"
+                    .to_string(),
+            ));
+        }
+
+        // Packed RGBA16F surface geometry; requires W % 4 == 0.
+        let (surface_w, surface_h, _pitch) = dma_f16_packed_layout(dst_w as u32, dst_h as u32)
+            .ok_or_else(|| {
+                crate::Error::NotSupported(format!(
+                    "GL float render-to-DMA: F16 NCHW requires width divisible by 4, \
+                     got {dst_w}; using CPU fallback"
+                ))
+            })?;
+        let program_id = self.float_f16_nchw_program.id;
 
         // ── Import the destination dma-buf as a renderable RGBA16F EGLImage ──
         // Packed surface (W/4, 3*H), bpp=8. The tensor's natural planar f16 row
@@ -685,8 +714,7 @@ impl GLProcessorST {
             PixelFormat::PlanarRgb,
             surface_w as usize,
             surface_h as usize,
-            DrmFourcc::Abgr16161616f,
-            8,
+            super::super::platform::PackedImportFormat::Rgba16161616F,
         )?;
 
         // Attach the EGLImage (renderbuffer when supported, else texture) to the
@@ -706,7 +734,14 @@ impl GLProcessorST {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    // Platform attach (EGLImage target on Linux,
+                    // eglBindTexImage on macOS — a raw OES call there
+                    // silently no-ops on a pbuffer handle and leaves the
+                    // FBO incomplete).
+                    super::super::platform::Platform::attach_tex_image_2d(
+                        &self.gl_context,
+                        dest_egl,
+                    )?;
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
                         gls::gl::COLOR_ATTACHMENT0,

@@ -1,38 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use super::cache::EglCacheKey;
-use super::context::{Egl, GlContext};
+use super::cache::BufferImportKey;
+use super::platform::{GlPlatform, Platform};
 use super::shaders::check_gl_error;
-use khronos_egl as egl;
-use log::error;
 use std::ffi::{c_void, CStr};
 use std::ptr::null;
-use std::rc::Rc;
-
-pub(super) struct EglImage {
-    pub(super) egl_image: egl::Image,
-    pub(super) egl: Rc<Egl>,
-    pub(super) display: egl::Display,
-}
-
-impl Drop for EglImage {
-    fn drop(&mut self) {
-        if self.egl_image.as_ptr() == egl::NO_IMAGE {
-            return;
-        }
-
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Display-level EGL op — same dedicated lock as creation.
-            let _image_guard = super::context::image_lifecycle_guard();
-            let e =
-                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
-            if let Err(e) = e {
-                error!("Could not destroy EGL image: {e:?}");
-            }
-        }));
-    }
-}
 
 pub(super) struct Texture {
     pub(super) id: u32,
@@ -43,7 +16,7 @@ pub(super) struct Texture {
     /// Which EGLImage (identified by buffer identity key) is currently bound
     /// to this texture via `glEGLImageTargetTexture2DOES`. `None` means no
     /// EGLImage is bound (or the binding has been invalidated).
-    bound_egl_key: Option<EglCacheKey>,
+    bound_egl_key: Option<BufferImportKey>,
 }
 
 impl Default for Texture {
@@ -115,44 +88,54 @@ impl Texture {
         }
     }
 
-    /// Bind an EGLImage to this GL_TEXTURE_2D texture if the key differs from
-    /// what's already bound. Returns `true` if the bind was performed, `false`
-    /// if skipped (already bound).
+    /// Attach a platform import to this GL_TEXTURE_2D texture if the key
+    /// differs from what's already bound. Returns `true` if the attach was
+    /// performed, `false` if skipped (already bound). The binding-skip
+    /// cache applies only where attachments persist
+    /// (`GlPlatform::PERSISTENT_TEX_BINDINGS`) — on macOS every call
+    /// attaches and the platform releases at its sync point.
     ///
     /// # Safety
-    /// Caller must ensure the texture is bound to the active texture unit and
-    /// `egl_image_ptr` is a valid EGL image handle.
+    /// Caller must ensure the texture is bound to the active texture unit
+    /// and `handle`'s import is alive (cache-owned).
     pub(super) unsafe fn bind_egl_image(
         &mut self,
-        key: EglCacheKey,
-        egl_image_ptr: *const c_void,
-    ) -> bool {
-        if self.bound_egl_key == Some(key) {
-            return false;
+        display: &<Platform as GlPlatform>::Display,
+        key: BufferImportKey,
+        handle: <Platform as GlPlatform>::ImportHandle,
+    ) -> crate::Result<bool> {
+        if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
+            return Ok(false);
         }
-        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, egl_image_ptr);
-        self.bound_egl_key = Some(key);
-        true
+        Platform::attach_tex_image_2d(display, handle)?;
+        if Platform::PERSISTENT_TEX_BINDINGS {
+            self.bound_egl_key = Some(key);
+        }
+        Ok(true)
     }
 
-    /// Bind an EGLImage to this GL_TEXTURE_EXTERNAL_OES texture if the key
-    /// differs from what's already bound. Returns `true` if the bind was
-    /// performed, `false` if skipped.
+    /// Attach a platform import to this GL_TEXTURE_EXTERNAL_OES texture if
+    /// the key differs from what's already bound. Returns `true` if the
+    /// attach was performed, `false` if skipped. Errors on platforms
+    /// without the OES extension (`PlatformCaps::external_oes` gates the
+    /// path before it gets here).
     ///
     /// # Safety
-    /// Caller must ensure the texture is bound to the active texture unit and
-    /// `egl_image_ptr` is a valid EGL image handle.
+    /// As [`Self::bind_egl_image`].
     pub(super) unsafe fn bind_egl_image_external(
         &mut self,
-        key: EglCacheKey,
-        egl_image_ptr: *const c_void,
-    ) -> bool {
-        if self.bound_egl_key == Some(key) {
-            return false;
+        display: &<Platform as GlPlatform>::Display,
+        key: BufferImportKey,
+        handle: <Platform as GlPlatform>::ImportHandle,
+    ) -> crate::Result<bool> {
+        if Platform::PERSISTENT_TEX_BINDINGS && self.bound_egl_key == Some(key) {
+            return Ok(false);
         }
-        gls::egl_image_target_texture_2d_oes(gls::gl::TEXTURE_EXTERNAL_OES, egl_image_ptr);
-        self.bound_egl_key = Some(key);
-        true
+        Platform::attach_tex_image_external(display, handle)?;
+        if Platform::PERSISTENT_TEX_BINDINGS {
+            self.bound_egl_key = Some(key);
+        }
+        Ok(true)
     }
 
     /// Invalidate the cached EGL binding key. Must be called when the

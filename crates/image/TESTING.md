@@ -249,7 +249,7 @@ code can actually execute:
 |---------|------------------------------|------|
 | `classify_float_render`, `packed_rgba16f_layout`, `float_render_support`, `dma_f16_packed_layout`, `pbo_elem_count`/`pbo_shape`, `float_crop_uniforms`, `float_pbo_buffer_id` | Pure logic — runs everywhere | all |
 | CPU U8→F16/F32 widen + `[0,1]` normalize fallback (`cpu/mod.rs`) | CPU — runs everywhere | all |
-| **IOSurface F16 zero-copy GL render** (`macos_processor.rs`, `iosurface_import.rs`) | ANGLE → Metal on the macOS runner's GPU | **macOS** |
+| **IOSurface F16 zero-copy GL render** (engine + `platform/angle.rs`, `iosurface_import.rs`) | ANGLE → Metal on the macOS runner's GPU | **macOS** |
 | **Linux GL float PBO render** (`gl/processor/float.rs` `upload_float_src` / `draw_float_quad` / `convert_float_to_pbo`, `threaded.rs` PBO send/recv) | Mesa **llvmpipe** — software GL, no GPU needed, same GLSL | **software-gl** |
 | **Linux GL float DMA-BUF render** (`gl/processor/float.rs` `convert_float_to_dma`) | Needs a real **V3D/Mali** GPU | *none — see ceiling below* |
 

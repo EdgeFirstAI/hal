@@ -318,22 +318,18 @@ use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
-#[cfg(target_os = "linux")]
+#[cfg(feature = "opengl")]
+pub use opengl_headless::EglDisplayKind;
 #[cfg(feature = "opengl")]
 pub use opengl_headless::GLProcessorThreaded;
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::Int8InterpolationMode;
-#[cfg(target_os = "macos")]
-#[cfg(feature = "opengl")]
-pub use opengl_headless::MacosGlProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
+pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
 // EGLImage cache counter snapshots (diagnostics): see
 // `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
 // `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{CacheStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
@@ -964,8 +960,9 @@ pub struct ImageProcessorConfig {
     /// PlatformDevice, Default. Use [`probe_egl_displays`] to discover
     /// which displays are available on the current system.
     ///
-    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set.
-    #[cfg(target_os = "linux")]
+    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS
+    /// (ANGLE/Metal is the only display there; a `Some` value logs a
+    /// debug note and is otherwise ignored).
     #[cfg(feature = "opengl")]
     pub egl_display: Option<EglDisplayKind>,
 
@@ -1124,11 +1121,12 @@ pub struct ImageProcessor {
     pub opengl: Option<GLProcessorThreaded>,
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
-    /// OpenGL-based image converter for macOS via ANGLE + IOSurface.
-    /// Available when ANGLE's libEGL.dylib can be loaded (see
-    /// README.md § macOS GPU Acceleration). Same field name as the
-    /// Linux variant so call sites can be written once.
-    pub opengl: Option<MacosGlProcessor>,
+    /// OpenGL-based image converter for macOS via ANGLE + IOSurface —
+    /// the same unified `GLProcessorThreaded` engine as Linux (its
+    /// worker owns a per-processor ANGLE context). Available when
+    /// ANGLE's libEGL.dylib can be loaded (see README.md § macOS GPU
+    /// Acceleration).
+    pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
@@ -1277,7 +1275,7 @@ impl ImageProcessor {
                 #[cfg(target_os = "macos")]
                 {
                     #[cfg(feature = "opengl")]
-                    let opengl = match MacosGlProcessor::new() {
+                    let opengl = match GLProcessorThreaded::new(config.egl_display) {
                         Ok(gl) => Some(gl),
                         Err(e) => {
                             log::warn!(
@@ -1294,7 +1292,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         forced_backend: None,
-                    });
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
@@ -1383,7 +1382,7 @@ impl ImageProcessor {
                     #[cfg(target_os = "macos")]
                     #[cfg(feature = "opengl")]
                     {
-                        let opengl = MacosGlProcessor::new().map_err(|e| {
+                        let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
                             Error::ForcedBackendUnavailable(format!(
                                 "opengl forced on macOS but ANGLE init failed: {e:?}"
                             ))
@@ -1392,7 +1391,8 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             forced_backend: Some(ForcedBackend::OpenGl),
-                        })
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
                     }
                     #[cfg(not(all(
                         any(target_os = "linux", target_os = "macos"),
@@ -1454,7 +1454,7 @@ impl ImageProcessor {
             log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
-            match MacosGlProcessor::new() {
+            match GLProcessorThreaded::new(config.egl_display) {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::debug!(
@@ -1494,7 +1494,7 @@ impl ImageProcessor {
     /// it (currently the Linux GL backend); no-op elsewhere. Constructor
     /// plumbing for [`ImageProcessorConfig::colorimetry`].
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
-        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        #[cfg(feature = "opengl")]
         {
             let mut me = self;
             if let Err(e) = me.set_colorimetry_mode(_mode) {
@@ -1502,7 +1502,7 @@ impl ImageProcessor {
             }
             me
         }
-        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        #[cfg(not(feature = "opengl"))]
         self
     }
 
@@ -1510,7 +1510,6 @@ impl ImageProcessor {
     /// on the OpenGL backend. No-op if OpenGL is not available. The
     /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
     /// it is set, this call logs and keeps the env-selected mode.
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
@@ -1521,7 +1520,6 @@ impl ImageProcessor {
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
     /// backend. No-op if OpenGL is not available.
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
@@ -5248,13 +5246,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_grey_r8_iosurface_to_rgba_opengl_macos() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5317,7 +5312,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_two_pass_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5398,7 +5393,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_to_planar_f16_two_pass_pool_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5470,7 +5465,7 @@ mod image_tests {
         assert!(any_half, "expected ~0.5 grey samples in the letterbox band");
     }
 
-    /// Mirrors the orchestrator: the `MacosGlProcessor` is created on one thread
+    /// Mirrors the orchestrator: the GL processor is created on one thread
     /// and `convert()` is called from a *different* thread (the profiler's
     /// Pre-processing worker). Reproduces (or rules out) the GL-context /
     /// `glFinish` cross-thread hang seen in the live pipeline. A 20 s watchdog
@@ -5552,7 +5547,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv_to_planar_f16_varying_sizes_no_leak_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("SKIPPED: {} — init failed ({e:?})", function!());
@@ -5646,13 +5641,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv12_nv16_nv24_to_rgba_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5774,13 +5766,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_nv_to_rgba_larger_pool_surface_opengl_macos() {
-        let mut gpu = match MacosGlProcessor::new() {
+        let mut gpu = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -5919,11 +5908,11 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl_macos() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?}). \
+                    "SKIPPED: {} — GL engine init failed ({e:?}). \
                      Install ANGLE via `brew install startergo/angle/angle` \
                      and re-sign per README.md § macOS GPU Acceleration to \
                      run this test.",
@@ -5999,13 +5988,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_yuyv_to_rgba_opengl_macos_multi_resolution() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6072,13 +6058,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_macos_gl_pbuffer_cache_reuses_surfaces() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6138,13 +6121,10 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_macos_gl_pbuffer_cache_steady_state() {
-        let mut proc = match MacosGlProcessor::new() {
+        let mut proc = match GLProcessorThreaded::new(None) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
+                eprintln!("SKIPPED: {} — GL engine init failed ({e:?})", function!());
                 return;
             }
         };
@@ -6168,25 +6148,318 @@ mod image_tests {
             proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
         }
-        let (warm_hits, warm_misses, warm_entries) = proc.pbuf_cache_stats();
+        let warm = proc.egl_cache_stats().unwrap();
 
         for src in pool.iter().cycle().take(FRAMES) {
             proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
         }
-        let (hits, misses, entries) = proc.pbuf_cache_stats();
+        let steady = proc.egl_cache_stats().unwrap();
 
         assert_eq!(
-            warm_misses, misses,
-            "steady-state loop created new EGL pbuffers \
-             (warm: {warm_hits}h/{warm_misses}m/{warm_entries}e, \
-             steady: {hits}h/{misses}m/{entries}e)"
+            warm.total_misses(),
+            steady.total_misses(),
+            "steady-state loop created new imports (warm {warm:?}, steady {steady:?})"
         );
-        assert_eq!(warm_entries, entries, "pbuffer cache entry count drifted");
+        let hits = |s: &GlCacheStats| s.src.hits + s.dst.hits + s.nv_r8.hits;
         assert!(
-            hits - warm_hits >= FRAMES as u64,
-            "expected at least {FRAMES} pbuffer cache hits over the loop, got {}",
-            hits - warm_hits
+            hits(&steady) - hits(&warm) >= FRAMES as u64,
+            "expected at least {FRAMES} import-cache hits over the loop, got {}",
+            hits(&steady) - hits(&warm)
+        );
+    }
+
+    /// Backend assertion for the F16 zero-copy path: when the GL backend
+    /// initialized (ANGLE on macOS) and reports F16 color-buffer support,
+    /// the NV12→PlanarRgb-F16 IOSurface convert MUST be handled by the GL
+    /// engine — proven by the engine's import-cache counters moving, not
+    /// just by output correctness. This is the guard against the
+    /// silent-CPU-fallback failure mode: a misclassified IOSurface F16
+    /// destination keeps every output-correctness test green while
+    /// quietly running ~10× slower on CPU; only a backend observable
+    /// catches it. Skips ONLY when GL itself is unavailable or the
+    /// configuration lacks F16 — a convert error or a CPU-routed convert
+    /// with the capability present is a FAILURE.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_macos_gl_f16_planar_is_gl_backed() {
+        let mut proc = ImageProcessor::new().expect("ImageProcessor");
+        let Some(ref gl) = proc.opengl else {
+            eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+            return;
+        };
+        if !gl.supported_render_dtypes().f16 {
+            eprintln!(
+                "SKIPPED: {} — configuration lacks F16 color-buffer support",
+                function!()
+            );
+            return;
+        }
+        let stats_before = gl.egl_cache_stats().expect("cache stats");
+
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 31) % 211) as u8;
+            }
+        }
+        let mut dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        proc.convert(
+            &src,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            Crop::letterbox([114, 114, 114, 255]),
+        )
+        .expect("F16 capability reported but the NV12→PlanarF16 convert failed");
+        let stats_after = proc
+            .opengl
+            .as_ref()
+            .expect("GL backend present")
+            .egl_cache_stats()
+            .expect("cache stats");
+        // ≥ 2 misses: the fused convert imports the zero-copy NV source
+        // (pass 1) AND the F16 destination (pass 2). Requiring both means a
+        // convert that imported its source, failed mid-engine, and fell back
+        // to CPU (1 miss) cannot satisfy this gate.
+        assert!(
+            stats_after.total_misses() >= stats_before.total_misses() + 2,
+            "convert succeeded but the GL engine did not import both the \
+             source and the F16 destination — the work did not (fully) run \
+             on the GL backend (silent CPU fallback); misses before={} after={}",
+            stats_before.total_misses(),
+            stats_after.total_misses()
+        );
+    }
+
+    /// Portable oracle for the fused NV12→PlanarRgb-F16 engine convert
+    /// (two GL passes: NV→RGBA intermediate, then the packed RGBA16F
+    /// render). New on every platform with F16 render support — macOS
+    /// IOSurface and Linux DMA-BUF alike. Compares against the CPU
+    /// backend's reference within the float-path tolerance.
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_to_planar_f16_fused_engine_vs_cpu() {
+        let mut gl = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) if p.opengl.is_some() => p,
+            _ => {
+                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                return;
+            }
+        };
+        if !gl
+            .opengl
+            .as_ref()
+            .map(|g| g.supported_render_dtypes().f16)
+            .unwrap_or(false)
+        {
+            eprintln!("SKIPPED: {} — no F16 render support", function!());
+            return;
+        }
+        let mem = if edgefirst_tensor::is_gpu_buffer_available() {
+            TensorMemory::Dma
+        } else {
+            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            return;
+        };
+
+        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, Some(mem)).unwrap();
+        {
+            // Smooth gradients, NOT noise: the GL and CPU paths upsample
+            // chroma with different kernels (nearest vs bilinear), which
+            // legitimately diverges on per-texel chroma noise. Gradients
+            // keep that kernel difference sub-LSB while still exercising
+            // the full matrix math and the letterbox geometry.
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            let buf = m.as_mut_slice();
+            let (w, h) = (1280usize, 720usize);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[y * w + x] = ((x * 255) / w) as u8; // luma ramp
+                }
+            }
+            for y in 0..(h / 2) {
+                for x in 0..(w / 2) {
+                    let o = h * w + y * w + 2 * x;
+                    buf[o] = ((y * 255) / (h / 2)) as u8; // U vertical ramp
+                    buf[o + 1] = (((x + y) * 255) / (w / 2 + h / 2)) as u8; // V diagonal
+                }
+            }
+        }
+        let crop = Crop::letterbox([114, 114, 114, 255]);
+        let mut gl_dst =
+            TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(mem)).unwrap();
+        // Drive the GL backend DIRECTLY: a convert through `ImageProcessor`
+        // silently falls back to CPU on a GL error, turning this oracle into
+        // a CPU-vs-CPU tautology. A direct call surfaces the engine error.
+        gl.opengl
+            .as_mut()
+            .expect("GL backend present")
+            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
+            .expect("fused NV12→PlanarF16 GL convert");
+
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        cpu.convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+            .expect("CPU reference convert");
+
+        let g = gl_dst.as_f16().unwrap().map().unwrap().as_slice().to_vec();
+        let c = cpu_dst.as_f16().unwrap().map().unwrap().as_slice().to_vec();
+        assert_eq!(g.len(), c.len());
+        let mut max_diff = 0.0f32;
+        let mut max_at = 0usize;
+        for (i, (a, b)) in g.iter().zip(c.iter()).enumerate() {
+            let d = (a.to_f32() - b.to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                max_at = i;
+            }
+        }
+        // Localize: plane (R/G/B), row, col of the worst element.
+        let (plane, rem) = (max_at / (640 * 640), max_at % (640 * 640));
+        let (row, col) = (rem / 640, rem % 640);
+        eprintln!(
+            "fused-vs-cpu: max_diff={max_diff} at plane={plane} row={row} col={col} \
+             gl={} cpu={}",
+            g[max_at].to_f32(),
+            c[max_at].to_f32()
+        );
+        // Two GPU passes (8-bit intermediate + linear filtering) vs the
+        // CPU's direct path: allow a few 8-bit steps of divergence.
+        assert!(
+            max_diff <= 4.0 / 255.0 + 1e-3,
+            "fused NV12→PlanarF16 diverges from CPU reference: max_diff={max_diff}"
+        );
+    }
+
+    /// Zero-copy source → heap destination through the GL engine,
+    /// driven on the GL backend DIRECTLY so a GL error cannot hide
+    /// behind the `ImageProcessor` CPU fallback (the shape that exposed
+    /// the macOS `glReadnPixels` failure: imported source, rendered,
+    /// then errored at the heap readback). RGBA→BGRA so the convert is
+    /// a pure byte shuffle: no chroma kernel or colorimetry ambiguity
+    /// (Vivante's NV fast path legitimately diverges from the CPU
+    /// reference), and the readback stays GL_RGBA (V3D rejects RGB
+    /// readbacks).
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_zero_copy_src_to_mem_dst_gl_direct() {
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) if p.opengl.is_some() => p,
+            _ => {
+                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                return;
+            }
+        };
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            return;
+        }
+
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 31) % 211) as u8;
+            }
+        }
+        let mut gl_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        proc.opengl
+            .as_mut()
+            .expect("GL backend present")
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .expect("zero-copy src → heap dst GL convert");
+
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        cpu.convert(
+            &src,
+            &mut cpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("CPU reference convert");
+
+        let g = gl_dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        let c = cpu_dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        assert_eq!(g.len(), c.len());
+        let max_diff = g
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        // Same-size byte shuffle: GL samples texel centers 1:1, so allow
+        // only rounding slack.
+        assert!(
+            max_diff <= 2,
+            "zero-copy src → heap dst diverges from CPU reference: max_diff={max_diff}"
         );
     }
 

@@ -21,7 +21,6 @@
 // threaded processor — see `crates/image/ARCHITECTURE.md` for the
 // rationale and the planned convergence story.
 
-#[cfg(target_os = "linux")]
 macro_rules! function {
     () => {{
         fn f() {}
@@ -38,7 +37,6 @@ macro_rules! function {
     }};
 }
 
-#[cfg(target_os = "linux")]
 mod cache;
 #[cfg(target_os = "linux")]
 mod context;
@@ -68,30 +66,25 @@ mod render;
 mod fourcc;
 #[cfg(target_os = "macos")]
 mod iosurface_import;
-#[cfg(target_os = "macos")]
-mod macos_processor;
 mod platform;
-#[cfg(target_os = "linux")]
 mod processor;
-#[cfg(target_os = "linux")]
 mod resources;
-#[cfg(target_os = "linux")]
 mod shaders;
 mod shaders_common;
+// Engine GL tests: written against the Linux display probe + dma_test
+// helpers (112 platform-specific references). macOS engine coverage
+// lives in lib.rs (oracles, parallel correctness, fused F16, cache
+// gates); porting this file's mask/proto/batch sections to run on
+// ANGLE is a tracked follow-up.
 #[cfg(target_os = "linux")]
 mod tests;
-#[cfg(target_os = "linux")]
 mod threaded;
 
 #[cfg(target_os = "linux")]
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
-#[cfg(target_os = "linux")]
 pub use cache::{CacheStats, GlCacheStats};
-#[cfg(target_os = "macos")]
-pub use macos_processor::MacosGlProcessor;
-#[cfg(target_os = "linux")]
 pub use threaded::GLProcessorThreaded;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
@@ -186,7 +179,7 @@ pub(crate) enum TransferBackend {
     /// but OpenGL is present. Data stays in GPU-accessible memory.
     Pbo,
 
-    /// Synchronous `glTexSubImage2D` upload + `glReadnPixels` readback.
+    /// Synchronous `glTexSubImage2D` upload + `glReadPixels` readback.
     /// Used when DMA-buf is unavailable or when the DMA-buf verification
     /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
     /// succeeds but rendered data is all zeros).
@@ -196,6 +189,19 @@ pub(crate) enum TransferBackend {
 impl TransferBackend {
     /// Returns `true` if DMA-buf zero-copy is available.
     pub(crate) fn is_dma(self) -> bool {
+        self == TransferBackend::DmaBuf
+    }
+
+    /// Returns `true` if the platform can import `TensorMemory::Dma`
+    /// tensors zero-copy: DMA-BUF EGLImages on Linux, IOSurface pbuffers
+    /// on macOS. Path-selection sites use this; probes that are
+    /// specifically about DMA-BUF semantics (e.g. the render-roundtrip
+    /// verification) keep `is_dma`.
+    pub(crate) fn is_zero_copy(self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self == TransferBackend::IOSurface {
+            return true;
+        }
         self == TransferBackend::DmaBuf
     }
 }

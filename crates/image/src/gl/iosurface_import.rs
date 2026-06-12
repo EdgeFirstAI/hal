@@ -15,7 +15,7 @@
 //! `eglCreatePbufferFromClientBuffer` with `EGL_IOSURFACE_ANGLE` to
 //! produce an `EGLSurface` (pbuffer) that is bound to a texture via
 //! `eglBindTexImage`. The macOS path is invoked from
-//! [`super::macos_processor::MacosGlProcessor::convert_yuyv_to_rgba`];
+//! the engine's zero-copy source attach (`draw_src_texture`);
 //! Linux callers do not go through this module.
 //!
 //! See `spikes/angle_iosurface/` (local, gitignored) for the proof-of-

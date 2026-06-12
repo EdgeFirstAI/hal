@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — unified GL processor on macOS** (`edgefirst-image`):
+  `ImageProcessor` on macOS now drives the same `GLProcessorThreaded`
+  engine as Linux, with a dedicated worker thread and a private ANGLE
+  context per processor on the shared Metal display. `MacosGlProcessor`
+  is removed from the public API. Multiple `ImageProcessor` instances
+  run GL work in parallel on macOS (the previous backend serialized all
+  instances on one shared context), `ImageProcessorConfig::egl_display`
+  exists on both platforms (ignored with a debug log on macOS), and
+  `set_colorimetry_mode` / `set_int8_interpolation_mode` /
+  `CacheStats` / `GlCacheStats` / `EglDisplayKind` are available on
+  macOS. The IOSurface conversion paths run zero-copy through the
+  engine (sources attach as `TEXTURE_2D`; YUYV via a portable
+  `sampler2D` shader), and macOS inherits the engine's full conversion
+  matrix — resize/letterbox for every format pair, rotation/flip, int8,
+  masks — where the legacy backend was same-size YUYV/NV→RGBA only.
+  Measured parallel scaling on Apple Silicon: NV12→RGBA zero-copy
+  S(2)=1.62 / S(4)=3.16, F16 model-input path S(2)=1.52 / S(4)=3.13.
+
+### Added
+
+- **Fused NV12/NV16/NV24 → PlanarRgb F16 GL convert** (`edgefirst-image`):
+  the model-input conversion (YUV source → letterboxed planar F16
+  tensor) now runs as two GL passes inside one `convert()` call on every
+  platform with F16 render support — macOS IOSurface and Linux DMA-BUF
+  alike (previously macOS-only via the legacy backend, CPU on Linux).
+  The intermediate between the passes is a GPU-resident texture: the
+  pixel path is zero-copy source → GPU → texture → GPU → zero-copy
+  destination, with no host round-trip and no synchronization between
+  the passes (same-context command ordering). Guarded by a
+  cross-platform oracle against the CPU reference and a backend
+  assertion that proves the GL engine did the work.
+
 ### Fixed
+
+- **Virtualized GPUs get the Full GL serialization policy**
+  (`edgefirst-image`): on paravirtual Metal (e.g. GitHub's macOS CI
+  runners, macOS VMs) concurrent GL across per-processor contexts
+  mis-renders — parallel converts produced 60–86% diverged output
+  bytes against each processor's own sequential oracle. Renderers
+  matching `Paravirtual`/`virtio` in `GL_RENDERER` now serialize
+  per-message like Vivante (`EDGEFIRST_GL_SERIALIZE=lifecycle`
+  overrides); real Apple GPUs keep full parallelism. Surfaced by the
+  parallel-correctness gate once the `glReadnPixels` fix below made
+  its converts genuinely GPU-executed on macOS.
+
+- **GL readbacks on macOS used an ES 3.2-only entry point**
+  (`edgefirst-image`): every heap-destination readback called
+  `glReadnPixels`, which ANGLE/Metal (ES 3.0) rejects with
+  `GL_INVALID_OPERATION` — the engine errored on any Mem-destination
+  convert, mask draw, or PBO readback on macOS and silently fell back
+  to CPU. All readbacks now use plain `glReadPixels` (core since ES
+  2.0, identical semantics — the destination size is validated by
+  construction), so heap-destination paths genuinely run on the GPU
+  on macOS. Guarded by a new direct-engine regression test, and the
+  fused-convert oracle / backend-assertion tests are strengthened so
+  a GL failure can no longer hide behind the CPU fallback.
 
 - **GL proto-mask texture lifecycle** (`edgefirst-image`): two latent bugs
   with one root cause. (1) The experimental GLES 3.1 compute-shader proto

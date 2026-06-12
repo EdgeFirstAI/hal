@@ -1,25 +1,28 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use drm_fourcc::DrmFourcc;
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
-use std::os::fd::AsRawFd;
-use std::ptr::null_mut;
-use std::rc::Rc;
 use std::time::Instant;
 
-use super::cache::CachedEglImage;
+use super::cache::CachedImport;
 use super::EglDisplayKind;
 
-use super::cache::{CacheKind, EglCacheKey, EglImageCache, GlCacheStats};
-use super::context::{egl_ext, GlContext};
-use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
+use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
+use super::platform::{GlPlatform, Platform};
+
+/// The platform display/context owned by this processor — `GlContext` on
+/// Linux, `AngleDisplay` (per-processor ANGLE context) on macOS.
+type PlatformDisplay = <Platform as GlPlatform>::Display;
+/// The owned platform import the caches hold (`EglImage` / `IoSurfacePbuffer`).
+type PlatformImport = <Platform as GlPlatform>::Import;
+/// The `Copy` import handle (`egl::Image` / `egl::Surface`).
+type PlatformHandle = <Platform as GlPlatform>::ImportHandle;
+use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
@@ -94,9 +97,9 @@ enum DstTarget {
 /// How a [`DstTarget::Texture`] render reaches the destination tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DstReadback {
-    /// `glReadnPixels` straight into the mapped Mem tensor.
+    /// `glReadPixels` straight into the mapped Mem tensor.
     Mem,
-    /// `glReadnPixels` into this destination PBO's PACK binding.
+    /// `glReadPixels` into this destination PBO's PACK binding.
     Pbo(u32),
 }
 
@@ -212,7 +215,7 @@ pub struct GLProcessorST {
     /// GPU can render to an F16 color attachment. Surfaced through
     /// `RenderDtypeSupport`; on Linux this gates the F16 NCHW PBO and
     /// zero-copy DMA-BUF render paths (`FloatRenderPath::PboF16Nchw`,
-    /// `FloatRenderPath::DmaF16Nchw`) via `classify_float_render`.
+    /// `FloatRenderPath::ZeroCopyF16Nchw`) via `classify_float_render`.
     pub(super) supports_f16_color: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
@@ -255,14 +258,20 @@ pub struct GLProcessorST {
     /// vice versa.
     draw_render_texture: Texture,
     /// EGLImage cache for source DMA buffers.
-    src_egl_cache: EglImageCache,
+    src_egl_cache: ImportCache<PlatformImport>,
     /// EGLImage cache for destination DMA buffers.
-    dst_egl_cache: EglImageCache,
+    dst_egl_cache: ImportCache<PlatformImport>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
+    /// Whether the GPU is a virtualized/paravirtual device (GL_RENDERER).
+    /// Concurrent GL across contexts mis-renders on paravirtual Metal
+    /// (observed on macOS CI runners: parallel processors produce ~60-86%
+    /// diverged output bytes); such devices get the Full serialization
+    /// policy, like Vivante.
+    is_virtual_gpu: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -278,14 +287,22 @@ pub struct GLProcessorST {
     /// Current allocated size of the intermediate texture (0,0 = unallocated).
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
-    texture_program_yuv: GlProgram,
+    /// External-OES sampler programs (`None` where the platform lacks
+    /// `GL_OES_EGL_image_external_essl3` — ANGLE/Metal).
+    texture_program_yuv: Option<GlProgram>,
     /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
     texture_int8_program: GlProgram,
     /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
-    texture_int8_program_yuv: GlProgram,
-    texture_program_planar: GlProgram,
+    texture_int8_program_yuv: Option<GlProgram>,
+    texture_program_planar: Option<GlProgram>,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
-    texture_program_planar_int8: GlProgram,
+    texture_program_planar_int8: Option<GlProgram>,
+    /// YUYV (RG-sampled) → RGBA, portable `sampler2D` — the zero-copy
+    /// IOSurface source path on macOS (and a future heap-YUYV upload).
+    yuyv_program_2d: GlProgram,
+    /// Link-time uniform locations for `yuyv_program_2d`
+    /// (src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub).
+    yuyv_2d_locs: [i32; 7],
     /// Shader: packed RGB -> RGBA8 packing (2D texture source, pass 2).
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
@@ -317,7 +334,7 @@ pub struct GLProcessorST {
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
-    nv_r8_egl_cache: EglImageCache,
+    nv_r8_egl_cache: ImportCache<PlatformImport>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
@@ -340,7 +357,7 @@ pub struct GLProcessorST {
     /// device a buffer whose batched render may still be in flight; cleared by
     /// the flush. See [`flush_pending`](Self::flush_pending).
     pub(super) pending_flush: bool,
-    pub(super) gl_context: GlContext,
+    pub(super) gl_context: PlatformDisplay,
 }
 
 impl Drop for GLProcessorST {
@@ -469,7 +486,7 @@ impl ImageProcessorTrait for GLProcessorST {
         // decline and let the dispatcher fall back to the CPU backend, which
         // writes the sub-region correctly via offset + parent stride.
         if dst.view_origin().is_some()
-            && !(self.gl_context.transfer_backend.is_dma()
+            && !(self.gl_context.transfer_backend.is_zero_copy()
                 && dst.memory() == TensorMemory::Dma
                 && matches!(
                     dst.dtype(),
@@ -506,10 +523,29 @@ impl ImageProcessorTrait for GLProcessorST {
                 self.supports_f32_color,
                 self.supports_f16_color,
             );
+            // Fused NV*→PlanarRgb-F16 (the model-input convert): two engine
+            // passes — NV→RGBA full-res into a cached intermediate, then the
+            // packed float render with the caller's crop/letterbox. Viability
+            // is pass 2's own classifier verdict on an RGBA source.
+            if matches!(
+                src_fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) && dst_fmt == PixelFormat::PlanarRgb
+                && dst_dtype == edgefirst_tensor::DType::F16
+                && classify_float_render(
+                    PixelFormat::Rgba,
+                    dst_fmt,
+                    dst_dtype,
+                    dst.memory(),
+                    support,
+                ) != FloatRenderPath::None
+            {
+                return self.convert_nv_to_planar_float_two_pass(src, dst, rotation, flip, crop);
+            }
             let path = classify_float_render(src_fmt, dst_fmt, dst_dtype, dst.memory(), support);
             match path {
-                FloatRenderPath::DmaF16Nchw => {
-                    return self.convert_float_to_dma(src, dst, rotation, flip, crop);
+                FloatRenderPath::ZeroCopyF16Nchw => {
+                    return self.convert_float_to_zero_copy(src, dst, rotation, flip, crop);
                 }
                 FloatRenderPath::None => {}
                 _ => {
@@ -679,6 +715,45 @@ fn should_reject_software_gl(is_software_renderer: bool, override_enabled: bool)
     is_software_renderer && !override_enabled
 }
 
+/// GL_RENDERER-derived driver traits that feed per-driver policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RendererTraits {
+    /// Verisilicon/Vivante core — GPU-hang workarounds + Full serialization.
+    vivante: bool,
+    /// Software rasterizer (llvmpipe/softpipe/swrast) — rejected unless the
+    /// coverage-lane override is set.
+    software: bool,
+    /// Virtualized/paravirtual GPU — concurrent GL across contexts
+    /// mis-renders (observed: Apple Paravirtual device on macOS CI runners);
+    /// gets the Full serialization policy.
+    virtual_gpu: bool,
+}
+
+/// Capability probe results from a freshly-current GL context
+/// (`gl_check_support`): extension-derived feature flags plus the
+/// GL_RENDERER-derived driver traits.
+struct GlSupport {
+    has_float_linear: bool,
+    has_bgra: bool,
+    renderer: RendererTraits,
+    supports_f32_color: bool,
+    supports_f16_color: bool,
+}
+
+/// Classify a GL_RENDERER string into driver-policy traits. Pure —
+/// unit-testable without a GL context.
+fn classify_renderer(renderer: &str) -> RendererTraits {
+    let lower = renderer.to_ascii_lowercase();
+    RendererTraits {
+        vivante: lower.contains("vivante") || lower.contains("gc7000") || lower.contains("galcore"),
+        software: lower.contains("llvmpipe")
+            || lower.contains("softpipe")
+            || lower.contains("swrast")
+            || lower.contains("software rasterizer"),
+        virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
+    }
+}
+
 impl GLProcessorST {
     /// Issue the single batched GPU sync if a `convert_deferred` is still owed,
     /// then clear the pending flag. No-op when nothing is pending. Used by both
@@ -697,34 +772,29 @@ impl GLProcessorST {
     }
 
     pub fn new(kind: Option<EglDisplayKind>) -> Result<GLProcessorST, crate::Error> {
-        let gl_context = GlContext::new(kind)?;
-        // Load the GL function pointers exactly once per process (the same
-        // pattern as macOS's GL_LOADED). `gls` bindings are gl_generator
-        // `static mut` function-pointer tables, so re-running `load_with` on
-        // every processor construction is a data race the moment another
-        // processor's worker thread is calling GL without holding `GL_MUTEX`
-        // — a prerequisite for scoping the per-message lock to Vivante.
-        // Once-loading is also semantically right: the pointers come from the
-        // process-global shared EGL display, so every context resolves the
-        // same addresses.
-        static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        GL_LOADED.get_or_init(|| {
-            gls::load_with(|s| {
-                gl_context
-                    .egl
-                    .get_proc_address(s)
-                    .map_or(std::ptr::null(), |p| p as *const _)
-            });
-        });
+        // Display bring-up goes through the platform seam — the contract a
+        // future platform (Windows/ANGLE) implements instead of forking this
+        // engine. On Linux this delegates straight to `GlContext::new`.
+        let gl_context = Platform::init_display(kind)?;
+        // Load the GL function pointers exactly once per process — `gls`
+        // bindings are gl_generator `static mut` function-pointer tables, so
+        // re-running `load_with` per construction would be a data race with
+        // unlocked workers. Platform-routed: Linux loads via this display's
+        // eglGetProcAddress; macOS loaded at shared-display init already.
+        Platform::load_gl_once(&gl_context);
 
-        let (
+        let GlSupport {
             has_float_linear,
             has_bgra,
-            is_vivante,
-            is_software_renderer,
+            renderer:
+                RendererTraits {
+                    vivante: is_vivante,
+                    software: is_software_renderer,
+                    virtual_gpu: is_virtual_gpu,
+                },
             supports_f32_color,
             supports_f16_color,
-        ) = Self::gl_check_support()?;
+        } = Self::gl_check_support()?;
 
         // Software renderers (llvmpipe, softpipe, swrast) are CPU-based OpenGL
         // implementations that are slower and less capable than our native CPU
@@ -758,21 +828,60 @@ impl GLProcessorST {
             gls::gl::PixelStorei(gls::gl::UNPACK_ALIGNMENT, 1);
         }
 
-        let texture_program_planar =
-            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader())?;
+        // External-OES sampler programs exist only where the platform's
+        // import binding uses them (Linux Path A); ANGLE/Metal rejects the
+        // extension at shader-compile time, so they are not built there.
+        let texture_program_planar = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_planar_rgb_shader(),
+            )?)
+        } else {
+            None
+        };
 
         let texture_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_fragment_shader())?;
 
-        let texture_program_yuv = GlProgram::new(
-            generate_vertex_shader(),
-            generate_texture_fragment_shader_yuv(),
-        )?;
+        let texture_program_yuv = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_texture_fragment_shader_yuv(),
+            )?)
+        } else {
+            None
+        };
 
         let texture_int8_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
-        let texture_int8_program_yuv =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
+        let texture_int8_program_yuv = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_texture_int8_shader_yuv(),
+            )?)
+        } else {
+            None
+        };
+
+        let yuyv_program_2d = GlProgram::new(
+            generate_vertex_shader(),
+            super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
+        )?;
+        let yuyv_2d_locs = unsafe {
+            gls::gl::UseProgram(yuyv_program_2d.id);
+            // Constant sampler binding resolved at link (B6 pattern).
+            let tex = gls::gl::GetUniformLocation(yuyv_program_2d.id, c"tex".as_ptr());
+            gls::gl::Uniform1i(tex, 0);
+            [
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"src_size".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_offset".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_scale".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vr".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ug".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vg".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ub".as_ptr()),
+            ]
+        };
 
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
@@ -819,8 +928,14 @@ impl GLProcessorST {
         color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
         // Int8 variant of the existing planar RGB shader (for planar RGB int8 destinations).
-        let texture_program_planar_int8 =
-            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
+        let texture_program_planar_int8 = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_planar_rgb_int8_shader(),
+            )?)
+        } else {
+            None
+        };
 
         // Planar RGB shaders with sampler2D (for two-pass NV12→RGBA→PlanarRgb on Vivante)
         let texture_program_planar_2d =
@@ -947,6 +1062,8 @@ impl GLProcessorST {
             texture_int8_program_yuv,
             texture_program_planar,
             texture_program_planar_int8,
+            yuyv_program_2d,
+            yuyv_2d_locs,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
             texture_program_planar_2d,
@@ -977,10 +1094,11 @@ impl GLProcessorST {
             convert_fbo: FrameBuffer::new(),
             draw_fbo: FrameBuffer::new(),
             draw_render_texture,
-            src_egl_cache: EglImageCache::new(egl_cache_capacity),
-            dst_egl_cache: EglImageCache::new(egl_cache_capacity),
+            src_egl_cache: ImportCache::new(egl_cache_capacity),
+            dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
             is_vivante,
+            is_virtual_gpu,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -1003,7 +1121,7 @@ impl GLProcessorST {
             nv_r8_uniforms,
             nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
-            nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
+            nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
@@ -1311,8 +1429,10 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let lowering =
-            super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory());
+        let lowering = super::render::lower_dst(
+            self.gl_context.transfer_backend.is_zero_copy(),
+            dst.memory(),
+        );
         let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
         let _span = tracing::trace_span!(
             "image.convert.gl.engine",
@@ -1560,14 +1680,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -1584,14 +1703,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
@@ -1748,14 +1866,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -1772,14 +1889,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
@@ -1800,8 +1916,8 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> bool {
-        if backend.is_dma() && img.memory() == TensorMemory::Dma {
-            // EGLImage DMA-BUF path supports:
+        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
+            // Zero-copy import path supports:
             //   Path A (samplerExternalOES): RGBA, GREY, YUYV, NV12
             //   Path B (R8 texelFetch shader): NV16, NV24 (contiguous only)
             // VYUY excluded: Vivante GPU accepts the DRM fourcc but produces
@@ -1844,7 +1960,7 @@ impl GLProcessorST {
         if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
         }
-        if backend.is_dma() && img.memory() == TensorMemory::Dma {
+        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
             matches!(
                 fmt,
                 PixelFormat::Rgba
@@ -1861,37 +1977,30 @@ impl GLProcessorST {
         }
     }
 
-    /// Query GL capabilities and detect GPU vendor/renderer type.
-    ///
-    /// Returns `(has_float_linear, has_bgra, is_vivante, is_software_renderer,
-    /// supports_f32_color, supports_f16_color)`. The two float-color flags
-    /// report whether the GPU can render to F32 / F16 color attachments
-    /// (independent extensions: a configuration may have one but not the
-    /// other). On this Linux backend they are forward-compat capability
-    /// probes surfaced via `RenderDtypeSupport`; the macOS IOSurface path
-    /// is the only render destination that consumes float dtypes today.
-    fn gl_check_support() -> Result<(bool, bool, bool, bool, bool, bool), crate::Error> {
+    /// Query GL capabilities and detect GPU vendor/renderer type — see
+    /// [`GlSupport`]. The two float-color flags report whether the GPU can
+    /// render to F32 / F16 color attachments (independent extensions: a
+    /// configuration may have one but not the other), surfaced via
+    /// `RenderDtypeSupport`.
+    fn gl_check_support() -> Result<GlSupport, crate::Error> {
         if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
         }
 
-        // Detect GPU vendor and software renderers via GL_RENDERER string.
-        let (is_vivante, is_software_renderer) = gls::get_string(gls::gl::RENDERER)
+        // Detect GPU vendor / software / virtualized renderers via GL_RENDERER.
+        let traits = gls::get_string(gls::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
-                let lower = r.to_ascii_lowercase();
-                let vivante = lower.contains("vivante")
-                    || lower.contains("gc7000")
-                    || lower.contains("galcore");
-                let software = lower.contains("llvmpipe")
-                    || lower.contains("softpipe")
-                    || lower.contains("swrast")
-                    || lower.contains("software rasterizer");
-                (vivante, software)
+                classify_renderer(&r)
             })
-            .unwrap_or((false, false));
+            .unwrap_or_default();
+        let RendererTraits {
+            vivante: is_vivante,
+            software: is_software_renderer,
+            virtual_gpu: is_virtual_gpu,
+        } = traits;
         if is_vivante {
             log::warn!(
                 "Vivante GPU detected — NV12 → planar RGB conversions will use \
@@ -1903,6 +2012,15 @@ impl GLProcessorST {
                 "Software OpenGL renderer detected — GPU backend will be disabled. \
                  Image processing will use the CPU backend instead. \
                  Check EGL ICD configuration if a hardware GPU is expected."
+            );
+        }
+        if is_virtual_gpu {
+            log::warn!(
+                "Virtualized GPU detected — concurrent GL across contexts \
+                 mis-renders on paravirtual Metal (observed on macOS CI \
+                 runners); processors will serialize per-message (Full \
+                 policy, same as Vivante). Override with \
+                 EDGEFIRST_GL_SERIALIZE=lifecycle."
             );
         }
 
@@ -1918,7 +2036,14 @@ impl GLProcessorST {
                 .to_string()
         };
         log::debug!("GL Extensions: {extensions}");
-        let required_ext = ["GL_OES_EGL_image_external_essl3"];
+        // The external-OES sampler is required only where the platform's
+        // import binding uses it (Linux Path A); ANGLE/Metal binds every
+        // import as TEXTURE_2D and never exposes the extension.
+        let required_ext: &[&str] = if Platform::EXTERNAL_OES {
+            &["GL_OES_EGL_image_external_essl3"]
+        } else {
+            &[]
+        };
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
             if !extensions.contains(required) {
@@ -1956,14 +2081,13 @@ impl GLProcessorST {
         log::debug!("GL_EXT_color_buffer_float: {supports_f32_color}");
         log::debug!("GL_EXT_color_buffer_half_float: {supports_f16_color}");
 
-        Ok((
+        Ok(GlSupport {
             has_float_linear,
             has_bgra,
-            is_vivante,
-            is_software_renderer,
+            renderer: traits,
             supports_f32_color,
             supports_f16_color,
-        ))
+        })
     }
 
     /// Invalidate EGL binding state on all destination textures.
@@ -1978,6 +2102,7 @@ impl GLProcessorST {
     fn invalidate_src_textures(&mut self) {
         self.camera_eglimage_texture.invalidate_egl_binding();
         self.nv_r8_texture.invalidate_egl_binding();
+        self.camera_normal_texture.invalidate_egl_binding();
     }
 
     /// Classify and bind the destination render target — the single entry
@@ -1990,7 +2115,10 @@ impl GLProcessorST {
         dst_fmt: PixelFormat,
         crop: ResolvedCrop,
     ) -> crate::Result<DstTarget> {
-        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
+        match super::render::lower_dst(
+            self.gl_context.transfer_backend.is_zero_copy(),
+            dst.memory(),
+        ) {
             super::render::DstLowering::ZeroCopy => {
                 self.setup_renderbuffer_dma(dst, dst_fmt)?;
                 Ok(DstTarget::ZeroCopyImage)
@@ -2036,7 +2164,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
+        let dst_key = BufferImportKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -2052,13 +2180,15 @@ impl GLProcessorST {
                 check_gl_error(function!(), line!())?;
             },
             None => unsafe {
-                gls::gl::UseProgram(self.texture_program_yuv.id);
+                if let Some(p) = &self.texture_program_yuv {
+                    gls::gl::UseProgram(p.id);
+                }
                 gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                 super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .render_texture
-                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                    .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -2126,7 +2256,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
+        let dst_key = BufferImportKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -2147,7 +2277,7 @@ impl GLProcessorST {
                 super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .draw_render_texture
-                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                    .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -2237,19 +2367,24 @@ impl GLProcessorST {
                 )))
             }
         };
+        // Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
+        // ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it with
+        // GL_INVALID_OPERATION at validation, before any parameter is looked
+        // at. The destination is always at least `dst.len()` bytes and the
+        // read is tightly packed (PACK_ALIGNMENT=1 at init), so the bounds
+        // the robust variant checked hold by construction.
         let len = dst.len();
         match pbo_id {
             None => unsafe {
                 let mut dst_map = dst.map()?;
                 gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadnPixels(
+                gls::gl::ReadPixels(
                     0,
                     0,
                     dst_w as i32,
                     dst_h as i32,
                     dest_format,
                     gls::gl::UNSIGNED_BYTE,
-                    len as i32,
                     dst_map.as_mut_ptr() as *mut c_void,
                 );
                 if dst_fmt == PixelFormat::Bgra {
@@ -2262,14 +2397,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         dest_format,
                         gls::gl::UNSIGNED_BYTE,
-                        len as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -2980,10 +3114,44 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> Result<(), crate::Error> {
-        let src_w = src.width().ok_or(Error::NotAnImage)?;
-        let src_h = src.height().ok_or(Error::NotAnImage)?;
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        self.convert_to_dims(
+            src,
+            src_fmt,
+            dst_w,
+            dst_h,
+            dst.view_origin(),
+            _dst_fmt,
+            is_int8,
+            rotation,
+            flip,
+            crop,
+        )
+    }
+
+    /// The body of [`convert_to`], taking the destination geometry directly:
+    /// renders `src` to the currently-bound FBO. Callers rendering into an
+    /// engine-internal texture (the fused float two-pass) have no `Tensor<u8>`
+    /// destination to lend — only its dimensions. `dst_fmt` feeds only
+    /// `select_nv_path`'s Vivante carve-out, never the render target format
+    /// (that is whatever the bound FBO holds).
+    #[allow(clippy::too_many_arguments)]
+    fn convert_to_dims(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst_w: usize,
+        dst_h: usize,
+        dst_view_origin: Option<edgefirst_tensor::ViewOrigin>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> Result<(), crate::Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
         check_gl_error(function!(), line!())?;
 
         // A view()/batch() destination shares ONE parent EGLImage with its
@@ -3003,7 +3171,7 @@ impl GLProcessorST {
         // Band rect via `region_to_viewport_top_down` — the SAME lowering as
         // the band viewport in `bind_dst`'s setup, so scissor and viewport can
         // never disagree on the orientation convention.
-        let _scissor = match dst.view_origin() {
+        let _scissor = match dst_view_origin {
             Some(vo) => {
                 let vp = super::render::region_to_viewport_top_down(crate::Region::new(
                     vo.x, vo.y, dst_w, dst_h,
@@ -3067,15 +3235,29 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::Dma {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
             // single-plane NV12/NV16/NV24, using the driver ExternalSampler only
             // for true-multiplane NV12 (which ShaderR8 cannot import).
-            let chosen = self.select_nv_path(src, src_fmt, _dst_fmt);
+            let chosen = self.select_nv_path(src, src_fmt, dst_fmt);
 
-            if chosen == NvConvertPath::ShaderR8 {
+            if !Platform::EXTERNAL_OES && chosen == NvConvertPath::ExternalSampler {
+                // No samplerExternalOES on this platform (ANGLE/Metal):
+                // packed/Grey zero-copy sources attach as TEXTURE_2D inside
+                // draw_src_texture; formats it can't take fall back to CPU
+                // via its error.
+                self.draw_src_texture(
+                    src,
+                    src_fmt,
+                    src_roi,
+                    dst_roi,
+                    rotation_offset,
+                    flip,
+                    is_int8,
+                )?;
+            } else if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
                     Ok(r8_egl) => {
                         tracing::trace!(
@@ -3329,7 +3511,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
@@ -3429,8 +3611,7 @@ impl GLProcessorST {
             dst_fmt,
             render_w,
             render_h,
-            DrmFourcc::Abgr8888,
-            4,
+            super::platform::PackedImportFormat::Rgba8888,
         )?;
         unsafe {
             match self.cached_dst_renderbuffer(dst, dst_fmt) {
@@ -3447,7 +3628,7 @@ impl GLProcessorST {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    Platform::attach_tex_image_2d(&self.gl_context, dest_egl)?;
                     // Raw re-target bypasses bind_egl_image's key tracking:
                     // drop the cached key so a later bind_egl_image on this
                     // texture cannot "reuse" a binding this call replaced
@@ -3716,8 +3897,8 @@ impl GLProcessorST {
     #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
         &mut self,
-        src_key: EglCacheKey,
-        egl_img: egl::Image,
+        src_key: BufferImportKey,
+        egl_img: PlatformHandle,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -3735,13 +3916,18 @@ impl GLProcessorST {
                 std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
             }
         }
+        let program_id = if int8 {
+            &self.texture_program_planar_int8
+        } else {
+            &self.texture_program_planar
+        }
+        .as_ref()
+        .ok_or_else(|| {
+            Error::NotSupported("external-OES planar program unavailable on this platform".into())
+        })?
+        .id;
         unsafe {
-            let program = if int8 {
-                &self.texture_program_planar_int8
-            } else {
-                &self.texture_program_planar
-            };
-            gls::gl::UseProgram(program.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
@@ -3757,10 +3943,11 @@ impl GLProcessorST {
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
 
-            if self
-                .camera_eglimage_texture
-                .bind_egl_image_external(src_key, egl_img.as_ptr())
-            {
+            if self.camera_eglimage_texture.bind_egl_image_external(
+                &self.gl_context,
+                src_key,
+                egl_img,
+            )? {
                 check_gl_error(function!(), line!())?;
                 log::trace!(
                     "draw_camera_planar: bound new src EGLImage id={:#x}",
@@ -3999,10 +4186,37 @@ impl GLProcessorST {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let texture_target = gls::gl::TEXTURE_2D;
+        // Zero-copy source attach: on platforms whose imports bind as
+        // TEXTURE_2D (macOS IOSurface), a Dma-memory source is imported
+        // and attached to the source texture instead of being uploaded.
+        // Import errors fall back to the upload below (the map() of an
+        // IOSurface tensor is always valid); YUYV has no upload arm and
+        // is accepted only when its RG attach succeeds.
+        let zero_copy_attach = if !self.gl_context.transfer_backend.is_dma()
+            && self.gl_context.transfer_backend.is_zero_copy()
+            && src.memory() == TensorMemory::Dma
+            && matches!(
+                src_fmt,
+                PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Yuyv
+            ) {
+            let key = BufferImportKey::from_tensor(src, src_fmt, false);
+            match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
+                Ok(handle) => Some((key, handle)),
+                Err(e) => {
+                    log::debug!("zero-copy source import failed ({e:?}); uploading instead");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let texture_format = match src_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
             PixelFormat::Rgba => gls::gl::RGBA,
             PixelFormat::Grey => gls::gl::RED,
+            // YUYV samples as RG (R=Y, G=alternating chroma) — zero-copy
+            // attach only; there is deliberately no upload arm yet.
+            PixelFormat::Yuyv if zero_copy_attach.is_some() => gls::gl::RG,
             _ => {
                 return Err(Error::NotSupported(format!(
                     "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
@@ -4012,13 +4226,39 @@ impl GLProcessorST {
         // Draw-time program selection: the int8 program is the same shader
         // plus the XOR-0x80 bias, selected here instead of swap-and-restore
         // around the render.
-        let program_id = if is_int8 {
+        let program_id = if src_fmt == PixelFormat::Yuyv {
+            if is_int8 {
+                return Err(Error::NotSupported(
+                    "YUYV zero-copy source has no int8 program; CPU fallback handles it".into(),
+                ));
+            }
+            self.yuyv_program_2d.id
+        } else if is_int8 {
             self.texture_int8_program.id
         } else {
             self.texture_program.id
         };
         unsafe {
             gls::gl::UseProgram(program_id);
+            if src_fmt == PixelFormat::Yuyv {
+                // YUYV program inputs: source texel grid + the YUV→RGB
+                // matrix/range resolved from the tensor colorimetry (same
+                // resolution rule as the NV paths).
+                let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+                let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
+                    cm.encoding
+                        .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                    cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+                );
+                let [src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub] = self.yuyv_2d_locs;
+                gls::gl::Uniform2f(src_size, src_w as f32, src_h as f32);
+                gls::gl::Uniform1f(y_offset, coeffs.y_offset);
+                gls::gl::Uniform1f(y_scale, coeffs.y_scale);
+                gls::gl::Uniform1f(c_vr, coeffs.c_vr);
+                gls::gl::Uniform1f(c_ug, coeffs.c_ug);
+                gls::gl::Uniform1f(c_vg, coeffs.c_vg);
+                gls::gl::Uniform1f(c_ub, coeffs.c_ub);
+            }
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
@@ -4046,21 +4286,30 @@ impl GLProcessorST {
             // 1-/3-bpp pitch is not 4-aligned so they can't take the stride-aware
             // EGLImage path. Tell GL the real row length (in pixels) so it skips
             // the padding; reset afterwards so other uploads stay tight.
-            let src_bpp = src_fmt.channels().max(1);
-            let row_len_px = src
-                .effective_row_stride()
-                .map(|s| s / src_bpp)
-                .filter(|&px| px != src_w)
-                .unwrap_or(0);
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
-            self.camera_normal_texture.update_texture(
-                texture_target,
-                src_w,
-                src_h,
-                texture_format,
-                &src.map()?,
-            );
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+            if let Some((key, handle)) = zero_copy_attach {
+                self.camera_normal_texture
+                    .bind_egl_image(&self.gl_context, key, handle)?;
+                // Poison the upload-tracking dims: a later upload on this
+                // texture must TexImage2D fresh storage, never
+                // TexSubImage2D into the attached client buffer.
+                self.camera_normal_texture.target = 0;
+            } else {
+                let src_bpp = src_fmt.channels().max(1);
+                let row_len_px = src
+                    .effective_row_stride()
+                    .map(|s| s / src_bpp)
+                    .filter(|&px| px != src_w)
+                    .unwrap_or(0);
+                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
+                self.camera_normal_texture.update_texture(
+                    texture_target,
+                    src_w,
+                    src_h,
+                    texture_format,
+                    &src.map()?,
+                );
+                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+            }
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
@@ -4140,22 +4389,27 @@ impl GLProcessorST {
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-        egl_img: egl::Image,
+        egl_img: PlatformHandle,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
         flip: Flip,
         is_int8: bool,
     ) -> Result<(), Error> {
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // Draw-time program selection (see draw_src_texture).
         let program_id = if is_int8 {
-            self.texture_int8_program_yuv.id
+            &self.texture_int8_program_yuv
         } else {
-            self.texture_program_yuv.id
-        };
+            &self.texture_program_yuv
+        }
+        .as_ref()
+        .ok_or_else(|| {
+            Error::NotSupported("external-OES sampler program unavailable on this platform".into())
+        })?
+        .id;
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(program_id);
@@ -4169,10 +4423,11 @@ impl GLProcessorST {
             // and greyscale EGLImages replicate luma to all channels
             // automatically via the YUV shader.
 
-            if self
-                .camera_eglimage_texture
-                .bind_egl_image_external(src_key, egl_img.as_ptr())
-            {
+            if self.camera_eglimage_texture.bind_egl_image_external(
+                &self.gl_context,
+                src_key,
+                egl_img,
+            )? {
                 check_gl_error(function!(), line!())?;
                 log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
             } else {
@@ -4272,7 +4527,7 @@ impl GLProcessorST {
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-        r8_src: Option<egl::Image>,
+        r8_src: Option<PlatformHandle>,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -4299,7 +4554,7 @@ impl GLProcessorST {
         let chroma_shift_y = layout.shift_y as i32;
         let chroma_lines = layout.uv_rows_per_luma as i32;
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // Draw-time program selection: the int8 NV program is the same shader
@@ -4344,7 +4599,10 @@ impl GLProcessorST {
 
             match r8_src {
                 Some(egl_img) => {
-                    if self.nv_r8_texture.bind_egl_image(src_key, egl_img.as_ptr()) {
+                    if self
+                        .nv_r8_texture
+                        .bind_egl_image(&self.gl_context, src_key, egl_img)?
+                    {
                         check_gl_error(function!(), line!())?;
                         log::trace!("draw_nv_texture_2d: bound new R8 EGLImage id={luma_id:#x}");
                     } else {
@@ -4512,17 +4770,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Create an R8 EGLImage for Path B (NV* combined-plane import).
-    fn create_image_from_dma_nv_r8(
-        &self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-    ) -> Result<EglImage, Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor_nv_r8(src, src_fmt)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
     /// Look up or create the Path-B R8 EGLImage for an NV* source tensor.
     ///
     /// Uses a dedicated cache (`nv_r8_egl_cache`) that is keyed identically to
@@ -4531,10 +4778,10 @@ impl GLProcessorST {
         &mut self,
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
-    ) -> Result<egl::Image, crate::Error> {
+    ) -> Result<PlatformHandle, crate::Error> {
         // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
         // never collapses onto a destination parent import.
-        let id = EglCacheKey::from_tensor(img, img_fmt, false);
+        let id = BufferImportKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
         if self.nv_r8_egl_cache.sweep() {
@@ -4547,16 +4794,16 @@ impl GLProcessorST {
                 self.nv_r8_egl_cache.hits += 1;
                 cached.last_used = ts;
                 log::trace!("nv_r8_egl_cache hit: id={luma_id:#x}");
-                return Ok(cached.egl_image.egl_image);
+                return Ok(Platform::import_handle(&cached.import));
             }
             self.nv_r8_egl_cache.misses += 1;
             log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
         }
 
-        let egl_image_obj = self.create_image_from_dma_nv_r8(img, img_fmt)?;
+        let egl_image_obj = Platform::import_buffer_nv_r8(&self.gl_context, img, img_fmt)?;
         self.nv_r8_texture.invalidate_egl_binding();
 
-        let handle = egl_image_obj.egl_image;
+        let handle = Platform::import_handle(&egl_image_obj);
         let guard = img.buffer_identity().weak();
         if self.nv_r8_egl_cache.entries.len() >= self.nv_r8_egl_cache.capacity {
             self.nv_r8_egl_cache.evict_lru();
@@ -4564,54 +4811,14 @@ impl GLProcessorST {
         let ts = self.nv_r8_egl_cache.next_timestamp();
         self.nv_r8_egl_cache.entries.insert(
             id,
-            super::cache::CachedEglImage {
-                egl_image: egl_image_obj,
+            super::cache::CachedImport {
+                import: egl_image_obj,
                 last_used: ts,
                 guard,
                 renderbuffer: None,
             },
         );
         Ok(handle)
-    }
-
-    fn create_image_from_dma2(
-        &self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        for_dst: bool,
-    ) -> Result<EglImage, crate::Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt, for_dst)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
-    fn new_egl_image_owned(
-        &'_ self,
-        target: egl::Enum,
-        attrib_list: &[Attrib],
-    ) -> Result<EglImage, Error> {
-        // Every EGLImage creation funnels through here (DMA-BUF, NV R8, RGB
-        // renderbuffer paths), so one span = one actual `eglCreateImageKHR`.
-        // Steady-state frame loops must show ZERO of these after warmup — the
-        // span count is the observable for cache-behavior equality gates.
-        let _span = tracing::trace_span!("image.convert.gl.egl_import", target).entered();
-        // EGLImage creation is a display-level EGL op shared by every
-        // processor — serialized by a dedicated short lock (zero cost in
-        // steady state: creations are cache-miss-only).
-        let _image_guard = super::context::image_lifecycle_guard();
-        let image = GlContext::egl_create_image_with_fallback(
-            &self.gl_context.egl,
-            self.gl_context.display,
-            unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
-            target,
-            unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
-            attrib_list,
-        )?;
-        Ok(EglImage {
-            egl_image: image,
-            display: self.gl_context.display,
-            egl: Rc::clone(&self.gl_context.egl),
-        })
     }
 
     /// Look up or create an EGLImage for a DMA tensor, returning the EGL image handle.
@@ -4624,13 +4831,13 @@ impl GLProcessorST {
         cache: CacheKind,
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
-    ) -> Result<egl::Image, crate::Error> {
+    ) -> Result<PlatformHandle, crate::Error> {
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
-        // (geometry) — see EglCacheKey. Only a destination view collapses onto
+        // (geometry) — see BufferImportKey. Only a destination view collapses onto
         // its parent key; a source view keys on its own region.
-        let id = EglCacheKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
+        let id = BufferImportKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
 
         // Sweep dead entries opportunistically before looking up.
@@ -4657,11 +4864,11 @@ impl GLProcessorST {
             if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
                 cached.last_used = ts;
-                log::trace!("EglImageCache {:?} hit: id={luma_id:#x}", cache);
-                return Ok(cached.egl_image.egl_image);
+                log::trace!("ImportCache {:?} hit: id={luma_id:#x}", cache);
+                return Ok(Platform::import_handle(&cached.import));
             }
             egl_cache.misses += 1;
-            log::trace!("EglImageCache {:?} miss: id={luma_id:#x}", cache);
+            log::trace!("ImportCache {:?} miss: id={luma_id:#x}", cache);
         }
 
         // Create the EGL image BEFORE evicting — if creation fails, we don't
@@ -4669,7 +4876,7 @@ impl GLProcessorST {
         // destination view imports its parent (glViewport tiling); a source view
         // imports its own region (it is sampled, not rendered into).
         let for_dst = cache == CacheKind::Dst;
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt, for_dst)?;
+        let egl_image_obj = Platform::import_buffer(&self.gl_context, img, img_fmt, for_dst)?;
 
         // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
         // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
@@ -4680,10 +4887,10 @@ impl GLProcessorST {
             unsafe {
                 gls::gl::GenRenderbuffers(1, &mut rbo);
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::EGLImageTargetRenderbufferStorageOES(
-                    gls::gl::RENDERBUFFER,
-                    egl_image_obj.egl_image.as_ptr(),
-                );
+                Platform::attach_renderbuffer_storage(
+                    &self.gl_context,
+                    Platform::import_handle(&egl_image_obj),
+                )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
                     gls::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
@@ -4701,7 +4908,7 @@ impl GLProcessorST {
             CacheKind::Dst => self.invalidate_dst_textures(),
         }
 
-        let handle = egl_image_obj.egl_image;
+        let handle = Platform::import_handle(&egl_image_obj);
         let guard = img.buffer_identity().weak();
         let egl_cache = match cache {
             CacheKind::Src => &mut self.src_egl_cache,
@@ -4714,8 +4921,8 @@ impl GLProcessorST {
         let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
+            CachedImport {
+                import: egl_image_obj,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,
@@ -4729,7 +4936,7 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = EglCacheKey::from_tensor(img, fmt, true);
+        let id = BufferImportKey::from_tensor(img, fmt, true);
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4745,69 +4952,27 @@ impl GLProcessorST {
     /// (packed-RGB DMA) and `f16` (RGBA16F-packed DMA) destinations. Only the
     /// DMA fd, stride and offset are read from the tensor; `width`, `height`,
     /// `drm_format` and `bpp` describe the GL-visible packed surface.
-    fn create_egl_image_with_dims<T>(
-        &self,
-        img: &Tensor<T>,
-        width: usize,
-        height: usize,
-        drm_format: DrmFourcc,
-        bpp: usize,
-    ) -> Result<EglImage, crate::Error>
-    where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
-    {
-        let dma = img.as_dma().ok_or_else(|| {
-            Error::NotImplemented("create_egl_image_with_dims requires DMA tensor".to_string())
-        })?;
-        let fd = dma.fd.as_raw_fd();
-
-        // Use the tensor's stored stride when available (externally allocated
-        // buffers with row padding), otherwise compute the tightly-packed pitch.
-        let pitch = img.effective_row_stride().unwrap_or(width * bpp);
-        let offset = img.plane_offset().unwrap_or(0);
-        let egl_img_attr = vec![
-            egl_ext::LINUX_DRM_FOURCC as Attrib,
-            drm_format as u32 as Attrib,
-            khronos_egl::WIDTH as Attrib,
-            width as Attrib,
-            khronos_egl::HEIGHT as Attrib,
-            height as Attrib,
-            egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
-            pitch as Attrib,
-            egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
-            offset as Attrib,
-            egl_ext::DMA_BUF_PLANE0_FD as Attrib,
-            fd as Attrib,
-            egl::IMAGE_PRESERVED as Attrib,
-            egl::TRUE as Attrib,
-            khronos_egl::NONE as Attrib,
-        ];
-
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
     /// Get or create an EGLImage for a packed DMA destination with
     /// reinterpreted dimensions. Uses the dst cache keyed by buffer identity.
     ///
     /// Generic over the tensor element type so it serves both the `u8`
-    /// packed-RGB destination (`DrmFourcc::Abgr8888`, bpp=4) and the `f16`
-    /// RGBA16F-packed planar destination (`DrmFourcc::Abgr16161616f`, bpp=8).
+    /// packed-RGB destination (`PackedImportFormat::Rgba8888`) and the
+    /// `f16` RGBA16F-packed planar destination (`Rgba16161616F`).
     fn get_or_create_egl_image_rgb<T>(
         &mut self,
         img: &Tensor<T>,
         img_fmt: PixelFormat,
         width: usize,
         height: usize,
-        drm_format: DrmFourcc,
-        bpp: usize,
-    ) -> Result<egl::Image, crate::Error>
+        packed: super::platform::PackedImportFormat,
+    ) -> Result<PlatformHandle, crate::Error>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
         // tensor's logical geometry, so `from_tensor` is a consistent key.
-        let id = EglCacheKey::from_tensor(img, img_fmt, true);
+        let id = BufferImportKey::from_tensor(img, img_fmt, true);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }
@@ -4816,11 +4981,11 @@ impl GLProcessorST {
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
-            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.luma_id);
-            return Ok(cached.egl_image.egl_image);
+            log::trace!("ImportCache dst (RGB) hit: id={:#x}", id.luma_id);
+            return Ok(Platform::import_handle(&cached.import));
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.luma_id);
+        log::trace!("ImportCache dst (RGB) miss: id={:#x}", id.luma_id);
         // Invalidate dst texture binding state on cache miss (new EGLImage creation).
         self.invalidate_dst_textures();
 
@@ -4828,18 +4993,19 @@ impl GLProcessorST {
             self.dst_egl_cache.evict_lru();
         }
 
-        let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
-        let handle = egl_image_obj.egl_image;
+        let egl_image_obj =
+            Platform::import_buffer_packed(&self.gl_context, img, width, height, packed)?;
+        let handle = Platform::import_handle(&egl_image_obj);
 
         let rbo = if self.use_renderbuffer {
             let mut rbo: u32 = 0;
             unsafe {
                 gls::gl::GenRenderbuffers(1, &mut rbo);
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::EGLImageTargetRenderbufferStorageOES(
-                    gls::gl::RENDERBUFFER,
-                    egl_image_obj.egl_image.as_ptr(),
-                );
+                Platform::attach_renderbuffer_storage(
+                    &self.gl_context,
+                    Platform::import_handle(&egl_image_obj),
+                )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
                     gls::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
@@ -4854,8 +5020,8 @@ impl GLProcessorST {
         let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
+            CachedImport {
+                import: egl_image_obj,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,
@@ -6223,6 +6389,120 @@ impl GLProcessorST {
             self.supports_f16_color,
         )
     }
+
+    /// Fused NV12/NV16/NV24 → PlanarRgb F16: two GPU passes under one call
+    /// with a **GPU-resident intermediate** — the pixel path is
+    /// zero-copy src → GPU → texture → GPU → zero-copy dst, never touching
+    /// host memory. Pass 1 renders the YUV source with the caller's full
+    /// geometry (resize, crop, letterbox) into the shared intermediate
+    /// RGBA8 texture at destination resolution (the same texture the
+    /// packed-RGB and Vivante planar two-passes use); pass 2 packs that
+    /// texture 1:1 into the RGBA16F zero-copy destination. The model-input
+    /// convert previously only the legacy macOS backend offered — now
+    /// portable (Linux DMA-BUF f16 targets included).
+    fn convert_nv_to_planar_float_two_pass(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        // Parity with the float render paths: rotation/flip stay on the CPU
+        // fallback until the fused path grows an oracle for them (pass 1
+        // could render them, but untested behavior must not silently flip
+        // backend).
+        if rotation != crate::Rotation::None || flip != Flip::None {
+            return Err(crate::Error::NotSupported(
+                "GL fused NV→PlanarF16: rotation/flip not supported; using CPU fallback"
+                    .to_string(),
+            ));
+        }
+        let src_u8 = src.as_u8().ok_or(Error::NotAnImage)?;
+        let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let _span =
+            tracing::trace_span!("image.convert.gl.nv_to_planar_float", dst_w, dst_h).entered();
+
+        // ── Pass 1: NV → RGBA with the caller's full geometry, into the
+        // shared intermediate texture (GPU-only; no tensor, no import) ──
+        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
+        self.packed_rgb_fbo.bind();
+        unsafe {
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        }
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples
+        // the finished intermediate; the convert syncs once at pass 2's
+        // fence. The flag restores before `?` so an error cannot leak
+        // defer state.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to_dims(
+            src_u8,
+            src_fmt,
+            dst_w,
+            dst_h,
+            None,
+            PixelFormat::Rgba,
+            false,
+            rotation,
+            flip,
+            crop,
+        );
+        self.defer_finish = saved_defer;
+        pass1?;
+
+        // ── Pass 2: 1:1 pack of the intermediate into the RGBA16F
+        // zero-copy destination. NO crop here: pass 1 already placed the
+        // content band and padding at destination geometry — re-applying
+        // the crop would letterbox a second time (the PR #107 bug class;
+        // see convert_nv_to_planar_two_pass pass 2).
+        let (src_rect_uv, dst_rect_px, pad_color) =
+            super::core::float_crop_uniforms(&ResolvedCrop::no_crop(), dst_w, dst_h, dst_w, dst_h)?;
+        self.render_float_to_zero_copy_tail(
+            self.packed_rgb_intermediate_tex.id,
+            src_rect_uv,
+            dst_rect_px,
+            pad_color,
+            dst,
+        )
+    }
+
+    /// Release per-pass platform texture attachments — called by the
+    /// dispatch wrapper after each message whose GPU work has synced
+    /// (no-op while a deferred batch still owes its flush, and on
+    /// platforms with persistent bindings).
+    pub(super) fn end_gpu_pass_if_synced(&self) {
+        if !self.pending_flush {
+            Platform::end_gpu_pass(&self.gl_context);
+        }
+    }
+
+    /// Assemble the immutable capability surface for this processor.
+    /// Captured ONCE by the dispatch wrapper at worker startup (before its
+    /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
+    /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
+    pub(super) fn platform_caps(&self) -> super::platform::PlatformCaps {
+        super::platform::PlatformCaps {
+            transfer_backend: self.gl_context.transfer_backend,
+            render_dtypes: self.supported_render_dtypes(),
+            // Full per-message serialization where concurrent GL across
+            // contexts is unsafe: Vivante/galcore (driver races) and
+            // virtualized GPUs (paravirtual Metal mis-renders).
+            serialize_gl: self.is_vivante() || self.is_virtual_gpu,
+            external_oes: Platform::EXTERNAL_OES,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6252,5 +6532,43 @@ mod tests {
         // A hardware renderer is never rejected, override or not.
         assert!(!should_reject_software_gl(false, false));
         assert!(!should_reject_software_gl(false, true));
+    }
+
+    // Real GL_RENDERER strings from the fleet: classification drives the
+    // Vivante workarounds, the software-GL rejection, and the Full
+    // serialization policy (Vivante + virtualized GPUs).
+    #[test]
+    fn classify_renderer_fleet_strings() {
+        use super::{classify_renderer, RendererTraits};
+        let real_gpu = RendererTraits::default();
+
+        // imx8mp (Vivante GC7000UL)
+        let t = classify_renderer("Vivante GC7000UL");
+        assert!(t.vivante && !t.software && !t.virtual_gpu);
+        // Apple Silicon via ANGLE (developer machines)
+        assert_eq!(
+            classify_renderer(
+                "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, \
+                 Version 26.4.1 (Build 25E253))"
+            ),
+            real_gpu
+        );
+        // Mali / V3D / Tegra: plain hardware
+        assert_eq!(classify_renderer("Mali-G310"), real_gpu);
+        assert_eq!(classify_renderer("V3D 7.1"), real_gpu);
+        assert_eq!(
+            classify_renderer("NVIDIA Tegra Orin (nvgpu)/integrated"),
+            real_gpu
+        );
+        // Mesa software rasterizer (CI coverage lane)
+        let t = classify_renderer("llvmpipe (LLVM 15.0.7, 256 bits)");
+        assert!(t.software && !t.vivante && !t.virtual_gpu);
+        // GitHub macOS runner: virtualized Metal — concurrent GL across
+        // contexts mis-renders there; must select the Full policy.
+        let t = classify_renderer(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, \
+             Version 15.7.7 (Build 24G720))",
+        );
+        assert!(t.virtual_gpu && !t.software && !t.vivante);
     }
 }
