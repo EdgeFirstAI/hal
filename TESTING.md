@@ -112,6 +112,18 @@ The helper builds with `--tests`, signs every binary in
 forwards remaining arguments to `cargo nextest run`. Re-running it is
 idempotent (signing the same binary twice is a no-op).
 
+### 3. CI guard against silent GL skips
+
+Every GL test self-skips when the backend is unavailable — correct for
+developer machines, but it means a broken CI GL stack (e.g. the ANGLE
+re-sign step regressing) would ship an untested GL backend behind a
+green lane. `gl_backend_available_canary` (crates/image lib tests)
+fails the run if `HAL_TEST_REQUIRE_GL=1` is set and
+`GLProcessorThreaded::new` errors. The macOS CI job sets it; local runs
+without the variable skip the canary trivially. On macOS the canary
+additionally requires `HAL_TEST_ALLOW_DLOPEN_ANGLE` so that coverage
+pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
+
 #### The manual way
 
 For one-off binaries (e.g. a release build of an example):

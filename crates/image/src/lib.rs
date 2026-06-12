@@ -3599,6 +3599,39 @@ mod image_tests {
         }
     }
 
+    /// CI canary: fails the lane when the GL backend cannot initialize.
+    ///
+    /// Every GL test in this suite self-skips when the backend is
+    /// unavailable — correct for developer machines, but it means a broken
+    /// CI GL stack (e.g. the macOS ANGLE re-sign step regressing, the exact
+    /// failure mode documented in the workflow) ships an untested GL
+    /// backend behind a green lane. Gated on `HAL_TEST_REQUIRE_GL=1`, set
+    /// only by CI jobs that install a working GL stack; local runs without
+    /// one pass trivially. On macOS it additionally requires
+    /// `HAL_TEST_ALLOW_DLOPEN_ANGLE`, so coverage pass 1 (unsigned
+    /// binaries, dlopen gate closed) skips it and pass 2 (signed) enforces.
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn gl_backend_available_canary() {
+        if std::env::var_os("HAL_TEST_REQUIRE_GL").is_none_or(|v| v != "1") {
+            eprintln!("SKIPPED: {} — HAL_TEST_REQUIRE_GL unset", function!());
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("HAL_TEST_ALLOW_DLOPEN_ANGLE").is_none() {
+            eprintln!(
+                "SKIPPED: {} — ANGLE dlopen gate closed (coverage pass 1)",
+                function!()
+            );
+            return;
+        }
+        GLProcessorThreaded::new(None).expect(
+            "HAL_TEST_REQUIRE_GL=1 but the GL backend failed to initialize — \
+             check the ANGLE install/re-sign step and binary entitlements \
+             (macOS) or the EGL stack (Linux)",
+        );
+    }
+
     #[test]
     fn test_load_jpeg_with_exif() {
         use edgefirst_codec::peek_info;

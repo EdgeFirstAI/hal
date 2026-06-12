@@ -384,6 +384,11 @@ jobs:
         env:
           COVERAGE: "1"
           COV_LCOV: target/coverage_rust.lcov
+          # gl_backend_available_canary: fail this lane (instead of
+          # silently skipping every GL test) if the ANGLE stack above is
+          # broken. Enforced in coverage pass 2 only — pass 1 runs
+          # unsigned binaries with the dlopen gate closed by design.
+          HAL_TEST_REQUIRE_GL: "1"
         run: |
           ./scripts/test-macos.sh -j 1 \
             2>&1 | tee target/test-metrics-rust-macos.txt
