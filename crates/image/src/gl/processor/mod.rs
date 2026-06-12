@@ -740,6 +740,63 @@ struct GlSupport {
     supports_f16_color: bool,
 }
 
+/// `glReadPixels` the bound read-framebuffer into `out`, honoring the ES 3
+/// guarantee: only `RGBA`/`UNSIGNED_BYTE` plus ONE implementation-defined
+/// pair are accepted. Mesa and the embedded drivers take `RGB`/`RED`
+/// directly; ANGLE/Metal (and V3D) reject them with `GL_INVALID_OPERATION`.
+/// When the direct read is unsupported, read an RGBA scratch and repack the
+/// leading channels (the FBO attachment has the destination's channel
+/// layout, so RGB keeps rgb, RED keeps r).
+///
+/// Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
+/// ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it at
+/// validation. `out` is at least `w*h*channels` bytes and reads are tightly
+/// packed (`PACK_ALIGNMENT=1` at init), so the bounds the robust variant
+/// checked hold by construction.
+///
+/// # Safety
+/// Must run on the GL thread with a complete read framebuffer bound and
+/// `ReadBuffer` selected.
+unsafe fn read_pixels_into(w: usize, h: usize, format: u32, out: &mut [u8]) {
+    let direct = format == gls::gl::RGBA || {
+        let mut impl_fmt = 0i32;
+        let mut impl_type = 0i32;
+        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_FORMAT, &mut impl_fmt);
+        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_TYPE, &mut impl_type);
+        impl_fmt as u32 == format && impl_type as u32 == gls::gl::UNSIGNED_BYTE
+    };
+    if direct {
+        gls::gl::ReadPixels(
+            0,
+            0,
+            w as i32,
+            h as i32,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+            out.as_mut_ptr() as *mut c_void,
+        );
+        return;
+    }
+    let channels = match format {
+        gls::gl::RGB => 3,
+        gls::gl::RED => 1,
+        _ => 4,
+    };
+    let mut scratch = vec![0u8; w * h * 4];
+    gls::gl::ReadPixels(
+        0,
+        0,
+        w as i32,
+        h as i32,
+        gls::gl::RGBA,
+        gls::gl::UNSIGNED_BYTE,
+        scratch.as_mut_ptr() as *mut c_void,
+    );
+    for (px, dst_px) in scratch.chunks_exact(4).zip(out.chunks_exact_mut(channels)) {
+        dst_px.copy_from_slice(&px[..channels]);
+    }
+}
+
 /// Classify a GL_RENDERER string into driver-policy traits. Pure —
 /// unit-testable without a GL context.
 fn classify_renderer(renderer: &str) -> RendererTraits {
@@ -1703,15 +1760,7 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
-                        0,
-                        0,
-                        dst_w as i32,
-                        dst_h as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst_map.as_mut_ptr() as *mut c_void,
-                    );
+                    read_pixels_into(dst_w, dst_h, format, dst_map.as_mut_slice());
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -1889,15 +1938,7 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
-                        0,
-                        0,
-                        dst_w as i32,
-                        dst_h as i32,
-                        format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst_map.as_mut_ptr() as *mut c_void,
-                    );
+                    read_pixels_into(dst_w, dst_h, format, dst_map.as_mut_slice());
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -2367,26 +2408,12 @@ impl GLProcessorST {
                 )))
             }
         };
-        // Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
-        // ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it with
-        // GL_INVALID_OPERATION at validation, before any parameter is looked
-        // at. The destination is always at least `dst.len()` bytes and the
-        // read is tightly packed (PACK_ALIGNMENT=1 at init), so the bounds
-        // the robust variant checked hold by construction.
         let len = dst.len();
         match pbo_id {
             None => unsafe {
                 let mut dst_map = dst.map()?;
                 gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadPixels(
-                    0,
-                    0,
-                    dst_w as i32,
-                    dst_h as i32,
-                    dest_format,
-                    gls::gl::UNSIGNED_BYTE,
-                    dst_map.as_mut_ptr() as *mut c_void,
-                );
+                read_pixels_into(dst_w, dst_h, dest_format, dst_map.as_mut_slice());
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
