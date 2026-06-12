@@ -114,3 +114,7 @@ echo "-> Generating LCOV report -> ${COV_LCOV}"
 cargo llvm-cov report --lcov --output-path "${COV_LCOV}" \
     --ignore-filename-regex '(\.cargo|/rustc/|/target/)'
 echo "-> Coverage report written to ${COV_LCOV}"
+
+echo "-> Coverage summary (per-file table follows)"
+cargo llvm-cov report --summary-only \
+    --ignore-filename-regex '(\.cargo|/rustc/|/target/)'
