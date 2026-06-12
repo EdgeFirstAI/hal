@@ -10,8 +10,6 @@ use khronos_egl::{self as egl, Attrib};
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::fd::AsRawFd;
-use std::ptr::null_mut;
-use std::rc::Rc;
 use std::time::Instant;
 
 use super::cache::CachedImport;
@@ -19,6 +17,7 @@ use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
 use super::context::{egl_ext, GlContext};
+use super::platform::{GlPlatform, Platform};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
@@ -700,8 +699,7 @@ impl GLProcessorST {
         // Display bring-up goes through the platform seam — the contract a
         // future platform (Windows/ANGLE) implements instead of forking this
         // engine. On Linux this delegates straight to `GlContext::new`.
-        let gl_context =
-            <super::platform::Platform as super::platform::GlPlatform>::init_display(kind)?;
+        let gl_context = Platform::init_display(kind)?;
         // Load the GL function pointers exactly once per process (the same
         // pattern as macOS's GL_LOADED). `gls` bindings are gl_generator
         // `static mut` function-pointer tables, so re-running `load_with` on
@@ -4516,17 +4514,6 @@ impl GLProcessorST {
         Ok(())
     }
 
-    /// Create an R8 EGLImage for Path B (NV* combined-plane import).
-    fn create_image_from_dma_nv_r8(
-        &self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-    ) -> Result<EglImage, Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor_nv_r8(src, src_fmt)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
     /// Look up or create the Path-B R8 EGLImage for an NV* source tensor.
     ///
     /// Uses a dedicated cache (`nv_r8_egl_cache`) that is keyed identically to
@@ -4557,7 +4544,7 @@ impl GLProcessorST {
             log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
         }
 
-        let egl_image_obj = self.create_image_from_dma_nv_r8(img, img_fmt)?;
+        let egl_image_obj = Platform::import_buffer_nv_r8(&self.gl_context, img, img_fmt)?;
         self.nv_r8_texture.invalidate_egl_binding();
 
         let handle = egl_image_obj.egl_image;
@@ -4576,46 +4563,6 @@ impl GLProcessorST {
             },
         );
         Ok(handle)
-    }
-
-    fn create_image_from_dma2(
-        &self,
-        src: &Tensor<u8>,
-        src_fmt: PixelFormat,
-        for_dst: bool,
-    ) -> Result<EglImage, crate::Error> {
-        let attrs = super::dma_import::DmaImportAttrs::from_tensor(src, src_fmt, for_dst)?;
-        let egl_img_attr = attrs.to_egl_attribs();
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
-    }
-
-    fn new_egl_image_owned(
-        &'_ self,
-        target: egl::Enum,
-        attrib_list: &[Attrib],
-    ) -> Result<EglImage, Error> {
-        // Every EGLImage creation funnels through here (DMA-BUF, NV R8, RGB
-        // renderbuffer paths), so one span = one actual `eglCreateImageKHR`.
-        // Steady-state frame loops must show ZERO of these after warmup — the
-        // span count is the observable for cache-behavior equality gates.
-        let _span = tracing::trace_span!("image.convert.gl.egl_import", target).entered();
-        // EGLImage creation is a display-level EGL op shared by every
-        // processor — serialized by a dedicated short lock (zero cost in
-        // steady state: creations are cache-miss-only).
-        let _image_guard = super::context::image_lifecycle_guard();
-        let image = GlContext::egl_create_image_with_fallback(
-            &self.gl_context.egl,
-            self.gl_context.display,
-            unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) },
-            target,
-            unsafe { egl::ClientBuffer::from_ptr(null_mut()) },
-            attrib_list,
-        )?;
-        Ok(EglImage {
-            egl_image: image,
-            display: self.gl_context.display,
-            egl: Rc::clone(&self.gl_context.egl),
-        })
     }
 
     /// Look up or create an EGLImage for a DMA tensor, returning the EGL image handle.
@@ -4673,7 +4620,7 @@ impl GLProcessorST {
         // destination view imports its parent (glViewport tiling); a source view
         // imports its own region (it is sampled, not rendered into).
         let for_dst = cache == CacheKind::Dst;
-        let egl_image_obj = self.create_image_from_dma2(img, img_fmt, for_dst)?;
+        let egl_image_obj = Platform::import_buffer(&self.gl_context, img, img_fmt, for_dst)?;
 
         // Optionally create a GL renderbuffer backed by this EGLImage for use as an FBO
         // color attachment.  Renderbuffers are required on Mali/Neutron GPUs (i.MX 95)
@@ -4787,7 +4734,11 @@ impl GLProcessorST {
             khronos_egl::NONE as Attrib,
         ];
 
-        self.new_egl_image_owned(egl_ext::LINUX_DMA_BUF, &egl_img_attr)
+        super::platform::linux::new_egl_image_owned(
+            &self.gl_context,
+            egl_ext::LINUX_DMA_BUF,
+            &egl_img_attr,
+        )
     }
 
     /// Get or create an EGLImage for a packed DMA destination with

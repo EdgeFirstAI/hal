@@ -37,6 +37,7 @@ pub(super) mod linux;
 pub(super) mod macos;
 
 use super::EglDisplayKind;
+use edgefirst_tensor::{PixelFormat, Tensor};
 
 /// Capability surface a platform reports for one initialized display +
 /// context. Captured once at processor/worker construction (see
@@ -80,6 +81,35 @@ pub(super) trait GlPlatform {
     /// `kind` selects the EGL display flavour on Linux and is ignored
     /// (with a debug log) on macOS, where ANGLE is the only display.
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<Self::Display>;
+
+    /// Import a tensor's zero-copy buffer, typed at `fmt`, for sampling
+    /// (`for_dst = false`) or rendering into (`for_dst = true`). The
+    /// distinction matters for views: a destination view imports its
+    /// PARENT buffer (the tile offset becomes viewport state), a source
+    /// view imports its own region. On Linux this is an `EGLImage` over
+    /// the tensor's DMA-BUF (multi-plane NV12 and the 64-byte stride
+    /// alignment invariant live in `dma_import.rs`); on macOS an EGL
+    /// pbuffer over the tensor's IOSurface.
+    ///
+    /// Callers cache the result in [`super::cache::ImportCache`] keyed by
+    /// [`super::cache::BufferImportKey`] — this is the miss path only.
+    fn import_buffer(
+        display: &Self::Display,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+        for_dst: bool,
+    ) -> crate::Result<Self::Import>;
+
+    /// Import an NV12/NV16/NV24 tensor's combined semi-planar plane as ONE
+    /// R8 buffer (luma + interleaved chroma addressed by the shader — the
+    /// "Path B" NV sampling strategy). On Linux a single-plane R8 EGLImage
+    /// at the buffer's physical pitch; on macOS the same shape as an R8
+    /// (`L008`) IOSurface pbuffer binding.
+    fn import_buffer_nv_r8(
+        display: &Self::Display,
+        img: &Tensor<u8>,
+        fmt: PixelFormat,
+    ) -> crate::Result<Self::Import>;
 }
 
 /// The one platform implementation for this build. macOS gains its alias
