@@ -284,6 +284,7 @@ jobs:
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
             target/test-metrics-rust-x86_64.txt
             target/test-metrics-capi-x86_64.txt
             target/test-metrics-python-x86_64.txt
@@ -293,9 +294,15 @@ jobs:
         uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
         if: always()
         with:
+          # Both nextest junit locations: plain runs use target/nextest,
+          # cargo-llvm-cov (make test-rust) relocates the store dir under
+          # target/llvm-cov-target. Until the nextest.toml junit.path fix
+          # the Rust junit landed at a nested path no step ever found —
+          # this check was silently pytest-only.
           files: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
           check_name: Test Results (x86_64)
           comment_mode: always
           ignore_runs: true
