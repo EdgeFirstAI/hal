@@ -6190,6 +6190,80 @@ mod image_tests {
         );
     }
 
+    /// Backend assertion for the F16 zero-copy path (PR-A A6 gate): when
+    /// ANGLE is present and reports F16 color-buffer support, the
+    /// NV12→PlanarRgb-F16 IOSurface convert MUST be handled by the GL
+    /// backend — proven by the pbuffer-cache import counters moving, not
+    /// just by output correctness. This is the guard against the
+    /// silent-CPU-fallback failure mode: float_dispatch classifying an
+    /// IOSurface F16 destination wrong (or a dispatch-arm deletion landing
+    /// before its replacement) keeps every output-correctness test green
+    /// while quietly running ~10× slower on CPU; only a backend observable
+    /// catches it. Skips ONLY when ANGLE itself is unavailable or the
+    /// configuration lacks F16 — never on a convert error, which is a
+    /// FAILURE here (the capability probe said the path must exist).
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[cfg(feature = "opengl")]
+    fn test_macos_gl_f16_planar_is_gl_backed() {
+        let mut proc = match MacosGlProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+        if !proc.supported_render_dtypes().f16 {
+            eprintln!(
+                "SKIPPED: {} — ANGLE configuration lacks F16 color-buffer support",
+                function!()
+            );
+            return;
+        }
+
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 31) % 211) as u8;
+            }
+        }
+        let mut dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        let (_, misses_before, _) = proc.pbuf_cache_stats();
+        proc.convert(
+            &src,
+            &mut dst,
+            Rotation::None,
+            Flip::None,
+            Crop::letterbox([114, 114, 114, 255]),
+        )
+        .expect("F16 capability reported but the GL F16 planar convert failed — silent CPU fallback or a broken dispatch arm");
+        let (_, misses_after, _) = proc.pbuf_cache_stats();
+        assert!(
+            misses_after > misses_before,
+            "convert succeeded but imported no pbuffers — the work did not run on the GL backend"
+        );
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_yuyv_to_rgb_g2d() {

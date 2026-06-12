@@ -14,7 +14,7 @@
 //! * [`dma_f16_packed_layout`] — Linux DMA packed-surface geometry (thin
 //!   wrapper over [`edgefirst_tensor::packed_rgba16f_layout`]).
 //! * The [`GLProcessorST`] float render methods: `convert_float_to_pbo`,
-//!   `convert_float_to_dma`, `upload_float_src`, `draw_float_quad`.
+//!   `convert_float_to_zero_copy`, `upload_float_src`, `draw_float_quad`.
 
 use std::ffi::{c_void, CStr};
 
@@ -350,7 +350,7 @@ impl GLProcessorST {
     ///   contiguous planar f16 elements per texel; readback is
     ///   `(RGBA, HALF_FLOAT)`.
     ///
-    /// [`FloatRenderPath::DmaF16Nchw`] and [`FloatRenderPath::None`] are not
+    /// [`FloatRenderPath::ZeroCopyF16Nchw`] and [`FloatRenderPath::None`] are not
     /// handled here — they return `NotSupported` so `convert()` falls back to
     /// CPU. Likewise,
     /// non-`Rgba` sources and any rotation/flip fall back: the
@@ -370,7 +370,7 @@ impl GLProcessorST {
         let (internal, client_fmt, gl_type) = match path {
             FloatRenderPath::PboF32Nhwc => (gls::gl::R32F, gls::gl::RED, gls::gl::FLOAT),
             FloatRenderPath::PboF16Nchw => (gls::gl::RGBA16F, gls::gl::RGBA, gls::gl::HALF_FLOAT),
-            FloatRenderPath::DmaF16Nchw | FloatRenderPath::None => {
+            FloatRenderPath::ZeroCopyF16Nchw | FloatRenderPath::None => {
                 return Err(crate::Error::NotSupported(
                     "GL float render-to-PBO: only PBO F32 NHWC / F16 NCHW are implemented; \
                      using CPU fallback"
@@ -586,7 +586,7 @@ impl GLProcessorST {
     /// the RGBA16F dma-buf import (e.g. Vivante, desktop NVIDIA) or returns an
     /// incomplete FBO, returns `Err(NotSupported)` so `convert()` degrades
     /// gracefully to the CPU. Never panics.
-    pub(super) fn convert_float_to_dma(
+    pub(super) fn convert_float_to_zero_copy(
         &mut self,
         src: &TensorDyn,
         dst: &mut TensorDyn,

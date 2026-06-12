@@ -211,7 +211,7 @@ pub struct GLProcessorST {
     /// GPU can render to an F16 color attachment. Surfaced through
     /// `RenderDtypeSupport`; on Linux this gates the F16 NCHW PBO and
     /// zero-copy DMA-BUF render paths (`FloatRenderPath::PboF16Nchw`,
-    /// `FloatRenderPath::DmaF16Nchw`) via `classify_float_render`.
+    /// `FloatRenderPath::ZeroCopyF16Nchw`) via `classify_float_render`.
     pub(super) supports_f16_color: bool,
     /// Interpolation mode for int8 proto textures.
     int8_interpolation_mode: Int8InterpolationMode,
@@ -507,8 +507,8 @@ impl ImageProcessorTrait for GLProcessorST {
             );
             let path = classify_float_render(src_fmt, dst_fmt, dst_dtype, dst.memory(), support);
             match path {
-                FloatRenderPath::DmaF16Nchw => {
-                    return self.convert_float_to_dma(src, dst, rotation, flip, crop);
+                FloatRenderPath::ZeroCopyF16Nchw => {
+                    return self.convert_float_to_zero_copy(src, dst, rotation, flip, crop);
                 }
                 FloatRenderPath::None => {}
                 _ => {

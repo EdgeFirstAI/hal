@@ -4813,7 +4813,7 @@ mod gl_tests {
                 TensorMemory::Dma,
                 s
             ),
-            FloatRenderPath::DmaF16Nchw
+            FloatRenderPath::ZeroCopyF16Nchw
         );
     }
 
@@ -5271,7 +5271,7 @@ mod gl_tests {
     }
 
     /// On-GPU round-trip: RGBA8 → F16 NCHW `[3,H,W]` DMA-BUF via the GL
-    /// float render path (`convert_float_to_dma`). Forces the OpenGL backend
+    /// float render path (`convert_float_to_zero_copy`). Forces the OpenGL backend
     /// (no CPU fallback) so any GL-path failure surfaces as a hard error
     /// instead of being silently masked. Identity crop, so the expected values
     /// are exact: `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
@@ -5297,7 +5297,7 @@ mod gl_tests {
         }
 
         // Force the OpenGL backend so a GL path error (e.g. from
-        // convert_float_to_dma) surfaces as Err instead of falling through
+        // convert_float_to_zero_copy) surfaces as Err instead of falling through
         // to the CPU backend.
         let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::OpenGl,

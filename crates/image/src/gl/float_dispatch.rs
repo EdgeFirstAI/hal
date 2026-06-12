@@ -10,21 +10,25 @@
 //! whole crate.
 //!
 //! The Linux processor (`gl::processor::float`) re-exports these and dispatches
-//! on [`FloatRenderPath::PboF16Nchw`] / [`PboF32Nhwc`] / [`DmaF16Nchw`].
+//! on [`FloatRenderPath::PboF16Nchw`] / [`PboF32Nhwc`] / [`ZeroCopyF16Nchw`].
 //!
-//! The macOS zero-copy ANGLE/IOSurface F16 path is **not** modelled here: a
-//! macOS IOSurface tensor reports `TensorMemory::Dma` (IOSurface shares the
-//! `Dma` memory slot), so the classifier inputs cannot distinguish it from a
-//! Linux DMA-BUF destination. macOS therefore owns its own platform-gated
-//! dispatch (a direct `(src, dst, dtype)` match in `macos_processor`) and this
-//! shared enum stays free of any macOS-only concept.
+//! [`ZeroCopyF16Nchw`] deliberately covers BOTH platforms' zero-copy F16
+//! render targets: a macOS IOSurface tensor reports `TensorMemory::Dma`
+//! (IOSurface shares the `Dma` memory slot), so the same
+//! `(Rgba, PlanarRgb, F16, Dma)` tuple that selects the Linux DMA-BUF render
+//! selects the IOSurface render once the engine runs on macOS — which buffer
+//! object backs the render is the platform seam's business
+//! (`GlPlatform::import_buffer`), not the classifier's. Until the legacy
+//! `macos_processor` is deleted, its inline `(src, dst, dtype)` match remains
+//! the macOS dispatch; this classifier is the single definition both
+//! converge on.
 //!
 //! No GL/EGL/gbm types appear in this module — it matches purely on
 //! [`edgefirst_tensor`] pixel/dtype/memory enums plus the reported
 //! [`crate::RenderDtypeSupport`].
 //!
 //! [`PboF32Nhwc`]: FloatRenderPath::PboF32Nhwc
-//! [`DmaF16Nchw`]: FloatRenderPath::DmaF16Nchw
+//! [`ZeroCopyF16Nchw`]: FloatRenderPath::ZeroCopyF16Nchw
 
 /// Which GL float render path should be used for a given conversion.
 ///
@@ -33,8 +37,8 @@
 /// CPU fallback, exactly as before this seam was added).
 ///
 /// These are the host-memory-discriminated render targets the classifier can
-/// decide from its inputs alone (the Linux PBO/DMA targets). The macOS IOSurface
-/// F16 path is intentionally not a variant here — see the module docs.
+/// decide from its inputs alone. `ZeroCopyF16Nchw` covers both platforms'
+/// zero-copy F16 targets (DMA-BUF and IOSurface) — see the module docs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(super) enum FloatRenderPath {
     /// No GL float render path applies; fall through to existing logic.
@@ -43,9 +47,10 @@ pub(super) enum FloatRenderPath {
     PboF16Nchw,
     /// RGBA → Rgb F32, PBO destination (R32F-wide shader). Linux.
     PboF32Nhwc,
-    /// RGBA → PlanarRgb F16, DMA-buf destination (zero-copy F16 render via
-    /// `convert_float_to_dma`). Linux.
-    DmaF16Nchw,
+    /// RGBA → PlanarRgb F16 into a zero-copy GPU buffer destination via
+    /// `convert_float_to_zero_copy` — a DMA-BUF on Linux, an IOSurface on
+    /// macOS (both report `TensorMemory::Dma`).
+    ZeroCopyF16Nchw,
 }
 
 /// Classify whether a conversion should use a GL float render target.
@@ -55,17 +60,11 @@ pub(super) enum FloatRenderPath {
 /// Returns [`FloatRenderPath::None`] when the combination is not supported so
 /// callers can fall through to the existing u8 path.
 ///
-/// This is the single definition of the float-path decision for the
-/// host-memory-discriminated paths: the Linux PBO/DMA targets (`Pbo*` /
-/// `Dma*`) returned for [`TensorMemory::Pbo`] / [`TensorMemory::Dma`]
-/// destinations.
-///
-/// The macOS IOSurface F16 path is intentionally **not** returned here: a macOS
-/// IOSurface tensor reports `TensorMemory::Dma` (IOSurface and Linux DMA-BUF
-/// share the same `TensorMemory::Dma` slot — see
-/// [`edgefirst_tensor::TensorMemory::Dma`]), so it is indistinguishable from a
-/// Linux DMA-BUF destination by the classifier inputs alone. The macOS backend
-/// owns that decision in its own platform-gated dispatch.
+/// This is the single definition of the float-path decision. A
+/// [`TensorMemory::Dma`] destination means "the platform's zero-copy GPU
+/// buffer" — a DMA-BUF on Linux, an IOSurface on macOS (they share the
+/// `Dma` slot — see [`edgefirst_tensor::TensorMemory::Dma`]); the platform
+/// seam, not this classifier, resolves which import backs the render.
 ///
 /// [`TensorMemory::Pbo`]: edgefirst_tensor::TensorMemory::Pbo
 /// [`TensorMemory::Dma`]: edgefirst_tensor::TensorMemory::Dma
@@ -82,7 +81,7 @@ pub(super) fn classify_float_render(
             FloatRenderPath::PboF16Nchw
         }
         (Rgba, PlanarRgb, DType::F16, TensorMemory::Dma) if support.f16 => {
-            FloatRenderPath::DmaF16Nchw
+            FloatRenderPath::ZeroCopyF16Nchw
         }
         (Rgba, Rgb, DType::F32, TensorMemory::Pbo) if support.f32 => FloatRenderPath::PboF32Nhwc,
         _ => FloatRenderPath::None,
@@ -132,7 +131,7 @@ mod tests {
                 TensorMemory::Dma,
                 YES
             ),
-            FloatRenderPath::DmaF16Nchw
+            FloatRenderPath::ZeroCopyF16Nchw
         );
     }
 
