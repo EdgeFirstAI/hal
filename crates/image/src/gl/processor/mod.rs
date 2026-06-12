@@ -275,6 +275,10 @@ pub struct GLProcessorST {
     dst_egl_cache: ImportCache<PlatformImport>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
+    /// Reusable RGBA staging buffer for `read_pixels_into`'s fallback path
+    /// (drivers whose implementation read-pair rejects direct RGB/RED
+    /// reads — ANGLE/Metal, V3D). Grown on demand, kept at high-water mark.
+    readback_scratch: Vec<u8>,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
@@ -769,7 +773,12 @@ struct GlSupport {
 /// # Safety
 /// Must run on the GL thread with a complete read framebuffer bound and
 /// `ReadBuffer` selected.
-unsafe fn read_pixels_into(w: usize, h: usize, format: u32, out: &mut [u8]) {
+///
+/// `scratch` is the caller's reusable RGBA staging buffer
+/// (`GLProcessorST::readback_scratch`) — grown on demand and kept at its
+/// high-water mark, so the fallback path costs no per-call allocation
+/// after the first read of a given size.
+unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
     let direct = format == gls::gl::RGBA || {
         let mut impl_fmt = 0i32;
         let mut impl_type = 0i32;
@@ -794,7 +803,9 @@ unsafe fn read_pixels_into(w: usize, h: usize, format: u32, out: &mut [u8]) {
         gls::gl::RED => 1,
         _ => 4,
     };
-    let mut scratch = vec![0u8; w * h * 4];
+    if scratch.len() < w * h * 4 {
+        scratch.resize(w * h * 4, 0);
+    }
     gls::gl::ReadPixels(
         0,
         0,
@@ -1166,6 +1177,7 @@ impl GLProcessorST {
             src_egl_cache: ImportCache::new(egl_cache_capacity),
             dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
+            readback_scratch: Vec::new(),
             is_vivante,
             is_virtual_gpu,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -1772,7 +1784,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    read_pixels_into(dst_w, dst_h, format, dst_map.as_mut_slice());
+                    read_pixels_into(
+                        dst_w,
+                        dst_h,
+                        format,
+                        &mut self.readback_scratch,
+                        dst_map.as_mut_slice(),
+                    );
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -1950,7 +1968,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    read_pixels_into(dst_w, dst_h, format, dst_map.as_mut_slice());
+                    read_pixels_into(
+                        dst_w,
+                        dst_h,
+                        format,
+                        &mut self.readback_scratch,
+                        dst_map.as_mut_slice(),
+                    );
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -2403,7 +2427,7 @@ impl GLProcessorST {
     /// completes. The converged readback shared by the non-DMA and any-to-PBO
     /// paths — they differ only in this target selector.
     fn readback_rendered(
-        &self,
+        &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         pbo_id: Option<u32>,
@@ -2425,7 +2449,13 @@ impl GLProcessorST {
             None => unsafe {
                 let mut dst_map = dst.map()?;
                 gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                read_pixels_into(dst_w, dst_h, dest_format, dst_map.as_mut_slice());
+                read_pixels_into(
+                    dst_w,
+                    dst_h,
+                    dest_format,
+                    &mut self.readback_scratch,
+                    dst_map.as_mut_slice(),
+                );
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
