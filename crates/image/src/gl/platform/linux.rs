@@ -12,14 +12,41 @@
 //! for *what* a platform provides, with `context.rs`/`dma_import.rs`
 //! owning *how* Linux provides it.
 
-use super::super::context::{egl_ext, GlContext};
+use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
-use super::super::resources::EglImage;
 use super::super::EglDisplayKind;
 use super::GlPlatform;
 use edgefirst_tensor::{PixelFormat, Tensor};
 use khronos_egl as egl;
 use std::rc::Rc;
+
+/// An owned EGLImage import over a DMA-BUF. Dropping destroys the
+/// EGLImage under the same display-level lifecycle lock as creation.
+/// This is the Linux [`GlPlatform::Import`]; the macOS analogue is
+/// `angle::IoSurfacePbuffer`.
+pub(in crate::opengl_headless) struct EglImage {
+    pub(in crate::opengl_headless) egl_image: egl::Image,
+    pub(in crate::opengl_headless) egl: Rc<Egl>,
+    pub(in crate::opengl_headless) display: egl::Display,
+}
+
+impl Drop for EglImage {
+    fn drop(&mut self) {
+        if self.egl_image.as_ptr() == egl::NO_IMAGE {
+            return;
+        }
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Display-level EGL op — same dedicated lock as creation.
+            let _image_guard = super::super::context::image_lifecycle_guard();
+            let e =
+                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
+            if let Err(e) = e {
+                log::error!("Could not destroy EGL image: {e:?}");
+            }
+        }));
+    }
+}
 
 /// Marker type: Linux EGL + DMA-BUF platform. Stateless — all state
 /// lives in the [`GlContext`] created by [`GlPlatform::init_display`].

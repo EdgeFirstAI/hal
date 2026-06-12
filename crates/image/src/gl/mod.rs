@@ -21,7 +21,6 @@
 // threaded processor — see `crates/image/ARCHITECTURE.md` for the
 // rationale and the planned convergence story.
 
-#[cfg(target_os = "linux")]
 macro_rules! function {
     () => {{
         fn f() {}
@@ -38,7 +37,6 @@ macro_rules! function {
     }};
 }
 
-#[cfg(target_os = "linux")]
 mod cache;
 #[cfg(target_os = "linux")]
 mod context;
@@ -73,9 +71,7 @@ mod macos_processor;
 mod platform;
 #[cfg(target_os = "linux")]
 mod processor;
-#[cfg(target_os = "linux")]
 mod resources;
-#[cfg(target_os = "linux")]
 mod shaders;
 mod shaders_common;
 #[cfg(target_os = "linux")]

@@ -2,37 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::cache::BufferImportKey;
-use super::context::{Egl, GlContext};
 use super::shaders::check_gl_error;
-use khronos_egl as egl;
-use log::error;
 use std::ffi::{c_void, CStr};
 use std::ptr::null;
-use std::rc::Rc;
-
-pub(super) struct EglImage {
-    pub(super) egl_image: egl::Image,
-    pub(super) egl: Rc<Egl>,
-    pub(super) display: egl::Display,
-}
-
-impl Drop for EglImage {
-    fn drop(&mut self) {
-        if self.egl_image.as_ptr() == egl::NO_IMAGE {
-            return;
-        }
-
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Display-level EGL op — same dedicated lock as creation.
-            let _image_guard = super::context::image_lifecycle_guard();
-            let e =
-                GlContext::egl_destroy_image_with_fallback(&self.egl, self.display, self.egl_image);
-            if let Err(e) = e {
-                error!("Could not destroy EGL image: {e:?}");
-            }
-        }));
-    }
-}
 
 pub(super) struct Texture {
     pub(super) id: u32,

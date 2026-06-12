@@ -17,8 +17,9 @@ use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
 use super::context::{egl_ext, GlContext};
+use super::platform::linux::EglImage;
 use super::platform::{GlPlatform, Platform};
-use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
+use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
