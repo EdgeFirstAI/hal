@@ -506,7 +506,7 @@ pub struct MacosGlProcessor {
     /// would get a stale pbuffer; if that pattern is ever introduced, key the
     /// cache on the tensor's `BufferIdentity` (a process-unique token) instead.
     pbuf_cache: Mutex<HashMap<PbufferCacheKey, egl::Surface>>,
-    /// Pbuffer-cache hit/miss counters (mirrors the Linux `EglImageCache`
+    /// Pbuffer-cache hit/miss counters (mirrors the Linux `ImportCache`
     /// counters). Steady-state tests capture these after warmup and after an
     /// N-frame loop and assert misses stay flat — the macOS half of the
     /// cache-behavior equality gate for GL refactors. Atomics because
@@ -1163,7 +1163,7 @@ impl MacosGlProcessor {
     }
 
     /// Snapshot the pbuffer-cache counters as `(hits, misses, entries)` —
-    /// the macOS analogue of the Linux `EglImageCache` stats. Steady-state
+    /// the macOS analogue of the Linux `ImportCache` stats. Steady-state
     /// tests assert misses stay flat across an N-frame loop over a fixed
     /// tensor pool (each new import is one `eglCreatePbufferFromClientBuffer`).
     pub fn pbuf_cache_stats(&self) -> (u64, u64, usize) {

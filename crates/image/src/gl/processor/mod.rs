@@ -14,10 +14,10 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 use std::time::Instant;
 
-use super::cache::CachedEglImage;
+use super::cache::CachedImport;
 use super::EglDisplayKind;
 
-use super::cache::{CacheKind, EglCacheKey, EglImageCache, GlCacheStats};
+use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
 use super::context::{egl_ext, GlContext};
 use super::resources::{Buffer, EglImage, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
@@ -255,9 +255,9 @@ pub struct GLProcessorST {
     /// vice versa.
     draw_render_texture: Texture,
     /// EGLImage cache for source DMA buffers.
-    src_egl_cache: EglImageCache,
+    src_egl_cache: ImportCache<EglImage>,
     /// EGLImage cache for destination DMA buffers.
-    dst_egl_cache: EglImageCache,
+    dst_egl_cache: ImportCache<EglImage>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
@@ -317,7 +317,7 @@ pub struct GLProcessorST {
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
-    nv_r8_egl_cache: EglImageCache,
+    nv_r8_egl_cache: ImportCache<EglImage>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
@@ -981,8 +981,8 @@ impl GLProcessorST {
             convert_fbo: FrameBuffer::new(),
             draw_fbo: FrameBuffer::new(),
             draw_render_texture,
-            src_egl_cache: EglImageCache::new(egl_cache_capacity),
-            dst_egl_cache: EglImageCache::new(egl_cache_capacity),
+            src_egl_cache: ImportCache::new(egl_cache_capacity),
+            dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
             is_vivante,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -1007,7 +1007,7 @@ impl GLProcessorST {
             nv_r8_uniforms,
             nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
-            nv_r8_egl_cache: EglImageCache::new(egl_cache_capacity),
+            nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
@@ -2040,7 +2040,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
+        let dst_key = BufferImportKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -2130,7 +2130,7 @@ impl GLProcessorST {
             (dst_w as i32, dst_h as i32)
         };
 
-        let dst_key = EglCacheKey::from_tensor(dst, dst_fmt, true);
+        let dst_key = BufferImportKey::from_tensor(dst, dst_fmt, true);
         let luma_id = dst_key.luma_id;
 
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
@@ -3333,7 +3333,7 @@ impl GLProcessorST {
             }
         }
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let src_egl = self.get_or_create_egl_image(CacheKind::Src, src, src_fmt)?;
 
         self.draw_camera_texture_to_rgb_planar(
@@ -3720,7 +3720,7 @@ impl GLProcessorST {
     #[allow(clippy::too_many_arguments)]
     fn draw_camera_texture_to_rgb_planar(
         &mut self,
-        src_key: EglCacheKey,
+        src_key: BufferImportKey,
         egl_img: egl::Image,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
@@ -4151,7 +4151,7 @@ impl GLProcessorST {
         flip: Flip,
         is_int8: bool,
     ) -> Result<(), Error> {
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // Draw-time program selection (see draw_src_texture).
@@ -4303,7 +4303,7 @@ impl GLProcessorST {
         let chroma_shift_y = layout.shift_y as i32;
         let chroma_lines = layout.uv_rows_per_luma as i32;
 
-        let src_key = EglCacheKey::from_tensor(src, src_fmt, false);
+        let src_key = BufferImportKey::from_tensor(src, src_fmt, false);
         let luma_id = src_key.luma_id;
 
         // Draw-time program selection: the int8 NV program is the same shader
@@ -4538,7 +4538,7 @@ impl GLProcessorST {
     ) -> Result<egl::Image, crate::Error> {
         // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
         // never collapses onto a destination parent import.
-        let id = EglCacheKey::from_tensor(img, img_fmt, false);
+        let id = BufferImportKey::from_tensor(img, img_fmt, false);
         let luma_id = id.luma_id;
 
         if self.nv_r8_egl_cache.sweep() {
@@ -4551,7 +4551,7 @@ impl GLProcessorST {
                 self.nv_r8_egl_cache.hits += 1;
                 cached.last_used = ts;
                 log::trace!("nv_r8_egl_cache hit: id={luma_id:#x}");
-                return Ok(cached.egl_image.egl_image);
+                return Ok(cached.import.egl_image);
             }
             self.nv_r8_egl_cache.misses += 1;
             log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
@@ -4568,8 +4568,8 @@ impl GLProcessorST {
         let ts = self.nv_r8_egl_cache.next_timestamp();
         self.nv_r8_egl_cache.entries.insert(
             id,
-            super::cache::CachedEglImage {
-                egl_image: egl_image_obj,
+            super::cache::CachedImport {
+                import: egl_image_obj,
                 last_used: ts,
                 guard,
                 renderbuffer: None,
@@ -4632,9 +4632,9 @@ impl GLProcessorST {
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
-        // (geometry) — see EglCacheKey. Only a destination view collapses onto
+        // (geometry) — see BufferImportKey. Only a destination view collapses onto
         // its parent key; a source view keys on its own region.
-        let id = EglCacheKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
+        let id = BufferImportKey::from_tensor(img, img_fmt, cache == CacheKind::Dst);
         let luma_id = id.luma_id;
 
         // Sweep dead entries opportunistically before looking up.
@@ -4661,11 +4661,11 @@ impl GLProcessorST {
             if let Some(cached) = egl_cache.entries.get_mut(&id) {
                 egl_cache.hits += 1;
                 cached.last_used = ts;
-                log::trace!("EglImageCache {:?} hit: id={luma_id:#x}", cache);
-                return Ok(cached.egl_image.egl_image);
+                log::trace!("ImportCache {:?} hit: id={luma_id:#x}", cache);
+                return Ok(cached.import.egl_image);
             }
             egl_cache.misses += 1;
-            log::trace!("EglImageCache {:?} miss: id={luma_id:#x}", cache);
+            log::trace!("ImportCache {:?} miss: id={luma_id:#x}", cache);
         }
 
         // Create the EGL image BEFORE evicting — if creation fails, we don't
@@ -4718,8 +4718,8 @@ impl GLProcessorST {
         let ts = egl_cache.next_timestamp();
         egl_cache.entries.insert(
             id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
+            CachedImport {
+                import: egl_image_obj,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,
@@ -4733,7 +4733,7 @@ impl GLProcessorST {
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {
-        let id = EglCacheKey::from_tensor(img, fmt, true);
+        let id = BufferImportKey::from_tensor(img, fmt, true);
         self.dst_egl_cache
             .entries
             .get(&id)
@@ -4811,7 +4811,7 @@ impl GLProcessorST {
         // Keyed identically to `cached_dst_renderbuffer` and the logical-dims
         // dst path: the packed render dims derive deterministically from the
         // tensor's logical geometry, so `from_tensor` is a consistent key.
-        let id = EglCacheKey::from_tensor(img, img_fmt, true);
+        let id = BufferImportKey::from_tensor(img, img_fmt, true);
         if self.dst_egl_cache.sweep() {
             self.invalidate_dst_textures();
         }
@@ -4820,11 +4820,11 @@ impl GLProcessorST {
         if let Some(cached) = self.dst_egl_cache.entries.get_mut(&id) {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
-            log::trace!("EglImageCache dst (RGB) hit: id={:#x}", id.luma_id);
-            return Ok(cached.egl_image.egl_image);
+            log::trace!("ImportCache dst (RGB) hit: id={:#x}", id.luma_id);
+            return Ok(cached.import.egl_image);
         }
         self.dst_egl_cache.misses += 1;
-        log::trace!("EglImageCache dst (RGB) miss: id={:#x}", id.luma_id);
+        log::trace!("ImportCache dst (RGB) miss: id={:#x}", id.luma_id);
         // Invalidate dst texture binding state on cache miss (new EGLImage creation).
         self.invalidate_dst_textures();
 
@@ -4858,8 +4858,8 @@ impl GLProcessorST {
         let ts = self.dst_egl_cache.next_timestamp();
         self.dst_egl_cache.entries.insert(
             id,
-            CachedEglImage {
-                egl_image: egl_image_obj,
+            CachedImport {
+                import: egl_image_obj,
                 guard,
                 renderbuffer: rbo,
                 last_used: ts,

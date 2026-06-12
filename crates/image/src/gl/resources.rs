@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use super::cache::EglCacheKey;
+use super::cache::BufferImportKey;
 use super::context::{Egl, GlContext};
 use super::shaders::check_gl_error;
 use khronos_egl as egl;
@@ -43,7 +43,7 @@ pub(super) struct Texture {
     /// Which EGLImage (identified by buffer identity key) is currently bound
     /// to this texture via `glEGLImageTargetTexture2DOES`. `None` means no
     /// EGLImage is bound (or the binding has been invalidated).
-    bound_egl_key: Option<EglCacheKey>,
+    bound_egl_key: Option<BufferImportKey>,
 }
 
 impl Default for Texture {
@@ -124,7 +124,7 @@ impl Texture {
     /// `egl_image_ptr` is a valid EGL image handle.
     pub(super) unsafe fn bind_egl_image(
         &mut self,
-        key: EglCacheKey,
+        key: BufferImportKey,
         egl_image_ptr: *const c_void,
     ) -> bool {
         if self.bound_egl_key == Some(key) {
@@ -144,7 +144,7 @@ impl Texture {
     /// `egl_image_ptr` is a valid EGL image handle.
     pub(super) unsafe fn bind_egl_image_external(
         &mut self,
-        key: EglCacheKey,
+        key: BufferImportKey,
         egl_image_ptr: *const c_void,
     ) -> bool {
         if self.bound_egl_key == Some(key) {

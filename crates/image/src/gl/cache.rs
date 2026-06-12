@@ -1,38 +1,43 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use super::resources::EglImage;
 use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 
-/// Selects which EGLImage cache to use.
+/// Selects which import cache to use.
 #[derive(Debug, PartialEq)]
 pub(super) enum CacheKind {
     Src,
     Dst,
 }
 
-/// A cached EGLImage with a weak reference to the source tensor's guard.
-pub(super) struct CachedEglImage {
-    pub(super) egl_image: EglImage,
+/// A cached buffer import with a weak reference to the source tensor's guard.
+///
+/// Generic over the platform's owned import object `I` — an `EglImage`
+/// (DMA-BUF) on Linux, an IOSurface-backed EGL pbuffer on macOS. Dropping
+/// the entry drops `I`, which releases the platform object.
+pub(super) struct CachedImport<I> {
+    pub(super) import: I,
     /// Weak reference to the source Tensor's BufferIdentity guard.
     pub(super) guard: std::sync::Weak<()>,
-    /// Optional GL renderbuffer backed by this EGLImage (used by direct RGB path).
+    /// Optional GL renderbuffer backed by this import (used by direct RGB path).
     pub(super) renderbuffer: Option<u32>,
     /// Monotonic access counter for LRU eviction.
     pub(super) last_used: u64,
 }
 
-/// EGLImage cache owned by GLProcessorST.
+/// Buffer-import cache owned by the GL processor.
 ///
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access
 /// updates the entry's `last_used` timestamp, and eviction removes the entry
 /// with the smallest `last_used` value.
-/// Identity + geometry that uniquely determine an imported EGLImage.
+/// Identity + geometry that uniquely determine an imported GPU buffer
+/// (an EGLImage over a DMA-BUF on Linux; an EGL pbuffer over an IOSurface
+/// on macOS — the key fields are platform-neutral).
 ///
 /// `luma_id` / `chroma_id` are the buffer identities.
 ///
 /// A `view()`/`batch()` sub-region is a `glViewport`/`glScissor` ROI into its
-/// parent, **not** a distinct import: [`from_tensor`](EglCacheKey::from_tensor)
+/// parent, **not** a distinct import: [`from_tensor`](BufferImportKey::from_tensor)
 /// keys such a tensor on its **parent** geometry (`view_origin`) with
 /// `plane_offset = 0`, so every sibling view of one buffer collapses to a single
 /// EGLImage and the per-tile offset becomes render state (the viewport). The
@@ -49,7 +54,7 @@ pub(super) struct CachedEglImage {
 /// wrong pitch — deterministically wrong single-threaded, nondeterministic in
 /// parallel, correct only on a heap source (which never takes this path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct EglCacheKey {
+pub(super) struct BufferImportKey {
     pub(super) luma_id: u64,
     pub(super) chroma_id: Option<u64>,
     pub(super) plane_offset: usize,
@@ -59,7 +64,7 @@ pub(super) struct EglCacheKey {
     pub(super) format: PixelFormat,
 }
 
-impl EglCacheKey {
+impl BufferImportKey {
     /// Build the cache key from a tensor and the format it will be imported as.
     /// Every construction site MUST go through this so the key used to insert
     /// an EGLImage matches the key used to look it up and to gate the texture
@@ -130,8 +135,8 @@ impl GlCacheStats {
     }
 }
 
-pub(super) struct EglImageCache {
-    pub(super) entries: std::collections::HashMap<EglCacheKey, CachedEglImage>,
+pub(super) struct ImportCache<I> {
+    pub(super) entries: std::collections::HashMap<BufferImportKey, CachedImport<I>>,
     pub(super) capacity: usize,
     pub(super) hits: u64,
     pub(super) misses: u64,
@@ -139,7 +144,7 @@ pub(super) struct EglImageCache {
     pub(super) access_counter: u64,
 }
 
-impl EglImageCache {
+impl<I> ImportCache<I> {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::with_capacity(capacity),
@@ -192,13 +197,13 @@ impl EglImageCache {
         });
         let swept = before - self.entries.len();
         if swept > 0 {
-            log::debug!("EglImageCache: swept {swept} dead entries");
+            log::debug!("ImportCache: swept {swept} dead entries");
         }
         swept > 0
     }
 }
 
-impl Drop for EglImageCache {
+impl<I> Drop for ImportCache<I> {
     fn drop(&mut self) {
         for entry in self.entries.values() {
             if let Some(rbo) = entry.renderbuffer {
@@ -206,7 +211,7 @@ impl Drop for EglImageCache {
             }
         }
         log::debug!(
-            "EglImageCache stats: {} hits, {} misses, {} entries remaining",
+            "ImportCache stats: {} hits, {} misses, {} entries remaining",
             self.hits,
             self.misses,
             self.entries.len()
@@ -216,7 +221,7 @@ impl Drop for EglImageCache {
 
 #[cfg(test)]
 mod tests {
-    use super::EglCacheKey;
+    use super::BufferImportKey;
     use edgefirst_tensor::PixelFormat;
     use std::collections::HashMap;
 
@@ -227,8 +232,8 @@ mod tests {
         height: usize,
         row_stride: usize,
         format: PixelFormat,
-    ) -> EglCacheKey {
-        EglCacheKey {
+    ) -> BufferImportKey {
+        BufferImportKey {
             luma_id,
             chroma_id: None,
             plane_offset,
@@ -247,7 +252,7 @@ mod tests {
         // tensor carrying a genuine foreign/multi-plane byte offset (e.g. an
         // externally-imported buffer whose data starts past the fd origin); two
         // such imports at different offsets must remain DISTINCT entries.
-        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let base = key(0xABCD, 0, 64, 64, 64, PixelFormat::Grey);
         let at_offset = key(0xABCD, 4096, 64, 64, 64, PixelFormat::Grey);
         map.insert(base, 1);
@@ -279,9 +284,9 @@ mod tests {
         let a = parent.view(Region::new(0, 0, 32, 32)).unwrap();
         let b = parent.view(Region::new(0, 32, 32, 32)).unwrap();
         // Destinations (`for_dst = true`) collapse onto the parent key.
-        let ka = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, true);
-        let kb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, true);
-        let kp = EglCacheKey::from_tensor(&parent, PixelFormat::Rgba, true);
+        let ka = BufferImportKey::from_tensor(&a, PixelFormat::Rgba, true);
+        let kb = BufferImportKey::from_tensor(&b, PixelFormat::Rgba, true);
+        let kp = BufferImportKey::from_tensor(&parent, PixelFormat::Rgba, true);
         assert_eq!(
             ka, kb,
             "sibling dst views collapse to one parent-keyed import"
@@ -296,8 +301,8 @@ mod tests {
         // SOURCES (`for_dst = false`) key on their OWN region — a source view is
         // imported and SAMPLED, not rendered into, so two source views of one
         // parent must NOT collapse (they'd alias and sample the wrong region).
-        let sa = EglCacheKey::from_tensor(&a, PixelFormat::Rgba, false);
-        let sb = EglCacheKey::from_tensor(&b, PixelFormat::Rgba, false);
+        let sa = BufferImportKey::from_tensor(&a, PixelFormat::Rgba, false);
+        let sb = BufferImportKey::from_tensor(&b, PixelFormat::Rgba, false);
         assert_ne!(sa, sb, "source views key on their own region (no collapse)");
         assert_eq!(
             (sa.width, sa.height),
@@ -312,7 +317,7 @@ mod tests {
         // (same luma_id + offset) reconfigured to different geometry via
         // `configure_image` must produce DISTINCT keys — otherwise the EGLImage
         // imported for the first geometry is reused at the wrong pitch.
-        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let g0 = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
         let g1 = key(0xBEEF, 0, 96, 128, 96, PixelFormat::Grey); // different w/h/stride
         let g2 = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Nv12); // different format
@@ -338,7 +343,7 @@ mod tests {
         // row_stride — e.g. a padded vs tight pool buffer) must be a DISTINCT
         // key. Guards against dropping `row_stride` from the key, which would
         // reintroduce the wrong-pitch stale read on a re-padded pool.
-        let mut map: HashMap<EglCacheKey, u32> = HashMap::new();
+        let mut map: HashMap<BufferImportKey, u32> = HashMap::new();
         let tight = key(0xBEEF, 0, 128, 96, 128, PixelFormat::Grey);
         let padded = key(0xBEEF, 0, 128, 96, 256, PixelFormat::Grey); // stride differs
         map.insert(tight, 1);
