@@ -7,10 +7,9 @@
 mod gl_tests {
     #[cfg(feature = "dma_test_formats")]
     use crate::opengl_headless::processor::GLProcessorST;
-    use crate::{
-        probe_egl_displays, Crop, EglDisplayKind, Flip, GLProcessorThreaded, ImageProcessorTrait,
-        Rotation,
-    };
+    #[cfg(target_os = "linux")]
+    use crate::{probe_egl_displays, EglDisplayKind};
+    use crate::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
     use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout};
     #[cfg(feature = "dma_test_formats")]
     use edgefirst_tensor::is_dma_available;
@@ -217,15 +216,11 @@ mod gl_tests {
     static NEUTRON_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
     fn is_opengl_available() -> bool {
-        #[cfg(all(target_os = "linux", feature = "opengl"))]
-        {
-            *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
-        }
-
-        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
-        {
-            false
-        }
+        // Portable: the unified engine runs on Linux (EGL/DMA-BUF) and
+        // macOS (ANGLE/IOSurface). On the macOS coverage flow this returns
+        // false in pass 1 (unsigned binaries, ANGLE dlopen gate closed) so
+        // the GL tests self-skip there and execute in pass 2.
+        *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
     }
 
     /// Returns true when running on an i.MX 95 board with Mali GPU.
@@ -1246,6 +1241,7 @@ mod gl_tests {
     /// available. Default requires a running compositor (Wayland/X11) and
     /// may not be present on headless targets.
     #[test]
+    #[cfg(target_os = "linux")] // Linux display probing
     fn test_probe_egl_displays() {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
@@ -1288,6 +1284,7 @@ mod gl_tests {
     /// that a subsequent GLProcessorThreaded::new() reuses it without
     /// deadlocking.
     #[test]
+    #[cfg(target_os = "linux")] // Linux display probing
     fn test_probe_then_create_gl_context() {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
@@ -1354,6 +1351,7 @@ mod gl_tests {
     /// GLProcessorThreaded::new(Some(kind)) succeeds and produces a working
     /// converter.
     #[test]
+    #[cfg(target_os = "linux")] // Linux display probing
     fn test_override_each_display_kind() {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
@@ -1406,6 +1404,7 @@ mod gl_tests {
     /// Validate that requesting a display kind that doesn't exist on the
     /// system returns an error rather than falling back silently.
     #[test]
+    #[cfg(target_os = "linux")] // Linux display probing
     fn test_override_unavailable_display_errors() {
         let displays = match probe_egl_displays() {
             Ok(d) => d,
@@ -1445,6 +1444,7 @@ mod gl_tests {
     /// Validate that auto-detection (None) still works — this is the existing
     /// default behaviour and must not regress.
     #[test]
+    #[cfg(target_os = "linux")] // Linux display probing
     fn test_auto_detect_display() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2101,6 +2101,7 @@ mod gl_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn test_gl_pbo_destination_smoke() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2134,6 +2135,7 @@ mod gl_tests {
     /// deadlock returned. A successful return proves the round-trip
     /// completed.
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn test_gl_convert_any_to_pbo_no_deadlock() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -2197,6 +2199,7 @@ mod gl_tests {
     /// underlying defect as `convert_any_to_pbo`; both sites were patched
     /// in commit c494fae and both need explicit coverage.
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn test_gl_convert_pbo_to_pbo_no_deadlock() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -4891,6 +4894,7 @@ mod gl_tests {
     /// Runs only where image allocation resolves to PBO (Orin / PBO-transfer
     /// targets); skipped elsewhere.
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn pbo_int8_letterbox_matches_mem_oracle() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -4988,6 +4992,7 @@ mod gl_tests {
     /// genuinely exercises `convert_float_to_pbo`. Uses an identity crop so
     /// the expected values are exact: `dst[y,x,c] == src[y,x,c] / 255`.
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn convert_f32_nhwc_pbo_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -5089,6 +5094,7 @@ mod gl_tests {
     /// distinct from NEAREST (which would land on a single integer texel,
     /// `2*dx * 16`), so the test discriminates bilinear vs NEAREST sampling.
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn convert_f32_nhwc_pbo_resize_bilinear() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -5184,6 +5190,7 @@ mod gl_tests {
     /// crop so `dst[c,y,x] == src[y,x,c] / 255` within one f16 ULP at 1.0
     /// (`2^-8`).
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn convert_f16_nchw_pbo_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use half::f16;
@@ -5419,6 +5426,7 @@ mod gl_tests {
     ///   content (exact normalization is GPU-dependent; we just need non-zero
     ///   and in-range)
     #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
     fn convert_f32_pbo_letterbox_pad_color() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -5524,6 +5532,7 @@ mod gl_tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // CUDA interop is Tegra/Linux-only
     fn convert_f32_pbo_cuda_map_roundtrip() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
 
@@ -5602,6 +5611,7 @@ mod gl_tests {
     /// `src[y,x,c] / 255.0` within 1e-3. Uses a 16×16 identity crop so the
     /// expected values are exact (no bilinear rounding).
     #[test]
+    #[cfg(target_os = "linux")] // CUDA interop is Tegra/Linux-only
     fn convert_f32_pbo_cuda_map_numeric() {
         use crate::{ComputeBackend, ImageProcessor, ImageProcessorConfig};
         use std::ffi::c_void;
