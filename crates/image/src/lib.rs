@@ -6194,39 +6194,34 @@ mod image_tests {
         );
     }
 
-    /// Backend assertion for the F16 zero-copy path (PR-A A6 gate): when
-    /// ANGLE is present and reports F16 color-buffer support, the
-    /// NV12→PlanarRgb-F16 IOSurface convert MUST be handled by the GL
-    /// backend — proven by the pbuffer-cache import counters moving, not
+    /// Backend assertion for the F16 zero-copy path: when the GL backend
+    /// initialized (ANGLE on macOS) and reports F16 color-buffer support,
+    /// the NV12→PlanarRgb-F16 IOSurface convert MUST be handled by the GL
+    /// engine — proven by the engine's import-cache counters moving, not
     /// just by output correctness. This is the guard against the
-    /// silent-CPU-fallback failure mode: float_dispatch classifying an
-    /// IOSurface F16 destination wrong (or a dispatch-arm deletion landing
-    /// before its replacement) keeps every output-correctness test green
-    /// while quietly running ~10× slower on CPU; only a backend observable
-    /// catches it. Skips ONLY when ANGLE itself is unavailable or the
-    /// configuration lacks F16 — never on a convert error, which is a
-    /// FAILURE here (the capability probe said the path must exist).
+    /// silent-CPU-fallback failure mode: a misclassified IOSurface F16
+    /// destination keeps every output-correctness test green while
+    /// quietly running ~10× slower on CPU; only a backend observable
+    /// catches it. Skips ONLY when GL itself is unavailable or the
+    /// configuration lacks F16 — a convert error or a CPU-routed convert
+    /// with the capability present is a FAILURE.
     #[test]
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
     fn test_macos_gl_f16_planar_is_gl_backed() {
-        let mut proc = match MacosGlProcessor::new() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "SKIPPED: {} — MacosGlProcessor init failed ({e:?})",
-                    function!()
-                );
-                return;
-            }
+        let mut proc = ImageProcessor::new().expect("ImageProcessor");
+        let Some(ref gl) = proc.opengl else {
+            eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+            return;
         };
-        if !proc.supported_render_dtypes().f16 {
+        if !gl.supported_render_dtypes().f16 {
             eprintln!(
-                "SKIPPED: {} — ANGLE configuration lacks F16 color-buffer support",
+                "SKIPPED: {} — configuration lacks F16 color-buffer support",
                 function!()
             );
             return;
         }
+        let stats_before = gl.egl_cache_stats().expect("cache stats");
 
         let src = TensorDyn::image(
             1280,
@@ -6252,7 +6247,6 @@ mod image_tests {
         )
         .unwrap();
 
-        let (_, misses_before, _) = proc.pbuf_cache_stats();
         proc.convert(
             &src,
             &mut dst,
@@ -6260,11 +6254,126 @@ mod image_tests {
             Flip::None,
             Crop::letterbox([114, 114, 114, 255]),
         )
-        .expect("F16 capability reported but the GL F16 planar convert failed — silent CPU fallback or a broken dispatch arm");
-        let (_, misses_after, _) = proc.pbuf_cache_stats();
+        .expect("F16 capability reported but the NV12→PlanarF16 convert failed");
+        let stats_after = proc
+            .opengl
+            .as_ref()
+            .expect("GL backend present")
+            .egl_cache_stats()
+            .expect("cache stats");
         assert!(
-            misses_after > misses_before,
-            "convert succeeded but imported no pbuffers — the work did not run on the GL backend"
+            stats_after.total_misses() > stats_before.total_misses(),
+            "convert succeeded but the GL engine imported nothing — the work \
+             did not run on the GL backend (silent CPU fallback)"
+        );
+    }
+
+    /// Portable oracle for the fused NV12→PlanarRgb-F16 engine convert
+    /// (two GL passes: NV→RGBA intermediate, then the packed RGBA16F
+    /// render). New on every platform with F16 render support — macOS
+    /// IOSurface and Linux DMA-BUF alike. Compares against the CPU
+    /// backend's reference within the float-path tolerance.
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_nv12_to_planar_f16_fused_engine_vs_cpu() {
+        let mut gl = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::OpenGl,
+            ..Default::default()
+        }) {
+            Ok(p) if p.opengl.is_some() => p,
+            _ => {
+                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                return;
+            }
+        };
+        if !gl
+            .opengl
+            .as_ref()
+            .map(|g| g.supported_render_dtypes().f16)
+            .unwrap_or(false)
+        {
+            eprintln!("SKIPPED: {} — no F16 render support", function!());
+            return;
+        }
+        let mem = if edgefirst_tensor::is_gpu_buffer_available() {
+            TensorMemory::Dma
+        } else {
+            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            return;
+        };
+
+        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, Some(mem)).unwrap();
+        {
+            // Smooth gradients, NOT noise: the GL and CPU paths upsample
+            // chroma with different kernels (nearest vs bilinear), which
+            // legitimately diverges on per-texel chroma noise. Gradients
+            // keep that kernel difference sub-LSB while still exercising
+            // the full matrix math and the letterbox geometry.
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            let buf = m.as_mut_slice();
+            let (w, h) = (1280usize, 720usize);
+            for y in 0..h {
+                for x in 0..w {
+                    buf[y * w + x] = ((x * 255) / w) as u8; // luma ramp
+                }
+            }
+            for y in 0..(h / 2) {
+                for x in 0..(w / 2) {
+                    let o = h * w + y * w + 2 * x;
+                    buf[o] = ((y * 255) / (h / 2)) as u8; // U vertical ramp
+                    buf[o + 1] = (((x + y) * 255) / (w / 2 + h / 2)) as u8; // V diagonal
+                }
+            }
+        }
+        let crop = Crop::letterbox([114, 114, 114, 255]);
+        let mut gl_dst =
+            TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(mem)).unwrap();
+        gl.convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
+            .expect("fused NV12→PlanarF16 GL convert");
+
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        cpu.convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+            .expect("CPU reference convert");
+
+        let g = gl_dst.as_f16().unwrap().map().unwrap().as_slice().to_vec();
+        let c = cpu_dst.as_f16().unwrap().map().unwrap().as_slice().to_vec();
+        assert_eq!(g.len(), c.len());
+        let mut max_diff = 0.0f32;
+        let mut max_at = 0usize;
+        for (i, (a, b)) in g.iter().zip(c.iter()).enumerate() {
+            let d = (a.to_f32() - b.to_f32()).abs();
+            if d > max_diff {
+                max_diff = d;
+                max_at = i;
+            }
+        }
+        // Localize: plane (R/G/B), row, col of the worst element.
+        let (plane, rem) = (max_at / (640 * 640), max_at % (640 * 640));
+        let (row, col) = (rem / 640, rem % 640);
+        eprintln!(
+            "fused-vs-cpu: max_diff={max_diff} at plane={plane} row={row} col={col} \
+             gl={} cpu={}",
+            g[max_at].to_f32(),
+            c[max_at].to_f32()
+        );
+        // Two GPU passes (8-bit intermediate + linear filtering) vs the
+        // CPU's direct path: allow a few 8-bit steps of divergence.
+        assert!(
+            max_diff <= 4.0 / 255.0 + 1e-3,
+            "fused NV12→PlanarF16 diverges from CPU reference: max_diff={max_diff}"
         );
     }
 

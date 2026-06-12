@@ -19,6 +19,7 @@
 use std::ffi::{c_void, CStr};
 
 use super::super::core::float_crop_uniforms;
+use super::super::platform::GlPlatform;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Error, Flip, ResolvedCrop, Rotation};
 use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
@@ -704,7 +705,14 @@ impl GLProcessorST {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    // Platform attach (EGLImage target on Linux,
+                    // eglBindTexImage on macOS — a raw OES call there
+                    // silently no-ops on a pbuffer handle and leaves the
+                    // FBO incomplete).
+                    super::super::platform::Platform::attach_tex_image_2d(
+                        &self.gl_context,
+                        dest_egl,
+                    )?;
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
                         gls::gl::COLOR_ATTACHMENT0,

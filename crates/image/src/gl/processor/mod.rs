@@ -281,14 +281,22 @@ pub struct GLProcessorST {
     /// Current allocated size of the intermediate texture (0,0 = unallocated).
     packed_rgb_intermediate_size: (usize, usize),
     texture_program: GlProgram,
-    texture_program_yuv: GlProgram,
+    /// External-OES sampler programs (`None` where the platform lacks
+    /// `GL_OES_EGL_image_external_essl3` — ANGLE/Metal).
+    texture_program_yuv: Option<GlProgram>,
     /// Int8 variant of texture_program — applies XOR 0x80 bias in fragment shader.
     texture_int8_program: GlProgram,
     /// Int8 variant of texture_program_yuv — applies XOR 0x80 bias in fragment shader.
-    texture_int8_program_yuv: GlProgram,
-    texture_program_planar: GlProgram,
+    texture_int8_program_yuv: Option<GlProgram>,
+    texture_program_planar: Option<GlProgram>,
     /// Shader: existing planar RGB with int8 bias (XOR 0x80) applied to output.
-    texture_program_planar_int8: GlProgram,
+    texture_program_planar_int8: Option<GlProgram>,
+    /// YUYV (RG-sampled) → RGBA, portable `sampler2D` — the zero-copy
+    /// IOSurface source path on macOS (and a future heap-YUYV upload).
+    yuyv_program_2d: GlProgram,
+    /// Link-time uniform locations for `yuyv_program_2d`
+    /// (src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub).
+    yuyv_2d_locs: [i32; 7],
     /// Shader: packed RGB -> RGBA8 packing (2D texture source, pass 2).
     packed_rgba8_program_2d: GlProgram,
     /// Shader: packed RGB int8 -> RGBA8 packing with XOR 0x80 (2D texture source, pass 2).
@@ -321,6 +329,11 @@ pub struct GLProcessorST {
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
     nv_r8_egl_cache: ImportCache<PlatformImport>,
+    /// Cached full-resolution RGBA8 intermediate for the fused
+    /// NV*→PlanarRgb-F16 two-pass convert, keyed by source dims.
+    /// Zero-copy memory where the platform can allocate it, heap
+    /// otherwise — pass 2 imports or uploads it accordingly.
+    float_two_pass_intermediate: Option<(usize, usize, TensorDyn)>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
@@ -472,7 +485,7 @@ impl ImageProcessorTrait for GLProcessorST {
         // decline and let the dispatcher fall back to the CPU backend, which
         // writes the sub-region correctly via offset + parent stride.
         if dst.view_origin().is_some()
-            && !(self.gl_context.transfer_backend.is_dma()
+            && !(self.gl_context.transfer_backend.is_zero_copy()
                 && dst.memory() == TensorMemory::Dma
                 && matches!(
                     dst.dtype(),
@@ -509,6 +522,25 @@ impl ImageProcessorTrait for GLProcessorST {
                 self.supports_f32_color,
                 self.supports_f16_color,
             );
+            // Fused NV*→PlanarRgb-F16 (the model-input convert): two engine
+            // passes — NV→RGBA full-res into a cached intermediate, then the
+            // packed float render with the caller's crop/letterbox. Viability
+            // is pass 2's own classifier verdict on an RGBA source.
+            if matches!(
+                src_fmt,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) && dst_fmt == PixelFormat::PlanarRgb
+                && dst_dtype == edgefirst_tensor::DType::F16
+                && classify_float_render(
+                    PixelFormat::Rgba,
+                    dst_fmt,
+                    dst_dtype,
+                    dst.memory(),
+                    support,
+                ) != FloatRenderPath::None
+            {
+                return self.convert_nv_to_planar_float_two_pass(src, dst, rotation, flip, crop);
+            }
             let path = classify_float_render(src_fmt, dst_fmt, dst_dtype, dst.memory(), support);
             match path {
                 FloatRenderPath::ZeroCopyF16Nchw => {
@@ -752,21 +784,60 @@ impl GLProcessorST {
             gls::gl::PixelStorei(gls::gl::UNPACK_ALIGNMENT, 1);
         }
 
-        let texture_program_planar =
-            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_shader())?;
+        // External-OES sampler programs exist only where the platform's
+        // import binding uses them (Linux Path A); ANGLE/Metal rejects the
+        // extension at shader-compile time, so they are not built there.
+        let texture_program_planar = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_planar_rgb_shader(),
+            )?)
+        } else {
+            None
+        };
 
         let texture_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_fragment_shader())?;
 
-        let texture_program_yuv = GlProgram::new(
-            generate_vertex_shader(),
-            generate_texture_fragment_shader_yuv(),
-        )?;
+        let texture_program_yuv = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_texture_fragment_shader_yuv(),
+            )?)
+        } else {
+            None
+        };
 
         let texture_int8_program =
             GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader())?;
-        let texture_int8_program_yuv =
-            GlProgram::new(generate_vertex_shader(), generate_texture_int8_shader_yuv())?;
+        let texture_int8_program_yuv = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_texture_int8_shader_yuv(),
+            )?)
+        } else {
+            None
+        };
+
+        let yuyv_program_2d = GlProgram::new(
+            generate_vertex_shader(),
+            super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
+        )?;
+        let yuyv_2d_locs = unsafe {
+            gls::gl::UseProgram(yuyv_program_2d.id);
+            // Constant sampler binding resolved at link (B6 pattern).
+            let tex = gls::gl::GetUniformLocation(yuyv_program_2d.id, c"tex".as_ptr());
+            gls::gl::Uniform1i(tex, 0);
+            [
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"src_size".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_offset".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_scale".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vr".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ug".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vg".as_ptr()),
+                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ub".as_ptr()),
+            ]
+        };
 
         let segmentation_program =
             GlProgram::new(generate_vertex_shader(), generate_segmentation_shader())?;
@@ -813,8 +884,14 @@ impl GLProcessorST {
         color_program.load_uniform_4fv(c"colors", &DEFAULT_COLORS)?;
 
         // Int8 variant of the existing planar RGB shader (for planar RGB int8 destinations).
-        let texture_program_planar_int8 =
-            GlProgram::new(generate_vertex_shader(), generate_planar_rgb_int8_shader())?;
+        let texture_program_planar_int8 = if Platform::EXTERNAL_OES {
+            Some(GlProgram::new(
+                generate_vertex_shader(),
+                generate_planar_rgb_int8_shader(),
+            )?)
+        } else {
+            None
+        };
 
         // Planar RGB shaders with sampler2D (for two-pass NV12→RGBA→PlanarRgb on Vivante)
         let texture_program_planar_2d =
@@ -941,6 +1018,8 @@ impl GLProcessorST {
             texture_int8_program_yuv,
             texture_program_planar,
             texture_program_planar_int8,
+            yuyv_program_2d,
+            yuyv_2d_locs,
             packed_rgba8_program_2d,
             packed_rgba8_int8_program_2d,
             texture_program_planar_2d,
@@ -998,6 +1077,7 @@ impl GLProcessorST {
             nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
+            float_two_pass_intermediate: None,
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
@@ -1305,8 +1385,10 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let lowering =
-            super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory());
+        let lowering = super::render::lower_dst(
+            self.gl_context.transfer_backend.is_zero_copy(),
+            dst.memory(),
+        );
         let plan = super::render::plan_convert(src_fmt, dst_fmt, lowering);
         let _span = tracing::trace_span!(
             "image.convert.gl.engine",
@@ -1794,8 +1876,8 @@ impl GLProcessorST {
         img: &Tensor<u8>,
         fmt: PixelFormat,
     ) -> bool {
-        if backend.is_dma() && img.memory() == TensorMemory::Dma {
-            // EGLImage DMA-BUF path supports:
+        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
+            // Zero-copy import path supports:
             //   Path A (samplerExternalOES): RGBA, GREY, YUYV, NV12
             //   Path B (R8 texelFetch shader): NV16, NV24 (contiguous only)
             // VYUY excluded: Vivante GPU accepts the DRM fourcc but produces
@@ -1838,7 +1920,7 @@ impl GLProcessorST {
         if fmt == PixelFormat::Bgra && !has_bgra {
             return false;
         }
-        if backend.is_dma() && img.memory() == TensorMemory::Dma {
+        if backend.is_zero_copy() && img.memory() == TensorMemory::Dma {
             matches!(
                 fmt,
                 PixelFormat::Rgba
@@ -1912,7 +1994,14 @@ impl GLProcessorST {
                 .to_string()
         };
         log::debug!("GL Extensions: {extensions}");
-        let required_ext = ["GL_OES_EGL_image_external_essl3"];
+        // The external-OES sampler is required only where the platform's
+        // import binding uses it (Linux Path A); ANGLE/Metal binds every
+        // import as TEXTURE_2D and never exposes the extension.
+        let required_ext: &[&str] = if Platform::EXTERNAL_OES {
+            &["GL_OES_EGL_image_external_essl3"]
+        } else {
+            &[]
+        };
         let extensions = extensions.split_ascii_whitespace().collect::<BTreeSet<_>>();
         for required in required_ext {
             if !extensions.contains(required) {
@@ -1972,6 +2061,7 @@ impl GLProcessorST {
     fn invalidate_src_textures(&mut self) {
         self.camera_eglimage_texture.invalidate_egl_binding();
         self.nv_r8_texture.invalidate_egl_binding();
+        self.camera_normal_texture.invalidate_egl_binding();
     }
 
     /// Classify and bind the destination render target — the single entry
@@ -1984,7 +2074,10 @@ impl GLProcessorST {
         dst_fmt: PixelFormat,
         crop: ResolvedCrop,
     ) -> crate::Result<DstTarget> {
-        match super::render::lower_dst(self.gl_context.transfer_backend.is_dma(), dst.memory()) {
+        match super::render::lower_dst(
+            self.gl_context.transfer_backend.is_zero_copy(),
+            dst.memory(),
+        ) {
             super::render::DstLowering::ZeroCopy => {
                 self.setup_renderbuffer_dma(dst, dst_fmt)?;
                 Ok(DstTarget::ZeroCopyImage)
@@ -2046,7 +2139,9 @@ impl GLProcessorST {
                 check_gl_error(function!(), line!())?;
             },
             None => unsafe {
-                gls::gl::UseProgram(self.texture_program_yuv.id);
+                if let Some(p) = &self.texture_program_yuv {
+                    gls::gl::UseProgram(p.id);
+                }
                 gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                 gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                 super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
@@ -3061,7 +3156,7 @@ impl GLProcessorST {
             crate::Rotation::Rotate180 => 2,
             crate::Rotation::CounterClockwise90 => 3,
         };
-        if self.gl_context.transfer_backend.is_dma() && src.memory() == TensorMemory::Dma {
+        if self.gl_context.transfer_backend.is_zero_copy() && src.memory() == TensorMemory::Dma {
             // Choose the NV* path (ShaderR8 vs ExternalSampler) honoring the
             // EDGEFIRST_NV_CONVERT_PATH preference. See `select_nv_path`: Auto
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
@@ -3069,7 +3164,21 @@ impl GLProcessorST {
             // for true-multiplane NV12 (which ShaderR8 cannot import).
             let chosen = self.select_nv_path(src, src_fmt, _dst_fmt);
 
-            if chosen == NvConvertPath::ShaderR8 {
+            if !Platform::EXTERNAL_OES && chosen == NvConvertPath::ExternalSampler {
+                // No samplerExternalOES on this platform (ANGLE/Metal):
+                // packed/Grey zero-copy sources attach as TEXTURE_2D inside
+                // draw_src_texture; formats it can't take fall back to CPU
+                // via its error.
+                self.draw_src_texture(
+                    src,
+                    src_fmt,
+                    src_roi,
+                    dst_roi,
+                    rotation_offset,
+                    flip,
+                    is_int8,
+                )?;
+            } else if chosen == NvConvertPath::ShaderR8 {
                 match self.get_or_create_nv_r8_egl_image(src, src_fmt) {
                     Ok(r8_egl) => {
                         tracing::trace!(
@@ -3728,13 +3837,18 @@ impl GLProcessorST {
                 std::mem::swap(&mut dst_roi.left, &mut dst_roi.right);
             }
         }
+        let program_id = if int8 {
+            &self.texture_program_planar_int8
+        } else {
+            &self.texture_program_planar
+        }
+        .as_ref()
+        .ok_or_else(|| {
+            Error::NotSupported("external-OES planar program unavailable on this platform".into())
+        })?
+        .id;
         unsafe {
-            let program = if int8 {
-                &self.texture_program_planar_int8
-            } else {
-                &self.texture_program_planar
-            };
-            gls::gl::UseProgram(program.id);
+            gls::gl::UseProgram(program_id);
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
             super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
@@ -3993,10 +4107,37 @@ impl GLProcessorST {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let texture_target = gls::gl::TEXTURE_2D;
+        // Zero-copy source attach: on platforms whose imports bind as
+        // TEXTURE_2D (macOS IOSurface), a Dma-memory source is imported
+        // and attached to the source texture instead of being uploaded.
+        // Import errors fall back to the upload below (the map() of an
+        // IOSurface tensor is always valid); YUYV has no upload arm and
+        // is accepted only when its RG attach succeeds.
+        let zero_copy_attach = if !self.gl_context.transfer_backend.is_dma()
+            && self.gl_context.transfer_backend.is_zero_copy()
+            && src.memory() == TensorMemory::Dma
+            && matches!(
+                src_fmt,
+                PixelFormat::Rgba | PixelFormat::Grey | PixelFormat::Yuyv
+            ) {
+            let key = BufferImportKey::from_tensor(src, src_fmt, false);
+            match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
+                Ok(handle) => Some((key, handle)),
+                Err(e) => {
+                    log::debug!("zero-copy source import failed ({e:?}); uploading instead");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let texture_format = match src_fmt {
             PixelFormat::Rgb => gls::gl::RGB,
             PixelFormat::Rgba => gls::gl::RGBA,
             PixelFormat::Grey => gls::gl::RED,
+            // YUYV samples as RG (R=Y, G=alternating chroma) — zero-copy
+            // attach only; there is deliberately no upload arm yet.
+            PixelFormat::Yuyv if zero_copy_attach.is_some() => gls::gl::RG,
             _ => {
                 return Err(Error::NotSupported(format!(
                     "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
@@ -4006,13 +4147,39 @@ impl GLProcessorST {
         // Draw-time program selection: the int8 program is the same shader
         // plus the XOR-0x80 bias, selected here instead of swap-and-restore
         // around the render.
-        let program_id = if is_int8 {
+        let program_id = if src_fmt == PixelFormat::Yuyv {
+            if is_int8 {
+                return Err(Error::NotSupported(
+                    "YUYV zero-copy source has no int8 program; CPU fallback handles it".into(),
+                ));
+            }
+            self.yuyv_program_2d.id
+        } else if is_int8 {
             self.texture_int8_program.id
         } else {
             self.texture_program.id
         };
         unsafe {
             gls::gl::UseProgram(program_id);
+            if src_fmt == PixelFormat::Yuyv {
+                // YUYV program inputs: source texel grid + the YUV→RGB
+                // matrix/range resolved from the tensor colorimetry (same
+                // resolution rule as the NV paths).
+                let cm = crate::colorimetry::resolve_colorimetry(src.colorimetry(), src.height());
+                let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(
+                    cm.encoding
+                        .unwrap_or(edgefirst_tensor::ColorEncoding::Bt709),
+                    cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
+                );
+                let [src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub] = self.yuyv_2d_locs;
+                gls::gl::Uniform2f(src_size, src_w as f32, src_h as f32);
+                gls::gl::Uniform1f(y_offset, coeffs.y_offset);
+                gls::gl::Uniform1f(y_scale, coeffs.y_scale);
+                gls::gl::Uniform1f(c_vr, coeffs.c_vr);
+                gls::gl::Uniform1f(c_ug, coeffs.c_ug);
+                gls::gl::Uniform1f(c_vg, coeffs.c_vg);
+                gls::gl::Uniform1f(c_ub, coeffs.c_ub);
+            }
             gls::gl::ActiveTexture(gls::gl::TEXTURE0);
             gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
             super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
@@ -4040,21 +4207,30 @@ impl GLProcessorST {
             // 1-/3-bpp pitch is not 4-aligned so they can't take the stride-aware
             // EGLImage path. Tell GL the real row length (in pixels) so it skips
             // the padding; reset afterwards so other uploads stay tight.
-            let src_bpp = src_fmt.channels().max(1);
-            let row_len_px = src
-                .effective_row_stride()
-                .map(|s| s / src_bpp)
-                .filter(|&px| px != src_w)
-                .unwrap_or(0);
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
-            self.camera_normal_texture.update_texture(
-                texture_target,
-                src_w,
-                src_h,
-                texture_format,
-                &src.map()?,
-            );
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+            if let Some((key, handle)) = zero_copy_attach {
+                self.camera_normal_texture
+                    .bind_egl_image(&self.gl_context, key, handle)?;
+                // Poison the upload-tracking dims: a later upload on this
+                // texture must TexImage2D fresh storage, never
+                // TexSubImage2D into the attached client buffer.
+                self.camera_normal_texture.target = 0;
+            } else {
+                let src_bpp = src_fmt.channels().max(1);
+                let row_len_px = src
+                    .effective_row_stride()
+                    .map(|s| s / src_bpp)
+                    .filter(|&px| px != src_w)
+                    .unwrap_or(0);
+                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
+                self.camera_normal_texture.update_texture(
+                    texture_target,
+                    src_w,
+                    src_h,
+                    texture_format,
+                    &src.map()?,
+                );
+                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+            }
 
             gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
             gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
@@ -4146,10 +4322,15 @@ impl GLProcessorST {
 
         // Draw-time program selection (see draw_src_texture).
         let program_id = if is_int8 {
-            self.texture_int8_program_yuv.id
+            &self.texture_int8_program_yuv
         } else {
-            self.texture_program_yuv.id
-        };
+            &self.texture_program_yuv
+        }
+        .as_ref()
+        .ok_or_else(|| {
+            Error::NotSupported("external-OES sampler program unavailable on this platform".into())
+        })?
+        .id;
         let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
             gls::gl::UseProgram(program_id);
@@ -6134,6 +6315,73 @@ impl GLProcessorST {
     /// Captured ONCE by the dispatch wrapper at worker startup (before its
     /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
     /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
+    /// Fused NV12/NV16/NV24 → PlanarRgb F16: two engine passes under one
+    /// call. Pass 1 renders the YUV source to a cached full-resolution
+    /// RGBA8 intermediate (no crop/transform); pass 2 runs the packed
+    /// RGBA16F float render with the caller's crop/letterbox. The
+    /// model-input convert previously only the legacy macOS backend
+    /// offered — now portable (Linux DMA-BUF f16 targets included).
+    fn convert_nv_to_planar_float_two_pass(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> crate::Result<()> {
+        let w = src.width().ok_or(Error::NotAnImage)?;
+        let h = src.height().ok_or(Error::NotAnImage)?;
+        let _span = tracing::trace_span!("image.convert.gl.nv_to_planar_float", w, h).entered();
+
+        // Reuse (or allocate) the intermediate: zero-copy where the
+        // platform allocates it (IOSurface/DMA), heap otherwise.
+        if !matches!(&self.float_two_pass_intermediate, Some((iw, ih, _)) if *iw == w && *ih == h) {
+            let interm = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                edgefirst_tensor::DType::U8,
+                Some(TensorMemory::Dma),
+            )
+            .or_else(|_| {
+                TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    edgefirst_tensor::DType::U8,
+                    Some(TensorMemory::Mem),
+                )
+            })?;
+            self.float_two_pass_intermediate = Some((w, h, interm));
+        }
+        let (iw, ih, mut interm) = self
+            .float_two_pass_intermediate
+            .take()
+            .expect("just filled");
+
+        // Pass 1: NV → RGBA, full resolution, identity transform (the
+        // caller's crop/rotation belong to pass 2's sampling).
+        let result = ImageProcessorTrait::convert(
+            self,
+            src,
+            &mut interm,
+            crate::Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .and_then(|()| {
+            // Pass 2 imports the intermediate as a SOURCE. On platforms
+            // with per-pass attachments (macOS) the pass-1 destination
+            // binding must be released first — binding one pbuffer to two
+            // textures is an EGL error. Pass 1 ran eagerly (synced), so
+            // releasing here is safe; no-op on Linux.
+            Platform::end_gpu_pass(&self.gl_context);
+            self.convert_float_to_zero_copy(&interm, dst, rotation, flip, crop)
+        });
+        self.float_two_pass_intermediate = Some((iw, ih, interm));
+        result
+    }
+
     /// Release per-pass platform texture attachments — called by the
     /// dispatch wrapper after each message whose GPU work has synced
     /// (no-op while a deferred batch still owes its flush, and on
@@ -6149,7 +6397,7 @@ impl GLProcessorST {
             transfer_backend: self.gl_context.transfer_backend,
             render_dtypes: self.supported_render_dtypes(),
             serialize_gl: self.is_vivante(),
-            external_oes: true,
+            external_oes: Platform::EXTERNAL_OES,
         }
     }
 }

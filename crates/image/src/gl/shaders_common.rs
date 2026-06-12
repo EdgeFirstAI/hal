@@ -176,6 +176,53 @@ macro_rules! nv_rgba_body_divfree {
 /// NV->RGBA fragment shader (Path B), shared verbatim by both backends. Vertex
 /// stage ([`VERTEX_SHADER`]) provides `fragPos`/`tc`; output is `color`. The
 /// bytes are validated on-target (Linux) and frozen by the golden test below.
+/// YUYV (sampled as a GL_RG texture: R=Y, G=alternating U/V) → RGBA.
+/// Each output pixel samples its own texel and the horizontal partner to
+/// recover both chroma components; the YUV→RGB matrix + range come from
+/// the per-tensor colorimetry uniforms (same names as the NV program).
+/// Portable `sampler2D` — shared by the IOSurface zero-copy source path
+/// and any future heap-YUYV upload path.
+pub(crate) const YUYV_RGBA_2D_FRAGMENT: &str = r#"#version 300 es
+precision highp float;
+uniform highp sampler2D tex;
+uniform vec2 src_size;
+uniform float y_offset;
+uniform float y_scale;
+uniform float c_vr;
+uniform float c_ug;
+uniform float c_vg;
+uniform float c_ub;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+
+void main() {
+    vec2 texel = vec2(1.0) / src_size;
+    vec2 col = floor(tc * src_size);
+    bool even = mod(col.x, 2.0) < 0.5;
+    vec2 self_uv = (col + vec2(0.5)) * texel;
+    vec2 pair_uv = (col + vec2(even ? 1.5 : -0.5, 0.5)) * texel;
+
+    vec4 self_rg = texture(tex, self_uv);
+    vec4 pair_rg = texture(tex, pair_uv);
+    float y = self_rg.r;
+    float u, v;
+    if (even) { u = self_rg.g; v = pair_rg.g; }
+    else      { v = self_rg.g; u = pair_rg.g; }
+
+    // Identical matrix/range math to the NV program: floor the expanded
+    // luma at 0 (limited-range footroom folds to 0; full range is a no-op
+    // with y_offset=0/y_scale=1), top end left to the per-channel clamp.
+    float yp = max((y - y_offset) * y_scale, 0.0);
+    float up = u - 128.0 / 255.0;
+    float vp = v - 128.0 / 255.0;
+    float r = clamp(yp + c_vr * vp, 0.0, 1.0);
+    float g = clamp(yp - c_ug * up - c_vg * vp, 0.0, 1.0);
+    float b = clamp(yp + c_ub * up, 0.0, 1.0);
+    color = vec4(r, g, b, 1.0);
+}
+"#;
+
 pub(crate) const NV_RGBA_FRAGMENT: &str = concat!(
     "\
 #version 300 es

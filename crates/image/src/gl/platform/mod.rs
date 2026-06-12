@@ -123,6 +123,13 @@ pub(super) trait GlPlatform {
     /// so the skip cache must stay cold there.
     const PERSISTENT_TEX_BINDINGS: bool;
 
+    /// Whether `GL_TEXTURE_EXTERNAL_OES` sampling of imports exists on
+    /// this platform (Linux: yes — the NV "Path A" and the legacy packed
+    /// DMA source path; ANGLE/Metal: no — every import binds as
+    /// `TEXTURE_2D`). Compile-time so the unsupported branch is
+    /// statically eliminated.
+    const EXTERNAL_OES: bool;
+
     /// Load the process-global GL function-pointer table exactly once.
     /// `gls` bindings are gl_generator `static mut` tables — loading must
     /// happen once per process, never per processor. Linux resolves via

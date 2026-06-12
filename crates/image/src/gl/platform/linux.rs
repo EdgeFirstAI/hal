@@ -60,6 +60,7 @@ impl GlPlatform for LinuxEgl {
     // EGLImage targets persist on the texture object — the engine's
     // binding-skip cache (BufferImportKey on Texture) applies.
     const PERSISTENT_TEX_BINDINGS: bool = true;
+    const EXTERNAL_OES: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
         GlContext::new(kind)

@@ -193,6 +193,19 @@ impl TransferBackend {
     pub(crate) fn is_dma(self) -> bool {
         self == TransferBackend::DmaBuf
     }
+
+    /// Returns `true` if the platform can import `TensorMemory::Dma`
+    /// tensors zero-copy: DMA-BUF EGLImages on Linux, IOSurface pbuffers
+    /// on macOS. Path-selection sites use this; probes that are
+    /// specifically about DMA-BUF semantics (e.g. the render-roundtrip
+    /// verification) keep `is_dma`.
+    pub(crate) fn is_zero_copy(self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self == TransferBackend::IOSurface {
+            return true;
+        }
+        self == TransferBackend::DmaBuf
+    }
 }
 
 /// Interpolation mode for int8 proto textures (GL_R8I cannot use GL_LINEAR).

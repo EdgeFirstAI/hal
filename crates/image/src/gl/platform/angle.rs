@@ -340,6 +340,7 @@ impl GlPlatform for AngleClientBuffer {
     // eglBindTexImage attachments are released at end_gpu_pass — the
     // engine's binding-skip cache must stay cold on macOS.
     const PERSISTENT_TEX_BINDINGS: bool = false;
+    const EXTERNAL_OES: bool = false;
 
     fn load_gl_once(_display: &AngleDisplay) {
         // Loaded once at shared-display init (`load_gl_once` above runs
@@ -407,11 +408,21 @@ impl GlPlatform for AngleClientBuffer {
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("packed import: tensor is not IOSurface-backed".into())
         })?;
-        // The packed surface is RGBA-shaped at the caller-computed dims;
-        // express it as the matching (PixelFormat, DType) IOSurface layout.
-        let (pf, dt) = match fmt {
-            super::PackedImportFormat::Rgba8888 => (PixelFormat::Rgba, DType::U8),
-            super::PackedImportFormat::Rgba16161616F => (PixelFormat::Rgba, DType::F16),
+        // The caller passes PACKED surface dims. ImageLayout speaks
+        // logical dims, so map each packed format onto the layout arm
+        // that produces exactly this surface: RGBA8 maps 1:1; the
+        // RGBA16F planar packing is (W/4, 3·H) — reconstruct the
+        // logical (W, H) the (PlanarRgb, F16) arm derives it from.
+        let (pf, dt, w, h) = match fmt {
+            super::PackedImportFormat::Rgba8888 => (PixelFormat::Rgba, DType::U8, width, height),
+            super::PackedImportFormat::Rgba16161616F => {
+                if !height.is_multiple_of(3) {
+                    return Err(Error::NotSupported(format!(
+                        "packed RGBA16F surface height {height} is not a 3-plane stack"
+                    )));
+                }
+                (PixelFormat::PlanarRgb, DType::F16, width * 4, height / 3)
+            }
         };
         let shared = display.shared;
         // SAFETY: as in `import_buffer`.
@@ -423,8 +434,8 @@ impl GlPlatform for AngleClientBuffer {
                 surface_ref,
                 pf,
                 dt,
-                width,
-                height,
+                w,
+                h,
             )?
         };
         Ok(IoSurfacePbuffer { shared, surface })
