@@ -23,7 +23,19 @@ type PlatformImport = <Platform as GlPlatform>::Import;
 /// The `Copy` import handle (`egl::Image` / `egl::Surface`).
 type PlatformHandle = <Platform as GlPlatform>::ImportHandle;
 use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
-use super::shaders::*;
+use super::shaders::{
+    check_gl_error, generate_color_shader, generate_instanced_segmentation_shader,
+    generate_nv_to_rgba_int8_shader_2d, generate_nv_to_rgba_shader_2d,
+    generate_packed_f32_nhwc_shader, generate_packed_rgba8_int8_shader_2d,
+    generate_packed_rgba8_shader_2d, generate_planar_rgb_f16_packed_shader,
+    generate_planar_rgb_int8_shader, generate_planar_rgb_int8_shader_2d,
+    generate_planar_rgb_shader, generate_planar_rgb_shader_2d, generate_proto_dequant_shader_int8,
+    generate_proto_repack_compute_shader, generate_proto_segmentation_shader,
+    generate_proto_segmentation_shader_f32, generate_proto_segmentation_shader_int8_bilinear,
+    generate_proto_segmentation_shader_int8_nearest, generate_segmentation_shader,
+    generate_texture_fragment_shader, generate_texture_fragment_shader_yuv,
+    generate_texture_int8_shader, generate_texture_int8_shader_yuv, generate_vertex_shader,
+};
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
