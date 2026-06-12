@@ -1693,3 +1693,708 @@ impl ImageProcessorTrait for MacosGlProcessor {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR-A step A0 spike (THROWAWAY — deleted with this file at A8).
+//
+// De-risks the per-processor-ANGLE-context + channel-hop migration before any
+// production code changes. Six legs (see the PR-A plan):
+//   (i)   multi-context render scaling: N private contexts on the shared
+//         ANGLE display, each held current on its own thread — does Metal
+//         scale, and does a Tegra-style tiny-convert collapse appear?
+//   (ii)  historical deadlock shape smoke: 2 processors × pipelined
+//         NV12→PlanarF16 two-pass (the profiler shape that deadlocked on the
+//         shared context at depth>1) + S(2) + zero-copy (flat pbuf misses).
+//   (iii) channel-hop NET overhead: inline production shape (lock_gl +
+//         MakeCurrentGuard per convert) vs threaded production shape (context
+//         held current once + tokio mpsc(1)/oneshot per call — the exact
+//         GLProcessorThreaded anatomy). Budgets: round trip ≤20 µs, net delta
+//         ≤15 µs absolute and ≤3% median at 720p; 64×64 absolute-µs only.
+//   (iv)  EGL entry-point contention: per-convert eglBindTexImage/
+//         eglReleaseTexImage on cached pbuffers from N threads × N contexts —
+//         ANGLE serializes EGL entry points behind a display-global lock and
+//         this, not Metal context switching, is the plausible serializer.
+//   (v)   concurrent cold-import storm: eglCreatePbufferFromClientBuffer +
+//         destroy from 2 threads (import-path serialization).
+//   (vi)  lifecycle churn: create/drop processors while another converts
+//         (the known macOS parallel-test flake shape).
+//
+// Run on macOS (each leg is `#[ignore]` — on-demand, not CI):
+//   cargo test -p edgefirst-image --release spike_a0 -- \
+//       --ignored --nocapture --test-threads=1
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod spike_a0 {
+    use super::super::core as glcore;
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    const FILL_FRAGMENT: &str = r#"#version 300 es
+precision mediump float;
+in vec3 fragPos;
+in vec2 tc;
+out vec4 color;
+void main() { color = vec4(tc.x, tc.y, 0.5, 1.0); }
+"#;
+
+    fn image_dma(w: usize, h: usize, fmt: PixelFormat, dt: DType) -> TensorDyn {
+        TensorDyn::image(w, h, fmt, dt, Some(TensorMemory::Dma))
+            .expect("IOSurface-backed tensor alloc")
+    }
+
+    fn fill_u8(t: &TensorDyn, seed: usize) {
+        use edgefirst_tensor::{TensorMapTrait, TensorTrait};
+        let tu = t.as_u8().expect("u8 tensor");
+        let mut m = tu.map().expect("tensor map");
+        for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+            *b = ((seed * 41 + i) % 223) as u8;
+        }
+    }
+
+    fn median_p95(samples: &mut [Duration]) -> (Duration, Duration) {
+        samples.sort_unstable();
+        let med = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95) / 100];
+        (med, p95)
+    }
+
+    /// Per-thread private EGL context + minimal GL pipeline (fill shader,
+    /// quad, FBO). This is the post-PR-A shape: context created on the
+    /// shared display, made current ONCE on its owning thread, held for
+    /// the thread's life. Render target is either a plain RGBA8 texture
+    /// (leg i) or an IOSurface pbuffer bound per-iteration (leg iv).
+    struct ThreadGl {
+        d: &'static SharedAngleDisplay,
+        ctx: egl::Context,
+        dummy: egl::Surface,
+        program: u32,
+        vao: u32,
+        vbo: u32,
+        fbo: u32,
+        rt_tex: u32,
+        src_tex: u32,
+        dst_tex: u32,
+    }
+
+    impl ThreadGl {
+        fn new(rt: Option<(i32, i32)>) -> Result<Self> {
+            let d = shared_display()?;
+            let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
+            let ctx = d
+                .egl
+                .create_context(d.display, d.config, None, &ctx_attribs)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("create_context: {e:?}"))))?;
+            let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
+            let dummy = d
+                .egl
+                .create_pbuffer_surface(d.display, d.config, &dummy_attribs)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("dummy pbuffer: {e:?}"))))?;
+            d.egl
+                .make_current(d.display, Some(dummy), Some(dummy), Some(ctx))
+                .map_err(|e| Error::Io(std::io::Error::other(format!("make_current: {e:?}"))))?;
+
+            // SAFETY: this thread's context is current; gls pointers were
+            // loaded once at shared-display init and are display-global.
+            unsafe {
+                let program = glcore::compile_program(VERTEX_SHADER, FILL_FRAGMENT)?;
+                #[rustfmt::skip]
+                let quad: [f32; 20] = [
+                    -1.0,-1.0, 0.0,  0.0, 0.0,
+                     1.0,-1.0, 0.0,  1.0, 0.0,
+                    -1.0, 1.0, 0.0,  0.0, 1.0,
+                     1.0, 1.0, 0.0,  1.0, 1.0,
+                ];
+                let mut vbo = 0u32;
+                let mut vao = 0u32;
+                gls::gl::GenBuffers(1, &mut vbo);
+                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, vbo);
+                gls::gl::BufferData(
+                    gls::gl::ARRAY_BUFFER,
+                    std::mem::size_of_val(&quad) as isize,
+                    quad.as_ptr() as *const _,
+                    gls::gl::STATIC_DRAW,
+                );
+                gls::gl::GenVertexArrays(1, &mut vao);
+                gls::gl::BindVertexArray(vao);
+                gls::gl::VertexAttribPointer(0, 3, gls::gl::FLOAT, 0, 20, std::ptr::null());
+                gls::gl::EnableVertexAttribArray(0);
+                gls::gl::VertexAttribPointer(1, 2, gls::gl::FLOAT, 0, 20, 12 as *const _);
+                gls::gl::EnableVertexAttribArray(1);
+
+                let mut fbo = 0u32;
+                gls::gl::GenFramebuffers(1, &mut fbo);
+                let mut rt_tex = 0u32;
+                if let Some((w, h)) = rt {
+                    gls::gl::GenTextures(1, &mut rt_tex);
+                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, rt_tex);
+                    glcore::set_tex_filter_clamp(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+                    gls::gl::TexImage2D(
+                        gls::gl::TEXTURE_2D,
+                        0,
+                        gls::gl::RGBA8 as i32,
+                        w,
+                        h,
+                        0,
+                        gls::gl::RGBA,
+                        gls::gl::UNSIGNED_BYTE,
+                        std::ptr::null(),
+                    );
+                    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
+                    gls::gl::FramebufferTexture2D(
+                        gls::gl::FRAMEBUFFER,
+                        gls::gl::COLOR_ATTACHMENT0,
+                        gls::gl::TEXTURE_2D,
+                        rt_tex,
+                        0,
+                    );
+                    glcore::check_framebuffer_complete().map_err(|s| {
+                        Error::Io(std::io::Error::other(format!("FBO incomplete: 0x{s:x}")))
+                    })?;
+                }
+                let mut src_tex = 0u32;
+                let mut dst_tex = 0u32;
+                gls::gl::GenTextures(1, &mut src_tex);
+                gls::gl::GenTextures(1, &mut dst_tex);
+                for tex in [src_tex, dst_tex] {
+                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
+                    glcore::set_tex_filter_clamp(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+                }
+                Ok(Self {
+                    d,
+                    ctx,
+                    dummy,
+                    program,
+                    vao,
+                    vbo,
+                    fbo,
+                    rt_tex,
+                    src_tex,
+                    dst_tex,
+                })
+            }
+        }
+
+        fn draw_once(&self, w: i32, h: i32) {
+            // SAFETY: context current on this thread for its whole life.
+            unsafe {
+                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.fbo);
+                gls::gl::Viewport(0, 0, w, h);
+                gls::gl::UseProgram(self.program);
+                gls::gl::BindVertexArray(self.vao);
+                gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
+                gls::gl::Finish();
+            }
+        }
+    }
+
+    impl Drop for ThreadGl {
+        fn drop(&mut self) {
+            // SAFETY: still on the owning thread, context still current.
+            unsafe {
+                gls::gl::DeleteProgram(self.program);
+                gls::gl::DeleteBuffers(1, &self.vbo);
+                gls::gl::DeleteVertexArrays(1, &self.vao);
+                gls::gl::DeleteFramebuffers(1, &self.fbo);
+                if self.rt_tex != 0 {
+                    gls::gl::DeleteTextures(1, &self.rt_tex);
+                }
+                gls::gl::DeleteTextures(1, &self.src_tex);
+                gls::gl::DeleteTextures(1, &self.dst_tex);
+            }
+            let _ = self.d.egl.make_current(self.d.display, None, None, None);
+            let _ = self.d.egl.destroy_surface(self.d.display, self.dummy);
+            let _ = self.d.egl.destroy_context(self.d.display, self.ctx);
+        }
+    }
+
+    /// Leg (i): N private contexts rendering concurrently to plain
+    /// textures. Pure GL/Metal scaling, no EGL calls in the loop.
+    fn run_multi_ctx(n: usize, w: i32, h: i32, iters: usize) -> f64 {
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Duration {
+                    let tgl = ThreadGl::new(Some((w, h))).expect("ThreadGl");
+                    for _ in 0..20 {
+                        tgl.draw_once(w, h);
+                    }
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        tgl.draw_once(w, h);
+                    }
+                    t0.elapsed()
+                })
+            })
+            .collect();
+        let max = handles
+            .into_iter()
+            .map(|h| h.join().expect("leg(i) thread"))
+            .max()
+            .unwrap();
+        (n * iters) as f64 / max.as_secs_f64()
+    }
+
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_i_multi_context_render_scaling() {
+        for (w, h, iters) in [(1280, 720, 400), (64, 64, 3000)] {
+            let mut base = 0.0f64;
+            for n in [1usize, 2, 4] {
+                let rate = run_multi_ctx(n, w, h, iters);
+                if n == 1 {
+                    base = rate;
+                }
+                println!(
+                    "leg(i) {w}x{h} n={n}: {rate:9.0} draws/s  S({n})={:.2}",
+                    rate / base
+                );
+            }
+        }
+    }
+
+    /// Leg (ii): the historical profiler deadlock shape. 2 processors on 2
+    /// threads, each looping the NV12→PlanarF16 two-pass convert (pipelined
+    /// across processors). Watchdog instead of a hang; asserts zero-copy via
+    /// flat pbuf-cache misses after warmup.
+    fn two_pass_loop(iters: usize, seed: usize) -> (Duration, u64) {
+        let mut proc = MacosGlProcessor::new().expect("processor");
+        let src = image_dma(1280, 720, PixelFormat::Nv12, DType::U8);
+        fill_u8(&src, seed);
+        let mut dst = image_dma(640, 640, PixelFormat::PlanarRgb, DType::F16);
+        let crop = Crop::letterbox([114, 114, 114, 255]);
+        for _ in 0..5 {
+            ImageProcessorTrait::convert(
+                &mut proc,
+                &src,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .expect("warmup convert");
+        }
+        let (_, misses_warm, _) = proc.pbuf_cache_stats();
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            ImageProcessorTrait::convert(
+                &mut proc,
+                &src,
+                &mut dst,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .expect("convert");
+        }
+        let elapsed = t0.elapsed();
+        let (_, misses_end, _) = proc.pbuf_cache_stats();
+        (elapsed, misses_end - misses_warm)
+    }
+
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_ii_two_pass_deadlock_smoke() {
+        const ITERS: usize = 60;
+        let (t1, m1) = two_pass_loop(ITERS, 1);
+        assert_eq!(m1, 0, "leg(ii) single-proc: pbuf misses not flat");
+        let rate1 = ITERS as f64 / t1.as_secs_f64();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let barrier = Arc::new(Barrier::new(2));
+        for i in 0..2usize {
+            let done = done_tx.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let r = two_pass_loop(ITERS, i + 2);
+                done.send(r).unwrap();
+            });
+        }
+        let mut agg_elapsed = Duration::ZERO;
+        for _ in 0..2 {
+            let (elapsed, misses) = done_rx
+                .recv_timeout(Duration::from_secs(90))
+                .expect("leg(ii) DEADLOCK: two-pass pipelined convert hung");
+            assert_eq!(misses, 0, "leg(ii) parallel: pbuf misses not flat");
+            agg_elapsed = agg_elapsed.max(elapsed);
+        }
+        let rate2 = (2 * ITERS) as f64 / agg_elapsed.as_secs_f64();
+        println!(
+            "leg(ii) NV12->PlanarF16 two-pass: 1-proc {rate1:6.1} conv/s, \
+             2-proc agg {rate2:6.1} conv/s, S(2)={:.2}",
+            rate2 / rate1
+        );
+    }
+
+    /// Leg (iii): channel-hop NET overhead, production shape vs production
+    /// shape. Inline = today's `convert` (lock_gl + MakeCurrentGuard per
+    /// call). Threaded = post-PR-A shape (worker holds the context current
+    /// once; caller pays tokio mpsc(1) send + fresh oneshot per call —
+    /// the exact GLProcessorThreaded anatomy).
+    struct SpikeSendPtr<T>(*const T);
+    unsafe impl<T> Send for SpikeSendPtr<T> {}
+    struct SpikeSendPtrMut<T>(*mut T);
+    unsafe impl<T> Send for SpikeSendPtrMut<T> {}
+
+    enum HopMsg {
+        Convert(
+            SpikeSendPtr<TensorDyn>,
+            SpikeSendPtrMut<TensorDyn>,
+            PixelFormat,
+            PixelFormat,
+            tokio::sync::oneshot::Sender<Result<()>>,
+        ),
+        Noop(tokio::sync::oneshot::Sender<Result<()>>),
+    }
+
+    fn inline_phase(src: &TensorDyn, dst: &mut TensorDyn, iters: usize) -> Vec<Duration> {
+        let mut proc = MacosGlProcessor::new().expect("processor");
+        for _ in 0..20 {
+            ImageProcessorTrait::convert(
+                &mut proc,
+                src,
+                dst,
+                Rotation::None,
+                Flip::None,
+                Crop::default(),
+            )
+            .expect("inline warmup");
+        }
+        (0..iters)
+            .map(|_| {
+                let t0 = Instant::now();
+                ImageProcessorTrait::convert(
+                    &mut proc,
+                    src,
+                    dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .expect("inline convert");
+                t0.elapsed()
+            })
+            .collect()
+    }
+
+    fn threaded_phase(
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        iters: usize,
+        noop_iters: usize,
+    ) -> (Vec<Duration>, Vec<Duration>) {
+        let (send, mut recv) = tokio::sync::mpsc::channel::<HopMsg>(1);
+        let worker = std::thread::spawn(move || {
+            let proc = MacosGlProcessor::new().expect("worker processor");
+            let d = shared_display().expect("display");
+            // Post-PR-A shape: current ONCE, held for the thread's life.
+            // No lock_gl in the loop — this spike phase is the only GL
+            // user while it runs (test-threads=1, inline phase finished).
+            let _current = MakeCurrentGuard::new(d).expect("make current");
+            while let Some(msg) = recv.blocking_recv() {
+                match msg {
+                    HopMsg::Convert(s, dptr, sf, df, resp) => {
+                        // SAFETY: caller blocks on the oneshot before
+                        // touching the tensors again (same contract as
+                        // GLProcessorThreaded's SendablePtr).
+                        let (src, dst) = unsafe { (&*s.0, &mut *dptr.0) };
+                        let _ = resp.send(proc.convert_yuyv_to_rgba_inner(d, src, dst, sf, df));
+                    }
+                    HopMsg::Noop(resp) => {
+                        let _ = resp.send(Ok(()));
+                    }
+                }
+            }
+        });
+
+        let sf = src.format().unwrap();
+        let df = dst.format().unwrap();
+        let call = |dst: &mut TensorDyn| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            send.blocking_send(HopMsg::Convert(
+                SpikeSendPtr(src as *const _),
+                SpikeSendPtrMut(dst as *mut _),
+                sf,
+                df,
+                tx,
+            ))
+            .expect("send");
+            rx.blocking_recv().expect("recv").expect("threaded convert");
+        };
+        for _ in 0..20 {
+            call(dst);
+        }
+        let conv: Vec<Duration> = (0..iters)
+            .map(|_| {
+                let t0 = Instant::now();
+                call(dst);
+                t0.elapsed()
+            })
+            .collect();
+        let noop: Vec<Duration> = (0..noop_iters)
+            .map(|_| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let t0 = Instant::now();
+                send.blocking_send(HopMsg::Noop(tx)).expect("send");
+                rx.blocking_recv().expect("recv").expect("noop");
+                t0.elapsed()
+            })
+            .collect();
+        drop(send);
+        worker.join().expect("worker join");
+        (conv, noop)
+    }
+
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_iii_channel_hop_overhead() {
+        for (w, h, iters) in [(1280usize, 720usize, 400usize), (64, 64, 2000)] {
+            let src = image_dma(w, h, PixelFormat::Yuyv, DType::U8);
+            fill_u8(&src, 7);
+            let mut dst = image_dma(w, h, PixelFormat::Rgba, DType::U8);
+
+            let mut inline = inline_phase(&src, &mut dst, iters);
+            let (mut threaded, mut noop) = threaded_phase(&src, &mut dst, iters, 5000);
+
+            let (in_med, in_p95) = median_p95(&mut inline);
+            let (th_med, th_p95) = median_p95(&mut threaded);
+            let (rt_med, _) = median_p95(&mut noop);
+            let net_us = th_med.as_secs_f64() * 1e6 - in_med.as_secs_f64() * 1e6;
+            println!(
+                "leg(iii) {w}x{h} YUYV->RGBA: inline med {:.1}us p95 {:.1}us | \
+                 threaded med {:.1}us p95 {:.1}us | net {net_us:+.1}us ({:+.1}%) | \
+                 noop round-trip med {:.1}us",
+                in_med.as_secs_f64() * 1e6,
+                in_p95.as_secs_f64() * 1e6,
+                th_med.as_secs_f64() * 1e6,
+                th_p95.as_secs_f64() * 1e6,
+                net_us / (in_med.as_secs_f64() * 1e6) * 100.0,
+                rt_med.as_secs_f64() * 1e6,
+            );
+        }
+    }
+
+    /// Leg (iv): per-convert eglBindTexImage/eglReleaseTexImage on cached
+    /// pbuffers, N threads × N private contexts — the candidate macOS
+    /// serializer (ANGLE locks EGL entry points display-wide).
+    fn run_egl_bind(n: usize, w: usize, h: usize, iters: usize) -> f64 {
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Duration {
+                    let tgl = ThreadGl::new(None).expect("ThreadGl");
+                    let d = tgl.d;
+                    let src = image_dma(w, h, PixelFormat::Rgba, DType::U8);
+                    fill_u8(&src, i);
+                    let dst = image_dma(w, h, PixelFormat::Rgba, DType::U8);
+                    // Cached pbuffers: created once, bind/release per iter.
+                    // SAFETY: tensors outlive the pbuffers (destroyed below).
+                    let (src_pbuf, dst_pbuf) = unsafe {
+                        (
+                            iosurface_import::create_iosurface_pbuffer(
+                                &d.egl,
+                                d.display,
+                                d.config,
+                                src.as_u8().unwrap().iosurface_ref().unwrap(),
+                                PixelFormat::Rgba,
+                                DType::U8,
+                                w,
+                                h,
+                            )
+                            .expect("src pbuffer"),
+                            iosurface_import::create_iosurface_pbuffer(
+                                &d.egl,
+                                d.display,
+                                d.config,
+                                dst.as_u8().unwrap().iosurface_ref().unwrap(),
+                                PixelFormat::Rgba,
+                                DType::U8,
+                                w,
+                                h,
+                            )
+                            .expect("dst pbuffer"),
+                        )
+                    };
+                    let one_iter = || {
+                        // SAFETY: context current on this thread; RAII
+                        // guards release the tex images per iteration —
+                        // the exact production convert shape.
+                        unsafe {
+                            gls::gl::BindTexture(gls::gl::TEXTURE_2D, tgl.src_tex);
+                            let _sb = BoundTexImage::bind(d, src_pbuf).expect("bind src");
+                            gls::gl::BindTexture(gls::gl::TEXTURE_2D, tgl.dst_tex);
+                            let _db = BoundTexImage::bind(d, dst_pbuf).expect("bind dst");
+                            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, tgl.fbo);
+                            gls::gl::FramebufferTexture2D(
+                                gls::gl::FRAMEBUFFER,
+                                gls::gl::COLOR_ATTACHMENT0,
+                                gls::gl::TEXTURE_2D,
+                                tgl.dst_tex,
+                                0,
+                            );
+                            gls::gl::Viewport(0, 0, w as i32, h as i32);
+                            gls::gl::UseProgram(tgl.program);
+                            gls::gl::BindVertexArray(tgl.vao);
+                            gls::gl::DrawArrays(gls::gl::TRIANGLE_STRIP, 0, 4);
+                            gls::gl::Finish();
+                        }
+                    };
+                    for _ in 0..20 {
+                        one_iter();
+                    }
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        one_iter();
+                    }
+                    let elapsed = t0.elapsed();
+                    let _ = d.egl.destroy_surface(d.display, src_pbuf);
+                    let _ = d.egl.destroy_surface(d.display, dst_pbuf);
+                    elapsed
+                })
+            })
+            .collect();
+        let max = handles
+            .into_iter()
+            .map(|h| h.join().expect("leg(iv) thread"))
+            .max()
+            .unwrap();
+        (n * iters) as f64 / max.as_secs_f64()
+    }
+
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_iv_egl_bind_contention() {
+        for (w, h, iters) in [(1280usize, 720usize, 300usize), (64, 64, 1500)] {
+            let mut base = 0.0f64;
+            for n in [1usize, 2, 4] {
+                let rate = run_egl_bind(n, w, h, iters);
+                if n == 1 {
+                    base = rate;
+                }
+                println!(
+                    "leg(iv) {w}x{h} n={n}: {rate:9.0} bind+draw/s  S({n})={:.2}",
+                    rate / base
+                );
+            }
+        }
+    }
+
+    /// Leg (v): cold pbuffer import storm — create+destroy per iteration
+    /// from N threads. Measures eglCreatePbufferFromClientBuffer
+    /// serialization (cache-miss path only; production is miss-only too).
+    fn run_import_storm(n: usize, iters: usize) -> f64 {
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Duration {
+                    let tgl = ThreadGl::new(None).expect("ThreadGl");
+                    let d = tgl.d;
+                    let t = image_dma(1280, 720, PixelFormat::Rgba, DType::U8);
+                    fill_u8(&t, i);
+                    let surface_ref = t.as_u8().unwrap().iosurface_ref().unwrap();
+                    barrier.wait();
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        // SAFETY: tensor outlives the pbuffer.
+                        let pbuf = unsafe {
+                            iosurface_import::create_iosurface_pbuffer(
+                                &d.egl,
+                                d.display,
+                                d.config,
+                                surface_ref,
+                                PixelFormat::Rgba,
+                                DType::U8,
+                                1280,
+                                720,
+                            )
+                            .expect("import")
+                        };
+                        let _ = d.egl.destroy_surface(d.display, pbuf);
+                    }
+                    t0.elapsed()
+                })
+            })
+            .collect();
+        let max = handles
+            .into_iter()
+            .map(|h| h.join().expect("leg(v) thread"))
+            .max()
+            .unwrap();
+        (n * iters) as f64 / max.as_secs_f64()
+    }
+
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_v_concurrent_import_storm() {
+        let r1 = run_import_storm(1, 500);
+        let r2 = run_import_storm(2, 500);
+        println!(
+            "leg(v) import storm: 1-thread {r1:8.0} imports/s, \
+             2-thread agg {r2:8.0} imports/s, S(2)={:.2}",
+            r2 / r1
+        );
+    }
+
+    /// Leg (vi): processor create/drop churn against a converting
+    /// processor — the lifecycle-vs-convert interleaving of the known
+    /// macOS parallel-test flake.
+    #[test]
+    #[ignore = "A0 spike: on-demand, needs ANGLE + Apple GPU"]
+    fn spike_vi_lifecycle_churn() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+
+        let conv_done = done_tx.clone();
+        std::thread::spawn(move || {
+            let mut proc = MacosGlProcessor::new().expect("converter processor");
+            let src = image_dma(1280, 720, PixelFormat::Yuyv, DType::U8);
+            fill_u8(&src, 3);
+            let mut dst = image_dma(1280, 720, PixelFormat::Rgba, DType::U8);
+            for _ in 0..300 {
+                ImageProcessorTrait::convert(
+                    &mut proc,
+                    &src,
+                    &mut dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .expect("churn-leg convert");
+            }
+            conv_done.send("converter").unwrap();
+        });
+
+        std::thread::spawn(move || {
+            let src = image_dma(64, 64, PixelFormat::Grey, DType::U8);
+            fill_u8(&src, 5);
+            let mut dst = image_dma(64, 64, PixelFormat::Rgba, DType::U8);
+            for _ in 0..30 {
+                let mut proc = MacosGlProcessor::new().expect("churn processor");
+                ImageProcessorTrait::convert(
+                    &mut proc,
+                    &src,
+                    &mut dst,
+                    Rotation::None,
+                    Flip::None,
+                    Crop::default(),
+                )
+                .expect("churn convert");
+                drop(proc);
+            }
+            done_tx.send("churner").unwrap();
+        });
+
+        for _ in 0..2 {
+            let who = done_rx
+                .recv_timeout(Duration::from_secs(120))
+                .expect("leg(vi) HANG: lifecycle churn vs convert deadlocked");
+            println!("leg(vi) {who} finished cleanly");
+        }
+    }
+}
