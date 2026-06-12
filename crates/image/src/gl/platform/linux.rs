@@ -65,6 +65,18 @@ impl GlPlatform for LinuxEgl {
         GlContext::new(kind)
     }
 
+    fn load_gl_once(display: &GlContext) {
+        static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        GL_LOADED.get_or_init(|| {
+            gls::load_with(|s| {
+                display
+                    .egl
+                    .get_proc_address(s)
+                    .map_or(std::ptr::null(), |p| p as *const _)
+            });
+        });
+    }
+
     fn import_handle(import: &EglImage) -> egl::Image {
         import.egl_image
     }

@@ -631,9 +631,10 @@ impl GLProcessorST {
                 )));
             }
         };
-        if dst_f16.as_dma().is_none() {
+        if dst_f16.memory() != edgefirst_tensor::TensorMemory::Dma {
             return Err(crate::Error::NotSupported(
-                "GL float render-to-DMA: dst is not a DMA tensor; using CPU fallback".to_string(),
+                "GL float render-to-DMA: dst is not a zero-copy GPU buffer; using CPU fallback"
+                    .to_string(),
             ));
         }
 

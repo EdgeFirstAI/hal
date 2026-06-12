@@ -292,12 +292,19 @@ impl GLProcessorThreaded {
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
 
         let func = move || {
+            // Creation runs under the global lifecycle lock on Linux
+            // (bring-up races on some embedded drivers); ANGLE serializes
+            // display-level entry points internally, so macOS needs none
+            // (validated by the A0 lifecycle-churn spike leg).
+            #[cfg(target_os = "linux")]
             let init_result = {
                 let _guard = super::context::GL_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 GLProcessorST::new(kind)
             };
+            #[cfg(target_os = "macos")]
+            let init_result = GLProcessorST::new(kind);
             let mut gl_converter = match init_result {
                 Ok(gl) => gl,
                 Err(e) => {
@@ -332,6 +339,7 @@ impl GLProcessorThreaded {
                 }
             );
             while let Some(msg) = recv.blocking_recv() {
+                #[cfg(target_os = "linux")]
                 let _guard = serialize_per_msg.then(|| {
                     super::context::GL_MUTEX
                         .lock()
@@ -715,7 +723,9 @@ impl GLProcessorThreaded {
                 // synced; deferred batches keep theirs until Flush.
                 gl_converter.end_gpu_pass_if_synced();
             }
-            // Explicitly drop under the mutex so EGL teardown is serialized.
+            // Explicitly drop under the mutex so EGL teardown is serialized
+            // (Linux; ANGLE teardown is display-internal on macOS).
+            #[cfg(target_os = "linux")]
             let _guard = super::context::GL_MUTEX
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());

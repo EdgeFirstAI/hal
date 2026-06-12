@@ -5,7 +5,6 @@ use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use khronos_egl as egl;
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::time::Instant;
@@ -14,9 +13,15 @@ use super::cache::CachedImport;
 use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
-use super::context::GlContext;
-use super::platform::linux::EglImage;
 use super::platform::{GlPlatform, Platform};
+
+/// The platform display/context owned by this processor — `GlContext` on
+/// Linux, `AngleDisplay` (per-processor ANGLE context) on macOS.
+type PlatformDisplay = <Platform as GlPlatform>::Display;
+/// The owned platform import the caches hold (`EglImage` / `IoSurfacePbuffer`).
+type PlatformImport = <Platform as GlPlatform>::Import;
+/// The `Copy` import handle (`egl::Image` / `egl::Surface`).
+type PlatformHandle = <Platform as GlPlatform>::ImportHandle;
 use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
 use super::shaders::*;
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
@@ -253,9 +258,9 @@ pub struct GLProcessorST {
     /// vice versa.
     draw_render_texture: Texture,
     /// EGLImage cache for source DMA buffers.
-    src_egl_cache: ImportCache<EglImage>,
+    src_egl_cache: ImportCache<PlatformImport>,
     /// EGLImage cache for destination DMA buffers.
-    dst_egl_cache: ImportCache<EglImage>,
+    dst_egl_cache: ImportCache<PlatformImport>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
@@ -315,7 +320,7 @@ pub struct GLProcessorST {
     /// Texture for the Path-B R8 EGLImage source (TEXTURE_2D, not EXTERNAL_OES).
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
-    nv_r8_egl_cache: ImportCache<EglImage>,
+    nv_r8_egl_cache: ImportCache<PlatformImport>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
@@ -338,7 +343,7 @@ pub struct GLProcessorST {
     /// device a buffer whose batched render may still be in flight; cleared by
     /// the flush. See [`flush_pending`](Self::flush_pending).
     pub(super) pending_flush: bool,
-    pub(super) gl_context: GlContext,
+    pub(super) gl_context: PlatformDisplay,
 }
 
 impl Drop for GLProcessorST {
@@ -699,24 +704,12 @@ impl GLProcessorST {
         // future platform (Windows/ANGLE) implements instead of forking this
         // engine. On Linux this delegates straight to `GlContext::new`.
         let gl_context = Platform::init_display(kind)?;
-        // Load the GL function pointers exactly once per process (the same
-        // pattern as macOS's GL_LOADED). `gls` bindings are gl_generator
-        // `static mut` function-pointer tables, so re-running `load_with` on
-        // every processor construction is a data race the moment another
-        // processor's worker thread is calling GL without holding `GL_MUTEX`
-        // — a prerequisite for scoping the per-message lock to Vivante.
-        // Once-loading is also semantically right: the pointers come from the
-        // process-global shared EGL display, so every context resolves the
-        // same addresses.
-        static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        GL_LOADED.get_or_init(|| {
-            gls::load_with(|s| {
-                gl_context
-                    .egl
-                    .get_proc_address(s)
-                    .map_or(std::ptr::null(), |p| p as *const _)
-            });
-        });
+        // Load the GL function pointers exactly once per process — `gls`
+        // bindings are gl_generator `static mut` function-pointer tables, so
+        // re-running `load_with` per construction would be a data race with
+        // unlocked workers. Platform-routed: Linux loads via this display's
+        // eglGetProcAddress; macOS loaded at shared-display init already.
+        Platform::load_gl_once(&gl_context);
 
         let (
             has_float_linear,
@@ -3717,7 +3710,7 @@ impl GLProcessorST {
     fn draw_camera_texture_to_rgb_planar(
         &mut self,
         src_key: BufferImportKey,
-        egl_img: egl::Image,
+        egl_img: PlatformHandle,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -4141,7 +4134,7 @@ impl GLProcessorST {
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-        egl_img: egl::Image,
+        egl_img: PlatformHandle,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -4274,7 +4267,7 @@ impl GLProcessorST {
         &mut self,
         src: &Tensor<u8>,
         src_fmt: PixelFormat,
-        r8_src: Option<egl::Image>,
+        r8_src: Option<PlatformHandle>,
         src_roi: RegionOfInterest,
         mut dst_roi: RegionOfInterest,
         rotation_offset: usize,
@@ -4525,7 +4518,7 @@ impl GLProcessorST {
         &mut self,
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
-    ) -> Result<egl::Image, crate::Error> {
+    ) -> Result<PlatformHandle, crate::Error> {
         // The NV R8 path imports a SOURCE (NV12/16/24 as one R8 texture), so it
         // never collapses onto a destination parent import.
         let id = BufferImportKey::from_tensor(img, img_fmt, false);
@@ -4578,7 +4571,7 @@ impl GLProcessorST {
         cache: CacheKind,
         img: &Tensor<u8>,
         img_fmt: PixelFormat,
-    ) -> Result<egl::Image, crate::Error> {
+    ) -> Result<PlatformHandle, crate::Error> {
         // Identity + offset + geometry: sub-region views share one buffer
         // identity but need distinct EGLImages (offset), and a pooled buffer
         // reconfigured to a new size/format/stride needs a fresh import
@@ -4712,7 +4705,7 @@ impl GLProcessorST {
         width: usize,
         height: usize,
         packed: super::platform::PackedImportFormat,
-    ) -> Result<egl::Image, crate::Error>
+    ) -> Result<PlatformHandle, crate::Error>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
     {

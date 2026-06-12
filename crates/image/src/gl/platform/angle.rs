@@ -341,6 +341,11 @@ impl GlPlatform for AngleClientBuffer {
     // engine's binding-skip cache must stay cold on macOS.
     const PERSISTENT_TEX_BINDINGS: bool = false;
 
+    fn load_gl_once(_display: &AngleDisplay) {
+        // Loaded once at shared-display init (`load_gl_once` above runs
+        // inside `init_shared_display`, before any context exists).
+    }
+
     fn import_handle(import: &IoSurfacePbuffer) -> egl::Surface {
         import.surface
     }

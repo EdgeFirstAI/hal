@@ -318,22 +318,24 @@ use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::GLProcessorThreaded;
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::Int8InterpolationMode;
-#[cfg(target_os = "macos")]
+// The legacy macOS shared-context processor is no longer part of the
+// public API (BREAKING — `ImageProcessor` now drives the unified
+// `GLProcessorThreaded` on macOS); it remains compiled for its
+// regression tests until the remaining conversions migrate.
 #[cfg(feature = "opengl")]
-pub use opengl_headless::MacosGlProcessor;
+pub use opengl_headless::EglDisplayKind;
+#[cfg(all(test, target_os = "macos", feature = "opengl"))]
+use opengl_headless::MacosGlProcessor;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-pub use opengl_headless::{probe_egl_displays, EglDisplayInfo, EglDisplayKind};
+pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
 // EGLImage cache counter snapshots (diagnostics): see
 // `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
 // `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
-#[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
 pub use opengl_headless::{CacheStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
@@ -964,8 +966,9 @@ pub struct ImageProcessorConfig {
     /// PlatformDevice, Default. Use [`probe_egl_displays`] to discover
     /// which displays are available on the current system.
     ///
-    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set.
-    #[cfg(target_os = "linux")]
+    /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS
+    /// (ANGLE/Metal is the only display there; a `Some` value logs a
+    /// debug note and is otherwise ignored).
     #[cfg(feature = "opengl")]
     pub egl_display: Option<EglDisplayKind>,
 
@@ -1124,11 +1127,12 @@ pub struct ImageProcessor {
     pub opengl: Option<GLProcessorThreaded>,
     #[cfg(target_os = "macos")]
     #[cfg(feature = "opengl")]
-    /// OpenGL-based image converter for macOS via ANGLE + IOSurface.
-    /// Available when ANGLE's libEGL.dylib can be loaded (see
-    /// README.md § macOS GPU Acceleration). Same field name as the
-    /// Linux variant so call sites can be written once.
-    pub opengl: Option<MacosGlProcessor>,
+    /// OpenGL-based image converter for macOS via ANGLE + IOSurface —
+    /// the same unified `GLProcessorThreaded` engine as Linux (its
+    /// worker owns a per-processor ANGLE context). Available when
+    /// ANGLE's libEGL.dylib can be loaded (see README.md § macOS GPU
+    /// Acceleration).
+    pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
@@ -1277,7 +1281,7 @@ impl ImageProcessor {
                 #[cfg(target_os = "macos")]
                 {
                     #[cfg(feature = "opengl")]
-                    let opengl = match MacosGlProcessor::new() {
+                    let opengl = match GLProcessorThreaded::new(config.egl_display) {
                         Ok(gl) => Some(gl),
                         Err(e) => {
                             log::warn!(
@@ -1294,7 +1298,8 @@ impl ImageProcessor {
                         #[cfg(feature = "opengl")]
                         opengl,
                         forced_backend: None,
-                    });
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
@@ -1383,7 +1388,7 @@ impl ImageProcessor {
                     #[cfg(target_os = "macos")]
                     #[cfg(feature = "opengl")]
                     {
-                        let opengl = MacosGlProcessor::new().map_err(|e| {
+                        let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
                             Error::ForcedBackendUnavailable(format!(
                                 "opengl forced on macOS but ANGLE init failed: {e:?}"
                             ))
@@ -1392,7 +1397,8 @@ impl ImageProcessor {
                             cpu: None,
                             opengl: Some(opengl),
                             forced_backend: Some(ForcedBackend::OpenGl),
-                        })
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
                     }
                     #[cfg(not(all(
                         any(target_os = "linux", target_os = "macos"),
@@ -1454,7 +1460,7 @@ impl ImageProcessor {
             log::debug!("EDGEFIRST_DISABLE_GL is set");
             None
         } else {
-            match MacosGlProcessor::new() {
+            match GLProcessorThreaded::new(config.egl_display) {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::debug!(
@@ -1494,7 +1500,7 @@ impl ImageProcessor {
     /// it (currently the Linux GL backend); no-op elsewhere. Constructor
     /// plumbing for [`ImageProcessorConfig::colorimetry`].
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
-        #[cfg(all(target_os = "linux", feature = "opengl"))]
+        #[cfg(feature = "opengl")]
         {
             let mut me = self;
             if let Err(e) = me.set_colorimetry_mode(_mode) {
@@ -1502,7 +1508,7 @@ impl ImageProcessor {
             }
             me
         }
-        #[cfg(not(all(target_os = "linux", feature = "opengl")))]
+        #[cfg(not(feature = "opengl"))]
         self
     }
 
@@ -1510,7 +1516,6 @@ impl ImageProcessor {
     /// on the OpenGL backend. No-op if OpenGL is not available. The
     /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
     /// it is set, this call logs and keeps the env-selected mode.
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
@@ -1521,7 +1526,6 @@ impl ImageProcessor {
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
     /// backend. No-op if OpenGL is not available.
-    #[cfg(target_os = "linux")]
     #[cfg(feature = "opengl")]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — unified GL processor on macOS** (`edgefirst-image`):
+  `ImageProcessor` on macOS now drives the same `GLProcessorThreaded`
+  engine as Linux, with a dedicated worker thread and a private ANGLE
+  context per processor on the shared Metal display. `MacosGlProcessor`
+  is removed from the public API. Multiple `ImageProcessor` instances
+  run GL work in parallel on macOS (the previous backend serialized all
+  instances on one shared context), `ImageProcessorConfig::egl_display`
+  exists on both platforms (ignored with a debug log on macOS), and
+  `set_colorimetry_mode` / `set_int8_interpolation_mode` /
+  `CacheStats` / `GlCacheStats` / `EglDisplayKind` are available on
+  macOS. The legacy zero-copy IOSurface conversion paths (YUYV/NV→RGBA,
+  NV→PlanarRgb F16) migrate onto the engine within this release; until
+  that lands in the next entries, those specific conversions fall back
+  to CPU on macOS.
+
 ### Fixed
 
 - **GL proto-mask texture lifecycle** (`edgefirst-image`): two latent bugs

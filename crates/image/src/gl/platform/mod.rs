@@ -123,6 +123,13 @@ pub(super) trait GlPlatform {
     /// so the skip cache must stay cold there.
     const PERSISTENT_TEX_BINDINGS: bool;
 
+    /// Load the process-global GL function-pointer table exactly once.
+    /// `gls` bindings are gl_generator `static mut` tables — loading must
+    /// happen once per process, never per processor. Linux resolves via
+    /// this display's `eglGetProcAddress`; macOS already loaded at
+    /// shared-ANGLE-display init, so this is a no-op there.
+    fn load_gl_once(display: &Self::Display);
+
     /// Bring up the platform display + context for one processor.
     /// `kind` selects the EGL display flavour on Linux and is ignored
     /// (with a debug log) on macOS, where ANGLE is the only display.

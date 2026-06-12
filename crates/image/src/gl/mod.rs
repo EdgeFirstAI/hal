@@ -66,28 +66,27 @@ mod render;
 mod fourcc;
 #[cfg(target_os = "macos")]
 mod iosurface_import;
-#[cfg(target_os = "macos")]
+// Tests-only since the unified engine took over macOS dispatch: the
+// legacy shared-context processor survives solely for its regression
+// tests until the remaining conversions migrate to the engine.
+#[cfg(all(target_os = "macos", test))]
 mod macos_processor;
 mod platform;
-#[cfg(target_os = "linux")]
 mod processor;
 mod resources;
 mod shaders;
 mod shaders_common;
 #[cfg(target_os = "linux")]
 mod tests;
-#[cfg(target_os = "linux")]
 mod threaded;
 
 #[cfg(target_os = "linux")]
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
-#[cfg(target_os = "linux")]
 pub use cache::{CacheStats, GlCacheStats};
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 pub use macos_processor::MacosGlProcessor;
-#[cfg(target_os = "linux")]
 pub use threaded::GLProcessorThreaded;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
