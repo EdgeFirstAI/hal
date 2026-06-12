@@ -5,13 +5,13 @@
 #[cfg(feature = "opengl")]
 #[allow(deprecated)]
 mod gl_tests {
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     use crate::opengl_headless::processor::GLProcessorST;
     #[cfg(target_os = "linux")]
     use crate::{probe_egl_displays, EglDisplayKind};
     use crate::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};
     use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout};
-    #[cfg(feature = "dma_test_formats")]
+    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     use edgefirst_tensor::is_dma_available;
     use edgefirst_tensor::{
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
@@ -223,6 +223,16 @@ mod gl_tests {
         *GL_AVAILABLE.get_or_init(|| GLProcessorThreaded::new(None).is_ok())
     }
 
+    /// Zero-copy GPU image buffers available? DMA-BUF heaps on Linux,
+    /// IOSurface on macOS. The portable seam for tests whose `@Dma`
+    /// fixtures allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV);
+    /// packed-RGB `@Dma` has no IOSurface FourCC, so tests with RGB DMA
+    /// destinations stay Linux-gated.
+    #[cfg(feature = "dma_test_formats")]
+    fn is_gpu_image_buffer_available() -> bool {
+        edgefirst_tensor::is_gpu_buffer_available()
+    }
+
     /// Returns true when running on an i.MX 95 board with Mali GPU.
     ///
     /// `/dev/neutron0` is used as a platform discriminator for i.MX 95 + Mali GPU,
@@ -364,10 +374,10 @@ mod gl_tests {
     /// behavior across GL refactors: a refactor that re-imports per frame
     /// passes every pixel-equality test but fails this one.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_pool_steady_state_zero_imports() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
@@ -439,6 +449,8 @@ mod gl_tests {
     /// byte-identical output across iterations, so any texture-unit state leak
     /// between converts surfaces either as an error or as a pixel diff.
     #[test]
+    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
+    // FourCC, so the fixture cannot allocate on macOS.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn repeat_convert_rgba_mem_to_rgb_dma() {
         if !is_dma_available() {
@@ -536,7 +548,7 @@ mod gl_tests {
     /// whose coverage lane enables the feature); the `dma_test_formats`
     /// gate only matches the `load_raw_image` helper's.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn int8_mem_convert_is_xor_biased_u8() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - OpenGL not available", function!());
@@ -628,10 +640,10 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_rgba_reference() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         // Load PixelFormat::Nv12 source with DMA
@@ -693,10 +705,10 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Rgba conversion against ffmpeg reference
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_rgba_reference() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         // Load PixelFormat::Yuyv source with DMA
@@ -768,10 +780,13 @@ mod gl_tests {
     /// exact failure that capped batched render-to-DMA-BUF. With the fix each
     /// offset gets its own EGLImage and the buffer is correctly partitioned.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn opengl_render_into_dma_subviews_no_aliasing() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -876,7 +891,7 @@ mod gl_tests {
 
     /// Overwrite an existing tensor's bytes in place (re-map → copy → drop →
     /// DMA_BUF_IOCTL_SYNC(END)), simulating a pool recycle of one buffer.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn overwrite_in_place(t: &TensorDyn, bytes: &[u8]) {
         let mut map = t.as_u8().unwrap().map().unwrap();
         map.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
@@ -885,7 +900,7 @@ mod gl_tests {
     /// Write image A into a DMA source, convert, then overwrite the SAME source
     /// with distinct image B and convert again on the SAME processor. Assert the
     /// second output matches a fresh-DMA-source convert of B (no stale read).
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_stale_read_check(
         w: usize,
         h: usize,
@@ -937,10 +952,13 @@ mod gl_tests {
     /// Grey source (profiler's decode-pool format; EXTERNAL_OES Path A).
     /// Grey→Rgba is a scalar luma replicate (no YUV matrix) → byte-exact.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_grey_stale_read() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -957,10 +975,13 @@ mod gl_tests {
     /// NV12 source (EXTERNAL_OES Path A on Vivante / R8 texelFetch Path B on
     /// V3D/Mali). YUV→Rgba carries a small color-matrix rounding → tolerance 4.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_nv12_stale_read() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -974,10 +995,13 @@ mod gl_tests {
 
     /// NV16 source (full-res chroma; R8 texelFetch Path B). tolerance 4.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_nv16_stale_read() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -994,10 +1018,13 @@ mod gl_tests {
     /// the same frame. Exercises the cache/LRU interaction across more than one
     /// recycled identity.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_pool_recycle_all_frames_match_oracle() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1046,7 +1073,7 @@ mod gl_tests {
     /// tensor's effective row stride. Non-uniform content is essential: a solid
     /// fill survives any stride/geometry misread, so it could not detect the
     /// cache-key bug.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn fill_grey_pattern(t: &TensorDyn, w: usize, h: usize, salt: u8) {
         let stride = t.effective_row_stride().unwrap_or(w);
         let mut map = t.as_u8().unwrap().map().unwrap();
@@ -1067,10 +1094,13 @@ mod gl_tests {
     /// stride and samples the buffer at the wrong pitch → mismatch. This test
     /// FAILS on buggy main and passes once the cache key carries geometry.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_recycle_geometry_change_stale_read() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         // Oversized pool (like the profiler's pool_w x 3*max_h R8 surface),
@@ -1133,10 +1163,13 @@ mod gl_tests {
     /// (buffer, geometry) has its own entry, so interleaving is order-
     /// independent and every output must match its fresh-source oracle.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_pool_geometry_interleaved_stale_read() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let mut pool = [
@@ -1200,10 +1233,13 @@ mod gl_tests {
     /// Regression guard: a single-shot (non-recycled) DMA source must equal a
     /// fresh-source convert — the fix must not break the first-frame path.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn dma_single_shot_grey_matches_fresh() {
-        if !is_dma_available() || !is_opengl_available() {
-            eprintln!("SKIPPED: {} - DMA or OpenGL not available", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -1551,6 +1587,8 @@ mod gl_tests {
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 640x640 with letterbox (two-pass packed PixelFormat::Rgb pipeline).
     /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb to validate packing.
     #[test]
+    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
+    // FourCC, so the fixture cannot allocate on macOS.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_correctness() {
         if !is_dma_available() {
@@ -1681,6 +1719,8 @@ mod gl_tests {
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 1920x1080 (no letterbox, same size).
     /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb without scaling.
     #[test]
+    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
+    // FourCC, so the fixture cannot allocate on macOS.
     #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
     fn test_opengl_rgb_no_letterbox_correctness() {
         if !is_dma_available() {
@@ -1747,10 +1787,10 @@ mod gl_tests {
     /// Test OpenGL PixelFormat::Nv12→PixelFormat::Bgra conversion with DMA buffers.
     /// Compares against PixelFormat::Nv12→PixelFormat::Rgba by verifying R↔B swap.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_bgra() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - DMA not available");
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - no zero-copy GPU buffers");
             return;
         }
 
@@ -1827,10 +1867,10 @@ mod gl_tests {
 
     /// Test OpenGL PixelFormat::Yuyv→PixelFormat::Bgra conversion with DMA buffers.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_bgra() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - DMA not available");
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - no zero-copy GPU buffers");
             return;
         }
 
