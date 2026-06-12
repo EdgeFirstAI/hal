@@ -53,6 +53,7 @@ const EGL_GREEN_SIZE: i32 = 0x3023;
 const EGL_BLUE_SIZE: i32 = 0x3022;
 const EGL_ALPHA_SIZE: i32 = 0x3021;
 pub(in crate::opengl_headless) const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+const EGL_BACK_BUFFER: i32 = 0x3084;
 
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
@@ -269,6 +270,16 @@ pub(in crate::opengl_headless) struct AngleDisplay {
     pub(in crate::opengl_headless) shared: &'static SharedAngleDisplay,
     context: egl::Context,
     dummy_pbuffer: egl::Surface,
+    /// Duck-typed counterparts of the two `GlContext` members the
+    /// portable engine reads. IOSurface is the only transfer backend on
+    /// macOS; ANGLE's Metal backend exposes GLES 3.0 (no 3.1 compute).
+    pub(in crate::opengl_headless) transfer_backend: super::super::TransferBackend,
+    pub(in crate::opengl_headless) has_compute: bool,
+    /// Texture attachments made via `eglBindTexImage` since the last
+    /// `GlPlatform::end_gpu_pass` — released there, after the engine's
+    /// sync point (rendering must complete before release per the EGL
+    /// pbuffer contract). Single-threaded access (the owning worker).
+    active_binds: std::cell::RefCell<Vec<egl::Surface>>,
 }
 
 impl AngleDisplay {
@@ -284,6 +295,7 @@ impl AngleDisplay {
                 f16: self.shared.supports_f16_color,
             },
             serialize_gl: false,
+            external_oes: false,
         }
     }
 }
@@ -323,6 +335,95 @@ pub(crate) struct AngleClientBuffer;
 impl GlPlatform for AngleClientBuffer {
     type Display = AngleDisplay;
     type Import = IoSurfacePbuffer;
+    type ImportHandle = egl::Surface;
+
+    // eglBindTexImage attachments are released at end_gpu_pass — the
+    // engine's binding-skip cache must stay cold on macOS.
+    const PERSISTENT_TEX_BINDINGS: bool = false;
+
+    fn import_handle(import: &IoSurfacePbuffer) -> egl::Surface {
+        import.surface
+    }
+
+    unsafe fn attach_tex_image_2d(display: &AngleDisplay, handle: egl::Surface) -> Result<()> {
+        display
+            .shared
+            .egl
+            .bind_tex_image(display.shared.display, handle, EGL_BACK_BUFFER)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindTexImage: {e:?}"))))?;
+        display.active_binds.borrow_mut().push(handle);
+        Ok(())
+    }
+
+    unsafe fn attach_tex_image_external(
+        _display: &AngleDisplay,
+        _handle: egl::Surface,
+    ) -> Result<()> {
+        // Unreachable in practice: PlatformCaps::external_oes is false on
+        // macOS, so path selection never picks the external-sampler path.
+        Err(Error::NotSupported(
+            "GL_TEXTURE_EXTERNAL_OES is not available on ANGLE/Metal".into(),
+        ))
+    }
+
+    unsafe fn attach_renderbuffer_storage(
+        _display: &AngleDisplay,
+        _handle: egl::Surface,
+    ) -> Result<()> {
+        Err(Error::NotSupported(
+            "renderbuffer import targets are not available on ANGLE/Metal              (EDGEFIRST_OPENGL_RENDERSURFACE has no effect on macOS)"
+                .into(),
+        ))
+    }
+
+    fn end_gpu_pass(display: &AngleDisplay) {
+        // Called after the engine's sync point: every recorded pbuffer
+        // attachment can now be released (EGL requires release before the
+        // pbuffer may be rebound elsewhere or destroyed).
+        for surface in display.active_binds.borrow_mut().drain(..) {
+            let _ = display.shared.egl.release_tex_image(
+                display.shared.display,
+                surface,
+                EGL_BACK_BUFFER,
+            );
+        }
+    }
+
+    fn import_buffer_packed<T>(
+        display: &AngleDisplay,
+        img: &Tensor<T>,
+        width: usize,
+        height: usize,
+        fmt: super::PackedImportFormat,
+    ) -> Result<IoSurfacePbuffer>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
+        let surface_ref = img.iosurface_ref().ok_or_else(|| {
+            Error::NotSupported("packed import: tensor is not IOSurface-backed".into())
+        })?;
+        // The packed surface is RGBA-shaped at the caller-computed dims;
+        // express it as the matching (PixelFormat, DType) IOSurface layout.
+        let (pf, dt) = match fmt {
+            super::PackedImportFormat::Rgba8888 => (PixelFormat::Rgba, DType::U8),
+            super::PackedImportFormat::Rgba16161616F => (PixelFormat::Rgba, DType::F16),
+        };
+        let shared = display.shared;
+        // SAFETY: as in `import_buffer`.
+        let surface = unsafe {
+            iosurface_import::create_iosurface_pbuffer(
+                &shared.egl,
+                shared.display,
+                shared.config,
+                surface_ref,
+                pf,
+                dt,
+                width,
+                height,
+            )?
+        };
+        Ok(IoSurfacePbuffer { shared, surface })
+    }
 
     fn init_display(kind: Option<super::super::EglDisplayKind>) -> Result<AngleDisplay> {
         if let Some(kind) = kind {
@@ -369,6 +470,9 @@ impl GlPlatform for AngleClientBuffer {
             shared,
             context,
             dummy_pbuffer,
+            transfer_backend: super::super::TransferBackend::IOSurface,
+            has_compute: false,
+            active_binds: std::cell::RefCell::new(Vec::new()),
         })
     }
 

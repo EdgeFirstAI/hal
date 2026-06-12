@@ -1,22 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use drm_fourcc::DrmFourcc;
 use edgefirst_decoder::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use edgefirst_tensor::{
     PixelFormat, PixelLayout, Tensor, TensorMapTrait, TensorMemory, TensorTrait,
 };
-use khronos_egl::{self as egl, Attrib};
+use khronos_egl as egl;
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_void, CStr};
-use std::os::fd::AsRawFd;
 use std::time::Instant;
 
 use super::cache::CachedImport;
 use super::EglDisplayKind;
 
 use super::cache::{BufferImportKey, CacheKind, GlCacheStats, ImportCache};
-use super::context::{egl_ext, GlContext};
+use super::context::GlContext;
 use super::platform::linux::EglImage;
 use super::platform::{GlPlatform, Platform};
 use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
@@ -2061,7 +2059,7 @@ impl GLProcessorST {
                 super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .render_texture
-                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                    .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -2150,7 +2148,7 @@ impl GLProcessorST {
                 super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
                 if self
                     .draw_render_texture
-                    .bind_egl_image(dst_key, dest_egl.as_ptr())
+                    .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
                     gls::gl::FramebufferTexture2D(
                         gls::gl::FRAMEBUFFER,
@@ -3432,8 +3430,7 @@ impl GLProcessorST {
             dst_fmt,
             render_w,
             render_h,
-            DrmFourcc::Abgr8888,
-            4,
+            super::platform::PackedImportFormat::Rgba8888,
         )?;
         unsafe {
             match self.cached_dst_renderbuffer(dst, dst_fmt) {
@@ -3450,7 +3447,7 @@ impl GLProcessorST {
                     gls::gl::ActiveTexture(gls::gl::TEXTURE0);
                     gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
                     super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dest_egl.as_ptr());
+                    Platform::attach_tex_image_2d(&self.gl_context, dest_egl)?;
                     // Raw re-target bypasses bind_egl_image's key tracking:
                     // drop the cached key so a later bind_egl_image on this
                     // texture cannot "reuse" a binding this call replaced
@@ -3760,10 +3757,11 @@ impl GLProcessorST {
                 gls::gl::CLAMP_TO_EDGE as i32,
             );
 
-            if self
-                .camera_eglimage_texture
-                .bind_egl_image_external(src_key, egl_img.as_ptr())
-            {
+            if self.camera_eglimage_texture.bind_egl_image_external(
+                &self.gl_context,
+                src_key,
+                egl_img,
+            )? {
                 check_gl_error(function!(), line!())?;
                 log::trace!(
                     "draw_camera_planar: bound new src EGLImage id={:#x}",
@@ -4172,10 +4170,11 @@ impl GLProcessorST {
             // and greyscale EGLImages replicate luma to all channels
             // automatically via the YUV shader.
 
-            if self
-                .camera_eglimage_texture
-                .bind_egl_image_external(src_key, egl_img.as_ptr())
-            {
+            if self.camera_eglimage_texture.bind_egl_image_external(
+                &self.gl_context,
+                src_key,
+                egl_img,
+            )? {
                 check_gl_error(function!(), line!())?;
                 log::trace!("draw_camera: bound new src EGLImage id={luma_id:#x}");
             } else {
@@ -4347,7 +4346,10 @@ impl GLProcessorST {
 
             match r8_src {
                 Some(egl_img) => {
-                    if self.nv_r8_texture.bind_egl_image(src_key, egl_img.as_ptr()) {
+                    if self
+                        .nv_r8_texture
+                        .bind_egl_image(&self.gl_context, src_key, egl_img)?
+                    {
                         check_gl_error(function!(), line!())?;
                         log::trace!("draw_nv_texture_2d: bound new R8 EGLImage id={luma_id:#x}");
                     } else {
@@ -4539,7 +4541,7 @@ impl GLProcessorST {
                 self.nv_r8_egl_cache.hits += 1;
                 cached.last_used = ts;
                 log::trace!("nv_r8_egl_cache hit: id={luma_id:#x}");
-                return Ok(cached.import.egl_image);
+                return Ok(Platform::import_handle(&cached.import));
             }
             self.nv_r8_egl_cache.misses += 1;
             log::trace!("nv_r8_egl_cache miss: id={luma_id:#x}");
@@ -4548,7 +4550,7 @@ impl GLProcessorST {
         let egl_image_obj = Platform::import_buffer_nv_r8(&self.gl_context, img, img_fmt)?;
         self.nv_r8_texture.invalidate_egl_binding();
 
-        let handle = egl_image_obj.egl_image;
+        let handle = Platform::import_handle(&egl_image_obj);
         let guard = img.buffer_identity().weak();
         if self.nv_r8_egl_cache.entries.len() >= self.nv_r8_egl_cache.capacity {
             self.nv_r8_egl_cache.evict_lru();
@@ -4610,7 +4612,7 @@ impl GLProcessorST {
                 egl_cache.hits += 1;
                 cached.last_used = ts;
                 log::trace!("ImportCache {:?} hit: id={luma_id:#x}", cache);
-                return Ok(cached.import.egl_image);
+                return Ok(Platform::import_handle(&cached.import));
             }
             egl_cache.misses += 1;
             log::trace!("ImportCache {:?} miss: id={luma_id:#x}", cache);
@@ -4632,10 +4634,10 @@ impl GLProcessorST {
             unsafe {
                 gls::gl::GenRenderbuffers(1, &mut rbo);
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::EGLImageTargetRenderbufferStorageOES(
-                    gls::gl::RENDERBUFFER,
-                    egl_image_obj.egl_image.as_ptr(),
-                );
+                Platform::attach_renderbuffer_storage(
+                    &self.gl_context,
+                    Platform::import_handle(&egl_image_obj),
+                )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
                     gls::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
@@ -4653,7 +4655,7 @@ impl GLProcessorST {
             CacheKind::Dst => self.invalidate_dst_textures(),
         }
 
-        let handle = egl_image_obj.egl_image;
+        let handle = Platform::import_handle(&egl_image_obj);
         let guard = img.buffer_identity().weak();
         let egl_cache = match cache {
             CacheKind::Src => &mut self.src_egl_cache,
@@ -4697,65 +4699,19 @@ impl GLProcessorST {
     /// (packed-RGB DMA) and `f16` (RGBA16F-packed DMA) destinations. Only the
     /// DMA fd, stride and offset are read from the tensor; `width`, `height`,
     /// `drm_format` and `bpp` describe the GL-visible packed surface.
-    fn create_egl_image_with_dims<T>(
-        &self,
-        img: &Tensor<T>,
-        width: usize,
-        height: usize,
-        drm_format: DrmFourcc,
-        bpp: usize,
-    ) -> Result<EglImage, crate::Error>
-    where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
-    {
-        let dma = img.as_dma().ok_or_else(|| {
-            Error::NotImplemented("create_egl_image_with_dims requires DMA tensor".to_string())
-        })?;
-        let fd = dma.fd.as_raw_fd();
-
-        // Use the tensor's stored stride when available (externally allocated
-        // buffers with row padding), otherwise compute the tightly-packed pitch.
-        let pitch = img.effective_row_stride().unwrap_or(width * bpp);
-        let offset = img.plane_offset().unwrap_or(0);
-        let egl_img_attr = vec![
-            egl_ext::LINUX_DRM_FOURCC as Attrib,
-            drm_format as u32 as Attrib,
-            khronos_egl::WIDTH as Attrib,
-            width as Attrib,
-            khronos_egl::HEIGHT as Attrib,
-            height as Attrib,
-            egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
-            pitch as Attrib,
-            egl_ext::DMA_BUF_PLANE0_OFFSET as Attrib,
-            offset as Attrib,
-            egl_ext::DMA_BUF_PLANE0_FD as Attrib,
-            fd as Attrib,
-            egl::IMAGE_PRESERVED as Attrib,
-            egl::TRUE as Attrib,
-            khronos_egl::NONE as Attrib,
-        ];
-
-        super::platform::linux::new_egl_image_owned(
-            &self.gl_context,
-            egl_ext::LINUX_DMA_BUF,
-            &egl_img_attr,
-        )
-    }
-
     /// Get or create an EGLImage for a packed DMA destination with
     /// reinterpreted dimensions. Uses the dst cache keyed by buffer identity.
     ///
     /// Generic over the tensor element type so it serves both the `u8`
-    /// packed-RGB destination (`DrmFourcc::Abgr8888`, bpp=4) and the `f16`
-    /// RGBA16F-packed planar destination (`DrmFourcc::Abgr16161616f`, bpp=8).
+    /// packed-RGB destination (`PackedImportFormat::Rgba8888`) and the
+    /// `f16` RGBA16F-packed planar destination (`Rgba16161616F`).
     fn get_or_create_egl_image_rgb<T>(
         &mut self,
         img: &Tensor<T>,
         img_fmt: PixelFormat,
         width: usize,
         height: usize,
-        drm_format: DrmFourcc,
-        bpp: usize,
+        packed: super::platform::PackedImportFormat,
     ) -> Result<egl::Image, crate::Error>
     where
         T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
@@ -4773,7 +4729,7 @@ impl GLProcessorST {
             self.dst_egl_cache.hits += 1;
             cached.last_used = ts;
             log::trace!("ImportCache dst (RGB) hit: id={:#x}", id.luma_id);
-            return Ok(cached.import.egl_image);
+            return Ok(Platform::import_handle(&cached.import));
         }
         self.dst_egl_cache.misses += 1;
         log::trace!("ImportCache dst (RGB) miss: id={:#x}", id.luma_id);
@@ -4784,18 +4740,19 @@ impl GLProcessorST {
             self.dst_egl_cache.evict_lru();
         }
 
-        let egl_image_obj = self.create_egl_image_with_dims(img, width, height, drm_format, bpp)?;
-        let handle = egl_image_obj.egl_image;
+        let egl_image_obj =
+            Platform::import_buffer_packed(&self.gl_context, img, width, height, packed)?;
+        let handle = Platform::import_handle(&egl_image_obj);
 
         let rbo = if self.use_renderbuffer {
             let mut rbo: u32 = 0;
             unsafe {
                 gls::gl::GenRenderbuffers(1, &mut rbo);
                 gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::EGLImageTargetRenderbufferStorageOES(
-                    gls::gl::RENDERBUFFER,
-                    egl_image_obj.egl_image.as_ptr(),
-                );
+                Platform::attach_renderbuffer_storage(
+                    &self.gl_context,
+                    Platform::import_handle(&egl_image_obj),
+                )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
                     gls::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
@@ -6184,11 +6141,22 @@ impl GLProcessorST {
     /// Captured ONCE by the dispatch wrapper at worker startup (before its
     /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
     /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
+    /// Release per-pass platform texture attachments — called by the
+    /// dispatch wrapper after each message whose GPU work has synced
+    /// (no-op while a deferred batch still owes its flush, and on
+    /// platforms with persistent bindings).
+    pub(super) fn end_gpu_pass_if_synced(&self) {
+        if !self.pending_flush {
+            Platform::end_gpu_pass(&self.gl_context);
+        }
+    }
+
     pub(super) fn platform_caps(&self) -> super::platform::PlatformCaps {
         super::platform::PlatformCaps {
             transfer_backend: self.gl_context.transfer_backend,
             render_dtypes: self.supported_render_dtypes(),
             serialize_gl: self.is_vivante(),
+            external_oes: true,
         }
     }
 }

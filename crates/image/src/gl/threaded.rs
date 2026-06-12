@@ -710,6 +710,10 @@ impl GLProcessorThreaded {
                         edgefirst_tensor::gl_unregister_resource(resource);
                     }
                 }
+                // Per-pass platform texture attachments (macOS pbuffer
+                // binds) are released once the message's GPU work has
+                // synced; deferred batches keep theirs until Flush.
+                gl_converter.end_gpu_pass_if_synced();
             }
             // Explicitly drop under the mutex so EGL teardown is serialized.
             let _guard = super::context::GL_MUTEX

@@ -18,8 +18,6 @@
 
 use std::ffi::{c_void, CStr};
 
-use drm_fourcc::DrmFourcc;
-
 use super::super::core::float_crop_uniforms;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Error, Flip, ResolvedCrop, Rotation};
@@ -685,8 +683,7 @@ impl GLProcessorST {
             PixelFormat::PlanarRgb,
             surface_w as usize,
             surface_h as usize,
-            DrmFourcc::Abgr16161616f,
-            8,
+            super::super::platform::PackedImportFormat::Rgba16161616F,
         )?;
 
         // Attach the EGLImage (renderbuffer when supported, else texture) to the

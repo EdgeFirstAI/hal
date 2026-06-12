@@ -55,9 +55,89 @@ pub(crate) struct LinuxEgl;
 impl GlPlatform for LinuxEgl {
     type Display = GlContext;
     type Import = EglImage;
+    type ImportHandle = egl::Image;
+
+    // EGLImage targets persist on the texture object — the engine's
+    // binding-skip cache (BufferImportKey on Texture) applies.
+    const PERSISTENT_TEX_BINDINGS: bool = true;
 
     fn init_display(kind: Option<EglDisplayKind>) -> crate::Result<GlContext> {
         GlContext::new(kind)
+    }
+
+    fn import_handle(import: &EglImage) -> egl::Image {
+        import.egl_image
+    }
+
+    unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
+        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, handle.as_ptr());
+        Ok(())
+    }
+
+    unsafe fn attach_tex_image_external(
+        _display: &GlContext,
+        handle: egl::Image,
+    ) -> crate::Result<()> {
+        gls::egl_image_target_texture_2d_oes(gls::gl::TEXTURE_EXTERNAL_OES, handle.as_ptr());
+        Ok(())
+    }
+
+    unsafe fn attach_renderbuffer_storage(
+        _display: &GlContext,
+        handle: egl::Image,
+    ) -> crate::Result<()> {
+        gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, handle.as_ptr());
+        Ok(())
+    }
+
+    fn end_gpu_pass(_display: &GlContext) {
+        // EGLImage texture targets persist by design; nothing to release.
+    }
+
+    fn import_buffer_packed<T>(
+        display: &GlContext,
+        img: &Tensor<T>,
+        width: usize,
+        height: usize,
+        fmt: super::PackedImportFormat,
+    ) -> crate::Result<EglImage>
+    where
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    {
+        use std::os::fd::AsRawFd;
+        let drm_format = match fmt {
+            super::PackedImportFormat::Rgba8888 => drm_fourcc::DrmFourcc::Abgr8888,
+            super::PackedImportFormat::Rgba16161616F => drm_fourcc::DrmFourcc::Abgr16161616f,
+        };
+        let bpp = fmt.bytes_per_pixel();
+        let dma = img.as_dma().ok_or_else(|| {
+            crate::Error::NotImplemented("import_buffer_packed requires DMA tensor".to_string())
+        })?;
+        let fd = dma.fd.as_raw_fd();
+
+        // Use the tensor's stored stride when available (externally
+        // allocated buffers with row padding), otherwise compute the
+        // tightly-packed pitch.
+        let pitch = img.effective_row_stride().unwrap_or(width * bpp);
+        let offset = img.plane_offset().unwrap_or(0);
+        let egl_img_attr = [
+            egl_ext::LINUX_DRM_FOURCC as egl::Attrib,
+            drm_format as u32 as egl::Attrib,
+            khronos_egl::WIDTH as egl::Attrib,
+            width as egl::Attrib,
+            khronos_egl::HEIGHT as egl::Attrib,
+            height as egl::Attrib,
+            egl_ext::DMA_BUF_PLANE0_PITCH as egl::Attrib,
+            pitch as egl::Attrib,
+            egl_ext::DMA_BUF_PLANE0_OFFSET as egl::Attrib,
+            offset as egl::Attrib,
+            egl_ext::DMA_BUF_PLANE0_FD as egl::Attrib,
+            fd as egl::Attrib,
+            egl::IMAGE_PRESERVED as egl::Attrib,
+            egl::TRUE as egl::Attrib,
+            khronos_egl::NONE as egl::Attrib,
+        ];
+        new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }
 
     fn import_buffer(
