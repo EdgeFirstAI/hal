@@ -761,7 +761,7 @@ Tests run across multiple runner types:
 |-----|--------|--------------|----------|
 | Build & Test (x86_64) | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
 | Doc Tests | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
-| Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | No GPU |
+| Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
 | Hardware Test (imx8mp) | `nxp-imx8mp-latest` | aarch64 | G2D, DMA-heap |
@@ -771,6 +771,12 @@ The hardware runner (`nxp-imx8mp-latest`) is the only environment where
 G2D and DMA-BUF tests are fully exercised. Hardware-gated tests that
 return early on x86 and arm runners are counted as passed (not skipped)
 because the gate is an explicit probe, not a `#[ignore]` attribute.
+
+The x86_64, aarch64, and macOS lanes each publish a "Test Results (…)"
+check on the PR via `EnricoMi/publish-unit-test-result-action` (the
+macOS lane uses the `/macos` composite sub-action — the root action is
+docker-based and Linux-only). The macOS junit comes from coverage
+pass 2, i.e. the GL-enabled run on signed binaries.
 
 The x86_64 build steps moved to `ubuntu-22.04-xlarge` (16 vCPU) in the
 v0.22 → v0.23 cycle, cutting build time roughly 30 min → ~12 min.

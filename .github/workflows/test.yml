@@ -418,6 +418,21 @@ jobs:
             target/test-metrics-*-macos.txt
           retention-days: 30
 
+      - name: Publish test results
+        # The `/macos` sub-action is the composite (Python) variant — the
+        # root action is docker-based and Linux-only. Same pinned hash.
+        # The coverage flow runs nextest twice and pass 2 (GL-enabled,
+        # signed binaries) overwrites pass 1's junit at the same path, so
+        # the published results are the GL-enabled run.
+        uses: EnricoMi/publish-unit-test-result-action/macos@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
+        if: always()
+        with:
+          files: |
+            target/nextest/default/test-results.xml
+          check_name: Test Results (macOS)
+          comment_mode: always
+          ignore_runs: true
+
   # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)
   #
