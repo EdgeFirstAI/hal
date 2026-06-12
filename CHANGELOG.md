@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GL readbacks on macOS used an ES 3.2-only entry point**
+  (`edgefirst-image`): every heap-destination readback called
+  `glReadnPixels`, which ANGLE/Metal (ES 3.0) rejects with
+  `GL_INVALID_OPERATION` — the engine errored on any Mem-destination
+  convert, mask draw, or PBO readback on macOS and silently fell back
+  to CPU. All readbacks now use plain `glReadPixels` (core since ES
+  2.0, identical semantics — the destination size is validated by
+  construction), so heap-destination paths genuinely run on the GPU
+  on macOS. Guarded by a new direct-engine regression test, and the
+  fused-convert oracle / backend-assertion tests are strengthened so
+  a GL failure can no longer hide behind the CPU fallback.
+
 - **GL proto-mask texture lifecycle** (`edgefirst-image`): two latent bugs
   with one root cause. (1) The experimental GLES 3.1 compute-shader proto
   repack (`EDGEFIRST_PROTO_COMPUTE=1`) rendered garbage masks on every

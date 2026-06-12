@@ -173,7 +173,7 @@ flowchart TD
 | DMA-buf | GPU supports `EGL_EXT_image_dma_buf_import`; dtype != F32 | Zero-copy: GPU reads/writes the DMA buffer directly | NXP i.MX 95 (Mali/Panfrost), RPi 5 (V3D) |
 | Float PBO | `supported_render_dtypes().f16/f32` true; dtype F16 or F32 | `GL_PIXEL_PACK_BUFFER` readback | V3D, Mali, Tegra; macOS F16 via IOSurface |
 | u8/i8 PBO | GLES 3.0 available, DMA-buf roundtrip fails; dtype U8/I8 | Zero-copy GL: `GL_PIXEL_UNPACK_BUFFER` / `GL_PIXEL_PACK_BUFFER` | NVIDIA desktop, hosts without DMA-heap permissions |
-| Mem | No GPU or GL unavailable; float GPU cap absent | CPU `memcpy` via `glTexImage2D` / `glReadnPixels` | Universal fallback; `convert()` uses CPU path |
+| Mem | No GPU or GL unavailable; float GPU cap absent | CPU `memcpy` via `glTexImage2D` / `glReadPixels` | Universal fallback; `convert()` uses CPU path |
 
 **Note:** when `memory: None` is passed with a float dtype and GPU float
 support is absent, allocation falls through to `Mem` without error.
@@ -195,7 +195,7 @@ zero-copy shader pipeline used on DMA platforms.
 | `DmaBuf` | `verify_dma_buf_roundtrip()` passes (Linux) | `EGL_EXT_image_dma_buf_import` (zero-copy) | EGLImage export (zero-copy) |
 | `IOSurface` | macOS + `EGL_ANGLE_iosurface_client_buffer` present | `eglCreatePbufferFromClientBuffer(EGL_IOSURFACE_ANGLE)` + `eglBindTexImage` (zero-copy) | Same pbuffer is the FBO color attachment; CPU readback via `IOSurfaceLock` |
 | `Pbo` | GLES 3.0 available, DMA-buf fails | `GL_PIXEL_UNPACK_BUFFER` | `GL_PIXEL_PACK_BUFFER` |
-| `Sync` | Final fallback | `glTexImage2D` (host pointer) | `glReadnPixels` (host pointer) |
+| `Sync` | Final fallback | `glTexImage2D` (host pointer) | `glReadPixels` (host pointer) |
 
 `DmaBuf` and `IOSurface` are both zero-copy paths, just with different
 EGL extensions backing them — the choice is platform-bound and the
@@ -426,8 +426,8 @@ that tells the engine what completes the convert.
 | Lowering | Destination | Render target | Completion |
 |----------|-------------|---------------|------------|
 | `ZeroCopy` | DMA (with EGL dma_buf import) | dst's own EGLImage (renderbuffer on Mali, texture-FBO elsewhere) | none — render writes the buffer |
-| `TexturePbo` | PBO | offscreen texture seeded from the PBO via UNPACK | `glReadnPixels` into the PBO PACK binding |
-| `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadnPixels` into the mapped tensor |
+| `TexturePbo` | PBO | offscreen texture seeded from the PBO via UNPACK | `glReadPixels` into the PBO PACK binding |
+| `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadPixels` into the mapped tensor |
 
 One `convert_via_engine` executes every u8/i8 convert: the pure plan table
 `render::plan_convert(src_fmt, dst_fmt, lowering)` picks `SinglePass`,
@@ -457,7 +457,7 @@ clear colour is pre-biased (`int8_bias_clear`) on every lowering alike.
 ### CUDA registration of the float PBO
 
 After `convert()` writes the float output into the PBO via
-`glReadnPixels(GL_PIXEL_PACK_BUFFER)`, the same PBO buffer can be
+`glReadPixels(GL_PIXEL_PACK_BUFFER)`, the same PBO buffer can be
 registered with CUDA and accessed as a device pointer — no host copy.
 
 **Registration** happens on the GL worker thread at `create_image()` time

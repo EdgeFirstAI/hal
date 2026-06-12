@@ -6236,10 +6236,17 @@ mod image_tests {
             .expect("GL backend present")
             .egl_cache_stats()
             .expect("cache stats");
+        // ≥ 2 misses: the fused convert imports the zero-copy NV source
+        // (pass 1) AND the F16 destination (pass 2). Requiring both means a
+        // convert that imported its source, failed mid-engine, and fell back
+        // to CPU (1 miss) cannot satisfy this gate.
         assert!(
-            stats_after.total_misses() > stats_before.total_misses(),
-            "convert succeeded but the GL engine imported nothing — the work \
-             did not run on the GL backend (silent CPU fallback)"
+            stats_after.total_misses() >= stats_before.total_misses() + 2,
+            "convert succeeded but the GL engine did not import both the \
+             source and the F16 destination — the work did not (fully) run \
+             on the GL backend (silent CPU fallback); misses before={} after={}",
+            stats_before.total_misses(),
+            stats_after.total_misses()
         );
     }
 
@@ -6304,7 +6311,13 @@ mod image_tests {
         let crop = Crop::letterbox([114, 114, 114, 255]);
         let mut gl_dst =
             TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(mem)).unwrap();
-        gl.convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
+        // Drive the GL backend DIRECTLY: a convert through `ImageProcessor`
+        // silently falls back to CPU on a GL error, turning this oracle into
+        // a CPU-vs-CPU tautology. A direct call surfaces the engine error.
+        gl.opengl
+            .as_mut()
+            .expect("GL backend present")
+            .convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
             .expect("fused NV12→PlanarF16 GL convert");
 
         let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
@@ -6349,6 +6362,104 @@ mod image_tests {
         assert!(
             max_diff <= 4.0 / 255.0 + 1e-3,
             "fused NV12→PlanarF16 diverges from CPU reference: max_diff={max_diff}"
+        );
+    }
+
+    /// Zero-copy source → heap destination through the GL engine,
+    /// driven on the GL backend DIRECTLY so a GL error cannot hide
+    /// behind the `ImageProcessor` CPU fallback (the shape that exposed
+    /// the macOS `glReadnPixels` failure: imported source, rendered,
+    /// then errored at the heap readback). RGBA→BGRA so the convert is
+    /// a pure byte shuffle: no chroma kernel or colorimetry ambiguity
+    /// (Vivante's NV fast path legitimately diverges from the CPU
+    /// reference), and the readback stays GL_RGBA (V3D rejects RGB
+    /// readbacks).
+    #[test]
+    #[cfg(feature = "opengl")]
+    fn test_zero_copy_src_to_mem_dst_gl_direct() {
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) if p.opengl.is_some() => p,
+            _ => {
+                eprintln!("SKIPPED: {} — GL backend unavailable", function!());
+                return;
+            }
+        };
+        if !edgefirst_tensor::is_gpu_buffer_available() {
+            eprintln!("SKIPPED: {} — no zero-copy buffers", function!());
+            return;
+        }
+
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        {
+            let t = src.as_u8().unwrap();
+            let mut m = t.map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 31) % 211) as u8;
+            }
+        }
+        let mut gl_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        proc.opengl
+            .as_mut()
+            .expect("GL backend present")
+            .convert(
+                &src,
+                &mut gl_dst,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .expect("zero-copy src → heap dst GL convert");
+
+        let mut cpu = ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        cpu.convert(
+            &src,
+            &mut cpu_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("CPU reference convert");
+
+        let g = gl_dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        let c = cpu_dst.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+        assert_eq!(g.len(), c.len());
+        let max_diff = g
+            .iter()
+            .zip(c.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        // Same-size byte shuffle: GL samples texel centers 1:1, so allow
+        // only rounding slack.
+        assert!(
+            max_diff <= 2,
+            "zero-copy src → heap dst diverges from CPU reference: max_diff={max_diff}"
         );
     }
 

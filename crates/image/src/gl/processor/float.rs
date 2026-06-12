@@ -401,7 +401,6 @@ impl GLProcessorST {
         // Destination dimensions and PBO buffer id, by dtype.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let dst_len = dst.size() / dst.dtype().size();
         let dst_buffer_id = match dst {
             TensorDyn::F32(t) => float_pbo_buffer_id(t)?,
             TensorDyn::F16(t) => float_pbo_buffer_id(t)?,
@@ -551,14 +550,16 @@ impl GLProcessorST {
             // ── Readback into the destination PBO ──
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
             gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
+            // Plain ReadPixels — glReadnPixels is ES 3.2-only and rejected by
+            // ANGLE/Metal's ES 3.0 contexts (see `readback_rendered`). The PBO
+            // PACK binding bounds the write.
+            gls::gl::ReadPixels(
                 0,
                 0,
                 packed_w as i32,
                 packed_h as i32,
                 client_fmt,
                 gl_type,
-                (dst_len * dst.dtype().size()) as i32,
                 std::ptr::null_mut(),
             );
             gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);

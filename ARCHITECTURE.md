@@ -141,7 +141,7 @@ ImageProcessor::convert()
 │  GL worker thread
 │  ┌──────────────────────────────────────────────────────────┐
 │  │  FBO render (resize / letterbox / colorspace / dtype)    │
-│  │       ↓ glReadnPixels into GL_PIXEL_PACK_BUFFER          │
+│  │       ↓ glReadPixels into GL_PIXEL_PACK_BUFFER          │
 │  │  PBO (linear f16 NCHW or f32 NHWC in GPU memory)         │
 │  │       ↓ cudaGraphicsGLRegisterBuffer (once at alloc)     │
 │  │       ↓ cudaGraphicsMapResources (per cuda_map() call)   │
@@ -157,7 +157,7 @@ ImageProcessor::convert()
 │  └────────────────────────────────────────────┘
 ```
 
-`convert()` renders into an FBO and reads out via `glReadnPixels` into a
+`convert()` renders into an FBO and reads out via `glReadPixels` into a
 `GL_PIXEL_PACK_BUFFER` (PBO). Because the PBO is registered with CUDA via
 `cudaGraphicsGLRegisterBuffer`, mapping it with `cudaGraphicsMapResources`
 yields a contiguous linear device pointer that TensorRT's

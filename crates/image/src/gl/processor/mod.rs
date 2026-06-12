@@ -97,9 +97,9 @@ enum DstTarget {
 /// How a [`DstTarget::Texture`] render reaches the destination tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DstReadback {
-    /// `glReadnPixels` straight into the mapped Mem tensor.
+    /// `glReadPixels` straight into the mapped Mem tensor.
     Mem,
-    /// `glReadnPixels` into this destination PBO's PACK binding.
+    /// `glReadPixels` into this destination PBO's PACK binding.
     Pbo(u32),
 }
 
@@ -1636,14 +1636,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -1660,14 +1659,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
@@ -1824,14 +1822,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
@@ -1848,14 +1845,13 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
                         gls::gl::UNSIGNED_BYTE,
-                        dst.len() as i32,
                         dst_map.as_mut_ptr() as *mut c_void,
                     );
                 }
@@ -2326,19 +2322,24 @@ impl GLProcessorST {
                 )))
             }
         };
+        // Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
+        // ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it with
+        // GL_INVALID_OPERATION at validation, before any parameter is looked
+        // at. The destination is always at least `dst.len()` bytes and the
+        // read is tightly packed (PACK_ALIGNMENT=1 at init), so the bounds
+        // the robust variant checked hold by construction.
         let len = dst.len();
         match pbo_id {
             None => unsafe {
                 let mut dst_map = dst.map()?;
                 gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadnPixels(
+                gls::gl::ReadPixels(
                     0,
                     0,
                     dst_w as i32,
                     dst_h as i32,
                     dest_format,
                     gls::gl::UNSIGNED_BYTE,
-                    len as i32,
                     dst_map.as_mut_ptr() as *mut c_void,
                 );
                 if dst_fmt == PixelFormat::Bgra {
@@ -2351,14 +2352,13 @@ impl GLProcessorST {
                 unsafe {
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadnPixels(
+                    gls::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         dest_format,
                         gls::gl::UNSIGNED_BYTE,
-                        len as i32,
                         std::ptr::null_mut(),
                     );
                     gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);

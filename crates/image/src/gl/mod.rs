@@ -179,7 +179,7 @@ pub(crate) enum TransferBackend {
     /// but OpenGL is present. Data stays in GPU-accessible memory.
     Pbo,
 
-    /// Synchronous `glTexSubImage2D` upload + `glReadnPixels` readback.
+    /// Synchronous `glTexSubImage2D` upload + `glReadPixels` readback.
     /// Used when DMA-buf is unavailable or when the DMA-buf verification
     /// probe fails (e.g. NVIDIA discrete GPUs where EGLImage creation
     /// succeeds but rendered data is all zeros).
