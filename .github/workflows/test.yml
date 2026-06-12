@@ -433,6 +433,7 @@ jobs:
           name: test-results-macos
           path: |
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
             target/test-metrics-*-macos.txt
           retention-days: 30
 
@@ -445,8 +446,12 @@ jobs:
         uses: EnricoMi/publish-unit-test-result-action/macos@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
         if: always()
         with:
+          # Under cargo-llvm-cov the nextest target dir is
+          # target/llvm-cov-target, so the junit lands there; the plain
+          # path covers COVERAGE=0 runs of test-macos.sh.
           files: |
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
           check_name: Test Results (macOS)
           comment_mode: always
           ignore_runs: true
