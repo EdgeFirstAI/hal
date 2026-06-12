@@ -5917,7 +5917,7 @@ mod gl_tests {
     ///
     /// Matches the coefficient set used in both the CPU kernels and the
     /// `generate_nv_to_rgba_shader_2d` shader (and the macOS `NV_TO_RGBA_FRAGMENT`).
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn yuv601_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
         let yf = y as f32 / 255.0;
         let up = cb as f32 / 255.0 - 128.0 / 255.0;
@@ -5935,7 +5935,7 @@ mod gl_tests {
     /// Build a solid-colour NV16 (4:2:2) buffer of dimensions `(w, h)`.
     ///
     /// Layout: `[H rows of Y][H rows of interleaved CbCr]` (contiguous, width-aligned).
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn make_nv16_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
         let y_plane = vec![y; w * h];
         // NV16: H rows of UV, each row has w/2 pairs → w bytes/row.
@@ -5946,7 +5946,7 @@ mod gl_tests {
     /// Build a solid-colour NV24 (4:4:4) buffer of dimensions `(w, h)`.
     ///
     /// Layout: `[H rows of Y][H rows of interleaved CbCr full-res]`.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn make_nv24_solid(w: usize, h: usize, y: u8, cb: u8, cr: u8) -> Vec<u8> {
         let y_plane = vec![y; w * h];
         // NV24: H rows of UV, each row has w pairs → 2w bytes/row.
@@ -5961,11 +5961,11 @@ mod gl_tests {
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2 (rounding from f32 shader arithmetic).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_gpu_nv16_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
 
@@ -6776,11 +6776,11 @@ mod gl_tests {
     ///   (b) Every output pixel matches the expected BT.601 full-range RGB
     ///       within ±2.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_gpu_nv24_to_rgba_path_b() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
 
@@ -6849,11 +6849,11 @@ mod gl_tests {
     /// Builds a patterned NV16 source, runs it through the CPU and GPU
     /// converters, and asserts the GPU output matches the CPU output within ±2.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_gpu_nv16_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
 
@@ -6932,11 +6932,11 @@ mod gl_tests {
 
     /// Verify NV24→RGBA Path B output matches the CPU reference converter.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn test_gpu_nv24_matches_cpu_reference() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
 
@@ -7180,7 +7180,7 @@ mod gl_tests {
     ///
     /// This is intentionally the same pattern as `make_odd_both_source` in
     /// `odd_dim_cpu.rs` so the two test suites share an analytic ground truth.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn fill_patterned_nv(t: &TensorDyn) {
         let fmt = t.format().unwrap();
         let w = t.width().unwrap();
@@ -7228,7 +7228,7 @@ mod gl_tests {
 
     /// Build a pair of identically-filled NV tensors: one `Dma` (for the GPU),
     /// one `Mem` (for the CPU reference).  Returns `(dma_src, mem_src)`.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn make_patterned_nv_pair(w: usize, h: usize, fmt: PixelFormat) -> (TensorDyn, TensorDyn) {
         let mut dma = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma)).unwrap();
         let mut mem = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
@@ -7251,7 +7251,7 @@ mod gl_tests {
     /// reading both maps at their real `effective_row_stride`.
     ///
     /// Returns `(max_diff, first_failing_location)`.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn compare_gpu_vs_cpu_u8(
         gpu_dst: &TensorDyn,
         cpu_dst: &TensorDyn,
@@ -7328,11 +7328,11 @@ mod gl_tests {
     ///       Tolerance 4 absorbs f32 shader rounding; identical fill on both sides
     ///       rules out test-infrastructure bias.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g03_nv16_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -7388,11 +7388,11 @@ mod gl_tests {
 
     /// G-04: NV24 odd-width (65×64) end-to-end GPU vs CPU reference.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g04_nv24_odd_w_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -7452,11 +7452,11 @@ mod gl_tests {
     /// constraint that causes incorrect reads on strict tiled GPUs (e.g. V3D)
     /// when the last chroma row straddles the 64-byte alignment boundary.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g05_nv16_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
@@ -7516,11 +7516,11 @@ mod gl_tests {
     /// UV row at offset `3H − 2` (0-indexed), making it a different boundary
     /// from NV16.  This is the regression cell for the NV24 3H height bug.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g06_nv24_odd_both_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (321usize, 241usize); // QVGA-scale odd both (Mali rejects sub-minimum textures)
@@ -7653,11 +7653,11 @@ mod gl_tests {
     /// Path A — see `test_nv12_still_uses_path_a` (64×64). Asserts the GPU output
     /// agrees with the CPU reference ±4.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g01_nv12_odd_w_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (321usize, 240usize); // QVGA-scale odd width (Mali rejects sub-minimum textures)
@@ -7724,11 +7724,11 @@ mod gl_tests {
     ///   (a) `last_nv_convert_path == ShaderR8` — no CPU fallback for DMA source.
     ///   (b) GPU output matches CPU reference within ±4.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g02_nv12_odd_h_path_b_vs_cpu() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         // Even width, odd height — exercises odd-H chroma row boundary.
@@ -7808,11 +7808,12 @@ mod gl_tests {
     /// This guards the odd-W Grey IOSurface / EGLImage path that the macOS NV24
     /// fix relies on (64-aligned pitch + physical-stride shader addressing).
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g_grey_odd_w_vs_cpu() {
+        use crate::opengl_headless::processor::GLProcessorST;
         use edgefirst_codec::{ImageDecoder, ImageLoad};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let jpeg: &[u8] = &edgefirst_bench::testdata::read("coco_grey_odd.jpg");
@@ -8040,11 +8041,11 @@ mod gl_tests {
     /// behaviour on Path B.  Uses the same patterned fill and stride-aware
     /// comparison as the odd-dim cells.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g_even_nv16_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (64usize, 64usize);
@@ -8094,11 +8095,11 @@ mod gl_tests {
 
     /// Even-dim regression: NV24 64×64 → RGBA GPU vs CPU ±4.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    #[cfg(feature = "dma_test_formats")]
     fn g_even_nv24_64x64_regression() {
         use crate::opengl_headless::processor::{GLProcessorST, NvConvertPath};
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let (w, h) = (64usize, 64usize);
