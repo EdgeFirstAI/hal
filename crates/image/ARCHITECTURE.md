@@ -319,7 +319,9 @@ shapes live on in the engine:
   heap destinations read back via `glReadPixels` exactly as on Linux.
 - **NV* → PlanarRgb F16** (the model-input convert) is the engine's
   portable fused two-pass (`convert_nv_to_planar_float_two_pass`) — it
-  also runs on Linux DMA-BUF f16 targets now.
+  also runs on Linux DMA-BUF f16 targets now. The intermediate is the
+  shared GPU texture (`packed_rgb_intermediate_tex`): zero-copy source
+  → GPU → texture → GPU → zero-copy destination, no host transit.
 
 macOS thereby inherits the engine's full conversion matrix
 (resize/letterbox everywhere, rotation/flip, int8, masks, view/batch
@@ -1136,7 +1138,7 @@ image.materialize_masks                                 [user-facing fn]
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
 | `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA (the Vivante GC7000UL workaround for the GPU hang on single-pass NV* → PlanarRgb). | Selected automatically when `is_vivante && matches!(src_fmt, Nv12 \| Nv16 \| Nv24) && dst.layout == Planar`. |
 | `image.convert.gl.nv_to_planar.pass2_deinterleave`     | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
-| `image.convert.gl.nv_to_planar_float`                  | Fused NV12/NV16/NV24 → PlanarRgb F16: pass 1 NV→RGBA into a cached heap intermediate, pass 2 the packed RGBA16F float render with the caller's crop. Portable (macOS IOSurface + Linux DMA-BUF f16 targets). | Emitted by `convert_nv_to_planar_float_two_pass`. |
+| `image.convert.gl.nv_to_planar_float`                  | Fused NV12/NV16/NV24 → PlanarRgb F16 with a GPU-resident intermediate: pass 1 renders NV→RGBA with the caller's full geometry into the shared intermediate texture (`packed_rgb_intermediate_tex`), pass 2 packs it 1:1 through the RGBA16F float shader into the zero-copy destination. The pixels never visit the host between the zero-copy source and the zero-copy destination. Portable (macOS IOSurface + Linux DMA-BUF f16 targets). | Emitted by `convert_nv_to_planar_float_two_pass`. |
 | `image.convert.g2d`                                    | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
 | `image.convert.cpu.format_convert`                     | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
 | `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |

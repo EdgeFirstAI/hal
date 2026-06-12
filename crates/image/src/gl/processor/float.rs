@@ -614,7 +614,57 @@ impl GLProcessorST {
         let src_w = src_u8.width().ok_or(Error::NotAnImage)?;
         let src_h = src_u8.height().ok_or(Error::NotAnImage)?;
 
-        // Destination must be an F16 PlanarRgb DMA tensor.
+        // Destination geometry for the crop uniforms; the full destination
+        // validation (PlanarRgb, F16, zero-copy) happens in the shared tail.
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+
+        // Crop uniforms — identical contract to the F16 PBO path.
+        let (src_rect_uv, dst_rect_px, pad_color) =
+            float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
+
+        let src_tex_id = self.camera_normal_texture.id;
+
+        // PBO sources upload via GL_PIXEL_UNPACK_BUFFER (no map() — avoids a
+        // GL-thread deadlock); non-PBO sources map to CPU directly.
+        let src_pbo_id = src_u8.as_pbo().map(|p| p.buffer_id());
+        let src_cpu_pixels = if src_pbo_id.is_none() {
+            Some(src_u8.map()?)
+        } else {
+            None
+        };
+        let src_filter = gls::gl::LINEAR as i32;
+
+        // ── Source RGBA8 texture upload (shared with the PBO F16 path) ──
+        self.upload_float_src(
+            src_tex_id,
+            src_w,
+            src_h,
+            src_filter,
+            src_pbo_id,
+            src_cpu_pixels.as_deref(),
+        );
+        drop(src_cpu_pixels);
+
+        self.render_float_to_zero_copy_tail(src_tex_id, src_rect_uv, dst_rect_px, pad_color, dst)
+    }
+
+    /// The destination half of the zero-copy F16 render: import the RGBA16F
+    /// zero-copy destination, attach it to the FBO, and pack `src_tex_id`
+    /// (an RGBA8 texture already holding the source pixels) through the
+    /// packed-NCHW float shader. Shared by [`convert_float_to_zero_copy`]
+    /// (which uploads its tensor source first) and the fused NV→PlanarF16
+    /// two-pass (whose pass 1 rendered into an engine-internal texture —
+    /// the pixels never visit the host).
+    pub(super) fn render_float_to_zero_copy_tail(
+        &mut self,
+        src_tex_id: u32,
+        src_rect_uv: [f32; 4],
+        dst_rect_px: [f32; 4],
+        pad_color: [f32; 3],
+        dst: &mut TensorDyn,
+    ) -> crate::Result<()> {
+        // Destination must be an F16 PlanarRgb zero-copy tensor.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let dst_fmt = dst.format().ok_or(Error::NotAnImage)?;
@@ -648,33 +698,7 @@ impl GLProcessorST {
                      got {dst_w}; using CPU fallback"
                 ))
             })?;
-
-        // Crop uniforms — identical contract to the F16 PBO path.
-        let (src_rect_uv, dst_rect_px, pad_color) =
-            float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
-
         let program_id = self.float_f16_nchw_program.id;
-        let src_tex_id = self.camera_normal_texture.id;
-
-        // PBO sources upload via GL_PIXEL_UNPACK_BUFFER (no map() — avoids a
-        // GL-thread deadlock); non-PBO sources map to CPU directly.
-        let src_pbo_id = src_u8.as_pbo().map(|p| p.buffer_id());
-        let src_cpu_pixels = if src_pbo_id.is_none() {
-            Some(src_u8.map()?)
-        } else {
-            None
-        };
-        let src_filter = gls::gl::LINEAR as i32;
-
-        // ── Source RGBA8 texture upload (shared with the PBO F16 path) ──
-        self.upload_float_src(
-            src_tex_id,
-            src_w,
-            src_h,
-            src_filter,
-            src_pbo_id,
-            src_cpu_pixels.as_deref(),
-        );
 
         // ── Import the destination dma-buf as a renderable RGBA16F EGLImage ──
         // Packed surface (W/4, 3*H), bpp=8. The tensor's natural planar f16 row

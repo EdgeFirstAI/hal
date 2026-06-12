@@ -34,8 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tensor) now runs as two GL passes inside one `convert()` call on every
   platform with F16 render support — macOS IOSurface and Linux DMA-BUF
   alike (previously macOS-only via the legacy backend, CPU on Linux).
-  Guarded by a cross-platform oracle against the CPU reference and a
-  backend assertion that proves the GL engine did the work.
+  The intermediate between the passes is a GPU-resident texture: the
+  pixel path is zero-copy source → GPU → texture → GPU → zero-copy
+  destination, with no host round-trip and no synchronization between
+  the passes (same-context command ordering). Guarded by a
+  cross-platform oracle against the CPU reference and a backend
+  assertion that proves the GL engine did the work.
 
 ### Fixed
 

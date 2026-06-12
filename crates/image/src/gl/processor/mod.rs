@@ -329,11 +329,6 @@ pub struct GLProcessorST {
     nv_r8_texture: Texture,
     /// EGLImage cache for Path-B R8 source imports (keyed like src_egl_cache).
     nv_r8_egl_cache: ImportCache<PlatformImport>,
-    /// Cached full-resolution RGBA8 intermediate for the fused
-    /// NV*→PlanarRgb-F16 two-pass convert, keyed by source dims.
-    /// Zero-copy memory where the platform can allocate it, heap
-    /// otherwise — pass 2 imports or uploads it accordingly.
-    float_two_pass_intermediate: Option<(usize, usize, TensorDyn)>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
@@ -1077,7 +1072,6 @@ impl GLProcessorST {
             nv_r8_int8_uniforms,
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
-            float_two_pass_intermediate: None,
             last_nv_convert_path: NvConvertPath::None,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
@@ -3069,10 +3063,44 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> Result<(), crate::Error> {
-        let src_w = src.width().ok_or(Error::NotAnImage)?;
-        let src_h = src.height().ok_or(Error::NotAnImage)?;
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        self.convert_to_dims(
+            src,
+            src_fmt,
+            dst_w,
+            dst_h,
+            dst.view_origin(),
+            _dst_fmt,
+            is_int8,
+            rotation,
+            flip,
+            crop,
+        )
+    }
+
+    /// The body of [`convert_to`], taking the destination geometry directly:
+    /// renders `src` to the currently-bound FBO. Callers rendering into an
+    /// engine-internal texture (the fused float two-pass) have no `Tensor<u8>`
+    /// destination to lend — only its dimensions. `dst_fmt` feeds only
+    /// `select_nv_path`'s Vivante carve-out, never the render target format
+    /// (that is whatever the bound FBO holds).
+    #[allow(clippy::too_many_arguments)]
+    fn convert_to_dims(
+        &mut self,
+        src: &Tensor<u8>,
+        src_fmt: PixelFormat,
+        dst_w: usize,
+        dst_h: usize,
+        dst_view_origin: Option<edgefirst_tensor::ViewOrigin>,
+        dst_fmt: PixelFormat,
+        is_int8: bool,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: ResolvedCrop,
+    ) -> Result<(), crate::Error> {
+        let src_w = src.width().ok_or(Error::NotAnImage)?;
+        let src_h = src.height().ok_or(Error::NotAnImage)?;
         check_gl_error(function!(), line!())?;
 
         // A view()/batch() destination shares ONE parent EGLImage with its
@@ -3092,7 +3120,7 @@ impl GLProcessorST {
         // Band rect via `region_to_viewport_top_down` — the SAME lowering as
         // the band viewport in `bind_dst`'s setup, so scissor and viewport can
         // never disagree on the orientation convention.
-        let _scissor = match dst.view_origin() {
+        let _scissor = match dst_view_origin {
             Some(vo) => {
                 let vp = super::render::region_to_viewport_top_down(crate::Region::new(
                     vo.x, vo.y, dst_w, dst_h,
@@ -3162,7 +3190,7 @@ impl GLProcessorST {
             // prefers the portable, colorimetry-exact in-shader ShaderR8 for
             // single-plane NV12/NV16/NV24, using the driver ExternalSampler only
             // for true-multiplane NV12 (which ShaderR8 cannot import).
-            let chosen = self.select_nv_path(src, src_fmt, _dst_fmt);
+            let chosen = self.select_nv_path(src, src_fmt, dst_fmt);
 
             if !Platform::EXTERNAL_OES && chosen == NvConvertPath::ExternalSampler {
                 // No samplerExternalOES on this platform (ANGLE/Metal):
@@ -6311,16 +6339,16 @@ impl GLProcessorST {
         )
     }
 
-    /// Assemble the immutable capability surface for this processor.
-    /// Captured ONCE by the dispatch wrapper at worker startup (before its
-    /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
-    /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
-    /// Fused NV12/NV16/NV24 → PlanarRgb F16: two engine passes under one
-    /// call. Pass 1 renders the YUV source to a cached full-resolution
-    /// RGBA8 intermediate (no crop/transform); pass 2 runs the packed
-    /// RGBA16F float render with the caller's crop/letterbox. The
-    /// model-input convert previously only the legacy macOS backend
-    /// offered — now portable (Linux DMA-BUF f16 targets included).
+    /// Fused NV12/NV16/NV24 → PlanarRgb F16: two GPU passes under one call
+    /// with a **GPU-resident intermediate** — the pixel path is
+    /// zero-copy src → GPU → texture → GPU → zero-copy dst, never touching
+    /// host memory. Pass 1 renders the YUV source with the caller's full
+    /// geometry (resize, crop, letterbox) into the shared intermediate
+    /// RGBA8 texture at destination resolution (the same texture the
+    /// packed-RGB and Vivante planar two-passes use); pass 2 packs that
+    /// texture 1:1 into the RGBA16F zero-copy destination. The model-input
+    /// convert previously only the legacy macOS backend offered — now
+    /// portable (Linux DMA-BUF f16 targets included).
     fn convert_nv_to_planar_float_two_pass(
         &mut self,
         src: &TensorDyn,
@@ -6329,52 +6357,74 @@ impl GLProcessorST {
         flip: Flip,
         crop: ResolvedCrop,
     ) -> crate::Result<()> {
-        let w = src.width().ok_or(Error::NotAnImage)?;
-        let h = src.height().ok_or(Error::NotAnImage)?;
-        let _span = tracing::trace_span!("image.convert.gl.nv_to_planar_float", w, h).entered();
-
-        // Reuse (or allocate) the intermediate. Heap (not zero-copy)
-        // deliberately: pass 2 uploads its source from a CPU map, and
-        // mapping a buffer the GPU just rendered is not cache-coherent on
-        // Mali/V3D; the pass-1 readback into heap is coherent everywhere.
-        // Zero-copy pass chaining needs a float-path SOURCE import
-        // (tracked follow-up).
-        if !matches!(&self.float_two_pass_intermediate, Some((iw, ih, _)) if *iw == w && *ih == h) {
-            let interm = TensorDyn::image(
-                w,
-                h,
-                PixelFormat::Rgba,
-                edgefirst_tensor::DType::U8,
-                Some(TensorMemory::Mem),
-            )?;
-            self.float_two_pass_intermediate = Some((w, h, interm));
+        // Parity with the float render paths: rotation/flip stay on the CPU
+        // fallback until the fused path grows an oracle for them (pass 1
+        // could render them, but untested behavior must not silently flip
+        // backend).
+        if rotation != crate::Rotation::None || flip != Flip::None {
+            return Err(crate::Error::NotSupported(
+                "GL fused NV→PlanarF16: rotation/flip not supported; using CPU fallback"
+                    .to_string(),
+            ));
         }
-        let (iw, ih, mut interm) = self
-            .float_two_pass_intermediate
-            .take()
-            .expect("just filled");
+        let src_u8 = src.as_u8().ok_or(Error::NotAnImage)?;
+        let src_fmt = src.format().ok_or(Error::NotAnImage)?;
+        let dst_w = dst.width().ok_or(Error::NotAnImage)?;
+        let dst_h = dst.height().ok_or(Error::NotAnImage)?;
+        let _span =
+            tracing::trace_span!("image.convert.gl.nv_to_planar_float", dst_w, dst_h).entered();
 
-        // Pass 1: NV → RGBA, full resolution, identity transform (the
-        // caller's crop/rotation belong to pass 2's sampling).
-        let result = ImageProcessorTrait::convert(
-            self,
-            src,
-            &mut interm,
-            crate::Rotation::None,
-            Flip::None,
-            Crop::no_crop(),
+        // ── Pass 1: NV → RGBA with the caller's full geometry, into the
+        // shared intermediate texture (GPU-only; no tensor, no import) ──
+        self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
+        self.packed_rgb_fbo.bind();
+        unsafe {
+            gls::gl::FramebufferTexture2D(
+                gls::gl::FRAMEBUFFER,
+                gls::gl::COLOR_ATTACHMENT0,
+                gls::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+                0,
+            );
+            check_gl_error(function!(), line!())?;
+            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        }
+        // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
+        // same-context command ordering already guarantees pass 2 samples
+        // the finished intermediate; the convert syncs once at pass 2's
+        // fence. The flag restores before `?` so an error cannot leak
+        // defer state.
+        let saved_defer = self.defer_finish;
+        self.defer_finish = true;
+        let pass1 = self.convert_to_dims(
+            src_u8,
+            src_fmt,
+            dst_w,
+            dst_h,
+            None,
+            PixelFormat::Rgba,
+            false,
+            rotation,
+            flip,
+            crop,
+        );
+        self.defer_finish = saved_defer;
+        pass1?;
+
+        // ── Pass 2: 1:1 pack of the intermediate into the RGBA16F
+        // zero-copy destination. NO crop here: pass 1 already placed the
+        // content band and padding at destination geometry — re-applying
+        // the crop would letterbox a second time (the PR #107 bug class;
+        // see convert_nv_to_planar_two_pass pass 2).
+        let (src_rect_uv, dst_rect_px, pad_color) =
+            super::core::float_crop_uniforms(&ResolvedCrop::no_crop(), dst_w, dst_h, dst_w, dst_h)?;
+        self.render_float_to_zero_copy_tail(
+            self.packed_rgb_intermediate_tex.id,
+            src_rect_uv,
+            dst_rect_px,
+            pad_color,
+            dst,
         )
-        .and_then(|()| {
-            // Pass 2 imports the intermediate as a SOURCE. On platforms
-            // with per-pass attachments (macOS) the pass-1 destination
-            // binding must be released first — binding one pbuffer to two
-            // textures is an EGL error. Pass 1 ran eagerly (synced), so
-            // releasing here is safe; no-op on Linux.
-            Platform::end_gpu_pass(&self.gl_context);
-            self.convert_float_to_zero_copy(&interm, dst, rotation, flip, crop)
-        });
-        self.float_two_pass_intermediate = Some((iw, ih, interm));
-        result
     }
 
     /// Release per-pass platform texture attachments — called by the
@@ -6387,6 +6437,10 @@ impl GLProcessorST {
         }
     }
 
+    /// Assemble the immutable capability surface for this processor.
+    /// Captured ONCE by the dispatch wrapper at worker startup (before its
+    /// message loop) — `serialize_gl` is the Vivante/galcore process-wide
+    /// serialization requirement; see `PlatformCaps` in `platform/mod.rs`.
     pub(super) fn platform_caps(&self) -> super::platform::PlatformCaps {
         super::platform::PlatformCaps {
             transfer_backend: self.gl_context.transfer_backend,
