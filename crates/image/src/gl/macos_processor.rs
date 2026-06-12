@@ -41,36 +41,23 @@
 #![cfg(target_os = "macos")]
 
 use super::iosurface_import;
-use super::platform::macos::MacosPlatform;
-// `MacosPlatform::{load_egl_lib, create_display}` are the two macOS-specific
-// helpers; everything else (pbuffer creation, texture binding, FBO setup,
-// shader compilation) is inline here. See platform/mod.rs for the seam
-// rationale.
+// The process-global ANGLE display (and its bring-up) lives in
+// `super::platform::angle`; this module keeps the legacy shared-context
+// execution model (GL_MUTEX + MakeCurrentGuard around that display's
+// `context`) until the convergence deletes it.
+use super::platform::angle::{shared_display, SharedAngleDisplay};
 use super::Egl;
 use crate::{Crop, Error, Flip, ImageProcessorTrait, MaskOverlay, ResolvedCrop, Result, Rotation};
 use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{DType, PixelFormat, TensorDyn, TensorMemory};
 use khronos_egl as egl;
-use log::debug;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
-// ---------------------------------------------------------------------------
-// EGL constants reused across the macOS path. The "production" constants in
-// `super::iosurface_import` cover the IOSurface-pbuffer attribute set; these
-// are the additional constants needed at MacosGlProcessor::new time.
-// ---------------------------------------------------------------------------
-
-const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
-const EGL_PBUFFER_BIT: i32 = 0x0001;
-const EGL_RENDERABLE_TYPE: i32 = 0x3040;
-const EGL_SURFACE_TYPE: i32 = 0x3033;
-const EGL_RED_SIZE: i32 = 0x3024;
-const EGL_GREEN_SIZE: i32 = 0x3023;
-const EGL_BLUE_SIZE: i32 = 0x3022;
-const EGL_ALPHA_SIZE: i32 = 0x3021;
-const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+// The shared ANGLE display bring-up (and the EGL config/context constants
+// it needs) now lives in `super::platform::angle` — this module keeps only
+// the constant its own RAII binding guard uses.
 const EGL_BACK_BUFFER: i32 = 0x3084;
 
 // ---------------------------------------------------------------------------
@@ -203,211 +190,13 @@ const RGBA8_TO_PLANAR_F16_PACKED_FRAGMENT: &str =
     super::shaders_common::PLANAR_RGB_F16_PACKED_FRAGMENT;
 
 // ---------------------------------------------------------------------------
-// One-shot GL function-pointer table.
-//
-// `gls::load_with` populates global function pointers — exists once per
-// process. We load via EGL's `eglGetProcAddress` so the symbols come
-// from ANGLE's libGLESv2.dylib.
-// ---------------------------------------------------------------------------
-
-static GL_LOADED: OnceLock<()> = OnceLock::new();
-
-fn load_gl_once(egl: &Egl) {
-    GL_LOADED.get_or_init(|| {
-        gls::load_with(|name| match egl.get_proc_address(name) {
-            Some(ptr) => ptr as *const c_void,
-            None => std::ptr::null(),
-        });
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Process-global ANGLE EGL display + context + dummy pbuffer.
-//
-// `eglTerminate` is ref-counted but never safely terminable mid-process
-// (ANGLE's Metal device is a per-process singleton, and any in-flight GL
-// command from any thread aborts when the display goes away). The Linux
-// backend uses a `SharedEglDisplay` in `context.rs` for the same reason.
-// Sharing here also avoids hammering `eglInitialize` from every
-// `MacosGlProcessor::new()` call.
-//
-// `GL_MUTEX` serialises every `eglMakeCurrent` + GL call across all
-// `MacosGlProcessor` instances — ANGLE's Metal backend is internally
-// thread-safe enough that a single global mutex is the right granularity.
-// Per-instance mutexes would race on the current-thread context state
-// because the EGL context is shared.
-// ---------------------------------------------------------------------------
-
-/// All process-global EGL state. Use [`shared_display`] to access.
-struct SharedAngleDisplay {
-    /// Static-lifetime EGL handle. The actual ANGLE libEGL.dylib is
-    /// leaked at first dlopen and never closed.
-    egl: Egl,
-    display: egl::Display,
-    config: egl::Config,
-    context: egl::Context,
-    /// Tiny scratch surface kept alive so the context can be made
-    /// current outside of a `convert` call (e.g. for shader compile,
-    /// resource allocation, or `Drop`-time cleanup).
-    dummy_pbuffer: egl::Surface,
-    /// `GL_EXT_color_buffer_float` is exposed by this ANGLE/Metal
-    /// configuration. Gates F32 destination tensors on the IOSurface
-    /// render path.
-    supports_f32_color: bool,
-    /// `GL_EXT_color_buffer_half_float` is exposed by this
-    /// ANGLE/Metal configuration. Gates F16 destination tensors on
-    /// the IOSurface render path.
-    supports_f16_color: bool,
-}
-
-// SAFETY: every member is either a leak'd static, an EGL handle (which
-// the ANGLE driver synchronises internally), or a pointer to driver-
-// owned state. Access is gated by GL_MUTEX.
-unsafe impl Send for SharedAngleDisplay {}
-unsafe impl Sync for SharedAngleDisplay {}
-
-static SHARED_DISPLAY: OnceLock<std::result::Result<SharedAngleDisplay, String>> = OnceLock::new();
+// GL serialization for the legacy shared-context model: `GL_MUTEX`
+// serialises every `eglMakeCurrent` + GL call across all
+// `MacosGlProcessor` instances, because they all run on the ONE shared
+// context owned by `platform::angle::SharedAngleDisplay`. The
+// convergence model (per-processor contexts on dedicated worker
+// threads) does not take this lock.
 static GL_MUTEX: Mutex<()> = Mutex::new(());
-
-/// Acquire a reference to the process-global ANGLE display, initialising
-/// it on first call. Subsequent calls return the same handle. The error
-/// case is cached too — once ANGLE fails to load we don't keep retrying.
-fn shared_display() -> Result<&'static SharedAngleDisplay> {
-    SHARED_DISPLAY
-        .get_or_init(|| init_shared_display().map_err(|e| e.to_string()))
-        .as_ref()
-        .map_err(|s| Error::Io(std::io::Error::other(s.clone())))
-}
-
-fn init_shared_display() -> Result<SharedAngleDisplay> {
-    let _span =
-        tracing::info_span!("image.gl_init", platform = "macos", backend = "iosurface",).entered();
-
-    // 1. Load ANGLE libEGL and bring up an EGL instance.
-    let egl_lib = MacosPlatform::load_egl_lib()
-        .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
-    let egl: Egl = unsafe {
-        khronos_egl::Instance::<
-            khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
-        >::load_required_from(egl_lib)
-    }
-    .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
-
-    // 2. Metal-backed display from MacosPlatform.
-    let display = MacosPlatform::create_display(&egl)?;
-    let (maj, min) = egl
-        .initialize(display)
-        .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
-    debug!("MacosGlProcessor: EGL {maj}.{min} initialised via ANGLE (process-global)");
-
-    egl.bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
-
-    // 3. Choose an EGL config that supports GLES 3 + PBUFFER +
-    //    EGL_BIND_TO_TEXTURE_TARGET_ANGLE = EGL_TEXTURE_2D.
-    //
-    // 8-bit RGBA color sizes are explicit but the config doesn't
-    // restrict half-float IOSurface texture binding — ANGLE's
-    // `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` overrides at pbuffer
-    // creation time. Verified by reading ANGLE's
-    // `EGLIOSurfaceClientBufferTest::RenderToRGBA16FIOSurface` which
-    // also binds u8 surfaces in the same context.
-    let cfg_attribs = [
-        EGL_RENDERABLE_TYPE,
-        EGL_OPENGL_ES3_BIT,
-        EGL_SURFACE_TYPE,
-        EGL_PBUFFER_BIT,
-        EGL_RED_SIZE,
-        8,
-        EGL_GREEN_SIZE,
-        8,
-        EGL_BLUE_SIZE,
-        8,
-        EGL_ALPHA_SIZE,
-        8,
-        iosurface_import::EGL_BIND_TO_TEXTURE_TARGET_ANGLE,
-        0x305F, // EGL_TEXTURE_2D
-        egl::NONE,
-    ];
-    let config = egl
-        .choose_first_config(display, &cfg_attribs)
-        .map_err(|e| Error::Io(std::io::Error::other(format!("eglChooseConfig: {e:?}"))))?
-        .ok_or_else(|| {
-            Error::NotSupported("no EGL config with GLES3+PBUFFER+TEXTURE_2D bind".into())
-        })?;
-
-    // 4. GLES3 context.
-    let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, egl::NONE];
-    let context = egl
-        .create_context(display, config, None, &ctx_attribs)
-        .map_err(|e| Error::Io(std::io::Error::other(format!("eglCreateContext: {e:?}"))))?;
-
-    // 5. Dummy pbuffer for context-current bring-up.
-    let dummy_attribs = [egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE];
-    let dummy_pbuffer = egl
-        .create_pbuffer_surface(display, config, &dummy_attribs)
-        .map_err(|e| {
-            // Clean up the context we just created before bailing.
-            let _ = egl.destroy_context(display, context);
-            Error::Io(std::io::Error::other(format!(
-                "eglCreatePbufferSurface(dummy): {e:?}"
-            )))
-        })?;
-
-    // 6. Load GL function pointers via the now-initialised display.
-    //    Make-current is required for some drivers to expose GLES symbols.
-    if let Err(e) = egl.make_current(
-        display,
-        Some(dummy_pbuffer),
-        Some(dummy_pbuffer),
-        Some(context),
-    ) {
-        let _ = egl.destroy_surface(display, dummy_pbuffer);
-        let _ = egl.destroy_context(display, context);
-        return Err(Error::Io(std::io::Error::other(format!(
-            "eglMakeCurrent(dummy): {e:?}"
-        ))));
-    }
-    load_gl_once(&egl);
-
-    // Probe the float-color-buffer extensions while the context is
-    // still current. ANGLE's Metal backend exposes both extensions on
-    // Apple Silicon + recent ANGLE bundles; on older configurations
-    // either or both may be missing — consumers fall back per dtype.
-    let extensions = unsafe {
-        let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
-        if ptr.is_null() {
-            String::new()
-        } else {
-            std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char)
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
-    let supports_f32_color = extensions
-        .split_ascii_whitespace()
-        .any(|e| e == "GL_EXT_color_buffer_float");
-    let supports_f16_color = extensions
-        .split_ascii_whitespace()
-        .any(|e| e == "GL_EXT_color_buffer_half_float");
-    debug!(
-        "MacosGlProcessor: GL_EXT_color_buffer_float={supports_f32_color}, \
-         GL_EXT_color_buffer_half_float={supports_f16_color}"
-    );
-
-    let _ = egl.make_current(display, None, None, None);
-
-    Ok(SharedAngleDisplay {
-        egl,
-        display,
-        config,
-        context,
-        dummy_pbuffer,
-        supports_f32_color,
-        supports_f16_color,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Mutex helpers.
 //
@@ -1727,6 +1516,7 @@ impl ImageProcessorTrait for MacosGlProcessor {
 #[cfg(test)]
 mod spike_a0 {
     use super::super::core as glcore;
+    use super::super::platform::angle::EGL_CONTEXT_CLIENT_VERSION;
     use super::*;
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};

@@ -31,6 +31,8 @@
 //! decision tables, never as new `cfg` branches in the engine. Caps are
 //! captured ONCE per processor at worker startup, never per message.
 
+#[cfg(target_os = "macos")]
+pub(super) mod angle;
 #[cfg(target_os = "linux")]
 pub(super) mod linux;
 #[cfg(target_os = "macos")]
@@ -112,15 +114,14 @@ pub(super) trait GlPlatform {
     ) -> crate::Result<Self::Import>;
 }
 
-/// The one platform implementation for this build. macOS gains its alias
-/// when `angle.rs` lands (PR-A step A4); until then the macOS backend is
-/// `MacosGlProcessor`, which does not route through the trait.
+/// The one platform implementation for this build.
 #[cfg(target_os = "linux")]
 pub(super) type Platform = linux::LinuxEgl;
+#[cfg(target_os = "macos")]
+pub(super) type Platform = angle::AngleClientBuffer;
 
 // Compile-time check that the selected platform implements the contract —
 // a partial port fails here, not at a call site deep in the engine.
-#[cfg(target_os = "linux")]
 const _: fn() = || {
     fn assert_platform<P: GlPlatform>() {}
     assert_platform::<Platform>();
