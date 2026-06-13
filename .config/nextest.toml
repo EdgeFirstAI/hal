@@ -2,8 +2,14 @@
 # Reference: https://nexte.st/book/configuration.html
 
 [profile.default]
-# JUnit XML output for CI test reporting
-junit.path = "target/nextest/default/test-results.xml"
+# JUnit XML output for CI test reporting. junit.path is relative to the
+# profile's STORE directory (target/nextest/default — or, under
+# cargo-llvm-cov, target/llvm-cov-target/nextest/default), so a bare
+# filename lands the report at <store>/test-results.xml. The previous
+# full-path value nested it at
+# target/nextest/default/target/nextest/default/test-results.xml, which
+# no CI publish step ever found.
+junit.path = "test-results.xml"
 junit.store-success-output = true
 junit.store-failure-output = true
 
@@ -17,6 +23,6 @@ retries = 1
 # CI profile with more retries and no fail-fast
 fail-fast = false
 retries = 2
-junit.path = "target/nextest/ci/test-results.xml"
+junit.path = "test-results.xml"
 junit.store-success-output = true
 junit.store-failure-output = true
