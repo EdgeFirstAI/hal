@@ -1260,6 +1260,18 @@ jobs:
             python3 .github/scripts/fix_coverage_paths.py "$xml" tests
           done
 
+          echo "=== Normalizing LCOV source paths to repo-relative ==="
+          # cargo-llvm-cov writes absolute SF: paths. The Linux lanes'
+          # /home/runner/work/hal/hal/... happen to match this scanner
+          # host's checkout, so they resolved by accident; the macOS
+          # lane's /Users/runner/work/hal/hal/... never did — its
+          # coverage (the only ANGLE/IOSurface GL coverage) was silently
+          # dropped by SonarCloud. Strip everything up to the repo root
+          # so every lane resolves identically, on any runner layout.
+          for lcov in $(find coverage/ -name "*.lcov" -type f); do
+            sed -i -E 's|^SF:.*/work/hal/hal/|SF:|' "$lcov"
+          done
+
           RUST_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
           PYTHON_REPORTS=$(find coverage/ -name "coverage_python.xml" | tr '\n' ',' | sed 's/,$//')
 
