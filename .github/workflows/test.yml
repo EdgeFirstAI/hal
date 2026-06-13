@@ -284,6 +284,7 @@ jobs:
           path: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
             target/test-metrics-rust-x86_64.txt
             target/test-metrics-capi-x86_64.txt
             target/test-metrics-python-x86_64.txt
@@ -293,9 +294,15 @@ jobs:
         uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
         if: always()
         with:
+          # Both nextest junit locations: plain runs use target/nextest,
+          # cargo-llvm-cov (make test-rust) relocates the store dir under
+          # target/llvm-cov-target. Until the nextest.toml junit.path fix
+          # the Rust junit landed at a nested path no step ever found —
+          # this check was silently pytest-only.
           files: |
             target/pytest_results.xml
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
           check_name: Test Results (x86_64)
           comment_mode: always
           ignore_runs: true
@@ -384,6 +391,11 @@ jobs:
         env:
           COVERAGE: "1"
           COV_LCOV: target/coverage_rust.lcov
+          # gl_backend_available_canary: fail this lane (instead of
+          # silently skipping every GL test) if the ANGLE stack above is
+          # broken. Enforced in coverage pass 2 only — pass 1 runs
+          # unsigned binaries with the dlopen gate closed by design.
+          HAL_TEST_REQUIRE_GL: "1"
         run: |
           ./scripts/test-macos.sh -j 1 \
             2>&1 | tee target/test-metrics-rust-macos.txt
@@ -396,6 +408,19 @@ jobs:
 
           cd crates/capi/tests
           make test 2>&1 | tee ../../../target/test-metrics-capi-macos.txt
+
+      - name: Coverage summary (macOS)
+        # Tool-free per-lane visibility: overall lines plus the GL-engine
+        # slice (the number the GL-tests-on-ANGLE port moves), straight
+        # from the lcov into the job's step summary.
+        if: always()
+        run: |
+          if [[ -f target/coverage_rust.lcov ]]; then
+            awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END{ if (lf>0) printf "## Coverage (macOS lane)\nLines: %d / %d (%.1f%%)\n", lh, lf, 100*lh/lf }' \
+              target/coverage_rust.lcov >> "$GITHUB_STEP_SUMMARY"
+            awk -F'[:,]' '/^SF:.*crates\/image\/src\/gl\//{f=1} f&&/^LF:/{lf+=$2} f&&/^LH:/{lh+=$2} /^end_of_record/{f=0} END{ if (lf>0) printf "\nGL engine (crates/image/src/gl): %d / %d (%.1f%%)\n", lh, lf, 100*lh/lf }' \
+              target/coverage_rust.lcov >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload coverage artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -415,8 +440,28 @@ jobs:
           name: test-results-macos
           path: |
             target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
             target/test-metrics-*-macos.txt
           retention-days: 30
+
+      - name: Publish test results
+        # The `/macos` sub-action is the composite (Python) variant — the
+        # root action is docker-based and Linux-only. Same pinned hash.
+        # The coverage flow runs nextest twice and pass 2 (GL-enabled,
+        # signed binaries) overwrites pass 1's junit at the same path, so
+        # the published results are the GL-enabled run.
+        uses: EnricoMi/publish-unit-test-result-action/macos@c950f6fb443cb5af20a377fd0dfaa78838901040  # v2.23.0
+        if: always()
+        with:
+          # Under cargo-llvm-cov the nextest target dir is
+          # target/llvm-cov-target, so the junit lands there; the plain
+          # path covers COVERAGE=0 runs of test-macos.sh.
+          files: |
+            target/nextest/default/test-results.xml
+            target/llvm-cov-target/nextest/default/test-results.xml
+          check_name: Test Results (macOS)
+          comment_mode: always
+          ignore_runs: true
 
   # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)
