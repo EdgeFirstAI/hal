@@ -49,6 +49,13 @@ COV_LCOV="${COV_LCOV:-target/coverage_rust.lcov}"
 
 WS_EXCLUDES=(--workspace --exclude gpu-probe --exclude edgefirst-bench)
 
+# dma_test_formats un-gates the gl/tests.rs zero-copy tier on macOS
+# (IOSurface-backed @Dma fixtures). MUST be identical across the build
+# and every nextest invocation below — a feature mismatch between the
+# coverage passes triggers a rebuild between the codesign step and the
+# run, leaving pass 2 with unsigned binaries (GL tests SIGKILL/skip).
+FEATURES=(--features edgefirst-image/dma_test_formats)
+
 sign_test_binaries() {
     # Sign every test binary in the given deps dir with the library-
     # validation-disabled entitlement so dlopen() of ad-hoc-signed ANGLE
@@ -65,12 +72,12 @@ if [[ "$COVERAGE" != "1" ]]; then
     # ----- Normal path: build → sign → run -----
     DEPS_DIR="target/$PROFILE/deps"
     echo "→ Building workspace tests ($PROFILE)…"
-    cargo build --tests ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}"
+    cargo build --tests ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}"
     echo "→ Codesigning test binaries with library-validation disabled…"
     sign_test_binaries "$DEPS_DIR"
     echo "→ Running nextest…"
     export HAL_TEST_ALLOW_DLOPEN_ANGLE=1
-    exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "$@"
+    exec cargo nextest run ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
 fi
 
 # ----- Coverage path: two-pass so the codesign seam survives -----
@@ -101,14 +108,14 @@ COV_DEPS_DIR="target/llvm-cov-target/$PROFILE/deps"
 
 echo "→ Coverage pass 1/2: build + run (GL dlopen tests self-skip)…"
 cargo llvm-cov nextest --no-report ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
-    "${WS_EXCLUDES[@]}" "$@"
+    "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
 
 echo "→ Codesigning instrumented test binaries…"
 sign_test_binaries "$COV_DEPS_DIR"
 
 echo "→ Coverage pass 2/2: re-run with ANGLE dlopen enabled…"
 HAL_TEST_ALLOW_DLOPEN_ANGLE=1 cargo llvm-cov nextest --no-report \
-    ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "$@"
+    ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} "${WS_EXCLUDES[@]}" "${FEATURES[@]}" "$@"
 
 echo "-> Generating LCOV report -> ${COV_LCOV}"
 cargo llvm-cov report --lcov --output-path "${COV_LCOV}" \

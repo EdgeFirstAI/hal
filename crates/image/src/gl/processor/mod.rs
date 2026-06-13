@@ -23,7 +23,19 @@ type PlatformImport = <Platform as GlPlatform>::Import;
 /// The `Copy` import handle (`egl::Image` / `egl::Surface`).
 type PlatformHandle = <Platform as GlPlatform>::ImportHandle;
 use super::resources::{Buffer, FrameBuffer, GlProgram, Texture};
-use super::shaders::*;
+use super::shaders::{
+    check_gl_error, generate_color_shader, generate_instanced_segmentation_shader,
+    generate_nv_to_rgba_int8_shader_2d, generate_nv_to_rgba_shader_2d,
+    generate_packed_f32_nhwc_shader, generate_packed_rgba8_int8_shader_2d,
+    generate_packed_rgba8_shader_2d, generate_planar_rgb_f16_packed_shader,
+    generate_planar_rgb_int8_shader, generate_planar_rgb_int8_shader_2d,
+    generate_planar_rgb_shader, generate_planar_rgb_shader_2d, generate_proto_dequant_shader_int8,
+    generate_proto_repack_compute_shader, generate_proto_segmentation_shader,
+    generate_proto_segmentation_shader_f32, generate_proto_segmentation_shader_int8_bilinear,
+    generate_proto_segmentation_shader_int8_nearest, generate_segmentation_shader,
+    generate_texture_fragment_shader, generate_texture_fragment_shader_yuv,
+    generate_texture_int8_shader, generate_texture_int8_shader_yuv, generate_vertex_shader,
+};
 use super::{Int8InterpolationMode, RegionOfInterest, TransferBackend};
 use crate::{Crop, Error, Flip, ImageProcessorTrait, ResolvedCrop, Rotation, DEFAULT_COLORS};
 use edgefirst_tensor::TensorDyn;
@@ -263,6 +275,10 @@ pub struct GLProcessorST {
     dst_egl_cache: ImportCache<PlatformImport>,
     /// Whether the BGRA byte-swap workaround warning has been logged.
     bgra_warned: bool,
+    /// Reusable RGBA staging buffer for `read_pixels_into`'s fallback path
+    /// (drivers whose implementation read-pair rejects direct RGB/RED
+    /// reads — ANGLE/Metal, V3D). Grown on demand, kept at high-water mark.
+    readback_scratch: Vec<u8>,
     /// Whether the GPU is a Verisilicon/Vivante core (detected via GL_RENDERER).
     /// Used to block operations known to cause unrecoverable GPU hangs.
     pub(super) is_vivante: bool,
@@ -740,6 +756,70 @@ struct GlSupport {
     supports_f16_color: bool,
 }
 
+/// `glReadPixels` the bound read-framebuffer into `out`, honoring the ES 3
+/// guarantee: only `RGBA`/`UNSIGNED_BYTE` plus ONE implementation-defined
+/// pair are accepted. Mesa and the embedded drivers take `RGB`/`RED`
+/// directly; ANGLE/Metal (and V3D) reject them with `GL_INVALID_OPERATION`.
+/// When the direct read is unsupported, read an RGBA scratch and repack the
+/// leading channels (the FBO attachment has the destination's channel
+/// layout, so RGB keeps rgb, RED keeps r).
+///
+/// Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
+/// ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it at
+/// validation. `out` is at least `w*h*channels` bytes and reads are tightly
+/// packed (`PACK_ALIGNMENT=1` at init), so the bounds the robust variant
+/// checked hold by construction.
+///
+/// # Safety
+/// Must run on the GL thread with a complete read framebuffer bound and
+/// `ReadBuffer` selected.
+///
+/// `scratch` is the caller's reusable RGBA staging buffer
+/// (`GLProcessorST::readback_scratch`) — grown on demand and kept at its
+/// high-water mark, so the fallback path costs no per-call allocation
+/// after the first read of a given size.
+unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
+    let direct = format == gls::gl::RGBA || {
+        let mut impl_fmt = 0i32;
+        let mut impl_type = 0i32;
+        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_FORMAT, &mut impl_fmt);
+        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_TYPE, &mut impl_type);
+        impl_fmt as u32 == format && impl_type as u32 == gls::gl::UNSIGNED_BYTE
+    };
+    if direct {
+        gls::gl::ReadPixels(
+            0,
+            0,
+            w as i32,
+            h as i32,
+            format,
+            gls::gl::UNSIGNED_BYTE,
+            out.as_mut_ptr() as *mut c_void,
+        );
+        return;
+    }
+    let channels = match format {
+        gls::gl::RGB => 3,
+        gls::gl::RED => 1,
+        _ => 4,
+    };
+    if scratch.len() < w * h * 4 {
+        scratch.resize(w * h * 4, 0);
+    }
+    gls::gl::ReadPixels(
+        0,
+        0,
+        w as i32,
+        h as i32,
+        gls::gl::RGBA,
+        gls::gl::UNSIGNED_BYTE,
+        scratch.as_mut_ptr() as *mut c_void,
+    );
+    for (px, dst_px) in scratch.chunks_exact(4).zip(out.chunks_exact_mut(channels)) {
+        dst_px.copy_from_slice(&px[..channels]);
+    }
+}
+
 /// Classify a GL_RENDERER string into driver-policy traits. Pure —
 /// unit-testable without a GL context.
 fn classify_renderer(renderer: &str) -> RendererTraits {
@@ -1097,6 +1177,7 @@ impl GLProcessorST {
             src_egl_cache: ImportCache::new(egl_cache_capacity),
             dst_egl_cache: ImportCache::new(egl_cache_capacity),
             bgra_warned: false,
+            readback_scratch: Vec::new(),
             is_vivante,
             is_virtual_gpu,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
@@ -1703,14 +1784,12 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
-                        0,
-                        0,
-                        dst_w as i32,
-                        dst_h as i32,
+                    read_pixels_into(
+                        dst_w,
+                        dst_h,
                         format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst_map.as_mut_ptr() as *mut c_void,
+                        &mut self.readback_scratch,
+                        dst_map.as_mut_slice(),
                     );
                 }
                 check_gl_error(function!(), line!())?;
@@ -1889,14 +1968,12 @@ impl GLProcessorST {
                 let mut dst_map = dst.map()?;
                 unsafe {
                     gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
-                        0,
-                        0,
-                        dst_w as i32,
-                        dst_h as i32,
+                    read_pixels_into(
+                        dst_w,
+                        dst_h,
                         format,
-                        gls::gl::UNSIGNED_BYTE,
-                        dst_map.as_mut_ptr() as *mut c_void,
+                        &mut self.readback_scratch,
+                        dst_map.as_mut_slice(),
                     );
                 }
                 check_gl_error(function!(), line!())?;
@@ -2350,7 +2427,7 @@ impl GLProcessorST {
     /// completes. The converged readback shared by the non-DMA and any-to-PBO
     /// paths — they differ only in this target selector.
     fn readback_rendered(
-        &self,
+        &mut self,
         dst: &mut Tensor<u8>,
         dst_fmt: PixelFormat,
         pbo_id: Option<u32>,
@@ -2367,25 +2444,17 @@ impl GLProcessorST {
                 )))
             }
         };
-        // Plain `glReadPixels`, NOT `glReadnPixels`: the robust variant is an
-        // ES 3.2 entry point and ANGLE/Metal (ES 3.0 max) rejects it with
-        // GL_INVALID_OPERATION at validation, before any parameter is looked
-        // at. The destination is always at least `dst.len()` bytes and the
-        // read is tightly packed (PACK_ALIGNMENT=1 at init), so the bounds
-        // the robust variant checked hold by construction.
         let len = dst.len();
         match pbo_id {
             None => unsafe {
                 let mut dst_map = dst.map()?;
                 gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                gls::gl::ReadPixels(
-                    0,
-                    0,
-                    dst_w as i32,
-                    dst_h as i32,
+                read_pixels_into(
+                    dst_w,
+                    dst_h,
                     dest_format,
-                    gls::gl::UNSIGNED_BYTE,
-                    dst_map.as_mut_ptr() as *mut c_void,
+                    &mut self.readback_scratch,
+                    dst_map.as_mut_slice(),
                 );
                 if dst_fmt == PixelFormat::Bgra {
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {

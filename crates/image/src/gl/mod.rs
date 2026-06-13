@@ -71,12 +71,12 @@ mod processor;
 mod resources;
 mod shaders;
 mod shaders_common;
-// Engine GL tests: written against the Linux display probe + dma_test
-// helpers (112 platform-specific references). macOS engine coverage
-// lives in lib.rs (oracles, parallel correctness, fused F16, cache
-// gates); porting this file's mask/proto/batch sections to run on
-// ANGLE is a tracked follow-up.
-#[cfg(target_os = "linux")]
+// Engine GL tests, in three tiers (see crates/image/TESTING.md):
+//   portable                       — run on Linux AND macOS/ANGLE
+//   cfg(target_os = "linux")       — display probing, PBO/CUDA paths
+//   cfg(all(linux, dma_test_formats)) — DMA-BUF import/pool specifics
+// Per-item cfg gates inside the module select the tier; the mount
+// itself is unconditional so the macOS lane runs the portable tier.
 mod tests;
 mod threaded;
 

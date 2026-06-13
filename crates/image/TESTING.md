@@ -76,6 +76,24 @@ returns early if it returns `false`. This keeps the suite green on developer
 machines without GPU hardware while still exercising the full hardware path
 on target boards and CI runners.
 
+The module runs on **both Linux and macOS/ANGLE** in three tiers, selected
+by per-item `cfg` gates:
+
+| Tier | Gate | Contents |
+|------|------|----------|
+| Portable | none | mask/segmentation/box render, proto suite, src_rect crops, decision tables, F16 zero-copy roundtrip |
+| Zero-copy | `feature = "dma_test_formats"` | `@Dma` fixtures that allocate on both platforms (RGBA/BGRA/GREY/NV*/YUYV — DMA-BUF on Linux, IOSurface on macOS): pool/recycle/steady-state, NV12/YUYV references, subview no-aliasing, NV16/NV24 Path-B oracles, odd-geometry `g01–g06`/grey/64×64 GPU-vs-CPU oracles |
+| Linux-only | `cfg(target_os = "linux")` (± the feature) | display probing, PBO/CUDA destinations, packed-RGB `@Dma` incl. the int8 odd-geometry oracles (no IOSurface FourCC for 3-byte RGB), DMA stride guards, multi-plane fd imports, Neutron scenarios, NV path-selection asserts and divergence probes |
+
+The zero-copy tier probes `is_gpu_image_buffer_available()`
+(`edgefirst_tensor::is_gpu_buffer_available`) instead of the Linux-flavored
+`is_dma_available()`. **Acceptance bar for newly ported tests:** green under
+`EDGEFIRST_GL_SERIALIZE=full` — GitHub's macOS runners expose a
+paravirtualized Metal GPU that takes the Full serialization policy.
+`scripts/test-macos.sh` enables `dma_test_formats` so the macOS lane runs
+the first two tiers; the feature set must stay identical across its
+coverage passes (see the script comment).
+
 The Neutron-scenario tests gate on `/dev/neutron0` as a platform
 discriminator for i.MX 95 with Mali GPU. This device node indicates that
 large-offset DMA-BUF EGLImage imports are supported — these fail with
