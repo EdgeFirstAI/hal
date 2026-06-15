@@ -1025,6 +1025,13 @@ impl GLProcessorThreaded {
         tensor
             .set_format(format)
             .map_err(|e| Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}")))?;
+        // Register the PBO with CUDA (best-effort; no-op without libcudart) so
+        // `cuda_map()` can yield a device pointer — matching the float PBO path
+        // in `create_pbo_image_dtype`. Without this, u8 PBOs were never
+        // CUDA-interop-capable, so the codec's nvJPEG backend (and any CUDA
+        // consumer) could not use a `create_image`-allocated PBO destination.
+        // The i8 transmute by the caller preserves the attached handle.
+        register_pbo_cuda(&mut tensor, buffer_id, size, sender);
         Ok(tensor)
     }
 

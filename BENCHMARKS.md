@@ -619,6 +619,69 @@ All JPEG measurements use the custom decoder (not zune-jpeg). All measurements a
 - PNG decode uses zune-png internally; edgefirst-codec adds 2–5% overhead for strided row-copy into the pre-allocated tensor.
 - imx95-frdm (Cortex-A55 @ 1.8 GHz) is ~4–5% faster than imx8mp-frdm (Cortex-A53 @ 1.6 GHz) across JPEG decode paths.
 
+#### nvJPEG GPU Decode (Jetson Orin) — on-target only
+
+On NVIDIA platforms the codec prefers the nvJPEG GPU backend
+(`nvjpeg → v4l2 → cpu`). It decodes interleaved **RGB** straight into a
+CUDA-registered PBO (what `ImageProcessor::create_image` yields on Jetson), so
+the decoded image is born GPU-resident and is consumed zero-copy by
+`convert()`. Benchmark cells `codec/jpeg/nvjpeg/rgbi/<fixture>` run only when
+CUDA + libnvjpeg are present (`edgefirst_codec::nvjpeg_available()`) and skip
+cleanly elsewhere — `bench_compare.py` treats absent cells as one-sided and
+never gates on them. nvJPEG is **opt-in** (off by default so it never contends
+with CUDA inference), so the cells need `EDGEFIRST_ENABLE_NVJPEG=1`. Build/run
+on-target with the CUDA library path:
+
+```bash
+EDGEFIRST_ENABLE_NVJPEG=1 \
+  LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
+  cargo bench -p edgefirst-codec --bench codec_benchmark -- --json out.json
+```
+
+**In-tree `cargo bench` cells** (Orin Nano, L4T R36.4.7 / CUDA 12.6 / nvJPEG
+12.3.3; captured 2026-06-15, `codec_benchmark` cross-built for
+`aarch64-unknown-linux-gnu`, n=100). The nvJPEG cell is the full `load_image` =
+`cuda_map` + `nvjpegDecode` (RGBI) + stream sync + unmap into a `create_image`
+PBO; the CPU `nv12` cell is the **same binary's** CPU decoder, so this is a
+like-for-like decode comparison on one run:
+
+| Cell | nvJPEG RGB (GPU-resident) | CPU NV12 | Speedup (median) |
+|------|--------------------------|----------|------------------|
+| zidane 720p (1280×720) | **2.21 ms** (p95 2.24) | 5.97 ms (p95 5.98) | **2.70×** |
+| giraffe 640 (640×640)  | **3.24 ms** (p95 3.49) | 5.39 ms (p95 5.41) | **1.67×** |
+
+These confirm the earlier `examples/nvjpeg_decode` smoke-test figures (2.04 ms /
+3.31 ms). And nvJPEG output is already RGB and GPU-resident, so it also saves the
+NV12→RGB convert and the host→GPU upload the CPU path still owes.
+
+**Decode-only RGBI into a device pointer** (lower-level C++ probe data, same Orin,
+full per-call stream sync):
+
+| Image | Subsampling | Bitstream | nvJPEG (GPU_HYBRID) |
+|-------|-------------|-----------|---------------------|
+| 1280×800 | 4:4:4 | 107 KB | ~7.0 ms |
+| 3840×2160 | 4:4:4 | 153 KB | ~17.8 ms |
+| 3840×2160 | 4:4:4 | 3.28 MB | ~73.6 ms |
+
+**Key points:**
+- On Orin, `NVJPEG_BACKEND_HARDWARE` is unsupported (`nvjpegCreateEx` → status
+  7); nvJPEG runs on **CUDA cores** (`GPU_HYBRID`/`DEFAULT`), not the NVJPG ASIC.
+  To use the ASIC you would need the Jetson multimedia `NvJPEGDecoder` API — out
+  of scope.
+- The win is **GPU-resident output + a freed CPU**, not raw decode speed.
+  Decode time tracks resolution and bitstream entropy (4K spans ~18–74 ms). The
+  honest comparison is end-to-end **nvJPEG-RGB-decode + `convert()`** vs
+  **CPU-NV12-decode + GPU-upload + NV12→RGB `convert()`** — to be captured
+  on-target as `codec/jpeg/nvjpeg/e2e/*` once deployed.
+- Each frame pays two GL-thread `cuda_map`/unmap round-trips (the PBO must be
+  unmapped before `convert()` samples it); the `nvjpeg_map`/`nvjpeg_unmap`
+  tracing spans isolate that cost. Keep the decode-source pool on a GL thread
+  off the `convert()` hot path to avoid contention.
+- _Status:_ the end-to-end codec path and the in-tree `codec/jpeg/nvjpeg/rgbi/*`
+  bench cells are validated on-target (tables above, captured 2026-06-15). The
+  multi-worker e2e/overlap comparison still needs a profiler-level deployment to
+  drive concurrent decoders, and is to be captured here then.
+
 ### EXIF Orientation Overhead
 
 **Data collected:** 2026-05-17 (codec at b77df09..4e04dc4 + EXIF coverage). Each

@@ -579,10 +579,13 @@ name = "edgefirst-codec"
 version = "0.24.2"
 dependencies = [
  "edgefirst-bench",
+ "edgefirst-image",
  "edgefirst-tensor",
+ "env_logger",
  "image",
  "kamadak-exif",
  "libc",
+ "libloading",
  "log",
  "nix 0.31.2",
  "num-traits",

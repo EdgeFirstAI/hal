@@ -44,14 +44,14 @@ only) for the hardware backend. The crate has no dependency on
 | `exif.rs`    | EXIF orientation parsing → `(rotation_degrees, flip_horizontal)`; never applied |
 | `decoder.rs` | `ImageDecoder` struct, magic-byte format detection, decode dispatch |
 | `traits.rs`  | `ImageLoad` extension trait for Tensor/TensorDyn|
-| `jpeg/`      | Custom baseline JPEG decoder + V4L2 backend (see below) |
+| `jpeg/`      | Custom baseline JPEG decoder + V4L2 / nvJPEG backends (see below) |
 | `png.rs`     | Native-format PNG decode with 8-bit and native 16-bit paths |
 
 ### JPEG Module Map (`jpeg/`)
 
 | Module           | Purpose                                              |
 |------------------|------------------------------------------------------|
-| `mod.rs`         | `JpegDecoderState`, `decode_jpeg_into<T>()`, `native_format()`, V4L2 dispatch seam, EXIF reporting |
+| `mod.rs`         | `JpegDecoderState`, `decode_jpeg_into<T>()`, `native_format()`, nvJPEG→V4L2→CPU dispatch seam, EXIF reporting |
 | `types.rs`       | `Component`, `SamplingFactor`, `ImageHeader`, `QuantTable`, `ZIGZAG` |
 | `markers.rs`     | SOF/SOS/DQT/DHT/DRI/APP marker parsing               |
 | `bitstream.rs`   | 64-bit bit buffer with FF/00 byte-stuffing, bulk refill |
@@ -63,6 +63,15 @@ only) for the hardware backend. The crate has no dependency on
 | `idct/sse41.rs`  | SSE4.1 8×8 IDCT: native mullo_epi32, min/max clamping |
 | `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12` row writes, 4:2:0 chroma downsample (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
+| `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
+
+### nvJPEG Backend Module Map (`jpeg/nvjpeg/`, Linux + `nvjpeg` feature)
+
+| Module        | Purpose                                                |
+|---------------|--------------------------------------------------------|
+| `mod.rs`      | `NvJpegProbe` lifecycle, persistent `NvJpegContext` (handle/state/stream), `try_decode()` tri-state, decode-into-PBO-device-pointer (RGB), circuit breaker |
+| `loader.rs`   | `dlopen` of `libnvjpeg.so.12` (explicit CUDA paths; requires `nvjpeg*` symbols to reject the libjpeg-turbo decoy), `OnceLock` table, `EDGEFIRST_ENABLE_NVJPEG` opt-in (**default off**) |
+| `ffi.rs`      | Hand-rolled `#[repr(C)]` `nvjpegImage_t`, enums/consts, `extern "C"` fn-pointer typedefs (verified vs the on-target `nvjpeg.h` 12.3.3) |
 
 ### V4L2 Backend Module Map (`jpeg/v4l2/`, Linux + `v4l2` feature)
 
@@ -109,11 +118,21 @@ pass in the decode hot loop.
 
 ### Hardware Decode Tried Before CPU (Linux)
 
-On Linux with the `v4l2` feature, `decode_jpeg_into` dispatches to the V4L2
-hardware backend first; the from-scratch CPU decoder is the fallback. See
-[V4L2 Hardware Backend](#v4l2-hardware-backend) below. On non-Linux targets, or
-with the feature disabled, the seam compiles to nothing and the CPU decoder
-always runs.
+On Linux, `decode_jpeg_into` dispatches through a three-tier priority —
+**nvJPEG → V4L2 → CPU**:
+
+1. With the `nvjpeg` feature **and** `EDGEFIRST_ENABLE_NVJPEG` set (opt-in,
+   off by default — see [nvJPEG GPU Backend](#nvjpeg-gpu-backend)), if a CUDA
+   device + `libnvjpeg` are present **and** the destination is a CUDA-backed
+   tensor (a PBO on Jetson), the nvJPEG GPU backend decodes interleaved RGB
+   straight into the tensor's device pointer.
+2. Otherwise, with the `v4l2` feature, the V4L2 hardware backend (native
+   NV12/Grey/NV24) — see [V4L2 Hardware Backend](#v4l2-hardware-backend).
+3. Otherwise the from-scratch CPU decoder.
+
+Each tier returns `Ok(None)` (not applicable) or a `Fallback` error to cascade
+to the next. On non-Linux targets, or with both features disabled, the seams
+compile to nothing and the CPU decoder always runs.
 
 ### Standalone `ImageDecoder` Struct
 
@@ -121,7 +140,8 @@ The decoder is a standalone struct rather than being embedded in
 `ImageProcessor` or stored in thread-local state. This gives callers explicit
 ownership and composability — one decoder per pipeline stage, no hidden global
 state. Its `JpegDecoderState` holds the reusable MCU scratch and (on Linux) the
-lazily-probed V4L2 backend, both amortised across frames.
+lazily-probed nvJPEG and V4L2 backends — including nvJPEG's persistent
+handle/state/stream — all amortised across frames.
 
 ```rust
 let mut decoder = ImageDecoder::new();
@@ -429,6 +449,97 @@ wrong size yields the wrong ioctl request number → `ENOTTY` → a silent CPU
 fallback that makes parity tests pass trivially. On-target `strace` is the only
 reliable verification of the raw ioctl ABI — see `TESTING.md`.
 
+## nvJPEG GPU Backend
+
+`jpeg/nvjpeg/` offloads JPEG decode to the CUDA nvJPEG library on NVIDIA
+platforms (lead target: Jetson Orin). When enabled it is preferred ahead of
+V4L2/CPU, but it is **opt-in and off by default** (`EDGEFIRST_ENABLE_NVJPEG`,
+see [Discovery](#discovery-dlopen-capability-based)) so it never silently
+contends with CUDA inference. It is entirely `dlopen`-based — no link-time CUDA
+dependency, so one binary runs on Jetson (nvJPEG), i.MX (V4L2), and a laptop
+(CPU).
+
+### Discovery (dlopen, capability-based)
+
+`loader.rs` opens `libnvjpeg.so.12`, trying explicit CUDA install paths first
+(the soname is not on JetPack's default loader path) and **requiring** the
+`nvjpeg*` symbols to resolve — this rejects the libjpeg-turbo *decoy*
+(`/usr/lib/.../nvidia/libnvjpeg.so`) that shares the name but exports `jpeg_*`.
+nvJPEG is **opt-in and off by default** — it decodes on the same GPU as CUDA
+inference (TensorRT etc.), so sharing the device can cost a concurrent inference
+engine more than the decode speedup returns. Set `EDGEFIRST_ENABLE_NVJPEG=1`
+(`true`/`yes`) to enable it on decode-bound workloads or where no concurrent GPU
+compute runs. (V4L2 stays opt-out via `EDGEFIRST_DISABLE_V4L2`: it is a separate
+hardware block and does not contend with CUDA.) The `NvJpegProbe` (on
+`JpegDecoderState`) is probed once per `ImageDecoder`; a ready `NvJpegContext`
+persists the nvJPEG handle, a reusable decode state (keeping nvJPEG's internal
+device scratch hot), and **one CUDA stream per decoder** so concurrent decode
+workers do not serialise on the default stream.
+
+### RGB output — a deliberate exception to the native-format contract
+
+Unlike the CPU/V4L2 paths (native NV12/Grey/NV24, never colour-converted), the
+nvJPEG path emits packed **`Rgb`** via `NVJPEG_OUTPUT_RGBI`. nvJPEG performs the
+YCbCr→RGB on the GPU at near-zero marginal cost, the result is GPU-resident, and
+`ImageProcessor::convert()` accepts an `Rgb` source directly (removing the
+downstream NV12→RGB step). `Rgbi` maps onto the existing `PixelFormat::Rgb` — no
+new enum variant. The backend reconfigures the destination NV12→Rgb and, on any
+post-reconfigure failure, restores the native format so the V4L2/CPU
+fall-through writes into a correctly-shaped tensor. (The L4T nvJPEG 12.3.3 build
+has no `NVJPEG_OUTPUT_NV12`, so RGB is also the only single-call option here.)
+
+### PBO + `cuda_map` zero-copy chain
+
+The destination is a `TensorMemory::Pbo` tensor — what
+`ImageProcessor::create_image` yields on Jetson (no dma-heap) — whose CUDA
+GL-buffer registration is mapped to a device pointer via `Tensor::cuda_map()`.
+nvJPEG decodes a single interleaved RGB plane into that pointer (honouring any
+batch `plane_offset`), the stream is synchronised, and the PBO is unmapped so
+`convert()` can sample it. The nvJPEG row pitch is read back from
+`Tensor::effective_row_stride()` *after* the `Rgb` reconfigure rather than
+assumed — `configure_image` keeps a PBO tight (`width*3`) but rounds a
+CUDA-backed DMA destination up to a 64-byte-aligned pitch, and writing at the
+wrong pitch would shear the rows `convert()` then samples. Because
+`cuda_map`/unmap on a GL-buffer route to the GL worker thread that owns the PBO,
+each frame pays **two GL-thread round-trips** (map + unmap). The capacity of the
+packed RGB write is bounds-checked against the mapping length explicitly —
+`configure_image` does not guard a packed format on GL (PBO) memory — and an
+NV12-sized buffer too small for 3 B/px RGB falls back to V4L2/CPU rather than
+erroring.
+
+### Orin: GPU_HYBRID, not the NVJPG ASIC
+
+On Orin the dedicated-hardware backend (`NVJPEG_BACKEND_HARDWARE`) is
+unsupported (`nvjpegCreateEx` returns status 7), so the context uses
+`NVJPEG_BACKEND_DEFAULT` (GPU-hybrid: CUDA-core Huffman). The throughput win is
+**GPU-resident output + freed CPU**, not raw decode speed (measured RGBI
+decode-only: 720p 4:4:4 ~7 ms; 4K ~18–74 ms, entropy-dependent). Whether it
+beats CPU-decode-NV12 + GPU-upload is a per-resolution call, gated on the
+on-target `codec/jpeg/nvjpeg/*` benchmarks.
+
+### Overlap model
+
+Per-decoder CUDA streams let concurrent decode workers interleave on the GPU;
+the primary throughput mechanism is pipeline overlap via the consumer's ring
+buffer (decode worker N+1 runs while worker N's frame is converted).
+Intra-frame CUDA/GL overlap on the single Orin GPU is unproven and must be
+trace-verified. To keep the per-frame `cuda_map` round-trips off the `convert()`
+hot path, the consumer should own the decode-source pool on a GL thread distinct
+from the convert GL thread (a consumer-side concern).
+
+### Fallback & recovery
+
+`try_decode()` returns `Ok(None)` when nvJPEG is unavailable or the destination
+is not CUDA-backed (untouched tensor → V4L2/CPU), `Err(Fallback)` on a transient
+nvJPEG error (the native format is restored and the CPU decoder — which handles
+progressive/non-baseline JPEGs nvJPEG rejects — runs on the same tensor), and
+`Fatal` for deterministic tensor errors. After `MAX_CONSECUTIVE_FAILURES` (8)
+the backend is demoted for the rest of the session (circuit breaker).
+
+A future increment (not built) could defer the `cudaStreamSynchronize`/unmap and
+hand a CUDA event to `convert()`, gated on a measured demonstration that
+per-decode sync stalls the worker.
+
 ## Tracing Spans
 
 `ImageDecoder::decode_into` (and the trait-method `Tensor::load_image`) emits a
@@ -455,6 +566,12 @@ codec.decode_jpeg                                       [user-facing fn]
 │ fields: dtype = "u8", n_bytes
 │
 ├── codec.decode_jpeg.parse_markers                     ← parse SOF0/DQT/DHT/DRI/SOS/APP1, read EXIF orientation
+├── codec.decode_jpeg.nvjpeg                            ← nvJPEG GPU decode into the PBO device pointer (RGB)
+│   │ fields: w, h, n_bytes, target = "rgbi"
+│   ├── codec.decode_jpeg.nvjpeg_map                    ← cuda_map(): GL-thread round-trip → device pointer
+│   ├── codec.decode_jpeg.nvjpeg_submit                 ← nvjpegDecode enqueue on the per-decoder stream
+│   ├── codec.decode_jpeg.nvjpeg_sync                   ← cudaStreamSynchronize (GPU decode time)
+│   └── codec.decode_jpeg.nvjpeg_unmap                  ← drop(CudaMap): GL-thread round-trip, PBO freed for convert()
 ├── codec.decode_jpeg.v4l2_rebuild                      ← full V4L2 session setup (first frame, OUTPUT overflow, recovery)
 │   fields: w, h
 ├── codec.decode_jpeg.v4l2_reconfigure                  ← CAPTURE-only retarget on geometry change (~1 ms, DMABUF)
@@ -472,12 +589,14 @@ codec.decode_png                                        [user-facing fn]
     field: path = "u8" | "native_u16"
 ```
 
-The `v4l2_*` and `mcu_loop` spans are mutually exclusive: when the V4L2
-hardware backend handles a JPEG the `mcu_loop` span is absent, and when the
-CPU decodes (no device, non-Linux, or hardware fallback) no `v4l2_*` span
-appears. A steady-state hardware frame shows only `v4l2_collect` (the reuse
-path); `v4l2_reconfigure` appears on geometry changes and `v4l2_rebuild` on
-the first frame or error recovery.
+The `nvjpeg*`, `v4l2_*`, and `mcu_loop` spans are mutually exclusive — exactly
+one backend handles a given JPEG. An nvJPEG frame shows the `nvjpeg` subtree
+(and no `v4l2_*`/`mcu_loop`); a V4L2 frame shows the `v4l2_*` spans; a CPU frame
+(no GPU/device, non-Linux, or a hardware fallback) shows only `mcu_loop`. A
+steady-state V4L2 frame shows only `v4l2_collect` (the reuse path);
+`v4l2_reconfigure` appears on geometry changes and `v4l2_rebuild` on the first
+frame or error recovery. For nvJPEG, `nvjpeg_sync` is the GPU decode time and
+`nvjpeg_map`/`nvjpeg_unmap` isolate the per-frame GL-thread round-trip cost.
 
 ### What each span measures
 
@@ -485,6 +604,9 @@ the first frame or error recovery.
 |-----------------------------------|--------------------------|----------------------|
 | `codec.decode_jpeg`               | Full JPEG decode: marker parsing then either the V4L2 hardware decode or the CPU MCU loop, writing native `Nv12`/`Grey`. | Baseline JPEG decode per ITU T.81. |
 | `codec.decode_jpeg.parse_markers` | Walk the JPEG byte stream once: parse SOF0, DQT, DHT, DRI, SOS, and APP1 (EXIF) segments; build Huffman LUTs and quant tables; read the EXIF orientation tag. | Equivalent to libjpeg's `jpeg_read_header` + DHT/DQT table builds. |
+| `codec.decode_jpeg.nvjpeg`        | The nvJPEG GPU decode: map the PBO, `nvjpegGetImageInfo`, decode interleaved `Rgb` into the device pointer, synchronise, unmap. `target = "rgbi"`. Absent when V4L2/CPU decodes. | nvJPEG single-image GPU decode (`nvjpegDecode`). |
+| `codec.decode_jpeg.nvjpeg_map` / `nvjpeg_unmap` | The `cuda_map()` / drop round-trips to the PBO's owning GL worker thread (`cudaGraphicsMapResources` / `Unmap`). Isolates the per-frame GL-thread interop cost. | CUDA-GL interop buffer map/unmap. |
+| `codec.decode_jpeg.nvjpeg_submit` / `nvjpeg_sync` | `nvjpegDecode` enqueue on the per-decoder CUDA stream, then `cudaStreamSynchronize`. `nvjpeg_sync`'s duration is the GPU decode time (resolution/entropy dependent). | Async CUDA decode + stream sync. |
 | `codec.decode_jpeg.mcu_loop`      | The CPU core loop: per MCU row, Huffman-decode + dequant-fuse → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2) → native `Grey`/`Nv12`/`Nv24` write, strided into the tensor. Allocation-free after warmup. Absent when hardware decodes. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, IDCT handwritten and SIMD-dispatched. |
 | `codec.decode_jpeg.v4l2_rebuild`  | Full V4L2 stream setup: OUTPUT buffer allocation + mmap + `STREAMON`, JPEG staging, `SOURCE_CHANGE` wait, CAPTURE format negotiation, `REQBUFS(DMABUF)`, `STREAMON`. Runs on the first frame, OUTPUT overflow, or error recovery. | A stateful V4L2 decoder session open + format negotiation. |
 | `codec.decode_jpeg.v4l2_reconfigure` | The geometry-change hot path: `STREAMOFF`/`REQBUFS(0)` on CAPTURE only, JPEG staging + `QBUF` while OUTPUT keeps streaming, `SOURCE_CHANGE` wait, `G_FMT` stale-geometry guard, renegotiation, `REQBUFS(1, DMABUF)`, `STREAMON`. ~1 ms — DMABUF makes `REQBUFS` allocation-free, vs ~110 ms for an MMAP buffer reallocation. | The V4L2 stateful-decoder dynamic-resolution-change sequence. |

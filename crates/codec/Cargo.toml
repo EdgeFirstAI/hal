@@ -13,17 +13,20 @@ categories = ["multimedia::images", "embedded"]
 documentation = "https://docs.rs/edgefirst-codec"
 
 [features]
-# v4l2 is on by default but its deps are Linux-target-only and all backend
-# code is gated `#[cfg(all(target_os = "linux", feature = "v4l2"))]`, so off
-# Linux it compiles to nothing and pulls no extra dependencies.
-default = ["v4l2"]
+# v4l2 and nvjpeg are on by default but their backend code is fully gated
+# `#[cfg(all(target_os = "linux", feature = "..."))]`, so off Linux they compile
+# to nothing. nvjpeg is pure dlopen (no link-time CUDA dependency) — it loads
+# libnvjpeg.so.12 at runtime and degrades to the V4L2/CPU decoders when absent.
+default = ["v4l2", "nvjpeg"]
 v4l2 = ["dep:nix", "dep:libc"]
+nvjpeg = ["dep:libloading"]
 opencv = ["dep:opencv"]
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
 edgefirst-tensor = { workspace = true }
 kamadak-exif = { workspace = true }
+libloading = { workspace = true, optional = true }
 log = { workspace = true }
 num-traits = { workspace = true }
 opencv = { workspace = true, optional = true }
@@ -40,6 +43,12 @@ libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
+env_logger = { workspace = true }
+# edgefirst-image is used only by the on-target nvjpeg benchmark cells to
+# allocate a CUDA-registered PBO destination via ImageProcessor::create_image.
+# This is a dev-dependency cycle (image depends on codec); Cargo permits it
+# because dev-dependencies do not participate in the library's own build graph.
+edgefirst-image = { workspace = true }
 image = { workspace = true }
 # zune-jpeg is used only by parity tests and the comparison benchmark.
 zune-jpeg = { workspace = true }

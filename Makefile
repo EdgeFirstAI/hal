@@ -297,6 +297,17 @@ bench:
 	@cargo bench $(RUST_FEATURES) --workspace
 	@echo "✓ Benchmarks complete"
 
+# On-target nvJPEG decode benchmark (Jetson). Points the loader at the CUDA
+# library path (libnvjpeg.so.12 is not on the default loader path) and runs
+# only the codec bench; the nvjpeg cells self-skip without CUDA/libnvjpeg.
+.PHONY: bench-nvjpeg
+bench-nvjpeg:
+	@echo "Running nvJPEG benchmark (on-target)..."
+	@EDGEFIRST_ENABLE_NVJPEG=1 \
+		LD_LIBRARY_PATH="/usr/local/cuda/targets/aarch64-linux/lib:$$LD_LIBRARY_PATH" \
+		cargo bench -p edgefirst-codec --bench codec_benchmark -- --json nvjpeg-bench.json
+	@echo "✓ nvJPEG benchmark complete (results in nvjpeg-bench.json)"
+
 # ===========================================================================
 # SBOM & LICENSE COMPLIANCE
 # ===========================================================================

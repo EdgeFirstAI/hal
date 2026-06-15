@@ -22,6 +22,25 @@ pub mod types;
 #[cfg(all(target_os = "linux", feature = "v4l2"))]
 mod v4l2;
 
+/// Optional nvJPEG GPU JPEG-decoder backend (Linux + CUDA, `nvjpeg` feature).
+#[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+mod nvjpeg;
+
+/// Runtime probe: `true` when the nvJPEG GPU decoder is available.
+#[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+pub(crate) use nvjpeg::is_nvjpeg_available as nvjpeg_available;
+
+/// Parse a boolean backend-gate environment variable: `true` only for
+/// `1`/`true`/`yes` (case-insensitive, trimmed); absent or anything else is
+/// `false`. Shared by the V4L2 opt-out (`EDGEFIRST_DISABLE_V4L2`) and the nvJPEG
+/// opt-in (`EDGEFIRST_ENABLE_NVJPEG`) gates.
+#[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 use crate::error::{CodecError, UnsupportedFeature};
 use crate::exif::read_exif_orientation;
 use crate::options::ImageInfo;
@@ -41,6 +60,11 @@ pub struct JpegDecoderState {
     /// decodes.
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
     v4l2: v4l2::V4l2Probe,
+    /// nvJPEG GPU decoder, lazily probed on first decode. Preferred over V4L2
+    /// when a CUDA device + libnvjpeg are present and the destination is a
+    /// CUDA-backed tensor; reuses one nvJPEG handle/state/stream across decodes.
+    #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+    nvjpeg: nvjpeg::NvJpegProbe,
 }
 
 impl JpegDecoderState {
@@ -49,6 +73,8 @@ impl JpegDecoderState {
             mcu_scratch: None,
             #[cfg(all(target_os = "linux", feature = "v4l2"))]
             v4l2: v4l2::V4l2Probe::default(),
+            #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+            nvjpeg: nvjpeg::NvJpegProbe::default(),
         }
     }
 }
@@ -203,7 +229,33 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         .effective_row_stride()
         .unwrap_or(native_row_stride(img_w));
 
-    // Try the V4L2 hardware decoder first when available; a probed-but-failing
+    // Try the nvJPEG GPU decoder first when available (CUDA + libnvjpeg). It
+    // decodes interleaved RGB straight into a CUDA-backed (PBO) destination for
+    // zero-copy `convert()`. A non-CUDA destination or any failure cascades to
+    // the V4L2/CPU decoders.
+    #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
+    {
+        match state
+            .nvjpeg
+            .try_decode::<T>(data, &headers, dst, output_fmt, img_w, img_h, dst_stride)
+        {
+            Ok(Some(mut info)) => {
+                info.rotation_degrees = rotation_degrees;
+                info.flip_horizontal = flip_horizontal;
+                // RGB output carries no chroma colorimetry; clear any stale
+                // value left on a recycled pool tensor.
+                dst.set_colorimetry(None);
+                return Ok(info);
+            }
+            Ok(None) => {}
+            Err(nvjpeg::NvJpegDecode::Fallback(why)) => {
+                log::debug!("nvjpeg jpeg decode fell back: {why}");
+            }
+            Err(nvjpeg::NvJpegDecode::Fatal(e)) => return Err(e),
+        }
+    }
+
+    // Try the V4L2 hardware decoder next when available; a probed-but-failing
     // device resets itself and falls through to the CPU decoder transparently.
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
     {

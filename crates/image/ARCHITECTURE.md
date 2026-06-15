@@ -456,16 +456,23 @@ targets the PACK binding. Mem tensors map directly — no channel round-trip
 XORs rendered pixels with 0x80 and no readback un-biases, so the letterbox
 clear colour is pre-biased (`int8_bias_clear`) on every lowering alike.
 
-### CUDA registration of the float PBO
+### CUDA registration of PBO tensors (u8 and float)
 
-After `convert()` writes the float output into the PBO via
-`glReadPixels(GL_PIXEL_PACK_BUFFER)`, the same PBO buffer can be
-registered with CUDA and accessed as a device pointer — no host copy.
+A PBO-backed tensor can be registered with CUDA and accessed as a device
+pointer — no host copy. Both directions use this: a **float** convert
+destination written via `glReadPixels(GL_PIXEL_PACK_BUFFER)` and bound to
+TensorRT (below), and a **u8** source (e.g. an RGB destination the codec's
+nvJPEG backend decodes into via `cuda_map()`, then GL samples for `convert()`).
 
-**Registration** happens on the GL worker thread at `create_image()` time
-(or lazily on the first `cuda_map()` call, whichever comes first) via
-`cudaGraphicsGLRegisterBuffer`. The registration persists for the lifetime
-of the `PboTensor` and is shared across all `cuda_map()` calls on that tensor.
+**Registration** happens on the GL worker thread at `create_image()` time via
+`cudaGraphicsGLRegisterBuffer`, for **both** the u8 PBO path (`create_pbo_image`)
+and the float PBO path (`create_pbo_image_dtype`) — `register_pbo_cuda` is called
+from each. It is **best-effort**: without libcudart (or if the GL context is not
+CUDA-interop-capable, e.g. a Mesa software context) it is a no-op and the tensor
+remains a normal CPU/GL buffer. There is **no lazy path** — if a PBO was not
+registered at creation, `cuda_map()` returns `None` (and CUDA consumers such as
+the nvJPEG backend transparently fall back). The registration persists for the
+lifetime of the `PboTensor` and is shared across all `cuda_map()` calls on it.
 
 **Aliasing rule**: while `CudaMap` is alive, GL must not write into the PBO.
 The aliasing rule is a caller convention enforced by the scoped `CudaMap`

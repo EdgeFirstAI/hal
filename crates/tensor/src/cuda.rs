@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 pub(crate) type CudaError = c_int; // cudaSuccess == 0
 pub type GraphicsResource = *mut c_void; // cudaGraphicsResource_t
 pub(crate) type ExternalMemory = *mut c_void; // cudaExternalMemory_t
+pub type CudaStream = *mut c_void; // cudaStream_t
 
 #[allow(non_snake_case, dead_code)]
 pub(crate) struct CudaTable {
@@ -37,6 +38,9 @@ pub(crate) struct CudaTable {
     pub destroy_external_memory: unsafe extern "C" fn(ExternalMemory) -> CudaError,
     pub memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> CudaError,
     pub free: unsafe extern "C" fn(*mut c_void) -> CudaError,
+    pub stream_create: unsafe extern "C" fn(*mut CudaStream) -> CudaError,
+    pub stream_synchronize: unsafe extern "C" fn(CudaStream) -> CudaError,
+    pub stream_destroy: unsafe extern "C" fn(CudaStream) -> CudaError,
 }
 
 static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
@@ -63,6 +67,9 @@ fn load() -> Option<CudaTable> {
         destroy_external_memory: sym!("cudaDestroyExternalMemory"),
         memcpy: sym!("cudaMemcpy"),
         free: sym!("cudaFree"),
+        stream_create: sym!("cudaStreamCreate"),
+        stream_synchronize: sym!("cudaStreamSynchronize"),
+        stream_destroy: sym!("cudaStreamDestroy"),
     })
 }
 
@@ -98,6 +105,45 @@ pub unsafe fn memcpy_device_to_host(
     }
 }
 
+/// Create a CUDA stream. Returns `None` if libcudart is unavailable or stream
+/// creation fails. The returned stream must be released with
+/// [`stream_destroy`]. Intended for clients (e.g. the codec's nvJPEG backend)
+/// that submit async device work and synchronise on it.
+pub fn stream_create() -> Option<CudaStream> {
+    let t = table()?;
+    let mut stream: CudaStream = std::ptr::null_mut();
+    if unsafe { (t.stream_create)(&mut stream) } != 0 {
+        return None;
+    }
+    Some(stream)
+}
+
+/// Block until all work submitted to `stream` completes. Returns `false` on
+/// failure or if libcudart is unavailable.
+///
+/// # Safety
+///
+/// `stream` must be a live stream returned by [`stream_create`] and not yet
+/// destroyed.
+pub unsafe fn stream_synchronize(stream: CudaStream) -> bool {
+    match table() {
+        Some(t) => (t.stream_synchronize)(stream) == 0,
+        None => false,
+    }
+}
+
+/// Destroy a CUDA stream. No-op if libcudart is unavailable.
+///
+/// # Safety
+///
+/// `stream` must be a live stream returned by [`stream_create`] and must not be
+/// used after this call.
+pub unsafe fn stream_destroy(stream: CudaStream) {
+    if let Some(t) = table() {
+        let _ = (t.stream_destroy)(stream);
+    }
+}
+
 /// Register a GL buffer (PBO) with CUDA. Returns the resource as `usize`
 /// (pointer) or `None`. MUST be called on the thread where the GL context is
 /// current.
@@ -105,7 +151,9 @@ pub fn gl_register_buffer(buffer_id: u32) -> Option<usize> {
     let t = table()?;
     let mut res: GraphicsResource = std::ptr::null_mut();
     // cudaGraphicsRegisterFlagsNone = 0
-    if unsafe { (t.graphics_gl_register_buffer)(&mut res, buffer_id, 0) } != 0 {
+    let rc = unsafe { (t.graphics_gl_register_buffer)(&mut res, buffer_id, 0) };
+    if rc != 0 {
+        log::debug!("cudaGraphicsGLRegisterBuffer(buffer={buffer_id}) failed: cudaError {rc}");
         return None;
     }
     Some(res as usize)
