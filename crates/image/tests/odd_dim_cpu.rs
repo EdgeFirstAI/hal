@@ -1242,3 +1242,97 @@ fn d6_planar_packed_roundtrip() {
         "RGBA→PlanarRgba→RGBA not identity"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fused NV→PlanarRgb / PlanarRgba (strip decode) parity
+//
+// The fused no-resize NV→planar path (`convert_nv_to_planar_fused`) decodes the
+// YUV source into packed RGB one row strip at a time and deinterleaves each
+// strip into the destination planes. It must be byte-for-byte identical to the
+// proven NV→RGB packed path (same `yuv` kernel, just full-image vs strip): NV12
+// 4:2:0 replicates one chroma row across two luma rows, so strip boundaries do
+// not change the per-row chroma pairing. The source fill is arbitrary — both
+// paths read the same bytes — so any seam from strip decoding would surface as a
+// mismatch. Sizes are chosen to straddle the 32-row strip boundary and exercise
+// odd widths/heights (the partial last strip).
+// ---------------------------------------------------------------------------
+
+fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool, label: &str) {
+    let mut src = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    {
+        let mut m = src.map().unwrap();
+        for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(37).wrapping_add(11)) & 0xff) as u8;
+        }
+    }
+    let src_dyn = TensorDyn::from(src);
+    let mut proc = CPUProcessor::default();
+
+    let pfmt = if with_alpha {
+        PixelFormat::PlanarRgba
+    } else {
+        PixelFormat::PlanarRgb
+    };
+    let mut planar =
+        TensorDyn::image(w, h, pfmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    proc.convert(
+        &src_dyn,
+        &mut planar,
+        Rotation::None,
+        Flip::None,
+        Crop::default(),
+    )
+    .unwrap();
+
+    // Reference: the proven NV→RGB packed conversion (unchanged path).
+    let mut rgb =
+        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    proc.convert(&src_dyn, &mut rgb, Rotation::None, Flip::None, Crop::default())
+        .unwrap();
+
+    let planar_t = planar.as_u8().unwrap();
+    let rgb_t = rgb.as_u8().unwrap();
+    let p_stride = planar_t.effective_row_stride().unwrap_or(w);
+    let rgb_stride = rgb_t.effective_row_stride().unwrap_or(w * 3);
+    let p_plane = p_stride * h;
+    let pm = planar_t.map().unwrap();
+    let rm = rgb_t.map().unwrap();
+    let p = pm.as_slice();
+    let r = rm.as_slice();
+
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..3 {
+                assert_eq!(
+                    p[c * p_plane + y * p_stride + x],
+                    r[y * rgb_stride + x * 3 + c],
+                    "{label}: plane {c} at ({x},{y}) differs from packed reference"
+                );
+            }
+            if with_alpha {
+                assert_eq!(
+                    p[3 * p_plane + y * p_stride + x],
+                    255,
+                    "{label}: alpha at ({x},{y}) must be 255"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_nv_planar_parity_matrix() {
+    // (w, h): clean strip multiple, strip-tail, odd-w, odd-h, odd-both, tiny.
+    let dims = [(64, 64), (128, 100), (101, 96), (96, 97), (97, 95), (3, 3), (1, 1)];
+    for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+        for &(w, h) in &dims {
+            for with_alpha in [false, true] {
+                let label = format!(
+                    "{fmt:?} {w}x{h} {}",
+                    if with_alpha { "PlanarRgba" } else { "PlanarRgb" }
+                );
+                fused_nv_planar_parity(w, h, fmt, with_alpha, &label);
+            }
+        }
+    }
+}

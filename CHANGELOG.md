@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cached CPU convert intermediates** (`edgefirst-image`): the multi-step
+  CPU convert pipeline (pre-resize format-convert and the resized-RGB
+  scratch used by letterbox/resize) now reuses two `CPUProcessor`-held
+  buffers across frames instead of allocating — and `alloc_zeroed`-clearing
+  — a fresh full-frame buffer per call. Each consumer fully overwrites the
+  region it reads, so reused (non-zeroed) contents are never observed, and
+  output is unchanged. Measured on Orin Nano (interleaved A/B, NV12 1280×720
+  → 640×640 letterbox): median −8% (2.7→2.5 ms) and, more importantly, the
+  tail flattens (p95 3.3→2.6 ms, max 5.2→2.8 ms) by removing the per-frame
+  mmap/page-fault spikes.
+- **Strip-fused CPU NV→PlanarRgb conversion** (`edgefirst-image`): the
+  no-resize NV12/NV16/NV24 → `PlanarRgb`/`PlanarRgba` conversion now decodes
+  the YUV source into packed RGB one cache-resident row strip at a time
+  (into a `CPUProcessor`-cached scratch) and NEON-deinterleaves each strip
+  straight into the destination planes. The full-size packed-RGB
+  intermediate no longer round-trips through DRAM and is no longer
+  reallocated per frame, so the strip stays hot in L2 between the YUV decode
+  and the deinterleave. Output is byte-for-byte identical to the previous
+  two-pass path (NV12 4:2:0 replicates one chroma row across two luma rows,
+  so strip boundaries do not change the per-row chroma pairing — verified
+  across NV12/16/24, planar/planar-RGBA, and odd dimensions). Measured on
+  Orin Nano (CPU backend, 1280×720, no resize): NV12→PlanarRgb a further
+  −21% on top of the NEON deinterleave (≈ −46% vs the original scalar
+  path). The letterbox path is unchanged (its resize step requires the
+  full packed buffer).
 - **NEON-accelerated CPU packed↔planar conversion and float widen**
   (`edgefirst-image`): the CPU `pack_to_planar` scatter (RGB/RGBA →
   `PlanarRgb`/`PlanarRgba` — the JPEG→NV→planar model-input path on the
