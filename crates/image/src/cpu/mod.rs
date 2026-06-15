@@ -67,6 +67,12 @@ pub struct CPUProcessor {
     /// reuses the allocation instead of a fresh `Vec` per call (the stride
     /// alignment in this release makes that de-stride copy fire far more often).
     resize_destride_scratch: Vec<u8>,
+    /// Reusable cache-resident scratch for the strip-fused NV→planar path
+    /// (`convert_nv_to_planar_fused`): holds a single row strip of packed RGB
+    /// (`STRIP_ROWS * width * 3` bytes). Keeping it on the processor avoids a
+    /// per-frame allocation and lets each strip stay hot in L2 between the YUV
+    /// decode and the deinterleave. Grown on demand; never shrunk.
+    nv_strip_scratch: Vec<u8>,
 }
 
 // `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
@@ -82,6 +88,7 @@ impl Clone for CPUProcessor {
             colors: self.colors,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
         }
     }
 }
@@ -290,6 +297,7 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
         }
     }
 
@@ -306,6 +314,7 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
         }
     }
 
@@ -855,6 +864,19 @@ impl CPUProcessor {
         } else {
             dst_params
         };
+
+        // Fused NV→planar (no resize/flip/rotation/crop): decode the YUV source
+        // into packed RGB one cache-resident row strip at a time and
+        // NEON-deinterleave each strip straight into the destination planes, so
+        // the full-size packed-RGB intermediate never round-trips through DRAM
+        // and is not reallocated per frame. JPEG decodes to the NV family and the
+        // model wants planar RGB, so this is the hot Orin CPU-preprocess path.
+        if !need_resize_flip_rotation
+            && matches!(src_fmt, Nv12 | Nv16 | Nv24)
+            && matches!(dst_fmt, PlanarRgb | PlanarRgba)
+        {
+            return self.convert_nv_to_planar_fused(src, dst, src_fmt, dst_fmt, direct_params);
+        }
 
         // check if a direct conversion can be done
         if !need_resize_flip_rotation && Self::support_conversion_pf(src_fmt, dst_fmt) {
