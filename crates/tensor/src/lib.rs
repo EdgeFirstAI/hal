@@ -96,6 +96,17 @@ use std::{
 };
 pub use tensor_dyn::TensorDyn;
 
+/// Opaque keep-alive handle for a foreign-memory tensor (see
+/// [`Tensor::from_foreign`] / [`TensorDyn::from_foreign_ptr`]).
+///
+/// The HAL borrows the foreign buffer without owning it; this handle co-owns
+/// the *source* so the borrowed memory stays valid for the tensor's life. Its
+/// `Drop` releases the source — e.g. a small struct that calls `cudaFreeHost`,
+/// or a `Py<PyAny>` that decrements a NumPy array's refcount. Wrapping it in an
+/// `Arc` (then boxing each clone) makes the release fire exactly once, after
+/// the last sharing tensor/view/map drops, regardless of drop order.
+pub type ForeignOwner = Box<dyn std::any::Any + Send + Sync>;
+
 /// Re-export of `half::f16` so downstream crates can write
 /// `Tensor::<edgefirst_tensor::f16>::from_iosurface(…)` without
 /// adding `half` to their own dependency list. The version stays in
@@ -1506,6 +1517,54 @@ where
             m.as_mut_slice().copy_from_slice(values);
         }
         Ok(t)
+    }
+
+    /// Wrap externally-owned memory as a tensor without copying. The tensor
+    /// borrows `[ptr, ptr + shape.product() * size_of::<T>())` as
+    /// [`TensorMemory::Mem`]; `owner`, when `Some`, co-owns the source so it
+    /// outlives the tensor (and all derived views/maps). See [`ForeignOwner`].
+    ///
+    /// The canonical use is CUDA zero-copy: allocate host-coherent memory
+    /// (`cudaHostAlloc`), wrap the host pointer here, and bind the matching
+    /// device pointer to the inference engine — reads and writes hit the same
+    /// physical buffer with no host copy. The identical primitive backs the
+    /// Python `Tensor.from_numpy` zero-copy borrow (owner = the NumPy object).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null, aligned to `align_of::<T>()`, and valid for
+    /// `shape.product()` elements of `T` for as long as the returned tensor —
+    /// and every view/map sharing its backing — is alive. Pass an `owner` that
+    /// co-owns the source to uphold that contract.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSize`] if `shape` is empty.
+    pub unsafe fn from_foreign(
+        ptr: *mut T,
+        shape: &[usize],
+        owner: Option<crate::ForeignOwner>,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        if shape.is_empty() {
+            return Err(Error::InvalidSize(0));
+        }
+        if ptr.is_null() {
+            return Err(Error::InvalidArgument(
+                "from_foreign: ptr must be non-null".to_owned(),
+            ));
+        }
+        shape
+            .iter()
+            .copied()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "from_foreign: shape.product() overflows usize (shape={shape:?})"
+                ))
+            })?;
+        let mem = MemTensor::<T>::from_foreign(ptr, shape, owner, name);
+        Ok(Self::wrap(TensorStorage::Mem(mem)))
     }
 
     /// Construct a tensor from a 3-D ndarray view. Respects strides — one

@@ -29,8 +29,21 @@ use std::{
 /// whose `mmap` likewise hands out independent `&mut` windows of one buffer).
 /// `UnsafeCell` makes the *non-overlapping* case sound; overlapping mutable
 /// windows held simultaneously remain UB by the documented `subview` contract.
-struct MemBacking<T> {
-    cells: Box<[UnsafeCell<T>]>,
+enum MemBacking<T> {
+    /// HAL-owned allocation; the `Box` frees it when the last `Arc` drops.
+    Owned(Box<[UnsafeCell<T>]>),
+    /// Externally-owned memory the HAL borrows but never frees. `ptr`/`len`
+    /// describe the borrowed region (`len` in elements); `_owner`, when
+    /// present, is an opaque keep-alive whose `Drop` releases the source (e.g.
+    /// `cudaFreeHost`, a NumPy ref decrement). Dropping this arm runs
+    /// `_owner`'s destructor but leaves the foreign pointer untouched. The
+    /// elements are still `UnsafeCell` so the shared-`Arc` write-provenance
+    /// contract documented above holds for foreign buffers too.
+    Foreign {
+        ptr: *mut UnsafeCell<T>,
+        len: usize,
+        _owner: Option<crate::ForeignOwner>,
+    },
 }
 
 // SAFETY: `UnsafeCell<T>` is `!Sync`, but a `MemBacking` is only mutated through
@@ -42,23 +55,28 @@ unsafe impl<T: Sync> Sync for MemBacking<T> {}
 
 impl<T: fmt::Debug> fmt::Debug for MemBacking<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MemBacking")
-            .field("len", &self.cells.len())
-            .finish()
+        let len = self.len();
+        f.debug_struct("MemBacking").field("len", &len).finish()
     }
 }
 
 impl<T> MemBacking<T> {
     /// Number of elements in the allocation.
     fn len(&self) -> usize {
-        self.cells.len()
+        match self {
+            MemBacking::Owned(cells) => cells.len(),
+            MemBacking::Foreign { len, .. } => *len,
+        }
     }
 
     /// Base pointer with write provenance (the cells are `UnsafeCell`, so
     /// interior mutation through the shared `Arc` is sound). `UnsafeCell<T>`
     /// is `#[repr(transparent)]`, so the address equals the `T` element's.
     fn base_ptr(&self) -> *mut T {
-        self.cells.as_ptr() as *mut T
+        match self {
+            MemBacking::Owned(cells) => cells.as_ptr() as *mut T,
+            MemBacking::Foreign { ptr, .. } => *ptr as *mut T,
+        }
     }
 
     /// Build a zeroed backing of `n` elements by writing `T::zero()` into each
@@ -70,9 +88,7 @@ impl<T> MemBacking<T> {
         T: Num + Clone,
     {
         let cells: Vec<UnsafeCell<T>> = (0..n).map(|_| UnsafeCell::new(T::zero())).collect();
-        Self {
-            cells: cells.into_boxed_slice(),
-        }
+        MemBacking::Owned(cells.into_boxed_slice())
     }
 
     /// Build a zeroed backing of `n` elements, using the allocator's zeroed
@@ -93,9 +109,7 @@ impl<T> MemBacking<T> {
         T: Num + Clone + 'static,
     {
         if n == 0 {
-            return Self {
-                cells: Vec::new().into_boxed_slice(),
-            };
+            return MemBacking::Owned(Vec::new().into_boxed_slice());
         }
         if crate::dtype_of::<T>().is_some() {
             // SAFETY: `dtype_of` is `Some` only for HAL's primitive numeric
@@ -128,9 +142,7 @@ impl<T> MemBacking<T> {
         // `(ptr, n)` and element type deallocates with the matching
         // `Layout::array::<UnsafeCell<T>>(n)` on drop.
         let slice = std::slice::from_raw_parts_mut(ptr, n);
-        Self {
-            cells: Box::from_raw(slice),
-        }
+        MemBacking::Owned(Box::from_raw(slice))
     }
 }
 
@@ -300,6 +312,40 @@ where
             // allocations.
             identity: parent.identity.clone(),
         })
+    }
+
+    /// Wrap externally-owned memory as a `MemTensor` without taking ownership
+    /// of the allocation (no copy). The tensor borrows
+    /// `[ptr, ptr + shape.product() * size_of::<T>())`; `owner`, when `Some`,
+    /// co-owns the *source* so the borrowed memory outlives this tensor (and
+    /// any [`view`](Self::view) or map derived from it). The foreign pointer is
+    /// never freed by this type — only `owner`'s destructor runs on drop.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null, aligned to `align_of::<T>()`, and valid for
+    /// `shape.product()` elements of `T` for as long as this tensor — and every
+    /// view/map sharing its backing — is alive. Passing an `owner` that co-owns
+    /// the source (e.g. an `Arc` whose `Drop` frees it) is the supported way to
+    /// uphold that lifetime contract.
+    pub(crate) unsafe fn from_foreign(
+        ptr: *mut T,
+        shape: &[usize],
+        owner: Option<crate::ForeignOwner>,
+        name: Option<&str>,
+    ) -> Self {
+        let len: usize = shape.iter().product();
+        MemTensor {
+            name: name.unwrap_or("foreign_mem_tensor").to_owned(),
+            shape: shape.to_vec(),
+            data: Arc::new(MemBacking::Foreign {
+                ptr: ptr as *mut UnsafeCell<T>,
+                len,
+                _owner: owner,
+            }),
+            offset: 0,
+            identity: crate::BufferIdentity::new(),
+        }
     }
 
     /// Set the byte offset of the logical window into the backing allocation.
@@ -675,5 +721,81 @@ mod tests {
             "debug should name MemBacking: {s}"
         );
         assert!(s.contains("len"), "debug should report len: {s}");
+    }
+
+    #[test]
+    fn from_foreign_without_owner_borrows_caller_memory() {
+        // No owner: the caller guarantees the buffer outlives the tensor. Writes
+        // through the tensor must land in the caller's own allocation (zero-copy).
+        let mut vec: Vec<i32> = vec![0; 4];
+        let ptr = vec.as_mut_ptr();
+        let t = unsafe { MemTensor::<i32>::from_foreign(ptr, &[4], None, None) };
+        assert_eq!(t.shape(), &[4]);
+        assert_eq!(t.memory(), TensorMemory::Mem);
+        {
+            let mut m = t.map().unwrap();
+            m.as_mut_slice().copy_from_slice(&[10, 20, 30, 40]);
+        }
+        drop(t);
+        // The writes are visible in the caller's Vec — same physical buffer.
+        assert_eq!(vec, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn from_foreign_views_share_the_borrowed_buffer() {
+        // A `view()` shares the backing `Arc`, so it addresses the same foreign
+        // memory as the parent (with an offset) — the zero-copy export path.
+        let mut vec: Vec<u8> = vec![0u8; 6];
+        let ptr = vec.as_mut_ptr();
+        let owner: crate::ForeignOwner = Box::new(vec); // keep the heap buffer alive
+        let t = unsafe { MemTensor::<u8>::from_foreign(ptr, &[2, 3], Some(owner), Some("foreign")) };
+        {
+            let mut m = t.map().unwrap();
+            m.as_mut_slice().copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        }
+        // Second row [4,5,6] via a sub-region view of the same buffer.
+        let v = MemTensor::view(&t, 3, &[3]).unwrap();
+        assert_eq!(v.map().unwrap().as_slice(), &[4, 5, 6]);
+    }
+
+    #[test]
+    fn from_foreign_owner_drop_fires_on_last_reference() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The owner co-owns the source; its `Drop` (the "free") must fire exactly
+        // once, after the last tensor/map sharing the backing is gone — regardless
+        // of whether the source tensor or a derived map outlives the other.
+        struct DropFlag {
+            _buf: Box<[u8]>,
+            flag: Arc<AtomicBool>,
+        }
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.flag.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut buf = vec![7u8; 4].into_boxed_slice();
+        let ptr = buf.as_mut_ptr();
+        let owner: crate::ForeignOwner = Box::new(DropFlag {
+            _buf: buf,
+            flag: flag.clone(),
+        });
+        let t = unsafe { MemTensor::<u8>::from_foreign(ptr, &[4], Some(owner), None) };
+
+        // `map()` returns an owned `Arc` clone, so the map outlives the tensor.
+        let m = t.map().unwrap();
+        assert_eq!(m.as_slice()[0], 7);
+        drop(t);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "owner must stay alive while a map still references the backing"
+        );
+        drop(m);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "owner Drop (the free) must fire on the last reference drop"
+        );
     }
 }
