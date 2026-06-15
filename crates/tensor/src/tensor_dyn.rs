@@ -531,6 +531,40 @@ impl TensorDyn {
         }
     }
 
+    /// Wrap externally-owned memory as a type-erased tensor without copying.
+    /// The tensor borrows `[ptr, ptr + shape.product() * dtype.size())` as
+    /// [`TensorMemory::Mem`]; `owner`, when `Some`, co-owns the source so it
+    /// outlives the tensor (and all derived views/maps). See
+    /// [`crate::ForeignOwner`] and [`Tensor::from_foreign`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null, aligned to the element type, and valid for
+    /// `shape.product()` elements of `dtype` for as long as the returned
+    /// tensor — and every view/map sharing its backing — is alive. Pass an
+    /// `owner` that co-owns the source to uphold that contract.
+    pub unsafe fn from_foreign_ptr(
+        ptr: *mut u8,
+        shape: &[usize],
+        dtype: DType,
+        owner: Option<crate::ForeignOwner>,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        match dtype {
+            DType::U8 => Tensor::<u8>::from_foreign(ptr.cast(), shape, owner, name).map(Self::U8),
+            DType::I8 => Tensor::<i8>::from_foreign(ptr.cast(), shape, owner, name).map(Self::I8),
+            DType::U16 => Tensor::<u16>::from_foreign(ptr.cast(), shape, owner, name).map(Self::U16),
+            DType::I16 => Tensor::<i16>::from_foreign(ptr.cast(), shape, owner, name).map(Self::I16),
+            DType::U32 => Tensor::<u32>::from_foreign(ptr.cast(), shape, owner, name).map(Self::U32),
+            DType::I32 => Tensor::<i32>::from_foreign(ptr.cast(), shape, owner, name).map(Self::I32),
+            DType::U64 => Tensor::<u64>::from_foreign(ptr.cast(), shape, owner, name).map(Self::U64),
+            DType::I64 => Tensor::<i64>::from_foreign(ptr.cast(), shape, owner, name).map(Self::I64),
+            DType::F16 => Tensor::<f16>::from_foreign(ptr.cast(), shape, owner, name).map(Self::F16),
+            DType::F32 => Tensor::<f32>::from_foreign(ptr.cast(), shape, owner, name).map(Self::F32),
+            DType::F64 => Tensor::<f64>::from_foreign(ptr.cast(), shape, owner, name).map(Self::F64),
+        }
+    }
+
     /// Wrap an externally-allocated IOSurface as a type-erased tensor
     /// (macOS only).
     ///
@@ -809,6 +843,29 @@ mod tests {
         let dyn_t: TensorDyn = t.into();
         assert_eq!(dyn_t.dtype(), DType::U8);
         assert_eq!(dyn_t.shape(), &[10]);
+    }
+
+    #[test]
+    fn from_foreign_ptr_wraps_borrowed_memory() {
+        use crate::TensorMapTrait;
+        // The CUDA zero-copy export shape: wrap an externally-allocated buffer as
+        // a type-erased Mem tensor, with an owner that frees it on last drop.
+        let mut vec: Vec<f32> = vec![0.0; 4];
+        let ptr = vec.as_mut_ptr() as *mut u8;
+        let owner: crate::ForeignOwner = Box::new(vec);
+        let t = unsafe {
+            TensorDyn::from_foreign_ptr(ptr, &[2, 2], DType::F32, Some(owner), Some("trt_output"))
+        }
+        .unwrap();
+        assert_eq!(t.dtype(), DType::F32);
+        assert_eq!(t.memory(), TensorMemory::Mem);
+        assert_eq!(t.shape(), &[2, 2]);
+        {
+            let mut m = t.as_f32().unwrap().map().unwrap();
+            m.as_mut_slice().copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        }
+        let m = t.as_f32().unwrap().map().unwrap();
+        assert_eq!(m.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
