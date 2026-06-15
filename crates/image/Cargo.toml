@@ -99,6 +99,10 @@ name = "convert_matrix_benchmark"
 harness = false
 
 [[bench]]
+name = "cpu_preprocess_benchmark"
+harness = false
+
+[[bench]]
 name = "batch_convert_benchmark"
 harness = false
 

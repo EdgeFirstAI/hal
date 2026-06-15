@@ -12,6 +12,7 @@ use edgefirst_tensor::{
 mod convert;
 mod masks;
 mod resize;
+mod simd;
 mod tests;
 
 // bilinear_dot removed — masks.rs now uses slice-native bilinear_dot_slice
@@ -608,21 +609,6 @@ impl ImageProcessorTrait for CPUProcessor {
     }
 }
 
-/// Widen a `u8` source buffer into a typed destination buffer element-by-element.
-///
-/// `f` converts a single `u8` element to `T`. The implementation is a plain
-/// `iter`/`zip` loop so LLVM can auto-vectorise it (e.g. for the `f32` case).
-///
-/// # Panics (debug)
-/// Panics in debug mode if `src.len() != dst.len()`.
-#[inline]
-fn widen_into<T: Copy>(src: &[u8], dst: &mut [T], f: impl Fn(u8) -> T) {
-    debug_assert_eq!(src.len(), dst.len());
-    for (o, &b) in dst.iter_mut().zip(src.iter()) {
-        *o = f(b);
-    }
-}
-
 // Internal methods — dtype-aware dispatch layer.
 impl CPUProcessor {
     /// Top-level conversion dispatcher: handles dtype combinations.
@@ -719,17 +705,20 @@ impl CPUProcessor {
                             let dst_t = dst.as_f32_mut().unwrap();
                             let mut dst_map = dst_t.map()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
-                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
-                                b as f32 / 255.0
-                            });
+                            // NEON-accelerated u8→f32 `/255` widen (bit-identical
+                            // to the scalar `b as f32 / 255.0`); the scalar
+                            // iterator form did not vectorise. See cpu::simd.
+                            simd::widen_u8_to_f32_norm(src_map.as_slice(), dst_map.as_mut_slice());
                         }
                         DType::F16 => {
                             let dst_t = dst.as_f16_mut().unwrap();
                             let mut dst_map = dst_t.map()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
-                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
-                                half::f16::from_f32(b as f32 / 255.0)
-                            });
+                            // u8→f16 `/255` widen; uses native FP16
+                            // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
+                            // (Orin), scalar `half::f16::from_f32` elsewhere.
+                            // See cpu::simd.
+                            simd::widen_u8_to_f16_norm(src_map.as_slice(), dst_map.as_mut_slice());
                         }
                         _ => unreachable!(),
                     }

@@ -216,6 +216,69 @@ fn pack_to_planar(
     if plane == 0 {
         return Ok(()); // zero-height / empty image: nothing to scatter
     }
+
+    // Fast path: identity colour mapping (R,G,B ← src channels 0,1,2) with a
+    // 3- or 4-channel packed source, and either no alpha plane, a constant
+    // alpha plane (RGB → PlanarRgba), or an alpha plane copied from src
+    // channel 3 (RGBA → PlanarRgba). This covers every current caller. A single
+    // NEON deinterleaving pass reads the packed source once and writes all
+    // planes, replacing the per-plane scalar gather (which re-read the source
+    // once per plane). Parallelism moves from per-plane to per-row-strip.
+    let n_planes = plane_src.len();
+    let identity_rgb = n_planes >= 3
+        && plane_src[0] == Some(0)
+        && plane_src[1] == Some(1)
+        && plane_src[2] == Some(2);
+    let alpha_from_src = n_planes == 4 && plane_src[3] == Some(3);
+    let const_alpha = n_planes == 4 && plane_src[3].is_none();
+    let fast = identity_rgb
+        && (src_ch == 3 || src_ch == 4)
+        && (n_planes == 3 || (alpha_from_src && src_ch == 4) || const_alpha);
+
+    if fast {
+        let mut planes = dst_bytes.chunks_mut(plane).take(n_planes);
+        let rp = planes.next().unwrap();
+        let gp = planes.next().unwrap();
+        let bp = planes.next().unwrap();
+        let ap = planes.next(); // Some(_) only when n_planes == 4
+        let src_rows = &src_bytes[..h * src_stride];
+
+        // Serial, one pass per row: the NEON `vld3`/`vld4` deinterleave reads
+        // the packed source once and is memory-bandwidth-bound, so on Orin's
+        // shared bus row-level rayon parallelism measured no faster than serial
+        // for the model-preprocessing sizes (≤1080p) while adding scheduling
+        // overhead on small frames. The rare arbitrary-mapping path below keeps
+        // its per-plane parallelism.
+        match ap {
+            Some(ap) if alpha_from_src => {
+                src_rows
+                    .chunks(src_stride)
+                    .zip(rp.chunks_mut(dst_stride))
+                    .zip(gp.chunks_mut(dst_stride))
+                    .zip(bp.chunks_mut(dst_stride))
+                    .zip(ap.chunks_mut(dst_stride))
+                    .for_each(|((((s, r), g), b), a)| {
+                        super::simd::deinterleave_row(s, r, g, b, Some(a), w, src_ch);
+                    });
+            }
+            other => {
+                if let Some(ap) = other {
+                    // Constant alpha plane (RGB → PlanarRgba): fill once.
+                    ap.fill(255);
+                }
+                src_rows
+                    .chunks(src_stride)
+                    .zip(rp.chunks_mut(dst_stride))
+                    .zip(gp.chunks_mut(dst_stride))
+                    .zip(bp.chunks_mut(dst_stride))
+                    .for_each(|(((s, r), g), b)| {
+                        super::simd::deinterleave_row(s, r, g, b, None, w, src_ch);
+                    });
+            }
+        }
+        return Ok(());
+    }
+
     let plane_slices: Vec<&mut [u8]> = dst_bytes.chunks_mut(plane).take(plane_src.len()).collect();
     rayon::scope(|sc| {
         for (pb, &chan) in plane_slices.into_iter().zip(plane_src.iter()) {
