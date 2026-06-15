@@ -69,15 +69,17 @@ fn fmt_name(f: PixelFormat) -> &'static str {
 }
 
 fn main() {
-    env_logger::init();
-    let mut suite = BenchSuite::from_args();
-
-    // Pin the CPU backend: this bench characterises the CPU preprocessing path
-    // that the Orin Nano deployment uses to keep the GPU free for TensorRT.
-    // SAFETY: set_var before any threads spawn.
+    // Pin the CPU backend first, before anything that could spawn a thread:
+    // this bench characterises the CPU preprocessing path the Orin Nano
+    // deployment uses to keep the GPU free for TensorRT.
+    // SAFETY: set_var runs at the very top of main(), before env_logger,
+    // argument parsing, or any worker threads — the process is single-threaded.
     if std::env::var("EDGEFIRST_FORCE_BACKEND").is_err() {
         unsafe { std::env::set_var("EDGEFIRST_FORCE_BACKEND", "cpu") };
     }
+
+    env_logger::init();
+    let mut suite = BenchSuite::from_args();
 
     let iters: usize = std::env::var("EDGEFIRST_BENCH_ITERS")
         .ok()
@@ -187,9 +189,8 @@ fn main() {
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
                     .unwrap();
             });
-            // Throughput is reported against source bytes for the u8 cells; the
-            // f32 cell shares the source so the number is comparable.
-            let _ = src_bytes;
+            // Throughput is reported against source bytes; the f32/f16 cells
+            // share the same source so the numbers are comparable across dtypes.
             r.print_summary_with_throughput(src_bytes);
             suite.record(&r);
         }

@@ -263,8 +263,13 @@ fn pack_to_planar(
             }
             other => {
                 if let Some(ap) = other {
-                    // Constant alpha plane (RGB → PlanarRgba): fill once.
-                    ap.fill(255);
+                    // Constant alpha plane (RGB → PlanarRgba): fill only the `w`
+                    // logical bytes of each row, matching this function's
+                    // contract and the slow-path `None` handling (leave per-row
+                    // padding untouched rather than filling the whole plane).
+                    for row in ap.chunks_mut(dst_stride).take(h) {
+                        row[..w].fill(255);
+                    }
                 }
                 src_rows
                     .chunks(src_stride)

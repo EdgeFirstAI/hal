@@ -49,6 +49,14 @@ pub(super) fn deinterleave_row(
     debug_assert!(src.len() >= w * src_ch);
     debug_assert!(r.len() >= w && g.len() >= w && b.len() >= w);
     debug_assert!(a.as_ref().is_none_or(|a| a.len() >= w));
+    // An alpha plane can only be sourced from a 4-channel input (`src[..+3]`);
+    // a 3-channel source has no alpha byte. The kernels below also guard the
+    // alpha write on `src_ch == 4`, so a misuse can never read out of bounds —
+    // this assert just surfaces the logic error in debug builds.
+    debug_assert!(
+        a.is_none() || src_ch == 4,
+        "alpha output plane requires a 4-channel source"
+    );
 
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is baseline on aarch64; the debug_asserts above document the
@@ -74,7 +82,10 @@ fn deinterleave_row_scalar(
     src_ch: usize,
 ) {
     match a {
-        Some(a) => {
+        // Alpha is only sourced when the input has a 4th channel; the
+        // `src_ch == 4` guard keeps `p[3]` in bounds even if a caller wrongly
+        // pairs `Some(a)` with a 3-channel source (the debug_assert flags it).
+        Some(a) if src_ch == 4 => {
             for x in 0..w {
                 let p = &src[x * src_ch..];
                 r[x] = p[0];
@@ -83,7 +94,7 @@ fn deinterleave_row_scalar(
                 a[x] = p[3];
             }
         }
-        None => {
+        _ => {
             for x in 0..w {
                 let p = &src[x * src_ch..];
                 r[x] = p[0];
@@ -312,13 +323,19 @@ unsafe fn deinterleave_row_neon(
         }
     }
 
-    // Scalar tail for the remaining < 16 pixels.
+    // Scalar tail for the remaining < 16 pixels. The alpha write is gated on
+    // `src_ch == 4` (an alpha byte only exists in a 4-channel source), so
+    // `sp.add(x * src_ch + 3)` can never read past the row even if a caller
+    // wrongly pairs `Some(a)` with a 3-channel source.
+    let write_alpha = src_ch == 4;
     while x < w {
         *rp.add(x) = *sp.add(x * src_ch);
         *gp.add(x) = *sp.add(x * src_ch + 1);
         *bp.add(x) = *sp.add(x * src_ch + 2);
-        if let Some(ap) = ap {
-            *ap.add(x) = *sp.add(x * src_ch + 3);
+        if write_alpha {
+            if let Some(ap) = ap {
+                *ap.add(x) = *sp.add(x * src_ch + 3);
+            }
         }
         x += 1;
     }
