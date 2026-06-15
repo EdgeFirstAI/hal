@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cached CPU convert intermediates** (`edgefirst-image`): the multi-step
+  CPU convert pipeline (pre-resize format-convert and the resized-RGB
+  scratch used by letterbox/resize) now reuses two `CPUProcessor`-held
+  buffers across frames instead of allocating — and `alloc_zeroed`-clearing
+  — a fresh full-frame buffer per call. Each consumer fully overwrites the
+  region it reads, so reused (non-zeroed) contents are never observed, and
+  output is unchanged. Measured on Orin Nano (interleaved A/B, NV12 1280×720
+  → 640×640 letterbox): median −8% (2.7→2.5 ms) and, more importantly, the
+  tail flattens (p95 3.3→2.6 ms, max 5.2→2.8 ms) by removing the per-frame
+  mmap/page-fault spikes.
 - **Strip-fused CPU NV→PlanarRgb conversion** (`edgefirst-image`): the
   no-resize NV12/NV16/NV24 → `PlanarRgb`/`PlanarRgba` conversion now decodes
   the YUV source into packed RGB one cache-resident row strip at a time
