@@ -12,6 +12,7 @@ use edgefirst_tensor::{
 mod convert;
 mod masks;
 mod resize;
+mod simd;
 mod tests;
 
 // bilinear_dot removed — masks.rs now uses slice-native bilinear_dot_slice
@@ -66,6 +67,20 @@ pub struct CPUProcessor {
     /// reuses the allocation instead of a fresh `Vec` per call (the stride
     /// alignment in this release makes that de-stride copy fire far more often).
     resize_destride_scratch: Vec<u8>,
+    /// Reusable cache-resident scratch for the strip-fused NV→planar path
+    /// (`convert_nv_to_planar_fused`): holds a single row strip of packed RGB
+    /// (`STRIP_ROWS * width * 3` bytes). Keeping it on the processor avoids a
+    /// per-frame allocation and lets each strip stay hot in L2 between the YUV
+    /// decode and the deinterleave. Grown on demand; never shrunk.
+    nv_strip_scratch: Vec<u8>,
+    /// Reusable intermediate buffers for the multi-step convert pipeline
+    /// (pre-resize format-convert and the resized-RGB scratch). Reused across
+    /// frames when the dimensions/format match so the steady-state
+    /// letterbox/resize loop does not reallocate — and `alloc_zeroed`-clear — a
+    /// full-frame buffer per call. The region each consumer reads is always
+    /// fully overwritten first, so reused (non-zeroed) contents are never read.
+    convert_tmp: Option<Tensor<u8>>,
+    convert_tmp2: Option<Tensor<u8>>,
 }
 
 // `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
@@ -81,6 +96,9 @@ impl Clone for CPUProcessor {
             colors: self.colors,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
+            convert_tmp: None,
+            convert_tmp2: None,
         }
     }
 }
@@ -289,6 +307,9 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
+            convert_tmp: None,
+            convert_tmp2: None,
         }
     }
 
@@ -305,6 +326,9 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            nv_strip_scratch: Vec::new(),
+            convert_tmp: None,
+            convert_tmp2: None,
         }
     }
 
@@ -608,21 +632,6 @@ impl ImageProcessorTrait for CPUProcessor {
     }
 }
 
-/// Widen a `u8` source buffer into a typed destination buffer element-by-element.
-///
-/// `f` converts a single `u8` element to `T`. The implementation is a plain
-/// `iter`/`zip` loop so LLVM can auto-vectorise it (e.g. for the `f32` case).
-///
-/// # Panics (debug)
-/// Panics in debug mode if `src.len() != dst.len()`.
-#[inline]
-fn widen_into<T: Copy>(src: &[u8], dst: &mut [T], f: impl Fn(u8) -> T) {
-    debug_assert_eq!(src.len(), dst.len());
-    for (o, &b) in dst.iter_mut().zip(src.iter()) {
-        *o = f(b);
-    }
-}
-
 // Internal methods — dtype-aware dispatch layer.
 impl CPUProcessor {
     /// Top-level conversion dispatcher: handles dtype combinations.
@@ -719,17 +728,20 @@ impl CPUProcessor {
                             let dst_t = dst.as_f32_mut().unwrap();
                             let mut dst_map = dst_t.map()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
-                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
-                                b as f32 / 255.0
-                            });
+                            // NEON-accelerated u8→f32 `/255` widen (bit-identical
+                            // to the scalar `b as f32 / 255.0`); the scalar
+                            // iterator form did not vectorise. See cpu::simd.
+                            simd::widen_u8_to_f32_norm(src_map.as_slice(), dst_map.as_mut_slice());
                         }
                         DType::F16 => {
                             let dst_t = dst.as_f16_mut().unwrap();
                             let mut dst_map = dst_t.map()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
-                            widen_into(src_map.as_slice(), dst_map.as_mut_slice(), |b| {
-                                half::f16::from_f32(b as f32 / 255.0)
-                            });
+                            // u8→f16 `/255` widen; uses native FP16
+                            // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
+                            // (Orin), scalar `half::f16::from_f32` elsewhere.
+                            // See cpu::simd.
+                            simd::widen_u8_to_f16_norm(src_map.as_slice(), dst_map.as_mut_slice());
                         }
                         _ => unreachable!(),
                     }
@@ -739,6 +751,25 @@ impl CPUProcessor {
             }
             (s, d) => Err(Error::NotSupported(format!("dtype {s} -> {d}",))),
         }
+    }
+
+    /// Reuse `cached` if it already has dimensions `(w, h)` and pixel format
+    /// `fmt`, otherwise allocate a fresh `Mem` image. The returned buffer's
+    /// contents are **not** zeroed on reuse — callers must fully overwrite the
+    /// region they later read (see the note at the convert pipeline's tmp/tmp2
+    /// site). This amortises the per-frame `Tensor::image` `alloc_zeroed`.
+    fn reuse_or_alloc_image(
+        cached: Option<Tensor<u8>>,
+        w: usize,
+        h: usize,
+        fmt: PixelFormat,
+    ) -> Result<Tensor<u8>> {
+        if let Some(t) = cached {
+            if t.width() == Some(w) && t.height() == Some(h) && t.format() == Some(fmt) {
+                return Ok(t);
+            }
+        }
+        Ok(Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem))?)
     }
 
     /// U8-to-U8 conversion: the full format conversion + resize pipeline.
@@ -867,6 +898,19 @@ impl CPUProcessor {
             dst_params
         };
 
+        // Fused NV→planar (no resize/flip/rotation/crop): decode the YUV source
+        // into packed RGB one cache-resident row strip at a time and
+        // NEON-deinterleave each strip straight into the destination planes, so
+        // the full-size packed-RGB intermediate never round-trips through DRAM
+        // and is not reallocated per frame. JPEG decodes to the NV family and the
+        // model wants planar RGB, so this is the hot Orin CPU-preprocess path.
+        if !need_resize_flip_rotation
+            && matches!(src_fmt, Nv12 | Nv16 | Nv24)
+            && matches!(dst_fmt, PlanarRgb | PlanarRgba)
+        {
+            return self.convert_nv_to_planar_fused(src, dst, src_fmt, dst_fmt, direct_params);
+        }
+
         // check if a direct conversion can be done
         if !need_resize_flip_rotation && Self::support_conversion_pf(src_fmt, dst_fmt) {
             return Self::convert_format_pf(src, dst, src_fmt, dst_fmt, direct_params);
@@ -880,11 +924,18 @@ impl CPUProcessor {
             )));
         }
 
-        // create tmp buffer
-        let mut tmp_buffer;
-        let tmp;
-        let tmp_fmt;
-        if intermediate != src_fmt {
+        // Take the cached intermediates out of `self` so the resize step can
+        // borrow `self` exclusively; they are restored before returning on the
+        // success path. Reused buffers are not re-zeroed — every consumer below
+        // fully overwrites the region it later reads (the pre-resize convert
+        // writes all of `tmp`; the resize writes the scaled rect of `tmp2` and
+        // its letterbox border is either pre-filled from `dst` or overwritten in
+        // `dst` by the final `fill_image_outside_crop_u8`).
+        let mut cached_tmp = self.convert_tmp.take();
+        let mut cached_tmp2 = self.convert_tmp2.take();
+
+        // create tmp buffer (reusing the cached one when its geometry matches)
+        let tmp_holder: Option<Tensor<u8>> = if intermediate != src_fmt {
             let _s = tracing::trace_span!(
                 "image.convert.cpu.format_convert",
                 from = ?src_fmt,
@@ -892,15 +943,17 @@ impl CPUProcessor {
                 pass = "pre_resize",
             )
             .entered();
-            tmp_buffer = Tensor::<u8>::image(src_w, src_h, intermediate, Some(TensorMemory::Mem))?;
-
-            Self::convert_format_pf(src, &mut tmp_buffer, src_fmt, intermediate, src_params)?;
-            tmp = &tmp_buffer;
-            tmp_fmt = intermediate;
+            let mut t =
+                Self::reuse_or_alloc_image(cached_tmp.take(), src_w, src_h, intermediate)?;
+            Self::convert_format_pf(src, &mut t, src_fmt, intermediate, src_params)?;
+            Some(t)
         } else {
-            tmp = src;
-            tmp_fmt = src_fmt;
-        }
+            None
+        };
+        let (tmp, tmp_fmt): (&Tensor<u8>, PixelFormat) = match &tmp_holder {
+            Some(t) => (t, intermediate),
+            None => (src, src_fmt),
+        };
 
         // format must be RGB/RGBA/GREY
         debug_assert!(matches!(tmp_fmt, Rgb | Rgba | Grey));
@@ -917,7 +970,8 @@ impl CPUProcessor {
             .entered();
             Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt, dst_params)?;
         } else {
-            let mut tmp2 = Tensor::<u8>::image(dst_w, dst_h, tmp_fmt, Some(TensorMemory::Mem))?;
+            let mut tmp2 =
+                Self::reuse_or_alloc_image(cached_tmp2.take(), dst_w, dst_h, tmp_fmt)?;
             if crop.dst_rect.is_some_and(|c| {
                 c != Rect {
                     left: 0,
@@ -943,7 +997,16 @@ impl CPUProcessor {
                 .entered();
                 Self::convert_format_pf(&tmp2, dst, tmp_fmt, dst_fmt, dst_params)?;
             }
+            cached_tmp2 = Some(tmp2);
         }
+        // Restore the intermediates to the cache for the next call (`tmp` — a
+        // borrow of `tmp_holder` — is no longer used past this point).
+        if let Some(t) = tmp_holder {
+            cached_tmp = Some(t);
+        }
+        self.convert_tmp = cached_tmp;
+        self.convert_tmp2 = cached_tmp2;
+
         if let (Some(dst_rect), Some(dst_color)) = (crop.dst_rect, crop.dst_color) {
             let full_rect = Rect {
                 left: 0,

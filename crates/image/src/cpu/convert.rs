@@ -216,6 +216,74 @@ fn pack_to_planar(
     if plane == 0 {
         return Ok(()); // zero-height / empty image: nothing to scatter
     }
+
+    // Fast path: identity colour mapping (R,G,B ← src channels 0,1,2) with a
+    // 3- or 4-channel packed source, and either no alpha plane, a constant
+    // alpha plane (RGB → PlanarRgba), or an alpha plane copied from src
+    // channel 3 (RGBA → PlanarRgba). This covers every current caller. A single
+    // NEON deinterleaving pass reads the packed source once and writes all
+    // planes, replacing the per-plane scalar gather (which re-read the source
+    // once per plane). Parallelism moves from per-plane to per-row-strip.
+    let n_planes = plane_src.len();
+    let identity_rgb = n_planes >= 3
+        && plane_src[0] == Some(0)
+        && plane_src[1] == Some(1)
+        && plane_src[2] == Some(2);
+    let alpha_from_src = n_planes == 4 && plane_src[3] == Some(3);
+    let const_alpha = n_planes == 4 && plane_src[3].is_none();
+    let fast = identity_rgb
+        && (src_ch == 3 || src_ch == 4)
+        && (n_planes == 3 || (alpha_from_src && src_ch == 4) || const_alpha);
+
+    if fast {
+        let mut planes = dst_bytes.chunks_mut(plane).take(n_planes);
+        let rp = planes.next().unwrap();
+        let gp = planes.next().unwrap();
+        let bp = planes.next().unwrap();
+        let ap = planes.next(); // Some(_) only when n_planes == 4
+        let src_rows = &src_bytes[..h * src_stride];
+
+        // Serial, one pass per row: the NEON `vld3`/`vld4` deinterleave reads
+        // the packed source once and is memory-bandwidth-bound, so on Orin's
+        // shared bus row-level rayon parallelism measured no faster than serial
+        // for the model-preprocessing sizes (≤1080p) while adding scheduling
+        // overhead on small frames. The rare arbitrary-mapping path below keeps
+        // its per-plane parallelism.
+        match ap {
+            Some(ap) if alpha_from_src => {
+                src_rows
+                    .chunks(src_stride)
+                    .zip(rp.chunks_mut(dst_stride))
+                    .zip(gp.chunks_mut(dst_stride))
+                    .zip(bp.chunks_mut(dst_stride))
+                    .zip(ap.chunks_mut(dst_stride))
+                    .for_each(|((((s, r), g), b), a)| {
+                        super::simd::deinterleave_row(s, r, g, b, Some(a), w, src_ch);
+                    });
+            }
+            other => {
+                if let Some(ap) = other {
+                    // Constant alpha plane (RGB → PlanarRgba): fill only the `w`
+                    // logical bytes of each row, matching this function's
+                    // contract and the slow-path `None` handling (leave per-row
+                    // padding untouched rather than filling the whole plane).
+                    for row in ap.chunks_mut(dst_stride).take(h) {
+                        row[..w].fill(255);
+                    }
+                }
+                src_rows
+                    .chunks(src_stride)
+                    .zip(rp.chunks_mut(dst_stride))
+                    .zip(gp.chunks_mut(dst_stride))
+                    .zip(bp.chunks_mut(dst_stride))
+                    .for_each(|(((s, r), g), b)| {
+                        super::simd::deinterleave_row(s, r, g, b, None, w, src_ch);
+                    });
+            }
+        }
+        return Ok(());
+    }
+
     let plane_slices: Vec<&mut [u8]> = dst_bytes.chunks_mut(plane).take(plane_src.len()).collect();
     rayon::scope(|sc| {
         for (pb, &chan) in plane_slices.into_iter().zip(plane_src.iter()) {
@@ -1336,6 +1404,183 @@ impl CPUProcessor {
             }
         }
         Ok(())
+    }
+
+    /// Strip-fused NV12/NV16/NV24 → PlanarRgb/PlanarRgba for the no-resize
+    /// case. Decodes the YUV source into packed RGB one cache-resident row
+    /// strip at a time (into the reused [`Self::nv_strip_scratch`]) and
+    /// NEON-deinterleaves each strip straight into the destination planes, so
+    /// the full-size packed-RGB intermediate never round-trips through DRAM and
+    /// is not reallocated per frame. The strip height keeps a `width × 3`
+    /// strip resident in L2 between the YUV decode and the deinterleave.
+    ///
+    /// Geometry mirrors `convert_nv12`/`convert_nv16`/`convert_nv24` (contiguous
+    /// and multiplane sources). NV12 (4:2:0) advances the chroma plane by half
+    /// the luma rows; the strip height is even so each strip starts on an even
+    /// luma row. The destination is validated against the derived plane sizes
+    /// (untrusted dims → `InvalidShape`, not a panic), like the other helpers.
+    pub(super) fn convert_nv_to_planar_fused(
+        &mut self,
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        src_fmt: edgefirst_tensor::PixelFormat,
+        dst_fmt: edgefirst_tensor::PixelFormat,
+        cp: ColorParams,
+    ) -> Result<()> {
+        use edgefirst_tensor::PixelFormat::{Nv12, Nv16, Nv24, PlanarRgb, PlanarRgba};
+
+        /// Strip height (rows). Even (NV12 4:2:0 needs an even strip start) and
+        /// sized so one packed-RGB strip stays in L2 across realistic widths
+        /// (32 × 1920 × 3 ≈ 180 KiB).
+        const STRIP_ROWS: usize = 32;
+
+        let w = src.width().unwrap();
+        let h = src.height().unwrap();
+        let has_alpha = dst_fmt == PlanarRgba;
+        debug_assert!(matches!(dst_fmt, PlanarRgb | PlanarRgba));
+
+        // ---- source plane geometry (mirrors convert_nv12/nv16/nv24) ----
+        let y_stride = src.effective_row_stride().unwrap_or(w.next_multiple_of(2));
+        // `chroma_div` maps a luma row index to its chroma row index: NV12
+        // (4:2:0) subsamples chroma vertically by two; NV16/NV24 do not.
+        let (uv_stride, chroma_div) = match src_fmt {
+            Nv12 => {
+                let uv = if src.is_multiplane() {
+                    src.chroma()
+                        .unwrap()
+                        .effective_row_stride()
+                        .unwrap_or(w.next_multiple_of(2))
+                } else {
+                    y_stride
+                };
+                (uv, 2usize)
+            }
+            Nv16 => (y_stride, 1usize),
+            Nv24 => (y_stride * 2, 1usize),
+            other => return Err(Error::NotSupported(format!("fused {other} → planar"))),
+        };
+
+        let src_map = src.map()?;
+        let chroma_map = if src.is_multiplane() {
+            Some(src.chroma().unwrap().map()?)
+        } else {
+            None
+        };
+        let (y_plane, uv_plane): (&[u8], &[u8]) = if let Some(cm) = &chroma_map {
+            (src_map.as_slice(), cm.as_slice())
+        } else {
+            super::split_semi_planar(src_map.as_slice(), y_stride, h, src_fmt)?
+        };
+
+        // ---- destination plane geometry + validation ----
+        let dst_stride = super::tensor_row_stride(dst);
+        let n_planes = if has_alpha { 4 } else { 3 };
+        let mut dst_map = dst.map()?;
+        let dst_bytes = dst_map.as_mut_slice();
+        let plane = dst_stride.checked_mul(h).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "fused nv→planar plane overflow (stride={dst_stride}, h={h})"
+            ))
+        })?;
+        let dst_need = plane.checked_mul(n_planes).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "fused nv→planar dst overflow (plane={plane}, planes={n_planes})"
+            ))
+        })?;
+        if dst_stride < w || dst_bytes.len() < dst_need {
+            return Err(Error::InvalidShape(format!(
+                "fused nv→planar dst too small: {} bytes, need {dst_need} (stride={dst_stride} >= w={w}, planes={n_planes})",
+                dst_bytes.len()
+            )));
+        }
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+
+        let mut planes = dst_bytes.chunks_mut(plane);
+        let rp = planes.next().unwrap();
+        let gp = planes.next().unwrap();
+        let bp = planes.next().unwrap();
+        if has_alpha {
+            // NV sources carry no alpha; PlanarRgba gets a constant 255 plane.
+            planes.next().unwrap().fill(255);
+        }
+
+        // ---- strip loop: decode into the cached scratch, deinterleave out ----
+        let mut scratch = std::mem::take(&mut self.nv_strip_scratch);
+        let need = STRIP_ROWS.saturating_mul(w).saturating_mul(3);
+        if scratch.len() < need {
+            scratch.resize(need, 0);
+        }
+
+        let mut r0 = 0usize;
+        let mut result = Ok(());
+        while r0 < h {
+            let sh = STRIP_ROWS.min(h - r0);
+            let yoff = r0 * y_stride;
+            let uvoff = (r0 / chroma_div) * uv_stride;
+            let img = yuv::YuvBiPlanarImage {
+                y_plane: &y_plane[yoff..],
+                y_stride: y_stride as u32,
+                uv_plane: &uv_plane[uvoff..],
+                uv_stride: uv_stride as u32,
+                width: w as u32,
+                height: sh as u32,
+            };
+            let rgb_stride = (w * 3) as u32;
+            {
+                let rgb = &mut scratch[..sh * w * 3];
+                let decode = match src_fmt {
+                    Nv12 => yuv::yuv_nv12_to_rgb(
+                        &img,
+                        rgb,
+                        rgb_stride,
+                        cp.range,
+                        cp.matrix,
+                        yuv::YuvConversionMode::Balanced,
+                    ),
+                    Nv16 => yuv::yuv_nv16_to_rgb(
+                        &img,
+                        rgb,
+                        rgb_stride,
+                        cp.range,
+                        cp.matrix,
+                        yuv::YuvConversionMode::Balanced,
+                    ),
+                    Nv24 => yuv::yuv_nv24_to_rgb(
+                        &img,
+                        rgb,
+                        rgb_stride,
+                        cp.range,
+                        cp.matrix,
+                        yuv::YuvConversionMode::Balanced,
+                    ),
+                    _ => unreachable!(),
+                };
+                if let Err(e) = decode {
+                    result = Err(e.into());
+                    break;
+                }
+            }
+            // The strip's packed RGB is now hot in the scratch; scatter each row
+            // into the destination planes at its frame-row offset.
+            for i in 0..sh {
+                let s = &scratch[i * w * 3..i * w * 3 + w * 3];
+                let roff = (r0 + i) * dst_stride;
+                super::simd::deinterleave_row(
+                    s,
+                    &mut rp[roff..roff + w],
+                    &mut gp[roff..roff + w],
+                    &mut bp[roff..roff + w],
+                    None,
+                    w,
+                    3,
+                );
+            }
+            r0 += sh;
+        }
+        self.nv_strip_scratch = scratch;
+        result
     }
 
     /// Read a planar `[C, H, W]` source into a packed interleaved destination,

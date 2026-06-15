@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cached CPU convert intermediates** (`edgefirst-image`): the multi-step
+  CPU convert pipeline (pre-resize format-convert and the resized-RGB
+  scratch used by letterbox/resize) now reuses two `CPUProcessor`-held
+  buffers across frames instead of allocating — and `alloc_zeroed`-clearing
+  — a fresh full-frame buffer per call. Each consumer fully overwrites the
+  region it reads, so reused (non-zeroed) contents are never observed, and
+  output is unchanged. Measured on Orin Nano (interleaved A/B, NV12 1280×720
+  → 640×640 letterbox): median −8% (2.7→2.5 ms) and, more importantly, the
+  tail flattens (p95 3.3→2.6 ms, max 5.2→2.8 ms) by removing the per-frame
+  mmap/page-fault spikes.
+- **Strip-fused CPU NV→PlanarRgb conversion** (`edgefirst-image`): the
+  no-resize NV12/NV16/NV24 → `PlanarRgb`/`PlanarRgba` conversion now decodes
+  the YUV source into packed RGB one cache-resident row strip at a time
+  (into a `CPUProcessor`-cached scratch) and NEON-deinterleaves each strip
+  straight into the destination planes. The full-size packed-RGB
+  intermediate no longer round-trips through DRAM and is no longer
+  reallocated per frame, so the strip stays hot in L2 between the YUV decode
+  and the deinterleave. Output is byte-for-byte identical to the previous
+  two-pass path (NV12 4:2:0 replicates one chroma row across two luma rows,
+  so strip boundaries do not change the per-row chroma pairing — verified
+  across NV12/16/24, planar/planar-RGBA, and odd dimensions). Measured on
+  Orin Nano (CPU backend, 1280×720, no resize): NV12→PlanarRgb a further
+  −21% on top of the NEON deinterleave (≈ −46% vs the original scalar
+  path). The letterbox path is unchanged (its resize step requires the
+  full packed buffer).
+- **NEON-accelerated CPU packed↔planar conversion and float widen**
+  (`edgefirst-image`): the CPU `pack_to_planar` scatter (RGB/RGBA →
+  `PlanarRgb`/`PlanarRgba` — the JPEG→NV→planar model-input path on the
+  Jetson Orin CPU pipeline) now uses a single-pass NEON `vld3`/`vld4`
+  deinterleave (one hardware-deinterleaving load reads the packed source
+  once and splits the channels) instead of a per-plane scalar gather that
+  re-read the source once per plane. The U8→F32 `/255` normalisation widen
+  uses NEON `vmovl`/`vcvtq`/`vdivq` (bit-identical to the scalar form), and
+  the U8→F16 widen gains a native half-precision kernel
+  (`ucvtf.8h`+`fdiv.8h`) selected at runtime on FEAT_FP16 CPUs (e.g. the
+  Orin's Cortex-A78AE), with a scalar fallback elsewhere (forceable via
+  `EDGEFIRST_IMAGE_NO_FP16`). The deinterleave is memory-bandwidth-bound,
+  so it now runs serially (the previous per-plane rayon fan-out added
+  scheduling overhead without a throughput gain); the rare arbitrary
+  channel-mapping path keeps its parallel fallback. Measured on Orin Nano
+  (CPU backend, 1280×720 → 640×640 letterbox): NV12→PlanarRgb −25%,
+  letterbox→PlanarRgb −9%, letterbox→PlanarRgb F16 −24% (F16 is now faster
+  than F32 for model input). Output is unchanged for the integer/F32 paths
+  and within ~1 f16 ULP for the native F16 path. NEON is baseline on
+  aarch64; non-aarch64 targets keep the scalar path.
 - **BREAKING — unified GL processor on macOS** (`edgefirst-image`):
   `ImageProcessor` on macOS now drives the same `GLProcessorThreaded`
   engine as Linux, with a dedicated worker thread and a private ANGLE
@@ -29,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`cpu_preprocess_benchmark`** (`edgefirst-image`): a self-contained
+  on-target benchmark for the CPU JPEG-preprocessing path (NV12/NV16/NV24
+  → RGB / PlanarRgb / PlanarRgb-F32 / PlanarRgb-F16, same-size and
+  letterbox), used to characterise and gate the Orin CPU pipeline. Sources
+  are synthesised (no testdata), and it honours `EDGEFIRST_FORCE_BACKEND`,
+  `EDGEFIRST_BENCH_ITERS`, and `EDGEFIRST_BENCH_ONLY` for `perf` profiling
+  of individual cells.
 - **Fused NV12/NV16/NV24 → PlanarRgb F16 GL convert** (`edgefirst-image`):
   the model-input conversion (YUV source → letterboxed planar F16
   tensor) now runs as two GL passes inside one `convert()` call on every
