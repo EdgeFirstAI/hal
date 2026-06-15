@@ -1549,6 +1549,20 @@ where
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
+        if ptr.is_null() {
+            return Err(Error::InvalidArgument(
+                "from_foreign: ptr must be non-null".to_owned(),
+            ));
+        }
+        shape
+            .iter()
+            .copied()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "from_foreign: shape.product() overflows usize (shape={shape:?})"
+                ))
+            })?;
         let mem = MemTensor::<T>::from_foreign(ptr, shape, owner, name);
         Ok(Self::wrap(TensorStorage::Mem(mem)))
     }
