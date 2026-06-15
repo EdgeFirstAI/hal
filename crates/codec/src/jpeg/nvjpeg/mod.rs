@@ -244,13 +244,19 @@ impl NvJpegContext {
 
         // Bounds-check the packed RGB write against the true PBO allocation
         // (`configure_image` does NOT guard a packed format on GL memory).
+        // Two distinct failure modes:
+        //   * `img_h * rgb_stride` overflowing `usize` is a degenerate image
+        //     geometry (only reachable for an enormous image on a 32-bit
+        //     `usize`) — unrepresentable for ANY backend, so surface it as
+        //     `InvalidData` rather than a misleading capacity error.
+        //   * the write merely exceeding THIS PBO mapping is a destination-too-
+        //     small case — fall back to V4L2/CPU.
         let offset = dst.plane_offset().unwrap_or(0);
-        let needed = img_h.checked_mul(rgb_stride).ok_or(DecodeErr::Fatal(
-            CodecError::InsufficientCapacity {
-                image: (img_w, img_h),
-                tensor: (0, 0),
-            },
-        ))?;
+        let needed = img_h.checked_mul(rgb_stride).ok_or_else(|| {
+            DecodeErr::Fatal(CodecError::InvalidData(format!(
+                "nvjpeg: RGB geometry {img_w}x{img_h} (stride {rgb_stride}) overflows usize"
+            )))
+        })?;
         if offset.checked_add(needed).is_none_or(|end| end > map_len) {
             return Err(DecodeErr::Unsupported(format!(
                 "RGB {img_w}x{img_h} ({needed} B) + offset {offset} exceeds PBO mapping ({map_len} B)"
