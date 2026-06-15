@@ -54,7 +54,7 @@ impl ProbedDevice {
 /// otherwise infallible — discovery failure is never an error, it just means
 /// the CPU decoder is used.
 pub fn probe() -> Option<ProbedDevice> {
-    if env_flag(ENV_DISABLE) {
+    if crate::jpeg::env_flag(ENV_DISABLE) {
         log::debug!("v4l2 jpeg decode disabled via {ENV_DISABLE}");
         return None;
     }
@@ -166,11 +166,4 @@ fn output_queue_has_jpeg(fd: std::os::fd::RawFd, api: ApiVariant) -> bool {
         }
     }
     false
-}
-
-/// Read a boolean-ish environment flag (`1`/`true`/`yes`, case-insensitive).
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
 }

@@ -70,7 +70,7 @@ only) for the hardware backend. The crate has no dependency on
 | Module        | Purpose                                                |
 |---------------|--------------------------------------------------------|
 | `mod.rs`      | `NvJpegProbe` lifecycle, persistent `NvJpegContext` (handle/state/stream), `try_decode()` tri-state, decode-into-PBO-device-pointer (RGB), circuit breaker |
-| `loader.rs`   | `dlopen` of `libnvjpeg.so.12` (explicit CUDA paths; requires `nvjpeg*` symbols to reject the libjpeg-turbo decoy), `OnceLock` table, `EDGEFIRST_DISABLE_NVJPEG` opt-out |
+| `loader.rs`   | `dlopen` of `libnvjpeg.so.12` (explicit CUDA paths; requires `nvjpeg*` symbols to reject the libjpeg-turbo decoy), `OnceLock` table, `EDGEFIRST_ENABLE_NVJPEG` opt-in (**default off**) |
 | `ffi.rs`      | Hand-rolled `#[repr(C)]` `nvjpegImage_t`, enums/consts, `extern "C"` fn-pointer typedefs (verified vs the on-target `nvjpeg.h` 12.3.3) |
 
 ### V4L2 Backend Module Map (`jpeg/v4l2/`, Linux + `v4l2` feature)
@@ -121,10 +121,11 @@ pass in the decode hot loop.
 On Linux, `decode_jpeg_into` dispatches through a three-tier priority —
 **nvJPEG → V4L2 → CPU**:
 
-1. With the `nvjpeg` feature, if a CUDA device + `libnvjpeg` are present **and**
-   the destination is a CUDA-backed tensor (a PBO on Jetson), the nvJPEG GPU
-   backend decodes interleaved RGB straight into the tensor's device pointer.
-   See [nvJPEG GPU Backend](#nvjpeg-gpu-backend) below.
+1. With the `nvjpeg` feature **and** `EDGEFIRST_ENABLE_NVJPEG` set (opt-in,
+   off by default — see [nvJPEG GPU Backend](#nvjpeg-gpu-backend)), if a CUDA
+   device + `libnvjpeg` are present **and** the destination is a CUDA-backed
+   tensor (a PBO on Jetson), the nvJPEG GPU backend decodes interleaved RGB
+   straight into the tensor's device pointer.
 2. Otherwise, with the `v4l2` feature, the V4L2 hardware backend (native
    NV12/Grey/NV24) — see [V4L2 Hardware Backend](#v4l2-hardware-backend).
 3. Otherwise the from-scratch CPU decoder.
@@ -451,9 +452,12 @@ reliable verification of the raw ioctl ABI — see `TESTING.md`.
 ## nvJPEG GPU Backend
 
 `jpeg/nvjpeg/` offloads JPEG decode to the CUDA nvJPEG library on NVIDIA
-platforms (lead target: Jetson Orin). It is preferred ahead of V4L2/CPU and is
-entirely `dlopen`-based — no link-time CUDA dependency, so one binary runs on
-Jetson (nvJPEG), i.MX (V4L2), and a laptop (CPU).
+platforms (lead target: Jetson Orin). When enabled it is preferred ahead of
+V4L2/CPU, but it is **opt-in and off by default** (`EDGEFIRST_ENABLE_NVJPEG`,
+see [Discovery](#discovery-dlopen-capability-based)) so it never silently
+contends with CUDA inference. It is entirely `dlopen`-based — no link-time CUDA
+dependency, so one binary runs on Jetson (nvJPEG), i.MX (V4L2), and a laptop
+(CPU).
 
 ### Discovery (dlopen, capability-based)
 
@@ -461,7 +465,12 @@ Jetson (nvJPEG), i.MX (V4L2), and a laptop (CPU).
 (the soname is not on JetPack's default loader path) and **requiring** the
 `nvjpeg*` symbols to resolve — this rejects the libjpeg-turbo *decoy*
 (`/usr/lib/.../nvidia/libnvjpeg.so`) that shares the name but exports `jpeg_*`.
-`EDGEFIRST_DISABLE_NVJPEG=1` forces it off. The `NvJpegProbe` (on
+nvJPEG is **opt-in and off by default** — it decodes on the same GPU as CUDA
+inference (TensorRT etc.), so sharing the device can cost a concurrent inference
+engine more than the decode speedup returns. Set `EDGEFIRST_ENABLE_NVJPEG=1`
+(`true`/`yes`) to enable it on decode-bound workloads or where no concurrent GPU
+compute runs. (V4L2 stays opt-out via `EDGEFIRST_DISABLE_V4L2`: it is a separate
+hardware block and does not contend with CUDA.) The `NvJpegProbe` (on
 `JpegDecoderState`) is probed once per `ImageDecoder`; a ready `NvJpegContext`
 persists the nvJPEG handle, a reusable decode state (keeping nvJPEG's internal
 device scratch hot), and **one CUDA stream per decoder** so concurrent decode

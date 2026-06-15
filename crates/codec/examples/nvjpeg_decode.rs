@@ -8,8 +8,12 @@
 //! which backend fired (RGB ⇒ nvJPEG, NV12/Grey ⇒ V4L2/CPU), verifies the
 //! decoded pixels are non-trivial, and times the steady-state decode.
 //!
+//! nvJPEG is opt-in (off by default, to avoid contending with CUDA inference),
+//! so `EDGEFIRST_ENABLE_NVJPEG=1` is required for the GPU path to engage:
+//!
 //! ```bash
-//! LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
+//! EDGEFIRST_ENABLE_NVJPEG=1 \
+//!   LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
 //!   cargo run -p edgefirst-codec --example nvjpeg_decode -- image.jpg
 //! ```
 

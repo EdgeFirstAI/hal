@@ -30,6 +30,17 @@ mod nvjpeg;
 #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
 pub(crate) use nvjpeg::is_nvjpeg_available as nvjpeg_available;
 
+/// Parse a boolean backend-gate environment variable: `true` only for
+/// `1`/`true`/`yes` (case-insensitive, trimmed); absent or anything else is
+/// `false`. Shared by the V4L2 opt-out (`EDGEFIRST_DISABLE_V4L2`) and the nvJPEG
+/// opt-in (`EDGEFIRST_ENABLE_NVJPEG`) gates.
+#[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 use crate::error::{CodecError, UnsupportedFeature};
 use crate::exif::read_exif_orientation;
 use crate::options::ImageInfo;

@@ -22,8 +22,14 @@ use super::ffi::*;
 use libloading::Library;
 use std::sync::OnceLock;
 
-/// Environment variable forcing the V4L2/CPU decoders (skip nvJPEG probing).
-const ENV_DISABLE: &str = "EDGEFIRST_DISABLE_NVJPEG";
+/// Opt-in environment variable enabling the nvJPEG backend. **Default off**:
+/// nvJPEG decodes on the same GPU as CUDA inference (e.g. TensorRT), so it is
+/// not enabled automatically — sharing the GPU can slow a concurrent inference
+/// engine more than the decode speedup is worth. Set `EDGEFIRST_ENABLE_NVJPEG`
+/// to `1`/`true`/`yes` on workloads that benefit (decode-bound, or no
+/// concurrent GPU compute). Contrast `EDGEFIRST_DISABLE_V4L2`, which is opt-out:
+/// V4L2 is a separate hardware block and does not contend with CUDA.
+const ENV_ENABLE: &str = "EDGEFIRST_ENABLE_NVJPEG";
 
 /// Candidate library names/paths, in priority order. Explicit CUDA install
 /// locations come first (the soname is not on the default loader path); the
@@ -52,8 +58,8 @@ pub(crate) struct NvjpegLib {
 static LIB: OnceLock<Option<NvjpegLib>> = OnceLock::new();
 
 fn load() -> Option<NvjpegLib> {
-    if std::env::var_os(ENV_DISABLE).is_some() {
-        log::debug!("nvjpeg disabled via {ENV_DISABLE}");
+    if !crate::jpeg::env_flag(ENV_ENABLE) {
+        log::debug!("nvjpeg off by default; set {ENV_ENABLE}=1 to enable");
         return None;
     }
     for name in CANDIDATES {
@@ -125,8 +131,9 @@ pub(crate) fn lib() -> Option<&'static NvjpegLib> {
     LIB.get_or_init(load).as_ref()
 }
 
-/// True iff both libnvjpeg and libcudart loaded with all required symbols.
-/// Cheap (cached) — intended as a fast pre-check for benches/consumers.
+/// True iff nvJPEG is opted in (`EDGEFIRST_ENABLE_NVJPEG`) **and** both
+/// libnvjpeg and libcudart loaded with all required symbols. Cheap (cached) —
+/// intended as a fast pre-check for benches/consumers.
 pub fn is_nvjpeg_available() -> bool {
     lib().is_some() && edgefirst_tensor::is_cuda_available()
 }

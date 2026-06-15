@@ -255,7 +255,8 @@ fn bench_exif_overhead(suite: &mut BenchSuite) {
 
 fn bench_nvjpeg(suite: &mut BenchSuite) {
     if !edgefirst_codec::nvjpeg_available() {
-        println!("\n== nvjpeg: SKIP (no CUDA / libnvjpeg) ==\n");
+        // nvJPEG is opt-in (off by default); also requires CUDA + libnvjpeg.
+        println!("\n== nvjpeg: SKIP (set EDGEFIRST_ENABLE_NVJPEG=1; needs CUDA + libnvjpeg) ==\n");
         return;
     }
     println!("\n== edgefirst-codec: nvjpeg decode into PBO (GPU-resident RGB) ==\n");

@@ -303,7 +303,8 @@ bench:
 .PHONY: bench-nvjpeg
 bench-nvjpeg:
 	@echo "Running nvJPEG benchmark (on-target)..."
-	@LD_LIBRARY_PATH="/usr/local/cuda/targets/aarch64-linux/lib:$$LD_LIBRARY_PATH" \
+	@EDGEFIRST_ENABLE_NVJPEG=1 \
+		LD_LIBRARY_PATH="/usr/local/cuda/targets/aarch64-linux/lib:$$LD_LIBRARY_PATH" \
 		cargo bench -p edgefirst-codec --bench codec_benchmark -- --json nvjpeg-bench.json
 	@echo "✓ nvJPEG benchmark complete (results in nvjpeg-bench.json)"
 

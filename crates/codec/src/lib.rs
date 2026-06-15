@@ -59,11 +59,13 @@ pub use options::ImageInfo;
 pub use pixel::ImagePixel;
 pub use traits::ImageLoad;
 
-/// Returns `true` when the nvJPEG GPU JPEG decoder is available at runtime
-/// (Linux with CUDA + libnvjpeg loaded), and the codec will prefer it over the
-/// V4L2/CPU backends for CUDA-backed destinations. Always `false` on other
-/// platforms or when the `nvjpeg` feature is disabled. Useful for benchmarks
-/// and consumers that branch on backend availability.
+/// Returns `true` when the nvJPEG GPU JPEG decoder is available at runtime —
+/// Linux with CUDA + libnvjpeg loaded **and** opted in via
+/// `EDGEFIRST_ENABLE_NVJPEG` (off by default, so it never silently contends with
+/// CUDA inference). When `true` the codec prefers it over the V4L2/CPU backends
+/// for CUDA-backed destinations. Always `false` on other platforms or when the
+/// `nvjpeg` feature is disabled. Useful for benchmarks and consumers that branch
+/// on backend availability.
 pub fn nvjpeg_available() -> bool {
     #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
     {

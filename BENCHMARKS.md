@@ -628,10 +628,13 @@ the decoded image is born GPU-resident and is consumed zero-copy by
 `convert()`. Benchmark cells `codec/jpeg/nvjpeg/rgbi/<fixture>` run only when
 CUDA + libnvjpeg are present (`edgefirst_codec::nvjpeg_available()`) and skip
 cleanly elsewhere — `bench_compare.py` treats absent cells as one-sided and
-never gates on them. Build/run on-target with the CUDA library path:
+never gates on them. nvJPEG is **opt-in** (off by default so it never contends
+with CUDA inference), so the cells need `EDGEFIRST_ENABLE_NVJPEG=1`. Build/run
+on-target with the CUDA library path:
 
 ```bash
-LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
+EDGEFIRST_ENABLE_NVJPEG=1 \
+  LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
   cargo bench -p edgefirst-codec --bench codec_benchmark -- --json out.json
 ```
 
