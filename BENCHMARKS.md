@@ -635,16 +635,20 @@ LD_LIBRARY_PATH=/usr/local/cuda/targets/aarch64-linux/lib \
   cargo bench -p edgefirst-codec --bench codec_benchmark -- --json out.json
 ```
 
-**Validated end-to-end through the codec** (Orin Nano, L4T R36.4.7 / CUDA 12.6 /
-nvJPEG 12.3.3; `examples/nvjpeg_decode`, full `load_image` = map + nvjpegDecode +
-sync + unmap into a `create_image` PBO, RGB output):
+**In-tree `cargo bench` cells** (Orin Nano, L4T R36.4.7 / CUDA 12.6 / nvJPEG
+12.3.3; captured 2026-06-15, `codec_benchmark` cross-built for
+`aarch64-unknown-linux-gnu`, n=100). The nvJPEG cell is the full `load_image` =
+`cuda_map` + `nvjpegDecode` (RGBI) + stream sync + unmap into a `create_image`
+PBO; the CPU `nv12` cell is the **same binary's** CPU decoder, so this is a
+like-for-like decode comparison on one run:
 
-| Image | nvJPEG (RGB, GPU-resident) | CPU (NV12) | Speedup |
-|-------|---------------------------|-----------|---------|
-| zidane 720p (1280×720) | **2.04 ms** | 5.95 ms | **2.9× faster** |
-| giraffe 640 (640×640) | **3.31 ms** | 5.44 ms | **1.6× faster** |
+| Cell | nvJPEG RGB (GPU-resident) | CPU NV12 | Speedup (median) |
+|------|--------------------------|----------|------------------|
+| zidane 720p (1280×720) | **2.21 ms** (p95 2.24) | 5.97 ms (p95 5.98) | **2.70×** |
+| giraffe 640 (640×640)  | **3.24 ms** (p95 3.49) | 5.39 ms (p95 5.41) | **1.67×** |
 
-And nvJPEG output is already RGB and GPU-resident, so it also saves the
+These confirm the earlier `examples/nvjpeg_decode` smoke-test figures (2.04 ms /
+3.31 ms). And nvJPEG output is already RGB and GPU-resident, so it also saves the
 NV12→RGB convert and the host→GPU upload the CPU path still owes.
 
 **Decode-only RGBI into a device pointer** (lower-level C++ probe data, same Orin,
@@ -670,10 +674,10 @@ full per-call stream sync):
   unmapped before `convert()` samples it); the `nvjpeg_map`/`nvjpeg_unmap`
   tracing spans isolate that cost. Keep the decode-source pool on a GL thread
   off the `convert()` hot path to avoid contention.
-- _Status:_ the end-to-end codec path is validated on-target (table above, via
-  `examples/nvjpeg_decode`). The in-tree `codec/jpeg/nvjpeg/rgbi/*` bench cells
-  and the multi-worker e2e/overlap comparison are to be captured here after a
-  profiler deployment run.
+- _Status:_ the end-to-end codec path and the in-tree `codec/jpeg/nvjpeg/rgbi/*`
+  bench cells are validated on-target (tables above, captured 2026-06-15). The
+  multi-worker e2e/overlap comparison still needs a profiler-level deployment to
+  drive concurrent decoders, and is to be captured here then.
 
 ### EXIF Orientation Overhead
 

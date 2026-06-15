@@ -158,34 +158,59 @@ impl NvJpegContext {
         )
         .entered();
 
-        let lib =
-            loader::lib().ok_or_else(|| DecodeErr::Reset("nvjpeg library vanished".into()))?;
-
-        // Reconfigure the destination NV12 → Rgb (tight `width*3` packed stride).
-        // `configure_image` preserves the tensor's CUDA registration, so the
-        // same PBO + device pointer is reused.
-        let rgb_stride = img_w * 3;
-        dst.configure_image(img_w, img_h, PixelFormat::Rgb)
-            .map_err(|e| DecodeErr::Fatal(CodecError::Tensor(e)))?;
-
-        // The device decode borrows `dst` immutably (via `cuda_map`); scope it so
-        // the format can be restored mutably on the error path.
-        match self.decode_into_device(lib, dst, data, img_w, img_h, rgb_stride) {
-            Ok(()) => Ok(ImageInfo {
-                width: img_w,
-                height: img_h,
-                format: PixelFormat::Rgb,
-                row_stride: rgb_stride,
-                rotation_degrees: 0,
-                flip_horizontal: false,
-            }),
+        // Run the reconfigure + device decode in a helper so EVERY failure path
+        // — including a failed `Rgb` reconfigure — restores the caller's native
+        // format, leaving a correctly-shaped tensor for the V4L2/CPU fall-through.
+        match self.decode_reconfigured(data, dst, img_w, img_h) {
+            Ok(info) => Ok(info),
             Err(e) => {
-                // Restore the native format the dispatch site configured so the
-                // V4L2/CPU decoder writes into a correctly-shaped tensor.
                 let _ = dst.configure_image(img_w, img_h, output_fmt);
                 Err(e)
             }
         }
+    }
+
+    /// Reconfigure `dst` to `Rgb` and decode into its device pointer. Any error
+    /// leaves `dst` configured as `Rgb` (possibly partially) — the caller's
+    /// [`decode`](Self::decode) restores the native format.
+    fn decode_reconfigured<T: ImagePixel>(
+        &self,
+        data: &[u8],
+        dst: &mut Tensor<T>,
+        img_w: usize,
+        img_h: usize,
+    ) -> Result<ImageInfo, DecodeErr> {
+        let lib =
+            loader::lib().ok_or_else(|| DecodeErr::Reset("nvjpeg library vanished".into()))?;
+
+        // Reconfigure the destination NV12 → Rgb. `configure_image` preserves the
+        // tensor's CUDA registration (same PBO + device pointer), and chooses the
+        // row stride from the backing: a CUDA-backed DMA destination is rounded up
+        // to a 64-byte-aligned pitch, a PBO stays tight (`width*3`). A failed
+        // reconfigure — e.g. an NV12 buffer (1.5 B/px) is too small for RGB
+        // (3 B/px) — is NOT fatal: fall back to V4L2/CPU.
+        dst.configure_image(img_w, img_h, PixelFormat::Rgb)
+            .map_err(|e| DecodeErr::Unsupported(format!("Rgb reconfigure failed: {e}")))?;
+
+        // Use the stride `configure_image` actually set, NOT an assumed `width*3`:
+        // on an alignment-padded (DMA) destination the rows are 64-aligned, and
+        // writing at `width*3` would shear rows that `convert()` then samples at
+        // the wider pitch.
+        let rgb_stride = dst
+            .effective_row_stride()
+            .ok_or_else(|| DecodeErr::Reset("no row stride after Rgb reconfigure".into()))?;
+
+        // The device decode borrows `dst` immutably (via `cuda_map`); scope it so
+        // the format can be restored mutably on the error path by the caller.
+        self.decode_into_device(lib, dst, data, img_w, img_h, rgb_stride)?;
+        Ok(ImageInfo {
+            width: img_w,
+            height: img_h,
+            format: PixelFormat::Rgb,
+            row_stride: rgb_stride,
+            rotation_degrees: 0,
+            flip_horizontal: false,
+        })
     }
 
     /// Map the destination PBO to a device pointer, decode RGB into it on the
@@ -408,13 +433,21 @@ mod tests {
         let mut probe = NvJpegProbe::default();
         let mut dst =
             Tensor::<u8>::image(64, 64, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
-        // Parse a tiny header is unnecessary; the cuda() gate fires first. Use a
-        // minimal valid-ish JPEG SOI; headers are unused by this path.
-        let headers = crate::jpeg::markers::parse_markers(MINIMAL_JPEG).ok();
-        if let Some(h) = headers {
-            let r = probe.try_decode::<u8>(MINIMAL_JPEG, &h, &mut dst, PixelFormat::Nv12, 8, 8, 16);
-            assert!(matches!(r, Ok(None)));
-        }
+        // The `cuda()` gate fires before the headers are consulted, but parse the
+        // fixture unconditionally so a broken `MINIMAL_JPEG` fails the test loudly
+        // instead of silently skipping the `try_decode` call.
+        let headers =
+            crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
+        let r = probe.try_decode::<u8>(
+            MINIMAL_JPEG,
+            &headers,
+            &mut dst,
+            PixelFormat::Nv12,
+            8,
+            8,
+            16,
+        );
+        assert!(matches!(r, Ok(None)));
         // Format must be unchanged (still Nv12) for the fall-through.
         assert_eq!(dst.format(), Some(PixelFormat::Nv12));
     }

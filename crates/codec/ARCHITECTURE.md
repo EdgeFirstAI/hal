@@ -484,13 +484,19 @@ has no `NVJPEG_OUTPUT_NV12`, so RGB is also the only single-call option here.)
 The destination is a `TensorMemory::Pbo` tensor — what
 `ImageProcessor::create_image` yields on Jetson (no dma-heap) — whose CUDA
 GL-buffer registration is mapped to a device pointer via `Tensor::cuda_map()`.
-nvJPEG decodes a single interleaved RGB plane into that pointer (at the tensor's
-`width*3` pitch, honouring any batch `plane_offset`), the stream is
-synchronised, and the PBO is unmapped so `convert()` can sample it. Because
+nvJPEG decodes a single interleaved RGB plane into that pointer (honouring any
+batch `plane_offset`), the stream is synchronised, and the PBO is unmapped so
+`convert()` can sample it. The nvJPEG row pitch is read back from
+`Tensor::effective_row_stride()` *after* the `Rgb` reconfigure rather than
+assumed — `configure_image` keeps a PBO tight (`width*3`) but rounds a
+CUDA-backed DMA destination up to a 64-byte-aligned pitch, and writing at the
+wrong pitch would shear the rows `convert()` then samples. Because
 `cuda_map`/unmap on a GL-buffer route to the GL worker thread that owns the PBO,
 each frame pays **two GL-thread round-trips** (map + unmap). The capacity of the
 packed RGB write is bounds-checked against the mapping length explicitly —
-`configure_image` does not guard a packed format on GL memory.
+`configure_image` does not guard a packed format on GL (PBO) memory — and an
+NV12-sized buffer too small for 3 B/px RGB falls back to V4L2/CPU rather than
+erroring.
 
 ### Orin: GPU_HYBRID, not the NVJPG ASIC
 
