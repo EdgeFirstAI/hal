@@ -77,7 +77,8 @@ pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
 pub(crate) use crate::shm::{ShmMap, ShmTensor};
 pub use cuda::{
     gl_map_resource, gl_register_buffer, gl_unmap_resource, gl_unregister_resource,
-    is_cuda_available, memcpy_device_to_host, CudaGlOps, CudaHandle, CudaMap,
+    is_cuda_available, memcpy_device_to_host, stream_create, stream_destroy, stream_synchronize,
+    CudaGlOps, CudaHandle, CudaMap, CudaStream,
 };
 pub use error::{Error, Result};
 pub use format::{ChromaLayout, PixelFormat, PixelLayout};
