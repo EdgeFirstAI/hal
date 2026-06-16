@@ -5074,4 +5074,113 @@ mod tests {
             assert_eq!(host.len(), 4); // 2*2 f32 elements
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Tensor::from_foreign — public API tests at the Tensor<T> layer.
+    //
+    // The low-level MemTensor::from_foreign mechanics (owner-drop, view sharing)
+    // are covered in mem.rs.  These tests exercise the Tensor<T> guard paths
+    // (null ptr, empty shape, size overflow) and the basic wrap+readback
+    // contract, confirming the public unsafe API wires through correctly.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn from_foreign_valid_wrap_and_readback() {
+        // The canonical CUDA zero-copy shape: wrap a caller allocation as a
+        // Mem tensor and verify the tensor reads the exact same bytes.
+        let mut buf: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let ptr = buf.as_mut_ptr();
+        let t = unsafe { Tensor::<f32>::from_foreign(ptr, &[2, 3], None, Some("test_foreign")) }
+            .expect("valid from_foreign must succeed");
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.memory(), TensorMemory::Mem);
+        assert_eq!(t.name(), "test_foreign");
+        let m = t.map().unwrap();
+        // The tensor is a zero-copy borrow — it sees the caller's data.
+        assert_eq!(m.as_slice(), &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn from_foreign_write_visible_in_caller_allocation() {
+        // Writes through the tensor's map land in the caller's buffer (zero-copy).
+        let mut buf: Vec<u8> = vec![0u8; 6];
+        let ptr = buf.as_mut_ptr();
+        let t =
+            unsafe { Tensor::<u8>::from_foreign(ptr, &[2, 3], None, None) }.unwrap();
+        {
+            let mut m = t.map().unwrap();
+            m.as_mut_slice().copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+        }
+        drop(t);
+        // Mutations are visible in the original Vec — same physical buffer.
+        assert_eq!(buf, vec![10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn from_foreign_rejects_null_ptr() {
+        let err = unsafe {
+            Tensor::<u8>::from_foreign(std::ptr::null_mut(), &[4], None, None)
+        }
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("non-null")),
+            "expected InvalidArgument(non-null), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_rejects_empty_shape() {
+        let mut dummy: u8 = 0;
+        let err = unsafe { Tensor::<u8>::from_foreign(&mut dummy, &[], None, None) }.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidSize(0)),
+            "expected InvalidSize(0) for empty shape, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_rejects_overflow_shape() {
+        // Two dimensions whose product overflows usize — the overflow guard must
+        // fire before any pointer arithmetic is attempted.
+        let mut dummy: u8 = 0;
+        let huge = [usize::MAX / 2 + 1, 2];
+        let err =
+            unsafe { Tensor::<u8>::from_foreign(&mut dummy, &huge, None, None) }.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("overflow")),
+            "expected InvalidArgument(overflow), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_owner_keeps_allocation_alive() {
+        // When `owner` is `Some`, dropping the Tensor must not free the backing
+        // before the owner is also gone — the owner's Drop fires on last ref.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        struct Guard(std::sync::Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let mut buf: Vec<u32> = vec![42u32; 4];
+        let ptr = buf.as_mut_ptr();
+        let owner: ForeignOwner = Box::new(Guard(flag2));
+        let t = unsafe { Tensor::<u32>::from_foreign(ptr, &[4], Some(owner), None) }.unwrap();
+        // Map co-owns the backing Arc; the owner must stay alive while the map lives.
+        let m = t.map().unwrap();
+        assert_eq!(m.as_slice()[0], 42);
+        drop(t); // tensor dropped while map is still live
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "owner must not drop while a map shares the backing"
+        );
+        drop(m);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "owner Drop must fire when the last Arc reference is released"
+        );
+    }
 }
