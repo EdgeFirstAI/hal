@@ -128,7 +128,10 @@ fn v4l2_persistent_loop() {
     let mut decoder = ImageDecoder::new();
     let mut tensor =
         Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
-    for i in 0..50 {
+    // 5 iterations prove the persistent stream survives multiple reuses
+    // (the correctness property). Throughput measurement moves to the
+    // codec_benchmark bench cell `codec/jpeg/nv12/zidane_720p_persistent_stream`.
+    for i in 0..5 {
         let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
         assert_eq!((info.width, info.height), (1280, 720));
         assert_eq!(info.format, PixelFormat::Nv12);
@@ -234,7 +237,10 @@ fn v4l2_geometry_change_reconfigures() {
 
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
-    for i in 0..10 {
+    // 3 rounds: initial configure, geometry-change reconfigure, stable reuse.
+    // Proves the cheap reconfigure path stays pixel-correct without measuring
+    // throughput (which belongs in the bench harness).
+    for i in 0..3 {
         for (jpeg, w, h, cpu, label) in [
             (&z, 1280usize, 720usize, &cpu_z, "zidane"),
             (&g, 640, 640, &cpu_g, "giraffe"),
