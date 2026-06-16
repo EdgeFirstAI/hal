@@ -986,6 +986,28 @@ where
 
     /// Get the buffer identity for cache keying and liveness tracking.
     fn buffer_identity(&self) -> &BufferIdentity;
+
+    /// Create a zero-copy sub-region view of this backing that shares the
+    /// underlying allocation **and** [`BufferIdentity`].
+    ///
+    /// The window is `[offset_bytes, offset_bytes + shape.product() *
+    /// size_of::<T>())` measured from this tensor's own logical start, so a
+    /// sub-view of a sub-view composes by adding offsets. Sharing the parent's
+    /// identity is the contract that lets identity-keyed caches (e.g. the GL
+    /// EGLImage import cache) treat offset-distinct windows as one buffer rather
+    /// than unrelated allocations — `view` must never mint a fresh identity.
+    ///
+    /// Defaults to [`Error::NotImplemented`]; every backend that supports
+    /// sub-views overrides it (`Mem`, `Shm`, Linux DMA, macOS IOSurface, `Pbo`).
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let _ = (offset_bytes, shape);
+        Err(Error::NotImplemented(
+            "view (zero-copy sub-region) is not supported for this tensor backend".to_owned(),
+        ))
+    }
 }
 
 pub trait TensorMapTrait<T>
@@ -1430,6 +1452,23 @@ where
             TensorStorage::Shm(t) => t.buffer_identity(),
             TensorStorage::Mem(t) => t.buffer_identity(),
             TensorStorage::Pbo(t) => t.buffer_identity(),
+        }
+    }
+
+    /// Forward a sub-region view to the active backend, re-wrapping the
+    /// backend's view (which shares the parent's allocation and
+    /// [`BufferIdentity`]) back into the matching `TensorStorage` variant. Each
+    /// backend's `view` is its own `TensorTrait::view` override; this single
+    /// match is the only per-variant dispatch (`Tensor::subview` calls through
+    /// here rather than matching the storage itself).
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.view(offset_bytes, shape).map(TensorStorage::Shm),
+            TensorStorage::Mem(t) => t.view(offset_bytes, shape).map(TensorStorage::Mem),
+            TensorStorage::Pbo(t) => t.view(offset_bytes, shape).map(TensorStorage::Pbo),
         }
     }
 }
@@ -2548,39 +2587,15 @@ where
             .unwrap_or(0)
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
-        let mut t = match &self.storage {
-            TensorStorage::Mem(parent) => Tensor::wrap(TensorStorage::Mem(MemTensor::view(
-                parent,
-                offset_bytes,
-                shape,
-            )?)),
-            // macOS `Dma` is the IOSurface, Linux `Dma` is the DMA-BUF — both
-            // expose `view(offset, shape)` sharing the resource AND
-            // BufferIdentity (unlike `from_fd`/`from_surface`, which mint a fresh
-            // identity). The GL backend keys the import on the shared identity so
-            // offset-distinct sub-views of one buffer reuse a single import and
-            // address their window via `glViewport`.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            TensorStorage::Dma(parent) => {
-                Tensor::wrap(TensorStorage::Dma(parent.view(offset_bytes, shape)?))
-            }
-            #[cfg(unix)]
-            TensorStorage::Shm(parent) => {
-                // Shares the parent's segment via a cloned fd (the SHM sharing
-                // model) and its BufferIdentity, distinguished by offset.
-                Tensor::wrap(TensorStorage::Shm(ShmTensor::view(
-                    parent,
-                    offset_bytes,
-                    shape,
-                )?))
-            }
-            TensorStorage::Pbo(parent) => {
-                // Shares the GL buffer handle (via the PBO's `Arc`) and
-                // BufferIdentity; the window is addressed by offset on the
-                // staged copy / read-back, mirroring the other backings.
-                Tensor::wrap(TensorStorage::Pbo(parent.view(offset_bytes, shape)?))
-            }
-        };
+        // Every backend exposes `view(offset, shape)` via `TensorTrait`, sharing
+        // the resource AND `BufferIdentity` (unlike `from_fd`/`from_surface`,
+        // which mint a fresh identity). The GL backend keys the import on the
+        // shared identity so offset-distinct sub-views of one buffer reuse a
+        // single import and address their window via `glViewport`. `Mem`/`Shm`
+        // share via the allocation `Arc` / a cloned fd; `Pbo` via the GL-buffer
+        // `Arc`; Linux DMA-BUF / macOS IOSurface via the shared fd / CFRetain.
+        // `TensorStorage::view` performs the one remaining per-variant dispatch.
+        let mut t = Tensor::wrap(self.storage.view(offset_bytes, shape)?);
         // Inherit the parent's image metadata so the view is a ready-to-use
         // sub-image (e.g. a `convert()` destination). The offset is applied
         // LAST because `set_format` deliberately clears it — the offset is a
@@ -4193,6 +4208,58 @@ mod tests {
         let parent = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
         // offset 6 + 4 bytes = 10 exceeds the 8-byte allocation.
         assert!(parent.subview(6, &[4]).is_err());
+    }
+
+    /// Regression guard for the `TensorTrait::view` promotion (R2): a `subview`
+    /// must share the parent's `BufferIdentity` on **every** backend, not mint a
+    /// fresh one. Identity-keyed caches (the GL EGLImage import) rely on this to
+    /// treat offset-distinct windows of one buffer as a single import; a fresh
+    /// identity would silently break that and regress zero-copy import reuse.
+    ///
+    /// Runs each backend that can be allocated without a GPU/GL context on the
+    /// test host: `Mem` (always); `Shm` (when POSIX shm is available); the
+    /// platform-native zero-copy buffer `Dma` (DMA-BUF on Linux / IOSurface on
+    /// macOS, when available). `Pbo` shares its identity the same way (see
+    /// `pbo.rs` `view`) but needs a live GL context, so it is exercised by the
+    /// image-crate GL tests rather than here.
+    #[test]
+    fn subview_shares_buffer_identity_all_backends() {
+        // u8 has align 1, so every byte offset is valid for the alignment check;
+        // this isolates the identity-sharing contract from alignment concerns.
+        let assert_shares = |memory: TensorMemory, label: &str| {
+            let parent = Tensor::<u8>::new(&[64], Some(memory), None)
+                .unwrap_or_else(|e| panic!("{label}: parent alloc failed: {e:?}"));
+            let parent_id = parent.buffer_identity().id();
+            // Two offset-distinct windows must both carry the parent's identity.
+            let v0 = parent
+                .subview(0, &[16])
+                .unwrap_or_else(|e| panic!("{label}: subview(0) failed: {e:?}"));
+            let v1 = parent
+                .subview(16, &[16])
+                .unwrap_or_else(|e| panic!("{label}: subview(16) failed: {e:?}"));
+            assert_eq!(
+                v0.buffer_identity().id(),
+                parent_id,
+                "{label}: subview(0) minted a fresh BufferIdentity"
+            );
+            assert_eq!(
+                v1.buffer_identity().id(),
+                parent_id,
+                "{label}: subview(16) minted a fresh BufferIdentity"
+            );
+        };
+
+        assert_shares(TensorMemory::Mem, "Mem");
+
+        #[cfg(unix)]
+        if crate::is_shm_available() {
+            assert_shares(TensorMemory::Shm, "Shm");
+        }
+
+        // Dma == DMA-BUF on Linux, IOSurface on macOS; same public variant.
+        if crate::is_gpu_buffer_available() {
+            assert_shares(TensorMemory::Dma, "Dma");
+        }
     }
 
     #[test]
