@@ -4260,12 +4260,12 @@ outputs:
             // fixture (strides 8/16/32, DFL boxes, sigmoid-applied
             // scores, mask coefficients per-scale, NHWC protos), build
             // a decoder, and confirm:
-            //   * a DecodeProgram is attached (split schema)
+            //   * the per-scale fast path is attached (split schema)
             //   * `normalized_boxes() == Some(true)`: HAILORT emits
             //     pixel-space coords, but the per-scale path normalizes
             //     internally using the schema's input_dims — the public
             //     accessor reports the post-decode state
-            //   * the DFL reg_max extracted from the program == 16
+            //   * the DFL reg_max extracted from the per-scale plan == 16
             //     (= 64 feature channels ÷ 4)
             let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
             let schema = SchemaV2::parse_json(&json).unwrap();
@@ -4276,129 +4276,33 @@ outputs:
                 .build()
                 .expect("Hailo YOLOv8-seg schema should build");
             assert!(
-                decoder.decode_program.is_some(),
-                "Hailo schema has per-scale children; DecodeProgram required"
+                decoder.per_scale.is_some(),
+                "Hailo schema has per-scale children; per-scale plan required"
             );
             assert_eq!(decoder.normalized_boxes(), Some(true));
+            let reg_max = decoder
+                .per_scale
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .plan
+                .boxes_reg_max();
             assert_eq!(
-                decoder.decode_program.as_ref().unwrap().boxes_reg_max(),
+                reg_max,
                 Some(16),
                 "reg_max must be 16 (64 feature channels ÷ 4)"
             );
         }
 
-        /// End-to-end numerical parity with the validator's synthetic
-        /// test (`scripts/decode_hailo_split.py::test_synthetic`):
-        /// feed uniform uint8=128 tensors through the whole pipeline
-        /// and confirm the DFL-decoded first anchor's xc / w match the
-        /// analytic values from HAILORT_DECODER.md §"Test Vectors".
-        ///
-        /// Uniform 128 produces uniform DFL logits (scale-independent
-        /// post-dequant since softmax normalises), so every anchor
-        /// decodes to distance `(reg_max-1)/2 = 7.5` on all four sides.
-        /// For the first stride-8 anchor at grid (0.5, 0.5):
-        ///   xc = (0.5 + 0) * 8 = 4.0
-        ///   w  = (7.5 + 7.5) * 8 = 120.0
-        #[test]
-        #[ignore = "TODO: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
-        fn hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity() {
-            use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
-            let json = edgefirst_bench::testdata::read_to_string("hailo_yolov8seg_edgefirst.json");
-            let schema = SchemaV2::parse_json(&json).unwrap();
-            let decoder = DecoderBuilder::new()
-                .with_schema(schema)
-                .with_score_threshold(0.25)
-                .with_iou_threshold(0.5)
-                .build()
-                .unwrap();
-
-            fn uniform_u8(shape: &[usize], value: u8) -> TensorDyn {
-                let t = Tensor::<u8>::new(shape, Some(TensorMemory::Mem), None).unwrap();
-                {
-                    let mut m = t.map().unwrap();
-                    for byte in m.as_mut_slice() {
-                        *byte = value;
-                    }
-                }
-                TensorDyn::U8(t)
-            }
-
-            // Shapes in schema order. 128 across the board → uniform
-            // DFL distributions and sigmoid-pre-applied scores of
-            // `128 × (1/255) ≈ 0.502`.
-            let b0 = uniform_u8(&[1, 80, 80, 64], 128);
-            let b1 = uniform_u8(&[1, 40, 40, 64], 128);
-            let b2 = uniform_u8(&[1, 20, 20, 64], 128);
-            let s0 = uniform_u8(&[1, 80, 80, 80], 128);
-            let s1 = uniform_u8(&[1, 40, 40, 80], 128);
-            let s2 = uniform_u8(&[1, 20, 20, 80], 128);
-            let m0 = uniform_u8(&[1, 80, 80, 32], 128);
-            let m1 = uniform_u8(&[1, 40, 40, 32], 128);
-            let m2 = uniform_u8(&[1, 20, 20, 32], 128);
-            let protos = uniform_u8(&[1, 160, 160, 32], 128);
-            let inputs: Vec<&TensorDyn> =
-                vec![&b0, &b1, &b2, &s0, &s1, &s2, &m0, &m1, &m2, &protos];
-
-            // Reach into the decode program directly to verify the
-            // post-DFL merged boxes tensor rather than running the full
-            // NMS — uniform input produces 8400 near-identical
-            // candidates which collapse arbitrarily through NMS.
-            let program = decoder
-                .decode_program
-                .as_ref()
-                .expect("Hailo schema compiles a DecodeProgram");
-            let merged = program.execute(&inputs).unwrap();
-
-            // Schema order: boxes, scores, mask_coefs, protos.
-            let boxes = &merged[0];
-            assert_eq!(
-                boxes.shape(),
-                &[1, 4, 8400],
-                "post-DFL merged boxes must be (1, 4, 8400)"
-            );
-
-            // First anchor = stride-8 grid (0, 0) → xc = 4.0, w = 120.
-            assert!(
-                (boxes[[0, 0, 0]] - 4.0).abs() < 1e-2,
-                "first anchor xc = {}, expected ~4.0",
-                boxes[[0, 0, 0]]
-            );
-            assert!(
-                (boxes[[0, 1, 0]] - 4.0).abs() < 1e-2,
-                "first anchor yc = {}, expected ~4.0",
-                boxes[[0, 1, 0]]
-            );
-            assert!(
-                (boxes[[0, 2, 0]] - 120.0).abs() < 1e-1,
-                "first anchor w = {}, expected ~120.0",
-                boxes[[0, 2, 0]]
-            );
-            assert!(
-                (boxes[[0, 3, 0]] - 120.0).abs() < 1e-1,
-                "first anchor h = {}, expected ~120.0",
-                boxes[[0, 3, 0]]
-            );
-
-            // Scores merged: (1, 80, 8400). Sigmoid-pre-applied with
-            // scale=1/255 and zp=0 ⇒ dequant(128) = 128/255 ≈ 0.5020.
-            let scores = &merged[1];
-            assert_eq!(scores.shape(), &[1, 80, 8400]);
-            let s00 = scores[[0, 0, 0]];
-            assert!(
-                (s00 - 0.5020).abs() < 1e-3,
-                "score[0,0,0] = {s00}, expected ~0.5020"
-            );
-
-            // Mask coefs merged: (1, 32, 8400).
-            let mask_coefs = &merged[2];
-            assert_eq!(mask_coefs.shape(), &[1, 32, 8400]);
-
-            // Protos passthrough: (1, 160, 160, 32) — schema declares
-            // NHWC; HAL does not transpose on merge. Downstream mask
-            // rendering is a separate concern (NHWC_PROTOS.md).
-            let protos_out = &merged[3];
-            assert_eq!(protos_out.shape(), &[1, 160, 160, 32]);
-        }
+        // NOTE: the former `hailo_yolov8seg_uniform_uint8_128_dfl_decode_parity`
+        // test exercised DFL decode through the legacy schema-v2 merge path
+        // (`decode_program.execute`). That path has been removed; the
+        // equivalent (and broader) numerical parity for the live per-scale
+        // path is covered by `tests/per_scale_parity.rs`
+        // (`parity_yolov8n_seg_per_scale_int8`, the analytic `xc=4` anchor
+        // assertions, and the yolov8n/yolo11n/yolo26n end-to-end + pre-NMS
+        // parity cases).
     }
 
     // =========================================================================

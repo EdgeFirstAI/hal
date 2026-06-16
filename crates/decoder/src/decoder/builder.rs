@@ -1181,8 +1181,19 @@ impl DecoderBuilder {
         DecoderError,
     > {
         schema.validate()?;
-        let program = DecodeProgram::try_from_schema(&schema)?;
+        // The per-scale subsystem claims per-scale schemas in full and owns
+        // their decode end-to-end (`decode` / `decode_proto` short-circuit on
+        // `per_scale.is_some()`). Build it first and use its claim as the
+        // single source of truth: only fall back to the schema-v2 merge
+        // program for split schemas it does NOT claim (e.g. ARA-2 channel
+        // sub-splits). This keeps `decode_program` `None` for per-scale
+        // schemas so the merge path never sees per-scale logicals.
         let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
+        let program = if per_scale.is_some() {
+            None
+        } else {
+            DecodeProgram::try_from_schema(&schema)?
+        };
         // Extract model input (W, H) from `input.shape`/`dshape`. Used by
         // the legacy decode path to honour `normalized: false` (see
         // EDGEAI-1303). `None` is fine when the schema omits the input

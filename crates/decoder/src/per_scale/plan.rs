@@ -365,6 +365,21 @@ impl PerScalePlan {
             proto_layout,
         }))
     }
+
+    /// DFL `reg_max` for the boxes role, or `None` when boxes are not
+    /// DFL-encoded.
+    ///
+    /// `reg_max` is uniform across FPN levels (validated at plan time),
+    /// so the first level is authoritative. Surfaces the value already
+    /// computed in [`Self::try_from_schema`] so tests can assert the
+    /// box-decode bin count of a built decoder.
+    #[cfg(test)]
+    pub(crate) fn boxes_reg_max(&self) -> Option<usize> {
+        if self.box_encoding != BoxEncoding::Dfl {
+            return None;
+        }
+        self.levels.first().map(|lvl| lvl.reg_max)
+    }
 }
 
 /// Map a schema-level [`crate::schema::DType`] (which uses `Int8`/`Float32`

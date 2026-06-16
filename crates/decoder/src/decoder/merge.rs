@@ -19,7 +19,12 @@
 //! |---|---|---|
 //! | [`LogicalMerge::Direct`] | logical has no children | find tensor by shape, dequantize to f32 |
 //! | [`LogicalMerge::ChannelConcat`] | children lack `stride` (e.g. ARA-2 `boxes_xy` + `boxes_wh`) | dequantize each, concat along channel axis |
-//! | [`LogicalMerge::PerScale`] | children carry `stride` (e.g. Hailo FPN) | sort by stride ascending, dequantize, flatten H×W, concat along spatial axis, reshape to logical shape |
+//!
+//! Per-scale FPN splits (children carrying `stride`, e.g. Hailo
+//! YOLOv8/v11 with `encoding: dfl`) are NOT handled here: the
+//! `per_scale` subsystem ([`crate::per_scale::PerScalePlan`]) claims
+//! those schemas in full at builder time, so the merge program is only
+//! ever built for flat or channel-sub-split schemas.
 //!
 //! # Not yet supported
 //!
@@ -27,30 +32,13 @@
 //!   currently only consumes per-tensor scalar `(scale, zero_point)`.
 //! - **Activation flags on floats** — when a child carries
 //!   `activation_required: sigmoid` the HAL does not yet apply it
-//!   during merge. For split ARA-2 / Hailo typical usage the NPU
-//!   applies sigmoid on-chip (`activation_applied`), so this is not
-//!   blocking.
-//!
-//! # DFL decoding
-//!
-//! Per-scale children with `encoding: dfl` (Hailo YOLOv8/v11 boxes)
-//! carry `4 × reg_max` channels per anchor. The per-scale merge runs
-//! a numerically stable softmax + weighted-sum + `dist2bbox` inside
-//! [`execute_per_scale`] before spatial concat, collapsing the
-//! feature axis to the 4 xcycwh pixel-coordinate channels the
-//! downstream Ultralytics decoder expects. Per-FPN-level anchor
-//! grids and `dfl_bins` are pre-computed at plan time (see
-//! [`DflConfig`]). Reference: `HAILORT_DECODER.md` §"DFL Decode +
-//! dist2bbox" and [`super::dfl`].
+//!   during merge. For split ARA-2 typical usage the NPU applies
+//!   sigmoid on-chip (`activation_applied`), so this is not blocking.
 
-use ndarray::{Array, Array3, ArrayD, ArrayViewD, Axis, IxDyn};
+use ndarray::{Array, ArrayD, ArrayViewD, Axis, IxDyn};
 
-use super::dfl;
 use crate::configs::DimName;
-use crate::schema::{
-    self, padding_axes, squeeze_padding_dims, Activation, LogicalOutput, LogicalType, SchemaV2,
-    Stride,
-};
+use crate::schema::{self, padding_axes, squeeze_padding_dims, LogicalOutput, SchemaV2};
 // `squeeze_padding_dims` is re-used by plan_channel_concat below.
 use crate::{dequantize_cpu_chunked, DecoderError, DecoderResult, Quantization};
 use edgefirst_tensor::{TensorDyn, TensorMapTrait, TensorTrait};
@@ -83,29 +71,6 @@ enum LogicalMerge {
         padding_axes: Vec<usize>,
         quant: Option<Quantization>,
     },
-    /// Children share a common feature axis and differ in spatial
-    /// extent. Concatenate along the logical anchor / box axis after
-    /// flattening each child's H×W.
-    PerScale {
-        // TODO: legacy PerScale arm to be removed; the
-        // executor body now loud-fails and these fields are constructed
-        // by `plan_per_scale` only for the legacy path, which the
-        // per-scale subsystem now claims at builder time.
-        #[allow(dead_code)]
-        children: Vec<PhysicalBinding>,
-        #[allow(dead_code)]
-        logical_shape: Vec<usize>,
-        #[allow(dead_code)]
-        feature_axis_logical: usize,
-        #[allow(dead_code)]
-        box_axis_logical: usize,
-        /// When `Some`, the feature axis is `4 × reg_max` DFL logits
-        /// and the executor applies per-level DFL decode (softmax,
-        /// weighted sum, `dist2bbox`) before concat, collapsing the
-        /// feature axis to 4 xcycwh pixel-coordinate channels.
-        #[allow(dead_code)]
-        dfl: Option<DflConfig>,
-    },
     /// Children share a common anchor axis and differ along the channel
     /// dimension (e.g. ARA-2 xy + wh). Dequantize each and concat along
     /// the channel axis.
@@ -121,35 +86,8 @@ enum LogicalMerge {
 
 #[derive(Debug, Clone)]
 struct PhysicalBinding {
-    name: String,
     shape: Vec<usize>,
-    dshape: Vec<(DimName, usize)>,
     quant: Option<Quantization>,
-    stride: Option<Stride>,
-    #[allow(dead_code)] // applied by the NPU; currently informational
-    activation_applied: Option<Activation>,
-}
-
-/// Pre-computed DFL decode state for a logical `boxes` output with
-/// `encoding: dfl` and per-scale children. Produced at plan time so
-/// the per-frame path never allocates anchor grids.
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-#[derive(Debug, Clone)]
-pub(crate) struct DflConfig {
-    pub(crate) reg_max: usize,
-    /// One entry per child, in `PerScale::children` order
-    /// (stride-ascending after [`plan_per_scale`]'s sort).
-    grids: Vec<DflChildGrid>,
-}
-
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-#[derive(Debug, Clone)]
-struct DflChildGrid {
-    stride: f32,
-    /// Row-major `H*W` anchor-centre x-coordinates in grid units.
-    grid_x: Vec<f32>,
-    /// Row-major `H*W` anchor-centre y-coordinates in grid units.
-    grid_y: Vec<f32>,
 }
 
 impl DecodeProgram {
@@ -199,19 +137,6 @@ impl DecodeProgram {
             .map(|m| execute_merge(m, inputs, &mut used))
             .collect()
     }
-
-    /// Returns the DFL `reg_max` extracted from the first DFL-encoded
-    /// `boxes` logical output in the schema, or `None` when the schema
-    /// has no DFL boxes.
-    #[cfg(test)]
-    pub(crate) fn boxes_reg_max(&self) -> Option<usize> {
-        for m in &self.merges {
-            if let LogicalMerge::PerScale { dfl: Some(d), .. } = m {
-                return Some(d.reg_max);
-            }
-        }
-        None
-    }
 }
 
 fn plan_logical(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
@@ -231,129 +156,20 @@ fn plan_logical(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
 
     let first_has_stride = logical.outputs[0].stride.is_some();
     if first_has_stride {
-        plan_per_scale(logical)
+        // Per-scale FPN splits are owned end-to-end by the `per_scale`
+        // subsystem, which claims such schemas at builder time before the
+        // merge program is built (see `DecoderBuilder::build_from_schema`).
+        // Reaching here means a schema mixes a per-scale logical with
+        // flat/channel-sub-split siblings such that `PerScalePlan` declined
+        // it — a decomposition the merge path does not support.
+        Err(DecoderError::NotSupported(format!(
+            "logical `{}` has per-scale (strided) children but the schema was \
+             not claimed by the per-scale subsystem; mixed per-scale + \
+             channel-sub-split schemas are not supported by the merge path",
+            logical.name.as_deref().unwrap_or("<anonymous>")
+        )))
     } else {
         plan_channel_concat(logical)
-    }
-}
-
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn plan_per_scale(logical: &LogicalOutput) -> DecoderResult<LogicalMerge> {
-    let mut children = logical
-        .outputs
-        .iter()
-        .map(physical_binding)
-        .collect::<DecoderResult<Vec<_>>>()?;
-    children.sort_by_key(|c| c.stride.map(|s| s.x()).unwrap_or(0));
-
-    // Identify feature and box axes in the logical dshape. If dshape is
-    // absent we cannot merge unambiguously — fall back to heuristics
-    // based on common YOLO conventions (batch, features, boxes).
-    let (feature_axis_logical, box_axis_logical) = logical_per_scale_axes(logical)?;
-
-    let dfl = if logical.type_ == Some(LogicalType::Boxes)
-        && logical.encoding == Some(schema::BoxEncoding::Dfl)
-    {
-        Some(plan_dfl(logical, &children)?)
-    } else {
-        None
-    };
-
-    Ok(LogicalMerge::PerScale {
-        children,
-        logical_shape: logical.shape.clone(),
-        feature_axis_logical,
-        box_axis_logical,
-        dfl,
-    })
-}
-
-/// Compute the DFL `reg_max` and per-child anchor grids at plan time.
-///
-/// `reg_max` is derived from the first child's feature count (`feat /
-/// 4`) and verified to be uniform across all children — the HAL's
-/// schema validator already rejects non-divisible-by-4 feature axes,
-/// but we re-check here so an internal logic bug is caught before
-/// per-frame decode starts reading bogus strides. See
-/// `HAILORT_DECODER.md` §"Open Questions" for the heterogeneous
-/// `reg_max` future work.
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn plan_dfl(logical: &LogicalOutput, children: &[PhysicalBinding]) -> DecoderResult<DflConfig> {
-    let first_feat = child_feature_count(&children[0])?;
-    if first_feat == 0 || first_feat % 4 != 0 {
-        return Err(DecoderError::InvalidConfig(format!(
-            "DFL logical `{}` first child feature count {first_feat} is not a positive multiple of 4",
-            logical.name.as_deref().unwrap_or("<anonymous>")
-        )));
-    }
-    let reg_max = first_feat / 4;
-    let mut grids = Vec::with_capacity(children.len());
-    for child in children {
-        let feat = child_feature_count(child)?;
-        if feat / 4 != reg_max {
-            return Err(DecoderError::NotSupported(format!(
-                "DFL logical `{}` has heterogeneous reg_max across children \
-                 (child `{}` feature count {feat}, expected {}). \
-                 Per-child reg_max is not yet supported.",
-                logical.name.as_deref().unwrap_or("<anonymous>"),
-                child.name,
-                reg_max * 4,
-            )));
-        }
-        let (h, w) = child_hw(child)?;
-        let stride = child.stride.map(|s| s.x() as f32).ok_or_else(|| {
-            DecoderError::InvalidConfig(format!(
-                "DFL child `{}` has no stride — required for anchor-grid pre-compute",
-                child.name
-            ))
-        })?;
-        let (gx, gy) = dfl::make_anchor_grid(h, w);
-        grids.push(DflChildGrid {
-            stride,
-            grid_x: gx,
-            grid_y: gy,
-        });
-    }
-    Ok(DflConfig { reg_max, grids })
-}
-
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn child_feature_count(child: &PhysicalBinding) -> DecoderResult<usize> {
-    for (i, (name, _)) in child.dshape.iter().enumerate() {
-        if matches!(
-            name,
-            DimName::NumFeatures
-                | DimName::NumClasses
-                | DimName::NumProtos
-                | DimName::BoxCoords
-                | DimName::NumAnchorsXFeatures
-        ) {
-            return Ok(child.shape[i]);
-        }
-    }
-    Err(DecoderError::InvalidConfig(format!(
-        "per-scale child `{}` dshape {:?} lacks a feature axis",
-        child.name, child.dshape
-    )))
-}
-
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn child_hw(child: &PhysicalBinding) -> DecoderResult<(usize, usize)> {
-    let mut h = None;
-    let mut w = None;
-    for (i, (name, _)) in child.dshape.iter().enumerate() {
-        match name {
-            DimName::Height => h = Some(child.shape[i]),
-            DimName::Width => w = Some(child.shape[i]),
-            _ => {}
-        }
-    }
-    match (h, w) {
-        (Some(h), Some(w)) => Ok((h, w)),
-        _ => Err(DecoderError::InvalidConfig(format!(
-            "DFL per-scale child `{}` dshape {:?} must name both `height` and `width`",
-            child.name, child.dshape
-        ))),
     }
 }
 
@@ -385,12 +201,8 @@ fn physical_binding(p: &schema::PhysicalOutput) -> DecoderResult<PhysicalBinding
         .map(schema_quant_to_runtime)
         .transpose()?;
     Ok(PhysicalBinding {
-        name: p.name.clone(),
         shape: p.shape.clone(),
-        dshape: p.dshape.clone(),
         quant,
-        stride: p.stride,
-        activation_applied: p.activation_applied,
     })
 }
 
@@ -407,39 +219,6 @@ fn schema_quant_to_runtime(q: &schema::Quantization) -> DecoderResult<Quantizati
         *q.scale.first().unwrap_or(&0.0),
         q.zero_point_at(0),
     ))
-}
-
-fn logical_per_scale_axes(logical: &LogicalOutput) -> DecoderResult<(usize, usize)> {
-    // Require a dshape so we can name axes unambiguously.
-    if logical.dshape.is_empty() {
-        return Err(DecoderError::InvalidConfig(format!(
-            "logical `{}` has per-scale children but no `dshape`; cannot \
-             infer feature / box axes for merge",
-            logical.name.as_deref().unwrap_or("<anonymous>")
-        )));
-    }
-    let feature = logical.dshape.iter().position(|(n, _)| {
-        matches!(
-            n,
-            DimName::NumFeatures
-                | DimName::NumClasses
-                | DimName::NumProtos
-                | DimName::BoxCoords
-                | DimName::NumAnchorsXFeatures
-        )
-    });
-    let boxes = logical
-        .dshape
-        .iter()
-        .position(|(n, _)| matches!(n, DimName::NumBoxes));
-    match (feature, boxes) {
-        (Some(f), Some(b)) => Ok((f, b)),
-        _ => Err(DecoderError::InvalidConfig(format!(
-            "logical `{}` dshape {:?} must name both a feature dim and `num_boxes`",
-            logical.name.as_deref().unwrap_or("<anonymous>"),
-            logical.dshape,
-        ))),
-    }
 }
 
 fn channel_axis_in_logical(logical: &LogicalOutput) -> DecoderResult<usize> {
@@ -501,12 +280,6 @@ fn execute_merge(
             padding_axes,
             used,
         ),
-        LogicalMerge::PerScale { .. } => Err(DecoderError::Internal(
-            "merge.rs::LogicalMerge::PerScale was reached; per-scale schemas must be \
-             claimed by per_scale::PerScalePlan::try_from_schema. This indicates capability \
-             detection let a per-scale schema through to the legacy path — file a bug."
-                .into(),
-        )),
     }
 }
 
@@ -749,322 +522,13 @@ fn execute_channel_concat(
     Ok(merged)
 }
 
-/// Merge per-scale children into a `(batch, features, total_anchors)`
-/// logical tensor.
-///
-/// For each child:
-/// 1. Resolve batch / height / width / feature axes from its `dshape`.
-/// 2. Dequantize to `f32`.
-/// 3. Reorder to `(batch, features, H*W)` regardless of NHWC/NCHW.
-///
-/// Concatenate parts along the anchor axis (stride-ascending order was
-/// set at plan time), then reshape to `logical_shape`.
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn execute_per_scale(
-    inputs: &[&TensorDyn],
-    children: &[PhysicalBinding],
-    logical_shape: &[usize],
-    feature_axis_logical: usize,
-    box_axis_logical: usize,
-    dfl_cfg: Option<&DflConfig>,
-    used: &mut Vec<usize>,
-) -> DecoderResult<ArrayD<f32>> {
-    if children.is_empty() {
-        return Err(DecoderError::InvalidConfig(
-            "per-scale merge with zero children".into(),
-        ));
-    }
-
-    let mut per_scale_parts: Vec<Array3<f32>> = Vec::with_capacity(children.len());
-    let mut feature_count: Option<usize> = None;
-    let mut batch: Option<usize> = None;
-    for (idx, child) in children.iter().enumerate() {
-        let arr = find_and_dequantize(inputs, &child.shape, child.quant, used)?;
-        let (b, features, part) = child_to_batch_feature_spatial(arr, child)?;
-        match batch {
-            None => batch = Some(b),
-            Some(prev) if prev != b => {
-                return Err(DecoderError::InvalidShape(format!(
-                    "per-scale children have inconsistent batch: {prev} vs {b}"
-                )));
-            }
-            _ => {}
-        }
-        match feature_count {
-            None => feature_count = Some(features),
-            Some(prev) if prev != features => {
-                return Err(DecoderError::InvalidShape(format!(
-                    "per-scale children have inconsistent feature count: {prev} vs {features}"
-                )));
-            }
-            _ => {}
-        }
-        let part = match dfl_cfg {
-            Some(cfg) => dfl_decode_child(part, cfg, idx)?,
-            None => part,
-        };
-        per_scale_parts.push(part);
-    }
-
-    let views: Vec<_> = per_scale_parts.iter().map(|a| a.view()).collect();
-    let merged = ndarray::concatenate(Axis(2), &views).map_err(DecoderError::NDArrayShape)?;
-
-    // merged is (batch, features, total_anchors) where `features` is 4
-    // for DFL (post-decode) or the raw child feature count otherwise.
-    // Reshape to the logical shape declared in the schema.
-    reshape_to_logical(
-        merged.into_dyn(),
-        logical_shape,
-        feature_axis_logical,
-        box_axis_logical,
-    )
-}
-
-/// Apply per-level DFL decode to one child's `(batch, 4 × reg_max, N)`
-/// tensor, producing a `(batch, 4, N)` tensor of xcycwh pixel
-/// coordinates.
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn dfl_decode_child(
-    part: Array3<f32>,
-    cfg: &DflConfig,
-    child_idx: usize,
-) -> DecoderResult<Array3<f32>> {
-    let (batch, features, n) = part.dim();
-    let expected_feat = 4 * cfg.reg_max;
-    if features != expected_feat {
-        return Err(DecoderError::InvalidShape(format!(
-            "DFL child {child_idx}: feature count {features} != 4 × reg_max ({expected_feat})"
-        )));
-    }
-    if batch != 1 {
-        return Err(DecoderError::NotSupported(format!(
-            "DFL decode with batch={batch} is not supported (only batch=1 today)"
-        )));
-    }
-    let grid = cfg
-        .grids
-        .get(child_idx)
-        .ok_or_else(|| DecoderError::Internal(format!("DFL grid missing for child {child_idx}")))?;
-    if grid.grid_x.len() != n {
-        return Err(DecoderError::InvalidShape(format!(
-            "DFL child {child_idx}: anchor count {n} != precomputed grid {}",
-            grid.grid_x.len()
-        )));
-    }
-
-    // Transpose (1, F, N) → (1, N, F) and materialise contiguous so
-    // the flat slice is NHWC-inner with features as the innermost
-    // axis — the layout `dfl::decode_dfl_level` expects.
-    let transposed = part.permuted_axes([0, 2, 1]);
-    let contiguous = transposed.as_standard_layout().to_owned();
-    let flat = contiguous
-        .as_slice()
-        .ok_or_else(|| DecoderError::Internal("DFL transposed slice not contiguous".into()))?;
-
-    let decoded = dfl::decode_dfl_level(
-        flat,
-        1,
-        n,
-        cfg.reg_max,
-        &grid.grid_x,
-        &grid.grid_y,
-        grid.stride,
-    );
-    // `decoded` is `N * 4` flat in (anchor, side) order — shape (1, N, 4).
-    // Transpose back to (1, 4, N) for the anchor-axis concat downstream.
-    let decoded_nhwc = Array::from_shape_vec(ndarray::Ix3(1, n, 4), decoded)
-        .map_err(DecoderError::NDArrayShape)?;
-    let out = decoded_nhwc
-        .permuted_axes([0, 2, 1])
-        .as_standard_layout()
-        .to_owned();
-    Ok(out)
-}
-
-/// Permute a physical child's dequantized array to a canonical
-/// `(batch, features, H*W)` layout regardless of whether the child was
-/// declared NCHW or NHWC.
-///
-/// Returns the materialised `Array3<f32>` along with the batch and
-/// feature dimensions for cross-child consistency checks.
-#[allow(dead_code)] // TODO: legacy PerScale arm to be removed
-fn child_to_batch_feature_spatial(
-    arr: ArrayD<f32>,
-    child: &PhysicalBinding,
-) -> DecoderResult<(usize, usize, Array3<f32>)> {
-    if child.dshape.is_empty() {
-        return Err(DecoderError::InvalidConfig(format!(
-            "per-scale child `{}` must declare `dshape` for layout \
-             disambiguation (NCHW vs NHWC)",
-            child.name
-        )));
-    }
-    let shape = arr.shape().to_vec();
-    if shape.len() != child.dshape.len() {
-        return Err(DecoderError::InvalidShape(format!(
-            "per-scale child `{}` shape rank {} does not match dshape rank {}",
-            child.name,
-            shape.len(),
-            child.dshape.len()
-        )));
-    }
-
-    let mut batch = 1usize;
-    let mut height = 1usize;
-    let mut width = 1usize;
-    let mut features = 1usize;
-    for (i, (name, _)) in child.dshape.iter().enumerate() {
-        let size = shape[i];
-        match name {
-            DimName::Batch => batch = size,
-            DimName::Height => height = size,
-            DimName::Width => width = size,
-            DimName::NumFeatures
-            | DimName::NumClasses
-            | DimName::NumProtos
-            | DimName::BoxCoords
-            | DimName::NumAnchorsXFeatures => features = size,
-            DimName::NumBoxes | DimName::Padding | DimName::Unknown => {}
-        }
-    }
-
-    let b_axis = axis_index(&child.dshape, &[DimName::Batch]).ok_or_else(|| {
-        DecoderError::InvalidConfig(format!(
-            "per-scale child `{}` dshape {:?} lacks a `batch` axis",
-            child.name, child.dshape
-        ))
-    })?;
-    let f_axis = axis_index(
-        &child.dshape,
-        &[
-            DimName::NumFeatures,
-            DimName::NumClasses,
-            DimName::NumProtos,
-            DimName::BoxCoords,
-            DimName::NumAnchorsXFeatures,
-        ],
-    )
-    .ok_or_else(|| {
-        DecoderError::InvalidConfig(format!(
-            "per-scale child `{}` dshape {:?} lacks a feature axis",
-            child.name, child.dshape
-        ))
-    })?;
-    let h_axis = axis_index(&child.dshape, &[DimName::Height]);
-    let w_axis = axis_index(&child.dshape, &[DimName::Width]);
-
-    // Permute to canonical order: batch, feature, then spatial (H, W)
-    // when present. Remaining axes are appended so the permutation is
-    // a valid permutation of 0..rank.
-    let mut perm: Vec<usize> = vec![b_axis, f_axis];
-    if let Some(h) = h_axis {
-        perm.push(h);
-    }
-    if let Some(w) = w_axis {
-        perm.push(w);
-    }
-    for i in 0..child.dshape.len() {
-        if !perm.contains(&i) {
-            perm.push(i);
-        }
-    }
-    debug_assert_eq!(perm.len(), child.dshape.len());
-
-    // Permute then materialise (contiguous (batch, feature, H, W, ...)).
-    let permuted = arr.permuted_axes(IxDyn(&perm));
-    let contiguous = permuted
-        .as_standard_layout()
-        .to_owned()
-        .into_dimensionality::<IxDyn>()
-        .map_err(DecoderError::NDArrayShape)?;
-
-    let spatial = height * width;
-    // Reshape into (batch, feature, spatial) Array3. This is a pure
-    // view reshape of the contiguous permuted data.
-    let reshaped = contiguous
-        .into_shape_with_order(ndarray::Ix3(batch, features, spatial))
-        .map_err(|e| {
-            DecoderError::InvalidShape(format!(
-                "per-scale: failed to reshape permuted child `{}` to \
-                 (batch,features,spatial)=({batch},{features},{spatial}): {e}",
-                child.name
-            ))
-        })?;
-    Ok((batch, features, reshaped))
-}
-
-fn axis_index(dshape: &[(DimName, usize)], any_of: &[DimName]) -> Option<usize> {
-    dshape.iter().position(|(n, _)| any_of.contains(n))
-}
-
-/// Reshape a `(batch, features, anchors)` tensor into the logical shape
-/// declared by the schema, moving features/anchors to their logical
-/// positions.
-fn reshape_to_logical(
-    merged: ArrayD<f32>,
-    logical_shape: &[usize],
-    feature_axis_logical: usize,
-    box_axis_logical: usize,
-) -> DecoderResult<ArrayD<f32>> {
-    // Common case: logical is [batch, features, boxes] in the same order
-    // as our intermediate representation — this is the YOLO convention.
-    if logical_shape.len() == 3
-        && feature_axis_logical == 1
-        && box_axis_logical == 2
-        && merged.shape() == logical_shape
-    {
-        return Ok(merged);
-    }
-    // General case: reshape if the element count matches, and transpose
-    // batch/feature/boxes into the logical order.
-    let total: usize = logical_shape.iter().product();
-    if merged.len() != total {
-        return Err(DecoderError::InvalidShape(format!(
-            "merged shape {:?} has {} elements; logical shape {:?} \
-             expects {} elements",
-            merged.shape(),
-            merged.len(),
-            logical_shape,
-            total
-        )));
-    }
-
-    // Build a permutation that takes (batch=0, features=1, boxes=2) to
-    // (batch_pos, feature_pos, box_pos) inside logical_shape. We assume
-    // batch is at axis 0 in logical_shape unless otherwise declared.
-    let batch_pos_logical = (0..logical_shape.len())
-        .find(|&i| i != feature_axis_logical && i != box_axis_logical)
-        .unwrap_or(0);
-    let mut target = vec![0usize; logical_shape.len()];
-    target[batch_pos_logical] = 0; // batch
-    target[feature_axis_logical] = 1;
-    target[box_axis_logical] = 2;
-
-    // If logical has more than 3 dims (padding etc.), put remaining
-    // logical dims past 3. We don't currently support padding dims in
-    // per-scale merges — reject if present.
-    if logical_shape.len() != 3 {
-        return Err(DecoderError::NotSupported(format!(
-            "per-scale merge into logical rank {} is not yet supported \
-             (only rank-3 [batch, features, boxes] today)",
-            logical_shape.len()
-        )));
-    }
-
-    let inv_perm: Vec<usize> = (0..3)
-        .map(|src| target.iter().position(|&t| t == src).unwrap())
-        .collect();
-    let out = merged.permuted_axes(inv_perm);
-    Ok(out.as_standard_layout().to_owned())
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::schema::{
         BoxEncoding, DType, DecoderKind, LogicalOutput, LogicalType, PhysicalOutput, PhysicalType,
-        Quantization as SchemaQuant, SchemaV2, ScoreFormat, Stride as SchemaStride,
+        Quantization as SchemaQuant, SchemaV2, ScoreFormat,
     };
     use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait};
 
@@ -1384,108 +848,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
-    fn per_scale_merge_nhwc_to_nchw() {
-        // Boxes split per-scale, NHWC children → (1, 4, total) logical NCHW.
-        // Strides 8 + 16: spatial sizes 4 + 1 = 5 anchors, 4 features each.
-        let schema = SchemaV2 {
-            schema_version: 2,
-            outputs: vec![LogicalOutput {
-                name: Some("boxes".into()),
-                type_: Some(LogicalType::Boxes),
-                shape: vec![1, 4, 5],
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::NumFeatures, 4),
-                    (DimName::NumBoxes, 5),
-                ],
-                decoder: Some(DecoderKind::Ultralytics),
-                encoding: Some(BoxEncoding::Direct),
-                score_format: None,
-                normalized: Some(true),
-                anchors: None,
-                stride: None,
-                dtype: None,
-                quantization: None,
-                outputs: vec![
-                    PhysicalOutput {
-                        name: "b0".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        // NHWC [1, 2, 2, 4]: 4 anchors at stride 8
-                        shape: vec![1, 2, 2, 4],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 2),
-                            (DimName::Width, 2),
-                            (DimName::NumFeatures, 4),
-                        ],
-                        dtype: DType::Uint8,
-                        quantization: Some(per_tensor_q(1.0, 0, DType::Uint8)),
-                        stride: Some(SchemaStride::Square(8)),
-                        scale_index: Some(0),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                    PhysicalOutput {
-                        name: "b1".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        // NHWC [1, 1, 1, 4]: 1 anchor at stride 16
-                        shape: vec![1, 1, 1, 4],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 1),
-                            (DimName::Width, 1),
-                            (DimName::NumFeatures, 4),
-                        ],
-                        dtype: DType::Uint8,
-                        quantization: Some(per_tensor_q(1.0, 0, DType::Uint8)),
-                        stride: Some(SchemaStride::Square(16)),
-                        scale_index: Some(1),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                ],
-                activation_applied: None,
-                activation_required: None,
-            }],
-            ..Default::default()
-        };
-
-        let program = DecodeProgram::try_from_schema(&schema).unwrap().unwrap();
-
-        // b0: NHWC [1, 2, 2, 4]. Anchor-major, feature-minor.
-        //   Values by (h, w, c):
-        //     (0,0,*) = [1, 2, 3, 4]
-        //     (0,1,*) = [5, 6, 7, 8]
-        //     (1,0,*) = [9, 10, 11, 12]
-        //     (1,1,*) = [13, 14, 15, 16]
-        // b1: NHWC [1, 1, 1, 4]. Values = [100, 101, 102, 103]
-        let b0 = make_u8_tensor(
-            &[1, 2, 2, 4],
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-        );
-        let b1 = make_u8_tensor(&[1, 1, 1, 4], &[100, 101, 102, 103]);
-        let inputs: Vec<&TensorDyn> = vec![&b0, &b1];
-        let merged = program.execute(&inputs).unwrap();
-
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].shape(), &[1, 4, 5]);
-        let arr = &merged[0];
-        // Anchors 0..4 are from stride-8 (4 anchors). Anchor 4 is from stride-16.
-        // Canonical per-scale ordering: row-major over H then W, so (0,0),
-        // (0,1), (1,0), (1,1) for stride 8.
-        // Feature 0 across all anchors = [1, 5, 9, 13, 100]
-        assert_eq!(arr[[0, 0, 0]], 1.0);
-        assert_eq!(arr[[0, 0, 1]], 5.0);
-        assert_eq!(arr[[0, 0, 2]], 9.0);
-        assert_eq!(arr[[0, 0, 3]], 13.0);
-        assert_eq!(arr[[0, 0, 4]], 100.0);
-        // Feature 3 across all anchors = [4, 8, 12, 16, 103]
-        assert_eq!(arr[[0, 3, 0]], 4.0);
-        assert_eq!(arr[[0, 3, 4]], 103.0);
-    }
-
-    #[test]
     fn direct_logical_with_float_tensor_pass_through() {
         // A flat logical (no children) with a float32 tensor.
         // try_from_schema returns None (no merge); we directly call the
@@ -1594,273 +956,6 @@ mod tests {
         assert!((merged[1][[0, 0, 2]] - 3.0).abs() < 1e-6);
         assert!((merged[1][[0, 1, 0]] - 2.0).abs() < 1e-6);
         assert!((merged[1][[0, 1, 2]] - 6.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn dfl_split_with_per_scale_children_is_accepted_and_exposes_reg_max() {
-        // Schema-level acceptance test: the HAL now consumes DFL boxes
-        // with per-scale children natively (Hailo YOLOv8/v11 split
-        // output convention). The compile step must succeed and
-        // expose the extracted `reg_max` for downstream consumers.
-        let schema = SchemaV2 {
-            schema_version: 2,
-            outputs: vec![LogicalOutput {
-                name: Some("boxes".into()),
-                type_: Some(LogicalType::Boxes),
-                // Post-decode logical shape: 4 xcycwh channels × 6400
-                // anchors (single 80×80 FPN level in this minimal case).
-                shape: vec![1, 4, 6400],
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::BoxCoords, 4),
-                    (DimName::NumBoxes, 6400),
-                ],
-                decoder: Some(DecoderKind::Ultralytics),
-                encoding: Some(BoxEncoding::Dfl),
-                score_format: None,
-                normalized: Some(false),
-                anchors: None,
-                stride: None,
-                dtype: None,
-                quantization: None,
-                outputs: vec![PhysicalOutput {
-                    name: "b0".into(),
-                    type_: Some(PhysicalType::Boxes),
-                    shape: vec![1, 80, 80, 64],
-                    dshape: vec![
-                        (DimName::Batch, 1),
-                        (DimName::Height, 80),
-                        (DimName::Width, 80),
-                        (DimName::NumFeatures, 64),
-                    ],
-                    dtype: DType::Uint8,
-                    quantization: Some(per_tensor_q(0.01, 128, DType::Uint8)),
-                    stride: Some(SchemaStride::Square(8)),
-                    scale_index: Some(0),
-                    activation_applied: None,
-                    activation_required: None,
-                }],
-                activation_applied: None,
-                activation_required: None,
-            }],
-            ..Default::default()
-        };
-        let program = DecodeProgram::try_from_schema(&schema).unwrap().unwrap();
-        assert_eq!(program.boxes_reg_max(), Some(16));
-    }
-
-    #[test]
-    #[ignore = "TODO: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
-    fn per_scale_dfl_merge_produces_4ch_pixel_coordinates() {
-        // Two FPN levels, reg_max=4 (feature axis = 16 per child):
-        //   stride  8 @ 2×2  → 4 anchors
-        //   stride 16 @ 1×1  → 1 anchor
-        // Post-merge shape: (1, 4, 5) xcycwh pixel coords.
-        // Uniform +1.0 logits per slot → uniform softmax → distance =
-        // (reg_max-1)/2 = 1.5 on all four sides for every anchor.
-        //   stride 8,  grid (0.5, 0.5): xc=4,  yc=4,  w=24, h=24
-        //   stride 8,  grid (1.5, 0.5): xc=12, yc=4
-        //   stride 8,  grid (0.5, 1.5): xc=4,  yc=12
-        //   stride 8,  grid (1.5, 1.5): xc=12, yc=12
-        //   stride 16, grid (0.5, 0.5): xc=8,  yc=8,  w=48, h=48
-        let schema = SchemaV2 {
-            schema_version: 2,
-            outputs: vec![LogicalOutput {
-                name: Some("boxes".into()),
-                type_: Some(LogicalType::Boxes),
-                shape: vec![1, 4, 5],
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::BoxCoords, 4),
-                    (DimName::NumBoxes, 5),
-                ],
-                decoder: Some(DecoderKind::Ultralytics),
-                encoding: Some(BoxEncoding::Dfl),
-                score_format: None,
-                normalized: Some(false),
-                anchors: None,
-                stride: None,
-                dtype: None,
-                quantization: None,
-                outputs: vec![
-                    PhysicalOutput {
-                        name: "b0".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        shape: vec![1, 2, 2, 16],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 2),
-                            (DimName::Width, 2),
-                            (DimName::NumFeatures, 16),
-                        ],
-                        dtype: DType::Float32,
-                        quantization: None,
-                        stride: Some(SchemaStride::Square(8)),
-                        scale_index: Some(0),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                    PhysicalOutput {
-                        name: "b1".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        shape: vec![1, 1, 1, 16],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 1),
-                            (DimName::Width, 1),
-                            (DimName::NumFeatures, 16),
-                        ],
-                        dtype: DType::Float32,
-                        quantization: None,
-                        stride: Some(SchemaStride::Square(16)),
-                        scale_index: Some(1),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                ],
-                activation_applied: None,
-                activation_required: None,
-            }],
-            ..Default::default()
-        };
-        let program = DecodeProgram::try_from_schema(&schema).unwrap().unwrap();
-        let b0 = make_f32_tensor(&[1, 2, 2, 16], &[1.0f32; 2 * 2 * 16]);
-        let b1 = make_f32_tensor(&[1, 1, 1, 16], &[1.0f32; 16]);
-        let inputs: Vec<&TensorDyn> = vec![&b0, &b1];
-        let merged = program.execute(&inputs).unwrap();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].shape(), &[1, 4, 5]);
-        let arr = &merged[0];
-        // xc across anchors [s8 row-major, s16]:
-        assert!(
-            (arr[[0, 0, 0]] - 4.0).abs() < 1e-3,
-            "xc[0]={}",
-            arr[[0, 0, 0]]
-        );
-        assert!(
-            (arr[[0, 0, 1]] - 12.0).abs() < 1e-3,
-            "xc[1]={}",
-            arr[[0, 0, 1]]
-        );
-        assert!(
-            (arr[[0, 0, 2]] - 4.0).abs() < 1e-3,
-            "xc[2]={}",
-            arr[[0, 0, 2]]
-        );
-        assert!(
-            (arr[[0, 0, 3]] - 12.0).abs() < 1e-3,
-            "xc[3]={}",
-            arr[[0, 0, 3]]
-        );
-        assert!(
-            (arr[[0, 0, 4]] - 8.0).abs() < 1e-3,
-            "xc[4]={}",
-            arr[[0, 0, 4]]
-        );
-        // yc across anchors:
-        assert!((arr[[0, 1, 0]] - 4.0).abs() < 1e-3);
-        assert!((arr[[0, 1, 2]] - 12.0).abs() < 1e-3);
-        assert!((arr[[0, 1, 4]] - 8.0).abs() < 1e-3);
-        // width & height:
-        for a in 0..4 {
-            assert!((arr[[0, 2, a]] - 24.0).abs() < 1e-3);
-            assert!((arr[[0, 3, a]] - 24.0).abs() < 1e-3);
-        }
-        assert!((arr[[0, 2, 4]] - 48.0).abs() < 1e-3);
-        assert!((arr[[0, 3, 4]] - 48.0).abs() < 1e-3);
-    }
-
-    #[test]
-    #[ignore = "TODO: legacy PerScale arm to be removed; tests should be migrated to per_scale subsystem"]
-    fn dfl_children_declared_out_of_stride_order_are_sorted_ascending() {
-        // Validator-parity: the merged output must place stride-8
-        // anchors before stride-16 anchors regardless of the order
-        // they appear in `edgefirst.json`. Mirrors
-        // `test_make_anchors_flat_orders_stride_ascending` from
-        // `edgefirst-validator @ feature/DE-823-hailort`.
-        let schema = SchemaV2 {
-            schema_version: 2,
-            outputs: vec![LogicalOutput {
-                name: Some("boxes".into()),
-                type_: Some(LogicalType::Boxes),
-                shape: vec![1, 4, 5],
-                dshape: vec![
-                    (DimName::Batch, 1),
-                    (DimName::BoxCoords, 4),
-                    (DimName::NumBoxes, 5),
-                ],
-                decoder: Some(DecoderKind::Ultralytics),
-                encoding: Some(BoxEncoding::Dfl),
-                score_format: None,
-                normalized: Some(false),
-                anchors: None,
-                stride: None,
-                dtype: None,
-                quantization: None,
-                // Intentional descending-stride declaration order:
-                outputs: vec![
-                    PhysicalOutput {
-                        name: "b_big".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        shape: vec![1, 1, 1, 16],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 1),
-                            (DimName::Width, 1),
-                            (DimName::NumFeatures, 16),
-                        ],
-                        dtype: DType::Float32,
-                        quantization: None,
-                        stride: Some(SchemaStride::Square(16)),
-                        scale_index: Some(1),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                    PhysicalOutput {
-                        name: "b_small".into(),
-                        type_: Some(PhysicalType::Boxes),
-                        shape: vec![1, 2, 2, 16],
-                        dshape: vec![
-                            (DimName::Batch, 1),
-                            (DimName::Height, 2),
-                            (DimName::Width, 2),
-                            (DimName::NumFeatures, 16),
-                        ],
-                        dtype: DType::Float32,
-                        quantization: None,
-                        stride: Some(SchemaStride::Square(8)),
-                        scale_index: Some(0),
-                        activation_applied: None,
-                        activation_required: None,
-                    },
-                ],
-                activation_applied: None,
-                activation_required: None,
-            }],
-            ..Default::default()
-        };
-        let program = DecodeProgram::try_from_schema(&schema).unwrap().unwrap();
-        let big = make_f32_tensor(&[1, 1, 1, 16], &[1.0f32; 16]);
-        let small = make_f32_tensor(&[1, 2, 2, 16], &[1.0f32; 2 * 2 * 16]);
-        // Caller passes inputs in schema declaration order; the plan
-        // sorts children stride-ascending, so after merge the first
-        // four anchors must be stride-8 (w=24) and the last must be
-        // stride-16 (w=48) — not the other way round.
-        let inputs: Vec<&TensorDyn> = vec![&big, &small];
-        let merged = program.execute(&inputs).unwrap();
-        let arr = &merged[0];
-        for a in 0..4 {
-            assert!(
-                (arr[[0, 2, a]] - 24.0).abs() < 1e-3,
-                "anchor {a} w={} (expected 24 stride-8)",
-                arr[[0, 2, a]]
-            );
-        }
-        assert!(
-            (arr[[0, 2, 4]] - 48.0).abs() < 1e-3,
-            "last anchor w={} (expected 48 stride-16)",
-            arr[[0, 2, 4]]
-        );
     }
 
     #[test]
