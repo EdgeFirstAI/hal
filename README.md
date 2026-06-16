@@ -839,10 +839,6 @@ graph TD
 3. **Additional trackers** — SORT, Deep SORT
 4. **Async I/O** — non-blocking image loading and processing
 
-> **Implemented:** Zero-copy CUDA tensor mapping (PBO → CUDA device pointer for
-> TensorRT) shipped in the [Unreleased] cycle. See the
-> [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input) section above.
-
 ## Support
 
 ### Community resources
