@@ -305,9 +305,8 @@ fallback for a DMA NV* source.
 macOS runs the SAME `GLProcessorThreaded` engine as Linux: each
 `ImageProcessor` owns a dedicated worker thread holding a private ANGLE
 context on the process-global Metal display (made current once, held
-for the thread's life). The former parallel `MacosGlProcessor`
-(shared-context, `lock_gl`-per-convert) is deleted; its conversion
-shapes live on in the engine:
+for the thread's life). The engine handles the macOS-specific
+conversion shapes through the shared seam:
 
 - **Sources** attach zero-copy as `TEXTURE_2D` (`eglBindTexImage`):
   RGBA/Grey through `draw_src_texture`'s attach mode, YUYV through the
