@@ -464,6 +464,36 @@ jobs:
           ignore_runs: true
 
   # ===========================================================================
+  # Build Check on Windows (verify Windows compilation before release)
+  #
+  # Catches cfg-gate mismatches between Linux/macOS-only modules (e.g.
+  # opengl_headless) and feature-only #[cfg] guards that compile fine on
+  # Linux but break on Windows. gpu-probe depends on EGL/GBM which are
+  # Linux-only; all other workspace crates must compile on Windows.
+  # ===========================================================================
+  build-windows:
+    name: Build Check (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-windows
+          cache-on-failure: true
+
+      - name: Check workspace compiles on Windows
+        run: cargo check --workspace --exclude gpu-probe
+
+  # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)
   #
   # Exercises the Linux GL float *render* path (gl/processor/float.rs PBO

@@ -318,11 +318,11 @@ use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
-#[cfg(feature = "opengl")]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
 pub use opengl_headless::EglDisplayKind;
-#[cfg(feature = "opengl")]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
 pub use opengl_headless::GLProcessorThreaded;
-#[cfg(feature = "opengl")]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
 pub use opengl_headless::Int8InterpolationMode;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
@@ -330,7 +330,7 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
 // EGLImage cache counter snapshots (diagnostics): see
 // `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
 // `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
-#[cfg(feature = "opengl")]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
 pub use opengl_headless::{CacheStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
 
@@ -963,7 +963,7 @@ pub struct ImageProcessorConfig {
     /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS
     /// (ANGLE/Metal is the only display there; a `Some` value logs a
     /// debug note and is otherwise ignored).
-    #[cfg(feature = "opengl")]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
     pub egl_display: Option<EglDisplayKind>,
 
     /// Preferred compute backend.
@@ -1494,7 +1494,7 @@ impl ImageProcessor {
     /// it (currently the Linux GL backend); no-op elsewhere. Constructor
     /// plumbing for [`ImageProcessorConfig::colorimetry`].
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
-        #[cfg(feature = "opengl")]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
         {
             let mut me = self;
             if let Err(e) = me.set_colorimetry_mode(_mode) {
@@ -1502,15 +1502,18 @@ impl ImageProcessor {
             }
             me
         }
-        #[cfg(not(feature = "opengl"))]
-        self
+        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "opengl")))]
+        {
+            let _ = _mode;
+            self
+        }
     }
 
     /// Sets the colorimetry/performance trade-off (see [`ColorimetryMode`])
     /// on the OpenGL backend. No-op if OpenGL is not available. The
     /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
     /// it is set, this call logs and keeps the env-selected mode.
-    #[cfg(feature = "opengl")]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_colorimetry_mode(mode)?;
@@ -1520,7 +1523,7 @@ impl ImageProcessor {
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
     /// backend. No-op if OpenGL is not available.
-    #[cfg(feature = "opengl")]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_int8_interpolation_mode(mode)?;
