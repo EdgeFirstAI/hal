@@ -237,13 +237,43 @@ jobs:
 
       - name: Publish crates to crates.io
         run: |
-          output=$(cargo publish --workspace --no-verify 2>&1) && exit 0
-          echo "$output"
-          if echo "$output" | grep -q "already uploaded"; then
-            echo "::warning::Some crates were already published — skipping"
-            exit 0
-          fi
-          exit 1
+          # cargo publish --workspace prepares all packages before uploading any,
+          # which fails because intra-workspace deps aren't in the registry yet.
+          # Publish each crate individually in topological dependency order,
+          # sleeping 30s after each so the sparse index has time to catch up.
+          publish_crate() {
+            local crate=$1
+            echo "--- Publishing $crate ---"
+            local out
+            out=$(cargo publish -p "$crate" --no-verify 2>&1)
+            local rc=$?
+            echo "$out"
+            if [ $rc -eq 0 ]; then
+              return 0
+            fi
+            if echo "$out" | grep -q "already uploaded"; then
+              echo "::warning::$crate already published — skipping"
+              return 0
+            fi
+            return 1
+          }
+
+          # Topological order: leaves first, dependents last.
+          CRATES=(
+            edgefirst-tensor
+            edgefirst-tracker
+            edgefirst-codec
+            edgefirst-decoder
+            edgefirst-image
+            edgefirst-hal
+          )
+
+          for crate in "${CRATES[@]}"; do
+            publish_crate "$crate" || exit 1
+            # Wait for the sparse index to reflect the just-published crate
+            # before packaging the next one (which may depend on it).
+            sleep 30
+          done
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
