@@ -1,8 +1,19 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.8
-**Last Updated:** May 24, 2026
-**Status:** Adds macOS GPU backend on Apple Silicon (`mbp-m2-max`) via ANGLE + IOSurface. The same GLES 3.0 shaders that drive the Linux GPU path now drive Metal through ANGLE, and `TensorMemory::Dma` is implemented over IOSurface for zero-copy bind. YUYV→RGBA **same-size format-conversion** speedups vs the Apple Silicon CPU path: **1.32×** at 1080p and **4.76×** at 4K. Letterbox-pipeline GL benchmarks for `mbp-m2-max` are not yet available — only the same-size convert path is shader-implemented today (see Known Gap #17 below). Memcpy through IOSurface is also **2.7× faster than SHM** at 4K.
+**Version:** 3.9
+**Last Updated:** June 16, 2026
+**Status:** 0.25.0 release refresh. The full bench matrix was re-collected on the 0.25.0
+converged-GL-engine code across imx8mp-frdm (Vivante GC7000UL + G2D), imx95-frdm
+(Mali-G310 + DPU-G2D), rpi5-hailo (V3D 7.1), and jetson-orin-nano (NVIDIA Tegra Orin,
+PBO/CUDA path), plus the existing `mbp-m2-max` (ANGLE + IOSurface). The re-collected matrix confirms the
+recent GL-convergence captures within measurement noise (e.g. imx95 GL 1080p YUYV→RGBA
+letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no regressions were observed on
+any GPU class. The Allocation table is updated for the notable imx8mp DMA-alloc
+improvement (38 ms → 1.8 ms at 720p); other tables are unchanged within noise. Raw
+per-board JSON lives in the (git-ignored) `benchmarks/<platform>/` working tree and is
+regenerated into these tables via `.github/scripts/generate_benchmark_tables.py`. The
+macOS GPU path remains same-size-convert only (see Known Gap #17). YUYV→RGBA same-size
+convert vs the Apple Silicon CPU path: **1.32×** at 1080p, **4.76×** at 4K.
 
 ---
 
@@ -350,19 +361,17 @@ Measures `Tensor::new()` latency for each buffer type and resolution.
 
 | Platform | Buffer | 720p (3.5 MB) | 1080p (7.9 MB) | 4K (31.6 MB) |
 |----------|--------|---------------|-----------------|---------------|
-| imx8mp-frdm | MEM | 310 us | 698 us | 2.8 ms |
+| imx8mp-frdm | MEM | 311 us | 698 us | 2.8 ms |
 | imx8mp-frdm | SHM | 26 us | 26 us | 26 us |
-| imx8mp-frdm | DMA | 38.2 ms | 29.9 ms | 10.0 ms |
-| imx95-frdm | MEM | 266 us | 596 us | 2.4 ms |
+| imx8mp-frdm | DMA | 1.8 ms | 2.8 ms | 10.3 ms |
+| imx95-frdm | MEM | 263 us | 594 us | 2.4 ms |
 | imx95-frdm | SHM | 31 us | 31 us | 31 us |
 | imx95-frdm | DMA | 983 us | 2.1 ms | 8.4 ms |
-| rpi5-hailo | MEM | 249 us | 736 us | 3.5 ms |
-| rpi5-hailo | SHM | 6.0 us | 6.0 us | 6.0 us |
-| rpi5-hailo | DMA | 713 us | 1.6 ms | 6.2 ms |
-| jetson-orin-nano | MEM | 171 us | 386 us | 1.5 ms |
-| jetson-orin-nano | SHM | 14 us | 14 us | 14 us |
-| x86-desktop | MEM | 105 us | 268 us | 807 us |
-| x86-desktop | SHM | 2.0 us | 2.0 us | 2.0 us |
+| rpi5-hailo | MEM | 285 us | 790 us | 3.5 ms |
+| rpi5-hailo | SHM | 5.0 us | 5.0 us | 6.0 us |
+| rpi5-hailo | DMA | 714 us | 1.6 ms | 6.2 ms |
+| jetson-orin-nano | MEM | 140 us | 330 us | 1.3 ms |
+| jetson-orin-nano | SHM | 12 us | 12 us | 12 us |
 | mbp-m2-max | MEM | 28 us | 65 us | 323 us |
 | mbp-m2-max | SHM | 2.0 us | 2.0 us | 2.0 us |
 | mbp-m2-max | DMA | 16 us | 16 us | 16 us |
