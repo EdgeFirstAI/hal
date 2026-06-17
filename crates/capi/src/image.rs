@@ -1592,6 +1592,7 @@ pub extern "C" fn hal_align_width_for_pixel_format(
 /// @endcode
 ///
 /// @see hal_plane_descriptor_new, hal_import_image
+#[cfg(unix)]
 pub struct HalPlaneDescriptor {
     inner: Option<edgefirst_tensor::PlaneDescriptor>,
 }
@@ -1608,6 +1609,7 @@ pub struct HalPlaneDescriptor {
 /// - EMFILE/ENFILE: fd dup failed (fd limit reached)
 /// - EIO: other dup failure
 #[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_plane_descriptor_new(fd: c_int) -> *mut HalPlaneDescriptor {
     if fd < 0 {
         return set_error_null(libc::EINVAL);
@@ -1634,6 +1636,7 @@ pub unsafe extern "C" fn hal_plane_descriptor_new(fd: c_int) -> *mut HalPlaneDes
 ///
 /// @param pd Plane descriptor handle to free (can be NULL)
 #[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_plane_descriptor_free(pd: *mut HalPlaneDescriptor) {
     if !pd.is_null() {
         drop(unsafe { Box::from_raw(pd) });
@@ -1657,6 +1660,7 @@ pub unsafe extern "C" fn hal_plane_descriptor_free(pd: *mut HalPlaneDescriptor) 
 /// @par Errors (errno):
 /// - EINVAL: NULL pd, stride is zero, or descriptor already consumed
 #[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_plane_descriptor_set_stride(
     pd: *mut HalPlaneDescriptor,
     stride: size_t,
@@ -1684,6 +1688,7 @@ pub unsafe extern "C" fn hal_plane_descriptor_set_stride(
 /// @par Errors (errno):
 /// - EINVAL: NULL pd or descriptor already consumed
 #[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn hal_plane_descriptor_set_offset(
     pd: *mut HalPlaneDescriptor,
     offset: size_t,
@@ -1822,7 +1827,7 @@ pub unsafe extern "C" fn hal_import_image(
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub unsafe extern "C" fn hal_import_image(
     _processor: *mut HalImageProcessor,
     _image: *mut HalPlaneDescriptor,
