@@ -248,7 +248,7 @@ jobs:
 
           output=$(cargo publish --workspace --no-verify 2>&1) && exit 0
           echo "$output"
-          if echo "$output" | grep -q "already uploaded"; then
+          if echo "$output" | grep -qE "already uploaded|already exists on crates.io"; then
             echo "::warning::Some crates were already published — skipping"
             exit 0
           fi
