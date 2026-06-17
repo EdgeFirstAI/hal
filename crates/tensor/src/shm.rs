@@ -93,59 +93,6 @@ where
         })
     }
 
-    /// Create a zero-copy sub-region view that shares `parent`'s segment via a
-    /// cloned fd (the SHM sharing model is fd-based, like `clone_fd`/`from_fd`).
-    ///
-    /// The view maps the window `[offset_bytes, offset_bytes + logical_size)`
-    /// measured from `parent`'s own window (`logical_size = shape.product() *
-    /// size_of::<T>()`), so a sub-view of a sub-view composes. N such views into
-    /// one parent share the segment (no copy) and write independently.
-    ///
-    /// # Errors
-    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
-    ///   `align_of::<T>()` (required for the `ShmMap` pointer cast).
-    /// - [`Error::InsufficientCapacity`] if the window exceeds the segment.
-    pub(crate) fn view(
-        parent: &ShmTensor<T>,
-        offset_bytes: usize,
-        shape: &[usize],
-    ) -> Result<Self> {
-        let elem = std::mem::size_of::<T>();
-        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
-            return Err(Error::InvalidOperation(format!(
-                "ShmTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
-                std::mem::align_of::<T>()
-            )));
-        }
-        let abs_offset = parent
-            .offset
-            .checked_add(offset_bytes)
-            .ok_or(Error::InvalidSize(offset_bytes))?;
-        let logical = shape.iter().product::<usize>() * elem;
-        // Bound against the segment's *logical* byte length, not the physical
-        // `capacity_bytes()` (`st_size`): the latter is page-rounded on macOS,
-        // which would let an out-of-bounds window slip through (see `byte_len`).
-        let capacity = parent.byte_len;
-        let needed = abs_offset
-            .checked_add(logical)
-            .ok_or(Error::InvalidSize(logical))?;
-        if needed > capacity {
-            return Err(Error::InsufficientCapacity { needed, capacity });
-        }
-        Ok(ShmTensor {
-            name: parent.name.clone(),
-            fd: parent.fd.try_clone()?,
-            shape: shape.to_vec(),
-            offset: abs_offset,
-            byte_len: parent.byte_len,
-            _marker: std::marker::PhantomData,
-            // A sub-view is the *same* segment: share the parent's identity so
-            // identity-keyed logic treats the windows as one buffer at distinct
-            // offsets, not unrelated allocations.
-            identity: parent.identity.clone(),
-        })
-    }
-
     /// Map exposing `byte_size` bytes via `as_slice()` for self-allocated
     /// strided tensors whose rows are padded. The caller (`Tensor::map`)
     /// validates `byte_size <= capacity_bytes()` first.
@@ -330,6 +277,56 @@ where
         }
         self.shape = shape.to_vec();
         Ok(())
+    }
+
+    /// Zero-copy sub-region view sharing this tensor's segment via a cloned fd
+    /// (the SHM sharing model is fd-based, like `clone_fd`/`from_fd`) and its
+    /// [`BufferIdentity`](crate::BufferIdentity).
+    ///
+    /// The view maps `[offset_bytes, offset_bytes + logical_size)` measured from
+    /// this tensor's own window (`logical_size = shape.product() *
+    /// size_of::<T>()`), so a sub-view of a sub-view composes. N such views into
+    /// one parent share the segment (no copy) and write independently.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
+    ///   `align_of::<T>()` (required for the `ShmMap` pointer cast).
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the segment.
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "ShmTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = self
+            .offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * elem;
+        // Bound against the segment's *logical* byte length, not the physical
+        // `capacity_bytes()` (`st_size`): the latter is page-rounded on macOS,
+        // which would let an out-of-bounds window slip through (see `byte_len`).
+        let capacity = self.byte_len;
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > capacity {
+            return Err(Error::InsufficientCapacity { needed, capacity });
+        }
+        Ok(ShmTensor {
+            name: self.name.clone(),
+            fd: self.fd.try_clone()?,
+            shape: shape.to_vec(),
+            offset: abs_offset,
+            byte_len: self.byte_len,
+            _marker: std::marker::PhantomData,
+            // A sub-view is the *same* segment: share the parent's identity so
+            // identity-keyed logic treats the windows as one buffer at distinct
+            // offsets, not unrelated allocations.
+            identity: self.identity.clone(),
+        })
     }
 }
 

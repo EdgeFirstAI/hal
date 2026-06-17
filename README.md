@@ -37,7 +37,7 @@ Rust:
 
 ```toml
 [dependencies]
-edgefirst-hal = "0.24"
+edgefirst-hal = "0.25"
 ```
 
 C: download a release archive from
@@ -68,7 +68,7 @@ processor.draw_masks(decoder, [output0, output1], output)
 **Rust:**
 
 The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
-so a single `edgefirst-hal = "0.24"` dependency is enough — no need to
+so a single `edgefirst-hal = "0.25"` dependency is enough — no need to
 list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
 
 ```rust
@@ -838,10 +838,6 @@ graph TD
 2. **VPI integration** — support for NVIDIA Vision Programming Interface
 3. **Additional trackers** — SORT, Deep SORT
 4. **Async I/O** — non-blocking image loading and processing
-
-> **Implemented:** Zero-copy CUDA tensor mapping (PBO → CUDA device pointer for
-> TensorRT) shipped in the [Unreleased] cycle. See the
-> [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input) section above.
 
 ## Support
 

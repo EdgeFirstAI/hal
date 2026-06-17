@@ -76,6 +76,16 @@ pub fn opengl_available() -> bool {
 /// Locate a test file in the testdata directory, handling different working
 /// directories.
 pub fn find_testdata_path(filename: &str) -> std::path::PathBuf {
+    // Honor EDGEFIRST_TESTDATA_DIR first (matches the test harness), so
+    // on-target bench runs can point at a deployed testdata dir without a
+    // CWD-relative symlink.
+    if let Ok(dir) = std::env::var("EDGEFIRST_TESTDATA_DIR") {
+        let path = Path::new(&dir).join(filename);
+        if path.exists() {
+            return path;
+        }
+    }
+
     let candidates = [
         Path::new("testdata").join(filename),
         Path::new("../testdata").join(filename),

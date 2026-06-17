@@ -9,6 +9,23 @@ use log::trace;
 use nalgebra::{Dyn, OMatrix, U4};
 use uuid::Uuid;
 
+/// Builder for [`ByteTrack`] with fluent setter methods.
+///
+/// All parameters have defaults tuned for typical 30-fps inference pipelines.
+/// Call [`ByteTrackBuilder::new`] (or `Default::default()`) to start with the
+/// defaults, override only what you need, then call [`ByteTrackBuilder::build`]
+/// to construct the tracker.
+///
+/// # Example
+///
+/// ```rust
+/// use edgefirst_tracker::bytetrack::ByteTrackBuilder;
+///
+/// let tracker = ByteTrackBuilder::new()
+///     .track_high_conf(0.5)          // accept more low-quality detections
+///     .track_extra_lifespan(1_000_000_000) // keep lost tracks for 1 s
+///     .build::<edgefirst_tracker::MockDetection>();
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ByteTrackBuilder {
     track_extra_lifespan: u64,
@@ -103,24 +120,93 @@ impl ByteTrackBuilder {
     }
 }
 
+/// ByteTrack multi-object tracker — the concrete [`Tracker`] implementation.
+///
+/// Prefer constructing via [`ByteTrackBuilder`] rather than directly, since the
+/// public fields default to zero-values that are not usable defaults.
+///
+/// # Algorithm overview
+///
+/// Each call to [`Tracker::update`] runs a two-pass IoU matching loop:
+///
+/// 1. **Predict.** Every active tracklet's Kalman filter advances one step,
+///    predicting where the object should appear this frame.
+/// 2. **High-confidence pass.** Detections scoring ≥ `track_high_conf` are
+///    assigned to existing tracklets via LAPJV linear assignment on an IoU cost
+///    matrix (cells below `track_iou` are set to `INVALID_MATCH`).
+/// 3. **Low-confidence pass.** Remaining unmatched tracklets are tried against
+///    all remaining detections (any score) — this recovers briefly occluded
+///    objects without admitting low-quality detections into the high-confidence
+///    pool.
+/// 4. **Expire.** Tracklets whose `last_updated` is more than `track_extra_lifespan`
+///    nanoseconds behind `timestamp` are removed.
+/// 5. **Spawn.** Unmatched high-confidence detections spawn new tracklets.
+///
+/// # Thread safety
+///
+/// `ByteTrack<T>` is `Send + Sync` (provided `T: Send + Sync`). Mutable
+/// methods take `&mut self`; callers that share a tracker across threads must
+/// serialize with an external mutex.
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
 pub struct ByteTrack<T: DetectionBox> {
+    /// How long (in nanoseconds) a tracklet may go unmatched before it is
+    /// deleted. Default: 500 ms (500_000_000 ns).
     pub track_extra_lifespan: u64,
+
+    /// Minimum detection score to enter the high-confidence matching pass and
+    /// to spawn new tracklets. Default: 0.7.
     pub track_high_conf: f32,
+
+    /// Minimum IoU required for a detection–tracklet assignment to be accepted.
+    /// Pairs below this threshold are set to `INVALID_MATCH` in the cost matrix.
+    /// Default: 0.25.
     pub track_iou: f32,
+
+    /// Kalman filter measurement gain (0–1). Lower values trust the Kalman
+    /// prediction more; higher values follow the raw detection more closely.
+    /// Default: 0.25.
     pub track_update: f32,
+
+    /// All currently active tracklets (matched or unmatched-but-not-expired).
     pub tracklets: Vec<Tracklet<T>>,
+
+    /// Running count of frames processed since the tracker was created.
+    /// Incremented on every [`Tracker::update`] call, including empty frames.
     pub frame_count: i32,
 }
 
+/// Internal state for one tracked object.
+///
+/// Not part of the public API contract; exposed as `pub` for test and benchmark
+/// access only. The canonical public view of a tracklet is [`TrackInfo`]
+/// (returned by [`Tracker::update`]) or [`ActiveTrackInfo`] (returned by
+/// [`Tracker::get_active_tracks`]).
 #[derive(Debug, Clone)]
 pub struct Tracklet<T: DetectionBox> {
+    /// Globally unique identifier, assigned at tracklet creation and preserved
+    /// until the tracklet is deleted. Surfaced via [`TrackInfo::uuid`].
     pub id: Uuid,
+
+    /// Kalman filter modeling the tracklet's position and velocity in XYAH
+    /// space (`[x_center, y_center, aspect, height]` + their derivatives).
     pub filter: ConstantVelocityXYAHModel2<f32>,
+
+    /// Number of frames this tracklet has been matched to a detection. Starts
+    /// at 1 on the frame of creation. Surfaced via [`TrackInfo::count`].
     pub count: i32,
+
+    /// Timestamp passed to [`Tracker::update`] on the frame this tracklet was
+    /// created. Surfaced via [`TrackInfo::created`].
     pub created: u64,
+
+    /// Timestamp passed to [`Tracker::update`] on the most recent frame this
+    /// tracklet was matched to a detection. Tracklets are deleted when
+    /// `timestamp - last_updated > track_extra_lifespan`.
     pub last_updated: u64,
+
+    /// The raw detection box from the most recent match. Surfaced via
+    /// [`ActiveTrackInfo::last_box`]. Not Kalman-smoothed.
     pub last_box: T,
 }
 
@@ -132,6 +218,11 @@ impl<T: DetectionBox> Tracklet<T> {
         self.last_box = detect_box.clone();
     }
 
+    /// Return the current Kalman-predicted bounding box in XYXY format.
+    ///
+    /// Projects the filter's 8-D XYAH mean into 4-D measurement space and
+    /// converts back to `[xmin, ymin, xmax, ymax]`.  This is the value
+    /// surfaced in [`TrackInfo::tracked_location`].
     pub fn get_predicted_location(&self) -> [f32; 4] {
         let projected = self.filter.project().0;
         let predicted_xyah = projected.as_slice();

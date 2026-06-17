@@ -986,6 +986,28 @@ where
 
     /// Get the buffer identity for cache keying and liveness tracking.
     fn buffer_identity(&self) -> &BufferIdentity;
+
+    /// Create a zero-copy sub-region view of this backing that shares the
+    /// underlying allocation **and** [`BufferIdentity`].
+    ///
+    /// The window is `[offset_bytes, offset_bytes + shape.product() *
+    /// size_of::<T>())` measured from this tensor's own logical start, so a
+    /// sub-view of a sub-view composes by adding offsets. Sharing the parent's
+    /// identity is the contract that lets identity-keyed caches (e.g. the GL
+    /// EGLImage import cache) treat offset-distinct windows as one buffer rather
+    /// than unrelated allocations — `view` must never mint a fresh identity.
+    ///
+    /// Defaults to [`Error::NotImplemented`]; every backend that supports
+    /// sub-views overrides it (`Mem`, `Shm`, Linux DMA, macOS IOSurface, `Pbo`).
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let _ = (offset_bytes, shape);
+        Err(Error::NotImplemented(
+            "view (zero-copy sub-region) is not supported for this tensor backend".to_owned(),
+        ))
+    }
 }
 
 pub trait TensorMapTrait<T>
@@ -1430,6 +1452,23 @@ where
             TensorStorage::Shm(t) => t.buffer_identity(),
             TensorStorage::Mem(t) => t.buffer_identity(),
             TensorStorage::Pbo(t) => t.buffer_identity(),
+        }
+    }
+
+    /// Forward a sub-region view to the active backend, re-wrapping the
+    /// backend's view (which shares the parent's allocation and
+    /// [`BufferIdentity`]) back into the matching `TensorStorage` variant. Each
+    /// backend's `view` is its own `TensorTrait::view` override; this single
+    /// match is the only per-variant dispatch (`Tensor::subview` calls through
+    /// here rather than matching the storage itself).
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
+            #[cfg(unix)]
+            TensorStorage::Shm(t) => t.view(offset_bytes, shape).map(TensorStorage::Shm),
+            TensorStorage::Mem(t) => t.view(offset_bytes, shape).map(TensorStorage::Mem),
+            TensorStorage::Pbo(t) => t.view(offset_bytes, shape).map(TensorStorage::Pbo),
         }
     }
 }
@@ -2548,39 +2587,15 @@ where
             .unwrap_or(0)
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
-        let mut t = match &self.storage {
-            TensorStorage::Mem(parent) => Tensor::wrap(TensorStorage::Mem(MemTensor::view(
-                parent,
-                offset_bytes,
-                shape,
-            )?)),
-            // macOS `Dma` is the IOSurface, Linux `Dma` is the DMA-BUF — both
-            // expose `view(offset, shape)` sharing the resource AND
-            // BufferIdentity (unlike `from_fd`/`from_surface`, which mint a fresh
-            // identity). The GL backend keys the import on the shared identity so
-            // offset-distinct sub-views of one buffer reuse a single import and
-            // address their window via `glViewport`.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            TensorStorage::Dma(parent) => {
-                Tensor::wrap(TensorStorage::Dma(parent.view(offset_bytes, shape)?))
-            }
-            #[cfg(unix)]
-            TensorStorage::Shm(parent) => {
-                // Shares the parent's segment via a cloned fd (the SHM sharing
-                // model) and its BufferIdentity, distinguished by offset.
-                Tensor::wrap(TensorStorage::Shm(ShmTensor::view(
-                    parent,
-                    offset_bytes,
-                    shape,
-                )?))
-            }
-            TensorStorage::Pbo(parent) => {
-                // Shares the GL buffer handle (via the PBO's `Arc`) and
-                // BufferIdentity; the window is addressed by offset on the
-                // staged copy / read-back, mirroring the other backings.
-                Tensor::wrap(TensorStorage::Pbo(parent.view(offset_bytes, shape)?))
-            }
-        };
+        // Every backend exposes `view(offset, shape)` via `TensorTrait`, sharing
+        // the resource AND `BufferIdentity` (unlike `from_fd`/`from_surface`,
+        // which mint a fresh identity). The GL backend keys the import on the
+        // shared identity so offset-distinct sub-views of one buffer reuse a
+        // single import and address their window via `glViewport`. `Mem`/`Shm`
+        // share via the allocation `Arc` / a cloned fd; `Pbo` via the GL-buffer
+        // `Arc`; Linux DMA-BUF / macOS IOSurface via the shared fd / CFRetain.
+        // `TensorStorage::view` performs the one remaining per-variant dispatch.
+        let mut t = Tensor::wrap(self.storage.view(offset_bytes, shape)?);
         // Inherit the parent's image metadata so the view is a ready-to-use
         // sub-image (e.g. a `convert()` destination). The offset is applied
         // LAST because `set_format` deliberately clears it — the offset is a
@@ -4195,6 +4210,58 @@ mod tests {
         assert!(parent.subview(6, &[4]).is_err());
     }
 
+    /// Regression guard for the `TensorTrait::view` promotion (R2): a `subview`
+    /// must share the parent's `BufferIdentity` on **every** backend, not mint a
+    /// fresh one. Identity-keyed caches (the GL EGLImage import) rely on this to
+    /// treat offset-distinct windows of one buffer as a single import; a fresh
+    /// identity would silently break that and regress zero-copy import reuse.
+    ///
+    /// Runs each backend that can be allocated without a GPU/GL context on the
+    /// test host: `Mem` (always); `Shm` (when POSIX shm is available); the
+    /// platform-native zero-copy buffer `Dma` (DMA-BUF on Linux / IOSurface on
+    /// macOS, when available). `Pbo` shares its identity the same way (see
+    /// `pbo.rs` `view`) but needs a live GL context, so it is exercised by the
+    /// image-crate GL tests rather than here.
+    #[test]
+    fn subview_shares_buffer_identity_all_backends() {
+        // u8 has align 1, so every byte offset is valid for the alignment check;
+        // this isolates the identity-sharing contract from alignment concerns.
+        let assert_shares = |memory: TensorMemory, label: &str| {
+            let parent = Tensor::<u8>::new(&[64], Some(memory), None)
+                .unwrap_or_else(|e| panic!("{label}: parent alloc failed: {e:?}"));
+            let parent_id = parent.buffer_identity().id();
+            // Two offset-distinct windows must both carry the parent's identity.
+            let v0 = parent
+                .subview(0, &[16])
+                .unwrap_or_else(|e| panic!("{label}: subview(0) failed: {e:?}"));
+            let v1 = parent
+                .subview(16, &[16])
+                .unwrap_or_else(|e| panic!("{label}: subview(16) failed: {e:?}"));
+            assert_eq!(
+                v0.buffer_identity().id(),
+                parent_id,
+                "{label}: subview(0) minted a fresh BufferIdentity"
+            );
+            assert_eq!(
+                v1.buffer_identity().id(),
+                parent_id,
+                "{label}: subview(16) minted a fresh BufferIdentity"
+            );
+        };
+
+        assert_shares(TensorMemory::Mem, "Mem");
+
+        #[cfg(unix)]
+        if crate::is_shm_available() {
+            assert_shares(TensorMemory::Shm, "Shm");
+        }
+
+        // Dma == DMA-BUF on Linux, IOSurface on macOS; same public variant.
+        if crate::is_gpu_buffer_available() {
+            assert_shares(TensorMemory::Dma, "Dma");
+        }
+    }
+
     #[test]
     fn mem_subview_four_views_no_aliasing() {
         // One [4,3] f32 parent; four [1,3] views at 12-byte strides, each
@@ -5073,5 +5140,114 @@ mod tests {
             // TensorMapTrait::len() returns the element count (not bytes).
             assert_eq!(host.len(), 4); // 2*2 f32 elements
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tensor::from_foreign — public API tests at the Tensor<T> layer.
+    //
+    // The low-level MemTensor::from_foreign mechanics (owner-drop, view sharing)
+    // are covered in mem.rs.  These tests exercise the Tensor<T> guard paths
+    // (null ptr, empty shape, size overflow) and the basic wrap+readback
+    // contract, confirming the public unsafe API wires through correctly.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn from_foreign_valid_wrap_and_readback() {
+        // The canonical CUDA zero-copy shape: wrap a caller allocation as a
+        // Mem tensor and verify the tensor reads the exact same bytes.
+        let mut buf: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let ptr = buf.as_mut_ptr();
+        let t = unsafe { Tensor::<f32>::from_foreign(ptr, &[2, 3], None, Some("test_foreign")) }
+            .expect("valid from_foreign must succeed");
+        assert_eq!(t.shape(), &[2, 3]);
+        assert_eq!(t.memory(), TensorMemory::Mem);
+        assert_eq!(t.name(), "test_foreign");
+        let m = t.map().unwrap();
+        // The tensor is a zero-copy borrow — it sees the caller's data.
+        assert_eq!(m.as_slice(), &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn from_foreign_write_visible_in_caller_allocation() {
+        // Writes through the tensor's map land in the caller's buffer (zero-copy).
+        let mut buf: Vec<u8> = vec![0u8; 6];
+        let ptr = buf.as_mut_ptr();
+        let t =
+            unsafe { Tensor::<u8>::from_foreign(ptr, &[2, 3], None, None) }.unwrap();
+        {
+            let mut m = t.map().unwrap();
+            m.as_mut_slice().copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+        }
+        drop(t);
+        // Mutations are visible in the original Vec — same physical buffer.
+        assert_eq!(buf, vec![10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn from_foreign_rejects_null_ptr() {
+        let err = unsafe {
+            Tensor::<u8>::from_foreign(std::ptr::null_mut(), &[4], None, None)
+        }
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("non-null")),
+            "expected InvalidArgument(non-null), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_rejects_empty_shape() {
+        let mut dummy: u8 = 0;
+        let err = unsafe { Tensor::<u8>::from_foreign(&mut dummy, &[], None, None) }.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidSize(0)),
+            "expected InvalidSize(0) for empty shape, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_rejects_overflow_shape() {
+        // Two dimensions whose product overflows usize — the overflow guard must
+        // fire before any pointer arithmetic is attempted.
+        let mut dummy: u8 = 0;
+        let huge = [usize::MAX / 2 + 1, 2];
+        let err =
+            unsafe { Tensor::<u8>::from_foreign(&mut dummy, &huge, None, None) }.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("overflow")),
+            "expected InvalidArgument(overflow), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_owner_keeps_allocation_alive() {
+        // When `owner` is `Some`, dropping the Tensor must not free the backing
+        // before the owner is also gone — the owner's Drop fires on last ref.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        struct Guard(std::sync::Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let mut buf: Vec<u32> = vec![42u32; 4];
+        let ptr = buf.as_mut_ptr();
+        let owner: ForeignOwner = Box::new(Guard(flag2));
+        let t = unsafe { Tensor::<u32>::from_foreign(ptr, &[4], Some(owner), None) }.unwrap();
+        // Map co-owns the backing Arc; the owner must stay alive while the map lives.
+        let m = t.map().unwrap();
+        assert_eq!(m.as_slice()[0], 42);
+        drop(t); // tensor dropped while map is still live
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "owner must not drop while a map shares the backing"
+        );
+        drop(m);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "owner Drop must fire when the last Arc reference is released"
+        );
     }
 }

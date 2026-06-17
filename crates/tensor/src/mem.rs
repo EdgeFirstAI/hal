@@ -259,61 +259,6 @@ where
         }))
     }
 
-    /// Create a zero-copy sub-region view that shares `parent`'s allocation.
-    ///
-    /// The view maps the window `[offset_bytes, offset_bytes + logical_size)`
-    /// measured from `parent`'s own logical start, where
-    /// `logical_size = shape.product() * size_of::<T>()`. N such views into one
-    /// parent share the buffer (no copy) and can be written independently.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
-    ///   `align_of::<T>()` (required for the pointer cast in `MemMap`).
-    /// - [`Error::InsufficientCapacity`] if the window exceeds the parent
-    ///   allocation.
-    pub fn view(parent: &MemTensor<T>, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
-        let elem = std::mem::size_of::<T>();
-        // Alignment depends on `align_of::<T>()`, not size (a `size_of == 1`,
-        // `align_of > 1` type would otherwise skip this and make the `MemMap`
-        // pointer cast UB). `is_multiple_of(1)` is always true, so this is a
-        // no-op for the common align-1 element types.
-        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
-            return Err(Error::InvalidOperation(format!(
-                "MemTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
-                std::mem::align_of::<T>()
-            )));
-        }
-        let logical: usize = shape.iter().product::<usize>() * elem;
-        // The view is positioned relative to this tensor's own window, so a
-        // sub-view of a sub-view composes correctly.
-        let abs_offset = parent
-            .offset
-            .checked_add(offset_bytes)
-            .ok_or(Error::InvalidSize(offset_bytes))?;
-        let total = parent.data.len() * elem;
-        let needed = abs_offset
-            .checked_add(logical)
-            .ok_or(Error::InvalidSize(logical))?;
-        if needed > total {
-            return Err(Error::InsufficientCapacity {
-                needed,
-                capacity: total,
-            });
-        }
-        Ok(MemTensor {
-            name: parent.name.clone(),
-            shape: shape.to_vec(),
-            data: Arc::clone(&parent.data),
-            offset: abs_offset,
-            // A sub-view is the *same* buffer: share the parent's identity so
-            // identity-keyed caches (e.g. the GL EGLImage cache) treat the
-            // windows as one buffer distinguished by offset, not as unrelated
-            // allocations.
-            identity: parent.identity.clone(),
-        })
-    }
-
     /// Wrap externally-owned memory as a `MemTensor` without taking ownership
     /// of the allocation (no copy). The tensor borrows
     /// `[ptr, ptr + shape.product() * size_of::<T>())`; `owner`, when `Some`,
@@ -455,6 +400,61 @@ where
         }
         self.shape = shape.to_vec();
         Ok(())
+    }
+
+    /// Zero-copy sub-region view sharing this tensor's allocation and
+    /// [`BufferIdentity`](crate::BufferIdentity).
+    ///
+    /// The view maps `[offset_bytes, offset_bytes + logical_size)` measured from
+    /// this tensor's own logical start, where `logical_size = shape.product() *
+    /// size_of::<T>()`. N such views into one parent share the buffer (no copy)
+    /// and can be written independently.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is not aligned to
+    ///   `align_of::<T>()` (required for the pointer cast in `MemMap`).
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the allocation.
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        let elem = std::mem::size_of::<T>();
+        // Alignment depends on `align_of::<T>()`, not size (a `size_of == 1`,
+        // `align_of > 1` type would otherwise skip this and make the `MemMap`
+        // pointer cast UB). `is_multiple_of(1)` is always true, so this is a
+        // no-op for the common align-1 element types.
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "MemTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let logical: usize = shape.iter().product::<usize>() * elem;
+        // The view is positioned relative to this tensor's own window, so a
+        // sub-view of a sub-view composes correctly.
+        let abs_offset = self
+            .offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let total = self.data.len() * elem;
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > total {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: total,
+            });
+        }
+        Ok(MemTensor {
+            name: self.name.clone(),
+            shape: shape.to_vec(),
+            data: Arc::clone(&self.data),
+            offset: abs_offset,
+            // A sub-view is the *same* buffer: share the parent's identity so
+            // identity-keyed caches (e.g. the GL EGLImage cache) treat the
+            // windows as one buffer distinguished by offset, not as unrelated
+            // allocations.
+            identity: self.identity.clone(),
+        })
     }
 }
 
@@ -680,8 +680,8 @@ mod tests {
         // only its own bytes and the parent must reflect both — proving the
         // shared-`Arc` mutable mapping is sound for non-overlapping windows.
         let parent = MemTensor::<u8>::with_capacity_bytes(&[8], 8, None).unwrap();
-        let a = MemTensor::view(&parent, 0, &[4]).unwrap();
-        let b = MemTensor::view(&parent, 4, &[4]).unwrap();
+        let a = parent.view(0, &[4]).unwrap();
+        let b = parent.view(4, &[4]).unwrap();
         a.map()
             .unwrap()
             .as_mut_slice()
@@ -754,7 +754,7 @@ mod tests {
             m.as_mut_slice().copy_from_slice(&[1, 2, 3, 4, 5, 6]);
         }
         // Second row [4,5,6] via a sub-region view of the same buffer.
-        let v = MemTensor::view(&t, 3, &[3]).unwrap();
+        let v = t.view(3, &[3]).unwrap();
         assert_eq!(v.map().unwrap().as_slice(), &[4, 5, 6]);
     }
 

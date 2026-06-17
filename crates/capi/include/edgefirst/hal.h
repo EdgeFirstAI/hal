@@ -10,7 +10,7 @@ extern "C" {
  * @brief EdgeFirst HAL C API
  *
  * SPDX-License-Identifier: Apache-2.0
- * Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
+ * Copyright (c) 2025-2026 Au-Zone Technologies. All Rights Reserved.
  *
  * C API for EdgeFirst Hardware Abstraction Layer providing:
  * - Zero-copy tensor operations with DMA/SHM support

@@ -868,6 +868,72 @@ mod tests {
         assert_eq!(m.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
     }
 
+    // -------------------------------------------------------------------------
+    // TensorDyn::from_foreign_ptr guard paths.
+    //
+    // The happy path (F32) is covered by `from_foreign_ptr_wraps_borrowed_memory`
+    // above. These cells add the null-ptr, empty-shape, and overflow guards, plus
+    // a U8 dtype to confirm the match-arm dispatch is exercised for integer types.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn from_foreign_ptr_rejects_null_ptr() {
+        let err = unsafe {
+            TensorDyn::from_foreign_ptr(std::ptr::null_mut(), &[4], DType::U8, None, None)
+        }
+        .unwrap_err();
+        // The null guard fires inside Tensor<u8>::from_foreign.
+        assert!(
+            matches!(err, crate::error::Error::InvalidArgument(ref m) if m.contains("non-null")),
+            "expected InvalidArgument(non-null), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_ptr_rejects_empty_shape() {
+        let mut dummy: u8 = 0;
+        let err = unsafe {
+            TensorDyn::from_foreign_ptr(&mut dummy as *mut u8, &[], DType::U8, None, None)
+        }
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::InvalidSize(0)),
+            "expected InvalidSize(0) for empty shape, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_ptr_rejects_overflow_shape() {
+        let mut dummy: u8 = 0;
+        let huge = [usize::MAX / 2 + 1, 2];
+        let err = unsafe {
+            TensorDyn::from_foreign_ptr(&mut dummy, &huge, DType::U8, None, None)
+        }
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::Error::InvalidArgument(ref m) if m.contains("overflow")),
+            "expected InvalidArgument(overflow), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_foreign_ptr_u8_dtype_dispatch() {
+        // Exercises the U8 arm of from_foreign_ptr's match, which wraps
+        // the raw pointer as Tensor<u8> and downcasts correctly.
+        let mut buf: Vec<u8> = vec![1, 2, 3, 4];
+        let ptr = buf.as_mut_ptr();
+        let owner: crate::ForeignOwner = Box::new(buf);
+        let t = unsafe {
+            TensorDyn::from_foreign_ptr(ptr, &[4], DType::U8, Some(owner), Some("u8_foreign"))
+        }
+        .unwrap();
+        assert_eq!(t.dtype(), DType::U8);
+        assert_eq!(t.shape(), &[4]);
+        let m = t.as_u8().unwrap().map().unwrap();
+        use crate::TensorMapTrait;
+        assert_eq!(m.as_slice(), &[1u8, 2, 3, 4]);
+    }
+
     #[test]
     fn downcast_ref() {
         let t = Tensor::<u8>::new(&[10], None, None).unwrap();

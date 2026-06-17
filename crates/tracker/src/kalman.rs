@@ -6,6 +6,26 @@ use nalgebra::{
     RealField, SVector, U1, U8,
 };
 
+/// Constant-velocity Kalman filter for tracking a bounding box in XYAH space.
+///
+/// The state vector is `[x, y, a, h, ẋ, ẏ, ȧ, ḣ]` (8 dimensions):
+///
+/// | Component | Meaning |
+/// |-----------|---------|
+/// | `x` | Centre x coordinate |
+/// | `y` | Centre y coordinate |
+/// | `a` | Aspect ratio (`width / height`), kept > 0 by a small epsilon floor |
+/// | `h` | Height |
+/// | `ẋ, ẏ, ȧ, ḣ` | First derivatives of the position components |
+///
+/// Measurements arriving via [`update`](Self::update) are in 4-dimensional
+/// XYAH space (no velocity), projected from the 8-D state by the observation
+/// matrix `H`.  The filter uses a scale-adaptive process-noise covariance:
+/// noise magnitude scales proportionally with the box height `h`, so
+/// fast-moving large objects tolerate wider uncertainty than small static ones.
+///
+/// This is the same Kalman filter parameterisation used in the original
+/// ByteTrack paper (Zhang et al., 2022).
 #[derive(Debug, Clone)]
 pub struct ConstantVelocityXYAHModel2<R>
 where
@@ -13,18 +33,47 @@ where
     DefaultAllocator: Allocator<U8, U8>,
     DefaultAllocator: Allocator<U8>,
 {
+    /// Current state estimate: `[x, y, a, h, ẋ, ẏ, ȧ, ḣ]`.
     pub mean: SVector<R, 8>,
+
+    /// Scale factor for position noise (`1/20` by default). Process noise for
+    /// position components is `std_weight_position * h`.
     pub std_weight_position: R,
+
+    /// Scale factor for velocity noise (`1/160` by default). Process noise for
+    /// velocity components is `std_weight_velocity * h`.
     pub std_weight_velocity: R,
+
+    /// Measurement-to-innovation scaling applied in [`update`](Self::update).
+    /// Set via [`ByteTrackBuilder::track_update`](crate::bytetrack::ByteTrackBuilder::track_update).
+    /// Values in `(0, 1]`; lower → smoother (trusts prediction more).
     pub update_factor: R,
+
+    /// State-transition matrix `F` (identity + velocity block). Projects the
+    /// state forward by one time step.
     motion_matrix: OMatrix<R, U8, U8>,
+
+    /// Observation matrix `H`. Extracts the `[x, y, a, h]` slice from the
+    /// 8-D state for comparison against incoming measurements.
     update_matrix: OMatrix<R, U4, U8>,
+
+    /// Current state covariance matrix `P` (8×8). Grows on each
+    /// [`predict`](Self::predict) and shrinks on each [`update`](Self::update).
     pub covariance: OMatrix<R, U8, U8>,
 }
 
+/// Distance metric used by [`ConstantVelocityXYAHModel2::gating_distance`].
+///
+/// `Mahalanobis` accounts for the current state uncertainty and is the
+/// theoretically correct gating criterion; `Gaussian` (squared Euclidean) is
+/// faster but scale-dependent.  In the current ByteTrack integration only the
+/// IoU-based cost matrix is used for assignment; this enum is available for
+/// future association strategies that want a filter-based gate.
 #[allow(dead_code)]
 pub enum GatingDistanceMetric {
+    /// Squared Euclidean distance (no covariance weighting).
     Gaussian,
+    /// Mahalanobis distance — normalised by the projected state covariance.
     Mahalanobis,
 }
 
@@ -32,6 +81,14 @@ impl<R> ConstantVelocityXYAHModel2<R>
 where
     R: RealField + Copy,
 {
+    /// Initialise the filter from the first observation.
+    ///
+    /// `measurement` is `[x, y, a, h]` in XYAH space.  Velocity components are
+    /// initialised to zero.  The initial covariance is set proportionally to
+    /// the box height so larger boxes start with wider uncertainty.
+    ///
+    /// `update_factor` is stored and applied as a measurement gain in
+    /// [`update`](Self::update).
     pub fn new(measurement: &[R; 4], update_factor: R) -> Self {
         let ndim = 4;
         let dt: R = convert(1.0);
@@ -85,6 +142,12 @@ where
         }
     }
 
+    /// Advance the filter by one time step with no measurement.
+    ///
+    /// Applies the constant-velocity motion model (`mean' = F * mean`,
+    /// `cov' = F * cov * Fᵀ + Q`) using a scale-adaptive process-noise
+    /// covariance `Q` proportional to the current box height.  Called once
+    /// per frame for every active tracklet before the assignment step.
     pub fn predict(&mut self) {
         let height = self.mean[3];
         let diag = [
@@ -107,6 +170,12 @@ where
         self.covariance = covariance;
     }
 
+    /// Project the 8-D state into 4-D measurement space.
+    ///
+    /// Returns `(projected_mean, projected_covariance)` — the expected
+    /// measurement and its uncertainty under the current state estimate.
+    /// Used by [`update`](Self::update) and by
+    /// [`gating_distance`](Self::gating_distance).
     pub fn project(&self) -> (OMatrix<R, U4, U1>, OMatrix<R, U4, U4>) {
         let height = self.mean[3];
         let diag = [
@@ -123,6 +192,18 @@ where
         (mean, covariance)
     }
 
+    /// Correct the state estimate with a new measurement.
+    ///
+    /// `measurement` is `[x, y, a, h]` in XYAH space, as produced by
+    /// [`xyxy_to_xyah`](super::bytetrack) in the ByteTrack update loop.
+    ///
+    /// The Kalman gain is computed via Cholesky decomposition of the projected
+    /// covariance.  If the decomposition fails (degenerate covariance) the
+    /// update is silently skipped and the prior state is preserved.
+    ///
+    /// The innovation is scaled by `self.update_factor` before being applied,
+    /// which effectively attenuates the correction — lower values produce
+    /// smoother trajectories at the cost of slower response to abrupt motion.
     pub fn update(&mut self, measurement: &[R; 4]) {
         let measurement = SVector::<R, 4>::from_row_slice(&[
             measurement[0],
@@ -151,6 +232,18 @@ where
         // kalman_gain.transpose();
     }
 
+    /// Compute per-measurement gating distances from the current state.
+    ///
+    /// Returns a vector of one scalar per row in `measurements`.  Each scalar
+    /// is either the squared Euclidean distance ([`GatingDistanceMetric::Gaussian`])
+    /// or the Mahalanobis distance ([`GatingDistanceMetric::Mahalanobis`]) from
+    /// the projected state mean to that measurement.
+    ///
+    /// `only_position` restricts the comparison to the first two components
+    /// (`x`, `y`), ignoring aspect and height.
+    ///
+    /// Not used by the current ByteTrack integration (which gates via IoU);
+    /// exposed for future association strategies.
     #[allow(dead_code)]
     pub fn gating_distance(
         &self,

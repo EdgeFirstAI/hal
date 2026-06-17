@@ -111,6 +111,23 @@ for the matrix definitions.
   [Performance Tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)
   section of the project README for capture and viewing instructions.
 
+## Tracing Span Catalog
+
+All spans emitted by this crate. The catalog exactly matches the `tracing::trace_span!`
+call sites in `crates/tracker/src/bytetrack.rs` (no spans are emitted in `kalman.rs`).
+
+| Span name | Source line | When it fires | Fields |
+|-----------|-------------|---------------|--------|
+| `tracker.update` | [`bytetrack.rs:439`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L439) | Once per `Tracker::update` call, wraps the entire update pipeline | `n_detections` (input box count), `n_tracklets` (active tracklets at entry), `timestamp` |
+| `tracker.update.predict` | [`bytetrack.rs:463`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L463) | Kalman predict step — fires only when tracklets exist; skipped on empty tracker | (none) |
+| `tracker.update.match_high_conf` | [`bytetrack.rs:470`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L470) | First-pass LAPJV assignment (high-confidence detections vs all tracklets) — fires only when tracklets exist | (none) |
+| `tracker.update.match_low_conf` | [`bytetrack.rs:494`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L494) | Second-pass LAPJV assignment (remaining unmatched detections vs remaining unmatched tracklets) — fires only when tracklets exist | (none) |
+
+The four child spans are sequential and non-overlapping within `tracker.update`.
+In the Perfetto timeline they appear as adjacent slices inside the parent span.
+Tracklet expiry and new-tracklet spawning happen after the spans close and do
+not have their own instrumentation.
+
 ## Inter-Crate Interfaces
 
 The tracker crate has no compile-time dependency on any other `edgefirst-*`
