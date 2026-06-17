@@ -37,7 +37,7 @@ Rust:
 
 ```toml
 [dependencies]
-edgefirst-hal = "0.24"
+edgefirst-hal = "0.25"
 ```
 
 C: download a release archive from
@@ -68,7 +68,7 @@ processor.draw_masks(decoder, [output0, output1], output)
 **Rust:**
 
 The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
-so a single `edgefirst-hal = "0.24"` dependency is enough — no need to
+so a single `edgefirst-hal = "0.25"` dependency is enough — no need to
 list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
 
 ```rust

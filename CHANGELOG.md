@@ -7,8 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-16
+
+### Removed
+
+- **Dead legacy per-scale merge path** (`edgefirst-decoder`): removed the
+  superseded `LogicalMerge::PerScale` schema-v2 merge arm and the now-orphaned
+  `decoder/dfl.rs` module (−1187 LOC, no behaviour change). Per-scale FPN/DFL
+  decoding is unaffected — it runs through the live `per_scale/` subsystem,
+  which claims those schemas at build time; the `boxes` `reg_max` value is now
+  sourced from `PerScalePlan`.
+
+### Documentation
+
+- **Tracker API documentation** (`edgefirst-tracker`): full rustdoc for the
+  public tracking API (`DetectionBox`/`Tracker` traits, `TrackInfo`,
+  `ByteTrack`, the Kalman motion model) plus a tracing span catalog in its
+  `ARCHITECTURE.md`.
+- The converged OpenGL engine (a single engine on Linux and macOS) is now
+  described in `ARCHITECTURE.md`, and was revalidated on-target across Mali-G310
+  (i.MX 95), V3D (RPi 5), NVIDIA Tegra Orin, and Vivante GC7000UL (i.MX 8M Plus)
+  — 359 GL tests, 0 failures on each.
+
 ### Changed
 
+- **Unified tensor backend `view()`** (`edgefirst-tensor`): the per-backend
+  `view`/`subview` implementations are unified onto the `TensorTrait` contract
+  (`subview` collapses five backend match arms into one), preserving the
+  `BufferIdentity`-sharing invariant that GL EGLImage import reuse relies on.
 - **Cached CPU convert intermediates** (`edgefirst-image`): the multi-step
   CPU convert pipeline (pre-resize format-convert and the resized-RGB
   scratch used by letterbox/resize) now reuses two `CPUProcessor`-held
