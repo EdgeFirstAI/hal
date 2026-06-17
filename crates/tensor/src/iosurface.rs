@@ -290,6 +290,51 @@ where
         self.shape = shape.to_vec();
         Ok(())
     }
+
+    /// Zero-copy sub-region view sharing this surface (CFRetain via the
+    /// `Arc`-backed `OwnedIoSurface`) and [`BufferIdentity`], positioned at
+    /// `offset_bytes` from this tensor's own window with logical `shape`. The
+    /// GL backend keys the IOSurface import on the shared identity and renders
+    /// the sub-region via `glViewport`; a CPU map adds `view_offset` to the
+    /// locked base address. Mirrors [`DmaTensor::view`](crate::TensorTrait::view).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidOperation`] if `offset_bytes` is mis-aligned for `T`.
+    /// - [`Error::InsufficientCapacity`] if the window exceeds the surface.
+    fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
+        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
+            return Err(Error::InvalidOperation(format!(
+                "IoSurfaceTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
+                std::mem::align_of::<T>()
+            )));
+        }
+        let abs_offset = self
+            .view_offset
+            .checked_add(offset_bytes)
+            .ok_or(Error::InvalidSize(offset_bytes))?;
+        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let needed = abs_offset
+            .checked_add(logical)
+            .ok_or(Error::InvalidSize(logical))?;
+        if needed > self.buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed,
+                capacity: self.buf_size,
+            });
+        }
+        Ok(Self {
+            name: self.name.clone(),
+            surface: self.surface.clone(),
+            shape: shape.to_vec(),
+            _marker: PhantomData,
+            identity: self.identity.clone(),
+            buf_size: self.buf_size,
+            bytes_per_row: self.bytes_per_row,
+            is_imported: self.is_imported,
+            view_offset: abs_offset,
+        })
+    }
 }
 
 impl<T> IoSurfaceTensor<T>
@@ -529,51 +574,6 @@ where
             bytes_per_row,
             is_imported: true,
             view_offset: 0,
-        })
-    }
-
-    /// Create a zero-copy sub-region view sharing this surface (CFRetain via
-    /// the `Arc`-backed `OwnedIoSurface`) and `BufferIdentity`, positioned at
-    /// `offset_bytes` from this tensor's own window with logical `shape`. The
-    /// GL backend keys the IOSurface import on the shared identity and renders
-    /// the sub-region via `glViewport`; a CPU map adds `view_offset` to the
-    /// locked base address. Mirrors [`DmaTensor::view`].
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidOperation`] if `offset_bytes` is mis-aligned for `T`.
-    /// - [`Error::InsufficientCapacity`] if the window exceeds the surface.
-    pub(crate) fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
-        if !offset_bytes.is_multiple_of(std::mem::align_of::<T>()) {
-            return Err(Error::InvalidOperation(format!(
-                "IoSurfaceTensor::view: offset {offset_bytes} not aligned to align_of::<T>()={}",
-                std::mem::align_of::<T>()
-            )));
-        }
-        let abs_offset = self
-            .view_offset
-            .checked_add(offset_bytes)
-            .ok_or(Error::InvalidSize(offset_bytes))?;
-        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
-        let needed = abs_offset
-            .checked_add(logical)
-            .ok_or(Error::InvalidSize(logical))?;
-        if needed > self.buf_size {
-            return Err(Error::InsufficientCapacity {
-                needed,
-                capacity: self.buf_size,
-            });
-        }
-        Ok(Self {
-            name: self.name.clone(),
-            surface: self.surface.clone(),
-            shape: shape.to_vec(),
-            _marker: PhantomData,
-            identity: self.identity.clone(),
-            buf_size: self.buf_size,
-            bytes_per_row: self.bytes_per_row,
-            is_imported: self.is_imported,
-            view_offset: abs_offset,
         })
     }
 
