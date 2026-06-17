@@ -118,7 +118,7 @@ call sites in `crates/tracker/src/bytetrack.rs` (no spans are emitted in `kalman
 
 | Span name | Source line | When it fires | Fields |
 |-----------|-------------|---------------|--------|
-| `tracker.update` | [`bytetrack.rs:440`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L440) | Once per `Tracker::update` call, wraps the entire update pipeline | `n_detections` (input box count), `n_tracklets` (active tracklets at entry), `timestamp` |
+| `tracker.update` | [`bytetrack.rs:439`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L439) | Once per `Tracker::update` call, wraps the entire update pipeline | `n_detections` (input box count), `n_tracklets` (active tracklets at entry), `timestamp` |
 | `tracker.update.predict` | [`bytetrack.rs:463`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L463) | Kalman predict step — fires only when tracklets exist; skipped on empty tracker | (none) |
 | `tracker.update.match_high_conf` | [`bytetrack.rs:470`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L470) | First-pass LAPJV assignment (high-confidence detections vs all tracklets) — fires only when tracklets exist | (none) |
 | `tracker.update.match_low_conf` | [`bytetrack.rs:494`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L494) | Second-pass LAPJV assignment (remaining unmatched detections vs remaining unmatched tracklets) — fires only when tracklets exist | (none) |

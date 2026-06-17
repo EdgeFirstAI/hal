@@ -495,18 +495,12 @@ mod tests {
     /// with `failures` just below the threshold and confirming the gate.
     #[test]
     fn circuit_breaker_threshold_constant_is_positive() {
-        // The constant is not exported, but its value must be > 0 so a single
-        // transient GPU error does not permanently demote the decoder.
-        assert!(
-            MAX_CONSECUTIVE_FAILURES > 0,
-            "circuit-breaker threshold must be > 0"
-        );
-        // And it must be large enough that occasional transients are tolerated
-        // (project convention: at least 2 so one retry is allowed).
-        assert!(
-            MAX_CONSECUTIVE_FAILURES >= 2,
-            "circuit-breaker threshold must allow at least one retry (got {MAX_CONSECUTIVE_FAILURES})"
-        );
+        // Compile-time contract: the threshold must allow at least one retry
+        // (>= 2, which also implies > 0), so a single transient GPU error never
+        // permanently demotes the decoder. A `const` assertion enforces this at
+        // build time; a runtime `assert!` on a constant would trip
+        // `clippy::assertions_on_constants`.
+        const _: () = assert!(MAX_CONSECUTIVE_FAILURES >= 2);
     }
 
     /// A freshly-created `NvJpegProbe` is `Unprobed`. On a host without

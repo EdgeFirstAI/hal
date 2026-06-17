@@ -96,6 +96,7 @@ pub trait DetectionBox: Debug + Clone {
 /// This type is **not** intended for production use. It is `#[doc(hidden)]` in
 /// the public docs but available as `edgefirst_tracker::MockDetection` so test
 /// code in downstream crates does not need to define its own dummy type.
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct MockDetection {
     bbox: [f32; 4],
