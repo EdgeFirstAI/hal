@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-06-17
+
+### Fixed
+
+- **Circular dev-dependency between `edgefirst-codec` and `edgefirst-image`**:
+  the nvJPEG GPU decode benchmark (`bench_nvjpeg`) was moved from
+  `edgefirst-codec`'s bench suite to a new `nvjpeg_benchmark` in
+  `edgefirst-image`, where it naturally belongs (it needs `ImageProcessor` to
+  allocate the CUDA-backed destination tensor, and `image` already depends on
+  `codec`). This removes the dev-dep cycle that prevented `cargo publish` from
+  packaging the crates without a `sed`-based workaround in the release workflow.
+
 ## [0.25.0] - 2026-06-16
 
 ### Removed
