@@ -44,11 +44,6 @@ libc = { workspace = true, optional = true }
 [dev-dependencies]
 edgefirst-bench = { workspace = true }
 env_logger = { workspace = true }
-# edgefirst-image is used only by the on-target nvjpeg benchmark cells to
-# allocate a CUDA-registered PBO destination via ImageProcessor::create_image.
-# This is a dev-dependency cycle (image depends on codec); Cargo permits it
-# because dev-dependencies do not participate in the library's own build graph.
-edgefirst-image = { workspace = true }
 image = { workspace = true }
 # zune-jpeg is used only by parity tests and the comparison benchmark.
 zune-jpeg = { workspace = true }

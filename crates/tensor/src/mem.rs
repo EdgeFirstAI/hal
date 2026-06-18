@@ -748,7 +748,8 @@ mod tests {
         let mut vec: Vec<u8> = vec![0u8; 6];
         let ptr = vec.as_mut_ptr();
         let owner: crate::ForeignOwner = Box::new(vec); // keep the heap buffer alive
-        let t = unsafe { MemTensor::<u8>::from_foreign(ptr, &[2, 3], Some(owner), Some("foreign")) };
+        let t =
+            unsafe { MemTensor::<u8>::from_foreign(ptr, &[2, 3], Some(owner), Some("foreign")) };
         {
             let mut m = t.map().unwrap();
             m.as_mut_slice().copy_from_slice(&[1, 2, 3, 4, 5, 6]);

@@ -943,8 +943,7 @@ impl CPUProcessor {
                 pass = "pre_resize",
             )
             .entered();
-            let mut t =
-                Self::reuse_or_alloc_image(cached_tmp.take(), src_w, src_h, intermediate)?;
+            let mut t = Self::reuse_or_alloc_image(cached_tmp.take(), src_w, src_h, intermediate)?;
             Self::convert_format_pf(src, &mut t, src_fmt, intermediate, src_params)?;
             Some(t)
         } else {
@@ -970,8 +969,7 @@ impl CPUProcessor {
             .entered();
             Self::convert_format_pf(tmp, dst, tmp_fmt, dst_fmt, dst_params)?;
         } else {
-            let mut tmp2 =
-                Self::reuse_or_alloc_image(cached_tmp2.take(), dst_w, dst_h, tmp_fmt)?;
+            let mut tmp2 = Self::reuse_or_alloc_image(cached_tmp2.take(), dst_w, dst_h, tmp_fmt)?;
             if crop.dst_rect.is_some_and(|c| {
                 c != Rect {
                     left: 0,

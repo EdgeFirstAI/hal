@@ -1273,8 +1273,7 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
     } else {
         PixelFormat::PlanarRgb
     };
-    let mut planar =
-        TensorDyn::image(w, h, pfmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut planar = TensorDyn::image(w, h, pfmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
     proc.convert(
         &src_dyn,
         &mut planar,
@@ -1287,8 +1286,14 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
     // Reference: the proven NV→RGB packed conversion (unchanged path).
     let mut rgb =
         TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
-    proc.convert(&src_dyn, &mut rgb, Rotation::None, Flip::None, Crop::default())
-        .unwrap();
+    proc.convert(
+        &src_dyn,
+        &mut rgb,
+        Rotation::None,
+        Flip::None,
+        Crop::default(),
+    )
+    .unwrap();
 
     let planar_t = planar.as_u8().unwrap();
     let rgb_t = rgb.as_u8().unwrap();
@@ -1323,13 +1328,25 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
 #[test]
 fn fused_nv_planar_parity_matrix() {
     // (w, h): clean strip multiple, strip-tail, odd-w, odd-h, odd-both, tiny.
-    let dims = [(64, 64), (128, 100), (101, 96), (96, 97), (97, 95), (3, 3), (1, 1)];
+    let dims = [
+        (64, 64),
+        (128, 100),
+        (101, 96),
+        (96, 97),
+        (97, 95),
+        (3, 3),
+        (1, 1),
+    ];
     for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
         for &(w, h) in &dims {
             for with_alpha in [false, true] {
                 let label = format!(
                     "{fmt:?} {w}x{h} {}",
-                    if with_alpha { "PlanarRgba" } else { "PlanarRgb" }
+                    if with_alpha {
+                        "PlanarRgba"
+                    } else {
+                        "PlanarRgb"
+                    }
                 );
                 fused_nv_planar_parity(w, h, fmt, with_alpha, &label);
             }

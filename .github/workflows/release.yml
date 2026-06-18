@@ -237,15 +237,6 @@ jobs:
 
       - name: Publish crates to crates.io
         run: |
-          # edgefirst-codec has a circular dev-dep on edgefirst-image
-          # (edgefirst-image itself depends on edgefirst-codec). Cargo allows
-          # this locally but cargo publish resolves dev-deps against the
-          # registry, where edgefirst-image doesn't exist yet when codec is
-          # being packaged. Strip it in-place before publishing; the dep is
-          # only used by on-target NVJPEG benchmarks and is not needed in the
-          # published crate.
-          sed -i '/^edgefirst-image[[:space:]]*=/d' crates/codec/Cargo.toml
-
           output=$(cargo publish --workspace --no-verify 2>&1) && exit 0
           echo "$output"
           if echo "$output" | grep -qE "already uploaded|already exists on crates.io"; then

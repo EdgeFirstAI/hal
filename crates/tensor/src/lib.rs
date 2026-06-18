@@ -5172,8 +5172,7 @@ mod tests {
         // Writes through the tensor's map land in the caller's buffer (zero-copy).
         let mut buf: Vec<u8> = vec![0u8; 6];
         let ptr = buf.as_mut_ptr();
-        let t =
-            unsafe { Tensor::<u8>::from_foreign(ptr, &[2, 3], None, None) }.unwrap();
+        let t = unsafe { Tensor::<u8>::from_foreign(ptr, &[2, 3], None, None) }.unwrap();
         {
             let mut m = t.map().unwrap();
             m.as_mut_slice().copy_from_slice(&[10, 20, 30, 40, 50, 60]);
@@ -5185,10 +5184,8 @@ mod tests {
 
     #[test]
     fn from_foreign_rejects_null_ptr() {
-        let err = unsafe {
-            Tensor::<u8>::from_foreign(std::ptr::null_mut(), &[4], None, None)
-        }
-        .unwrap_err();
+        let err = unsafe { Tensor::<u8>::from_foreign(std::ptr::null_mut(), &[4], None, None) }
+            .unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(ref m) if m.contains("non-null")),
             "expected InvalidArgument(non-null), got {err:?}"
@@ -5211,8 +5208,7 @@ mod tests {
         // fire before any pointer arithmetic is attempted.
         let mut dummy: u8 = 0;
         let huge = [usize::MAX / 2 + 1, 2];
-        let err =
-            unsafe { Tensor::<u8>::from_foreign(&mut dummy, &huge, None, None) }.unwrap_err();
+        let err = unsafe { Tensor::<u8>::from_foreign(&mut dummy, &huge, None, None) }.unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(ref m) if m.contains("overflow")),
             "expected InvalidArgument(overflow), got {err:?}"

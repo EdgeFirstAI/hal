@@ -21,6 +21,7 @@ crates/image/
     ├── pipeline_benchmark.rs    # End-to-end pipeline measurements
     ├── nv_path_benchmark.rs     # NV12/16/24 sampler-vs-shader A/B (EDGEFIRST_NV_CONVERT_PATH)
     ├── decode_pipeline_benchmark.rs  # JPEG decode → letterbox convert pipeline
+    ├── nvjpeg_benchmark.rs      # nvJPEG GPU decode into CUDA-backed PBO (on-target: Jetson)
     ├── opencv_benchmark.rs      # Comparison vs OpenCV reference (optional)
     ├── sanity_check.rs          # Quick smoke tests for bench harness setup
     └── common.rs                # Shared bench fixture helpers
@@ -161,6 +162,7 @@ on i.MX 8/i.MX 95 targets.
 | `mask_benchmark` | [`benches/mask_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/mask_benchmark.rs) | `decode_masks/{proto,materialize}`, `draw_masks/{cpu,opengl}`, `draw_proto_masks/{cpu,opengl}` |
 | `mask_decode_benchmark` | [`benches/mask_decode_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/mask_decode_benchmark.rs) | NMS + mask coefficient extraction (proto-only path) vs. full materialization |
 | `pipeline_benchmark` | [`benches/pipeline_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/pipeline_benchmark.rs) | End-to-end inference + decode + draw pipeline |
+| `nvjpeg_benchmark` | [`benches/nvjpeg_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/nvjpeg_benchmark.rs) | nvJPEG GPU decode into CUDA-backed PBO (`codec/jpeg/nvjpeg/rgbi/*` cells; on-target only, skips cleanly without CUDA) |
 | `opencv_benchmark` | [`benches/opencv_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/opencv_benchmark.rs) | Comparison vs OpenCV reference (requires `opencv` feature) |
 
 Run on host:
