@@ -481,8 +481,19 @@ mod tests {
             Tensor::<u8>::image(64, 64, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
-        let r = probe.try_decode::<u8>(MINIMAL_JPEG, &headers, &mut dst, PixelFormat::Nv12, 8, 8, 16);
-        assert!(matches!(r, Ok(None)), "Unavailable probe must return Ok(None)");
+        let r = probe.try_decode::<u8>(
+            MINIMAL_JPEG,
+            &headers,
+            &mut dst,
+            PixelFormat::Nv12,
+            8,
+            8,
+            16,
+        );
+        assert!(
+            matches!(r, Ok(None)),
+            "Unavailable probe must return Ok(None)"
+        );
         // Format must be unchanged — the probe must not have touched the tensor.
         assert_eq!(dst.format(), Some(PixelFormat::Nv12));
     }
@@ -524,7 +535,15 @@ mod tests {
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
         // First call probes; without CUDA the library is absent → Unavailable.
-        let r = probe.try_decode::<u8>(MINIMAL_JPEG, &headers, &mut dst, PixelFormat::Nv12, 8, 8, 16);
+        let r = probe.try_decode::<u8>(
+            MINIMAL_JPEG,
+            &headers,
+            &mut dst,
+            PixelFormat::Nv12,
+            8,
+            8,
+            16,
+        );
         // Either the non-CUDA Mem-tensor gate fires (Ok(None)) or the library is
         // truly absent and the probe returns Unavailable. Both produce Ok(None).
         assert!(matches!(r, Ok(None)), "no-CUDA probe must return Ok(None)");

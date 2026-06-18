@@ -232,6 +232,7 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline and format conversion (camera→model input) |
 | `nv_path_benchmark` | `edgefirst-image` | NV12/16/24 sampler-vs-shader A/B (set `EDGEFIRST_NV_CONVERT_PATH=sampler\|shader`); synthesized sources, no testdata |
 | `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert end-to-end (strided input, HWC/CHW output) |
+| `nvjpeg_benchmark` | `edgefirst-image` | nvJPEG GPU decode into CUDA-backed PBO (`codec/jpeg/nvjpeg/rgbi/*` cells); on-target only, skips cleanly without CUDA |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
@@ -659,7 +660,7 @@ like-for-like decode comparison on one run:
 | zidane 720p (1280×720) | **2.21 ms** (p95 2.24) | 5.97 ms (p95 5.98) | **2.70×** |
 | giraffe 640 (640×640)  | **3.24 ms** (p95 3.49) | 5.39 ms (p95 5.41) | **1.67×** |
 
-These confirm the earlier `examples/nvjpeg_decode` smoke-test figures (2.04 ms /
+These confirm the earlier `crates/image/examples/nvjpeg_decode` smoke-test figures (2.04 ms /
 3.31 ms). And nvJPEG output is already RGB and GPU-resident, so it also saves the
 NV12→RGB convert and the host→GPU upload the CPU path still owes.
 

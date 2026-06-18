@@ -243,6 +243,12 @@ Benchmark comparisons:
 - `edgefirst-codec` vs raw `zune-png` (PNG overhead of strided copy)
 - Strided vs tight decode (measures stride padding overhead)
 
+The nvJPEG GPU decode benchmark cells (`codec/jpeg/nvjpeg/rgbi/*`) that measure
+JPEG decode into a CUDA-backed PBO live in `crates/image/benches/nvjpeg_benchmark.rs`
+(run with `cargo bench -p edgefirst-image --bench nvjpeg_benchmark`). They require
+`ImageProcessor` to allocate the CUDA destination, so they belong in
+`edgefirst-image` which owns that type.
+
 ```bash
 # Run codec benchmarks
 cargo bench -p edgefirst-codec
