@@ -49,7 +49,7 @@ fn bench_nvjpeg(suite: &mut BenchSuite) {
         println!("\n== nvjpeg: SKIP (set EDGEFIRST_ENABLE_NVJPEG=1; needs CUDA + libnvjpeg) ==\n");
         return;
     }
-    println!("\n== edgefirst-codec: nvjpeg decode into PBO (GPU-resident RGB) ==\n");
+    println!("\n== edgefirst-image: nvjpeg decode into PBO (GPU-resident RGB) ==\n");
 
     let processor = match ImageProcessor::new() {
         Ok(p) => p,
