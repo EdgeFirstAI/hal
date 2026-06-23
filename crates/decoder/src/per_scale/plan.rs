@@ -102,6 +102,12 @@ pub(crate) struct PerScalePlan {
     /// dshape. Used by the pipeline to decide whether to transpose the
     /// raw proto data before writing it into the NHWC buffer.
     pub(crate) proto_layout: Option<Layout>,
+
+    /// When `true`, the per-channel kernel path is used for DFL box
+    /// dequantization instead of the per-tensor scalar fast path.
+    /// Default `false` (per-tensor, backward-compatible). Set via
+    /// [`crate::DecoderBuilder::with_dfl_per_channel`].
+    pub(crate) dfl_per_channel: bool,
 }
 
 #[derive(Debug)]
@@ -164,12 +170,17 @@ impl PerScalePlan {
     ///
     /// Returns `Ok(None)` for non-per-scale schemas (the caller falls
     /// through to the legacy decode path). Returns an error for
-    /// per-scale schemas this subsystem cannot handle (per-channel
-    /// quant, reg_max > 64, unsupported encoding, etc.).
+    /// per-scale schemas this subsystem cannot handle (reg_max > 64,
+    /// unsupported encoding, etc.).
+    ///
+    /// `dfl_per_channel` opts into per-channel DFL dequantization when
+    /// `true`; the default `false` preserves per-tensor (backward-compatible)
+    /// behavior.
     #[allow(dead_code)] // Wired into DecoderBuilder in Task 16.
     pub(crate) fn try_from_schema(
         schema: &SchemaV2,
         out_dtype: DecodeDtype,
+        dfl_per_channel: bool,
     ) -> DecoderResult<Option<Self>> {
         let boxes = match find_logical_by_type(schema, LogicalType::Boxes) {
             Some(b) if !b.outputs.is_empty() => b,
@@ -363,6 +374,7 @@ impl PerScalePlan {
             proto_shape,
             proto_nhwc_shape,
             proto_layout,
+            dfl_per_channel,
         }))
     }
 
@@ -626,7 +638,7 @@ mod tests {
     #[test]
     fn try_from_schema_yolov8n_returns_some() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .expect("should plan successfully")
             .expect("yolov8n schema is per-scale");
         assert_eq!(plan.levels.len(), 3);
@@ -641,7 +653,7 @@ mod tests {
     #[test]
     fn try_from_schema_yolo26n_returns_some_with_ltrb_encoding() {
         let schema = fixture_yolo26n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .expect("should plan successfully")
             .expect("yolo26n schema is per-scale");
         assert_eq!(plan.levels.len(), 3);
@@ -656,14 +668,14 @@ mod tests {
     #[test]
     fn try_from_schema_returns_none_for_flat_schema() {
         let schema = fixture_flat_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32).unwrap();
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false).unwrap();
         assert!(plan.is_none(), "flat schema should fall through to legacy");
     }
 
     #[test]
     fn try_from_schema_strides_sorted_ascending() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         let strides: Vec<f32> = plan.levels.iter().map(|l| l.stride).collect();
@@ -673,7 +685,7 @@ mod tests {
     #[test]
     fn try_from_schema_anchor_offsets_cumulative() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         assert_eq!(plan.levels[0].anchor_offset, 0);
@@ -684,7 +696,7 @@ mod tests {
     #[test]
     fn try_from_schema_grids_pre_computed() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         for lvl in &plan.levels {
@@ -696,7 +708,7 @@ mod tests {
     #[test]
     fn try_from_schema_dfl_reg_max_is_16() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         for lvl in &plan.levels {
@@ -707,7 +719,7 @@ mod tests {
     #[test]
     fn try_from_schema_yolov8n_selects_dfl_i8_to_f32_dispatch() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
@@ -729,7 +741,7 @@ mod tests {
     #[test]
     fn try_from_schema_yolo26n_selects_ltrb_dispatch() {
         let schema = fixture_yolo26n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         use crate::per_scale::kernels::dispatch::BoxLevelDispatch;
@@ -747,7 +759,7 @@ mod tests {
     #[test]
     fn nhwc_protos_layout_detected_correctly() {
         let schema = fixture_yolov8n_schema();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         // Fixture protos: [1, 160, 160, 32] NHWC
@@ -772,7 +784,7 @@ mod tests {
                 ];
             }
         }
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
         assert_eq!(plan.proto_layout, Some(Layout::Nchw));

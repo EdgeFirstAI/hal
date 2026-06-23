@@ -27,6 +27,7 @@ use crate::{
     float::{
         nms_class_aware_float, nms_extra_class_aware_float, nms_extra_float, nms_float,
         postprocess_boxes_float, postprocess_boxes_index_float,
+        postprocess_boxes_multilabel_index_float,
     },
     BBoxTypeTrait, BoundingBox, DetectBox, DetectBoxQuantized, ProtoData, ProtoLayout,
     Quantization, Segmentation, XYWH, XYXY,
@@ -305,6 +306,7 @@ where
         cap,
         None,
         None,
+        false, // multi_label: test shim stays on argmax
         output_boxes,
         output_masks,
     )
@@ -991,6 +993,7 @@ pub(crate) fn impl_yolo_segdet_float<
     max_det: usize,
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
     output_masks: &mut Vec<Segmentation>,
 ) -> Result<(), crate::DecoderError>
@@ -1007,11 +1010,13 @@ where
         nms,
         pre_nms_top_k,
         max_det,
+        multi_label,
     );
     maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn impl_yolo_segdet_get_boxes<
     B: BBoxTypeTrait,
     BOX: Float + AsPrimitive<f32> + Send + Sync,
@@ -1024,6 +1029,7 @@ pub(crate) fn impl_yolo_segdet_get_boxes<
     nms: Option<Nms>,
     pre_nms_top_k: usize,
     max_det: usize,
+    multi_label: bool,
 ) -> Vec<(DetectBox, usize)>
 where
     f32: AsPrimitive<SCORE>,
@@ -1037,13 +1043,35 @@ where
     );
     let _guard = span.enter();
 
-    let mut boxes = {
+    // Multi-label emits one candidate per (anchor, class) for every class
+    // above threshold; argmax emits one candidate per anchor (highest class).
+    // Multi-label requires class-aware NMS so per-class duplicates don't
+    // cross-suppress boxes from different classes on the same anchor.
+    let (mut boxes, effective_nms) = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.score_filter").entered();
-        postprocess_boxes_index_float::<B, _, _>(score_threshold.as_(), boxes_tensor, scores_tensor)
+        if multi_label {
+            let candidates = postprocess_boxes_multilabel_index_float::<B, _, _>(
+                score_threshold.as_(),
+                boxes_tensor,
+                scores_tensor,
+            );
+            // Class-agnostic NMS would suppress boxes that share the same
+            // anchor region but have different class labels — defeating the
+            // purpose of multi-label decode.  Force class-aware here.
+            let nms_override = Some(Nms::ClassAware);
+            (candidates, nms_override)
+        } else {
+            let candidates = postprocess_boxes_index_float::<B, _, _>(
+                score_threshold.as_(),
+                boxes_tensor,
+                scores_tensor,
+            );
+            (candidates, nms)
+        }
     };
     span.record("n_candidates", boxes.len());
 
-    if nms.is_some() {
+    if effective_nms.is_some() {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.top_k", k = pre_nms_top_k).entered();
         truncate_to_top_k_by_score(&mut boxes, pre_nms_top_k);
     }
@@ -1051,7 +1079,7 @@ where
 
     let mut boxes = {
         let _s = tracing::trace_span!("decoder.nms_get_boxes.suppress").entered();
-        dispatch_nms_extra_float(nms, iou_threshold, Some(max_det), boxes)
+        dispatch_nms_extra_float(effective_nms, iou_threshold, Some(max_det), boxes)
     };
     span.record("n_after_nms", boxes.len());
 
@@ -1278,6 +1306,7 @@ where
         nms,
         pre_nms_top_k,
         max_det,
+        false, // multi_label: split path is argmax-only (no Decoder context here)
     );
     maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
     impl_yolo_split_segdet_process_masks(boxes, mask_tensor, protos, output_boxes, output_masks)
@@ -1365,6 +1394,7 @@ pub(crate) fn impl_yolo_segdet_float_proto<
     max_det: usize,
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
+    multi_label: bool,
     output_boxes: &mut Vec<DetectBox>,
 ) -> ProtoData
 where
@@ -1381,6 +1411,7 @@ where
         nms,
         pre_nms_top_k,
         max_det,
+        multi_label,
     );
     maybe_normalize_boxes_in_place(&mut boxes, normalized, input_dims);
 
@@ -1423,6 +1454,7 @@ where
         nms,
         pre_nms_top_k,
         max_det,
+        false, // multi_label: split proto-extraction variant is argmax-only
     );
     maybe_normalize_boxes_in_place(&mut det_indices, normalized, input_dims);
 
@@ -2713,6 +2745,7 @@ mod tests {
             300,
             None,
             None,
+            false, // multi_label: argmax for this test
             &mut output_boxes,
         );
 
@@ -2765,6 +2798,7 @@ mod tests {
             Some(Nms::ClassAgnostic),        // NMS enabled so pre_nms_top_k applies
             crate::yolo::MAX_NMS_CANDIDATES, // pre_nms_top_k
             usize::MAX,                      // no post-NMS truncation
+            false,                           // multi_label: argmax for this test
         );
 
         assert_eq!(

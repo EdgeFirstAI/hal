@@ -91,6 +91,108 @@ macro_rules! impl_dfl_level_f16 {
     };
 }
 
+// ── DFL per-channel: per-bin dequant → softmax → weighted_sum → dist2bbox ──
+
+/// Generate per-cell DFL level kernels with per-channel quantization.
+/// `scales[i]` and `zps[i]` index into the channel axis (`4 * reg_max`
+/// values per anchor); each bin has its own scale and zero-point.
+/// Float inputs never carry per-channel quant from NPUs — only integer
+/// input types are instantiated.
+macro_rules! impl_dfl_level_f32_per_channel {
+    ($name:ident, $i:ty) => {
+        #[allow(dead_code)]
+        pub(crate) fn $name(
+            input: &[$i],
+            scales: &[f32],
+            zps: &[i32],
+            level: &LevelPlan,
+            dst: &mut [f32],
+        ) {
+            let h = level.h;
+            let w = level.w;
+            let reg_max = level.reg_max;
+            debug_assert_eq!(input.len(), h * w * 4 * reg_max);
+            debug_assert_eq!(dst.len(), 4 * h * w);
+            debug_assert!(reg_max <= MAX_REG_MAX);
+            debug_assert_eq!(scales.len(), 4 * reg_max);
+
+            let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
+            for anchor in 0..(h * w) {
+                let in_base = anchor * 4 * reg_max;
+                // Per-channel: deq[i] = (in[i] - zp[i]) * scale[i]
+                for i in 0..(4 * reg_max) {
+                    let raw = input[in_base + i] as f32;
+                    let zp = zps.get(i).copied().unwrap_or(0) as f32;
+                    deq[i] = (raw - zp) * scales[i];
+                }
+                for side in 0..4 {
+                    softmax_inplace_f32(&mut deq[side * reg_max..(side + 1) * reg_max]);
+                }
+                let ltrb = weighted_sum_4sides_f32(&deq[..4 * reg_max], reg_max);
+                let gx = level.grid_x[anchor];
+                let gy = level.grid_y[anchor];
+                let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
+                let out_base = anchor * 4;
+                dst[out_base..out_base + 4].copy_from_slice(&xywh);
+            }
+        }
+    };
+}
+
+impl_dfl_level_f32_per_channel!(decode_box_level_dfl_i8_to_f32_per_channel, i8);
+impl_dfl_level_f32_per_channel!(decode_box_level_dfl_u8_to_f32_per_channel, u8);
+impl_dfl_level_f32_per_channel!(decode_box_level_dfl_i16_to_f32_per_channel, i16);
+impl_dfl_level_f32_per_channel!(decode_box_level_dfl_u16_to_f32_per_channel, u16);
+
+/// Generate per-cell DFL level kernels with per-channel quant and f16 output.
+macro_rules! impl_dfl_level_f16_per_channel {
+    ($name:ident, $i:ty) => {
+        #[allow(dead_code)]
+        pub(crate) fn $name(
+            input: &[$i],
+            scales: &[f32],
+            zps: &[i32],
+            level: &LevelPlan,
+            dst: &mut [f16],
+        ) {
+            let h = level.h;
+            let w = level.w;
+            let reg_max = level.reg_max;
+            debug_assert_eq!(input.len(), h * w * 4 * reg_max);
+            debug_assert_eq!(dst.len(), 4 * h * w);
+            debug_assert!(reg_max <= MAX_REG_MAX);
+            debug_assert_eq!(scales.len(), 4 * reg_max);
+
+            let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
+            for anchor in 0..(h * w) {
+                let in_base = anchor * 4 * reg_max;
+                for i in 0..(4 * reg_max) {
+                    let raw = input[in_base + i] as f32;
+                    let zp = zps.get(i).copied().unwrap_or(0) as f32;
+                    deq[i] = (raw - zp) * scales[i];
+                }
+                for side in 0..4 {
+                    softmax_inplace_f32(&mut deq[side * reg_max..(side + 1) * reg_max]);
+                }
+                let ltrb = weighted_sum_4sides_f32(&deq[..4 * reg_max], reg_max);
+                let gx = level.grid_x[anchor];
+                let gy = level.grid_y[anchor];
+                let xywh = dist2bbox_anchor_f32(ltrb, gx, gy, level.stride);
+                let out_base = anchor * 4;
+                dst[out_base] = f16::from_f32(xywh[0]);
+                dst[out_base + 1] = f16::from_f32(xywh[1]);
+                dst[out_base + 2] = f16::from_f32(xywh[2]);
+                dst[out_base + 3] = f16::from_f32(xywh[3]);
+            }
+        }
+    };
+}
+
+impl_dfl_level_f16_per_channel!(decode_box_level_dfl_i8_to_f16_per_channel, i8);
+impl_dfl_level_f16_per_channel!(decode_box_level_dfl_u8_to_f16_per_channel, u8);
+impl_dfl_level_f16_per_channel!(decode_box_level_dfl_i16_to_f16_per_channel, i16);
+impl_dfl_level_f16_per_channel!(decode_box_level_dfl_u16_to_f16_per_channel, u16);
+
 // 12 DFL cells.
 impl_dfl_level_f32!(decode_box_level_dfl_i8_to_f32, i8, dequant_i8_to_f32);
 impl_dfl_level_f32!(decode_box_level_dfl_u8_to_f32, u8, dequant_u8_to_f32);

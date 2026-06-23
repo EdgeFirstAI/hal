@@ -78,6 +78,19 @@ pub struct Decoder {
     /// physical children. Absent for flat configurations (v1 and
     /// flat-v2).
     pub(crate) decode_program: Option<merge::DecodeProgram>,
+    /// When `true`, emit one detection per (anchor, class) pair for every
+    /// class whose score meets the threshold — matching Ultralytics `val`
+    /// multi-label decode.  **OFF by default.**
+    ///
+    /// # Deployment safety
+    /// Multi-label must never be enabled on the tracked/deployment path:
+    /// the ByteTrack IoU-only tracker spawns one track per detection, so
+    /// duplicate boxes for the same anchor at different labels produce
+    /// phantom tracks.  `decode_tracked_*` entry points assert this is off.
+    ///
+    /// This field is intentionally builder-only (not schema/config-driven)
+    /// so a deployed `edgefirst.json` can never accidentally enable it.
+    pub(crate) multi_label: bool,
     /// Per-scale fast path. Constructed at build time from a schema-v2
     /// document with per-scale children. Wrapped in `Mutex` because
     /// `Decoder::decode_proto` and `Decoder::decode` are `&self` but
@@ -97,6 +110,7 @@ impl PartialEq for Decoder {
             && self.max_det == other.max_det
             && self.normalized == other.normalized
             && self.input_dims == other.input_dims
+            && self.multi_label == other.multi_label
             && self.decode_program.is_some() == other.decode_program.is_some()
             && self.per_scale.is_some() == other.per_scale.is_some()
     }
@@ -119,6 +133,7 @@ impl Clone for Decoder {
             max_det: self.max_det,
             normalized: self.normalized,
             input_dims: self.input_dims,
+            multi_label: self.multi_label,
             decode_program: self.decode_program.clone(),
             per_scale: None,
         }
@@ -1020,6 +1035,7 @@ impl Decoder {
                 self.max_det,
                 self.normalized,
                 self.input_dims,
+                self.multi_label,
             );
         }
 
@@ -1106,6 +1122,7 @@ impl Decoder {
                 self.max_det,
                 self.normalized,
                 self.input_dims,
+                self.multi_label,
             );
         }
 
@@ -1189,6 +1206,13 @@ impl Decoder {
         output_masks: &mut Vec<Segmentation>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<(), DecoderError> {
+        // multi-label duplicates would spawn phantom tracks in ByteTrack
+        // (tracker matches IoU-only; two boxes for the same anchor at different
+        // labels become two tracks). Deployment must always stay on argmax.
+        debug_assert!(
+            !self.multi_label,
+            "multi_label must be off on the tracked/deployment path"
+        );
         output_boxes.clear();
         output_masks.clear();
         output_tracks.clear();
@@ -1298,6 +1322,10 @@ impl Decoder {
         T: Float + AsPrimitive<f32> + AsPrimitive<u8> + Send + Sync + 'static,
         f32: AsPrimitive<T>,
     {
+        debug_assert!(
+            !self.multi_label,
+            "multi_label must be off on the tracked/deployment path"
+        );
         output_boxes.clear();
         output_masks.clear();
         output_tracks.clear();
@@ -1405,6 +1433,10 @@ impl Decoder {
         output_boxes: &mut Vec<DetectBox>,
         output_tracks: &mut Vec<edgefirst_tracker::TrackInfo>,
     ) -> Result<Option<ProtoData>, DecoderError> {
+        debug_assert!(
+            !self.multi_label,
+            "multi_label must be off on the tracked/deployment path"
+        );
         output_boxes.clear();
         output_tracks.clear();
         match &self.model_type {

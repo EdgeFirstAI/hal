@@ -3407,6 +3407,7 @@ outputs:
             300,
             None,
             None,
+            false, // multi_label: argmax for this parity test
             &mut output_boxes,
         );
 
@@ -3511,6 +3512,7 @@ outputs:
             300,
             None,
             None,
+            false, // multi_label: argmax for this parity test
             &mut output_boxes,
         );
 

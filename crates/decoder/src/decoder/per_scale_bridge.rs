@@ -118,6 +118,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
     max_det: usize,
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
+    multi_label: bool,
 ) -> Result<Option<ProtoData>, DecoderError> {
     let _span = trace_span!("decoder.decode_proto.per_scale_to_proto_data").entered();
     let widened = widen_to_f32(decoded);
@@ -142,6 +143,7 @@ pub(super) fn per_scale_to_proto_data<'a>(
             nms_mode,
             pre_nms_top_k,
             max_det,
+            multi_label,
         )
     };
     // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.
@@ -183,6 +185,7 @@ pub(super) fn per_scale_to_masks<'a>(
     max_det: usize,
     normalized: Option<bool>,
     input_dims: Option<(usize, usize)>,
+    multi_label: bool,
 ) -> Result<(), DecoderError> {
     let _span = trace_span!("decoder.decode.per_scale_to_masks").entered();
     let widened = widen_to_f32(decoded);
@@ -208,6 +211,7 @@ pub(super) fn per_scale_to_masks<'a>(
             nms_mode,
             pre_nms_top_k,
             max_det,
+            multi_label,
         )
     };
     // Per-scale `dist2bbox_anchor_*` emits pixel-space coords by design.

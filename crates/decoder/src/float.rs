@@ -83,6 +83,61 @@ pub fn postprocess_boxes_index_float<
         .collect()
 }
 
+/// Multi-label variant of [`postprocess_boxes_index_float`].
+///
+/// For each anchor row, emits one `(DetectBox, anchor_idx)` per class whose
+/// score meets `threshold` — every class, not just the argmax.  The same
+/// `anchor_idx` is returned for all per-class entries of a given anchor so
+/// that downstream mask-coefficient lookup can reuse the shared coefficient
+/// row.
+///
+/// The bbox is computed once per anchor (via `B::ndarray_to_xyxy_float`) and
+/// reused across all emitted classes, avoiding redundant work.
+///
+/// Intended for **validation/mAP evaluation only** (the Ultralytics `val`
+/// convention).  Deployment must use the argmax variant
+/// [`postprocess_boxes_index_float`] so trackers see at most one box per
+/// anchor.
+pub fn postprocess_boxes_multilabel_index_float<
+    B: BBoxTypeTrait,
+    BOX: Float + AsPrimitive<f32> + Send + Sync,
+    SCORE: Float + AsPrimitive<f32> + Send + Sync,
+>(
+    threshold: SCORE,
+    boxes: ArrayView2<BOX>,
+    scores: ArrayView2<SCORE>,
+) -> Vec<(DetectBox, usize)> {
+    assert_eq!(scores.dim().0, boxes.dim().0);
+    assert_eq!(boxes.dim().1, 4);
+    let n = boxes.dim().0;
+    let indices: Array1<usize> = (0..n).collect();
+    Zip::from(scores.rows())
+        .and(boxes.rows())
+        .and(&indices)
+        .into_par_iter()
+        .flat_map(|(score_row, bbox_row, &anchor_idx)| {
+            // Compute bbox once; clone into each per-class candidate.
+            let bbox = B::ndarray_to_xyxy_float(bbox_row);
+            let bbox: crate::BoundingBox = bbox.into();
+            score_row
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s >= threshold)
+                .map(move |(c, &s)| {
+                    (
+                        DetectBox {
+                            label: c,
+                            score: s.as_(),
+                            bbox,
+                        },
+                        anchor_idx,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Uses NMS to filter boxes based on the score and iou. Sorts boxes by score,
 /// then greedily selects a subset of boxes in descending order of score.
 ///
