@@ -1975,16 +1975,14 @@ fn make_zero_box_tensor() -> TensorDyn {
 /// Multi-label emits more candidates than argmax when multiple classes exceed
 /// the threshold for the same anchor.
 ///
-/// Setup: anchor 0 → 2 classes above threshold; anchor 1 → 1 class above
-/// threshold (class 1 at 0.5 = threshold exactly, excluded by strict `>=` on
-/// `0.01`). Argmax picks the highest-scoring class per anchor, so at most 2
-/// survive (anchors 0 and 1 both above 0.01). Multi-label emits one entry per
-/// (anchor, class) pair above threshold, so anchor 0 contributes 2.
-///
-/// Because anchors are spatially at different positions in the 2×2 grid, NMS
-/// with IoU=0.7 does NOT suppress them (they don't overlap). Class-aware NMS
-/// is used for multi-label so per-class duplicates on the same anchor would be
-/// suppressed, but our two classes have different labels and thus survive.
+/// Scores are dequantized and sigmoid-activated before the `0.01` threshold,
+/// so even a logit of 0 (sigmoid 0.5) clears it — the threshold excludes
+/// nothing in this fixture. Anchor 0 has two classes above threshold (logits
+/// 50 and 40); multi-label emits one entry per (anchor, class) above threshold,
+/// so anchor 0 contributes two candidates where argmax (top class per anchor)
+/// contributes one. Hence multi-label yields strictly more candidates — the
+/// only property asserted here; exact totals depend on class-aware NMS over the
+/// overlapping zero-boxes (see `make_multi_label_score_tensor`).
 #[test]
 fn multi_label_count_exceeds_argmax() {
     let box_t = make_zero_box_tensor();
@@ -2005,8 +2003,10 @@ fn multi_label_count_exceeds_argmax() {
         .decode(&inputs, &mut ml_boxes, &mut masks)
         .expect("multilabel decode");
 
-    // Anchor 0 contributes 2 in multi-label (class 0 AND class 1 above threshold)
-    // vs. 1 in argmax (only the winning class). Anchor 1 contributes 1 in both.
+    // Multi-label emits one candidate per (anchor, class) above threshold, so
+    // anchor 0 alone contributes both class 0 and class 1 — strictly more than
+    // argmax's one-per-anchor. (Exact totals depend on NMS; this test only
+    // asserts multi-label > argmax.)
     assert!(
         ml_boxes.len() > argmax_boxes.len(),
         "multi-label ({}) should yield more candidates than argmax ({})",
@@ -2122,7 +2122,7 @@ fn tracker_regression_argmax_one_track_multilabel_spawns_extra() {
 fn argmax_regression_bit_identical_with_and_without_flag() {
     use edgefirst_decoder::per_scale::DecodeDtype;
 
-    let make = |multi_label: bool| -> edgefirst_decoder::Decoder {
+    let make = |multi_label: Option<bool>| -> edgefirst_decoder::Decoder {
         let schema: SchemaV2 =
             serde_json::from_str(minimal_ltrb_schema_one_level_2x2_nhwc()).unwrap();
         let mut b = DecoderBuilder::default()
@@ -2131,8 +2131,8 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
             .with_iou_threshold(0.7)
             .with_score_threshold(0.5)
             .with_nms(Some(Nms::ClassAgnostic));
-        if multi_label {
-            b = b.with_multi_label(true);
+        if let Some(ml) = multi_label {
+            b = b.with_multi_label(ml);
         }
         b.build().expect("build")
     };
@@ -2152,8 +2152,8 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
     };
     let inputs: Vec<&TensorDyn> = vec![&box_t, &score_t];
 
-    let default_dec = make(false);
-    let explicit_argmax = make(false); // calling with_multi_label(false) is same as default
+    let default_dec = make(None); // never calls with_multi_label — the pure default path
+    let explicit_argmax = make(Some(false)); // explicitly exercises with_multi_label(false)
 
     let mut boxes_default: Vec<DetectBox> = Vec::with_capacity(10);
     let mut boxes_explicit: Vec<DetectBox> = Vec::with_capacity(10);

@@ -115,6 +115,15 @@ macro_rules! impl_dfl_level_f32_per_channel {
             debug_assert_eq!(dst.len(), 4 * h * w);
             debug_assert!(reg_max <= MAX_REG_MAX);
             debug_assert_eq!(scales.len(), 4 * reg_max);
+            // `zps` is either empty (the "all zero-points = 0" convention used
+            // for symmetric quant) or one entry per channel. A mismatched
+            // length would otherwise silently default missing channels to 0.
+            debug_assert!(
+                zps.is_empty() || zps.len() == 4 * reg_max,
+                "per-channel zero-points must be empty or 4*reg_max ({}), got {}",
+                4 * reg_max,
+                zps.len(),
+            );
 
             let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
             for anchor in 0..(h * w) {
@@ -162,6 +171,15 @@ macro_rules! impl_dfl_level_f16_per_channel {
             debug_assert_eq!(dst.len(), 4 * h * w);
             debug_assert!(reg_max <= MAX_REG_MAX);
             debug_assert_eq!(scales.len(), 4 * reg_max);
+            // `zps` is either empty (the "all zero-points = 0" convention used
+            // for symmetric quant) or one entry per channel. A mismatched
+            // length would otherwise silently default missing channels to 0.
+            debug_assert!(
+                zps.is_empty() || zps.len() == 4 * reg_max,
+                "per-channel zero-points must be empty or 4*reg_max ({}), got {}",
+                4 * reg_max,
+                zps.len(),
+            );
 
             let mut deq: [f32; 4 * MAX_REG_MAX] = [0.0_f32; 4 * MAX_REG_MAX];
             for anchor in 0..(h * w) {

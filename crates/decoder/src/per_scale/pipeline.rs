@@ -98,26 +98,28 @@ pub(crate) fn quant_from_tensor(
 ///
 /// Returns `Ok(None)` when the tensor carries per-tensor quant (caller falls
 /// back to the per-tensor scalar kernel). Returns `Ok(Some((scales, zps)))`
-/// when per-channel quant is present. Returns `Err(QuantMissing)` when no
-/// quantization is attached to an integer tensor.
+/// — borrowed from the tensor's quantization, no allocation — when per-channel
+/// quant is present; an **empty `zps`** slice means "all zero-points are 0"
+/// (the per-channel kernels treat a missing entry as 0). Returns
+/// `Err(QuantMissing)` when no quantization is attached to an integer tensor.
+///
+/// Borrowing (rather than `to_vec`) keeps this allocation-free on the per-frame
+/// decode hot path, where it runs once per FPN level per frame.
 ///
 /// Float tensors (`F16`, `F32`) never carry per-channel quant from NPUs and
 /// always return `Ok(None)` so the per-tensor (identity) fast path is used.
 pub(crate) fn box_per_channel_quant_from_tensor(
     t: &TensorDyn,
     level: usize,
-) -> DecoderResult<Option<(Vec<f32>, Vec<i32>)>> {
-    /// Convert a per-channel `Quantization` into `(scales, zps)` if it is
-    /// per-channel, otherwise return `None` (caller uses per-tensor path).
-    fn extract(q: &edgefirst_tensor::Quantization) -> Option<(Vec<f32>, Vec<i32>)> {
+) -> DecoderResult<Option<(&[f32], &[i32])>> {
+    /// Borrow per-channel `(scales, zps)` from a `Quantization` if it is
+    /// per-channel, otherwise return `None` (caller uses per-tensor path). An
+    /// empty `zps` is the "all zero-points = 0" convention (symmetric quant).
+    fn extract(q: &edgefirst_tensor::Quantization) -> Option<(&[f32], &[i32])> {
         if !q.is_per_channel() {
             return None;
         }
-        let scales = q.scale().to_vec();
-        let zps = q
-            .zero_point()
-            .map_or_else(|| vec![0i32; scales.len()], |z| z.to_vec());
-        Some((scales, zps))
+        Some((q.scale(), q.zero_point().unwrap_or(&[])))
     }
     match t {
         TensorDyn::I8(t) => match t.quantization() {
@@ -425,7 +427,7 @@ fn run_levels_sequential(
                             lvl.w,
                             box_channels,
                             layout_scratch,
-                            |input| dispatch_dfl_per_channel(input, &scales, &zps, lvl, dst),
+                            |input| dispatch_dfl_per_channel(input, scales, zps, lvl, dst),
                         )?;
                     }
                     None => {
@@ -679,7 +681,7 @@ fn process_one_level_nhwc(
             match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
                 Some((scales, zps)) => {
                     with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-                        dispatch_dfl_per_channel(input, &scales, &zps, lvl, box_dst)
+                        dispatch_dfl_per_channel(input, scales, zps, lvl, box_dst)
                     })?;
                 }
                 None => {
