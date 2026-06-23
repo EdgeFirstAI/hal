@@ -36,13 +36,13 @@ and the table below quantifies the cost of breaking it on each platform.
 | Cache imported camera tensors by inode | [§ Tensor Reuse Impact](#tensor-reuse-impact) (recreate variant); see also [ARCHITECTURE.md § Appendix C][arch-appendix-c] | Equivalent to recreating the source tensor every frame: 3.5 ms penalty per `convert()` on i.MX 95; 2.2 ms on i.MX 8MP |
 | Allocate via `ImageProcessor::create_image()` | [§ Image Preprocessing: Letterbox Pipeline](#image-preprocessing-letterbox-pipeline-camera--model-input) | Forced wrong-backend transfer adds the cost of a `glTexSubImage2D` upload (≈full conversion time) on every frame |
 | Build the decoder once | [§ Decoder Post-Processing](#decoder-post-processing) | Decoder construction parses the model schema and allocates working buffers — cost depends on output schema complexity |
-| One `ImageProcessor` per pipeline thread | [ARCHITECTURE.md § GL Command Serialization (GL_MUTEX)][gl-mutex] | Concurrent `convert()` calls serialize through a global mutex; effective throughput drops to single-threaded regardless of core count |
+| One `ImageProcessor` per pipeline thread | [image/ARCHITECTURE.md § GL Concurrency Model][gl-mutex] | Driver-dependent: on Vivante (i.MX 8MP) and paravirtual GPUs concurrent `convert()` calls serialize through the global `GL_MUTEX` (throughput drops toward single-threaded regardless of core count); on Mali, V3D, Tegra, and real Apple GPUs they run concurrently. One processor per thread is the portable rule. |
 | Native CPU feature builds (Rule 6) | [§ materialize_masks Batched-GEMM Optimisation](#materialize_masks-batched-gemm-optimisation) | Soft-float f16 helpers (`__extendhfsf2`) are measurably slower than native `fcvt` / `vcvtph2ps` on the mask kernel hot path; the exact factor depends on vector width and CPU. Verify with `scripts/audit_f16_codegen.sh`. |
 | Pass numpy arrays straight to `from_numpy()` (Rule 7) | [§ NumPy Interop Fast-Path](#numpy-interop-fast-path) | A redundant `np.ascontiguousarray` pre-copy on every call. Sized example: `(1, 116, 8400)` f32 transposed view on rpi5-hailo runs ≈ 6.5 ms in HAL's automatic fast path vs ≈ 27 ms in the legacy element-wise loop (4× faster); pre-applying `ascontiguousarray` above HAL adds a redundant copy of the same magnitude. |
 | Use `MaskResolution::Scaled` for COCO eval (Rule 8) | [§ materialize_masks Batched-GEMM Optimisation](#materialize_masks-batched-gemm-optimisation) | Threshold-then-upsample (`Proto` followed by binary `cv2.resize`) regresses mask mAP by 0.04–0.05 absolute on YOLOv8-seg / `coco128-seg`. The `Scaled` path is also faster at N ≥ 16 because the batched GEMM amortises across detections instead of being repeated per-detection in caller code. |
 
 [ARCHITECTURE.md]: ARCHITECTURE.md
-[gl-mutex]: ARCHITECTURE.md#gl-command-serialization-gl_mutex
+[gl-mutex]: crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy
 [arch-appendix-c]: ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching
 
 ### How to Reproduce the Numbers

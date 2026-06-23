@@ -57,6 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `IntoPyArray`/`ToPyArray` conversions resolve against the same `ndarray` the
     rest of the workspace uses; `lapjv` continues to use `ndarray` 0.16.
 
+### Documentation
+
+- **Corrected the GL serialization (`GL_MUTEX`) docs** in `README.md`,
+  `BENCHMARKS.md`, and the umbrella `ARCHITECTURE.md`, which still described
+  serialization as universal (the pre-2026-06 behavior). GL command
+  serialization is now a per-driver policy — `Full` (global `GL_MUTEX`) only on
+  Vivante `galcore` (i.MX 8M Plus) and virtualized/paravirtual GPUs, and
+  `LifecycleOnly` (concurrent execution) on Mali/Panfrost, V3D, Tegra,
+  llvmpipe, and real Apple GPUs. The summaries now match the canonical
+  description in `crates/image/ARCHITECTURE.md § GL Concurrency Model` and the
+  stale `#gl-command-serialization-gl_mutex` cross-doc anchors were repointed.
+
 ## [0.25.1] - 2026-06-17
 
 ### Fixed

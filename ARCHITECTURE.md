@@ -374,7 +374,7 @@ The `Send + Sync` story across the workspace:
 
 - `Tensor<T>` / `TensorDyn` — `Send + Sync`. Safe to share across threads.
 - `Decoder` — `Send + Sync` for read operations (decoding). The builder consumes itself on `.build()`.
-- `ImageProcessor` — `Send + Sync`, but concurrent use serializes on the global `GL_MUTEX` (see [`crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)). For best performance: one `ImageProcessor` per worker thread.
+- `ImageProcessor` — `Send + Sync`. Whether concurrent GL work runs in parallel is a per-driver policy: on Vivante `galcore` (i.MX 8M Plus) and virtualized/paravirtual GPUs every command serializes on the global `GL_MUTEX`; on other drivers (Mali/Panfrost, V3D, Tegra, llvmpipe, real Apple GPU) instances execute GL concurrently (see [`crates/image/ARCHITECTURE.md § GL Concurrency Model`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)). Either way, one `ImageProcessor` per worker thread is the portable choice.
 - `ByteTrack<T>` — `Send + Sync`. Mutable methods take `&mut self`, so concurrent updates require external synchronization.
 
 ### 9. Error handling
