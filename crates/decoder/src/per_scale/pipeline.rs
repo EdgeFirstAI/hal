@@ -415,7 +415,7 @@ fn run_levels_sequential(
                 .entered();
             let dst = boxes_level_slice_of(boxes, lvl.anchor_offset, lvl.h * lvl.w);
             let box_channels = box_channel_count_for_level(lvl);
-            if plan.box_encoding == crate::schema::BoxEncoding::Dfl && plan.dfl_per_channel {
+            if plan.box_encoding == crate::schema::BoxEncoding::Dfl {
                 match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
                     Some((scales, zps)) => {
                         with_mapped_or_transposed_input(
@@ -677,7 +677,7 @@ fn process_one_level_nhwc(
     {
         let _s = tracing::trace_span!("decoder.per_scale_run.level.boxes", encoding = ?plan.box_encoding)
             .entered();
-        if plan.box_encoding == crate::schema::BoxEncoding::Dfl && plan.dfl_per_channel {
+        if plan.box_encoding == crate::schema::BoxEncoding::Dfl {
             match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
                 Some((scales, zps)) => {
                     with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
@@ -1089,7 +1089,7 @@ mod tests {
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
             .unwrap()
             .unwrap();
 
@@ -1113,7 +1113,7 @@ mod tests {
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
             .unwrap()
             .unwrap();
 
