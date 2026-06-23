@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-06-23
+
+### Added
+
+- **Validation-accurate multi-label box decode** (`edgefirst-decoder`): an
+  opt-in decode mode (`DecoderBuilder::with_multi_label`, default `false`) that
+  recovers a systematic accuracy delta versus the Ultralytics validator. It
+  emits one candidate per class above threshold per anchor (matching Ultralytics
+  `val multi_label=True`) instead of an argmax single class, reusing the shared
+  anchor index so the mask-coefficient row is not duplicated. The shared f32
+  seam forces class-aware NMS so per-class duplicates do not cross-suppress.
+  Builder-only (never embedded in `edgefirst.json`); a `debug_assert` keeps the
+  tracked decode paths on argmax so ByteTrack's IoU-only matching does not spawn
+  phantom tracks. Default **off**, so deployment and tracking output is
+  byte-for-byte unchanged. Measured +0.56 pp box / +0.45 pp mask mAP on COCO
+  val2017 (yolov8n-seg).
+
+### Fixed
+
+- **Per-channel DFL quantization is now always honored** (`edgefirst-decoder`):
+  the per-scale box DFL head reads the box tensor's quantization metadata each
+  frame and dequantizes per-channel whenever the model is per-channel quantized,
+  rather than collapsing to a single per-tensor scale (which flattened the wide
+  anchor-free distance distribution — worst on yolo26, ~1.6–4.7 pp INT8 mAP
+  loss). The per-tensor scalar fast path is still selected automatically for
+  genuinely per-tensor (or float) tensors; per-channel kernels cover
+  `i8`/`u8`/`i16`/`u16` (f32 and f16) and are allocation-free on the decode hot
+  path. This supersedes the short-lived opt-in `with_dfl_per_channel` builder
+  flag introduced in PR #122 — honoring per-channel quantization is never
+  optional.
+
+### Changed
+
+- **Dependencies upgraded to latest** across the workspace. Notable major
+  upgrades: `pyo3`, `pyo3-build-config`, `numpy`, and `pythonize` 0.28 → 0.29
+  (in lockstep); `nalgebra` 0.34 → 0.35; `opencv` 0.98 → 0.99; `zip` 2 → 8;
+  `safetensors` 0.7 → 0.8; `ctor` 0.4 → 1.0; and `turbojpeg` 0.5 → 1.4. Patch
+  and minor bumps were applied to `ctor`, `libc`, `log`, `nix`, `rand`,
+  `rayon`, `serde_json`, `tokio`, `uuid`, and `yuv`. Source changes were
+  limited to the `ctor` 1.0 `#[ctor(unsafe)]` requirement and a `libloading`
+  deref; no behavioural changes.
+  - `libloading` is held at `0.8.x`: `khronos-egl` 6.0.0 (the latest release)
+    depends on `libloading ^0.8` and the GL backend shares a
+    `libloading::Library` handle with its `Dynamic` EGL instance, so a 0.9 bump
+    would split the `Library` type across the crate boundary. To be revisited
+    when `khronos-egl` ships a `libloading` 0.9 build.
+  - `numpy` 0.29 is pinned to `ndarray` 0.17.2 (the workspace version) so its
+    `IntoPyArray`/`ToPyArray` conversions resolve against the same `ndarray` the
+    rest of the workspace uses; `lapjv` continues to use `ndarray` 0.16.
+
 ## [0.25.1] - 2026-06-17
 
 ### Fixed

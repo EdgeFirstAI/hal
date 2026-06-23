@@ -48,7 +48,7 @@ static TABLE: OnceLock<Option<CudaTable>> = OnceLock::new();
 fn load() -> Option<CudaTable> {
     let lib = ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
         .iter()
-        .find_map(|n| unsafe { Library::new(n) }.ok())?;
+        .find_map(|n| unsafe { Library::new(*n) }.ok())?;
     let lib: &'static Library = Box::leak(Box::new(lib));
     macro_rules! sym {
         ($n:literal) => {{
