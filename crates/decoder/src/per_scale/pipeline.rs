@@ -94,6 +94,77 @@ pub(crate) fn quant_from_tensor(
     }
 }
 
+/// Read per-channel quantization from the bound box tensor for DFL decode.
+///
+/// Returns `Ok(None)` when the tensor carries per-tensor quant (caller falls
+/// back to the per-tensor scalar kernel). Returns `Ok(Some((scales, zps)))`
+/// — borrowed from the tensor's quantization, no allocation — when per-channel
+/// quant is present; an **empty `zps`** slice means "all zero-points are 0"
+/// (the per-channel kernels treat a missing entry as 0). Returns
+/// `Err(QuantMissing)` when no quantization is attached to an integer tensor.
+///
+/// Borrowing (rather than `to_vec`) keeps this allocation-free on the per-frame
+/// decode hot path, where it runs once per FPN level per frame.
+///
+/// Float tensors (`F16`, `F32`) never carry per-channel quant from NPUs and
+/// always return `Ok(None)` so the per-tensor (identity) fast path is used.
+pub(crate) fn box_per_channel_quant_from_tensor(
+    t: &TensorDyn,
+    level: usize,
+) -> DecoderResult<Option<(&[f32], &[i32])>> {
+    /// Borrow per-channel `(scales, zps)` from a `Quantization` if it is
+    /// per-channel, otherwise return `None` (caller uses per-tensor path). An
+    /// empty `zps` is the "all zero-points = 0" convention (symmetric quant).
+    fn extract(q: &edgefirst_tensor::Quantization) -> Option<(&[f32], &[i32])> {
+        if !q.is_per_channel() {
+            return None;
+        }
+        Some((q.scale(), q.zero_point().unwrap_or(&[])))
+    }
+    match t {
+        TensorDyn::I8(t) => match t.quantization() {
+            Some(q) => Ok(extract(q)),
+            None => Err(DecoderError::QuantMissing {
+                dtype: DType::I8,
+                role: "boxes",
+                level,
+            }),
+        },
+        TensorDyn::U8(t) => match t.quantization() {
+            Some(q) => Ok(extract(q)),
+            None => Err(DecoderError::QuantMissing {
+                dtype: DType::U8,
+                role: "boxes",
+                level,
+            }),
+        },
+        TensorDyn::I16(t) => match t.quantization() {
+            Some(q) => Ok(extract(q)),
+            None => Err(DecoderError::QuantMissing {
+                dtype: DType::I16,
+                role: "boxes",
+                level,
+            }),
+        },
+        TensorDyn::U16(t) => match t.quantization() {
+            Some(q) => Ok(extract(q)),
+            None => Err(DecoderError::QuantMissing {
+                dtype: DType::U16,
+                role: "boxes",
+                level,
+            }),
+        },
+        // Float tensors: no per-channel quant from NPUs — use per-tensor (identity).
+        TensorDyn::F16(_) | TensorDyn::F32(_) => Ok(None),
+        other => Err(DecoderError::DtypeMismatch {
+            expected: DType::I8,
+            actual: other.dtype(),
+            role: "boxes",
+            level,
+        }),
+    }
+}
+
 /// Find the first un-consumed input tensor matching `expected` shape.
 /// Marks the matched tensor's index in `used` so subsequent calls skip it.
 #[allow(dead_code)]
@@ -145,6 +216,12 @@ pub(crate) fn resolve_bindings<'a>(
 }
 
 use crate::per_scale::kernels::dispatch::{DstSliceMut, InputView};
+use crate::per_scale::kernels::level_box::{
+    decode_box_level_dfl_i16_to_f16_per_channel, decode_box_level_dfl_i16_to_f32_per_channel,
+    decode_box_level_dfl_i8_to_f16_per_channel, decode_box_level_dfl_i8_to_f32_per_channel,
+    decode_box_level_dfl_u16_to_f16_per_channel, decode_box_level_dfl_u16_to_f32_per_channel,
+    decode_box_level_dfl_u8_to_f16_per_channel, decode_box_level_dfl_u8_to_f32_per_channel,
+};
 use crate::per_scale::kernels::transpose::nchw_to_nhwc;
 use crate::per_scale::outputs::{
     boxes_level_slice_of, mask_coefs_level_slice_of, scores_level_slice_of, Buffer, BufferRef,
@@ -238,6 +315,57 @@ pub(crate) fn run<'a>(
     Ok(make_outputs_ref(buffers, plan))
 }
 
+/// Dispatch the per-channel DFL kernel for the given `(input, dst)` dtype pair.
+/// Does NOT use `BoxLevelDispatch` (which carries only per-tensor `Quantization`).
+/// Only integer input types are matched — float inputs fall through to a
+/// `KernelDispatchUnreachable` error because NPUs never emit per-channel quant
+/// on float outputs.
+fn dispatch_dfl_per_channel(
+    input: InputView<'_>,
+    scales: &[f32],
+    zps: &[i32],
+    level: &crate::per_scale::plan::LevelPlan,
+    dst: DstSliceMut<'_>,
+) -> DecoderResult<()> {
+    match (input, dst) {
+        (InputView::I8(i), DstSliceMut::F32(d)) => {
+            decode_box_level_dfl_i8_to_f32_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::U8(i), DstSliceMut::F32(d)) => {
+            decode_box_level_dfl_u8_to_f32_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::I16(i), DstSliceMut::F32(d)) => {
+            decode_box_level_dfl_i16_to_f32_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::U16(i), DstSliceMut::F32(d)) => {
+            decode_box_level_dfl_u16_to_f32_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::I8(i), DstSliceMut::F16(d)) => {
+            decode_box_level_dfl_i8_to_f16_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::U8(i), DstSliceMut::F16(d)) => {
+            decode_box_level_dfl_u8_to_f16_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::I16(i), DstSliceMut::F16(d)) => {
+            decode_box_level_dfl_i16_to_f16_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        (InputView::U16(i), DstSliceMut::F16(d)) => {
+            decode_box_level_dfl_u16_to_f16_per_channel(i, scales, zps, level, d);
+            Ok(())
+        }
+        _ => Err(DecoderError::KernelDispatchUnreachable(
+            "dispatch_dfl_per_channel: float inputs do not support per-channel quant".into(),
+        )),
+    }
+}
+
 /// Sequential per-level loop (NCHW path: `layout_scratch` is shared).
 fn run_levels_sequential(
     plan: &PerScalePlan,
@@ -285,20 +413,53 @@ fn run_levels_sequential(
         {
             let _s = tracing::trace_span!("decoder.per_scale_run.level.boxes", encoding = ?plan.box_encoding)
                 .entered();
-            let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
             let dst = boxes_level_slice_of(boxes, lvl.anchor_offset, lvl.h * lvl.w);
             let box_channels = box_channel_count_for_level(lvl);
-            with_mapped_or_transposed_input(
-                lvl_bind.boxes,
-                "boxes",
-                li,
-                lvl.layout,
-                lvl.h,
-                lvl.w,
-                box_channels,
-                layout_scratch,
-                |input| plan.box_dispatch.run(input, q, lvl, dst),
-            )?;
+            if plan.box_encoding == crate::schema::BoxEncoding::Dfl && plan.dfl_per_channel {
+                match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
+                    Some((scales, zps)) => {
+                        with_mapped_or_transposed_input(
+                            lvl_bind.boxes,
+                            "boxes",
+                            li,
+                            lvl.layout,
+                            lvl.h,
+                            lvl.w,
+                            box_channels,
+                            layout_scratch,
+                            |input| dispatch_dfl_per_channel(input, scales, zps, lvl, dst),
+                        )?;
+                    }
+                    None => {
+                        // Per-tensor fallback (tensor has per-tensor quant or is float).
+                        let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
+                        with_mapped_or_transposed_input(
+                            lvl_bind.boxes,
+                            "boxes",
+                            li,
+                            lvl.layout,
+                            lvl.h,
+                            lvl.w,
+                            box_channels,
+                            layout_scratch,
+                            |input| plan.box_dispatch.run(input, q, lvl, dst),
+                        )?;
+                    }
+                }
+            } else {
+                let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
+                with_mapped_or_transposed_input(
+                    lvl_bind.boxes,
+                    "boxes",
+                    li,
+                    lvl.layout,
+                    lvl.h,
+                    lvl.w,
+                    box_channels,
+                    layout_scratch,
+                    |input| plan.box_dispatch.run(input, q, lvl, dst),
+                )?;
+            }
         }
 
         // Scores — dequant + optional sigmoid. ~32% of decode time per
@@ -516,10 +677,27 @@ fn process_one_level_nhwc(
     {
         let _s = tracing::trace_span!("decoder.per_scale_run.level.boxes", encoding = ?plan.box_encoding)
             .entered();
-        let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
-        with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
-            plan.box_dispatch.run(input, q, lvl, box_dst)
-        })?;
+        if plan.box_encoding == crate::schema::BoxEncoding::Dfl && plan.dfl_per_channel {
+            match box_per_channel_quant_from_tensor(lvl_bind.boxes, li)? {
+                Some((scales, zps)) => {
+                    with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
+                        dispatch_dfl_per_channel(input, scales, zps, lvl, box_dst)
+                    })?;
+                }
+                None => {
+                    // Per-tensor fallback (tensor has per-tensor quant or is float).
+                    let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
+                    with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
+                        plan.box_dispatch.run(input, q, lvl, box_dst)
+                    })?;
+                }
+            }
+        } else {
+            let q = quant_from_tensor(lvl_bind.boxes, "boxes", li)?;
+            with_mapped_input(lvl_bind.boxes, "boxes", li, |input| {
+                plan.box_dispatch.run(input, q, lvl, box_dst)
+            })?;
+        }
     }
 
     {
@@ -911,7 +1089,7 @@ mod tests {
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
 
@@ -935,7 +1113,7 @@ mod tests {
         let json =
             edgefirst_bench::testdata::read_to_string("per_scale/synthetic_yolov8n_schema.json");
         let schema: SchemaV2 = serde_json::from_str(&json).unwrap();
-        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32)
+        let plan = PerScalePlan::try_from_schema(&schema, DecodeDtype::F32, false)
             .unwrap()
             .unwrap();
 
