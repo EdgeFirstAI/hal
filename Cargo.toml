@@ -15,7 +15,7 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-version = "0.25.1"
+version = "0.25.2"
 edition = "2021"
 readme = "README.md"
 
@@ -26,16 +26,16 @@ approx = "0.5.1"
 cbindgen = "0.29"
 errno = "0.3"
 argminmax = { version = "0.6.3", default-features = false }
-ctor = "0.4.2"
+ctor = "1.0.7"
 dma-heap = "0.4.1"
 # Internal crates
 edgefirst-bench = { path = "crates/bench" }
-edgefirst-codec = { version = "0.25.1", path = "crates/codec" }
-edgefirst-hal = { version = "0.25.1", path = "crates/hal" }
-edgefirst-decoder = { version = "0.25.1", path = "crates/decoder" }
-edgefirst-image = { version = "0.25.1", path = "crates/image" }
-edgefirst-tensor = { version = "0.25.1", path = "crates/tensor" }
-edgefirst-tracker = { version = "0.25.1", path = "crates/tracker" }
+edgefirst-codec = { version = "0.25.2", path = "crates/codec" }
+edgefirst-hal = { version = "0.25.2", path = "crates/hal" }
+edgefirst-decoder = { version = "0.25.2", path = "crates/decoder" }
+edgefirst-image = { version = "0.25.2", path = "crates/image" }
+edgefirst-tensor = { version = "0.25.2", path = "crates/tensor" }
+edgefirst-tracker = { version = "0.25.2", path = "crates/tracker" }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.10"
 fast-math = "0.1.1"
@@ -55,37 +55,41 @@ jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 kamadak-exif = "0.6.1"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 lapjv = "0.3.0"
-libc = "0.2.183"
-libloading = "0.8.8"
-log = "0.4.29"
-nalgebra = "0.34.2"
+libc = "0.2.186"
+# Pinned to 0.8.x: khronos-egl 6.0.0 (latest) depends on libloading ^0.8 and we
+# share a `libloading::Library` handle with its `Dynamic` EGL instance. Bumping
+# to 0.9 splits the `Library` type across the crate boundary (Borrow bound fails).
+# Revisit when khronos-egl releases a libloading-0.9 build.
+libloading = "0.8.9"
+log = "0.4.33"
+nalgebra = "0.35.0"
 ndarray = { version = "0.17.2", features = ["rayon"] }
 ndarray-stats = "0.7.0"
-nix = { version = "0.31.2", features = ["fs", "ioctl", "mman"] }
+nix = { version = "0.31.3", features = ["fs", "ioctl", "mman"] }
 num-traits = "0.2.19"
-numpy = { version = "0.28.0", features = ["half"] }
-opencv = { version = "0.98", default-features = false, features = ["imgproc"] }
+numpy = { version = "0.29.0", features = ["half"] }
+opencv = { version = "0.99", default-features = false, features = ["imgproc"] }
 procfs = "0.18.0"
-pyo3 = { version = "0.28.0" }
-pyo3-build-config = { version = "0.28.0" }
-pythonize = "0.28.0"
-rand = "0.10.0"
+pyo3 = { version = "0.29.0" }
+pyo3-build-config = { version = "0.29.0" }
+pythonize = "0.29.0"
+rand = "0.10.1"
 rand_distr = "0.6.0"
-rayon = "1.11.0"
+rayon = "1.12.0"
 rustc_version = "0.4"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_yaml = "0.9.34"
-tokio = { version = "1.50.0", features = ["rt", "sync"] }
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
-uuid = { version = "1.22.0", features = ["v4"] }
-yuv = { version = "0.8.14", features = ["fast_mode"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+uuid = { version = "1.23.3", features = ["v4"] }
+yuv = { version = "0.8.16", features = ["fast_mode"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 zune-jpeg = "0.5.15"
 zune-png = "0.5.2"
-safetensors = "0.7.0"
+safetensors = "0.8.0"
 
 [profile.release]
 opt-level = 3

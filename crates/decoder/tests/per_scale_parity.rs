@@ -2299,12 +2299,12 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     // Hand-compute the expected per-channel golden.
     let golden = compute_per_channel_golden(&input_data, &scales);
 
-    // Run the decoder with dfl_per_channel=true (per-channel kernel).
+    // Per-channel quant is honored automatically from the box tensor's
+    // metadata — no flag, it is never optional.
     let schema_pc: SchemaV2 = serde_json::from_str(&schema_json).unwrap();
     let decoder_pc = DecoderBuilder::default()
         .with_schema(schema_pc)
         .with_decode_dtype(DecodeDtype::F32)
-        .with_dfl_per_channel(true)
         .with_iou_threshold(0.7)
         .with_score_threshold(0.0001)
         .with_nms(Some(Nms::ClassAgnostic))
@@ -2366,12 +2366,13 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         golden[3]
     );
 
-    // Run the same input with dfl_per_channel=false (per-tensor, using scale[0]=0.01).
+    // Run a per-tensor-quantized box tensor (single scale=0.01); the pipeline
+    // selects the scalar fast path automatically because the metadata is
+    // per-tensor. This demonstrates the two paths diverge on the same raw data.
     let schema_pt: SchemaV2 = serde_json::from_str(&schema_json).unwrap();
     let decoder_pt = DecoderBuilder::default()
         .with_schema(schema_pt)
         .with_decode_dtype(DecodeDtype::F32)
-        .with_dfl_per_channel(false)
         .with_iou_threshold(0.7)
         .with_score_threshold(0.0001)
         .with_nms(Some(Nms::ClassAgnostic))
@@ -2429,19 +2430,17 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
     );
 }
 
-/// Regression: the default per-tensor path is unchanged when the flag is off.
-/// Uses the same LTRB schema as `synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre`
-/// but with an explicit `with_dfl_per_channel(false)` call to confirm the default holds.
+/// Regression: the per-tensor scalar fast path is used for per-tensor-quantized
+/// tensors. Uses the same LTRB schema as
+/// `synthetic_ltrb_one_anchor_zero_input_gives_zero_box_at_centre`.
 #[test]
-fn dfl_per_tensor_path_unchanged_when_flag_off() {
+fn dfl_per_tensor_path_uses_scalar_fast_path() {
     let schema_json = minimal_ltrb_schema_one_level();
     let schema: SchemaV2 = serde_json::from_str(schema_json).unwrap();
 
-    // Explicit flag=false (same as default).
     let decoder = DecoderBuilder::default()
         .with_schema(schema)
         .with_decode_dtype(DecodeDtype::F32)
-        .with_dfl_per_channel(false)
         .with_iou_threshold(0.7)
         .with_score_threshold(0.0001)
         .with_nms(Some(Nms::ClassAgnostic))
@@ -2471,7 +2470,7 @@ fn dfl_per_tensor_path_unchanged_when_flag_off() {
     assert_eq!(
         output_boxes.len(),
         1,
-        "expected 1 detection with flag=false"
+        "expected 1 detection"
     );
     let det = &output_boxes[0];
     assert!(

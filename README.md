@@ -256,7 +256,7 @@ for how to verify your integration follows it.
 | Allocate via `ImageProcessor::create_image()` | Auto-selects DMA-buf / PBO / heap based on the active GPU; bypassing forces a slow transfer path | Forced `glTexSubImage2D` upload or full CPU readback |
 | Cache imported camera tensors by **inode**, not by fd | V4L2 / libcamera recycle fd numbers across a small buffer pool; an fd-keyed cache misses on every frame even when the physical buffer is the same | Full EGL re-import per frame (≈0.5–1.5 ms on Vivante, doubled with chroma planes) |
 | Build `Decoder` once, decode many | Decoder construction parses model metadata and allocates working buffers | Parse + alloc cost per frame |
-| One `ImageProcessor` per pipeline | Each instance owns its own GL context, EGL display, and per-thread caches | Multiple GL contexts contend on the global `GL_MUTEX` |
+| One `ImageProcessor` per pipeline | Each instance owns its own GL context, EGL display, and per-thread caches | On Vivante / paravirtual GPUs multiple contexts serialize on the global `GL_MUTEX`; on Mali / V3D / Tegra / Apple they run concurrently (one per thread is the portable rule) |
 | Use native fp16 / AVX build overrides only on supporting CPUs | These flags unlock native widening / vector paths for local perf testing | Unsupported targets may SIGILL or fail to build; portability loss |
 | Pass numpy arrays straight to `Tensor.from_numpy()` — do not pre-`ascontiguousarray()` | HAL detects strided sources and materializes via numpy's vectorized C strided→contig pass; a manual workaround above HAL adds a redundant copy | Redundant pre-copy on every call (≈ 1.5 ms on a `(1, 116, 8400)` f32 view, rpi5-hailo) |
 | For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the proto plane *before* thresholding (clean sub-pixel edges); `Proto` thresholds at proto resolution and callers typically nearest-upsample (blocky) | Mask mAP regression of up to 0.04–0.05 absolute when `Proto` is nearest-upsampled |
@@ -401,14 +401,20 @@ frame.
 image cache. The EGL **display** itself is process-global (a shared
 `SharedEglDisplay` initialized once and never terminated), so additional
 processors don't pay the display-creation cost — but each one still
-creates a fresh context and per-instance caches, and all GL operations
-across every processor serialize on a global `GL_MUTEX`. Construct one
-per pipeline (or one per worker thread for parallel pipelines) and share
-it across all `convert()`, `draw_*()`, and `create_image()` calls.
+creates a fresh context and per-instance caches. Whether GL operations
+across processors run in parallel is a per-driver policy: on Vivante
+(i.MX 8M Plus) and virtualized/paravirtual GPUs every command serializes
+on a global `GL_MUTEX`; on Mali, V3D, Tegra, llvmpipe, and real Apple
+GPUs they execute concurrently (override with `EDGEFIRST_GL_SERIALIZE`).
+Construct one per pipeline (or one per worker thread for parallel
+pipelines) and share it across all `convert()`, `draw_*()`, and
+`create_image()` calls.
 
 `ImageProcessor` is `Send + Sync`, so it can be moved or shared across
-threads. Concurrent use of a single shared instance still serializes on
-`GL_MUTEX`; per-worker ownership gives more predictable cache behavior.
+threads. On serializing drivers, concurrent use of a single shared
+instance funnels through `GL_MUTEX`; per-worker ownership runs in
+parallel wherever the driver allows and gives more predictable cache
+behavior everywhere.
 
 ### Rule 6 — Local fp16 / AVX build overrides
 
@@ -520,7 +526,7 @@ caller code.
 | Document | Level | Use it for |
 |----------|-------|------------|
 | [ARCHITECTURE.md § Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching) | Architecture | Why the rules exist: `BufferIdentity`, EGL image cache, the v4l2 / GStreamer fd-recycling story, and the inode-keyed downstream cache pattern |
-| [image/ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#performance-considerations) | Architecture | GL serialization (`GL_MUTEX`), backend dispatch, per-instance caches |
+| [image/ARCHITECTURE.md § Performance Considerations](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#performance-considerations) | Architecture | Backend dispatch and per-instance caches; see also [§ GL Concurrency Model](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy) for the per-driver `GL_MUTEX` policy |
 | [TESTING.md § Validating Optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations) | Testing | Confirming your integration follows the rules |
 | [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md) | Benchmarks | Empirical cost of breaking each rule, per platform |
 

@@ -31,7 +31,7 @@ log = { workspace = true }
 num-traits = { workspace = true }
 opencv = { workspace = true, optional = true }
 tracing = { workspace = true }
-turbojpeg = { version = "0.5", optional = true }
+turbojpeg = { version = "1.4", optional = true }
 zune-png = { workspace = true }
 
 # Hardware JPEG decode (v4l2 feature). Linux-only: nix provides the ioctl

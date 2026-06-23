@@ -151,10 +151,6 @@ pub struct DecoderBuilder {
     /// threshold — matching Ultralytics `val` multi-label decode.
     /// OFF by default.  Never read from schema/config (builder-only flag).
     multi_label: bool,
-    /// Honor the model's per-channel quantization metadata for the DFL box
-    /// head instead of collapsing to per-tensor. OFF by default (per-tensor
-    /// scalar fast path). Never read from schema/config (builder-only flag).
-    dfl_per_channel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,7 +196,6 @@ impl Default for DecoderBuilder {
             max_det: 300,
             input_dims: None,
             multi_label: false,
-            dfl_per_channel: false,
         }
     }
 }
@@ -964,34 +959,6 @@ impl DecoderBuilder {
         self
     }
 
-    /// Enable per-channel DFL dequantization for the box head.
-    ///
-    /// When `true`, the decoder reads per-channel quantization metadata from
-    /// the box tensor (one scale + zero-point per DFL bin channel) instead of
-    /// collapsing to the first element (per-tensor). This recovers the ~1.6–4.7 pp
-    /// INT8 accuracy loss seen on yolo26 models with per-channel box quant.
-    ///
-    /// Default: `false` (per-tensor scalar fast path — backward-compatible).
-    /// Only applies to DFL-encoded boxes on the per-scale fast path; LTRB and
-    /// the legacy decode path are unaffected.
-    ///
-    /// # Examples
-    /// ```rust
-    /// # use edgefirst_decoder::{DecoderBuilder, DecoderResult};
-    /// # fn main() -> DecoderResult<()> {
-    /// # let config_json = edgefirst_bench::testdata::read_to_string("modelpack_split.json").to_string();
-    /// let decoder = DecoderBuilder::new()
-    ///     .with_config_json_str(config_json)
-    ///     .with_dfl_per_channel(true)
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn with_dfl_per_channel(mut self, v: bool) -> Self {
-        self.dfl_per_channel = v;
-        self
-    }
-
     /// Sets the maximum number of candidate boxes fed into NMS after score
     /// filtering.  Uses partial sort (O(N)) to select the top-K candidates,
     /// dramatically reducing the O(N²) NMS cost when many low-confidence
@@ -1123,18 +1090,17 @@ impl DecoderBuilder {
     /// ```
     pub fn build(self) -> Result<Decoder, DecoderError> {
         let decode_dtype = self.decode_dtype;
-        let dfl_per_channel = self.dfl_per_channel;
         let explicit_input_dims = self.input_dims;
         let (config, decode_program, per_scale_plan, schema_input_dims) = match self.config_src {
             Some(ConfigSource::Json(s)) => {
-                Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype, dfl_per_channel)?
+                Self::build_from_schema(SchemaV2::parse_json(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Yaml(s)) => {
-                Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype, dfl_per_channel)?
+                Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Config(c)) => (c, None, None, None),
             Some(ConfigSource::Schema(schema)) => {
-                Self::build_from_schema(schema, decode_dtype, dfl_per_channel)?
+                Self::build_from_schema(schema, decode_dtype)?
             }
             None => return Err(DecoderError::NoConfig),
         };
@@ -1243,7 +1209,6 @@ impl DecoderBuilder {
     fn build_from_schema(
         schema: SchemaV2,
         decode_dtype: DecodeDtype,
-        dfl_per_channel: bool,
     ) -> Result<
         (
             ConfigOutputs,
@@ -1261,7 +1226,7 @@ impl DecoderBuilder {
         // program for split schemas it does NOT claim (e.g. ARA-2 channel
         // sub-splits). This keeps `decode_program` `None` for per-scale
         // schemas so the merge path never sees per-scale logicals.
-        let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype, dfl_per_channel)?;
+        let per_scale = PerScalePlan::try_from_schema(&schema, decode_dtype)?;
         let program = if per_scale.is_some() {
             None
         } else {
