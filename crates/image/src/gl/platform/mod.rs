@@ -131,7 +131,7 @@ pub(super) trait GlPlatform {
     const EXTERNAL_OES: bool;
 
     /// Load the process-global GL function-pointer table exactly once.
-    /// `gls` bindings are gl_generator `static mut` tables — loading must
+    /// `edgefirst_gl` bindings are gl_generator `static mut` tables — loading must
     /// happen once per process, never per processor. Linux resolves via
     /// this display's `eglGetProcAddress`; macOS already loaded at
     /// shared-ANGLE-display init, so this is a no-op there.

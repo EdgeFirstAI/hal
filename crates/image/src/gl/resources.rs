@@ -9,10 +9,10 @@ use std::ptr::null;
 
 pub(super) struct Texture {
     pub(super) id: u32,
-    pub(super) target: gls::gl::types::GLenum,
+    pub(super) target: edgefirst_gl::gl::types::GLenum,
     pub(super) width: usize,
     pub(super) height: usize,
-    pub(super) format: gls::gl::types::GLenum,
+    pub(super) format: edgefirst_gl::gl::types::GLenum,
     /// Which EGLImage (identified by buffer identity key) is currently bound
     /// to this texture via `glEGLImageTargetTexture2DOES`. `None` means no
     /// EGLImage is bound (or the binding has been invalidated).
@@ -28,7 +28,7 @@ impl Default for Texture {
 impl Texture {
     pub(super) fn new() -> Self {
         let mut id = 0;
-        unsafe { gls::gl::GenTextures(1, &raw mut id) };
+        unsafe { edgefirst_gl::gl::GenTextures(1, &raw mut id) };
         Self {
             id,
             target: 0,
@@ -41,10 +41,10 @@ impl Texture {
 
     pub(super) fn update_texture(
         &mut self,
-        target: gls::gl::types::GLenum,
+        target: edgefirst_gl::gl::types::GLenum,
         width: usize,
         height: usize,
-        format: gls::gl::types::GLenum,
+        format: edgefirst_gl::gl::types::GLenum,
         data: &[u8],
     ) {
         if target != self.target
@@ -53,7 +53,7 @@ impl Texture {
             || format != self.format
         {
             unsafe {
-                gls::gl::TexImage2D(
+                edgefirst_gl::gl::TexImage2D(
                     target,
                     0,
                     format as i32,
@@ -61,7 +61,7 @@ impl Texture {
                     height as i32,
                     0,
                     format,
-                    gls::gl::UNSIGNED_BYTE,
+                    edgefirst_gl::gl::UNSIGNED_BYTE,
                     data.as_ptr() as *const c_void,
                 );
             }
@@ -73,7 +73,7 @@ impl Texture {
             self.bound_egl_key = None;
         } else {
             unsafe {
-                gls::gl::TexSubImage2D(
+                edgefirst_gl::gl::TexSubImage2D(
                     target,
                     0,
                     0,
@@ -81,7 +81,7 @@ impl Texture {
                     width as i32,
                     height as i32,
                     format,
-                    gls::gl::UNSIGNED_BYTE,
+                    edgefirst_gl::gl::UNSIGNED_BYTE,
                     data.as_ptr() as *const c_void,
                 );
             }
@@ -149,7 +149,7 @@ impl Texture {
 impl Drop for Texture {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            gls::gl::DeleteTextures(1, &raw mut self.id)
+            edgefirst_gl::gl::DeleteTextures(1, &raw mut self.id)
         }));
     }
 }
@@ -163,22 +163,22 @@ impl Buffer {
     pub(super) fn new(buffer_index: u32, size_per_point: usize, max_points: usize) -> Buffer {
         let mut id = 0;
         unsafe {
-            gls::gl::EnableVertexAttribArray(buffer_index);
-            gls::gl::GenBuffers(1, &raw mut id);
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, id);
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::EnableVertexAttribArray(buffer_index);
+            edgefirst_gl::gl::GenBuffers(1, &raw mut id);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, id);
+            edgefirst_gl::gl::VertexAttribPointer(
                 buffer_index,
                 size_per_point as i32,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 0,
                 null(),
             );
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * size_per_point * max_points) as isize,
                 null(),
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
         }
 
@@ -189,7 +189,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            gls::gl::DeleteBuffers(1, &raw mut self.id)
+            edgefirst_gl::gl::DeleteBuffers(1, &raw mut self.id)
         }));
     }
 }
@@ -202,18 +202,18 @@ impl FrameBuffer {
     pub(super) fn new() -> FrameBuffer {
         let mut id = 0;
         unsafe {
-            gls::gl::GenFramebuffers(1, &raw mut id);
+            edgefirst_gl::gl::GenFramebuffers(1, &raw mut id);
         }
 
         FrameBuffer { id }
     }
 
     pub(super) fn bind(&self) {
-        unsafe { gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, self.id) };
+        unsafe { edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, self.id) };
     }
 
     pub(super) fn unbind(&self) {
-        unsafe { gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0) };
+        unsafe { edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0) };
     }
 }
 
@@ -222,7 +222,7 @@ impl Drop for FrameBuffer {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.unbind();
             unsafe {
-                gls::gl::DeleteFramebuffers(1, &raw mut self.id);
+                edgefirst_gl::gl::DeleteFramebuffers(1, &raw mut self.id);
             }
         }));
     }
@@ -237,24 +237,24 @@ impl GlProgram {
         // Shared compile+link (deletes the shaders after a successful link) —
         // see `gl::core::compile_program`.
         let id = unsafe { super::core::compile_program(vertex_shader, fragment_shader)? };
-        unsafe { gls::gl::UseProgram(id) };
+        unsafe { edgefirst_gl::gl::UseProgram(id) };
         Ok(Self { id })
     }
 
     pub(super) fn load_uniform_1f(&self, name: &CStr, value: f32) -> Result<(), crate::Error> {
         unsafe {
-            gls::gl::UseProgram(self.id);
-            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
-            gls::gl::Uniform1f(location, value);
+            edgefirst_gl::gl::UseProgram(self.id);
+            let location = edgefirst_gl::gl::GetUniformLocation(self.id, name.as_ptr());
+            edgefirst_gl::gl::Uniform1f(location, value);
         }
         Ok(())
     }
 
     pub(super) fn load_uniform_1i(&self, name: &CStr, value: i32) -> Result<(), crate::Error> {
         unsafe {
-            gls::gl::UseProgram(self.id);
-            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
-            gls::gl::Uniform1i(location, value);
+            edgefirst_gl::gl::UseProgram(self.id);
+            let location = edgefirst_gl::gl::GetUniformLocation(self.id, name.as_ptr());
+            edgefirst_gl::gl::Uniform1i(location, value);
         }
         Ok(())
     }
@@ -265,15 +265,19 @@ impl GlProgram {
         value: &[[f32; 4]],
     ) -> Result<(), crate::Error> {
         unsafe {
-            gls::gl::UseProgram(self.id);
-            let location = gls::gl::GetUniformLocation(self.id, name.as_ptr());
+            edgefirst_gl::gl::UseProgram(self.id);
+            let location = edgefirst_gl::gl::GetUniformLocation(self.id, name.as_ptr());
             if location == -1 {
                 return Err(crate::Error::OpenGl(format!(
                     "Could not find uniform location for '{}'",
                     name.to_string_lossy().into_owned()
                 )));
             }
-            gls::gl::Uniform4fv(location, value.len() as i32, value.as_flattened().as_ptr());
+            edgefirst_gl::gl::Uniform4fv(
+                location,
+                value.len() as i32,
+                value.as_flattened().as_ptr(),
+            );
         }
         check_gl_error(function!(), line!())?;
         Ok(())
@@ -283,7 +287,7 @@ impl GlProgram {
 impl Drop for GlProgram {
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            gls::gl::DeleteProgram(self.id);
+            edgefirst_gl::gl::DeleteProgram(self.id);
         }));
     }
 }

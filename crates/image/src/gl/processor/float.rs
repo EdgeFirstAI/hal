@@ -123,19 +123,24 @@ pub(super) unsafe fn finish_via_fence() {
     // 1 second, in nanoseconds — generous; a healthy convert completes in well
     // under a millisecond and never reaches the timeout.
     const TIMEOUT_NS: u64 = 1_000_000_000;
-    let sync = gls::gl::FenceSync(gls::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+    let sync = edgefirst_gl::gl::FenceSync(edgefirst_gl::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
     if sync.is_null() {
         // Fence could not be created; preserve the completion guarantee.
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
         return;
     }
-    let status = gls::gl::ClientWaitSync(sync, gls::gl::SYNC_FLUSH_COMMANDS_BIT, TIMEOUT_NS);
-    gls::gl::DeleteSync(sync);
+    let status = edgefirst_gl::gl::ClientWaitSync(
+        sync,
+        edgefirst_gl::gl::SYNC_FLUSH_COMMANDS_BIT,
+        TIMEOUT_NS,
+    );
+    edgefirst_gl::gl::DeleteSync(sync);
     match status {
-        s if s == gls::gl::ALREADY_SIGNALED || s == gls::gl::CONDITION_SATISFIED => {}
+        s if s == edgefirst_gl::gl::ALREADY_SIGNALED
+            || s == edgefirst_gl::gl::CONDITION_SATISFIED => {}
         // Timeout expired or the wait failed: fall back to a blocking drain so
         // the caller never proceeds on an incomplete readback/render.
-        _ => gls::gl::Finish(),
+        _ => edgefirst_gl::gl::Finish(),
     }
 }
 
@@ -158,29 +163,37 @@ impl GLProcessorST {
         src_cpu_pixels: Option<&[u8]>,
     ) {
         unsafe {
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex_id);
-            gls::gl::TexParameteri(gls::gl::TEXTURE_2D, gls::gl::TEXTURE_MIN_FILTER, src_filter);
-            gls::gl::TexParameteri(gls::gl::TEXTURE_2D, gls::gl::TEXTURE_MAG_FILTER, src_filter);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex_id);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                src_filter,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                src_filter,
+            );
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_WRAP_S,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
+            );
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_WRAP_T,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
             // Identity swizzle (a prior Grey/planar conversion may have left
             // TEXTURE_SWIZZLE_* in a non-identity state on this texture).
             for (swizzle, comp) in [
-                (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
-                (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
-                (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
-                (gls::gl::TEXTURE_SWIZZLE_A, gls::gl::ALPHA),
+                (edgefirst_gl::gl::TEXTURE_SWIZZLE_R, edgefirst_gl::gl::RED),
+                (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, edgefirst_gl::gl::GREEN),
+                (edgefirst_gl::gl::TEXTURE_SWIZZLE_B, edgefirst_gl::gl::BLUE),
+                (edgefirst_gl::gl::TEXTURE_SWIZZLE_A, edgefirst_gl::gl::ALPHA),
             ] {
-                gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, comp as i32);
+                edgefirst_gl::gl::TexParameteri(edgefirst_gl::gl::TEXTURE_2D, swizzle, comp as i32);
             }
             if let Some(buffer_id) = src_pbo_id {
                 // Upload directly from the source PBO (zero CPU copy). The PBO
@@ -190,22 +203,22 @@ impl GLProcessorST {
                 // On the steady-state video path (fixed input size) reuse the
                 // existing storage with `TexSubImage2D` (PBO-bound, NULL data)
                 // instead of reallocating with `TexImage2D` every frame.
-                gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, buffer_id);
                 let cache = &mut self.camera_normal_texture;
-                let needs_alloc = cache.target != gls::gl::TEXTURE_2D
+                let needs_alloc = cache.target != edgefirst_gl::gl::TEXTURE_2D
                     || cache.width != src_w
                     || cache.height != src_h
-                    || cache.format != gls::gl::RGBA;
+                    || cache.format != edgefirst_gl::gl::RGBA;
                 if needs_alloc {
-                    gls::gl::TexImage2D(
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TexImage2D(
+                        edgefirst_gl::gl::TEXTURE_2D,
                         0,
-                        gls::gl::RGBA as i32,
+                        edgefirst_gl::gl::RGBA as i32,
                         src_w as i32,
                         src_h as i32,
                         0,
-                        gls::gl::RGBA,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::RGBA,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null(),
                     );
                     // Record the true storage state so the cache reflects
@@ -213,32 +226,32 @@ impl GLProcessorST {
                     // dims/format) will correctly take its TexSubImage2D fast
                     // path rather than be forced to reallocate. TexImage2D
                     // reallocated storage, so any EGLImage binding is stale.
-                    cache.target = gls::gl::TEXTURE_2D;
+                    cache.target = edgefirst_gl::gl::TEXTURE_2D;
                     cache.width = src_w;
                     cache.height = src_h;
-                    cache.format = gls::gl::RGBA;
+                    cache.format = edgefirst_gl::gl::RGBA;
                     cache.invalidate_egl_binding();
                 } else {
-                    gls::gl::TexSubImage2D(
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TexSubImage2D(
+                        edgefirst_gl::gl::TEXTURE_2D,
                         0,
                         0,
                         0,
                         src_w as i32,
                         src_h as i32,
-                        gls::gl::RGBA,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::RGBA,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null(),
                     );
                 }
-                gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             } else {
                 let pixels = src_cpu_pixels.expect("non-PBO source mapped by caller");
                 self.camera_normal_texture.update_texture(
-                    gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TEXTURE_2D,
                     src_w,
                     src_h,
-                    gls::gl::RGBA,
+                    edgefirst_gl::gl::RGBA,
                     pixels,
                 );
             }
@@ -269,35 +282,39 @@ impl GLProcessorST {
         dst_image_size: Option<(f32, f32)>,
     ) -> crate::Result<()> {
         unsafe {
-            gls::gl::Viewport(0, 0, packed_w as i32, packed_h as i32);
-            gls::gl::UseProgram(program_id);
+            edgefirst_gl::gl::Viewport(0, 0, packed_w as i32, packed_h as i32);
+            edgefirst_gl::gl::UseProgram(program_id);
 
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex_id);
-            let loc_sampler = gls::gl::GetUniformLocation(program_id, sampler_name.as_ptr());
-            gls::gl::Uniform1i(loc_sampler, 0);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex_id);
+            let loc_sampler =
+                edgefirst_gl::gl::GetUniformLocation(program_id, sampler_name.as_ptr());
+            edgefirst_gl::gl::Uniform1i(loc_sampler, 0);
 
-            let loc_src_rect = gls::gl::GetUniformLocation(program_id, c"src_rect_uv".as_ptr());
-            gls::gl::Uniform4f(
+            let loc_src_rect =
+                edgefirst_gl::gl::GetUniformLocation(program_id, c"src_rect_uv".as_ptr());
+            edgefirst_gl::gl::Uniform4f(
                 loc_src_rect,
                 src_rect_uv[0],
                 src_rect_uv[1],
                 src_rect_uv[2],
                 src_rect_uv[3],
             );
-            let loc_dst_rect = gls::gl::GetUniformLocation(program_id, c"dst_rect_px".as_ptr());
-            gls::gl::Uniform4f(
+            let loc_dst_rect =
+                edgefirst_gl::gl::GetUniformLocation(program_id, c"dst_rect_px".as_ptr());
+            edgefirst_gl::gl::Uniform4f(
                 loc_dst_rect,
                 dst_rect_px[0],
                 dst_rect_px[1],
                 dst_rect_px[2],
                 dst_rect_px[3],
             );
-            let loc_pad = gls::gl::GetUniformLocation(program_id, c"pad_color".as_ptr());
-            gls::gl::Uniform3f(loc_pad, pad_color[0], pad_color[1], pad_color[2]);
+            let loc_pad = edgefirst_gl::gl::GetUniformLocation(program_id, c"pad_color".as_ptr());
+            edgefirst_gl::gl::Uniform3f(loc_pad, pad_color[0], pad_color[1], pad_color[2]);
             if let Some((w, h)) = dst_image_size {
-                let loc_size = gls::gl::GetUniformLocation(program_id, c"dst_image_size".as_ptr());
-                gls::gl::Uniform2f(loc_size, w, h);
+                let loc_size =
+                    edgefirst_gl::gl::GetUniformLocation(program_id, c"dst_image_size".as_ptr());
+                edgefirst_gl::gl::Uniform2f(loc_size, w, h);
             }
             check_gl_error(function!(), line!())?;
 
@@ -305,34 +322,34 @@ impl GLProcessorST {
             // 0..1 texcoords. The float shaders ignore the interpolated
             // texcoords (they derive sampling from gl_FragCoord + uniforms),
             // but a valid quad is still needed to rasterize every fragment.
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
             let quad_pos: [f32; 12] = [
                 -1.0, 1.0, 0.0, // left top
                 1.0, 1.0, 0.0, // right top
                 1.0, -1.0, 0.0, // right bottom
                 -1.0, -1.0, 0.0, // left bottom
             ];
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * quad_pos.len()) as isize,
                 quad_pos.as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
             let quad_uv: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * quad_uv.len()) as isize,
                 quad_uv.as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
             let quad_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 quad_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 quad_index.as_ptr() as *const c_void,
             );
             check_gl_error(function!(), line!())?;
@@ -371,8 +388,16 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         // Only the two PBO float paths are implemented here.
         let (internal, client_fmt, gl_type) = match path {
-            FloatRenderPath::PboF32Nhwc => (gls::gl::R32F, gls::gl::RED, gls::gl::FLOAT),
-            FloatRenderPath::PboF16Nchw => (gls::gl::RGBA16F, gls::gl::RGBA, gls::gl::HALF_FLOAT),
+            FloatRenderPath::PboF32Nhwc => (
+                edgefirst_gl::gl::R32F,
+                edgefirst_gl::gl::RED,
+                edgefirst_gl::gl::FLOAT,
+            ),
+            FloatRenderPath::PboF16Nchw => (
+                edgefirst_gl::gl::RGBA16F,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::HALF_FLOAT,
+            ),
             FloatRenderPath::ZeroCopyF16Nchw | FloatRenderPath::None => {
                 return Err(crate::Error::NotSupported(
                     "GL float render-to-PBO: only PBO F32 NHWC / F16 NCHW are implemented; \
@@ -475,7 +500,7 @@ impl GLProcessorST {
         // paths. LINEAR on the RGBA8 source is unconditionally supported —
         // GL_OES_texture_float_linear is irrelevant here because we filter the
         // u8 source texture, not the float render target.
-        let src_filter = gls::gl::LINEAR as i32;
+        let src_filter = edgefirst_gl::gl::LINEAR as i32;
 
         // ── Source RGBA8 texture upload (shared with the DMA F16 path) ──
         self.upload_float_src(
@@ -489,8 +514,11 @@ impl GLProcessorST {
 
         unsafe {
             // ── Float render texture + FBO ──
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, render_tex_id);
-            super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, render_tex_id);
+            super::super::core::set_tex_filter(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::NEAREST,
+            );
             // Only (re)spec the render-target storage when the packed dims or
             // internal format change (mirrors `proto_tex_dims` / Texture's
             // size cache). On the steady-state fixed-input video path this is
@@ -498,8 +526,8 @@ impl GLProcessorST {
             // the per-frame `TexImage2D` reallocation entirely.
             let render_dims = (packed_w, packed_h, internal);
             if self.float_render_tex_dims != render_dims {
-                gls::gl::TexImage2D(
-                    gls::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TexImage2D(
+                    edgefirst_gl::gl::TEXTURE_2D,
                     0,
                     internal as i32,
                     packed_w as i32,
@@ -517,15 +545,15 @@ impl GLProcessorST {
             }
 
             self.convert_fbo.bind();
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 render_tex_id,
                 0,
             );
             if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
-                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
                 return Err(crate::Error::NotSupported(format!(
                     "GL float render-to-PBO: FBO incomplete (0x{fbo_status:x}) for {path:?}; \
                      using CPU fallback"
@@ -552,12 +580,12 @@ impl GLProcessorST {
 
         unsafe {
             // ── Readback into the destination PBO ──
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, dst_buffer_id);
+            edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
             // Plain ReadPixels — glReadnPixels is ES 3.2-only and rejected by
             // ANGLE/Metal's ES 3.0 contexts (see `readback_rendered`). The PBO
             // PACK binding bounds the write.
-            gls::gl::ReadPixels(
+            edgefirst_gl::gl::ReadPixels(
                 0,
                 0,
                 packed_w as i32,
@@ -566,7 +594,7 @@ impl GLProcessorST {
                 gl_type,
                 std::ptr::null_mut(),
             );
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
             // Wait for the readback into the destination PBO to complete before
             // returning (same contract as glFinish, scoped to a fence).
             finish_via_fence();
@@ -637,7 +665,7 @@ impl GLProcessorST {
         } else {
             None
         };
-        let src_filter = gls::gl::LINEAR as i32;
+        let src_filter = edgefirst_gl::gl::LINEAR as i32;
 
         // ── Source RGBA8 texture upload (shared with the PBO F16 path) ──
         self.upload_float_src(
@@ -722,18 +750,24 @@ impl GLProcessorST {
         unsafe {
             match self.cached_dst_renderbuffer(dst_f16, PixelFormat::PlanarRgb) {
                 Some(rbo) => {
-                    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                    gls::gl::FramebufferRenderbuffer(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::RENDERBUFFER,
+                    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+                    edgefirst_gl::gl::FramebufferRenderbuffer(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::RENDERBUFFER,
                         rbo,
                     );
                 }
                 None => {
-                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                    super::super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+                    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                    edgefirst_gl::gl::BindTexture(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        self.render_texture.id,
+                    );
+                    super::super::core::set_tex_filter(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        edgefirst_gl::gl::NEAREST,
+                    );
                     // Platform attach (EGLImage target on Linux,
                     // eglBindTexImage on macOS — a raw OES call there
                     // silently no-ops on a pbuffer handle and leaves the
@@ -742,10 +776,10 @@ impl GLProcessorST {
                         &self.gl_context,
                         dest_egl,
                     )?;
-                    gls::gl::FramebufferTexture2D(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::FramebufferTexture2D(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::TEXTURE_2D,
                         self.render_texture.id,
                         0,
                     );
@@ -757,7 +791,7 @@ impl GLProcessorST {
             }
 
             if let Err(fbo_status) = super::super::core::check_framebuffer_complete() {
-                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
                 return Err(crate::Error::NotSupported(format!(
                     "GL float render-to-DMA: FBO incomplete (0x{fbo_status:x}) for the RGBA16F \
                      dma-buf import; using CPU fallback"

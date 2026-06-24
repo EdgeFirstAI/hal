@@ -58,7 +58,7 @@ const EGL_BACK_BUFFER: i32 = 0x3084;
 // ---------------------------------------------------------------------------
 // One-shot GL function-pointer table.
 //
-// `gls::load_with` populates global function pointers — exists once per
+// `edgefirst_gl::load_with` populates global function pointers — exists once per
 // process. We load via EGL's `eglGetProcAddress` so the symbols come
 // from ANGLE's libGLESv2.dylib. The pointers are display-global, so a
 // single load serves every context created on the shared display.
@@ -68,7 +68,7 @@ static GL_LOADED: OnceLock<()> = OnceLock::new();
 
 fn load_gl_once(egl: &Egl) {
     GL_LOADED.get_or_init(|| {
-        gls::load_with(|name| match egl.get_proc_address(name) {
+        edgefirst_gl::load_with(|name| match egl.get_proc_address(name) {
             Some(ptr) => ptr as *const c_void,
             None => std::ptr::null(),
         });
@@ -222,7 +222,7 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
     // Apple Silicon + recent ANGLE bundles; on older configurations
     // either or both may be missing — consumers fall back per dtype.
     let extensions = unsafe {
-        let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
+        let ptr = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
         if ptr.is_null() {
             String::new()
         } else {

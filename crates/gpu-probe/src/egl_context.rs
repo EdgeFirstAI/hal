@@ -261,7 +261,7 @@ impl GpuContext {
             .map_err(|e| format!("eglMakeCurrent (surfaceless) failed: {e}"))?;
 
         // Load GL function pointers
-        gls::load_with(|s| {
+        edgefirst_gl::load_with(|s| {
             egl.get_proc_address(s)
                 .map_or(std::ptr::null(), |p| p as *const _)
         });
@@ -303,23 +303,23 @@ impl GpuContext {
 
     /// GL_RENDERER string.
     pub fn gl_renderer(&self) -> String {
-        gls::get_string(gls::gl::RENDERER).unwrap_or_else(|_| "<unknown>".into())
+        edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER).unwrap_or_else(|_| "<unknown>".into())
     }
 
     /// GL_VERSION string.
     pub fn gl_version(&self) -> String {
-        gls::get_string(gls::gl::VERSION).unwrap_or_else(|_| "<unknown>".into())
+        edgefirst_gl::get_string(edgefirst_gl::gl::VERSION).unwrap_or_else(|_| "<unknown>".into())
     }
 
     /// GL_VENDOR string.
     pub fn gl_vendor(&self) -> String {
-        gls::get_string(gls::gl::VENDOR).unwrap_or_else(|_| "<unknown>".into())
+        edgefirst_gl::get_string(edgefirst_gl::gl::VENDOR).unwrap_or_else(|_| "<unknown>".into())
     }
 
     /// Sorted list of GL extensions.
     pub fn gl_extensions(&self) -> Vec<String> {
         let ext_str = unsafe {
-            let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
+            let ptr = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
             if ptr.is_null() {
                 return Vec::new();
             }
@@ -337,11 +337,11 @@ impl GpuContext {
         exts
     }
 
-    /// Query a single GL integer parameter (e.g. `gls::gl::MAX_TEXTURE_SIZE`).
-    pub fn gl_get_integer(&self, param: gls::GLenum) -> i32 {
+    /// Query a single GL integer parameter (e.g. `edgefirst_gl::gl::MAX_TEXTURE_SIZE`).
+    pub fn gl_get_integer(&self, param: edgefirst_gl::GLenum) -> i32 {
         let mut value: i32 = 0;
         unsafe {
-            gls::gl::GetIntegerv(param, &mut value);
+            edgefirst_gl::gl::GetIntegerv(param, &mut value);
         }
         value
     }
@@ -361,7 +361,7 @@ impl GpuContext {
             true
         } else {
             let ext_str = unsafe {
-                let ptr = gls::gl::GetString(gls::gl::EXTENSIONS);
+                let ptr = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
                 if ptr.is_null() {
                     return false;
                 }

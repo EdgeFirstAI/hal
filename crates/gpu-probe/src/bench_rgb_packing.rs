@@ -187,9 +187,12 @@ fn compile_packing_program(frag_src: &str) -> Option<(u32, i32, i32, i32)> {
         }
     };
     unsafe {
-        let tex_loc = gls::gl::GetUniformLocation(program, CString::new("tex").unwrap().as_ptr());
-        let sw_loc = gls::gl::GetUniformLocation(program, CString::new("src_w").unwrap().as_ptr());
-        let sh_loc = gls::gl::GetUniformLocation(program, CString::new("src_h").unwrap().as_ptr());
+        let tex_loc =
+            edgefirst_gl::gl::GetUniformLocation(program, CString::new("tex").unwrap().as_ptr());
+        let sw_loc =
+            edgefirst_gl::gl::GetUniformLocation(program, CString::new("src_w").unwrap().as_ptr());
+        let sh_loc =
+            edgefirst_gl::gl::GetUniformLocation(program, CString::new("src_h").unwrap().as_ptr());
         Some((program, tex_loc, sw_loc, sh_loc))
     }
 }
@@ -246,28 +249,28 @@ fn try_create_rgba_egl_image(
 fn create_texture_from_image(image: &edgefirst_egl::Image) -> u32 {
     unsafe {
         let mut tex = 0u32;
-        gls::gl::GenTextures(1, &mut tex);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, image.as_ptr());
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::GenTextures(1, &mut tex);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, image.as_ptr());
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_WRAP_S,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_WRAP_T,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
         tex
     }
@@ -277,17 +280,17 @@ fn create_texture_from_image(image: &edgefirst_egl::Image) -> u32 {
 fn create_fbo_with_texture(tex: u32) -> (u32, bool) {
     unsafe {
         let mut fbo = 0u32;
-        gls::gl::GenFramebuffers(1, &mut fbo);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::FramebufferTexture2D(
-            gls::gl::FRAMEBUFFER,
-            gls::gl::COLOR_ATTACHMENT0,
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::FramebufferTexture2D(
+            edgefirst_gl::gl::FRAMEBUFFER,
+            edgefirst_gl::gl::COLOR_ATTACHMENT0,
+            edgefirst_gl::gl::TEXTURE_2D,
             tex,
             0,
         );
-        let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-        (fbo, status == gls::gl::FRAMEBUFFER_COMPLETE)
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+        (fbo, status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE)
     }
 }
 
@@ -301,35 +304,40 @@ unsafe fn bind_program_and_source(
     src_w: f32,
     src_h: f32,
 ) {
-    gls::gl::UseProgram(program);
-    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-    gls::gl::Uniform1i(tex_loc, 0);
+    edgefirst_gl::gl::UseProgram(program);
+    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+    edgefirst_gl::gl::Uniform1i(tex_loc, 0);
     if sw_loc >= 0 {
-        gls::gl::Uniform1f(sw_loc, src_w);
+        edgefirst_gl::gl::Uniform1f(sw_loc, src_w);
     }
     if sh_loc >= 0 {
-        gls::gl::Uniform1f(sh_loc, src_h);
+        edgefirst_gl::gl::Uniform1f(sh_loc, src_h);
     }
 }
 
 /// Draw the fullscreen quad and finish.
 unsafe fn draw_and_finish(vao: u32) {
-    gls::gl::BindVertexArray(vao);
-    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
-    gls::gl::Finish();
+    edgefirst_gl::gl::BindVertexArray(vao);
+    edgefirst_gl::gl::DrawElements(
+        edgefirst_gl::gl::TRIANGLES,
+        6,
+        edgefirst_gl::gl::UNSIGNED_INT,
+        null(),
+    );
+    edgefirst_gl::gl::Finish();
 }
 
 /// Cleanup: delete FBO, textures, destroy EGLImages.
 unsafe fn cleanup_gl(fbo: u32, textures: &[u32]) {
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::BindVertexArray(0);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::BindVertexArray(0);
     if fbo != 0 {
-        gls::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
     }
     for &t in textures {
         if t != 0 {
-            gls::gl::DeleteTextures(1, &t);
+            edgefirst_gl::gl::DeleteTextures(1, &t);
         }
     }
 }
@@ -394,16 +402,16 @@ pub fn run_verify(ctx: &GpuContext) {
 
         // Cleanup this config's source
         unsafe {
-            gls::gl::DeleteTextures(1, &src_tex);
+            edgefirst_gl::gl::DeleteTextures(1, &src_tex);
         }
         ctx.destroy_egl_image(src_img)
             .expect("destroy src EGLImage failed");
     }
 
     unsafe {
-        gls::gl::DeleteVertexArrays(1, &vao);
-        gls::gl::DeleteBuffers(1, &vbo);
-        gls::gl::DeleteBuffers(1, &ebo);
+        edgefirst_gl::gl::DeleteVertexArrays(1, &vao);
+        edgefirst_gl::gl::DeleteBuffers(1, &vbo);
+        edgefirst_gl::gl::DeleteBuffers(1, &ebo);
     }
 
     println!();
@@ -428,7 +436,7 @@ fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao:
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -440,7 +448,7 @@ fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao:
         None => {
             println!("  {name:40} SKIP (R8 EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -452,14 +460,14 @@ fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao:
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     unsafe {
-        gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -471,7 +479,7 @@ fn verify_packed_r8(ctx: &GpuContext, src_tex: u32, src_w: u32, src_h: u32, vao:
         );
         draw_and_finish(vao);
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -532,7 +540,7 @@ fn verify_packed_rgba8(
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -544,7 +552,7 @@ fn verify_packed_rgba8(
         None => {
             println!("  {name:40} SKIP (RGBA EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -555,14 +563,14 @@ fn verify_packed_rgba8(
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     unsafe {
-        gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -574,7 +582,7 @@ fn verify_packed_rgba8(
         );
         draw_and_finish(vao);
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -638,7 +646,7 @@ fn verify_planar_r8_1pass(
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -650,7 +658,7 @@ fn verify_planar_r8_1pass(
         None => {
             println!("  {name:40} SKIP (R8 EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -662,14 +670,14 @@ fn verify_planar_r8_1pass(
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     unsafe {
-        gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -681,7 +689,7 @@ fn verify_planar_r8_1pass(
         );
         draw_and_finish(vao);
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -739,7 +747,7 @@ fn verify_planar_r8_3pass(
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -751,7 +759,7 @@ fn verify_planar_r8_3pass(
         None => {
             println!("  {name:40} SKIP (R8 EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -763,41 +771,50 @@ fn verify_planar_r8_3pass(
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     // 3-pass rendering: one draw call per channel with TEXTURE_SWIZZLE_R
-    let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
+    let swizzles = [
+        edgefirst_gl::gl::RED,
+        edgefirst_gl::gl::GREEN,
+        edgefirst_gl::gl::BLUE,
+    ];
     unsafe {
-        gls::gl::UseProgram(program);
-        gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::Uniform1i(tex_loc, 0);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::UseProgram(program);
+        edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::Uniform1i(tex_loc, 0);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
 
         for (i, &swizzle) in swizzles.iter().enumerate() {
-            gls::gl::Viewport(0, (i as i32) * (src_h as i32), src_w as i32, src_h as i32);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::Viewport(0, (i as i32) * (src_h as i32), src_w as i32, src_h as i32);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                 swizzle as i32,
             );
-            gls::gl::BindVertexArray(vao);
-            gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+            edgefirst_gl::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLES,
+                6,
+                edgefirst_gl::gl::UNSIGNED_INT,
+                null(),
+            );
         }
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
 
         // Reset swizzle
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_SWIZZLE_R,
-            gls::gl::RED as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::RED as i32,
         );
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -856,7 +873,7 @@ fn verify_planar_rgba8_1pass(
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -868,7 +885,7 @@ fn verify_planar_rgba8_1pass(
         None => {
             println!("  {name:40} SKIP (RGBA EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -879,14 +896,14 @@ fn verify_planar_rgba8_1pass(
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     unsafe {
-        gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+        edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -898,7 +915,7 @@ fn verify_planar_rgba8_1pass(
         );
         draw_and_finish(vao);
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -962,7 +979,7 @@ fn verify_planar_rgba8_3pass(
         Err(e) => {
             println!("  {name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -974,7 +991,7 @@ fn verify_planar_rgba8_3pass(
         None => {
             println!("  {name:40} SKIP (RGBA EGLImage {dst_w}x{dst_h} failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -985,47 +1002,56 @@ fn verify_planar_rgba8_3pass(
         println!("  {name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     // 3-pass: one draw call per channel with TEXTURE_SWIZZLE_R
-    let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
+    let swizzles = [
+        edgefirst_gl::gl::RED,
+        edgefirst_gl::gl::GREEN,
+        edgefirst_gl::gl::BLUE,
+    ];
     unsafe {
-        gls::gl::UseProgram(program);
-        gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::Uniform1i(tex_loc, 0);
+        edgefirst_gl::gl::UseProgram(program);
+        edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::Uniform1i(tex_loc, 0);
         if sw_loc >= 0 {
-            gls::gl::Uniform1f(sw_loc, src_w as f32);
+            edgefirst_gl::gl::Uniform1f(sw_loc, src_w as f32);
         }
         if sh_loc >= 0 {
-            gls::gl::Uniform1f(sh_loc, src_h as f32);
+            edgefirst_gl::gl::Uniform1f(sh_loc, src_h as f32);
         }
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
 
         for (i, &swizzle) in swizzles.iter().enumerate() {
-            gls::gl::Viewport(0, (i as i32) * (src_h as i32), dst_w as i32, src_h as i32);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::Viewport(0, (i as i32) * (src_h as i32), dst_w as i32, src_h as i32);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                 swizzle as i32,
             );
-            gls::gl::BindVertexArray(vao);
-            gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+            edgefirst_gl::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLES,
+                6,
+                edgefirst_gl::gl::UNSIGNED_INT,
+                null(),
+            );
         }
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
 
         // Reset swizzle
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_SWIZZLE_R,
-            gls::gl::RED as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::RED as i32,
         );
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 
@@ -1195,16 +1221,16 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
 
         // Cleanup source resources
         unsafe {
-            gls::gl::DeleteTextures(1, &src_tex);
+            edgefirst_gl::gl::DeleteTextures(1, &src_tex);
         }
         ctx.destroy_egl_image(src_img)
             .expect("destroy src EGLImage failed");
     }
 
     unsafe {
-        gls::gl::DeleteVertexArrays(1, &vao);
-        gls::gl::DeleteBuffers(1, &vbo);
-        gls::gl::DeleteBuffers(1, &ebo);
+        edgefirst_gl::gl::DeleteVertexArrays(1, &vao);
+        edgefirst_gl::gl::DeleteBuffers(1, &vbo);
+        edgefirst_gl::gl::DeleteBuffers(1, &ebo);
     }
 
     println!();
@@ -1246,7 +1272,7 @@ fn bench_packed_r8(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1258,7 +1284,7 @@ fn bench_packed_r8(
         None => {
             println!("  {bench_name:40} SKIP (R8 EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1270,15 +1296,15 @@ fn bench_packed_r8(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::Viewport(0, 0, out_w as i32, out_h as i32);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::Viewport(0, 0, out_w as i32, out_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -1295,7 +1321,7 @@ fn bench_packed_r8(
 
     unsafe {
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }
@@ -1329,7 +1355,7 @@ fn bench_packed_rgba8(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1341,7 +1367,7 @@ fn bench_packed_rgba8(
         None => {
             println!("  {bench_name:40} SKIP (RGBA EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1352,15 +1378,15 @@ fn bench_packed_rgba8(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::Viewport(0, 0, out_w as i32, out_h as i32);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::Viewport(0, 0, out_w as i32, out_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -1377,7 +1403,7 @@ fn bench_packed_rgba8(
 
     unsafe {
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }
@@ -1417,7 +1443,7 @@ fn bench_planar_r8_1pass(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1429,7 +1455,7 @@ fn bench_planar_r8_1pass(
         None => {
             println!("  {bench_name:40} SKIP (R8 EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1441,15 +1467,15 @@ fn bench_planar_r8_1pass(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::Viewport(0, 0, out_w as i32, out_h as i32);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::Viewport(0, 0, out_w as i32, out_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -1466,7 +1492,7 @@ fn bench_planar_r8_1pass(
 
     unsafe {
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }
@@ -1506,7 +1532,7 @@ fn bench_planar_r8_3pass(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1518,7 +1544,7 @@ fn bench_planar_r8_3pass(
         None => {
             println!("  {bench_name:40} SKIP (R8 EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1530,46 +1556,55 @@ fn bench_planar_r8_3pass(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
-    let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
+    let swizzles = [
+        edgefirst_gl::gl::RED,
+        edgefirst_gl::gl::GREEN,
+        edgefirst_gl::gl::BLUE,
+    ];
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::UseProgram(program);
-        gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::Uniform1i(tex_loc, 0);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::UseProgram(program);
+        edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::Uniform1i(tex_loc, 0);
 
         for (i, &swizzle) in swizzles.iter().enumerate() {
-            gls::gl::Viewport(0, (i as i32) * (dst_h as i32), dst_w as i32, dst_h as i32);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::Viewport(0, (i as i32) * (dst_h as i32), dst_w as i32, dst_h as i32);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                 swizzle as i32,
             );
-            gls::gl::BindVertexArray(vao);
-            gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+            edgefirst_gl::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLES,
+                6,
+                edgefirst_gl::gl::UNSIGNED_INT,
+                null(),
+            );
         }
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
     });
     r.print_summary();
     results.push(r);
 
     // Reset swizzle and cleanup
     unsafe {
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_SWIZZLE_R,
-            gls::gl::RED as i32,
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::RED as i32,
         );
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }
@@ -1604,7 +1639,7 @@ fn bench_planar_rgba8_1pass(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1616,7 +1651,7 @@ fn bench_planar_rgba8_1pass(
         None => {
             println!("  {bench_name:40} SKIP (RGBA EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1627,15 +1662,15 @@ fn bench_planar_rgba8_1pass(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::Viewport(0, 0, out_w as i32, out_h as i32);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::Viewport(0, 0, out_w as i32, out_h as i32);
         bind_program_and_source(
             program,
             tex_loc,
@@ -1652,7 +1687,7 @@ fn bench_planar_rgba8_1pass(
 
     unsafe {
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }
@@ -1687,7 +1722,7 @@ fn bench_planar_rgba8_3pass(
         Err(e) => {
             println!("  {bench_name:40} SKIP (dst DMA alloc failed: {e})");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1699,7 +1734,7 @@ fn bench_planar_rgba8_3pass(
         None => {
             println!("  {bench_name:40} SKIP (RGBA EGLImage failed)");
             unsafe {
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
             }
             return;
         }
@@ -1710,52 +1745,61 @@ fn bench_planar_rgba8_3pass(
         println!("  {bench_name:40} SKIP (FBO incomplete)");
         unsafe {
             cleanup_gl(fbo, &[dst_tex]);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::DeleteProgram(program);
         }
         let _ = ctx.destroy_egl_image(dst_img);
         return;
     }
 
-    let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE];
+    let swizzles = [
+        edgefirst_gl::gl::RED,
+        edgefirst_gl::gl::GREEN,
+        edgefirst_gl::gl::BLUE,
+    ];
 
     let r = run_bench(&bench_name, 10, 200, || unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::UseProgram(program);
-        gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::Uniform1i(tex_loc, 0);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::UseProgram(program);
+        edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::Uniform1i(tex_loc, 0);
         if sw_loc >= 0 {
-            gls::gl::Uniform1f(sw_loc, dst_w as f32);
+            edgefirst_gl::gl::Uniform1f(sw_loc, dst_w as f32);
         }
         if sh_loc >= 0 {
-            gls::gl::Uniform1f(sh_loc, dst_h as f32);
+            edgefirst_gl::gl::Uniform1f(sh_loc, dst_h as f32);
         }
 
         for (i, &swizzle) in swizzles.iter().enumerate() {
-            gls::gl::Viewport(0, (i as i32) * (dst_h as i32), out_w as i32, dst_h as i32);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::Viewport(0, (i as i32) * (dst_h as i32), out_w as i32, dst_h as i32);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                 swizzle as i32,
             );
-            gls::gl::BindVertexArray(vao);
-            gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+            edgefirst_gl::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLES,
+                6,
+                edgefirst_gl::gl::UNSIGNED_INT,
+                null(),
+            );
         }
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
     });
     r.print_summary();
     results.push(r);
 
     // Reset swizzle and cleanup
     unsafe {
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_SWIZZLE_R,
-            gls::gl::RED as i32,
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+            edgefirst_gl::gl::RED as i32,
         );
         cleanup_gl(fbo, &[dst_tex]);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
     let _ = ctx.destroy_egl_image(dst_img);
 }

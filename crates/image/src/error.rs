@@ -129,8 +129,8 @@ impl From<gbm::FrontBufferError> for Error {
 
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
-impl From<gls::Error> for Error {
-    fn from(err: gls::Error) -> Self {
+impl From<edgefirst_gl::Error> for Error {
+    fn from(err: edgefirst_gl::Error) -> Self {
         Error::OpenGl(err.to_string())
     }
 }

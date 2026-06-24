@@ -175,7 +175,7 @@ impl<I> ImportCache<I> {
         if let Some((&evict_id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
             let evicted = self.entries.remove(&evict_id).expect("key just found");
             if let Some(rbo) = evicted.renderbuffer {
-                unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
             }
             return true;
         }
@@ -190,7 +190,7 @@ impl<I> ImportCache<I> {
             let alive = entry.guard.upgrade().is_some();
             if !alive {
                 if let Some(rbo) = entry.renderbuffer {
-                    unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                    unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
                 }
             }
             alive
@@ -207,7 +207,7 @@ impl<I> Drop for ImportCache<I> {
     fn drop(&mut self) {
         for entry in self.entries.values() {
             if let Some(rbo) = entry.renderbuffer {
-                unsafe { gls::gl::DeleteRenderbuffers(1, &rbo) };
+                unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
             }
         }
         log::debug!(

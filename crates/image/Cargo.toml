@@ -28,7 +28,7 @@ enum_dispatch = { workspace = true }
 env_logger = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
-gls = { workspace = true }
+edgefirst-gl = { workspace = true }
 half = { workspace = true }
 jpeg-encoder = { workspace = true }
 kamadak-exif = { workspace = true }

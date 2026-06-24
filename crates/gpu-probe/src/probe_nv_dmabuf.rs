@@ -119,9 +119,9 @@ fn native_chroma_pitch(fmt: PixelFormat, luma_stride: usize) -> usize {
 fn gl_has_extension(name: &str) -> bool {
     unsafe {
         let mut count: i32 = 0;
-        gls::gl::GetIntegerv(gls::gl::NUM_EXTENSIONS, &mut count);
+        edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::NUM_EXTENSIONS, &mut count);
         for i in 0..count {
-            let ptr = gls::gl::GetStringi(gls::gl::EXTENSIONS, i as u32);
+            let ptr = edgefirst_gl::gl::GetStringi(edgefirst_gl::gl::EXTENSIONS, i as u32);
             if ptr.is_null() {
                 continue;
             }
@@ -136,20 +136,20 @@ fn gl_has_extension(name: &str) -> bool {
 
 /// Drain and return the first pending GL error as a readable string, if any.
 fn gl_error(stage: &str) -> Result<(), String> {
-    let err = unsafe { gls::gl::GetError() };
-    if err == gls::gl::NO_ERROR {
+    let err = unsafe { edgefirst_gl::gl::GetError() };
+    if err == edgefirst_gl::gl::NO_ERROR {
         return Ok(());
     }
     let name = match err {
-        gls::gl::INVALID_ENUM => "GL_INVALID_ENUM",
-        gls::gl::INVALID_VALUE => "GL_INVALID_VALUE",
-        gls::gl::INVALID_OPERATION => "GL_INVALID_OPERATION",
-        gls::gl::INVALID_FRAMEBUFFER_OPERATION => "GL_INVALID_FRAMEBUFFER_OPERATION",
-        gls::gl::OUT_OF_MEMORY => "GL_OUT_OF_MEMORY",
+        edgefirst_gl::gl::INVALID_ENUM => "GL_INVALID_ENUM",
+        edgefirst_gl::gl::INVALID_VALUE => "GL_INVALID_VALUE",
+        edgefirst_gl::gl::INVALID_OPERATION => "GL_INVALID_OPERATION",
+        edgefirst_gl::gl::INVALID_FRAMEBUFFER_OPERATION => "GL_INVALID_FRAMEBUFFER_OPERATION",
+        edgefirst_gl::gl::OUT_OF_MEMORY => "GL_OUT_OF_MEMORY",
         other => return Err(format!("{stage}: GL error 0x{other:04X}")),
     };
     // Clear any further queued errors so they don't leak into the next case.
-    while unsafe { gls::gl::GetError() } != gls::gl::NO_ERROR {}
+    while unsafe { edgefirst_gl::gl::GetError() } != edgefirst_gl::gl::NO_ERROR {}
     Err(format!("{stage}: {name}"))
 }
 
@@ -174,7 +174,7 @@ fn run_case(
     dst_stride: usize,
 ) -> Result<(), String> {
     // Drain any stale error from a previous case.
-    while unsafe { gls::gl::GetError() } != gls::gl::NO_ERROR {}
+    while unsafe { edgefirst_gl::gl::GetError() } != edgefirst_gl::gl::NO_ERROR {}
 
     // --- 1. Source EGLImage (the allocation under test) -------------------
     let (src_img, tex_target, program, tex_loc) = match path {
@@ -194,7 +194,12 @@ fn run_case(
                     false,
                 )
                 .map_err(|e| format!("eglCreateImage(src R8 {stride}x{combined_h}): {e}"))?;
-            (img, gls::gl::TEXTURE_2D, progs.r8, progs.r8_tex_loc)
+            (
+                img,
+                edgefirst_gl::gl::TEXTURE_2D,
+                progs.r8,
+                progs.r8_tex_loc,
+            )
         }
         SrcPath::NativeYuv => {
             let program = progs
@@ -221,7 +226,7 @@ fn run_case(
                 .map_err(|e| format!("eglCreateImage(src {} {w}x{h}): {e}", f.name))?;
             (
                 img,
-                gls::gl::TEXTURE_EXTERNAL_OES,
+                edgefirst_gl::gl::TEXTURE_EXTERNAL_OES,
                 program,
                 progs.external_tex_loc,
             )
@@ -250,90 +255,101 @@ fn run_case(
         unsafe {
             // Source texture.
             let mut src_tex = 0u32;
-            gls::gl::GenTextures(1, &mut src_tex);
-            gls::gl::BindTexture(tex_target, src_tex);
-            gls::gl::EGLImageTargetTexture2DOES(tex_target, src_img.as_ptr());
+            edgefirst_gl::gl::GenTextures(1, &mut src_tex);
+            edgefirst_gl::gl::BindTexture(tex_target, src_tex);
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(tex_target, src_img.as_ptr());
             // R8 texelFetch wants NEAREST + no mips; external wants LINEAR.
             let filter = if path == SrcPath::R8 {
-                gls::gl::NEAREST
+                edgefirst_gl::gl::NEAREST
             } else {
-                gls::gl::LINEAR
+                edgefirst_gl::gl::LINEAR
             } as i32;
-            gls::gl::TexParameteri(tex_target, gls::gl::TEXTURE_MIN_FILTER, filter);
-            gls::gl::TexParameteri(tex_target, gls::gl::TEXTURE_MAG_FILTER, filter);
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::TexParameteri(
                 tex_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
+                edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                filter,
             );
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::TexParameteri(
                 tex_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
+                edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                filter,
+            );
+            edgefirst_gl::gl::TexParameteri(
+                tex_target,
+                edgefirst_gl::gl::TEXTURE_WRAP_S,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
+            );
+            edgefirst_gl::gl::TexParameteri(
+                tex_target,
+                edgefirst_gl::gl::TEXTURE_WRAP_T,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
             gl_error("bind src texture")?;
 
             // Destination texture + FBO.
             let mut dst_tex = 0u32;
-            gls::gl::GenTextures(1, &mut dst_tex);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, dst_tex);
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dst_img.as_ptr());
+            edgefirst_gl::gl::GenTextures(1, &mut dst_tex);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, dst_tex);
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                dst_img.as_ptr(),
+            );
             gl_error("bind dst texture")?;
 
             let mut fbo = 0u32;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 dst_tex,
                 0,
             );
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if status != gls::gl::FRAMEBUFFER_COMPLETE {
-                gls::gl::DeleteFramebuffers(1, &fbo);
-                gls::gl::DeleteTextures(1, &dst_tex);
-                gls::gl::DeleteTextures(1, &src_tex);
+            let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+            if status != edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
+                edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+                edgefirst_gl::gl::DeleteTextures(1, &dst_tex);
+                edgefirst_gl::gl::DeleteTextures(1, &src_tex);
                 return Err(format!("FBO incomplete: status 0x{status:04X}"));
             }
 
             // Draw.
-            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
-            gls::gl::UseProgram(program);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(tex_target, src_tex);
-            gls::gl::Uniform1i(tex_loc, 0);
-            gls::gl::BindVertexArray(progs.vao);
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLES,
+            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+            edgefirst_gl::gl::UseProgram(program);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(tex_target, src_tex);
+            edgefirst_gl::gl::Uniform1i(tex_loc, 0);
+            edgefirst_gl::gl::BindVertexArray(progs.vao);
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLES,
                 6,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 std::ptr::null(),
             );
-            gls::gl::Finish();
+            edgefirst_gl::gl::Finish();
             gl_error("draw")?;
 
             // Read back one pixel — proves the render surface is actually
             // readable, catching write/layout failures EGLImage creation alone
             // would not surface.
             let mut px = [0u8; 4];
-            gls::gl::ReadPixels(
+            edgefirst_gl::gl::ReadPixels(
                 0,
                 0,
                 1,
                 1,
-                gls::gl::RGBA,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 px.as_mut_ptr().cast(),
             );
             let read_err = gl_error("readback");
 
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::BindVertexArray(0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::DeleteTextures(1, &dst_tex);
-            gls::gl::DeleteTextures(1, &src_tex);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::BindVertexArray(0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::DeleteTextures(1, &dst_tex);
+            edgefirst_gl::gl::DeleteTextures(1, &src_tex);
             read_err
         }
     })();
@@ -439,7 +455,7 @@ pub fn run(ctx: &GpuContext) {
         }
     };
     let r8_tex_loc =
-        unsafe { gls::gl::GetUniformLocation(r8, CString::new("tex").unwrap().as_ptr()) };
+        unsafe { edgefirst_gl::gl::GetUniformLocation(r8, CString::new("tex").unwrap().as_ptr()) };
 
     let has_external = gl_has_extension("GL_OES_EGL_image_external_essl3");
     let (external, external_tex_loc) = if has_external {
@@ -447,7 +463,7 @@ pub fn run(ctx: &GpuContext) {
         match compile_program(&vert, &frag) {
             Ok(p) => {
                 let loc = unsafe {
-                    gls::gl::GetUniformLocation(p, CString::new("tex").unwrap().as_ptr())
+                    edgefirst_gl::gl::GetUniformLocation(p, CString::new("tex").unwrap().as_ptr())
                 };
                 (Some(p), loc)
             }
@@ -604,11 +620,11 @@ pub fn run(ctx: &GpuContext) {
 
     // Cleanup shared programs / VAO.
     unsafe {
-        gls::gl::DeleteProgram(progs.r8);
+        edgefirst_gl::gl::DeleteProgram(progs.r8);
         if let Some(p) = progs.external {
-            gls::gl::DeleteProgram(p);
+            edgefirst_gl::gl::DeleteProgram(p);
         }
-        gls::gl::DeleteVertexArrays(1, &progs.vao);
+        edgefirst_gl::gl::DeleteVertexArrays(1, &progs.vao);
     }
 }
 
@@ -658,7 +674,7 @@ fn probe_odd_destination(ctx: &GpuContext) {
 /// (`to_egl_attribs`) sets it; a plain render target does not. This isolates
 /// whether IMAGE_PRESERVED is what makes Mali reject odd-dimension dst imports.
 fn run_odd_dst_case(ctx: &GpuContext, w: usize, h: usize, preserved: bool) -> Result<(), String> {
-    while unsafe { gls::gl::GetError() } != gls::gl::NO_ERROR {}
+    while unsafe { edgefirst_gl::gl::GetError() } != edgefirst_gl::gl::NO_ERROR {}
 
     let stride = (w * 4).next_multiple_of(64);
     let dst =
@@ -690,49 +706,52 @@ fn run_odd_dst_case(ctx: &GpuContext, w: usize, h: usize, preserved: bool) -> Re
     let result = (|| -> Result<(), String> {
         unsafe {
             let mut tex = 0u32;
-            gls::gl::GenTextures(1, &mut tex);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-            gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, img.as_ptr());
+            edgefirst_gl::gl::GenTextures(1, &mut tex);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                img.as_ptr(),
+            );
             gl_error("bind dst texture")?;
 
             let mut fbo = 0u32;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 tex,
                 0,
             );
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            if status != gls::gl::FRAMEBUFFER_COMPLETE {
-                gls::gl::DeleteFramebuffers(1, &fbo);
-                gls::gl::DeleteTextures(1, &tex);
+            let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+            if status != edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
+                edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+                edgefirst_gl::gl::DeleteTextures(1, &tex);
                 return Err(format!("FBO incomplete: status 0x{status:04X}"));
             }
 
-            gls::gl::Viewport(0, 0, w as i32, h as i32);
-            gls::gl::ClearColor(0.2, 0.4, 0.6, 1.0);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
+            edgefirst_gl::gl::Viewport(0, 0, w as i32, h as i32);
+            edgefirst_gl::gl::ClearColor(0.2, 0.4, 0.6, 1.0);
+            edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+            edgefirst_gl::gl::Finish();
             gl_error("clear")?;
 
             let mut px = [0u8; 4];
-            gls::gl::ReadPixels(
+            edgefirst_gl::gl::ReadPixels(
                 0,
                 0,
                 1,
                 1,
-                gls::gl::RGBA,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 px.as_mut_ptr().cast(),
             );
             let read_err = gl_error("readback");
 
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::DeleteTextures(1, &tex);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::DeleteTextures(1, &tex);
             read_err
         }
     })();

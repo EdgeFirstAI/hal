@@ -52,7 +52,8 @@ drm-fourcc = "2.2.0"
 g2d-sys = "1.2.0"
 
 gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }
-gls = "0.1.6"
+# Vendored trimmed fork of the abandoned `gls`; imported as `edgefirst_gl`.
+edgefirst-gl = { version = "0.25.2", path = "crates/gl" }
 half = { version = "2.7.1", features = ["num-traits"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 image-compare = "0.5.0"

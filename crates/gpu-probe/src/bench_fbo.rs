@@ -17,10 +17,10 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     {
         let r = run_bench("fbo_create_bind_delete", 10, 1000, || unsafe {
             let mut fbo: u32 = 0;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
         });
         r.print_summary();
         results.push(r);
@@ -30,18 +30,18 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     {
         let mut fbo: u32 = 0;
         unsafe {
-            gls::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
         }
 
         let r = run_bench("fbo_bind_unbind_reuse", 10, 1000, || unsafe {
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
         });
         r.print_summary();
         results.push(r);
 
         unsafe {
-            gls::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
         }
     }
 
@@ -49,39 +49,39 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     {
         let r = run_bench("fbo_full_cycle_render", 10, 500, || unsafe {
             let mut tex: u32 = 0;
-            gls::gl::GenTextures(1, &mut tex);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::GenTextures(1, &mut tex);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+            edgefirst_gl::gl::TexImage2D(
+                edgefirst_gl::gl::TEXTURE_2D,
                 0,
-                gls::gl::RGBA as i32,
+                edgefirst_gl::gl::RGBA as i32,
                 640,
                 640,
                 0,
-                gls::gl::RGBA,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
 
             let mut fbo: u32 = 0;
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 tex,
                 0,
             );
 
-            gls::gl::Viewport(0, 0, 640, 640);
-            gls::gl::ClearColor(0.0, 0.0, 0.0, 1.0);
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-            gls::gl::Finish();
+            edgefirst_gl::gl::Viewport(0, 0, 640, 640);
+            edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 1.0);
+            edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+            edgefirst_gl::gl::Finish();
 
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::DeleteTextures(1, &tex);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::DeleteTextures(1, &tex);
         });
         r.print_summary();
         results.push(r);

@@ -69,7 +69,7 @@ impl GlPlatform for LinuxEgl {
     fn load_gl_once(display: &GlContext) {
         static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         GL_LOADED.get_or_init(|| {
-            gls::load_with(|s| {
+            edgefirst_gl::load_with(|s| {
                 display
                     .egl
                     .get_proc_address(s)
@@ -83,7 +83,7 @@ impl GlPlatform for LinuxEgl {
     }
 
     unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
-        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, handle.as_ptr());
+        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, handle.as_ptr());
         Ok(())
     }
 
@@ -91,7 +91,10 @@ impl GlPlatform for LinuxEgl {
         _display: &GlContext,
         handle: egl::Image,
     ) -> crate::Result<()> {
-        gls::egl_image_target_texture_2d_oes(gls::gl::TEXTURE_EXTERNAL_OES, handle.as_ptr());
+        edgefirst_gl::egl_image_target_texture_2d_oes(
+            edgefirst_gl::gl::TEXTURE_EXTERNAL_OES,
+            handle.as_ptr(),
+        );
         Ok(())
     }
 
@@ -99,7 +102,10 @@ impl GlPlatform for LinuxEgl {
         _display: &GlContext,
         handle: egl::Image,
     ) -> crate::Result<()> {
-        gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, handle.as_ptr());
+        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+            edgefirst_gl::gl::RENDERBUFFER,
+            handle.as_ptr(),
+        );
         Ok(())
     }
 
