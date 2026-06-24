@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## edgefirst-egl fork
+`edgefirst-egl` is a maintained fork of `khronos-egl` 6.0.0, vendored for the
+EdgeFirst HAL. Relative to upstream 6.0.0:
+- Ported to `libloading` 0.9.
+- Removed the static-linking path: the `static` and `no-pkg-config` features,
+  the `pkg-config` build dependency, the `Static`/`API` types, and `build.rs`.
+  Only runtime (dynamic) loading is supported.
+- Trimmed the documentation/examples accordingly.
+
+The upstream history below is retained for provenance.
+
 ## [6.0.0]
 ### Changed
 - `copy_buffers` is now unsafe.

@@ -1,89 +1,19 @@
-//! This crate provides a binding for the Khronos EGL 1.5 API.
-//! It was originally a fork of the [egl](https://crates.io/crates/egl) crate,
-//! which is left unmaintained.
+//! This crate provides a binding for the Khronos EGL 1.4/1.5 API.
+//!
+//! It is a trimmed, maintained fork of the [`khronos-egl`](https://crates.io/crates/khronos-egl)
+//! crate (itself a fork of the unmaintained `egl` crate), kept current for the
+//! EdgeFirst HAL. Only runtime (dynamic) loading of `libEGL` is supported; the
+//! upstream static-linking path has been removed.
 //!
 //! ## Usage
 //!
-//! You can access the EGL API using an [`Instance`]
-//! object defined by either statically linking with `libEGL.so.1` at compile time,
-//! or dynamically loading the EGL library at runtime.
+//! Enable the `dynamic` feature and load the EGL API at runtime via
+//! [`libloading`](https://crates.io/crates/libloading) into an
+//! `Instance<Dynamic<libloading::Library>>`:
 //!
-//! ### Static linking
-//!
-//! You must enable static linking using the `static` feature in your `Cargo.toml`:
-//! ```toml
-//! edgefirst-egl = { version = ..., features = ["static"] }
-//! ```
-//!
-//! This will add a dependency to the [`pkg-config`](https://crates.io/crates/pkg-config) crate,
-//! necessary to find the EGL library at compile time.
-//! Here is a simple example showing how to use this library to create an EGL context when static linking is enabled.
-//!
-//! ```rust
-//! extern crate edgefirst_egl as egl;
-//!
-//! fn main() -> Result<(), egl::Error> {
-//!   // Create an EGL API instance.
-//!   // The `egl::Static` API implementation is only available when the `static` feature is enabled.
-//!   let egl = egl::Instance::new(egl::Static);
-//!
-//!   let wayland_display = wayland_client::Display::connect_to_env().expect("unable to connect to the wayland server");
-//!   let display = unsafe { egl.get_display(wayland_display.get_display_ptr() as *mut std::ffi::c_void) }.unwrap();
-//!   egl.initialize(display)?;
-//!
-//!   let attributes = [
-//!     egl::RED_SIZE, 8,
-//!     egl::GREEN_SIZE, 8,
-//!     egl::BLUE_SIZE, 8,
-//!     egl::NONE
-//!   ];
-//!
-//!   let config = egl.choose_first_config(display, &attributes)?.expect("unable to find an appropriate ELG configuration");
-//!
-//!   let context_attributes = [
-//!     egl::CONTEXT_MAJOR_VERSION, 4,
-//!     egl::CONTEXT_MINOR_VERSION, 0,
-//!     egl::CONTEXT_OPENGL_PROFILE_MASK, egl::CONTEXT_OPENGL_CORE_PROFILE_BIT,
-//!     egl::NONE
-//!   ];
-//!
-//!   egl.create_context(display, config, None, &context_attributes);
-//!
-//!   Ok(())
-//! }
-//! ```
-//!
-//! The creation of a `Display` instance is not detailed here since it depends on your display server.
-//! It is created using the `get_display` function with a pointer to the display server connection handle.
-//! For instance, if you are using the [wayland-client](https://crates.io/crates/wayland-client) crate,
-//! you can get this pointer using the `Display::get_display_ptr` method.
-//!
-//! #### Static API Instance
-//!
-//! It may be bothering in some applications to pass the `Instance` to every fonction that needs to call the EGL API.
-//! One workaround would be to define a static `Instance`,
-//! which should be possible to define at compile time using static linking.
-//! However this is not yet supported by the stable `rustc` compiler.
-//! With the nightly compiler,
-//! you can combine the `nightly` and `static` features so that this crate
-//! can provide a static `Instance`, called `API` that can then be accessed everywhere.
-//!
-//! ```
-//! # extern crate edgefirst_egl as egl;
-//! use egl::API as egl;
-//! ```
-//!
-//! ### Dynamic Linking
-//!
-//! Dynamic linking allows your application to accept multiple versions of EGL and be more flexible.
-//! You must enable dynamic linking using the `dynamic` feature in your `Cargo.toml`:
 //! ```toml
 //! edgefirst-egl = { version = ..., features = ["dynamic"] }
 //! ```
-//!
-//! This will add a dependency to the [`libloading`](https://crates.io/crates/libloading) crate,
-//! necessary to find the EGL library at runtime.
-//! You can then load the EGL API into a `Instance<Dynamic<libloading::Library>>` as follows:
 //!
 //! ```
 //! # extern crate edgefirst_egl as egl;
@@ -91,9 +21,9 @@
 //! let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.expect("unable to load libEGL.so.1");
 //! ```
 //!
-//! Here, `egl::EGL1_4` is used to specify what is the minimum required version of EGL that must be provided by `libEGL.so.1`.
-//! This will return a `DynamicInstance<egl::EGL1_4>`, however in that case where `libEGL.so.1` provides a more recent version of EGL,
-//! you can still upcast ths instance to provide version specific features:
+//! `egl::EGL1_4` specifies the minimum required EGL version. When `libEGL.so.1`
+//! provides a newer version you can upcast for version-specific features:
+//!
 //! ```
 //! # extern crate edgefirst_egl as egl;
 //! # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.expect("unable to find libEGL.so.1");
@@ -106,21 +36,6 @@
 //!     // do something with EGL 1.4 instead.
 //!   }
 //! };
-//! ```
-//!
-//! ## Troubleshooting
-//!
-//! ### Static Linking with OpenGL ES
-//!
-//! When using OpenGL ES with `khronos-egl` with the `static` feature,
-//! it is necessary to place a dummy extern at the top of your application which links libEGL first, then GLESv1/2.
-//! This is because libEGL provides symbols required by GLESv1/2.
-//! Here's how to work around this:
-//!
-//! ```
-//! ##[link(name = "EGL")]
-//! ##[link(name = "GLESv2")]
-//! extern {}
 //! ```
 #![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
@@ -601,11 +516,10 @@ mod egl1_0 {
         ///
         /// ```
         /// # extern crate edgefirst_egl as egl;
-        /// # extern crate wayland_client;
         /// # fn main() -> Result<(), egl::Error> {
-        /// # let egl = egl::Instance::new(egl::Static);
-        /// # let wayland_display = wayland_client::Display::connect_to_env().expect("unable to connect to the wayland server");
-        /// # let display = unsafe { egl.get_display(wayland_display.get_display_ptr() as *mut std::ffi::c_void) }.unwrap();
+        /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
+        /// # let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.unwrap();
+        /// # let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.unwrap();
         /// # egl.initialize(display)?;
         /// # let attrib_list = [egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::NONE];
         /// // Get the number of matching configurations.
@@ -662,11 +576,10 @@ mod egl1_0 {
         /// size 1, which is equivalent to:
         /// ```
         /// # extern crate edgefirst_egl as egl;
-        /// # extern crate wayland_client;
         /// # fn main() -> Result<(), egl::Error> {
-        /// # let egl = egl::Instance::new(egl::Static);
-        /// # let wayland_display = wayland_client::Display::connect_to_env().expect("unable to connect to the wayland server");
-        /// # let display = unsafe { egl.get_display(wayland_display.get_display_ptr() as *mut std::ffi::c_void) }.unwrap();
+        /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
+        /// # let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.unwrap();
+        /// # let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.unwrap();
         /// # egl.initialize(display)?;
         /// # let attrib_list = [egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::NONE];
         /// let mut configs = Vec::with_capacity(1);
@@ -894,11 +807,10 @@ mod egl1_0 {
         /// ## Example
         /// ```
         /// # extern crate edgefirst_egl as egl;
-        /// # extern crate wayland_client;
         /// # fn main() -> Result<(), egl::Error> {
-        /// # let egl = egl::Instance::new(egl::Static);
-        /// # let wayland_display = wayland_client::Display::connect_to_env().expect("unable to connect to the wayland server");
-        /// # let display = unsafe { egl.get_display(wayland_display.get_display_ptr() as *mut std::ffi::c_void) }.unwrap();
+        /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
+        /// # let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.unwrap();
+        /// # let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.unwrap();
         /// # egl.initialize(display)?;
         /// let mut configs = Vec::with_capacity(egl.get_config_count(display)?);
         /// egl.get_configs(display, &mut configs);
@@ -931,11 +843,10 @@ mod egl1_0 {
         /// ## Example
         /// ```
         /// # extern crate edgefirst_egl as egl;
-        /// # extern crate wayland_client;
         /// # fn main() -> Result<(), egl::Error> {
-        /// # let egl = egl::Instance::new(egl::Static);
-        /// # let wayland_display = wayland_client::Display::connect_to_env().expect("unable to connect to the wayland server");
-        /// # let display = unsafe { egl.get_display(wayland_display.get_display_ptr() as *mut std::ffi::c_void) }.unwrap();
+        /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
+        /// # let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.unwrap();
+        /// # let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.unwrap();
         /// # egl.initialize(display)?;
         /// let mut configs = Vec::with_capacity(egl.get_config_count(display)?);
         /// egl.get_configs(display, &mut configs);
@@ -1913,44 +1824,6 @@ macro_rules! api {
 			api!(@api_traits () () $($id : $version { $(fn $name ($($arg : $atype ),* ) -> $rtype ;)* })*);
 		}
 
-		#[cfg(feature="static")]
-		mod ffi {
-			use libc::{c_char, c_void};
-
-			use super::{
-				Attrib, Boolean, EGLClientBuffer, EGLConfig, EGLContext, EGLDisplay, EGLImage, EGLSurface,
-				EGLSync, Enum, Int, NativeDisplayType, NativePixmapType, NativeWindowType, Time,
-			};
-
-			$(
-				extern "system" {
-					$(
-						#[cfg(feature=$version)]
-						pub fn $name ($($arg : $atype ),* ) -> $rtype ;
-					)*
-				}
-			)*
-		}
-
-		#[cfg(feature="static")]
-		/// Static EGL API interface.
-		///
-		/// This type is only available when the `static` feature is enabled,
-		/// by statically linking the EGL library at compile time.
-		#[derive(Copy, Clone, Debug)]
-		pub struct Static;
-
-		#[cfg(feature="static")]
-		impl Api for Static {
-			#[inline(always)]
-			fn version(&self) -> Version {
-				LATEST
-			}
-		}
-
-		#[cfg(feature="static")]
-		pub static API: Instance<Static> = Instance::new(Static);
-
 		#[cfg(feature="dynamic")]
 		extern crate libloading;
 
@@ -2184,9 +2057,7 @@ macro_rules! api {
 		///
 		/// An implementation of this trait can be used to create an [`Instance`].
 		///
-		/// This crate provides two implementation of this trait:
-		///  - [`Static`] which is available with the `static` feature enabled,
-		///    defined by statically linking to the EGL library at compile time.
+		/// This crate provides one implementation of this trait:
 		///  - [`Dynamic`] which is available with the `dynamic` feature enabled,
 		///    defined by dynamically linking to the EGL library at runtime.
 		///    In this case, you may prefer to directly use the `DynamicInstance` type.
@@ -2280,17 +2151,6 @@ macro_rules! api {
 		}
 	};
 	(@api_type ( $($pred:ident : $p_version:literal { $(fn $p_name:ident ($($p_arg:ident : $p_atype:ty ),* ) -> $p_rtype:ty ;)* })* ) $id:ident : $version:literal { $(fn $name:ident ($($arg:ident : $atype:ty ),* ) -> $rtype:ty ;)* }) => {
-		#[cfg(feature="static")]
-		#[cfg(feature=$version)]
-		unsafe impl api::$id for Static {
-			$(
-				#[inline(always)]
-				unsafe fn $name(&self, $($arg : $atype),*) -> $rtype {
-					ffi::$name($($arg),*)
-				}
-			)*
-		}
-
 		#[cfg(feature="dynamic")]
 		#[cfg(feature=$version)]
 		/// EGL version type.

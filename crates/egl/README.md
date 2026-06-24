@@ -7,7 +7,10 @@ This crate is a maintained fork of [`khronos-egl`](https://github.com/timothee-h
 vendored into the EdgeFirst HAL so we can keep its dependencies current —
 notably tracking `libloading` 0.9+ — and is published as `edgefirst-egl`.
 
-The public API is unchanged from upstream; the library is imported as
+Relative to upstream it tracks `libloading` 0.9 and drops the static-linking
+path (the `static`/`no-pkg-config` features, the `pkg-config` build dependency,
+and the `Static`/`API` types); only runtime (dynamic) loading is supported. The
+dynamic-loading API is otherwise unchanged. The library is imported as
 `edgefirst_egl`:
 
 ```rust

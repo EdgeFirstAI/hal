@@ -16,16 +16,6 @@ impl Error {
         Self(unsafe { GetError() })
     }
 
-    /// Return true if error raised.
-    pub fn is_error(self) -> bool {
-        self.0 != NO_ERROR
-    }
-
-    /// Return true if no error.
-    pub fn is_okay(self) -> bool {
-        self.0 == NO_ERROR
-    }
-
     /// Return human readable text of the error code.
     pub fn to_str(self) -> &'static str {
         match self.0 {
