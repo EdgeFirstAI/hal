@@ -51,9 +51,9 @@ four-char-code = "2.3.0"
 # Portable (platform-neutral) DRM FourCC enum — the same type `gbm` re-exports,
 # used directly so shader/format code need not pull in `gbm` (Linux-only).
 drm-fourcc = "2.2.0"
-g2d-sys = "1.2.0"
+g2d-sys = "1.3.1"
 
-gbm = { package = "edgefirst-gbm", version = "0.18.2", default-features = false, features = ["dynamic", "drm-support"] }
+gbm = { package = "edgefirst-gbm", version = "0.19.0", default-features = false, features = ["dynamic", "drm-support"] }
 half = { version = "2.7.1", features = ["num-traits"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 image-compare = "0.5.0"
@@ -63,10 +63,8 @@ lapjv = "0.3.0"
 libc = "0.2.186"
 # Shared with the `edgefirst-egl` fork's `Dynamic` EGL instance; both must use
 # the same libloading version so the `Borrow<Library>` bound holds across the
-# crate boundary. The fork tracks 0.9, so we do too. NOTE: libloading 0.8 still
-# appears transitively via `g2d-sys` and `edgefirst-gbm-sys` (they bundle their
-# own handles, so the bound is unaffected); fully collapsing the tree to one
-# libloading needs those crates bumped to 0.9 upstream.
+# crate boundary. The whole tree is unified on 0.9 (g2d-sys >=1.3 and
+# edgefirst-gbm >=0.19 dropped their old 0.8 transitive copies).
 libloading = "0.9"
 log = "0.4.33"
 nalgebra = "0.35.0"
