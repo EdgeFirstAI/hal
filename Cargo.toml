@@ -28,6 +28,9 @@ errno = "0.3"
 argminmax = { version = "0.6.3", default-features = false }
 ctor = "1.0.7"
 dma-heap = "0.4.1"
+# fast-math removed: upstream abandoned (last release 2019). Its single use
+# (an approximate sigmoid in the decoder) now uses std `f32::exp`, which the
+# rest of the decoder already relies on — see crates/decoder/src/modelpack.rs.
 # Internal crates
 edgefirst-bench = { path = "crates/bench" }
 edgefirst-codec = { version = "0.25.2", path = "crates/codec" }
@@ -38,7 +41,6 @@ edgefirst-tensor = { version = "0.25.2", path = "crates/tensor" }
 edgefirst-tracker = { version = "0.25.2", path = "crates/tracker" }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.10"
-fast-math = "0.1.1"
 fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 # Portable (platform-neutral) DRM FourCC enum — the same type `gbm` re-exports,
@@ -79,7 +81,9 @@ rayon = "1.12.0"
 rustc_version = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
-serde_yaml = "0.9.34"
+# serde_yaml (dtolnay) is archived & deprecated; serde_yaml_ng is the
+# API-identical maintained continuation. Aliased to keep `serde_yaml::` paths.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10.0" }
 tokio = { version = "1.52.3", features = ["rt", "sync"] }
 tracing = "0.1"
 tracing-chrome = "0.7"
