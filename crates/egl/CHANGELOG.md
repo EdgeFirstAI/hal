@@ -42,11 +42,11 @@ The upstream history below is retained for provenance.
 ### Changed
 - Upgrade dependency `libloading`: ^0.6 -> ^0.7.
 ### Removed
-- `nightly` feature hich is no longer needed since `const_fn` is stabilized.
+- `nightly` feature which is no longer needed since `const_fn` is stabilized.
 
 ## [3.0.2]
 ### Changed
-- One Linux, use the `RTLD_NODELETE` when loading the EGL library in `load_required_from_filename` and `load_from_filename`.
+- On Linux, use the `RTLD_NODELETE` when loading the EGL library in `load_required_from_filename` and `load_from_filename`.
 
 ## [3.0.1]
 ### Changed

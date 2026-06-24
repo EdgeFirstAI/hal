@@ -15,7 +15,7 @@
 //! edgefirst-egl = { version = ..., features = ["dynamic"] }
 //! ```
 //!
-//! ```
+//! ```no_run
 //! # extern crate edgefirst_egl as egl;
 //! let lib = unsafe { libloading::Library::new("libEGL.so.1") }.expect("unable to find libEGL.so.1");
 //! let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.expect("unable to load libEGL.so.1");
@@ -24,7 +24,7 @@
 //! `egl::EGL1_4` specifies the minimum required EGL version. When `libEGL.so.1`
 //! provides a newer version you can upcast for version-specific features:
 //!
-//! ```
+//! ```no_run
 //! # extern crate edgefirst_egl as egl;
 //! # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.expect("unable to find libEGL.so.1");
 //! # let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required_from(lib) }.expect("unable to load libEGL.so.1");
@@ -514,7 +514,7 @@ mod egl1_0 {
         ///
         /// ## Example
         ///
-        /// ```
+        /// ```no_run
         /// # extern crate edgefirst_egl as egl;
         /// # fn main() -> Result<(), egl::Error> {
         /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
@@ -574,7 +574,7 @@ mod egl1_0 {
         ///
         /// This is an helper function that will call `choose_config` with a buffer of
         /// size 1, which is equivalent to:
-        /// ```
+        /// ```no_run
         /// # extern crate edgefirst_egl as egl;
         /// # fn main() -> Result<(), egl::Error> {
         /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
@@ -805,7 +805,7 @@ mod egl1_0 {
         /// You can use it to setup the correct capacity for the configurations buffer in [`get_configs`](Self::get_configs).
         ///
         /// ## Example
-        /// ```
+        /// ```no_run
         /// # extern crate edgefirst_egl as egl;
         /// # fn main() -> Result<(), egl::Error> {
         /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();
@@ -841,7 +841,7 @@ mod egl1_0 {
         /// and setup the buffer's capacity accordingly.
         ///
         /// ## Example
-        /// ```
+        /// ```no_run
         /// # extern crate edgefirst_egl as egl;
         /// # fn main() -> Result<(), egl::Error> {
         /// # let lib = unsafe { libloading::Library::new("libEGL.so.1") }.unwrap();

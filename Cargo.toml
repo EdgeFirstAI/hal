@@ -29,8 +29,8 @@ argminmax = { version = "0.6.3", default-features = false }
 ctor = "1.0.7"
 dma-heap = "0.4.1"
 # fast-math removed: upstream abandoned (last release 2019). Its single use
-# (an approximate sigmoid in the decoder) now uses std `f32::exp`, which the
-# rest of the decoder already relies on — see crates/decoder/src/modelpack.rs.
+# (an approximate sigmoid in the decoder) now calls a bit-identical `exp_raw`
+# vendored from fast-math, preserving outputs — see crates/decoder/src/modelpack.rs.
 # Internal crates
 edgefirst-bench = { path = "crates/bench" }
 edgefirst-codec = { version = "0.25.2", path = "crates/codec" }
