@@ -1921,8 +1921,7 @@ fn yolo26n_seg_per_scale_decode_with_masks_succeeds() {
 /// Helper: build an argmax or multi-label decoder from the 2×2 NHWC schema.
 fn build_2x2_decoder(multi_label: bool) -> edgefirst_decoder::Decoder {
     use edgefirst_decoder::per_scale::DecodeDtype;
-    let schema: SchemaV2 =
-        serde_json::from_str(minimal_ltrb_schema_one_level_2x2_nhwc()).unwrap();
+    let schema: SchemaV2 = serde_json::from_str(minimal_ltrb_schema_one_level_2x2_nhwc()).unwrap();
     DecoderBuilder::default()
         .with_schema(schema)
         .with_decode_dtype(DecodeDtype::F32)
@@ -1951,9 +1950,9 @@ fn make_multi_label_score_tensor() -> TensorDyn {
     // NHWC [1, 2, 2, 2]: row-major over h×w, then NC per cell
     let data: Vec<i8> = vec![
         50, 40, // anchor (0,0): class0 high, class1 also high
-        30, 0,  // anchor (0,1): class0 above threshold, class1 at 0.5
-        0, 0,   // anchor (1,0): both at 0.5
-        0, 0,   // anchor (1,1): both at 0.5
+        30, 0, // anchor (0,1): class0 above threshold, class1 at 0.5
+        0, 0, // anchor (1,0): both at 0.5
+        0, 0, // anchor (1,1): both at 0.5
     ];
     let mut t = Tensor::<i8>::new(&[1, 2, 2, 2], Some(TensorMemory::Mem), None).unwrap();
     t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
@@ -2141,8 +2140,7 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
     let score_t = {
         // Only anchor 0 class 1 wins with score 0.99
         let data: Vec<i8> = vec![0, 50, 0, 0, 0, 0, 0, 0];
-        let mut t =
-            Tensor::<i8>::new(&[1, 2, 2, 2], Some(TensorMemory::Mem), None).unwrap();
+        let mut t = Tensor::<i8>::new(&[1, 2, 2, 2], Some(TensorMemory::Mem), None).unwrap();
         t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
         {
             let mut m = t.map().unwrap();
@@ -2193,7 +2191,9 @@ fn argmax_regression_bit_identical_with_and_without_flag() {
 /// synthetic_yolov8n_schema.json fixture convention.
 fn minimal_dfl_schema_per_channel() -> String {
     // Build the 16-element scale array: [0.01, 0.02, ..., 0.16]
-    let scales: Vec<String> = (1..=16).map(|i| format!("{:.2}", i as f32 * 0.01)).collect();
+    let scales: Vec<String> = (1..=16)
+        .map(|i| format!("{:.2}", i as f32 * 0.01))
+        .collect();
     let scales_json = scales.join(",");
     format!(
         r#"{{
@@ -2312,8 +2312,7 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         .expect("build per-channel decoder");
 
     // Build box tensor with per-channel quantization attached.
-    let mut box_t_pc =
-        Tensor::<i8>::new(&[1, 1, 1, 16], Some(TensorMemory::Mem), None).unwrap();
+    let mut box_t_pc = Tensor::<i8>::new(&[1, 1, 1, 16], Some(TensorMemory::Mem), None).unwrap();
     {
         // Attach per-channel quantization: 16 distinct scales, zp=0 for all.
         let zps: Vec<i32> = vec![0i32; 16];
@@ -2323,8 +2322,7 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         let mut m = box_t_pc.map().unwrap();
         m.as_mut_slice().copy_from_slice(&input_data);
     }
-    let mut score_t =
-        Tensor::<i8>::new(&[1, 1, 1, 1], Some(TensorMemory::Mem), None).unwrap();
+    let mut score_t = Tensor::<i8>::new(&[1, 1, 1, 1], Some(TensorMemory::Mem), None).unwrap();
     score_t.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
     {
         let mut m = score_t.map().unwrap();
@@ -2380,18 +2378,14 @@ fn dfl_per_channel_dequant_matches_golden_and_per_tensor_diverges() {
         .expect("build per-tensor decoder");
 
     // Same box tensor but with per-tensor quantization (scale=0.01, the first element).
-    let mut box_t_pt =
-        Tensor::<i8>::new(&[1, 1, 1, 16], Some(TensorMemory::Mem), None).unwrap();
-    box_t_pt
-        .set_quantization(TQ::per_tensor(0.01, 0))
-        .unwrap();
+    let mut box_t_pt = Tensor::<i8>::new(&[1, 1, 1, 16], Some(TensorMemory::Mem), None).unwrap();
+    box_t_pt.set_quantization(TQ::per_tensor(0.01, 0)).unwrap();
     {
         let mut m = box_t_pt.map().unwrap();
         m.as_mut_slice().copy_from_slice(&input_data);
     }
     // Build a fresh score tensor for the per-tensor run (score_t was moved above).
-    let mut score_t2 =
-        Tensor::<i8>::new(&[1, 1, 1, 1], Some(TensorMemory::Mem), None).unwrap();
+    let mut score_t2 = Tensor::<i8>::new(&[1, 1, 1, 1], Some(TensorMemory::Mem), None).unwrap();
     score_t2.set_quantization(TQ::per_tensor(0.1, 0)).unwrap();
     {
         let mut m = score_t2.map().unwrap();
@@ -2467,11 +2461,7 @@ fn dfl_per_tensor_path_uses_scalar_fast_path() {
         .expect("decode");
 
     // Exactly one detection, centered at (0.5, 0.5) normalized (same as baseline test).
-    assert_eq!(
-        output_boxes.len(),
-        1,
-        "expected 1 detection"
-    );
+    assert_eq!(output_boxes.len(), 1, "expected 1 detection");
     let det = &output_boxes[0];
     assert!(
         (det.bbox.xmin - 0.5).abs() < 1e-3,

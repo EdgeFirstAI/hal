@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-06-24
+
+### Changed
+
+- **Dependency hygiene: abandoned crates vendored or replaced, dependency tree
+  unified.** No behavioral change — decoder outputs are bit-identical and the
+  GPU paths are unchanged; this release only refreshes and tidies what the
+  workspace carries and statically analyses.
+  - **`khronos-egl` 6.0.0 → vendored `edgefirst-egl`** (`crates/egl`): the
+    upstream crate is dormant (last release 2023). Vendored as a maintained,
+    dynamic-only fork (imported as `edgefirst_egl`) with the static-linking
+    path, `pkg-config` build dependency, and `build.rs` removed. The public API
+    is unchanged, so consumers only needed the import identifier renamed.
+    glutin/glow were ruled out — neither provides the EGLImage/dmabuf import the
+    HAL relies on, and glutin is itself still on `libloading` 0.8.
+  - **`gls` 0.1.6 → vendored `edgefirst-gl`** (`crates/gl`): the upstream crate
+    is abandoned (last release 2021). Vendored as a trimmed fork (imported as
+    `edgefirst_gl`) carrying only the surface the HAL uses — the raw GLES 3.2 +
+    EGLImage bindings, 12 safe wrappers, and the `Error` type — which drops its
+    `nalgebra`, `serde`, `libc`, and `winapi` dependencies. The result has no
+    runtime dependencies. A full glow migration was rejected (~2730 call sites,
+    paradigm shift, GPU re-validation, and it would not remove the raw EGLImage
+    extension code). Both vendored crates have no path-only deps and are ready
+    to publish to crates.io standalone.
+  - **`fast-math` dropped** (`edgefirst-decoder`): upstream abandoned (last
+    release 2019). Its sole use — an approximate sigmoid in the ModelPack
+    decoder — now calls a bit-for-bit vendored Schraudolph `exp_raw`
+    (MIT/Apache-2.0, Huon Wilson), so decoder outputs stay byte-identical to
+    prior releases (verified by the existing golden-value and cross-path
+    decoder tests).
+  - **`serde_yaml` → `serde_yaml_ng`**: the original (dtolnay) is archived and
+    deprecated; the API-identical maintained continuation is aliased via a
+    package rename so all `serde_yaml::` paths are unchanged.
+  - **`libloading` unified on 0.9** and **`g2d-sys` 1.3.1 / `edgefirst-gbm`
+    0.19** bumped: the updated Au-Zone crates drop their stale transitive pins,
+    collapsing the duplicate dependency tree — single `libloading` 0.9 (0.8.9
+    gone), `nix` 0.31.3 (0.29 gone), `rustix` 1.x (0.38 gone), `ndarray` 0.17.2
+    (0.16 gone) — and removing the stale `linux-raw-sys` 0.4.15 and entire
+    `windows-*` 0.52 set that drm/gbm previously dragged in.
+  - **Comprehensive `cargo update`** across the tree (`cbindgen` 0.29.2 →
+    0.29.4 regenerates the C API header, plus ~15 in-semver bumps). `jiff` is
+    pinned to 0.2.24 to keep an unmaintained `proc-macro-error2`
+    (RUSTSEC-2026-0173) out of the lockfile as a phantom; `cargo audit` remains
+    at the single pre-existing `paste` phantom.
+
 ## [0.25.2] - 2026-06-23
 
 ### Added
