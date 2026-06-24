@@ -24,8 +24,8 @@
 #![cfg(target_os = "macos")]
 
 use crate::Error;
+use edgefirst_egl as egl;
 use edgefirst_tensor::{packed_rgba16f_layout, DType, PixelFormat, Tensor, TensorTrait};
-use khronos_egl as egl;
 
 // ---------------------------------------------------------------------------
 // ANGLE EGL constants for the IOSurface client-buffer path.

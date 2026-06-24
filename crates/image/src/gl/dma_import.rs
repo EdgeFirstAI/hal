@@ -8,8 +8,8 @@
 //! can be unit-tested without a GPU context.
 
 use drm_fourcc::DrmFourcc;
+use edgefirst_egl::{self as egl, Attrib};
 use edgefirst_tensor::{ColorEncoding, ColorRange, PixelFormat, PixelLayout, Tensor, TensorTrait};
-use khronos_egl::{self as egl, Attrib};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 
@@ -362,9 +362,9 @@ impl DmaImportAttrs {
         let mut attrs = vec![
             egl_ext::LINUX_DRM_FOURCC as Attrib,
             self.drm_fourcc as Attrib,
-            khronos_egl::WIDTH as Attrib,
+            edgefirst_egl::WIDTH as Attrib,
             self.width as Attrib,
-            khronos_egl::HEIGHT as Attrib,
+            edgefirst_egl::HEIGHT as Attrib,
             self.height as Attrib,
             egl_ext::DMA_BUF_PLANE0_PITCH as Attrib,
             self.plane0_pitch as Attrib,
@@ -411,7 +411,7 @@ impl DmaImportAttrs {
             ]);
         }
 
-        attrs.push(khronos_egl::NONE as Attrib);
+        attrs.push(edgefirst_egl::NONE as Attrib);
         attrs
     }
 }
@@ -985,7 +985,7 @@ mod tests {
         );
 
         // Terminated with NONE
-        assert_eq!(*egl.last().unwrap(), khronos_egl::NONE as Attrib);
+        assert_eq!(*egl.last().unwrap(), edgefirst_egl::NONE as Attrib);
     }
 
     /// Verify EGL attribute list for same-fd multiplane NV12.
@@ -1089,7 +1089,7 @@ mod tests {
         assert_eq!(egl_attrib_value(&egl, egl_ext::YUV_COLOR_SPACE_HINT), None);
 
         // Terminated
-        assert_eq!(*egl.last().unwrap(), khronos_egl::NONE as Attrib);
+        assert_eq!(*egl.last().unwrap(), edgefirst_egl::NONE as Attrib);
     }
 
     /// Contiguous with padded stride: UV offset uses stride, not width.

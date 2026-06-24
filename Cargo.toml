@@ -36,6 +36,9 @@ edgefirst-bench = { path = "crates/bench" }
 edgefirst-codec = { version = "0.25.2", path = "crates/codec" }
 edgefirst-hal = { version = "0.25.2", path = "crates/hal" }
 edgefirst-decoder = { version = "0.25.2", path = "crates/decoder" }
+# Vendored maintained fork of the abandoned `khronos-egl` 6.0.0; imported as
+# `edgefirst_egl`. Lets us track libloading 0.9+ (see libloading below).
+edgefirst-egl = { version = "0.25.2", path = "crates/egl", features = ["dynamic"] }
 edgefirst-image = { version = "0.25.2", path = "crates/image" }
 edgefirst-tensor = { version = "0.25.2", path = "crates/tensor" }
 edgefirst-tracker = { version = "0.25.2", path = "crates/tracker" }
@@ -55,14 +58,12 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 image-compare = "0.5.0"
 jpeg-encoder = { version = "0.7.0", features = ["simd"] }
 kamadak-exif = "0.6.1"
-khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 lapjv = "0.3.0"
 libc = "0.2.186"
-# Pinned to 0.8.x: khronos-egl 6.0.0 (latest) depends on libloading ^0.8 and we
-# share a `libloading::Library` handle with its `Dynamic` EGL instance. Bumping
-# to 0.9 splits the `Library` type across the crate boundary (Borrow bound fails).
-# Revisit when khronos-egl releases a libloading-0.9 build.
-libloading = "0.8.9"
+# Shared with the `edgefirst-egl` fork's `Dynamic` EGL instance; both must use
+# the same libloading version so the `Borrow<Library>` bound holds across the
+# crate boundary. The fork tracks 0.9, so we do too.
+libloading = "0.9"
 log = "0.4.33"
 nalgebra = "0.35.0"
 ndarray = { version = "0.17.2", features = ["rayon"] }

@@ -14,7 +14,7 @@ edgefirst-bench = { workspace = true }
 edgefirst-tensor = { workspace = true }
 gbm = { workspace = true }
 gls = { workspace = true }
-khronos-egl = { workspace = true }
+edgefirst-egl = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 nix = { workspace = true }

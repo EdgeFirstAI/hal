@@ -69,7 +69,7 @@ unsafe fn create_rgb_rbo_fbo(
     h: u32,
     fourcc: u32,
     pitch: i32,
-) -> Result<(u32, u32, khronos_egl::Image), String> {
+) -> Result<(u32, u32, edgefirst_egl::Image), String> {
     let egl_image = ctx.create_egl_image_dma(fd, w as i32, h as i32, fourcc, pitch)?;
 
     let mut rbo = 0u32;
@@ -107,7 +107,12 @@ unsafe fn create_rgb_rbo_fbo(
 /// # Safety
 ///
 /// Caller must ensure the resources are valid and a current GL context.
-unsafe fn destroy_rgb_rbo_fbo(ctx: &GpuContext, rbo: u32, fbo: u32, egl_image: khronos_egl::Image) {
+unsafe fn destroy_rgb_rbo_fbo(
+    ctx: &GpuContext,
+    rbo: u32,
+    fbo: u32,
+    egl_image: edgefirst_egl::Image,
+) {
     gls::gl::DeleteFramebuffers(1, &fbo);
     gls::gl::DeleteRenderbuffers(1, &rbo);
     ctx.destroy_egl_image(egl_image)

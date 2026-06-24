@@ -33,15 +33,15 @@ use super::super::Egl;
 use super::macos::MacosPlatform;
 use super::GlPlatform;
 use crate::{Error, Result};
+use edgefirst_egl as egl;
 use edgefirst_tensor::{DType, PixelFormat, Tensor};
-use khronos_egl as egl;
 use log::debug;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // EGL constants shared by the display bring-up and per-processor context
-// creation (from EGL/eglext headers; khronos_egl does not export these).
+// creation (from EGL/eglext headers; edgefirst_egl does not export these).
 // ---------------------------------------------------------------------------
 
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
@@ -134,8 +134,8 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
     let egl_lib = MacosPlatform::load_egl_lib()
         .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
     let egl: Egl = unsafe {
-        khronos_egl::Instance::<
-            khronos_egl::Dynamic<&'static libloading::Library, khronos_egl::EGL1_4>,
+        edgefirst_egl::Instance::<
+            edgefirst_egl::Dynamic<&'static libloading::Library, edgefirst_egl::EGL1_4>,
         >::load_required_from(egl_lib)
     }
     .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;

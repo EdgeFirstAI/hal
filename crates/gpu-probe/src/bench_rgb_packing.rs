@@ -218,7 +218,7 @@ fn try_create_r8_egl_image(
     fd: i32,
     width: u32,
     height: u32,
-) -> Option<khronos_egl::Image> {
+) -> Option<edgefirst_egl::Image> {
     let pitch = width as i32; // 1 byte per pixel
     ctx.create_egl_image_dma(fd, width as i32, height as i32, r8_fourcc(), pitch)
         .ok()
@@ -230,7 +230,7 @@ fn try_create_rgba_egl_image(
     fd: i32,
     width: u32,
     height: u32,
-) -> Option<khronos_egl::Image> {
+) -> Option<edgefirst_egl::Image> {
     let pitch = (width * 4) as i32;
     ctx.create_egl_image_dma(
         fd,
@@ -243,7 +243,7 @@ fn try_create_rgba_egl_image(
 }
 
 /// Create a GL texture backed by an EGLImage, with NEAREST filtering.
-fn create_texture_from_image(image: &khronos_egl::Image) -> u32 {
+fn create_texture_from_image(image: &edgefirst_egl::Image) -> u32 {
     unsafe {
         let mut tex = 0u32;
         gls::gl::GenTextures(1, &mut tex);

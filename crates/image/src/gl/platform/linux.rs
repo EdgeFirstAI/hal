@@ -16,8 +16,8 @@ use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
 use super::super::EglDisplayKind;
 use super::GlPlatform;
+use edgefirst_egl as egl;
 use edgefirst_tensor::{PixelFormat, Tensor};
-use khronos_egl as egl;
 use std::rc::Rc;
 
 /// An owned EGLImage import over a DMA-BUF. Dropping destroys the
@@ -136,9 +136,9 @@ impl GlPlatform for LinuxEgl {
         let egl_img_attr = [
             egl_ext::LINUX_DRM_FOURCC as egl::Attrib,
             drm_format as u32 as egl::Attrib,
-            khronos_egl::WIDTH as egl::Attrib,
+            edgefirst_egl::WIDTH as egl::Attrib,
             width as egl::Attrib,
-            khronos_egl::HEIGHT as egl::Attrib,
+            edgefirst_egl::HEIGHT as egl::Attrib,
             height as egl::Attrib,
             egl_ext::DMA_BUF_PLANE0_PITCH as egl::Attrib,
             pitch as egl::Attrib,
@@ -148,7 +148,7 @@ impl GlPlatform for LinuxEgl {
             fd as egl::Attrib,
             egl::IMAGE_PRESERVED as egl::Attrib,
             egl::TRUE as egl::Attrib,
-            khronos_egl::NONE as egl::Attrib,
+            edgefirst_egl::NONE as egl::Attrib,
         ];
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }

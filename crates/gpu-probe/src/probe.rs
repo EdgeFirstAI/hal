@@ -5,7 +5,7 @@
 //! limits, extension support, and device-node availability.
 
 use crate::egl_context::GpuContext;
-use khronos_egl as egl;
+use edgefirst_egl as egl;
 use std::path::Path;
 
 /// Returns `"YES"` when `b` is true, `"no"` otherwise.

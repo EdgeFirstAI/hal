@@ -10,11 +10,11 @@
 //! HAL's `opengl_headless::GlContext` stripped down for diagnostic /
 //! benchmarking use only.
 
+use edgefirst_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use gbm::{
     drm::{control::Device as DrmControlDevice, Device as DrmDevice},
     AsRaw, Device,
 };
-use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::{debug, info};
 use std::{
     collections::BTreeSet,

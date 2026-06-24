@@ -1,0 +1,41 @@
+[package]
+name = "edgefirst-egl"
+version.workspace = true
+authors = [
+    "Timothée Haudebourg <author@haudebourg.net>",
+    "Sean Kerr <sean@metatomic.io>",
+    "Au-Zone Technologies <support@au-zone.com>",
+]
+edition = "2021"
+description = "Rust bindings for the Khronos EGL API (maintained fork of khronos-egl)"
+documentation = "https://docs.rs/edgefirst-egl"
+repository.workspace = true
+readme = "README.md"
+keywords = ["egl", "gl", "khronos", "opengl"]
+license = "MIT/Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+libc = { workspace = true }
+libloading = { workspace = true, optional = true }
+
+[build-dependencies]
+pkg-config = { version = "0.3", optional = true }
+
+[lib]
+# The upstream doc examples need a live EGL + wayland environment (and old
+# wayland 0.28 dev-deps) to compile/run, which CI does not provide. rustdoc
+# still renders them; we just don't compile them as tests.
+doctest = false
+
+[features]
+1_0 = []
+1_1 = ["1_0"]
+1_2 = ["1_1"]
+1_3 = ["1_2"]
+1_4 = ["1_3"]
+1_5 = ["1_4"]
+default = ["1_5"]
+dynamic = ["libloading"]
+no-pkg-config = []
+static = ["pkg-config"]

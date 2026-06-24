@@ -36,7 +36,7 @@
 
 use super::super::Egl;
 use crate::Error;
-use khronos_egl as egl;
+use edgefirst_egl as egl;
 use log::{debug, warn};
 use std::sync::OnceLock;
 
