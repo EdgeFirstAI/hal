@@ -3,11 +3,11 @@
 
 use super::{EglDisplayInfo, EglDisplayKind, TransferBackend};
 use crate::Error;
+use edgefirst_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use gbm::{
     drm::{control::Device as DrmControlDevice, Device as DrmDevice},
     AsRaw, Device,
 };
-use khronos_egl::{self as egl, Attrib, Display, Dynamic, Instance, EGL1_4};
 use log::debug;
 use std::{
     ffi::c_void,
@@ -524,7 +524,7 @@ impl GlContext {
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
                 provided: egl.version(),
-                required: khronos_egl::Version::EGL1_5,
+                required: edgefirst_egl::Version::EGL1_5,
             }))
         }
     }
@@ -573,7 +573,7 @@ impl GlContext {
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
                 provided: egl.version(),
-                required: khronos_egl::Version::EGL1_5,
+                required: edgefirst_egl::Version::EGL1_5,
             }))
         }
     }
@@ -601,7 +601,7 @@ impl GlContext {
         } else {
             Err(Error::EGLLoad(egl::LoadError::InvalidVersion {
                 provided: egl.version(),
-                required: khronos_egl::Version::EGL1_5,
+                required: edgefirst_egl::Version::EGL1_5,
             }))
         }
     }
@@ -729,6 +729,6 @@ pub(super) mod egl_ext {
     /// # Safety
     /// The EGL spec defines EGL_NO_CONFIG_KHR as a null pointer. This is
     /// a safe transmute since `Config` is a newtype wrapper around `*mut c_void`.
-    pub(crate) const NO_CONFIG_KHR: khronos_egl::Config =
+    pub(crate) const NO_CONFIG_KHR: edgefirst_egl::Config =
         unsafe { std::mem::transmute(std::ptr::null_mut::<std::ffi::c_void>()) };
 }

@@ -66,71 +66,86 @@ pub(crate) fn rgb888_fourcc() -> u32 {
 /// GL objects and returns `Err` with the relevant info log.
 pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, String> {
     unsafe {
-        let program = gls::gl::CreateProgram();
+        let program = edgefirst_gl::gl::CreateProgram();
 
         // --- Vertex shader ---
-        let vs = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
+        let vs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::VERTEX_SHADER);
         let vs_ptr = vert.as_ptr();
-        gls::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
-        gls::gl::CompileShader(vs);
+        edgefirst_gl::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
+        edgefirst_gl::gl::CompileShader(vs);
         let mut vs_ok: i32 = 0;
-        gls::gl::GetShaderiv(vs, gls::gl::COMPILE_STATUS, &mut vs_ok);
+        edgefirst_gl::gl::GetShaderiv(vs, edgefirst_gl::gl::COMPILE_STATUS, &mut vs_ok);
         if vs_ok == 0 {
             let mut len: i32 = 0;
-            gls::gl::GetShaderiv(vs, gls::gl::INFO_LOG_LENGTH, &mut len);
+            edgefirst_gl::gl::GetShaderiv(vs, edgefirst_gl::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetShaderInfoLog(vs, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
-            gls::gl::DeleteShader(vs);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::GetShaderInfoLog(
+                vs,
+                len,
+                std::ptr::null_mut(),
+                log.as_mut_ptr().cast(),
+            );
+            edgefirst_gl::gl::DeleteShader(vs);
+            edgefirst_gl::gl::DeleteProgram(program);
             let msg = String::from_utf8_lossy(&log).into_owned();
             return Err(format!("vertex shader compile failed: {msg}"));
         }
-        gls::gl::AttachShader(program, vs);
+        edgefirst_gl::gl::AttachShader(program, vs);
 
         // --- Fragment shader ---
-        let fs = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
+        let fs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::FRAGMENT_SHADER);
         let fs_ptr = frag.as_ptr();
-        gls::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
-        gls::gl::CompileShader(fs);
+        edgefirst_gl::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
+        edgefirst_gl::gl::CompileShader(fs);
         let mut fs_ok: i32 = 0;
-        gls::gl::GetShaderiv(fs, gls::gl::COMPILE_STATUS, &mut fs_ok);
+        edgefirst_gl::gl::GetShaderiv(fs, edgefirst_gl::gl::COMPILE_STATUS, &mut fs_ok);
         if fs_ok == 0 {
             let mut len: i32 = 0;
-            gls::gl::GetShaderiv(fs, gls::gl::INFO_LOG_LENGTH, &mut len);
+            edgefirst_gl::gl::GetShaderiv(fs, edgefirst_gl::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetShaderInfoLog(fs, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
-            gls::gl::DetachShader(program, vs);
-            gls::gl::DeleteShader(vs);
-            gls::gl::DeleteShader(fs);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::GetShaderInfoLog(
+                fs,
+                len,
+                std::ptr::null_mut(),
+                log.as_mut_ptr().cast(),
+            );
+            edgefirst_gl::gl::DetachShader(program, vs);
+            edgefirst_gl::gl::DeleteShader(vs);
+            edgefirst_gl::gl::DeleteShader(fs);
+            edgefirst_gl::gl::DeleteProgram(program);
             let msg = String::from_utf8_lossy(&log).into_owned();
             return Err(format!("fragment shader compile failed: {msg}"));
         }
-        gls::gl::AttachShader(program, fs);
+        edgefirst_gl::gl::AttachShader(program, fs);
 
         // --- Link ---
-        gls::gl::LinkProgram(program);
+        edgefirst_gl::gl::LinkProgram(program);
         let mut link_ok: i32 = 0;
-        gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut link_ok);
+        edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::LINK_STATUS, &mut link_ok);
         if link_ok == 0 {
             let mut len: i32 = 0;
-            gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut len);
+            edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::INFO_LOG_LENGTH, &mut len);
             let mut log = vec![0u8; len.max(1) as usize];
-            gls::gl::GetProgramInfoLog(program, len, std::ptr::null_mut(), log.as_mut_ptr().cast());
-            gls::gl::DetachShader(program, vs);
-            gls::gl::DetachShader(program, fs);
-            gls::gl::DeleteShader(vs);
-            gls::gl::DeleteShader(fs);
-            gls::gl::DeleteProgram(program);
+            edgefirst_gl::gl::GetProgramInfoLog(
+                program,
+                len,
+                std::ptr::null_mut(),
+                log.as_mut_ptr().cast(),
+            );
+            edgefirst_gl::gl::DetachShader(program, vs);
+            edgefirst_gl::gl::DetachShader(program, fs);
+            edgefirst_gl::gl::DeleteShader(vs);
+            edgefirst_gl::gl::DeleteShader(fs);
+            edgefirst_gl::gl::DeleteProgram(program);
             let msg = String::from_utf8_lossy(&log).into_owned();
             return Err(format!("program link failed: {msg}"));
         }
 
         // Detach shaders so they can be deleted while program remains
-        gls::gl::DetachShader(program, vs);
-        gls::gl::DetachShader(program, fs);
-        gls::gl::DeleteShader(vs);
-        gls::gl::DeleteShader(fs);
+        edgefirst_gl::gl::DetachShader(program, vs);
+        edgefirst_gl::gl::DetachShader(program, fs);
+        edgefirst_gl::gl::DeleteShader(vs);
+        edgefirst_gl::gl::DeleteShader(fs);
 
         Ok(program)
     }
@@ -141,48 +156,55 @@ pub(crate) fn compile_program(vert: &CString, frag: &CString) -> Result<u32, Str
 pub(crate) fn create_quad_vao() -> (u32, u32, u32) {
     unsafe {
         let mut vao = 0u32;
-        gls::gl::GenVertexArrays(1, &mut vao);
-        gls::gl::BindVertexArray(vao);
+        edgefirst_gl::gl::GenVertexArrays(1, &mut vao);
+        edgefirst_gl::gl::BindVertexArray(vao);
 
         // VBO: interleaved [x, y, u, v]
         let mut vbo = 0u32;
-        gls::gl::GenBuffers(1, &mut vbo);
-        gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, vbo);
-        gls::gl::BufferData(
-            gls::gl::ARRAY_BUFFER,
+        edgefirst_gl::gl::GenBuffers(1, &mut vbo);
+        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, vbo);
+        edgefirst_gl::gl::BufferData(
+            edgefirst_gl::gl::ARRAY_BUFFER,
             std::mem::size_of_val(&QUAD_VERTICES) as isize,
             QUAD_VERTICES.as_ptr() as *const std::ffi::c_void,
-            gls::gl::STATIC_DRAW,
+            edgefirst_gl::gl::STATIC_DRAW,
         );
 
         // Attribute 0: position (vec2, declared as vec3 in shader — z defaults to 0)
         let stride = (4 * std::mem::size_of::<f32>()) as i32;
-        gls::gl::VertexAttribPointer(0, 2, gls::gl::FLOAT, gls::gl::FALSE, stride, null());
-        gls::gl::EnableVertexAttribArray(0);
+        edgefirst_gl::gl::VertexAttribPointer(
+            0,
+            2,
+            edgefirst_gl::gl::FLOAT,
+            edgefirst_gl::gl::FALSE,
+            stride,
+            null(),
+        );
+        edgefirst_gl::gl::EnableVertexAttribArray(0);
 
         // Attribute 1: texCoord (vec2)
-        gls::gl::VertexAttribPointer(
+        edgefirst_gl::gl::VertexAttribPointer(
             1,
             2,
-            gls::gl::FLOAT,
-            gls::gl::FALSE,
+            edgefirst_gl::gl::FLOAT,
+            edgefirst_gl::gl::FALSE,
             stride,
             (2 * std::mem::size_of::<f32>()) as *const std::ffi::c_void,
         );
-        gls::gl::EnableVertexAttribArray(1);
+        edgefirst_gl::gl::EnableVertexAttribArray(1);
 
         // EBO: indices
         let mut ebo = 0u32;
-        gls::gl::GenBuffers(1, &mut ebo);
-        gls::gl::BindBuffer(gls::gl::ELEMENT_ARRAY_BUFFER, ebo);
-        gls::gl::BufferData(
-            gls::gl::ELEMENT_ARRAY_BUFFER,
+        edgefirst_gl::gl::GenBuffers(1, &mut ebo);
+        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER, ebo);
+        edgefirst_gl::gl::BufferData(
+            edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER,
             std::mem::size_of_val(&QUAD_INDICES) as isize,
             QUAD_INDICES.as_ptr() as *const std::ffi::c_void,
-            gls::gl::STATIC_DRAW,
+            edgefirst_gl::gl::STATIC_DRAW,
         );
 
-        gls::gl::BindVertexArray(0);
+        edgefirst_gl::gl::BindVertexArray(0);
 
         (vao, vbo, ebo)
     }
@@ -214,7 +236,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
     // Get uniform location for the texture sampler
     let tex_uniform = unsafe {
         let name = CString::new("tex").unwrap();
-        gls::gl::GetUniformLocation(program, name.as_ptr())
+        edgefirst_gl::gl::GetUniformLocation(program, name.as_ptr())
     };
 
     let (vao, vbo, ebo) = create_quad_vao();
@@ -286,60 +308,71 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
                 unsafe {
                     // 3. Create src texture, bind EGLImage, set LINEAR filtering
                     let mut src_tex = 0u32;
-                    gls::gl::GenTextures(1, &mut src_tex);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, src_img.as_ptr());
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MIN_FILTER,
-                        gls::gl::LINEAR as i32,
+                    edgefirst_gl::gl::GenTextures(1, &mut src_tex);
+                    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+                    edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        src_img.as_ptr(),
                     );
-                    gls::gl::TexParameteri(
-                        gls::gl::TEXTURE_2D,
-                        gls::gl::TEXTURE_MAG_FILTER,
-                        gls::gl::LINEAR as i32,
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                        edgefirst_gl::gl::LINEAR as i32,
+                    );
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                        edgefirst_gl::gl::LINEAR as i32,
                     );
 
                     // 4. Create dst texture, bind EGLImage
                     let mut dst_tex = 0u32;
-                    gls::gl::GenTextures(1, &mut dst_tex);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, dst_tex);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dst_img.as_ptr());
+                    edgefirst_gl::gl::GenTextures(1, &mut dst_tex);
+                    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, dst_tex);
+                    edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        dst_img.as_ptr(),
+                    );
 
                     // 5. Create FBO, attach dst texture
                     let mut fbo = 0u32;
-                    gls::gl::GenFramebuffers(1, &mut fbo);
-                    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-                    gls::gl::FramebufferTexture2D(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+                    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+                    edgefirst_gl::gl::FramebufferTexture2D(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::TEXTURE_2D,
                         dst_tex,
                         0,
                     );
 
                     // 6. Viewport
-                    gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+                    edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
 
                     // 7. UseProgram, bind src texture to TEXTURE0
-                    gls::gl::UseProgram(program);
-                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-                    gls::gl::Uniform1i(tex_uniform, 0);
+                    edgefirst_gl::gl::UseProgram(program);
+                    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+                    edgefirst_gl::gl::Uniform1i(tex_uniform, 0);
 
                     // 8. Draw
-                    gls::gl::BindVertexArray(vao);
-                    gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+                    edgefirst_gl::gl::BindVertexArray(vao);
+                    edgefirst_gl::gl::DrawElements(
+                        edgefirst_gl::gl::TRIANGLES,
+                        6,
+                        edgefirst_gl::gl::UNSIGNED_INT,
+                        null(),
+                    );
 
                     // 9. Finish
-                    gls::gl::Finish();
+                    edgefirst_gl::gl::Finish();
 
                     // 10. Cleanup GL resources
-                    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-                    gls::gl::BindVertexArray(0);
-                    gls::gl::DeleteFramebuffers(1, &fbo);
-                    gls::gl::DeleteTextures(1, &dst_tex);
-                    gls::gl::DeleteTextures(1, &src_tex);
+                    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+                    edgefirst_gl::gl::BindVertexArray(0);
+                    edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+                    edgefirst_gl::gl::DeleteTextures(1, &dst_tex);
+                    edgefirst_gl::gl::DeleteTextures(1, &src_tex);
                 }
 
                 // Destroy EGLImages
@@ -366,32 +399,38 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
 
             let (src_tex, dst_tex, fbo) = unsafe {
                 let mut src_tex = 0u32;
-                gls::gl::GenTextures(1, &mut src_tex);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-                gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, src_img.as_ptr());
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MIN_FILTER,
-                    gls::gl::LINEAR as i32,
+                edgefirst_gl::gl::GenTextures(1, &mut src_tex);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+                edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                    edgefirst_gl::gl::TEXTURE_2D,
+                    src_img.as_ptr(),
                 );
-                gls::gl::TexParameteri(
-                    gls::gl::TEXTURE_2D,
-                    gls::gl::TEXTURE_MAG_FILTER,
-                    gls::gl::LINEAR as i32,
+                edgefirst_gl::gl::TexParameteri(
+                    edgefirst_gl::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                    edgefirst_gl::gl::LINEAR as i32,
+                );
+                edgefirst_gl::gl::TexParameteri(
+                    edgefirst_gl::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                    edgefirst_gl::gl::LINEAR as i32,
                 );
 
                 let mut dst_tex = 0u32;
-                gls::gl::GenTextures(1, &mut dst_tex);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, dst_tex);
-                gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, dst_img.as_ptr());
+                edgefirst_gl::gl::GenTextures(1, &mut dst_tex);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, dst_tex);
+                edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                    edgefirst_gl::gl::TEXTURE_2D,
+                    dst_img.as_ptr(),
+                );
 
                 let mut fbo = 0u32;
-                gls::gl::GenFramebuffers(1, &mut fbo);
-                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-                gls::gl::FramebufferTexture2D(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::TEXTURE_2D,
+                edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+                edgefirst_gl::gl::FramebufferTexture2D(
+                    edgefirst_gl::gl::FRAMEBUFFER,
+                    edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                    edgefirst_gl::gl::TEXTURE_2D,
                     dst_tex,
                     0,
                 );
@@ -402,29 +441,34 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
             let name = format!("render_cached/{label}");
             let r = run_bench(&name, 10, 200, || unsafe {
                 // Only the render path — resources are already set up
-                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-                gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+                edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
 
-                gls::gl::UseProgram(program);
-                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, src_tex);
-                gls::gl::Uniform1i(tex_uniform, 0);
+                edgefirst_gl::gl::UseProgram(program);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex);
+                edgefirst_gl::gl::Uniform1i(tex_uniform, 0);
 
-                gls::gl::BindVertexArray(vao);
-                gls::gl::DrawElements(gls::gl::TRIANGLES, 6, gls::gl::UNSIGNED_INT, null());
+                edgefirst_gl::gl::BindVertexArray(vao);
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLES,
+                    6,
+                    edgefirst_gl::gl::UNSIGNED_INT,
+                    null(),
+                );
 
-                gls::gl::Finish();
+                edgefirst_gl::gl::Finish();
             });
             r.print_summary();
             results.push(r);
 
             // Cleanup cached resources
             unsafe {
-                gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-                gls::gl::BindVertexArray(0);
-                gls::gl::DeleteFramebuffers(1, &fbo);
-                gls::gl::DeleteTextures(1, &dst_tex);
-                gls::gl::DeleteTextures(1, &src_tex);
+                edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+                edgefirst_gl::gl::BindVertexArray(0);
+                edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+                edgefirst_gl::gl::DeleteTextures(1, &dst_tex);
+                edgefirst_gl::gl::DeleteTextures(1, &src_tex);
             }
             ctx.destroy_egl_image(dst_img)
                 .expect("destroy dst EGLImage failed");
@@ -437,10 +481,10 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
     // Cleanup shared resources
     // ---------------------------------------------------------------
     unsafe {
-        gls::gl::DeleteVertexArrays(1, &vao);
-        gls::gl::DeleteBuffers(1, &vbo);
-        gls::gl::DeleteBuffers(1, &ebo);
-        gls::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteVertexArrays(1, &vao);
+        edgefirst_gl::gl::DeleteBuffers(1, &vbo);
+        edgefirst_gl::gl::DeleteBuffers(1, &ebo);
+        edgefirst_gl::gl::DeleteProgram(program);
     }
 
     println!();

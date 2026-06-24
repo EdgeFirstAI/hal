@@ -64,10 +64,13 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
 
                 unsafe {
                     let mut tex: u32 = 0;
-                    gls::gl::GenTextures(1, &mut tex);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-                    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, img.as_ptr());
-                    gls::gl::DeleteTextures(1, &tex);
+                    edgefirst_gl::gl::GenTextures(1, &mut tex);
+                    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+                    edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        img.as_ptr(),
+                    );
+                    edgefirst_gl::gl::DeleteTextures(1, &tex);
                 }
 
                 ctx.destroy_egl_image(img)

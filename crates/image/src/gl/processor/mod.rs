@@ -167,11 +167,12 @@ struct NvUniformState {
 impl NvUniformState {
     fn resolve(program: &GlProgram) -> Self {
         unsafe {
-            gls::gl::UseProgram(program.id);
-            let loc =
-                |name: &std::ffi::CStr| gls::gl::GetUniformLocation(program.id, name.as_ptr());
+            edgefirst_gl::gl::UseProgram(program.id);
+            let loc = |name: &std::ffi::CStr| {
+                edgefirst_gl::gl::GetUniformLocation(program.id, name.as_ptr())
+            };
             // Constant: the NV shaders always sample `src` from unit 0.
-            gls::gl::Uniform1i(loc(c"src"), 0);
+            edgefirst_gl::gl::Uniform1i(loc(c"src"), 0);
             NvUniformState {
                 locs: NvUniformLocs {
                     img_size: loc(c"img_size"),
@@ -381,10 +382,10 @@ impl Drop for GLProcessorST {
         unsafe {
             {
                 if self.proto_ssbo != 0 {
-                    gls::gl::DeleteBuffers(1, &self.proto_ssbo);
+                    edgefirst_gl::gl::DeleteBuffers(1, &self.proto_ssbo);
                 }
                 if let Some(program) = self.proto_repack_compute_program {
-                    gls::gl::DeleteProgram(program);
+                    edgefirst_gl::gl::DeleteProgram(program);
                 }
             }
         }
@@ -779,40 +780,46 @@ struct GlSupport {
 /// high-water mark, so the fallback path costs no per-call allocation
 /// after the first read of a given size.
 unsafe fn read_pixels_into(w: usize, h: usize, format: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
-    let direct = format == gls::gl::RGBA || {
+    let direct = format == edgefirst_gl::gl::RGBA || {
         let mut impl_fmt = 0i32;
         let mut impl_type = 0i32;
-        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_FORMAT, &mut impl_fmt);
-        gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_TYPE, &mut impl_type);
-        impl_fmt as u32 == format && impl_type as u32 == gls::gl::UNSIGNED_BYTE
+        edgefirst_gl::gl::GetIntegerv(
+            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
+            &mut impl_fmt,
+        );
+        edgefirst_gl::gl::GetIntegerv(
+            edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
+            &mut impl_type,
+        );
+        impl_fmt as u32 == format && impl_type as u32 == edgefirst_gl::gl::UNSIGNED_BYTE
     };
     if direct {
-        gls::gl::ReadPixels(
+        edgefirst_gl::gl::ReadPixels(
             0,
             0,
             w as i32,
             h as i32,
             format,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             out.as_mut_ptr() as *mut c_void,
         );
         return;
     }
     let channels = match format {
-        gls::gl::RGB => 3,
-        gls::gl::RED => 1,
+        edgefirst_gl::gl::RGB => 3,
+        edgefirst_gl::gl::RED => 1,
         _ => 4,
     };
     if scratch.len() < w * h * 4 {
         scratch.resize(w * h * 4, 0);
     }
-    gls::gl::ReadPixels(
+    edgefirst_gl::gl::ReadPixels(
         0,
         0,
         w as i32,
         h as i32,
-        gls::gl::RGBA,
-        gls::gl::UNSIGNED_BYTE,
+        edgefirst_gl::gl::RGBA,
+        edgefirst_gl::gl::UNSIGNED_BYTE,
         scratch.as_mut_ptr() as *mut c_void,
     );
     for (px, dst_px) in scratch.chunks_exact(4).zip(out.chunks_exact_mut(channels)) {
@@ -856,7 +863,7 @@ impl GLProcessorST {
         // future platform (Windows/ANGLE) implements instead of forking this
         // engine. On Linux this delegates straight to `GlContext::new`.
         let gl_context = Platform::init_display(kind)?;
-        // Load the GL function pointers exactly once per process — `gls`
+        // Load the GL function pointers exactly once per process — `edgefirst_gl`
         // bindings are gl_generator `static mut` function-pointer tables, so
         // re-running `load_with` per construction would be a data race with
         // unlocked workers. Platform-routed: Linux loads via this display's
@@ -904,8 +911,8 @@ impl GLProcessorST {
 
         // Uploads and downloads are all packed with no alignment requirements
         unsafe {
-            gls::gl::PixelStorei(gls::gl::PACK_ALIGNMENT, 1);
-            gls::gl::PixelStorei(gls::gl::UNPACK_ALIGNMENT, 1);
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::PACK_ALIGNMENT, 1);
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ALIGNMENT, 1);
         }
 
         // External-OES sampler programs exist only where the platform's
@@ -948,18 +955,18 @@ impl GLProcessorST {
             super::shaders_common::YUYV_RGBA_2D_FRAGMENT,
         )?;
         let yuyv_2d_locs = unsafe {
-            gls::gl::UseProgram(yuyv_program_2d.id);
+            edgefirst_gl::gl::UseProgram(yuyv_program_2d.id);
             // Constant sampler binding resolved at link (B6 pattern).
-            let tex = gls::gl::GetUniformLocation(yuyv_program_2d.id, c"tex".as_ptr());
-            gls::gl::Uniform1i(tex, 0);
+            let tex = edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"tex".as_ptr());
+            edgefirst_gl::gl::Uniform1i(tex, 0);
             [
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"src_size".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_offset".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"y_scale".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vr".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ug".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vg".as_ptr()),
-                gls::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ub".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"src_size".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"y_offset".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"y_scale".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vr".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ug".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_vg".as_ptr()),
+                edgefirst_gl::gl::GetUniformLocation(yuyv_program_2d.id, c"c_ub".as_ptr()),
             ]
         };
 
@@ -1225,13 +1232,13 @@ impl GLProcessorST {
                     converter.proto_repack_compute_program = Some(program);
                     unsafe {
                         converter.proto_compute_locs = (
-                            gls::gl::GetUniformLocation(program, c"width".as_ptr()),
-                            gls::gl::GetUniformLocation(program, c"height".as_ptr()),
-                            gls::gl::GetUniformLocation(program, c"num_protos".as_ptr()),
+                            edgefirst_gl::gl::GetUniformLocation(program, c"width".as_ptr()),
+                            edgefirst_gl::gl::GetUniformLocation(program, c"height".as_ptr()),
+                            edgefirst_gl::gl::GetUniformLocation(program, c"num_protos".as_ptr()),
                         );
                     }
                     let mut ssbo = 0u32;
-                    unsafe { gls::gl::GenBuffers(1, &mut ssbo) };
+                    unsafe { edgefirst_gl::gl::GenBuffers(1, &mut ssbo) };
                     converter.proto_ssbo = ssbo;
                 }
                 Err(e) => {
@@ -1699,7 +1706,7 @@ impl GLProcessorST {
                 ));
             }
             if is_dma && bg.memory() == TensorMemory::Dma {
-                gls::disable(gls::gl::BLEND);
+                edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
                 self.draw_camera_texture_eglimage(
                     bg,
@@ -1733,45 +1740,45 @@ impl GLProcessorST {
             // No background: actively clear the framebuffer so stale
             // pixels from the previous frame do not leak into the output.
             unsafe {
-                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             }
         }
 
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func_separate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
+        edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
+        edgefirst_gl::blend_func_separate(
+            edgefirst_gl::gl::SRC_ALPHA,
+            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
+            edgefirst_gl::gl::ZERO,
+            edgefirst_gl::gl::ONE,
         );
 
         self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect, color_mode)?;
         self.render_segmentation(detect, segmentation, color_mode)?;
 
-        gls::finish();
+        edgefirst_gl::finish();
         if !is_dma {
             let format = match dst_fmt {
-                PixelFormat::Rgb => gls::gl::RGB,
-                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+                PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
                 _ => unreachable!(),
             };
             if let Some(buffer_id) = pbo_buffer_id {
                 unsafe {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+                    edgefirst_gl::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null_mut(),
                     );
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    gls::gl::Finish();
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                    edgefirst_gl::gl::Finish();
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -1783,7 +1790,7 @@ impl GLProcessorST {
             } else {
                 let mut dst_map = dst.map()?;
                 unsafe {
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
                         dst_w,
                         dst_h,
@@ -1890,7 +1897,7 @@ impl GLProcessorST {
                 ));
             }
             if is_dma && bg.memory() == TensorMemory::Dma {
-                gls::disable(gls::gl::BLEND);
+                edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
                 let bg_egl = self.get_or_create_egl_image(CacheKind::Src, bg, bg_fmt)?;
                 self.draw_camera_texture_eglimage(
                     bg,
@@ -1917,45 +1924,45 @@ impl GLProcessorST {
             }
         } else {
             unsafe {
-                gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             }
         }
 
-        gls::enable(gls::gl::BLEND);
-        gls::blend_func_separate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
+        edgefirst_gl::enable(edgefirst_gl::gl::BLEND);
+        edgefirst_gl::blend_func_separate(
+            edgefirst_gl::gl::SRC_ALPHA,
+            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
+            edgefirst_gl::gl::ZERO,
+            edgefirst_gl::gl::ONE,
         );
 
         self.set_opacity_uniform(opacity)?;
         self.render_box(dst_w, dst_h, detect, color_mode)?;
         self.render_proto_segmentation(detect, proto_data, color_mode)?;
 
-        gls::finish();
+        edgefirst_gl::finish();
         if !is_dma {
             let format = match dst_fmt {
-                PixelFormat::Rgb => gls::gl::RGB,
-                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+                PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
                 _ => unreachable!(),
             };
             if let Some(buffer_id) = pbo_buffer_id {
                 unsafe {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+                    edgefirst_gl::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         format,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null_mut(),
                     );
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    gls::gl::Finish();
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                    edgefirst_gl::gl::Finish();
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
@@ -1967,7 +1974,7 @@ impl GLProcessorST {
             } else {
                 let mut dst_map = dst.map()?;
                 unsafe {
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                    edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
                         dst_w,
                         dst_h,
@@ -2060,14 +2067,14 @@ impl GLProcessorST {
     /// configuration may have one but not the other), surfaced via
     /// `RenderDtypeSupport`.
     fn gl_check_support() -> Result<GlSupport, crate::Error> {
-        if let Ok(version) = gls::get_string(gls::gl::SHADING_LANGUAGE_VERSION) {
+        if let Ok(version) = edgefirst_gl::get_string(edgefirst_gl::gl::SHADING_LANGUAGE_VERSION) {
             log::debug!("GL Shading Language Version: {version:?}");
         } else {
             log::warn!("Could not get GL Shading Language Version");
         }
 
         // Detect GPU vendor / software / virtualized renderers via GL_RENDERER.
-        let traits = gls::get_string(gls::gl::RENDERER)
+        let traits = edgefirst_gl::get_string(edgefirst_gl::gl::RENDERER)
             .map(|r| {
                 log::info!("GL_RENDERER: {r}");
                 classify_renderer(&r)
@@ -2102,7 +2109,7 @@ impl GLProcessorST {
         }
 
         let extensions = unsafe {
-            let str = gls::gl::GetString(gls::gl::EXTENSIONS);
+            let str = edgefirst_gl::gl::GetString(edgefirst_gl::gl::EXTENSIONS);
             if str.is_null() {
                 return Err(crate::Error::GLVersion(
                     "GL returned no supported extensions".to_string(),
@@ -2247,30 +2254,30 @@ impl GLProcessorST {
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
         match self.cached_dst_renderbuffer(dst, dst_fmt) {
             Some(rbo) => unsafe {
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::FramebufferRenderbuffer(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::RENDERBUFFER,
+                edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+                edgefirst_gl::gl::FramebufferRenderbuffer(
+                    edgefirst_gl::gl::FRAMEBUFFER,
+                    edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                    edgefirst_gl::gl::RENDERBUFFER,
                     rbo,
                 );
                 check_gl_error(function!(), line!())?;
             },
             None => unsafe {
                 if let Some(p) = &self.texture_program_yuv {
-                    gls::gl::UseProgram(p.id);
+                    edgefirst_gl::gl::UseProgram(p.id);
                 }
-                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.render_texture.id);
+                super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::LINEAR);
                 if self
                     .render_texture
                     .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
-                    gls::gl::FramebufferTexture2D(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::FramebufferTexture2D(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::TEXTURE_2D,
                         self.render_texture.id,
                         0,
                     );
@@ -2303,7 +2310,7 @@ impl GLProcessorST {
             },
         };
         unsafe {
-            gls::gl::Viewport(vp.x, vp.y, vp.w, vp.h);
+            edgefirst_gl::gl::Viewport(vp.x, vp.y, vp.w, vp.h);
         }
         Ok(())
     }
@@ -2339,27 +2346,30 @@ impl GLProcessorST {
         let dest_egl = self.get_or_create_egl_image(CacheKind::Dst, dst, dst_fmt)?;
         match self.cached_dst_renderbuffer(dst, dst_fmt) {
             Some(rbo) => unsafe {
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                gls::gl::FramebufferRenderbuffer(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
-                    gls::gl::RENDERBUFFER,
+                edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+                edgefirst_gl::gl::FramebufferRenderbuffer(
+                    edgefirst_gl::gl::FRAMEBUFFER,
+                    edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                    edgefirst_gl::gl::RENDERBUFFER,
                     rbo,
                 );
                 check_gl_error(function!(), line!())?;
             },
             None => unsafe {
-                gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.draw_render_texture.id);
-                super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
+                edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                edgefirst_gl::gl::BindTexture(
+                    edgefirst_gl::gl::TEXTURE_2D,
+                    self.draw_render_texture.id,
+                );
+                super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::LINEAR);
                 if self
                     .draw_render_texture
                     .bind_egl_image(&self.gl_context, dst_key, dest_egl)?
                 {
-                    gls::gl::FramebufferTexture2D(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::FramebufferTexture2D(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::TEXTURE_2D,
                         self.draw_render_texture.id,
                         0,
                     );
@@ -2376,7 +2386,7 @@ impl GLProcessorST {
         }
 
         unsafe {
-            gls::gl::Viewport(0, 0, width, height);
+            edgefirst_gl::gl::Viewport(0, 0, width, height);
         }
         Ok(())
     }
@@ -2435,9 +2445,9 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
         let dest_format = match dst_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
+            PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
+            PixelFormat::Grey => edgefirst_gl::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
                     "GL readback not supported for {dst_fmt}"
@@ -2448,7 +2458,7 @@ impl GLProcessorST {
         match pbo_id {
             None => unsafe {
                 let mut dst_map = dst.map()?;
-                gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
+                edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                 read_pixels_into(
                     dst_w,
                     dst_h,
@@ -2464,33 +2474,36 @@ impl GLProcessorST {
             },
             Some(buffer_id) => {
                 unsafe {
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                    gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-                    gls::gl::ReadPixels(
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, buffer_id);
+                    edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+                    edgefirst_gl::gl::ReadPixels(
                         0,
                         0,
                         dst_w as i32,
                         dst_h as i32,
                         dest_format,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null_mut(),
                     );
-                    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                    gls::gl::Finish();
+                    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                    edgefirst_gl::gl::Finish();
                 }
                 // BGRA R↔B swap must map the PBO on the GL thread. Int8 XOR 0x80
                 // is handled in the fragment shader — no CPU map needed.
                 if dst_fmt == PixelFormat::Bgra {
                     unsafe {
-                        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                        let ptr = gls::gl::MapBufferRange(
-                            gls::gl::PIXEL_PACK_BUFFER,
+                        edgefirst_gl::gl::BindBuffer(
+                            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                            buffer_id,
+                        );
+                        let ptr = edgefirst_gl::gl::MapBufferRange(
+                            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
                             0,
                             len as isize,
-                            gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                            edgefirst_gl::gl::MAP_READ_BIT | edgefirst_gl::gl::MAP_WRITE_BIT,
                         );
                         if ptr.is_null() {
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
                             return Err(crate::Error::OpenGl(
                                 "glMapBufferRange returned null for BGRA byte-swap".to_string(),
                             ));
@@ -2499,8 +2512,8 @@ impl GLProcessorST {
                         for chunk in slice.chunks_exact_mut(4) {
                             chunk.swap(0, 2);
                         }
-                        gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-                        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                        edgefirst_gl::gl::UnmapBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER);
+                        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
                     }
                 }
             }
@@ -2545,12 +2558,12 @@ impl GLProcessorST {
             self.bgra_warned = true;
         }
         let format = if is_planar {
-            gls::gl::RED
+            edgefirst_gl::gl::RED
         } else {
             match dst_fmt {
-                PixelFormat::Rgb => gls::gl::RGB,
-                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA, // BGRA uses RGBA internally
-                PixelFormat::Grey => gls::gl::RED,
+                PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA, // BGRA uses RGBA internally
+                PixelFormat::Grey => edgefirst_gl::gl::RED,
                 _ => unreachable!(),
             }
         };
@@ -2579,34 +2592,34 @@ impl GLProcessorST {
             }
         };
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
+            edgefirst_gl::gl::UseProgram(self.texture_program.id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.render_texture.id);
+            super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::LINEAR);
 
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TexImage2D(
+                edgefirst_gl::gl::TEXTURE_2D,
                 0,
                 format as i32,
                 width,
                 height,
                 0,
                 format,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 pixels,
             );
             // TexImage2D overwrites any EGLImage binding on this texture.
             self.render_texture.invalidate_egl_binding();
             check_gl_error(function!(), line!())?;
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.render_texture.id,
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, width, height);
+            edgefirst_gl::gl::Viewport(0, 0, width, height);
         }
         log::debug!("Set up framebuffer takes {:?}", start.elapsed());
         Ok(())
@@ -2641,8 +2654,8 @@ impl GLProcessorST {
         let map = src.map()?;
         let src_slice = map.as_slice();
         let format = match src_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
+            PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+            PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
                     "non-DMA bg upload not supported for {src_fmt}",
@@ -2661,25 +2674,25 @@ impl GLProcessorST {
         let pixels = swapped.as_deref().unwrap_or(src_slice).as_ptr() as *const c_void;
 
         unsafe {
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.render_texture.id);
+            edgefirst_gl::gl::TexImage2D(
+                edgefirst_gl::gl::TEXTURE_2D,
                 0,
                 format as i32,
                 dst_w as i32,
                 dst_h as i32,
                 0,
                 format,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 pixels,
             );
             // TexImage2D invalidates any prior EGLImage binding.
             self.render_texture.invalidate_egl_binding();
             check_gl_error(function!(), line!())?;
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.render_texture.id,
                 0,
             );
@@ -2711,16 +2724,16 @@ impl GLProcessorST {
     ) -> crate::Result<()> {
         self.convert_fbo.bind();
         unsafe {
-            gls::gl::UseProgram(self.texture_program.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::LINEAR);
+            edgefirst_gl::gl::UseProgram(self.texture_program.id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.render_texture.id);
+            super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::LINEAR);
 
             // Upload existing PBO content to the render texture.
             // Binding PBO as UNPACK buffer makes TexImage2D read from it.
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, buffer_id);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, buffer_id);
+            edgefirst_gl::gl::TexImage2D(
+                edgefirst_gl::gl::TEXTURE_2D,
                 0,
                 internal_format as i32,
                 width,
@@ -2730,20 +2743,20 @@ impl GLProcessorST {
                 gl_type,
                 std::ptr::null(),
             );
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             // TexImage2D overwrites any EGLImage binding on this texture.
             self.render_texture.invalidate_egl_binding();
 
             check_gl_error(function!(), line!())?;
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.render_texture.id,
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, width, height);
+            edgefirst_gl::gl::Viewport(0, 0, width, height);
         }
         Ok(())
     }
@@ -2779,12 +2792,12 @@ impl GLProcessorST {
         };
 
         let format = if is_planar {
-            gls::gl::RED
+            edgefirst_gl::gl::RED
         } else {
             match dst_fmt {
-                PixelFormat::Rgb => gls::gl::RGB,
-                PixelFormat::Rgba | PixelFormat::Bgra => gls::gl::RGBA,
-                PixelFormat::Grey => gls::gl::RED,
+                PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+                PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
+                PixelFormat::Grey => edgefirst_gl::gl::RED,
                 _ => {
                     return Err(crate::Error::NotSupported(format!(
                         "PBO renderbuffer not supported for {dst_fmt}",
@@ -2799,7 +2812,7 @@ impl GLProcessorST {
             buffer_id,
             format,
             format,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
         )
     }
 
@@ -2825,11 +2838,11 @@ impl GLProcessorST {
         let src_h = src.height().ok_or(Error::NotAnImage)?;
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
         let texture_format = match src_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
+            PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+            PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
+            PixelFormat::Grey => edgefirst_gl::gl::RED,
             _ => {
                 return Err(Error::NotSupported(format!(
                     "PBO upload not supported for {src_fmt:?}",
@@ -2879,40 +2892,48 @@ impl GLProcessorST {
         unsafe {
             if has_crop {
                 if let Some(dst_color) = crop.dst_color {
-                    gls::gl::ClearColor(
+                    edgefirst_gl::gl::ClearColor(
                         dst_color[0] as f32 / 255.0,
                         dst_color[1] as f32 / 255.0,
                         dst_color[2] as f32 / 255.0,
                         dst_color[3] as f32 / 255.0,
                     );
-                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                    edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
                 }
             }
 
             // Draw-time program selection (see draw_src_texture).
-            gls::gl::UseProgram(if is_int8 {
+            edgefirst_gl::gl::UseProgram(if is_int8 {
                 self.texture_int8_program.id
             } else {
                 self.texture_program.id
             });
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
-                    gls::gl::TEXTURE_SWIZZLE_R,
-                    gls::gl::TEXTURE_SWIZZLE_G,
-                    gls::gl::TEXTURE_SWIZZLE_B,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_G,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_B,
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        swizzle,
+                        edgefirst_gl::gl::RED as i32,
+                    );
                 }
             } else {
                 for (swizzle, src_component) in [
-                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
-                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
-                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_R, edgefirst_gl::gl::RED),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, edgefirst_gl::gl::GREEN),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_B, edgefirst_gl::gl::BLUE),
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_component as i32);
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        swizzle,
+                        src_component as i32,
+                    );
                 }
             }
 
@@ -2930,9 +2951,9 @@ impl GLProcessorST {
                 .unwrap_or(0);
 
             // Bind source PBO as UNPACK buffer — glTexImage2D reads from it
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
-            gls::gl::TexImage2D(
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, src_buffer_id);
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
+            edgefirst_gl::gl::TexImage2D(
                 texture_target,
                 0,
                 texture_format as i32,
@@ -2940,17 +2961,17 @@ impl GLProcessorST {
                 src_h as i32,
                 0,
                 texture_format,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 std::ptr::null(), // NULL = read from bound UNPACK buffer
             );
-            gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
-            gls::gl::BindBuffer(gls::gl::PIXEL_UNPACK_BUFFER, 0);
+            edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
 
             // Force texture cache state to be rebuilt next call
             self.camera_normal_texture.width = 0;
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             match flip {
                 crate::Flip::None => {}
@@ -2976,17 +2997,17 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0., // left bottom
             ];
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (camera_vertices.len() * std::mem::size_of::<f32>()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
-                gls::gl::STATIC_DRAW,
+                edgefirst_gl::gl::STATIC_DRAW,
             );
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::VertexAttribPointer(
                 self.vertex_buffer.buffer_index,
                 3,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 0,
                 std::ptr::null(),
             );
@@ -3033,27 +3054,27 @@ impl GLProcessorST {
                     src_roi.top,
                 ],
             ];
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (texture_coords[0].len() * std::mem::size_of::<f32>()) as isize,
                 texture_coords[rotation_offset].as_ptr() as *const c_void,
-                gls::gl::STATIC_DRAW,
+                edgefirst_gl::gl::STATIC_DRAW,
             );
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::VertexAttribPointer(
                 self.texture_buffer.buffer_index,
                 2,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 0,
                 std::ptr::null(),
             );
-            gls::gl::DrawArrays(gls::gl::TRIANGLE_FAN, 0, 4);
-            gls::gl::DisableVertexAttribArray(self.vertex_buffer.buffer_index);
-            gls::gl::DisableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::DrawArrays(edgefirst_gl::gl::TRIANGLE_FAN, 0, 4);
+            edgefirst_gl::gl::DisableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::DisableVertexAttribArray(self.texture_buffer.buffer_index);
 
-            gls::gl::Finish();
+            edgefirst_gl::gl::Finish();
         }
 
         check_gl_error(function!(), line!())?;
@@ -3233,7 +3254,7 @@ impl GLProcessorST {
         impl Drop for ScissorGuard {
             fn drop(&mut self) {
                 if self.0 {
-                    unsafe { gls::gl::Disable(gls::gl::SCISSOR_TEST) };
+                    unsafe { edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST) };
                 }
             }
         }
@@ -3246,8 +3267,8 @@ impl GLProcessorST {
                     vo.x, vo.y, dst_w, dst_h,
                 ));
                 unsafe {
-                    gls::gl::Scissor(vp.x, vp.y, vp.w, vp.h);
-                    gls::gl::Enable(gls::gl::SCISSOR_TEST);
+                    edgefirst_gl::gl::Scissor(vp.x, vp.y, vp.w, vp.h);
+                    edgefirst_gl::gl::Enable(edgefirst_gl::gl::SCISSOR_TEST);
                 }
                 ScissorGuard(true)
             }
@@ -3260,13 +3281,13 @@ impl GLProcessorST {
         if has_crop {
             if let Some(dst_color) = crop.dst_color {
                 unsafe {
-                    gls::gl::ClearColor(
+                    edgefirst_gl::gl::ClearColor(
                         dst_color[0] as f32 / 255.0,
                         dst_color[1] as f32 / 255.0,
                         dst_color[2] as f32 / 255.0,
                         dst_color[3] as f32 / 255.0,
                     );
-                    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                    edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
                 };
             }
         }
@@ -3467,7 +3488,7 @@ impl GLProcessorST {
         // batch this is the standalone convert's completion point and must run.
         if !self.defer_finish {
             let start = Instant::now();
-            unsafe { gls::gl::Finish() };
+            unsafe { edgefirst_gl::gl::Finish() };
             log::debug!("gl_Finish takes {:?}", start.elapsed());
         }
         check_gl_error(function!(), line!())?;
@@ -3593,7 +3614,7 @@ impl GLProcessorST {
             alpha,
             is_int8,
         )?;
-        unsafe { gls::gl::Finish() };
+        unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
 
         Ok(())
@@ -3643,15 +3664,15 @@ impl GLProcessorST {
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.packed_rgb_intermediate_tex.id,
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         }
         // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate).
         // It uses dst only for width/height in ROI coordinate math.
@@ -3685,35 +3706,41 @@ impl GLProcessorST {
         unsafe {
             match self.cached_dst_renderbuffer(dst, dst_fmt) {
                 Some(rbo) => {
-                    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-                    gls::gl::FramebufferRenderbuffer(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::RENDERBUFFER,
+                    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+                    edgefirst_gl::gl::FramebufferRenderbuffer(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::RENDERBUFFER,
                         rbo,
                     );
                 }
                 None => {
-                    gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-                    gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.render_texture.id);
-                    super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+                    edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+                    edgefirst_gl::gl::BindTexture(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        self.render_texture.id,
+                    );
+                    super::core::set_tex_filter(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        edgefirst_gl::gl::NEAREST,
+                    );
                     Platform::attach_tex_image_2d(&self.gl_context, dest_egl)?;
                     // Raw re-target bypasses bind_egl_image's key tracking:
                     // drop the cached key so a later bind_egl_image on this
                     // texture cannot "reuse" a binding this call replaced
                     // (silent write into the wrong destination buffer).
                     self.render_texture.invalidate_egl_binding();
-                    gls::gl::FramebufferTexture2D(
-                        gls::gl::FRAMEBUFFER,
-                        gls::gl::COLOR_ATTACHMENT0,
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::FramebufferTexture2D(
+                        edgefirst_gl::gl::FRAMEBUFFER,
+                        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                        edgefirst_gl::gl::TEXTURE_2D,
                         self.render_texture.id,
                         0,
                     );
                 }
             }
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, render_w as i32, render_h as i32);
+            edgefirst_gl::gl::Viewport(0, 0, render_w as i32, render_h as i32);
         }
 
         // Bind intermediate RGBA texture as source for the packing shader
@@ -3723,10 +3750,13 @@ impl GLProcessorST {
             &self.packed_rgba8_program_2d
         };
         unsafe {
-            gls::gl::UseProgram(program.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE1);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
-            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+            edgefirst_gl::gl::UseProgram(program.id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE1);
+            edgefirst_gl::gl::BindTexture(
+                edgefirst_gl::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+            );
+            super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::NEAREST);
         }
 
         // (`tex` = unit 1 is constant per program, uploaded at link time.)
@@ -3739,9 +3769,9 @@ impl GLProcessorST {
         // the processor-wide invariant between operations is "unit 0 active" —
         // leaking unit 1 here is what broke the second heap-source convert
         // (GL_INVALID_VALUE upload into the wrong texture).
-        unsafe { gls::gl::ActiveTexture(gls::gl::TEXTURE0) };
+        unsafe { edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0) };
 
-        unsafe { gls::gl::Finish() };
+        unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
         Ok(())
     }
@@ -3793,15 +3823,15 @@ impl GLProcessorST {
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.packed_rgb_intermediate_tex.id,
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         }
         // convert_to() renders to the currently-bound FBO (packed_rgb_fbo → intermediate RGBA).
         // Note: dst_fmt is passed but ignored (_dst_fmt in convert_to's signature) — the actual
@@ -3854,7 +3884,7 @@ impl GLProcessorST {
 
         self.draw_intermediate_to_rgb_planar(dst_roi, alpha, is_int8)?;
 
-        unsafe { gls::gl::Finish() };
+        unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
         Ok(())
     }
@@ -3865,17 +3895,20 @@ impl GLProcessorST {
             return Ok(());
         }
         unsafe {
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.packed_rgb_intermediate_tex.id);
-            super::core::set_tex_filter(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
-            gls::gl::TexImage2D(
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::BindTexture(
+                edgefirst_gl::gl::TEXTURE_2D,
+                self.packed_rgb_intermediate_tex.id,
+            );
+            super::core::set_tex_filter(edgefirst_gl::gl::TEXTURE_2D, edgefirst_gl::gl::NEAREST);
+            edgefirst_gl::gl::TexImage2D(
+                edgefirst_gl::gl::TEXTURE_2D,
                 0,
-                gls::gl::RGBA as i32,
+                edgefirst_gl::gl::RGBA as i32,
                 width as i32,
                 height as i32,
                 0,
-                gls::gl::RGBA,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
             check_gl_error(function!(), line!())?;
@@ -3888,8 +3921,8 @@ impl GLProcessorST {
     /// Used by the pass-2 packing shader in the two-pass packed RGB pipeline.
     fn draw_fullscreen_quad(&self) -> Result<(), crate::Error> {
         unsafe {
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             let vertices: [f32; 12] = [
                 -1.0, 1.0, 0.0, // top-left
@@ -3897,31 +3930,31 @@ impl GLProcessorST {
                 1.0, -1.0, 0.0, // bottom-right
                 -1.0, -1.0, 0.0, // bottom-left
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * vertices.len()) as isize,
                 vertices.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             // Texture coordinates (the packed shader uses gl_FragCoord, not tc,
             // but we still need valid buffers for the vertex attribute layout)
             let tex_coords: [f32; 8] = [0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * tex_coords.len()) as isize,
                 tex_coords.as_ptr() as *const c_void,
             );
 
             let indices: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 indices.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 indices.as_ptr() as *const c_void,
             );
         }
@@ -3939,26 +3972,26 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         if !alpha && color[0] == color[1] && color[1] == color[2] {
             unsafe {
-                gls::gl::ClearColor(color[0], color[0], color[0], 1.0);
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::ClearColor(color[0], color[0], color[0], 1.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             };
         }
 
         let split = if alpha { 4 } else { 3 };
 
         unsafe {
-            gls::gl::Enable(gls::gl::SCISSOR_TEST);
+            edgefirst_gl::gl::Enable(edgefirst_gl::gl::SCISSOR_TEST);
             let x = (((dst_roi.left + 1.0) / 2.0) * width as f32).round() as i32;
             let y = (((dst_roi.bottom + 1.0) / 2.0) * height as f32).round() as i32;
             let width = (((dst_roi.right - dst_roi.left) / 2.0) * width as f32).round() as i32;
             let height = (((dst_roi.top - dst_roi.bottom) / 2.0) * height as f32 / split as f32)
                 .round() as i32;
             for (i, c) in color.iter().enumerate().take(split) {
-                gls::gl::Scissor(x, y + i as i32 * height, width, height);
-                gls::gl::ClearColor(*c, *c, *c, 1.0);
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::Scissor(x, y + i as i32 * height, width, height);
+                edgefirst_gl::gl::ClearColor(*c, *c, *c, 1.0);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             }
-            gls::gl::Disable(gls::gl::SCISSOR_TEST);
+            edgefirst_gl::gl::Disable(edgefirst_gl::gl::SCISSOR_TEST);
         }
         Ok(())
     }
@@ -3975,7 +4008,7 @@ impl GLProcessorST {
         alpha: bool,
         int8: bool,
     ) -> Result<(), Error> {
-        let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
+        let texture_target = edgefirst_gl::gl::TEXTURE_EXTERNAL_OES;
         match flip {
             Flip::None => {}
             Flip::Vertical => {
@@ -3996,20 +4029,20 @@ impl GLProcessorST {
         })?
         .id;
         unsafe {
-            gls::gl::UseProgram(program_id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
-            super::core::set_tex_filter(texture_target, gls::gl::LINEAR);
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::UseProgram(program_id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
+            super::core::set_tex_filter(texture_target, edgefirst_gl::gl::LINEAR);
+            edgefirst_gl::gl::TexParameteri(
                 texture_target,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
+                edgefirst_gl::gl::TEXTURE_WRAP_S,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::TexParameteri(
                 texture_target,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
+                edgefirst_gl::gl::TEXTURE_WRAP_T,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
             if self.camera_eglimage_texture.bind_egl_image_external(
@@ -4033,11 +4066,16 @@ impl GLProcessorST {
             } else {
                 vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
             };
-            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE, gls::gl::ALPHA];
+            let swizzles = [
+                edgefirst_gl::gl::RED,
+                edgefirst_gl::gl::GREEN,
+                edgefirst_gl::gl::BLUE,
+                edgefirst_gl::gl::ALPHA,
+            ];
             // starts from bottom
             for (i, y_center) in y_centers.iter().enumerate() {
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
                     dst_roi.left,
                     dst_roi.top / 3.0 + y_center,
@@ -4052,15 +4090,18 @@ impl GLProcessorST {
                     dst_roi.bottom / 3.0 + y_center,
                     0., // left bottom
                 ];
-                gls::gl::BufferData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * camera_vertices.len()) as isize,
                     camera_vertices.as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
+                    edgefirst_gl::gl::DYNAMIC_DRAW,
                 );
 
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
+                    self.texture_buffer.id,
+                );
+                edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
                 let texture_vertices: [f32; 16] = [
                     src_roi.left,
                     src_roi.top,
@@ -4080,26 +4121,26 @@ impl GLProcessorST {
                     src_roi.bottom,
                 ];
 
-                gls::gl::BufferData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * 8) as isize,
                     (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
+                    edgefirst_gl::gl::DYNAMIC_DRAW,
                 );
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
                 // self.texture_program_planar
                 //     .load_uniform_1i(c"color_index", 2 - i as i32);
 
-                gls::gl::TexParameteri(
+                edgefirst_gl::gl::TexParameteri(
                     texture_target,
-                    gls::gl::TEXTURE_SWIZZLE_R,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
 
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
-                    gls::gl::UNSIGNED_INT,
+                    edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
             }
@@ -4113,10 +4154,10 @@ impl GLProcessorST {
             // `draw_decoded_masks`, which then channel-permutes the entire
             // overlay's background. Restoring identity before any later
             // sampler sees this texture is the safe move.
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::TexParameteri(
                 texture_target,
-                gls::gl::TEXTURE_SWIZZLE_R,
-                gls::gl::RED as i32,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+                edgefirst_gl::gl::RED as i32,
             );
             check_gl_error(function!(), line!())?;
         }
@@ -4135,17 +4176,17 @@ impl GLProcessorST {
         alpha: bool,
         int8: bool,
     ) -> Result<(), Error> {
-        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
         unsafe {
             let program = if int8 {
                 &self.texture_program_planar_int8_2d
             } else {
                 &self.texture_program_planar_2d
             };
-            gls::gl::UseProgram(program.id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
-            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
+            edgefirst_gl::gl::UseProgram(program.id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(texture_target, self.packed_rgb_intermediate_tex.id);
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
 
             // (`tex` = unit 0 is constant per program, uploaded at link time.)
             check_gl_error(function!(), line!())?;
@@ -4155,7 +4196,12 @@ impl GLProcessorST {
             } else {
                 vec![-2.0 / 3.0, 0.0, 2.0 / 3.0]
             };
-            let swizzles = [gls::gl::RED, gls::gl::GREEN, gls::gl::BLUE, gls::gl::ALPHA];
+            let swizzles = [
+                edgefirst_gl::gl::RED,
+                edgefirst_gl::gl::GREEN,
+                edgefirst_gl::gl::BLUE,
+                edgefirst_gl::gl::ALPHA,
+            ];
 
             // Source ROI is always fullscreen (intermediate is already at destination size)
             let src_roi = RegionOfInterest {
@@ -4166,8 +4212,8 @@ impl GLProcessorST {
             };
 
             for (i, y_center) in y_centers.iter().enumerate() {
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let camera_vertices: [f32; 12] = [
                     dst_roi.left,
                     dst_roi.top / 3.0 + y_center,
@@ -4182,15 +4228,18 @@ impl GLProcessorST {
                     dst_roi.bottom / 3.0 + y_center,
                     0., // left bottom
                 ];
-                gls::gl::BufferData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * camera_vertices.len()) as isize,
                     camera_vertices.as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
+                    edgefirst_gl::gl::DYNAMIC_DRAW,
                 );
 
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
+                    self.texture_buffer.id,
+                );
+                edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
                 // No rotation — pass 1 already handled it. Use base texture coords directly.
                 let texture_vertices: [f32; 8] = [
                     src_roi.left,
@@ -4202,25 +4251,25 @@ impl GLProcessorST {
                     src_roi.left,
                     src_roi.bottom,
                 ];
-                gls::gl::BufferData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * texture_vertices.len()) as isize,
                     texture_vertices.as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
+                    edgefirst_gl::gl::DYNAMIC_DRAW,
                 );
 
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
 
-                gls::gl::TexParameteri(
+                edgefirst_gl::gl::TexParameteri(
                     texture_target,
-                    gls::gl::TEXTURE_SWIZZLE_R,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
                     swizzles[i] as i32,
                 );
 
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
-                    gls::gl::UNSIGNED_INT,
+                    edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
             }
@@ -4231,10 +4280,10 @@ impl GLProcessorST {
             // planar channel selected (for example `GL_BLUE` for RGB or
             // `GL_ALPHA` for RGBA) poisons every later sampler bound to this
             // texture object.
-            gls::gl::TexParameteri(
+            edgefirst_gl::gl::TexParameteri(
                 texture_target,
-                gls::gl::TEXTURE_SWIZZLE_R,
-                gls::gl::RED as i32,
+                edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+                edgefirst_gl::gl::RED as i32,
             );
             check_gl_error(function!(), line!())?;
         }
@@ -4254,7 +4303,7 @@ impl GLProcessorST {
     ) -> Result<(), Error> {
         let src_w = src.width().ok_or(Error::NotAnImage)?;
         let src_h = src.height().ok_or(Error::NotAnImage)?;
-        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
         // Zero-copy source attach: on platforms whose imports bind as
         // TEXTURE_2D (macOS IOSurface), a Dma-memory source is imported
         // and attached to the source texture instead of being uploaded.
@@ -4280,12 +4329,12 @@ impl GLProcessorST {
             None
         };
         let texture_format = match src_fmt {
-            PixelFormat::Rgb => gls::gl::RGB,
-            PixelFormat::Rgba => gls::gl::RGBA,
-            PixelFormat::Grey => gls::gl::RED,
+            PixelFormat::Rgb => edgefirst_gl::gl::RGB,
+            PixelFormat::Rgba => edgefirst_gl::gl::RGBA,
+            PixelFormat::Grey => edgefirst_gl::gl::RED,
             // YUYV samples as RG (R=Y, G=alternating chroma) — zero-copy
             // attach only; there is deliberately no upload arm yet.
-            PixelFormat::Yuyv if zero_copy_attach.is_some() => gls::gl::RG,
+            PixelFormat::Yuyv if zero_copy_attach.is_some() => edgefirst_gl::gl::RG,
             _ => {
                 return Err(Error::NotSupported(format!(
                     "draw_src_texture does not support {src_fmt:?} (use DMA-BUF path for YUV)",
@@ -4308,7 +4357,7 @@ impl GLProcessorST {
             self.texture_program.id
         };
         unsafe {
-            gls::gl::UseProgram(program_id);
+            edgefirst_gl::gl::UseProgram(program_id);
             if src_fmt == PixelFormat::Yuyv {
                 // YUYV program inputs: source texel grid + the YUV→RGB
                 // matrix/range resolved from the tensor colorimetry (same
@@ -4320,32 +4369,40 @@ impl GLProcessorST {
                     cm.range.unwrap_or(edgefirst_tensor::ColorRange::Limited),
                 );
                 let [src_size, y_offset, y_scale, c_vr, c_ug, c_vg, c_ub] = self.yuyv_2d_locs;
-                gls::gl::Uniform2f(src_size, src_w as f32, src_h as f32);
-                gls::gl::Uniform1f(y_offset, coeffs.y_offset);
-                gls::gl::Uniform1f(y_scale, coeffs.y_scale);
-                gls::gl::Uniform1f(c_vr, coeffs.c_vr);
-                gls::gl::Uniform1f(c_ug, coeffs.c_ug);
-                gls::gl::Uniform1f(c_vg, coeffs.c_vg);
-                gls::gl::Uniform1f(c_ub, coeffs.c_ub);
+                edgefirst_gl::gl::Uniform2f(src_size, src_w as f32, src_h as f32);
+                edgefirst_gl::gl::Uniform1f(y_offset, coeffs.y_offset);
+                edgefirst_gl::gl::Uniform1f(y_scale, coeffs.y_scale);
+                edgefirst_gl::gl::Uniform1f(c_vr, coeffs.c_vr);
+                edgefirst_gl::gl::Uniform1f(c_ug, coeffs.c_ug);
+                edgefirst_gl::gl::Uniform1f(c_vg, coeffs.c_vg);
+                edgefirst_gl::gl::Uniform1f(c_ub, coeffs.c_ub);
             }
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(texture_target, self.camera_normal_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(texture_target, self.camera_normal_texture.id);
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
             if src_fmt == PixelFormat::Grey {
                 for swizzle in [
-                    gls::gl::TEXTURE_SWIZZLE_R,
-                    gls::gl::TEXTURE_SWIZZLE_G,
-                    gls::gl::TEXTURE_SWIZZLE_B,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_R,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_G,
+                    edgefirst_gl::gl::TEXTURE_SWIZZLE_B,
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, gls::gl::RED as i32);
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        swizzle,
+                        edgefirst_gl::gl::RED as i32,
+                    );
                 }
             } else {
                 for (swizzle, src_comp) in [
-                    (gls::gl::TEXTURE_SWIZZLE_R, gls::gl::RED),
-                    (gls::gl::TEXTURE_SWIZZLE_G, gls::gl::GREEN),
-                    (gls::gl::TEXTURE_SWIZZLE_B, gls::gl::BLUE),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_R, edgefirst_gl::gl::RED),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_G, edgefirst_gl::gl::GREEN),
+                    (edgefirst_gl::gl::TEXTURE_SWIZZLE_B, edgefirst_gl::gl::BLUE),
                 ] {
-                    gls::gl::TexParameteri(gls::gl::TEXTURE_2D, swizzle, src_comp as i32);
+                    edgefirst_gl::gl::TexParameteri(
+                        edgefirst_gl::gl::TEXTURE_2D,
+                        swizzle,
+                        src_comp as i32,
+                    );
                 }
             }
             // The source map exposes the full row-padded allocation (DMA/IOSurface
@@ -4369,7 +4426,10 @@ impl GLProcessorST {
                     .map(|s| s / src_bpp)
                     .filter(|&px| px != src_w)
                     .unwrap_or(0);
-                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, row_len_px as i32);
+                edgefirst_gl::gl::PixelStorei(
+                    edgefirst_gl::gl::UNPACK_ROW_LENGTH,
+                    row_len_px as i32,
+                );
                 self.camera_normal_texture.update_texture(
                     texture_target,
                     src_w,
@@ -4377,11 +4437,11 @@ impl GLProcessorST {
                     texture_format,
                     &src.map()?,
                 );
-                gls::gl::PixelStorei(gls::gl::UNPACK_ROW_LENGTH, 0);
+                edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             }
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             match flip {
                 Flip::None => {}
@@ -4407,14 +4467,14 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0., // left bottom
             ];
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
                 src_roi.top,
@@ -4434,17 +4494,17 @@ impl GLProcessorST {
                 src_roi.bottom,
             ];
 
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
             check_gl_error(function!(), line!())?;
@@ -4479,12 +4539,12 @@ impl GLProcessorST {
             Error::NotSupported("external-OES sampler program unavailable on this platform".into())
         })?
         .id;
-        let texture_target = gls::gl::TEXTURE_EXTERNAL_OES;
+        let texture_target = edgefirst_gl::gl::TEXTURE_EXTERNAL_OES;
         unsafe {
-            gls::gl::UseProgram(program_id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
-            super::core::set_tex_filter_clamp(texture_target, gls::gl::LINEAR);
+            edgefirst_gl::gl::UseProgram(program_id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(texture_target, self.camera_eglimage_texture.id);
+            super::core::set_tex_filter_clamp(texture_target, edgefirst_gl::gl::LINEAR);
 
             // Note: GL_TEXTURE_SWIZZLE_* is not supported for
             // GL_TEXTURE_EXTERNAL_OES in GLES. YUV→RGB conversion is
@@ -4502,8 +4562,8 @@ impl GLProcessorST {
             } else {
                 log::trace!("draw_camera: reusing bound src EGLImage id={luma_id:#x}");
             }
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             match flip {
                 Flip::None => {}
@@ -4529,15 +4589,15 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0., // left bottom
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
@@ -4557,18 +4617,18 @@ impl GLProcessorST {
                 src_roi.left,
                 src_roi.bottom,
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
             );
 
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
         }
@@ -4660,11 +4720,14 @@ impl GLProcessorST {
         let upload_colorimetry = state.last_colorimetry != Some(colorimetry);
 
         unsafe {
-            gls::gl::UseProgram(prog_id);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.nv_r8_texture.id);
+            edgefirst_gl::gl::UseProgram(prog_id);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.nv_r8_texture.id);
             // NEAREST — we address by integer texel; no interpolation wanted.
-            super::core::set_tex_filter_clamp(gls::gl::TEXTURE_2D, gls::gl::NEAREST);
+            super::core::set_tex_filter_clamp(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::NEAREST,
+            );
 
             match r8_src {
                 Some(egl_img) => {
@@ -4719,15 +4782,15 @@ impl GLProcessorST {
                     // (TODO/EDGEAI: reuse storage via glTexSubImage2D when dims are
                     // unchanged instead of reallocating every frame — tracked
                     // follow-up; needs EGLImage-vs-upload storage tracking to be safe.)
-                    gls::gl::TexImage2D(
-                        gls::gl::TEXTURE_2D,
+                    edgefirst_gl::gl::TexImage2D(
+                        edgefirst_gl::gl::TEXTURE_2D,
                         0,
-                        gls::gl::R8 as i32,
+                        edgefirst_gl::gl::R8 as i32,
                         tex_width,
                         combined_h as i32,
                         0,
-                        gls::gl::RED,
-                        gls::gl::UNSIGNED_BYTE,
+                        edgefirst_gl::gl::RED,
+                        edgefirst_gl::gl::UNSIGNED_BYTE,
                         bytes[offset..].as_ptr() as *const c_void,
                     );
                     check_gl_error(function!(), line!())?;
@@ -4740,23 +4803,23 @@ impl GLProcessorST {
 
             // Per-source uniforms through link-time-cached locations (the
             // `src` sampler binding is constant and uploaded at resolve time).
-            gls::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
-            gls::gl::Uniform1i(locs.tex_width, tex_width);
-            gls::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
-            gls::gl::Uniform1i(locs.chroma_lines, chroma_lines);
+            edgefirst_gl::gl::Uniform2i(locs.img_size, src_w as i32, src_h as i32);
+            edgefirst_gl::gl::Uniform1i(locs.tex_width, tex_width);
+            edgefirst_gl::gl::Uniform2i(locs.chroma_shift, chroma_shift_x, chroma_shift_y);
+            edgefirst_gl::gl::Uniform1i(locs.chroma_lines, chroma_lines);
 
             if upload_colorimetry {
                 let coeffs = crate::colorimetry::yuv_to_rgb_coeffs(colorimetry.0, colorimetry.1);
-                gls::gl::Uniform1f(locs.y_offset, coeffs.y_offset);
-                gls::gl::Uniform1f(locs.y_scale, coeffs.y_scale);
-                gls::gl::Uniform1f(locs.c_vr, coeffs.c_vr);
-                gls::gl::Uniform1f(locs.c_ug, coeffs.c_ug);
-                gls::gl::Uniform1f(locs.c_vg, coeffs.c_vg);
-                gls::gl::Uniform1f(locs.c_ub, coeffs.c_ub);
+                edgefirst_gl::gl::Uniform1f(locs.y_offset, coeffs.y_offset);
+                edgefirst_gl::gl::Uniform1f(locs.y_scale, coeffs.y_scale);
+                edgefirst_gl::gl::Uniform1f(locs.c_vr, coeffs.c_vr);
+                edgefirst_gl::gl::Uniform1f(locs.c_ug, coeffs.c_ug);
+                edgefirst_gl::gl::Uniform1f(locs.c_vg, coeffs.c_vg);
+                edgefirst_gl::gl::Uniform1f(locs.c_ub, coeffs.c_ub);
             }
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             match flip {
                 Flip::None => {}
@@ -4782,15 +4845,15 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0.,
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             let texture_vertices: [f32; 16] = [
                 src_roi.left,
@@ -4810,18 +4873,18 @@ impl GLProcessorST {
                 src_roi.left,
                 src_roi.bottom,
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices[(rotation_offset * 2)..]).as_ptr() as *const c_void,
             );
 
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
         }
@@ -4954,14 +5017,14 @@ impl GLProcessorST {
         let rbo = if cache == CacheKind::Dst && self.use_renderbuffer {
             let mut rbo: u32 = 0;
             unsafe {
-                gls::gl::GenRenderbuffers(1, &mut rbo);
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+                edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
                 Platform::attach_renderbuffer_storage(
                     &self.gl_context,
                     Platform::import_handle(&egl_image_obj),
                 )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
-                    gls::gl::DeleteRenderbuffers(1, &rbo);
+                    edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
                 }
             }
@@ -5069,14 +5132,14 @@ impl GLProcessorST {
         let rbo = if self.use_renderbuffer {
             let mut rbo: u32 = 0;
             unsafe {
-                gls::gl::GenRenderbuffers(1, &mut rbo);
-                gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
+                edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+                edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
                 Platform::attach_renderbuffer_storage(
                     &self.gl_context,
                     Platform::import_handle(&egl_image_obj),
                 )?;
                 if let Err(e) = check_gl_error(function!(), line!()) {
-                    gls::gl::DeleteRenderbuffers(1, &rbo);
+                    edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
                     return Err(e);
                 }
             }
@@ -5146,38 +5209,38 @@ impl GLProcessorST {
 
         let [height, width, classes] = shape;
 
-        let format = gls::gl::RGBA;
-        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+        let format = edgefirst_gl::gl::RGBA;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D_ARRAY;
         self.segmentation_program
             .load_uniform_1i(c"background_index", shape[2] as i32 - 1)?;
 
-        gls::use_program(self.segmentation_program.id);
+        edgefirst_gl::use_program(self.segmentation_program.id);
 
-        gls::bind_texture(texture_target, self.segmentation_texture.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::tex_parameteri(
+        edgefirst_gl::bind_texture(texture_target, self.segmentation_texture.id);
+        edgefirst_gl::active_texture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::LINEAR as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::LINEAR as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
-        );
-
-        gls::tex_parameteri(
-            texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TEXTURE_WRAP_S,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
 
-        gls::tex_image3d(
+        edgefirst_gl::tex_parameteri(
+            texture_target,
+            edgefirst_gl::gl::TEXTURE_WRAP_T,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
+        );
+
+        edgefirst_gl::tex_image3d(
             texture_target,
             0,
             format as i32,
@@ -5186,7 +5249,7 @@ impl GLProcessorST {
             classes.div_ceil(4) as i32,
             0,
             format,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             Some(&new_segmentation),
         );
 
@@ -5198,8 +5261,8 @@ impl GLProcessorST {
         };
 
         unsafe {
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             let camera_vertices: [f32; 12] = [
                 dst_roi.left,
@@ -5215,15 +5278,15 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0., // left bottom
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             let texture_vertices: [f32; 8] = [
                 src_roi.left,
@@ -5235,18 +5298,18 @@ impl GLProcessorST {
                 src_roi.left,
                 src_roi.bottom,
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices[0..]).as_ptr() as *const c_void,
             );
 
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
         }
@@ -5261,29 +5324,29 @@ impl GLProcessorST {
     /// `render_yolo_segmentation` avoids N× redundant `glTexParameteri`,
     /// `glUseProgram`, and `glBindTexture` calls per frame.
     fn setup_yolo_segmentation_pass(&self) {
-        let texture_target = gls::gl::TEXTURE_2D;
-        gls::use_program(self.instanced_segmentation_program.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::bind_texture(texture_target, self.segmentation_texture.id);
-        gls::tex_parameteri(
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
+        edgefirst_gl::use_program(self.instanced_segmentation_program.id);
+        edgefirst_gl::active_texture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::bind_texture(texture_target, self.segmentation_texture.id);
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::LINEAR as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::LINEAR as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TEXTURE_WRAP_S,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             texture_target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TEXTURE_WRAP_T,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
     }
 
@@ -5310,7 +5373,7 @@ impl GLProcessorST {
         class: usize,
     ) -> Result<(), crate::Error> {
         let [height, width] = shape;
-        let texture_target = gls::gl::TEXTURE_2D;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D;
 
         // Per-instance allocation + upload, equivalent to the old code path
         // but without the CPU pad copy. `glTexImage2D` here implicitly
@@ -5318,15 +5381,15 @@ impl GLProcessorST {
         // the in-flight previous draw keeps the old storage alive while
         // the new mask uploads to fresh memory, preserving CPU/GPU
         // parallelism.
-        gls::tex_image2d(
+        edgefirst_gl::tex_image2d(
             texture_target,
             0,
-            gls::gl::R8 as i32,
+            edgefirst_gl::gl::R8 as i32,
             width as i32,
             height as i32,
             0,
-            gls::gl::RED,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::RED,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             Some(segmentation),
         );
 
@@ -5352,8 +5415,8 @@ impl GLProcessorST {
         };
 
         unsafe {
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
             let camera_vertices: [f32; 12] = [
                 dst_roi.left,
@@ -5369,15 +5432,15 @@ impl GLProcessorST {
                 dst_roi.bottom,
                 0., // left bottom
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * camera_vertices.len()) as isize,
                 camera_vertices.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-            gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
             let texture_vertices: [f32; 8] = [
                 src_roi.left,
@@ -5389,18 +5452,18 @@ impl GLProcessorST {
                 src_roi.left,
                 src_roi.bottom,
             ];
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (size_of::<f32>() * 8) as isize,
                 (texture_vertices).as_ptr() as *const c_void,
             );
 
             let vertices_index: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::DrawElements(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::DrawElements(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 vertices_index.len() as i32,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 vertices_index.as_ptr() as *const c_void,
             );
 
@@ -5414,11 +5477,11 @@ impl GLProcessorST {
             // Mali Valhall (i.MX 95) is the opposite — `glFinish()` here
             // forces a TBDR tile store-unload of the framebuffer per
             // draw, which dominates the per-instance cost. Letting the
-            // pipeline batch into the single `gls::finish()` at the end
+            // pipeline batch into the single `edgefirst_gl::finish()` at the end
             // of `draw_decoded_masks_impl` recovers ~30% on a 40-mask
             // crowd scene.
             if self.is_vivante {
-                gls::gl::Finish();
+                edgefirst_gl::gl::Finish();
             }
         }
 
@@ -5471,7 +5534,7 @@ impl GLProcessorST {
         if coeff_shape[0] == 0 {
             return Ok(());
         }
-        let texture_target = gls::gl::TEXTURE_2D_ARRAY;
+        let texture_target = edgefirst_gl::gl::TEXTURE_2D_ARRAY;
 
         // Pure path decision: upload strategy × program × count uniform.
         // Rejects NCHW layouts and unsupported proto dtypes up front (the
@@ -5641,7 +5704,7 @@ impl GLProcessorST {
             }
         }
 
-        unsafe { gls::gl::Finish() };
+        unsafe { edgefirst_gl::gl::Finish() };
         Ok(())
     }
 
@@ -5664,8 +5727,10 @@ impl GLProcessorST {
         let (cached_id, mut loc_coeff, mut loc_class) = self.proto_quad_locs.get();
         if cached_id != program.id {
             unsafe {
-                loc_coeff = gls::gl::GetUniformLocation(program.id, c"mask_coeff".as_ptr());
-                loc_class = gls::gl::GetUniformLocation(program.id, c"class_index".as_ptr());
+                loc_coeff =
+                    edgefirst_gl::gl::GetUniformLocation(program.id, c"mask_coeff".as_ptr());
+                loc_class =
+                    edgefirst_gl::gl::GetUniformLocation(program.id, c"class_index".as_ptr());
             }
             self.proto_quad_locs.set((program.id, loc_coeff, loc_class));
         }
@@ -5686,8 +5751,8 @@ impl GLProcessorST {
             }
 
             unsafe {
-                gls::gl::Uniform4fv(loc_coeff, 8, packed_coeff.as_ptr() as *const f32);
-                gls::gl::Uniform1i(loc_class, color_index as i32);
+                edgefirst_gl::gl::Uniform4fv(loc_coeff, 8, packed_coeff.as_ptr() as *const f32);
+                edgefirst_gl::gl::Uniform1i(loc_class, color_index as i32);
             }
 
             let dst_roi = RegionOfInterest {
@@ -5712,8 +5777,8 @@ impl GLProcessorST {
             };
 
             unsafe {
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
 
                 let camera_vertices: [f32; 12] = [
                     dst_roi.left,
@@ -5729,15 +5794,18 @@ impl GLProcessorST {
                     dst_roi.bottom,
                     0.,
                 ];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferSubData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     0,
                     (size_of::<f32>() * camera_vertices.len()) as isize,
                     camera_vertices.as_ptr() as *const c_void,
                 );
 
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texture_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
+                    self.texture_buffer.id,
+                );
+                edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
 
                 let texture_vertices: [f32; 8] = [
                     src_roi.left,
@@ -5749,18 +5817,18 @@ impl GLProcessorST {
                     src_roi.left,
                     src_roi.bottom,
                 ];
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferSubData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     0,
                     (size_of::<f32>() * 8) as isize,
                     texture_vertices.as_ptr() as *const c_void,
                 );
 
                 let vertices_index: [u32; 4] = [0, 1, 2, 3];
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_FAN,
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLE_FAN,
                     vertices_index.len() as i32,
-                    gls::gl::UNSIGNED_INT,
+                    edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
             }
@@ -5811,61 +5879,75 @@ impl GLProcessorST {
             // Allocate as R32I (imageStore-compatible; the int8 fragment
             // shaders read integers identically from R8I or R32I via
             // texelFetch). Immutable storage + binding handled by the gate.
-            if self.ensure_proto_texture(texture_target, gls::gl::R32I, width, height, num_protos) {
-                Self::set_proto_tex_params(texture_target, gls::gl::NEAREST);
+            if self.ensure_proto_texture(
+                texture_target,
+                edgefirst_gl::gl::R32I,
+                width,
+                height,
+                num_protos,
+            ) {
+                Self::set_proto_tex_params(texture_target, edgefirst_gl::gl::NEAREST);
             }
 
             unsafe {
                 // Upload HWC data to SSBO
-                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, self.proto_ssbo);
+                edgefirst_gl::gl::BindBuffer(
+                    edgefirst_gl::gl::SHADER_STORAGE_BUFFER,
+                    self.proto_ssbo,
+                );
                 if data_bytes > self.proto_ssbo_size {
-                    gls::gl::BufferData(
-                        gls::gl::SHADER_STORAGE_BUFFER,
+                    edgefirst_gl::gl::BufferData(
+                        edgefirst_gl::gl::SHADER_STORAGE_BUFFER,
                         data_bytes as isize,
                         data.as_ptr() as *const std::ffi::c_void,
-                        gls::gl::STREAM_DRAW,
+                        edgefirst_gl::gl::STREAM_DRAW,
                     );
                     self.proto_ssbo_size = data_bytes;
                 } else {
-                    gls::gl::BufferSubData(
-                        gls::gl::SHADER_STORAGE_BUFFER,
+                    edgefirst_gl::gl::BufferSubData(
+                        edgefirst_gl::gl::SHADER_STORAGE_BUFFER,
                         0,
                         data_bytes as isize,
                         data.as_ptr() as *const std::ffi::c_void,
                     );
                 }
-                gls::gl::BindBufferBase(gls::gl::SHADER_STORAGE_BUFFER, 0, self.proto_ssbo);
+                edgefirst_gl::gl::BindBufferBase(
+                    edgefirst_gl::gl::SHADER_STORAGE_BUFFER,
+                    0,
+                    self.proto_ssbo,
+                );
 
                 // Bind texture as image for compute write (R32I for compatibility)
-                gls::gl::BindImageTexture(
+                edgefirst_gl::gl::BindImageTexture(
                     0,
                     self.proto_texture.id,
                     0,
-                    gls::gl::TRUE,
+                    edgefirst_gl::gl::TRUE,
                     0,
-                    gls::gl::WRITE_ONLY,
-                    gls::gl::R32I,
+                    edgefirst_gl::gl::WRITE_ONLY,
+                    edgefirst_gl::gl::R32I,
                 );
 
                 // Dispatch compute (uniform locations resolved at compile)
-                gls::gl::UseProgram(compute_program);
+                edgefirst_gl::gl::UseProgram(compute_program);
                 let (loc_w, loc_h, loc_np) = self.proto_compute_locs;
-                gls::gl::Uniform1i(loc_w, width as i32);
-                gls::gl::Uniform1i(loc_h, height as i32);
-                gls::gl::Uniform1i(loc_np, num_protos as i32);
+                edgefirst_gl::gl::Uniform1i(loc_w, width as i32);
+                edgefirst_gl::gl::Uniform1i(loc_h, height as i32);
+                edgefirst_gl::gl::Uniform1i(loc_np, num_protos as i32);
 
                 let groups_x = width.div_ceil(16) as u32;
                 let groups_y = height.div_ceil(16) as u32;
-                gls::gl::DispatchCompute(groups_x, groups_y, 1);
-                gls::gl::MemoryBarrier(
-                    gls::gl::TEXTURE_FETCH_BARRIER_BIT | gls::gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                edgefirst_gl::gl::DispatchCompute(groups_x, groups_y, 1);
+                edgefirst_gl::gl::MemoryBarrier(
+                    edgefirst_gl::gl::TEXTURE_FETCH_BARRIER_BIT
+                        | edgefirst_gl::gl::SHADER_IMAGE_ACCESS_BARRIER_BIT,
                 );
 
                 // Unbind SSBO and log any GL errors from compute dispatch
-                gls::gl::BindBuffer(gls::gl::SHADER_STORAGE_BUFFER, 0);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::SHADER_STORAGE_BUFFER, 0);
                 loop {
-                    let err = gls::gl::GetError();
-                    if err == gls::gl::NO_ERROR {
+                    let err = edgefirst_gl::gl::GetError();
+                    if err == edgefirst_gl::gl::NO_ERROR {
                         break;
                     }
                     log::debug!("GL error after compute dispatch: 0x{err:x}");
@@ -5877,13 +5959,13 @@ impl GLProcessorST {
 
             self.upload_proto_texture(
                 texture_target,
-                gls::gl::R8I,
+                edgefirst_gl::gl::R8I,
                 width,
                 height,
                 num_protos,
-                gls::gl::RED_INTEGER,
-                gls::gl::BYTE,
-                gls::gl::NEAREST,
+                edgefirst_gl::gl::RED_INTEGER,
+                edgefirst_gl::gl::BYTE,
+                edgefirst_gl::gl::NEAREST,
                 &tex_data,
             );
         }
@@ -5899,7 +5981,7 @@ impl GLProcessorST {
                 } else {
                     &self.proto_segmentation_int8_bilinear_program
                 };
-                gls::use_program(program.id);
+                edgefirst_gl::use_program(program.id);
                 program.load_uniform_1i(c"num_protos", num_protos as i32)?;
                 program.load_uniform_1f(c"proto_scale", proto_scale)?;
                 program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
@@ -5952,9 +6034,9 @@ impl GLProcessorST {
         // Save the caller's FBO and viewport so we can restore after dequant.
         let (saved_fbo, saved_viewport) = unsafe {
             let mut fbo: i32 = 0;
-            gls::gl::GetIntegerv(gls::gl::FRAMEBUFFER_BINDING, &mut fbo);
+            edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::FRAMEBUFFER_BINDING, &mut fbo);
             let mut vp = [0i32; 4];
-            gls::gl::GetIntegerv(gls::gl::VIEWPORT, vp.as_mut_ptr());
+            edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::VIEWPORT, vp.as_mut_ptr());
             (fbo as u32, vp)
         };
 
@@ -5966,38 +6048,38 @@ impl GLProcessorST {
             &mut self.proto_dequant_texture,
             &mut self.proto_dequant_tex_dims,
             texture_target,
-            gls::gl::RGBA16F,
+            edgefirst_gl::gl::RGBA16F,
             width,
             height,
             num_layers,
         ) {
-            Self::set_proto_tex_params(texture_target, gls::gl::LINEAR);
+            Self::set_proto_tex_params(texture_target, edgefirst_gl::gl::LINEAR);
         }
 
         let proto_scale = quantization.scale;
         let proto_scaled_zp = -(quantization.zero_point as f32) * quantization.scale;
 
         let dequant_program = &self.proto_dequant_int8_program;
-        gls::use_program(dequant_program.id);
+        edgefirst_gl::use_program(dequant_program.id);
         dequant_program.load_uniform_1f(c"proto_scale", proto_scale)?;
         dequant_program.load_uniform_1f(c"proto_scaled_zp", proto_scaled_zp)?;
 
         // Bind the int8 proto texture to TEXTURE0 for the dequant shader
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::bind_texture(texture_target, self.proto_texture.id);
+        edgefirst_gl::active_texture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::bind_texture(texture_target, self.proto_texture.id);
 
         // Render each RGBA16F layer (4 protos per layer)
         for layer in 0..num_layers {
             self.proto_dequant_fbo.bind();
             unsafe {
-                gls::gl::FramebufferTextureLayer(
-                    gls::gl::FRAMEBUFFER,
-                    gls::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::FramebufferTextureLayer(
+                    edgefirst_gl::gl::FRAMEBUFFER,
+                    edgefirst_gl::gl::COLOR_ATTACHMENT0,
                     self.proto_dequant_texture.id,
                     0,
                     layer as i32,
                 );
-                gls::gl::Viewport(0, 0, width as i32, height as i32);
+                edgefirst_gl::gl::Viewport(0, 0, width as i32, height as i32);
             }
             dequant_program.load_uniform_1i(c"base_layer", (layer * 4) as i32)?;
             self.draw_fullscreen_quad()?;
@@ -6005,8 +6087,8 @@ impl GLProcessorST {
 
         // Restore the caller's FBO and viewport.
         unsafe {
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, saved_fbo);
-            gls::gl::Viewport(
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, saved_fbo);
+            edgefirst_gl::gl::Viewport(
                 saved_viewport[0],
                 saved_viewport[1],
                 saved_viewport[2],
@@ -6016,9 +6098,9 @@ impl GLProcessorST {
 
         // Pass 2: render with existing f16 shader reading from dequant texture
         let program = &self.proto_segmentation_program;
-        gls::use_program(program.id);
-        gls::active_texture(gls::gl::TEXTURE0);
-        gls::bind_texture(texture_target, self.proto_dequant_texture.id);
+        edgefirst_gl::use_program(program.id);
+        edgefirst_gl::active_texture(edgefirst_gl::gl::TEXTURE0);
+        edgefirst_gl::bind_texture(texture_target, self.proto_dequant_texture.id);
         program.load_uniform_1i(c"num_layers", num_layers as i32)?;
         self.render_proto_detection_quads(
             program,
@@ -6060,13 +6142,13 @@ impl GLProcessorST {
                 let tex_data = super::proto_dispatch::repack_layers(*v);
                 self.upload_proto_texture(
                     texture_target,
-                    gls::gl::R32F,
+                    edgefirst_gl::gl::R32F,
                     width,
                     height,
                     num_protos,
-                    gls::gl::RED,
-                    gls::gl::FLOAT,
-                    gls::gl::LINEAR,
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::FLOAT,
+                    edgefirst_gl::gl::LINEAR,
                     &tex_data,
                 );
             }
@@ -6075,13 +6157,13 @@ impl GLProcessorST {
                     super::proto_dispatch::repack_rgba_f16_layers(*v, half::f16::from_f32);
                 self.upload_proto_texture(
                     texture_target,
-                    gls::gl::RGBA16F,
+                    edgefirst_gl::gl::RGBA16F,
                     width,
                     height,
                     num_layers,
-                    gls::gl::RGBA,
-                    gls::gl::HALF_FLOAT,
-                    gls::gl::LINEAR,
+                    edgefirst_gl::gl::RGBA,
+                    edgefirst_gl::gl::HALF_FLOAT,
+                    edgefirst_gl::gl::LINEAR,
                     &tex_data,
                 );
             }
@@ -6089,13 +6171,13 @@ impl GLProcessorST {
                 let (tex_data, _) = super::proto_dispatch::repack_rgba_f16_layers(*v, |x| x);
                 self.upload_proto_texture(
                     texture_target,
-                    gls::gl::RGBA16F,
+                    edgefirst_gl::gl::RGBA16F,
                     width,
                     height,
                     num_layers,
-                    gls::gl::RGBA,
-                    gls::gl::HALF_FLOAT,
-                    gls::gl::LINEAR,
+                    edgefirst_gl::gl::RGBA,
+                    edgefirst_gl::gl::HALF_FLOAT,
+                    edgefirst_gl::gl::LINEAR,
                     &tex_data,
                 );
             }
@@ -6115,7 +6197,7 @@ impl GLProcessorST {
                 )));
             }
         };
-        gls::use_program(program.id);
+        edgefirst_gl::use_program(program.id);
         match plan.count_uniform {
             CountUniform::NumProtos => program.load_uniform_1i(c"num_protos", num_protos as i32)?,
             CountUniform::NumLayers => program.load_uniform_1i(c"num_layers", num_layers as i32)?,
@@ -6194,40 +6276,44 @@ impl GLProcessorST {
             }
         }
 
-        gls::disable(gls::gl::BLEND);
+        edgefirst_gl::disable(edgefirst_gl::gl::BLEND);
         Ok(())
     }
 
     /// Compile a GLES 3.1 compute shader program from source.
     fn compile_compute_program(source: &str) -> Result<u32, Error> {
         unsafe {
-            let cs = gls::gl::CreateShader(gls::gl::COMPUTE_SHADER);
+            let cs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::COMPUTE_SHADER);
             if super::shaders::compile_shader_from_str(cs, source, "proto_repack_compute").is_err()
             {
-                gls::gl::DeleteShader(cs);
+                edgefirst_gl::gl::DeleteShader(cs);
                 return Err(Error::OpenGl("compute shader compile failed".into()));
             }
 
-            let program = gls::gl::CreateProgram();
-            gls::gl::AttachShader(program, cs);
-            gls::gl::LinkProgram(program);
+            let program = edgefirst_gl::gl::CreateProgram();
+            edgefirst_gl::gl::AttachShader(program, cs);
+            edgefirst_gl::gl::LinkProgram(program);
 
             let mut linked: i32 = 0;
-            gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut linked);
-            gls::gl::DeleteShader(cs);
+            edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::LINK_STATUS, &mut linked);
+            edgefirst_gl::gl::DeleteShader(cs);
 
             if linked == 0 {
                 let mut log_len = 0;
-                gls::gl::GetProgramiv(program, gls::gl::INFO_LOG_LENGTH, &mut log_len);
+                edgefirst_gl::gl::GetProgramiv(
+                    program,
+                    edgefirst_gl::gl::INFO_LOG_LENGTH,
+                    &mut log_len,
+                );
                 let mut log_buf: Vec<u8> = vec![0; log_len as usize];
-                gls::gl::GetProgramInfoLog(
+                edgefirst_gl::gl::GetProgramInfoLog(
                     program,
                     log_len,
                     std::ptr::null_mut(),
                     log_buf.as_mut_ptr() as *mut std::ffi::c_char,
                 );
                 let msg = String::from_utf8_lossy(&log_buf);
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::DeleteProgram(program);
                 return Err(Error::OpenGl(format!("compute program link failed: {msg}")));
             }
             Ok(program)
@@ -6285,17 +6371,24 @@ impl GLProcessorST {
         layers: usize,
     ) -> bool {
         let dims = (w, h, layers, internal_fmt);
-        gls::active_texture(gls::gl::TEXTURE0);
+        edgefirst_gl::active_texture(edgefirst_gl::gl::TEXTURE0);
         if dims == *tex_dims {
-            gls::bind_texture(target, texture.id);
+            edgefirst_gl::bind_texture(target, texture.id);
             return false;
         }
         // Immutable storage cannot be re-specified: recreate the object
         // (the old one is deleted by Texture's Drop).
         *texture = Texture::new();
-        gls::bind_texture(target, texture.id);
+        edgefirst_gl::bind_texture(target, texture.id);
         unsafe {
-            gls::gl::TexStorage3D(target, 1, internal_fmt, w as i32, h as i32, layers as i32);
+            edgefirst_gl::gl::TexStorage3D(
+                target,
+                1,
+                internal_fmt,
+                w as i32,
+                h as i32,
+                layers as i32,
+            );
         }
         *tex_dims = dims;
         true
@@ -6306,15 +6399,15 @@ impl GLProcessorST {
     /// object; params are per-texture state.
     fn set_proto_tex_params(target: u32, filter: u32) {
         unsafe { super::core::set_tex_filter(target, filter) };
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             target,
-            gls::gl::TEXTURE_WRAP_S,
-            gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TEXTURE_WRAP_S,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
-        gls::tex_parameteri(
+        edgefirst_gl::tex_parameteri(
             target,
-            gls::gl::TEXTURE_WRAP_T,
-            gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TEXTURE_WRAP_T,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
         );
     }
 
@@ -6335,7 +6428,7 @@ impl GLProcessorST {
             Self::set_proto_tex_params(target, filter);
         }
         unsafe {
-            gls::gl::TexSubImage3D(
+            edgefirst_gl::gl::TexSubImage3D(
                 target,
                 0,
                 0,
@@ -6380,15 +6473,15 @@ impl GLProcessorST {
         color_mode: crate::ColorMode,
     ) -> Result<(), Error> {
         unsafe {
-            gls::gl::UseProgram(self.color_program.id);
+            edgefirst_gl::gl::UseProgram(self.color_program.id);
             let rescale = |x: f32| x * 2.0 - 1.0;
             let thickness = 3.0;
             for (idx, d) in detect.iter().enumerate() {
                 let color_index = color_mode.index(idx, d.label);
                 self.color_program
                     .load_uniform_1i(c"class_index", color_index as i32)?;
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer.id);
-                gls::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+                edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
                 let bbox: [f32; 4] = d.bbox.into();
                 let outer_box = [
                     bbox[0] - thickness / dst_w as f32,
@@ -6422,18 +6515,18 @@ impl GLProcessorST {
                     rescale(outer_box[1]),
                     0., // top left
                 ];
-                gls::gl::BufferData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     (size_of::<f32>() * camera_vertices.len()) as isize,
                     camera_vertices.as_ptr() as *const c_void,
-                    gls::gl::DYNAMIC_DRAW,
+                    edgefirst_gl::gl::DYNAMIC_DRAW,
                 );
 
                 let vertices_index: [u32; 10] = [0, 1, 5, 2, 6, 3, 7, 0, 4, 5];
-                gls::gl::DrawElements(
-                    gls::gl::TRIANGLE_STRIP,
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLE_STRIP,
                     vertices_index.len() as i32,
-                    gls::gl::UNSIGNED_INT,
+                    edgefirst_gl::gl::UNSIGNED_INT,
                     vertices_index.as_ptr() as *const c_void,
                 );
             }
@@ -6499,15 +6592,15 @@ impl GLProcessorST {
         self.ensure_packed_rgb_intermediate(dst_w, dst_h)?;
         self.packed_rgb_fbo.bind();
         unsafe {
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 self.packed_rgb_intermediate_tex.id,
                 0,
             );
             check_gl_error(function!(), line!())?;
-            gls::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
+            edgefirst_gl::gl::Viewport(0, 0, dst_w as i32, dst_h as i32);
         }
         // Pass 1 must NOT glFinish (convert_to's standalone-boundary sync):
         // same-context command ordering already guarantees pass 2 samples

@@ -615,19 +615,19 @@ impl GLProcessorThreaded {
                     GLProcessorMessage::PboCreate(size, resp) => {
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             let mut id: u32 = 0;
-                            gls::gl::GenBuffers(1, &mut id);
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, id);
-                            gls::gl::BufferData(
-                                gls::gl::PIXEL_PACK_BUFFER,
+                            edgefirst_gl::gl::GenBuffers(1, &mut id);
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, id);
+                            edgefirst_gl::gl::BufferData(
+                                edgefirst_gl::gl::PIXEL_PACK_BUFFER,
                                 size as isize,
                                 std::ptr::null(),
-                                gls::gl::STREAM_COPY,
+                                edgefirst_gl::gl::STREAM_COPY,
                             );
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
                             match check_gl_error("PboCreate", 0) {
                                 Ok(()) => Ok(id),
                                 Err(e) => {
-                                    gls::gl::DeleteBuffers(1, &id);
+                                    edgefirst_gl::gl::DeleteBuffers(1, &id);
                                     Err(e)
                                 }
                             }
@@ -645,14 +645,17 @@ impl GLProcessorThreaded {
                     }
                     GLProcessorMessage::PboMap(buffer_id, size, resp) => {
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                            let ptr = gls::gl::MapBufferRange(
-                                gls::gl::PIXEL_PACK_BUFFER,
+                            edgefirst_gl::gl::BindBuffer(
+                                edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                                buffer_id,
+                            );
+                            let ptr = edgefirst_gl::gl::MapBufferRange(
+                                edgefirst_gl::gl::PIXEL_PACK_BUFFER,
                                 0,
                                 size as isize,
-                                gls::gl::MAP_READ_BIT | gls::gl::MAP_WRITE_BIT,
+                                edgefirst_gl::gl::MAP_READ_BIT | edgefirst_gl::gl::MAP_WRITE_BIT,
                             );
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
                             if ptr.is_null() {
                                 Err(crate::Error::OpenGl(
                                     "glMapBufferRange returned null".to_string(),
@@ -677,10 +680,14 @@ impl GLProcessorThreaded {
                     }
                     GLProcessorMessage::PboUnmap(buffer_id, resp) => {
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, buffer_id);
-                            let ok = gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-                            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
-                            if ok == gls::gl::FALSE {
+                            edgefirst_gl::gl::BindBuffer(
+                                edgefirst_gl::gl::PIXEL_PACK_BUFFER,
+                                buffer_id,
+                            );
+                            let ok =
+                                edgefirst_gl::gl::UnmapBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER);
+                            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
+                            if ok == edgefirst_gl::gl::FALSE {
                                 Err(Error::OpenGl(
                                     "PBO data was corrupted during mapping".into(),
                                 ))
@@ -701,7 +708,7 @@ impl GLProcessorThreaded {
                     }
                     GLProcessorMessage::PboDelete(buffer_id) => {
                         if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-                            gls::gl::DeleteBuffers(1, &buffer_id);
+                            edgefirst_gl::gl::DeleteBuffers(1, &buffer_id);
                         })) {
                             poisoned = true;
                             log::error!(

@@ -16,8 +16,8 @@ use super::super::context::{egl_ext, Egl, GlContext};
 use super::super::dma_import::DmaImportAttrs;
 use super::super::EglDisplayKind;
 use super::GlPlatform;
+use edgefirst_egl as egl;
 use edgefirst_tensor::{PixelFormat, Tensor};
-use khronos_egl as egl;
 use std::rc::Rc;
 
 /// An owned EGLImage import over a DMA-BUF. Dropping destroys the
@@ -69,7 +69,7 @@ impl GlPlatform for LinuxEgl {
     fn load_gl_once(display: &GlContext) {
         static GL_LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         GL_LOADED.get_or_init(|| {
-            gls::load_with(|s| {
+            edgefirst_gl::load_with(|s| {
                 display
                     .egl
                     .get_proc_address(s)
@@ -83,7 +83,7 @@ impl GlPlatform for LinuxEgl {
     }
 
     unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
-        gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, handle.as_ptr());
+        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, handle.as_ptr());
         Ok(())
     }
 
@@ -91,7 +91,10 @@ impl GlPlatform for LinuxEgl {
         _display: &GlContext,
         handle: egl::Image,
     ) -> crate::Result<()> {
-        gls::egl_image_target_texture_2d_oes(gls::gl::TEXTURE_EXTERNAL_OES, handle.as_ptr());
+        edgefirst_gl::egl_image_target_texture_2d_oes(
+            edgefirst_gl::gl::TEXTURE_EXTERNAL_OES,
+            handle.as_ptr(),
+        );
         Ok(())
     }
 
@@ -99,7 +102,10 @@ impl GlPlatform for LinuxEgl {
         _display: &GlContext,
         handle: egl::Image,
     ) -> crate::Result<()> {
-        gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, handle.as_ptr());
+        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+            edgefirst_gl::gl::RENDERBUFFER,
+            handle.as_ptr(),
+        );
         Ok(())
     }
 
@@ -136,9 +142,9 @@ impl GlPlatform for LinuxEgl {
         let egl_img_attr = [
             egl_ext::LINUX_DRM_FOURCC as egl::Attrib,
             drm_format as u32 as egl::Attrib,
-            khronos_egl::WIDTH as egl::Attrib,
+            edgefirst_egl::WIDTH as egl::Attrib,
             width as egl::Attrib,
-            khronos_egl::HEIGHT as egl::Attrib,
+            edgefirst_egl::HEIGHT as egl::Attrib,
             height as egl::Attrib,
             egl_ext::DMA_BUF_PLANE0_PITCH as egl::Attrib,
             pitch as egl::Attrib,
@@ -148,7 +154,7 @@ impl GlPlatform for LinuxEgl {
             fd as egl::Attrib,
             egl::IMAGE_PRESERVED as egl::Attrib,
             egl::TRUE as egl::Attrib,
-            khronos_egl::NONE as egl::Attrib,
+            edgefirst_egl::NONE as egl::Attrib,
         ];
         new_egl_image_owned(display, egl_ext::LINUX_DMA_BUF, &egl_img_attr)
     }

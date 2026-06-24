@@ -64,7 +64,7 @@ fn load() -> Option<NvjpegLib> {
     }
     for name in CANDIDATES {
         // SAFETY: dlopen of a system library; failures are expected and skipped.
-        let Ok(lib) = (unsafe { Library::new(name) }) else {
+        let Ok(lib) = (unsafe { Library::new(*name) }) else {
             continue;
         };
         // Require the real nvjpeg symbol set; this rejects the libjpeg-turbo

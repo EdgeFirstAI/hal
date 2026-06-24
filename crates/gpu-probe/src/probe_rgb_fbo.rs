@@ -27,13 +27,13 @@ fn yn(b: bool) -> &'static str {
 /// Map a `glCheckFramebufferStatus` return value to a human-readable name.
 fn fbo_status_name(status: u32) -> &'static str {
     match status {
-        gls::gl::FRAMEBUFFER_COMPLETE => "FRAMEBUFFER_COMPLETE",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "FRAMEBUFFER_INCOMPLETE_ATTACHMENT",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
+        edgefirst_gl::gl::FRAMEBUFFER_COMPLETE => "FRAMEBUFFER_COMPLETE",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "FRAMEBUFFER_INCOMPLETE_ATTACHMENT",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
             "FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT"
         }
         FRAMEBUFFER_INCOMPLETE_DIMENSIONS => "FRAMEBUFFER_INCOMPLETE_DIMENSIONS",
-        gls::gl::FRAMEBUFFER_UNSUPPORTED => "FRAMEBUFFER_UNSUPPORTED",
+        edgefirst_gl::gl::FRAMEBUFFER_UNSUPPORTED => "FRAMEBUFFER_UNSUPPORTED",
         FRAMEBUFFER_INCOMPLETE_MULTISAMPLE => "FRAMEBUFFER_INCOMPLETE_MULTISAMPLE",
         _ => "UNKNOWN",
     }
@@ -117,24 +117,27 @@ pub fn run(ctx: &GpuContext) -> bool {
     let complete = unsafe {
         // Create renderbuffer backed by the EGLImage
         let mut rbo: u32 = 0;
-        gls::gl::GenRenderbuffers(1, &mut rbo);
-        gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-        gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, egl_image.as_ptr());
+        edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+        edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+            edgefirst_gl::gl::RENDERBUFFER,
+            egl_image.as_ptr(),
+        );
 
         // Create FBO and attach the renderbuffer
         let mut fbo: u32 = 0;
-        gls::gl::GenFramebuffers(1, &mut fbo);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::FramebufferRenderbuffer(
-            gls::gl::FRAMEBUFFER,
-            gls::gl::COLOR_ATTACHMENT0,
-            gls::gl::RENDERBUFFER,
+        edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::FramebufferRenderbuffer(
+            edgefirst_gl::gl::FRAMEBUFFER,
+            edgefirst_gl::gl::COLOR_ATTACHMENT0,
+            edgefirst_gl::gl::RENDERBUFFER,
             rbo,
         );
 
         // Check completeness
-        let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-        let is_complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+        let is_complete = status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE;
 
         if is_complete {
             println!("  {:42} PASS", "FBO completeness");
@@ -147,10 +150,10 @@ pub fn run(ctx: &GpuContext) -> bool {
         }
 
         // Cleanup GL resources
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        gls::gl::DeleteFramebuffers(1, &fbo);
-        gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-        gls::gl::DeleteRenderbuffers(1, &rbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, 0);
+        edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
 
         is_complete
     };

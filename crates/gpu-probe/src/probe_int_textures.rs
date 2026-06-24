@@ -18,29 +18,29 @@ fn yn(b: bool) -> &'static str {
 
 fn gl_err_str(e: u32) -> &'static str {
     match e {
-        gls::gl::NO_ERROR => "OK",
-        gls::gl::INVALID_ENUM => "INVALID_ENUM",
-        gls::gl::INVALID_VALUE => "INVALID_VALUE",
-        gls::gl::INVALID_OPERATION => "INVALID_OP",
-        gls::gl::INVALID_FRAMEBUFFER_OPERATION => "INVALID_FBO_OP",
-        gls::gl::OUT_OF_MEMORY => "OOM",
+        edgefirst_gl::gl::NO_ERROR => "OK",
+        edgefirst_gl::gl::INVALID_ENUM => "INVALID_ENUM",
+        edgefirst_gl::gl::INVALID_VALUE => "INVALID_VALUE",
+        edgefirst_gl::gl::INVALID_OPERATION => "INVALID_OP",
+        edgefirst_gl::gl::INVALID_FRAMEBUFFER_OPERATION => "INVALID_FBO_OP",
+        edgefirst_gl::gl::OUT_OF_MEMORY => "OOM",
         _ => "UNKNOWN",
     }
 }
 
 fn fbo_str(s: u32) -> &'static str {
     match s {
-        gls::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACH",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => "MISSING_ATTACH",
-        gls::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
+        edgefirst_gl::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACH",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => "MISSING_ATTACH",
+        edgefirst_gl::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
         _ => "UNKNOWN",
     }
 }
 
 /// Drain any pending GL errors.
 fn drain_errors() {
-    unsafe { while gls::gl::GetError() != gls::gl::NO_ERROR {} }
+    unsafe { while edgefirst_gl::gl::GetError() != edgefirst_gl::gl::NO_ERROR {} }
 }
 
 struct FormatTest {
@@ -53,66 +53,66 @@ struct FormatTest {
 const INT_FORMATS: &[FormatTest] = &[
     FormatTest {
         name: "GL_R8UI",
-        internal: gls::gl::R8UI as i32,
-        format: gls::gl::RED_INTEGER,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::R8UI as i32,
+        format: edgefirst_gl::gl::RED_INTEGER,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_RG8UI",
-        internal: gls::gl::RG8UI as i32,
-        format: gls::gl::RG_INTEGER,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::RG8UI as i32,
+        format: edgefirst_gl::gl::RG_INTEGER,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_RGBA8UI",
-        internal: gls::gl::RGBA8UI as i32,
-        format: gls::gl::RGBA_INTEGER,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::RGBA8UI as i32,
+        format: edgefirst_gl::gl::RGBA_INTEGER,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_R8I",
-        internal: gls::gl::R8I as i32,
-        format: gls::gl::RED_INTEGER,
-        pixel_type: gls::gl::BYTE,
+        internal: edgefirst_gl::gl::R8I as i32,
+        format: edgefirst_gl::gl::RED_INTEGER,
+        pixel_type: edgefirst_gl::gl::BYTE,
     },
     FormatTest {
         name: "GL_RG8I",
-        internal: gls::gl::RG8I as i32,
-        format: gls::gl::RG_INTEGER,
-        pixel_type: gls::gl::BYTE,
+        internal: edgefirst_gl::gl::RG8I as i32,
+        format: edgefirst_gl::gl::RG_INTEGER,
+        pixel_type: edgefirst_gl::gl::BYTE,
     },
     FormatTest {
         name: "GL_RGBA8I",
-        internal: gls::gl::RGBA8I as i32,
-        format: gls::gl::RGBA_INTEGER,
-        pixel_type: gls::gl::BYTE,
+        internal: edgefirst_gl::gl::RGBA8I as i32,
+        format: edgefirst_gl::gl::RGBA_INTEGER,
+        pixel_type: edgefirst_gl::gl::BYTE,
     },
 ];
 
 const REF_FORMATS: &[FormatTest] = &[
     FormatTest {
         name: "GL_R8",
-        internal: gls::gl::R8 as i32,
-        format: gls::gl::RED,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::R8 as i32,
+        format: edgefirst_gl::gl::RED,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_RG8",
-        internal: gls::gl::RG8 as i32,
-        format: gls::gl::RG,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::RG8 as i32,
+        format: edgefirst_gl::gl::RG,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_RGBA8",
-        internal: gls::gl::RGBA8 as i32,
-        format: gls::gl::RGBA,
-        pixel_type: gls::gl::UNSIGNED_BYTE,
+        internal: edgefirst_gl::gl::RGBA8 as i32,
+        format: edgefirst_gl::gl::RGBA,
+        pixel_type: edgefirst_gl::gl::UNSIGNED_BYTE,
     },
     FormatTest {
         name: "GL_R8_SNORM",
-        internal: gls::gl::R8_SNORM as i32,
-        format: gls::gl::RED,
-        pixel_type: gls::gl::BYTE,
+        internal: edgefirst_gl::gl::R8_SNORM as i32,
+        format: edgefirst_gl::gl::RED,
+        pixel_type: edgefirst_gl::gl::BYTE,
     },
 ];
 
@@ -127,20 +127,20 @@ fn test_format(ft: &FormatTest, w: i32, h: i32) -> (bool, bool) {
     let mut fbo_complete = false;
 
     unsafe {
-        gls::gl::GenTextures(1, &mut tex);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::GenTextures(1, &mut tex);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexImage2D(
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TexImage2D(
+            edgefirst_gl::gl::TEXTURE_2D,
             0,
             ft.internal,
             w,
@@ -150,34 +150,34 @@ fn test_format(ft: &FormatTest, w: i32, h: i32) -> (bool, bool) {
             ft.pixel_type,
             std::ptr::null(),
         );
-        let tex_err = gls::gl::GetError();
-        tex_ok = tex_err == gls::gl::NO_ERROR;
+        let tex_err = edgefirst_gl::gl::GetError();
+        tex_ok = tex_err == edgefirst_gl::gl::NO_ERROR;
 
         print!("  {:<20}  TexImage2D: {:<12}", ft.name, gl_err_str(tex_err));
 
         if tex_ok {
-            gls::gl::GenFramebuffers(1, &mut fbo);
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-            gls::gl::FramebufferTexture2D(
-                gls::gl::FRAMEBUFFER,
-                gls::gl::COLOR_ATTACHMENT0,
-                gls::gl::TEXTURE_2D,
+            edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+            edgefirst_gl::gl::FramebufferTexture2D(
+                edgefirst_gl::gl::FRAMEBUFFER,
+                edgefirst_gl::gl::COLOR_ATTACHMENT0,
+                edgefirst_gl::gl::TEXTURE_2D,
                 tex,
                 0,
             );
-            let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-            fbo_complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
+            let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+            fbo_complete = status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE;
             print!("  FBO: {:<18}", fbo_str(status));
             if fbo_complete {
                 print!("  RENDERABLE");
             }
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
         } else {
             print!("  FBO: (skipped)");
         }
 
-        gls::gl::DeleteTextures(1, &tex);
+        edgefirst_gl::gl::DeleteTextures(1, &tex);
     }
     println!();
 
@@ -197,72 +197,72 @@ fn test_xor_render(w: i32, h: i32) {
     let mut fbo: u32 = 0;
 
     unsafe {
-        gls::gl::GenTextures(1, &mut tex);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::GenTextures(1, &mut tex);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexImage2D(
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TexImage2D(
+            edgefirst_gl::gl::TEXTURE_2D,
             0,
-            gls::gl::RGBA8UI as i32,
+            edgefirst_gl::gl::RGBA8UI as i32,
             w,
             h,
             0,
-            gls::gl::RGBA_INTEGER,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::RGBA_INTEGER,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             std::ptr::null(),
         );
-        let err = gls::gl::GetError();
-        if err != gls::gl::NO_ERROR {
+        let err = edgefirst_gl::gl::GetError();
+        if err != edgefirst_gl::gl::NO_ERROR {
             println!("      RGBA8UI TexImage2D failed: {}", gl_err_str(err));
-            gls::gl::DeleteTextures(1, &tex);
+            edgefirst_gl::gl::DeleteTextures(1, &tex);
             return;
         }
 
-        gls::gl::GenFramebuffers(1, &mut fbo);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::FramebufferTexture2D(
-            gls::gl::FRAMEBUFFER,
-            gls::gl::COLOR_ATTACHMENT0,
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::FramebufferTexture2D(
+            edgefirst_gl::gl::FRAMEBUFFER,
+            edgefirst_gl::gl::COLOR_ATTACHMENT0,
+            edgefirst_gl::gl::TEXTURE_2D,
             tex,
             0,
         );
-        let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-        if status != gls::gl::FRAMEBUFFER_COMPLETE {
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+        if status != edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
             println!("      FBO not complete: {}", fbo_str(status));
-            gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-            gls::gl::DeleteFramebuffers(1, &fbo);
-            gls::gl::DeleteTextures(1, &tex);
+            edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+            edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+            edgefirst_gl::gl::DeleteTextures(1, &tex);
             return;
         }
 
         // XOR test values: uint8 {0, 64, 128, 255} ^ 0x80
         //   0 ^ 0x80 = 0x80, 64 ^ 0x80 = 0xC0, 128 ^ 0x80 = 0, 255 ^ 0x80 = 0x7F
         let clear_val: [u32; 4] = [0x80, 0xC0, 0x00, 0x7F];
-        gls::gl::ClearBufferuiv(gls::gl::COLOR, 0, clear_val.as_ptr());
-        gls::gl::Finish();
+        edgefirst_gl::gl::ClearBufferuiv(edgefirst_gl::gl::COLOR, 0, clear_val.as_ptr());
+        edgefirst_gl::gl::Finish();
 
         let mut px: [u32; 4] = [0; 4];
-        gls::gl::ReadPixels(
+        edgefirst_gl::gl::ReadPixels(
             0,
             0,
             1,
             1,
-            gls::gl::RGBA_INTEGER,
-            gls::gl::UNSIGNED_INT,
+            edgefirst_gl::gl::RGBA_INTEGER,
+            edgefirst_gl::gl::UNSIGNED_INT,
             px.as_mut_ptr() as *mut std::ffi::c_void,
         );
-        let rp_err = gls::gl::GetError();
-        if rp_err != gls::gl::NO_ERROR {
+        let rp_err = edgefirst_gl::gl::GetError();
+        if rp_err != edgefirst_gl::gl::NO_ERROR {
             println!("      ReadPixels failed: {}", gl_err_str(rp_err));
         } else {
             println!("      Input uint8:   0,   64,  128,  255");
@@ -290,9 +290,9 @@ fn test_xor_render(w: i32, h: i32) {
             }
         }
 
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        gls::gl::DeleteFramebuffers(1, &fbo);
-        gls::gl::DeleteTextures(1, &tex);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::DeleteTextures(1, &tex);
     }
 
     // --- Test 2: R8UI single-channel (model input scenario) ---
@@ -300,47 +300,47 @@ fn test_xor_render(w: i32, h: i32) {
     drain_errors();
 
     unsafe {
-        gls::gl::GenTextures(1, &mut tex);
-        gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MIN_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::GenTextures(1, &mut tex);
+        edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexParameteri(
-            gls::gl::TEXTURE_2D,
-            gls::gl::TEXTURE_MAG_FILTER,
-            gls::gl::NEAREST as i32,
+        edgefirst_gl::gl::TexParameteri(
+            edgefirst_gl::gl::TEXTURE_2D,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            edgefirst_gl::gl::NEAREST as i32,
         );
-        gls::gl::TexImage2D(
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TexImage2D(
+            edgefirst_gl::gl::TEXTURE_2D,
             0,
-            gls::gl::R8UI as i32,
+            edgefirst_gl::gl::R8UI as i32,
             w,
             h,
             0,
-            gls::gl::RED_INTEGER,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::RED_INTEGER,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             std::ptr::null(),
         );
-        let err = gls::gl::GetError();
-        if err != gls::gl::NO_ERROR {
+        let err = edgefirst_gl::gl::GetError();
+        if err != edgefirst_gl::gl::NO_ERROR {
             println!("      R8UI TexImage2D failed: {}", gl_err_str(err));
-            gls::gl::DeleteTextures(1, &tex);
+            edgefirst_gl::gl::DeleteTextures(1, &tex);
             return;
         }
 
-        gls::gl::GenFramebuffers(1, &mut fbo);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::FramebufferTexture2D(
-            gls::gl::FRAMEBUFFER,
-            gls::gl::COLOR_ATTACHMENT0,
-            gls::gl::TEXTURE_2D,
+        edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::FramebufferTexture2D(
+            edgefirst_gl::gl::FRAMEBUFFER,
+            edgefirst_gl::gl::COLOR_ATTACHMENT0,
+            edgefirst_gl::gl::TEXTURE_2D,
             tex,
             0,
         );
-        let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-        if status != gls::gl::FRAMEBUFFER_COMPLETE {
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+        if status != edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
             println!(
                 "      FBO not complete: {} (not color-renderable)",
                 fbo_str(status)
@@ -348,27 +348,27 @@ fn test_xor_render(w: i32, h: i32) {
             println!("      NOTE: R8UI may not be renderable — use RGBA8UI or compute shader");
         } else {
             let clear_val: [u32; 4] = [42 ^ 0x80, 0, 0, 0];
-            gls::gl::ClearBufferuiv(gls::gl::COLOR, 0, clear_val.as_ptr());
-            gls::gl::Finish();
+            edgefirst_gl::gl::ClearBufferuiv(edgefirst_gl::gl::COLOR, 0, clear_val.as_ptr());
+            edgefirst_gl::gl::Finish();
 
             let mut px: [u32; 4] = [0; 4];
-            gls::gl::ReadPixels(
+            edgefirst_gl::gl::ReadPixels(
                 0,
                 0,
                 1,
                 1,
-                gls::gl::RED_INTEGER,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::RED_INTEGER,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 px.as_mut_ptr() as *mut std::ffi::c_void,
             );
-            let err = gls::gl::GetError();
-            if err == gls::gl::NO_ERROR && px[0] == (42 ^ 0x80) {
+            let err = edgefirst_gl::gl::GetError();
+            if err == edgefirst_gl::gl::NO_ERROR && px[0] == (42 ^ 0x80) {
                 println!(
                     "      Clear+ReadPixels: PASS (value={}, as int8={})",
                     px[0],
                     (px[0] & 0xFF) as u8 as i8
                 );
-            } else if err == gls::gl::NO_ERROR {
+            } else if err == edgefirst_gl::gl::NO_ERROR {
                 println!(
                     "      Clear+ReadPixels: MISMATCH (got {}, expected {})",
                     px[0],
@@ -379,9 +379,9 @@ fn test_xor_render(w: i32, h: i32) {
             }
         }
 
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        gls::gl::DeleteFramebuffers(1, &fbo);
-        gls::gl::DeleteTextures(1, &tex);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::DeleteTextures(1, &tex);
     }
 }
 
@@ -392,8 +392,8 @@ fn test_compute_shaders(_ctx: &GpuContext) {
     let mut gl_major: i32 = 0;
     let mut gl_minor: i32 = 0;
     unsafe {
-        gls::gl::GetIntegerv(gls::gl::MAJOR_VERSION, &mut gl_major);
-        gls::gl::GetIntegerv(gls::gl::MINOR_VERSION, &mut gl_minor);
+        edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::MAJOR_VERSION, &mut gl_major);
+        edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::MINOR_VERSION, &mut gl_minor);
     }
 
     if gl_major < 3 || (gl_major == 3 && gl_minor < 1) {
@@ -406,16 +406,28 @@ fn test_compute_shaders(_ctx: &GpuContext) {
 
     unsafe {
         let mut wg = [0i32; 3];
-        gls::gl::GetIntegeri_v(gls::gl::MAX_COMPUTE_WORK_GROUP_SIZE, 0, &mut wg[0]);
-        gls::gl::GetIntegeri_v(gls::gl::MAX_COMPUTE_WORK_GROUP_SIZE, 1, &mut wg[1]);
-        gls::gl::GetIntegeri_v(gls::gl::MAX_COMPUTE_WORK_GROUP_SIZE, 2, &mut wg[2]);
+        edgefirst_gl::gl::GetIntegeri_v(
+            edgefirst_gl::gl::MAX_COMPUTE_WORK_GROUP_SIZE,
+            0,
+            &mut wg[0],
+        );
+        edgefirst_gl::gl::GetIntegeri_v(
+            edgefirst_gl::gl::MAX_COMPUTE_WORK_GROUP_SIZE,
+            1,
+            &mut wg[1],
+        );
+        edgefirst_gl::gl::GetIntegeri_v(
+            edgefirst_gl::gl::MAX_COMPUTE_WORK_GROUP_SIZE,
+            2,
+            &mut wg[2],
+        );
         println!(
             "      Max workgroup size: {} x {} x {}",
             wg[0], wg[1], wg[2]
         );
 
         let mut max_img: i32 = 0;
-        gls::gl::GetIntegerv(gls::gl::MAX_COMPUTE_IMAGE_UNIFORMS, &mut max_img);
+        edgefirst_gl::gl::GetIntegerv(edgefirst_gl::gl::MAX_COMPUTE_IMAGE_UNIFORMS, &mut max_img);
         println!("      Max compute image uniforms: {max_img}");
     }
 
@@ -463,20 +475,20 @@ fn try_compile_compute(source: &std::ffi::CStr) -> (bool, bool) {
     unsafe {
         drain_errors();
 
-        let cs = gls::gl::CreateShader(gls::gl::COMPUTE_SHADER);
+        let cs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::COMPUTE_SHADER);
         let src_ptr = source.as_ptr();
-        gls::gl::ShaderSource(cs, 1, &raw const src_ptr, std::ptr::null());
-        gls::gl::CompileShader(cs);
+        edgefirst_gl::gl::ShaderSource(cs, 1, &raw const src_ptr, std::ptr::null());
+        edgefirst_gl::gl::CompileShader(cs);
 
         let mut compiled: i32 = 0;
-        gls::gl::GetShaderiv(cs, gls::gl::COMPILE_STATUS, &mut compiled);
+        edgefirst_gl::gl::GetShaderiv(cs, edgefirst_gl::gl::COMPILE_STATUS, &mut compiled);
 
         if compiled == 0 {
             let mut log_len: i32 = 0;
-            gls::gl::GetShaderiv(cs, gls::gl::INFO_LOG_LENGTH, &mut log_len);
+            edgefirst_gl::gl::GetShaderiv(cs, edgefirst_gl::gl::INFO_LOG_LENGTH, &mut log_len);
             if log_len > 0 {
                 let mut log = vec![0u8; log_len as usize];
-                gls::gl::GetShaderInfoLog(
+                edgefirst_gl::gl::GetShaderInfoLog(
                     cs,
                     log_len,
                     std::ptr::null_mut(),
@@ -485,23 +497,23 @@ fn try_compile_compute(source: &std::ffi::CStr) -> (bool, bool) {
                 let msg = String::from_utf8_lossy(&log);
                 println!("      Compile error: {msg}");
             }
-            gls::gl::DeleteShader(cs);
+            edgefirst_gl::gl::DeleteShader(cs);
             return (false, false);
         }
 
-        let prog = gls::gl::CreateProgram();
-        gls::gl::AttachShader(prog, cs);
-        gls::gl::LinkProgram(prog);
+        let prog = edgefirst_gl::gl::CreateProgram();
+        edgefirst_gl::gl::AttachShader(prog, cs);
+        edgefirst_gl::gl::LinkProgram(prog);
 
         let mut linked: i32 = 0;
-        gls::gl::GetProgramiv(prog, gls::gl::LINK_STATUS, &mut linked);
+        edgefirst_gl::gl::GetProgramiv(prog, edgefirst_gl::gl::LINK_STATUS, &mut linked);
 
         if linked == 0 {
             let mut log_len: i32 = 0;
-            gls::gl::GetProgramiv(prog, gls::gl::INFO_LOG_LENGTH, &mut log_len);
+            edgefirst_gl::gl::GetProgramiv(prog, edgefirst_gl::gl::INFO_LOG_LENGTH, &mut log_len);
             if log_len > 0 {
                 let mut log = vec![0u8; log_len as usize];
-                gls::gl::GetProgramInfoLog(
+                edgefirst_gl::gl::GetProgramInfoLog(
                     prog,
                     log_len,
                     std::ptr::null_mut(),
@@ -512,9 +524,9 @@ fn try_compile_compute(source: &std::ffi::CStr) -> (bool, bool) {
             }
         }
 
-        gls::gl::DetachShader(prog, cs);
-        gls::gl::DeleteShader(cs);
-        gls::gl::DeleteProgram(prog);
+        edgefirst_gl::gl::DetachShader(prog, cs);
+        edgefirst_gl::gl::DeleteShader(cs);
+        edgefirst_gl::gl::DeleteProgram(prog);
 
         (true, linked != 0)
     }

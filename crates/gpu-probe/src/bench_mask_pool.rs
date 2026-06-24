@@ -233,34 +233,39 @@ fn create_dst_fbo() -> (u32, u32) {
     unsafe {
         let mut fbo = 0u32;
         let mut rbo = 0u32;
-        gls::gl::GenFramebuffers(1, &mut fbo);
-        gls::gl::GenRenderbuffers(1, &mut rbo);
-        gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-        gls::gl::RenderbufferStorage(gls::gl::RENDERBUFFER, gls::gl::RGBA8, FBO_W, FBO_H);
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-        gls::gl::FramebufferRenderbuffer(
-            gls::gl::FRAMEBUFFER,
-            gls::gl::COLOR_ATTACHMENT0,
-            gls::gl::RENDERBUFFER,
+        edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+        edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+        edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+        edgefirst_gl::gl::RenderbufferStorage(
+            edgefirst_gl::gl::RENDERBUFFER,
+            edgefirst_gl::gl::RGBA8,
+            FBO_W,
+            FBO_H,
+        );
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+        edgefirst_gl::gl::FramebufferRenderbuffer(
+            edgefirst_gl::gl::FRAMEBUFFER,
+            edgefirst_gl::gl::COLOR_ATTACHMENT0,
+            edgefirst_gl::gl::RENDERBUFFER,
             rbo,
         );
-        let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
         assert_eq!(
             status,
-            gls::gl::FRAMEBUFFER_COMPLETE,
+            edgefirst_gl::gl::FRAMEBUFFER_COMPLETE,
             "FBO incomplete: 0x{:x}",
             status
         );
-        gls::gl::Viewport(0, 0, FBO_W, FBO_H);
+        edgefirst_gl::gl::Viewport(0, 0, FBO_W, FBO_H);
         (fbo, rbo)
     }
 }
 
 fn destroy_dst_fbo(fbo: u32, rbo: u32) {
     unsafe {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        gls::gl::DeleteFramebuffers(1, &fbo);
-        gls::gl::DeleteRenderbuffers(1, &rbo);
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
     }
 }
 
@@ -270,7 +275,7 @@ fn destroy_dst_fbo(fbo: u32, rbo: u32) {
 
 fn detect_vivante() -> bool {
     unsafe {
-        let r = gls::gl::GetString(gls::gl::RENDERER);
+        let r = edgefirst_gl::gl::GetString(edgefirst_gl::gl::RENDERER);
         if r.is_null() {
             return false;
         }
@@ -304,83 +309,98 @@ impl BaselinePath {
 
         unsafe {
             // Set static uniforms (colors, opacity, mask0 sampler unit)
-            gls::gl::UseProgram(program);
-            let colors_loc = gls::gl::GetUniformLocation(program, c"colors".as_ptr());
-            gls::gl::Uniform4fv(colors_loc, 20, DEFAULT_COLORS.as_flattened().as_ptr());
-            let opacity_loc = gls::gl::GetUniformLocation(program, c"opacity".as_ptr());
-            gls::gl::Uniform1f(opacity_loc, 1.0);
-            let mask0_loc = gls::gl::GetUniformLocation(program, c"mask0".as_ptr());
-            gls::gl::Uniform1i(mask0_loc, 0);
+            edgefirst_gl::gl::UseProgram(program);
+            let colors_loc = edgefirst_gl::gl::GetUniformLocation(program, c"colors".as_ptr());
+            edgefirst_gl::gl::Uniform4fv(colors_loc, 20, DEFAULT_COLORS.as_flattened().as_ptr());
+            let opacity_loc = edgefirst_gl::gl::GetUniformLocation(program, c"opacity".as_ptr());
+            edgefirst_gl::gl::Uniform1f(opacity_loc, 1.0);
+            let mask0_loc = edgefirst_gl::gl::GetUniformLocation(program, c"mask0".as_ptr());
+            edgefirst_gl::gl::Uniform1i(mask0_loc, 0);
 
-            let class_index_loc = gls::gl::GetUniformLocation(program, c"class_index".as_ptr());
+            let class_index_loc =
+                edgefirst_gl::gl::GetUniformLocation(program, c"class_index".as_ptr());
 
             let mut tex = 0u32;
-            gls::gl::GenTextures(1, &mut tex);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::GenTextures(1, &mut tex);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                edgefirst_gl::gl::LINEAR as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                edgefirst_gl::gl::LINEAR as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_WRAP_S,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TEXTURE_WRAP_T,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
             // VAO captures the attribute-pointer state so we only pay the
             // setup cost once. Per-call we just `BindVertexArray` and
             // `BufferSubData` the new vertex / texcoord values.
             let mut vao = 0u32;
-            gls::gl::GenVertexArrays(1, &mut vao);
-            gls::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::GenVertexArrays(1, &mut vao);
+            edgefirst_gl::gl::BindVertexArray(vao);
 
             let mut bufs = [0u32; 3];
-            gls::gl::GenBuffers(3, bufs.as_mut_ptr());
+            edgefirst_gl::gl::GenBuffers(3, bufs.as_mut_ptr());
             let vertex_buffer = bufs[0];
             let texcoord_buffer = bufs[1];
             let ebo = bufs[2];
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, vertex_buffer);
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, vertex_buffer);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (12 * std::mem::size_of::<f32>()) as isize,
                 std::ptr::null(),
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
-            gls::gl::EnableVertexAttribArray(0);
-            gls::gl::VertexAttribPointer(0, 3, gls::gl::FLOAT, gls::gl::FALSE, 0, null());
+            edgefirst_gl::gl::EnableVertexAttribArray(0);
+            edgefirst_gl::gl::VertexAttribPointer(
+                0,
+                3,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                null(),
+            );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, texcoord_buffer);
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, texcoord_buffer);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (8 * std::mem::size_of::<f32>()) as isize,
                 std::ptr::null(),
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
-            gls::gl::EnableVertexAttribArray(1);
-            gls::gl::VertexAttribPointer(1, 2, gls::gl::FLOAT, gls::gl::FALSE, 0, null());
+            edgefirst_gl::gl::EnableVertexAttribArray(1);
+            edgefirst_gl::gl::VertexAttribPointer(
+                1,
+                2,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                null(),
+            );
 
             let indices: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::BindBuffer(gls::gl::ELEMENT_ARRAY_BUFFER, ebo);
-            gls::gl::BufferData(
-                gls::gl::ELEMENT_ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER, ebo);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER,
                 std::mem::size_of_val(&indices) as isize,
                 indices.as_ptr() as *const c_void,
-                gls::gl::STATIC_DRAW,
+                edgefirst_gl::gl::STATIC_DRAW,
             );
 
-            gls::gl::BindVertexArray(0);
+            edgefirst_gl::gl::BindVertexArray(0);
 
             Ok(BaselinePath {
                 program,
@@ -399,10 +419,10 @@ impl BaselinePath {
     fn render(&self, detections: &[Detection], masks: &[Vec<u8>]) {
         unsafe {
             // Hoisted-out-of-loop state (matches Tier 1).
-            gls::gl::UseProgram(self.program);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D, self.tex);
-            gls::gl::BindVertexArray(self.vao);
+            edgefirst_gl::gl::UseProgram(self.program);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, self.tex);
+            edgefirst_gl::gl::BindVertexArray(self.vao);
 
             // Texel-centre UVs (matches Tier 1) — constant across the
             // batch since cell size is fixed.
@@ -411,9 +431,9 @@ impl BaselinePath {
             let u_hi = (CELL_W as f32 - 0.5) / CELL_W as f32;
             let v_hi = (CELL_H as f32 - 0.5) / CELL_H as f32;
             let tcs: [f32; 8] = [u_lo, v_hi, u_hi, v_hi, u_hi, v_lo, u_lo, v_lo];
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.texcoord_buffer);
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texcoord_buffer);
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (8 * std::mem::size_of::<f32>()) as isize,
                 tcs.as_ptr() as *const c_void,
@@ -421,19 +441,19 @@ impl BaselinePath {
 
             for (det, mask) in detections.iter().zip(masks.iter()) {
                 // Per-instance allocating upload (implicit orphan).
-                gls::gl::TexImage2D(
-                    gls::gl::TEXTURE_2D,
+                edgefirst_gl::gl::TexImage2D(
+                    edgefirst_gl::gl::TEXTURE_2D,
                     0,
-                    gls::gl::R8 as i32,
+                    edgefirst_gl::gl::R8 as i32,
                     CELL_W,
                     CELL_H,
                     0,
-                    gls::gl::RED,
-                    gls::gl::UNSIGNED_BYTE,
+                    edgefirst_gl::gl::RED,
+                    edgefirst_gl::gl::UNSIGNED_BYTE,
                     mask.as_ptr() as *const c_void,
                 );
 
-                gls::gl::Uniform1i(self.class_index_loc, det.class_index as i32);
+                edgefirst_gl::gl::Uniform1i(self.class_index_loc, det.class_index as i32);
 
                 let verts: [f32; 12] = [
                     det.bbox_ndc[0],
@@ -449,21 +469,26 @@ impl BaselinePath {
                     det.bbox_ndc[1],
                     0.0, // bottom-left
                 ];
-                gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.vertex_buffer);
-                gls::gl::BufferSubData(
-                    gls::gl::ARRAY_BUFFER,
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer);
+                edgefirst_gl::gl::BufferSubData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
                     0,
                     (12 * std::mem::size_of::<f32>()) as isize,
                     verts.as_ptr() as *const c_void,
                 );
 
-                gls::gl::DrawElements(gls::gl::TRIANGLE_FAN, 4, gls::gl::UNSIGNED_INT, null());
+                edgefirst_gl::gl::DrawElements(
+                    edgefirst_gl::gl::TRIANGLE_FAN,
+                    4,
+                    edgefirst_gl::gl::UNSIGNED_INT,
+                    null(),
+                );
 
                 if self.is_vivante {
-                    gls::gl::Finish();
+                    edgefirst_gl::gl::Finish();
                 }
             }
-            gls::gl::BindVertexArray(0);
+            edgefirst_gl::gl::BindVertexArray(0);
         }
     }
 }
@@ -471,11 +496,11 @@ impl BaselinePath {
 impl Drop for BaselinePath {
     fn drop(&mut self) {
         unsafe {
-            gls::gl::DeleteTextures(1, &self.tex);
+            edgefirst_gl::gl::DeleteTextures(1, &self.tex);
             let bufs = [self.vertex_buffer, self.texcoord_buffer, self.ebo];
-            gls::gl::DeleteBuffers(3, bufs.as_ptr());
-            gls::gl::DeleteVertexArrays(1, &self.vao);
-            gls::gl::DeleteProgram(self.program);
+            edgefirst_gl::gl::DeleteBuffers(3, bufs.as_ptr());
+            edgefirst_gl::gl::DeleteVertexArrays(1, &self.vao);
+            edgefirst_gl::gl::DeleteProgram(self.program);
         }
     }
 }
@@ -515,135 +540,149 @@ impl InstancedPath {
         let program = compile_program(&vs, &fs)?;
 
         unsafe {
-            gls::gl::UseProgram(program);
-            let colors_loc = gls::gl::GetUniformLocation(program, c"colors".as_ptr());
-            gls::gl::Uniform4fv(colors_loc, 20, DEFAULT_COLORS.as_flattened().as_ptr());
-            let opacity_loc = gls::gl::GetUniformLocation(program, c"opacity".as_ptr());
-            gls::gl::Uniform1f(opacity_loc, 1.0);
-            let sampler_loc = gls::gl::GetUniformLocation(program, c"mask_array".as_ptr());
-            gls::gl::Uniform1i(sampler_loc, 0);
+            edgefirst_gl::gl::UseProgram(program);
+            let colors_loc = edgefirst_gl::gl::GetUniformLocation(program, c"colors".as_ptr());
+            edgefirst_gl::gl::Uniform4fv(colors_loc, 20, DEFAULT_COLORS.as_flattened().as_ptr());
+            let opacity_loc = edgefirst_gl::gl::GetUniformLocation(program, c"opacity".as_ptr());
+            edgefirst_gl::gl::Uniform1f(opacity_loc, 1.0);
+            let sampler_loc = edgefirst_gl::gl::GetUniformLocation(program, c"mask_array".as_ptr());
+            edgefirst_gl::gl::Uniform1i(sampler_loc, 0);
 
             // Allocate the texture array at full capacity.
             let mut tex_array = 0u32;
-            gls::gl::GenTextures(1, &mut tex_array);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D_ARRAY, tex_array);
-            gls::gl::TexImage3D(
-                gls::gl::TEXTURE_2D_ARRAY,
+            edgefirst_gl::gl::GenTextures(1, &mut tex_array);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D_ARRAY, tex_array);
+            edgefirst_gl::gl::TexImage3D(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
                 0,
-                gls::gl::R8 as i32,
+                edgefirst_gl::gl::R8 as i32,
                 CELL_W,
                 CELL_H,
                 capacity as i32,
                 0,
-                gls::gl::RED,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RED,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D_ARRAY,
-                gls::gl::TEXTURE_MIN_FILTER,
-                gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
+                edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+                edgefirst_gl::gl::LINEAR as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D_ARRAY,
-                gls::gl::TEXTURE_MAG_FILTER,
-                gls::gl::LINEAR as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
+                edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+                edgefirst_gl::gl::LINEAR as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D_ARRAY,
-                gls::gl::TEXTURE_WRAP_S,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
+                edgefirst_gl::gl::TEXTURE_WRAP_S,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
-            gls::gl::TexParameteri(
-                gls::gl::TEXTURE_2D_ARRAY,
-                gls::gl::TEXTURE_WRAP_T,
-                gls::gl::CLAMP_TO_EDGE as i32,
+            edgefirst_gl::gl::TexParameteri(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
+                edgefirst_gl::gl::TEXTURE_WRAP_T,
+                edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
             );
 
             // VAO captures all 5 vertex attribute pointer bindings + EBO
             // binding. Per render() call we just BindVertexArray + 1
             // BufferSubData for the instance attrs.
             let mut vao = 0u32;
-            gls::gl::GenVertexArrays(1, &mut vao);
-            gls::gl::BindVertexArray(vao);
+            edgefirst_gl::gl::GenVertexArrays(1, &mut vao);
+            edgefirst_gl::gl::BindVertexArray(vao);
 
             // Shared unit quad: 4 vertices, attribute location 0.
             let unit_quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
             let mut bufs = [0u32; 3];
-            gls::gl::GenBuffers(3, bufs.as_mut_ptr());
+            edgefirst_gl::gl::GenBuffers(3, bufs.as_mut_ptr());
             let unit_quad_vbo = bufs[0];
             let instance_vbo = bufs[1];
             let ebo = bufs[2];
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, unit_quad_vbo);
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, unit_quad_vbo);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 std::mem::size_of_val(&unit_quad) as isize,
                 unit_quad.as_ptr() as *const c_void,
-                gls::gl::STATIC_DRAW,
+                edgefirst_gl::gl::STATIC_DRAW,
             );
-            gls::gl::EnableVertexAttribArray(0);
-            gls::gl::VertexAttribPointer(0, 2, gls::gl::FLOAT, gls::gl::FALSE, 0, null());
-            gls::gl::VertexAttribDivisor(0, 0);
+            edgefirst_gl::gl::EnableVertexAttribArray(0);
+            edgefirst_gl::gl::VertexAttribPointer(
+                0,
+                2,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                null(),
+            );
+            edgefirst_gl::gl::VertexAttribDivisor(0, 0);
 
             // Per-instance attribute buffer: pre-size to capacity.
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, instance_vbo);
-            gls::gl::BufferData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, instance_vbo);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 (std::mem::size_of::<MaskInstanceAttr>() * capacity as usize) as isize,
                 std::ptr::null(),
-                gls::gl::DYNAMIC_DRAW,
+                edgefirst_gl::gl::DYNAMIC_DRAW,
             );
             let stride = std::mem::size_of::<MaskInstanceAttr>() as i32;
             // bbox_ndc (vec4) at offset 0
-            gls::gl::EnableVertexAttribArray(1);
-            gls::gl::VertexAttribPointer(1, 4, gls::gl::FLOAT, gls::gl::FALSE, stride, null());
-            gls::gl::VertexAttribDivisor(1, 1);
+            edgefirst_gl::gl::EnableVertexAttribArray(1);
+            edgefirst_gl::gl::VertexAttribPointer(
+                1,
+                4,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                stride,
+                null(),
+            );
+            edgefirst_gl::gl::VertexAttribDivisor(1, 1);
             // mask_extent (vec2) at offset 16
-            gls::gl::EnableVertexAttribArray(2);
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::EnableVertexAttribArray(2);
+            edgefirst_gl::gl::VertexAttribPointer(
                 2,
                 2,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 stride,
                 16 as *const c_void,
             );
-            gls::gl::VertexAttribDivisor(2, 1);
+            edgefirst_gl::gl::VertexAttribDivisor(2, 1);
             // layer (float) at offset 24
-            gls::gl::EnableVertexAttribArray(3);
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::EnableVertexAttribArray(3);
+            edgefirst_gl::gl::VertexAttribPointer(
                 3,
                 1,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 stride,
                 24 as *const c_void,
             );
-            gls::gl::VertexAttribDivisor(3, 1);
+            edgefirst_gl::gl::VertexAttribDivisor(3, 1);
             // class_index (float) at offset 28
-            gls::gl::EnableVertexAttribArray(4);
-            gls::gl::VertexAttribPointer(
+            edgefirst_gl::gl::EnableVertexAttribArray(4);
+            edgefirst_gl::gl::VertexAttribPointer(
                 4,
                 1,
-                gls::gl::FLOAT,
-                gls::gl::FALSE,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
                 stride,
                 28 as *const c_void,
             );
-            gls::gl::VertexAttribDivisor(4, 1);
+            edgefirst_gl::gl::VertexAttribDivisor(4, 1);
 
             let indices: [u32; 4] = [0, 1, 2, 3];
-            gls::gl::BindBuffer(gls::gl::ELEMENT_ARRAY_BUFFER, ebo);
-            gls::gl::BufferData(
-                gls::gl::ELEMENT_ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER, ebo);
+            edgefirst_gl::gl::BufferData(
+                edgefirst_gl::gl::ELEMENT_ARRAY_BUFFER,
                 std::mem::size_of_val(&indices) as isize,
                 indices.as_ptr() as *const c_void,
-                gls::gl::STATIC_DRAW,
+                edgefirst_gl::gl::STATIC_DRAW,
             );
 
-            gls::gl::BindVertexArray(0);
+            edgefirst_gl::gl::BindVertexArray(0);
 
             Ok(InstancedPath {
                 program,
@@ -692,15 +731,15 @@ impl InstancedPath {
         );
 
         unsafe {
-            gls::gl::UseProgram(self.program);
-            gls::gl::ActiveTexture(gls::gl::TEXTURE0);
-            gls::gl::BindTexture(gls::gl::TEXTURE_2D_ARRAY, self.tex_array);
+            edgefirst_gl::gl::UseProgram(self.program);
+            edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
+            edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D_ARRAY, self.tex_array);
 
             // Single contiguous upload for all N layers — matches the
             // production code path where the mask pool is a flat
             // DMA-BUF or PBO and every detection writes directly into it.
-            gls::gl::TexSubImage3D(
-                gls::gl::TEXTURE_2D_ARRAY,
+            edgefirst_gl::gl::TexSubImage3D(
+                edgefirst_gl::gl::TEXTURE_2D_ARRAY,
                 0,
                 0,
                 0,
@@ -708,29 +747,29 @@ impl InstancedPath {
                 CELL_W,
                 CELL_H,
                 n,
-                gls::gl::RED,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RED,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 flat_masks.as_ptr() as *const c_void,
             );
 
-            gls::gl::BindBuffer(gls::gl::ARRAY_BUFFER, self.instance_vbo);
-            gls::gl::BufferSubData(
-                gls::gl::ARRAY_BUFFER,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.instance_vbo);
+            edgefirst_gl::gl::BufferSubData(
+                edgefirst_gl::gl::ARRAY_BUFFER,
                 0,
                 (std::mem::size_of::<MaskInstanceAttr>() * self.instance_attrs.len()) as isize,
                 self.instance_attrs.as_ptr() as *const c_void,
             );
 
             // VAO holds the attribute pointer state (set once at init).
-            gls::gl::BindVertexArray(self.vao);
-            gls::gl::DrawElementsInstanced(
-                gls::gl::TRIANGLE_FAN,
+            edgefirst_gl::gl::BindVertexArray(self.vao);
+            edgefirst_gl::gl::DrawElementsInstanced(
+                edgefirst_gl::gl::TRIANGLE_FAN,
                 4,
-                gls::gl::UNSIGNED_INT,
+                edgefirst_gl::gl::UNSIGNED_INT,
                 null(),
                 detections.len() as i32,
             );
-            gls::gl::BindVertexArray(0);
+            edgefirst_gl::gl::BindVertexArray(0);
         }
     }
 }
@@ -738,11 +777,11 @@ impl InstancedPath {
 impl Drop for InstancedPath {
     fn drop(&mut self) {
         unsafe {
-            gls::gl::DeleteTextures(1, &self.tex_array);
+            edgefirst_gl::gl::DeleteTextures(1, &self.tex_array);
             let bufs = [self.unit_quad_vbo, self.instance_vbo, self.ebo];
-            gls::gl::DeleteBuffers(3, bufs.as_ptr());
-            gls::gl::DeleteVertexArrays(1, &self.vao);
-            gls::gl::DeleteProgram(self.program);
+            edgefirst_gl::gl::DeleteBuffers(3, bufs.as_ptr());
+            edgefirst_gl::gl::DeleteVertexArrays(1, &self.vao);
+            edgefirst_gl::gl::DeleteProgram(self.program);
         }
     }
 }
@@ -754,14 +793,14 @@ impl Drop for InstancedPath {
 fn read_back_fbo() -> Vec<u8> {
     let mut buf = vec![0u8; (FBO_W * FBO_H * 4) as usize];
     unsafe {
-        gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-        gls::gl::ReadPixels(
+        edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+        edgefirst_gl::gl::ReadPixels(
             0,
             0,
             FBO_W,
             FBO_H,
-            gls::gl::RGBA,
-            gls::gl::UNSIGNED_BYTE,
+            edgefirst_gl::gl::RGBA,
+            edgefirst_gl::gl::UNSIGNED_BYTE,
             buf.as_mut_ptr() as *mut c_void,
         );
     }
@@ -777,22 +816,22 @@ fn compare_paths(
 ) -> (u32, u32) {
     unsafe {
         // Render baseline
-        gls::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
-        gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-        gls::gl::Enable(gls::gl::BLEND);
-        gls::gl::BlendFuncSeparate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
+        edgefirst_gl::gl::ClearColor(0.0, 0.0, 0.0, 0.0);
+        edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+        edgefirst_gl::gl::Enable(edgefirst_gl::gl::BLEND);
+        edgefirst_gl::gl::BlendFuncSeparate(
+            edgefirst_gl::gl::SRC_ALPHA,
+            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
+            edgefirst_gl::gl::ZERO,
+            edgefirst_gl::gl::ONE,
         );
         baseline.render(detections, masks);
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
         let img_a = read_back_fbo();
 
-        gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+        edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
         instanced.render(detections, flat_masks);
-        gls::gl::Finish();
+        edgefirst_gl::gl::Finish();
         let img_b = read_back_fbo();
 
         // Optional dump for diagnosis: set MASK_POOL_DUMP=/tmp/mp to write
@@ -871,12 +910,12 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
     };
 
     unsafe {
-        gls::gl::Enable(gls::gl::BLEND);
-        gls::gl::BlendFuncSeparate(
-            gls::gl::SRC_ALPHA,
-            gls::gl::ONE_MINUS_SRC_ALPHA,
-            gls::gl::ZERO,
-            gls::gl::ONE,
+        edgefirst_gl::gl::Enable(edgefirst_gl::gl::BLEND);
+        edgefirst_gl::gl::BlendFuncSeparate(
+            edgefirst_gl::gl::SRC_ALPHA,
+            edgefirst_gl::gl::ONE_MINUS_SRC_ALPHA,
+            edgefirst_gl::gl::ZERO,
+            edgefirst_gl::gl::ONE,
         );
     }
 
@@ -914,9 +953,9 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         {
             let name = format!("baseline_per_instance/N={n}");
             let r = run_bench(&name, WARMUP, ITERATIONS, || unsafe {
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
                 baseline.render(&dets, &masks);
-                gls::gl::Finish();
+                edgefirst_gl::gl::Finish();
             });
             r.print_summary();
             results.push(r);
@@ -926,9 +965,9 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         {
             let name = format!("instanced_array/N={n}");
             let r = run_bench(&name, WARMUP, ITERATIONS, || unsafe {
-                gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+                edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
                 instanced.render(&dets, &flat_masks);
-                gls::gl::Finish();
+                edgefirst_gl::gl::Finish();
             });
             r.print_summary();
             results.push(r);
@@ -950,21 +989,21 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         let mut buf = vec![0u8; (FBO_W * FBO_H * 4) as usize];
         // Render something so the framebuffer has content to read back.
         unsafe {
-            gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+            edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
             let dets = synthesize_detections(20);
             let masks: Vec<Vec<u8>> = (0..20).map(synthesize_mask).collect();
             baseline.render(&dets, &masks);
-            gls::gl::Finish();
+            edgefirst_gl::gl::Finish();
         }
         let r = run_bench("readback_640x640_rgba8", WARMUP, ITERATIONS, || unsafe {
-            gls::gl::ReadBuffer(gls::gl::COLOR_ATTACHMENT0);
-            gls::gl::ReadnPixels(
+            edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
+            edgefirst_gl::gl::ReadnPixels(
                 0,
                 0,
                 FBO_W,
                 FBO_H,
-                gls::gl::RGBA,
-                gls::gl::UNSIGNED_BYTE,
+                edgefirst_gl::gl::RGBA,
+                edgefirst_gl::gl::UNSIGNED_BYTE,
                 buf.len() as i32,
                 buf.as_mut_ptr() as *mut c_void,
             );

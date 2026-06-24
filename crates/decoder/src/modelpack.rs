@@ -473,13 +473,39 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
     (bboxes, bscores)
 }
 
+/// Fast approximation of `eˣ`, vendored bit-for-bit from the (abandoned)
+/// `fast-math` crate by Huon Wilson (MIT/Apache-2.0). Inlining the ~10-line
+/// Schraudolph float-bit-trick lets us drop the unmaintained dependency while
+/// keeping decoder outputs bit-identical to prior releases. Valid for roughly
+/// -88 ≤ x ≤ 88 (kept in range by the guard in `fast_sigmoid_impl`); max
+/// relative error < ~0.011.
+#[inline(always)]
+// Constants are reproduced verbatim from `fast-math` to stay bit-identical;
+// keep the upstream literals rather than rounding them to f32 precision.
+#[allow(clippy::excessive_precision)]
+fn exp_raw(x: f32) -> f32 {
+    const A: f32 = (1u32 << 23) as f32; // 2^SIGNIF for f32
+    const MASK: i32 = 0xff800000u32 as i32;
+    const EXP2_23: f32 = 1.1920929e-7;
+    const C0: f32 = 0.3371894346 * EXP2_23 * EXP2_23;
+    const C1: f32 = 0.657636276 * EXP2_23;
+    const C2: f32 = 1.00172476;
+
+    let a = A * core::f32::consts::LOG2_E;
+    let mul = (a * x) as i32;
+    let floor = mul & MASK;
+    let frac = (mul - floor) as f32;
+    let approx = (C0 * frac + C1) * frac + C2;
+    f32::from_bits(approx.to_bits().wrapping_add(floor as u32))
+}
+
 #[inline(always)]
 fn fast_sigmoid_impl(f: f32) -> f32 {
     if f.abs() > 80.0 {
         f.signum() * 0.5 + 0.5
     } else {
-        // these values are only valid for -88 < x < 88
-        1.0 / (1.0 + fast_math::exp_raw(-f))
+        // exp_raw is only valid for -88 < x < 88; the guard above keeps us in range
+        1.0 / (1.0 + exp_raw(-f))
     }
 }
 

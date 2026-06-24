@@ -224,13 +224,13 @@ struct ImportCase {
 /// Render a known color into the FBO and read back, verifying non-zero bytes.
 /// Assumes the FBO is currently bound and complete.
 unsafe fn render_and_verify(case: &ImportCase) -> bool {
-    gls::gl::Viewport(0, 0, case.w as i32, case.h as i32);
-    gls::gl::ClearColor(0.5, 0.25, 0.75, 1.0);
-    gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-    gls::gl::Finish();
+    edgefirst_gl::gl::Viewport(0, 0, case.w as i32, case.h as i32);
+    edgefirst_gl::gl::ClearColor(0.5, 0.25, 0.75, 1.0);
+    edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+    edgefirst_gl::gl::Finish();
 
     let mut buf = vec![0u8; (case.w * case.h * case.bpp) as usize];
-    gls::gl::ReadPixels(
+    edgefirst_gl::gl::ReadPixels(
         0,
         0,
         case.w as i32,
@@ -258,31 +258,34 @@ unsafe fn gl_try_import(ctx: &GpuContext, fd: c_int, pitch: u32, case: &ImportCa
 
     // --- Route 1: renderbuffer attachment ---
     let mut rbo: u32 = 0;
-    gls::gl::GenRenderbuffers(1, &mut rbo);
-    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-    let _ = gls::gl::GetError();
-    gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, egl_image.as_ptr());
-    let rbo_err = gls::gl::GetError();
+    edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+    let _ = edgefirst_gl::gl::GetError();
+    edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+        edgefirst_gl::gl::RENDERBUFFER,
+        egl_image.as_ptr(),
+    );
+    let rbo_err = edgefirst_gl::gl::GetError();
 
     let mut fbo: u32 = 0;
-    gls::gl::GenFramebuffers(1, &mut fbo);
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-    gls::gl::FramebufferRenderbuffer(
-        gls::gl::FRAMEBUFFER,
-        gls::gl::COLOR_ATTACHMENT0,
-        gls::gl::RENDERBUFFER,
+    edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+    edgefirst_gl::gl::FramebufferRenderbuffer(
+        edgefirst_gl::gl::FRAMEBUFFER,
+        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+        edgefirst_gl::gl::RENDERBUFFER,
         rbo,
     );
-    let rbo_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-    let rbo_complete = rbo_status == gls::gl::FRAMEBUFFER_COMPLETE && rbo_err == 0;
+    let rbo_status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+    let rbo_complete = rbo_status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE && rbo_err == 0;
     let mut rbo_verified = false;
     if rbo_complete {
         rbo_verified = render_and_verify(case);
     }
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::DeleteFramebuffers(1, &fbo);
-    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-    gls::gl::DeleteRenderbuffers(1, &rbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, 0);
+    edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
 
     if rbo_complete && rbo_verified {
         let _ = ctx.destroy_egl_image(egl_image);
@@ -291,42 +294,42 @@ unsafe fn gl_try_import(ctx: &GpuContext, fd: c_int, pitch: u32, case: &ImportCa
 
     // --- Route 2: TEXTURE_2D attachment ---
     let mut tex: u32 = 0;
-    gls::gl::GenTextures(1, &mut tex);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MIN_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::GenTextures(1, &mut tex);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MAG_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    let _ = gls::gl::GetError();
-    gls::gl::EGLImageTargetTexture2DOES(gls::gl::TEXTURE_2D, egl_image.as_ptr());
-    let tex_err = gls::gl::GetError();
+    let _ = edgefirst_gl::gl::GetError();
+    edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, egl_image.as_ptr());
+    let tex_err = edgefirst_gl::gl::GetError();
 
     let mut tfbo: u32 = 0;
-    gls::gl::GenFramebuffers(1, &mut tfbo);
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, tfbo);
-    gls::gl::FramebufferTexture2D(
-        gls::gl::FRAMEBUFFER,
-        gls::gl::COLOR_ATTACHMENT0,
-        gls::gl::TEXTURE_2D,
+    edgefirst_gl::gl::GenFramebuffers(1, &mut tfbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, tfbo);
+    edgefirst_gl::gl::FramebufferTexture2D(
+        edgefirst_gl::gl::FRAMEBUFFER,
+        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+        edgefirst_gl::gl::TEXTURE_2D,
         tex,
         0,
     );
-    let tex_status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-    let tex_complete = tex_status == gls::gl::FRAMEBUFFER_COMPLETE && tex_err == 0;
+    let tex_status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+    let tex_complete = tex_status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE && tex_err == 0;
     let mut tex_verified = false;
     if tex_complete {
         tex_verified = render_and_verify(case);
     }
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::DeleteFramebuffers(1, &tfbo);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, 0);
-    gls::gl::DeleteTextures(1, &tex);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::DeleteFramebuffers(1, &tfbo);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
+    edgefirst_gl::gl::DeleteTextures(1, &tex);
     let _ = ctx.destroy_egl_image(egl_image);
 
     if tex_complete && tex_verified {
@@ -360,10 +363,12 @@ fn gl_err_name(e: u32) -> &'static str {
 
 fn fbo_status_name(status: u32) -> &'static str {
     match status {
-        gls::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACHMENT",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => "INCOMPLETE_MISSING_ATTACHMENT",
-        gls::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
+        edgefirst_gl::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACHMENT",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
+            "INCOMPLETE_MISSING_ATTACHMENT"
+        }
+        edgefirst_gl::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
         _ => "UNKNOWN",
     }
 }
@@ -387,8 +392,8 @@ unsafe fn gl_import_render(ctx: &GpuContext, a: &AllocResult) -> String {
         fourcc: DRM_FORMAT_ABGR8888,
         w: a.width,
         h: a.height,
-        rd_format: gls::gl::RGBA,
-        rd_type: gls::gl::UNSIGNED_BYTE,
+        rd_format: edgefirst_gl::gl::RGBA,
+        rd_type: edgefirst_gl::gl::UNSIGNED_BYTE,
         bpp: 4,
     }];
     if pitch.is_multiple_of(8) {
@@ -397,8 +402,8 @@ unsafe fn gl_import_render(ctx: &GpuContext, a: &AllocResult) -> String {
             fourcc: DRM_FORMAT_ABGR16161616F,
             w: pitch / 8,
             h: a.height,
-            rd_format: gls::gl::RGBA,
-            rd_type: gls::gl::HALF_FLOAT,
+            rd_format: edgefirst_gl::gl::RGBA,
+            rd_type: edgefirst_gl::gl::HALF_FLOAT,
             bpp: 8,
         });
     }
@@ -406,7 +411,7 @@ unsafe fn gl_import_render(ctx: &GpuContext, a: &AllocResult) -> String {
     let mut best = String::from("FAIL (no fourcc accepted)");
     let mut any_pass = false;
     for case in &cases {
-        let _ = gls::gl::GetError(); // clear stale
+        let _ = edgefirst_gl::gl::GetError(); // clear stale
         let r = gl_try_import(ctx, a.fd, pitch, case);
         println!(
             "     [{}@{}x{} pitch={}] {}",

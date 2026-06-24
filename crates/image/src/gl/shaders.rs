@@ -18,15 +18,23 @@ pub(super) fn compile_shader_from_str(
     };
     let src_ptr = src.as_ptr();
     unsafe {
-        gls::gl::ShaderSource(shader, 1, &raw const src_ptr, null());
-        gls::gl::CompileShader(shader);
+        edgefirst_gl::gl::ShaderSource(shader, 1, &raw const src_ptr, null());
+        edgefirst_gl::gl::CompileShader(shader);
         let mut is_compiled = 0;
-        gls::gl::GetShaderiv(shader, gls::gl::COMPILE_STATUS, &raw mut is_compiled);
+        edgefirst_gl::gl::GetShaderiv(
+            shader,
+            edgefirst_gl::gl::COMPILE_STATUS,
+            &raw mut is_compiled,
+        );
         if is_compiled == 0 {
             let mut max_length = 0;
-            gls::gl::GetShaderiv(shader, gls::gl::INFO_LOG_LENGTH, &raw mut max_length);
+            edgefirst_gl::gl::GetShaderiv(
+                shader,
+                edgefirst_gl::gl::INFO_LOG_LENGTH,
+                &raw mut max_length,
+            );
             let mut error_log: Vec<u8> = vec![0; max_length as usize];
-            gls::gl::GetShaderInfoLog(
+            edgefirst_gl::gl::GetShaderInfoLog(
                 shader,
                 max_length,
                 &raw mut max_length,
@@ -37,7 +45,7 @@ pub(super) fn compile_shader_from_str(
                 .and_then(|c| c.into_string().ok())
                 .unwrap_or_else(|| "<non-UTF8 shader log>".to_string());
             error!("Shader '{}' failed: {:?}\n", shader_name, msg);
-            gls::gl::DeleteShader(shader);
+            edgefirst_gl::gl::DeleteShader(shader);
             return Err(());
         }
         Ok(())
@@ -46,8 +54,8 @@ pub(super) fn compile_shader_from_str(
 
 pub(super) fn check_gl_error(name: &str, line: u32) -> Result<(), Error> {
     unsafe {
-        let err = gls::gl::GetError();
-        if err != gls::gl::NO_ERROR {
+        let err = edgefirst_gl::gl::GetError();
+        if err != edgefirst_gl::gl::NO_ERROR {
             error!("GL Error: {name}:{line}: {err:#X}");
             // panic!("GL Error: {err}");
             return Err(Error::OpenGl(format!("{err:#X}")));

@@ -361,6 +361,10 @@ jobs:
         # skips and the entire GL backend ships untested in CI.
         run: |
           set -euxo pipefail
+          # Homebrew now requires explicit trust for third-party taps; these are
+          # taps we deliberately rely on for ANGLE, so disable the trust gate
+          # for this step rather than fail the install (Homebrew/brew Tap-Trust).
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew tap startergo/gn
           brew tap startergo/angle
           brew install startergo/angle/angle

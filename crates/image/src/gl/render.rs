@@ -3,7 +3,7 @@
 
 //! Portable GL render lowering — the single home for the pure geometry math the
 //! converged tile/batch renderer relies on. **No platform types** (no gbm,
-//! IOSurface, EGL, or `gls` symbols) appear here so the same lowering serves the
+//! IOSurface, EGL, or `edgefirst_gl` symbols) appear here so the same lowering serves the
 //! Linux DMA-BUF and macOS IOSurface backends behind one seam.
 //!
 //! Three responsibilities live here, each previously open-coded at several call

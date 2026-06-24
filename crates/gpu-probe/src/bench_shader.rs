@@ -63,29 +63,29 @@ void main() {
 /// vertex shader, create + compile + attach fragment shader, link, then delete.
 fn compile_link_delete(vert_src: &CString, frag_src: &CString) {
     unsafe {
-        let program = gls::gl::CreateProgram();
+        let program = edgefirst_gl::gl::CreateProgram();
 
         // Vertex shader
-        let vs = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
+        let vs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::VERTEX_SHADER);
         let vs_ptr = vert_src.as_ptr();
-        gls::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
-        gls::gl::CompileShader(vs);
-        gls::gl::AttachShader(program, vs);
+        edgefirst_gl::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
+        edgefirst_gl::gl::CompileShader(vs);
+        edgefirst_gl::gl::AttachShader(program, vs);
 
         // Fragment shader
-        let fs = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
+        let fs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::FRAGMENT_SHADER);
         let fs_ptr = frag_src.as_ptr();
-        gls::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
-        gls::gl::CompileShader(fs);
-        gls::gl::AttachShader(program, fs);
+        edgefirst_gl::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
+        edgefirst_gl::gl::CompileShader(fs);
+        edgefirst_gl::gl::AttachShader(program, fs);
 
         // Link
-        gls::gl::LinkProgram(program);
+        edgefirst_gl::gl::LinkProgram(program);
 
         // Cleanup
-        gls::gl::DeleteProgram(program);
-        gls::gl::DeleteShader(vs);
-        gls::gl::DeleteShader(fs);
+        edgefirst_gl::gl::DeleteProgram(program);
+        edgefirst_gl::gl::DeleteShader(vs);
+        edgefirst_gl::gl::DeleteShader(fs);
     }
 }
 
@@ -113,37 +113,37 @@ pub fn run(_ctx: &GpuContext) -> Vec<BenchResult> {
         // GL_OES_EGL_image_external_essl3 which may not be available on all
         // drivers.
         let links = unsafe {
-            let vs = gls::gl::CreateShader(gls::gl::VERTEX_SHADER);
+            let vs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::VERTEX_SHADER);
             let vs_ptr = vert_cstr.as_ptr();
-            gls::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
-            gls::gl::CompileShader(vs);
+            edgefirst_gl::gl::ShaderSource(vs, 1, &raw const vs_ptr, null());
+            edgefirst_gl::gl::CompileShader(vs);
             let mut vs_ok: i32 = 0;
-            gls::gl::GetShaderiv(vs, gls::gl::COMPILE_STATUS, &mut vs_ok);
+            edgefirst_gl::gl::GetShaderiv(vs, edgefirst_gl::gl::COMPILE_STATUS, &mut vs_ok);
 
-            let fs = gls::gl::CreateShader(gls::gl::FRAGMENT_SHADER);
+            let fs = edgefirst_gl::gl::CreateShader(edgefirst_gl::gl::FRAGMENT_SHADER);
             let fs_ptr = frag_cstr.as_ptr();
-            gls::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
-            gls::gl::CompileShader(fs);
+            edgefirst_gl::gl::ShaderSource(fs, 1, &raw const fs_ptr, null());
+            edgefirst_gl::gl::CompileShader(fs);
             let mut fs_ok: i32 = 0;
-            gls::gl::GetShaderiv(fs, gls::gl::COMPILE_STATUS, &mut fs_ok);
+            edgefirst_gl::gl::GetShaderiv(fs, edgefirst_gl::gl::COMPILE_STATUS, &mut fs_ok);
 
             let link_ok = if vs_ok != 0 && fs_ok != 0 {
-                let program = gls::gl::CreateProgram();
-                gls::gl::AttachShader(program, vs);
-                gls::gl::AttachShader(program, fs);
-                gls::gl::LinkProgram(program);
+                let program = edgefirst_gl::gl::CreateProgram();
+                edgefirst_gl::gl::AttachShader(program, vs);
+                edgefirst_gl::gl::AttachShader(program, fs);
+                edgefirst_gl::gl::LinkProgram(program);
                 let mut ok: i32 = 0;
-                gls::gl::GetProgramiv(program, gls::gl::LINK_STATUS, &mut ok);
-                gls::gl::DetachShader(program, vs);
-                gls::gl::DetachShader(program, fs);
-                gls::gl::DeleteProgram(program);
+                edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::LINK_STATUS, &mut ok);
+                edgefirst_gl::gl::DetachShader(program, vs);
+                edgefirst_gl::gl::DetachShader(program, fs);
+                edgefirst_gl::gl::DeleteProgram(program);
                 ok != 0
             } else {
                 false
             };
 
-            gls::gl::DeleteShader(vs);
-            gls::gl::DeleteShader(fs);
+            edgefirst_gl::gl::DeleteShader(vs);
+            edgefirst_gl::gl::DeleteShader(fs);
 
             link_ok
         };

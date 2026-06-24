@@ -5,7 +5,7 @@
 //! limits, extension support, and device-node availability.
 
 use crate::egl_context::GpuContext;
-use khronos_egl as egl;
+use edgefirst_egl as egl;
 use std::path::Path;
 
 /// Returns `"YES"` when `b` is true, `"no"` otherwise.
@@ -43,22 +43,31 @@ pub fn run_probes(ctx: &GpuContext) {
     // -----------------------------------------------------------------
     println!("=== GL Limits ===");
 
-    let limits: &[(&str, gls::GLenum)] = &[
-        ("MAX_TEXTURE_SIZE", gls::gl::MAX_TEXTURE_SIZE),
-        ("MAX_RENDERBUFFER_SIZE", gls::gl::MAX_RENDERBUFFER_SIZE),
-        ("MAX_VIEWPORT_DIMS", gls::gl::MAX_VIEWPORT_DIMS),
-        ("MAX_TEXTURE_IMAGE_UNITS", gls::gl::MAX_TEXTURE_IMAGE_UNITS),
+    let limits: &[(&str, edgefirst_gl::GLenum)] = &[
+        ("MAX_TEXTURE_SIZE", edgefirst_gl::gl::MAX_TEXTURE_SIZE),
+        (
+            "MAX_RENDERBUFFER_SIZE",
+            edgefirst_gl::gl::MAX_RENDERBUFFER_SIZE,
+        ),
+        ("MAX_VIEWPORT_DIMS", edgefirst_gl::gl::MAX_VIEWPORT_DIMS),
+        (
+            "MAX_TEXTURE_IMAGE_UNITS",
+            edgefirst_gl::gl::MAX_TEXTURE_IMAGE_UNITS,
+        ),
         (
             "MAX_COMBINED_TEXTURE_IMAGE_UNITS",
-            gls::gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+            edgefirst_gl::gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS,
         ),
-        ("MAX_VERTEX_ATTRIBS", gls::gl::MAX_VERTEX_ATTRIBS),
-        ("MAX_VARYING_VECTORS", gls::gl::MAX_VARYING_VECTORS),
+        ("MAX_VERTEX_ATTRIBS", edgefirst_gl::gl::MAX_VERTEX_ATTRIBS),
+        ("MAX_VARYING_VECTORS", edgefirst_gl::gl::MAX_VARYING_VECTORS),
         (
             "MAX_FRAGMENT_UNIFORM_VECTORS",
-            gls::gl::MAX_FRAGMENT_UNIFORM_VECTORS,
+            edgefirst_gl::gl::MAX_FRAGMENT_UNIFORM_VECTORS,
         ),
-        ("MAX_COLOR_ATTACHMENTS", gls::gl::MAX_COLOR_ATTACHMENTS),
+        (
+            "MAX_COLOR_ATTACHMENTS",
+            edgefirst_gl::gl::MAX_COLOR_ATTACHMENTS,
+        ),
     ];
 
     for (name, param) in limits {

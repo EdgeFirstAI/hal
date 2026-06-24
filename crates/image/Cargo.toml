@@ -14,7 +14,7 @@ documentation = "https://docs.rs/edgefirst-image"
 
 [features]
 default = ["opengl"]
-opengl = ["dep:khronos-egl", "dep:gbm", "dep:drm-fourcc"]
+opengl = ["dep:edgefirst-egl", "dep:gbm", "dep:drm-fourcc"]
 tracker = ["edgefirst-decoder/tracker", "dep:edgefirst-tracker"]
 opencv = ["dep:opencv"]
 g2d_test_formats = []
@@ -28,11 +28,11 @@ enum_dispatch = { workspace = true }
 env_logger = { workspace = true }
 fast_image_resize = { workspace = true }
 four-char-code = { workspace = true }
-gls = { workspace = true }
+edgefirst-gl = { workspace = true }
 half = { workspace = true }
 jpeg-encoder = { workspace = true }
 kamadak-exif = { workspace = true }
-khronos-egl = { workspace = true, optional = true }
+edgefirst-egl = { workspace = true, optional = true }
 libc = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }

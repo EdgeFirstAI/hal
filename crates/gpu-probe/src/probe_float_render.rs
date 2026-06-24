@@ -60,7 +60,7 @@ fn yn(b: bool) -> &'static str {
 
 /// Drain and return the current GL error (0 == `GL_NO_ERROR`).
 fn gl_err() -> u32 {
-    unsafe { gls::gl::GetError() }
+    unsafe { edgefirst_gl::gl::GetError() }
 }
 
 fn gl_err_name(e: u32) -> &'static str {
@@ -77,11 +77,13 @@ fn gl_err_name(e: u32) -> &'static str {
 
 fn fbo_status_name(status: u32) -> &'static str {
     match status {
-        gls::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACHMENT",
-        gls::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => "INCOMPLETE_MISSING_ATTACHMENT",
+        edgefirst_gl::gl::FRAMEBUFFER_COMPLETE => "COMPLETE",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => "INCOMPLETE_ATTACHMENT",
+        edgefirst_gl::gl::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
+            "INCOMPLETE_MISSING_ATTACHMENT"
+        }
         FRAMEBUFFER_INCOMPLETE_DIMENSIONS => "INCOMPLETE_DIMENSIONS",
-        gls::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
+        edgefirst_gl::gl::FRAMEBUFFER_UNSUPPORTED => "UNSUPPORTED",
         _ => "UNKNOWN",
     }
 }
@@ -90,9 +92,9 @@ fn fbo_status_name(status: u32) -> &'static str {
 struct FormatCase {
     /// Human label, e.g. `"RGBA16F"`.
     name: &'static str,
-    /// GL internal format (e.g. `gls::gl::RGBA16F`).
+    /// GL internal format (e.g. `edgefirst_gl::gl::RGBA16F`).
     internal: u32,
-    /// Client format for `TexImage2D` / `ReadPixels` (e.g. `gls::gl::RGBA`).
+    /// Client format for `TexImage2D` / `ReadPixels` (e.g. `edgefirst_gl::gl::RGBA`).
     format: u32,
     /// Client type (`HALF_FLOAT` or `FLOAT`).
     ty: u32,
@@ -107,20 +109,20 @@ struct FormatCase {
 /// Requires a current GL context. Generates and deletes its own GL objects.
 unsafe fn texture_fbo_complete(case: &FormatCase, w: i32, h: i32) -> (bool, u32) {
     let mut tex: u32 = 0;
-    gls::gl::GenTextures(1, &mut tex);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MIN_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::GenTextures(1, &mut tex);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MAG_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    gls::gl::TexImage2D(
-        gls::gl::TEXTURE_2D,
+    edgefirst_gl::gl::TexImage2D(
+        edgefirst_gl::gl::TEXTURE_2D,
         0,
         case.internal as i32,
         w,
@@ -133,17 +135,17 @@ unsafe fn texture_fbo_complete(case: &FormatCase, w: i32, h: i32) -> (bool, u32)
     let alloc_err = gl_err();
 
     let mut fbo: u32 = 0;
-    gls::gl::GenFramebuffers(1, &mut fbo);
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-    gls::gl::FramebufferTexture2D(
-        gls::gl::FRAMEBUFFER,
-        gls::gl::COLOR_ATTACHMENT0,
-        gls::gl::TEXTURE_2D,
+    edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+    edgefirst_gl::gl::FramebufferTexture2D(
+        edgefirst_gl::gl::FRAMEBUFFER,
+        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+        edgefirst_gl::gl::TEXTURE_2D,
         tex,
         0,
     );
-    let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-    let complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
+    let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+    let complete = status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE;
     if !complete && alloc_err == 0 {
         log::debug!(
             "{}: FBO status {} ({:#x})",
@@ -153,10 +155,10 @@ unsafe fn texture_fbo_complete(case: &FormatCase, w: i32, h: i32) -> (bool, u32)
         );
     }
 
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::DeleteFramebuffers(1, &fbo);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, 0);
-    gls::gl::DeleteTextures(1, &tex);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, 0);
+    edgefirst_gl::gl::DeleteTextures(1, &tex);
 
     (complete, alloc_err)
 }
@@ -171,20 +173,20 @@ unsafe fn texture_fbo_complete(case: &FormatCase, w: i32, h: i32) -> (bool, u32)
 unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
     // Destination float texture + FBO.
     let mut tex: u32 = 0;
-    gls::gl::GenTextures(1, &mut tex);
-    gls::gl::BindTexture(gls::gl::TEXTURE_2D, tex);
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MIN_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::GenTextures(1, &mut tex);
+    edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, tex);
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    gls::gl::TexParameteri(
-        gls::gl::TEXTURE_2D,
-        gls::gl::TEXTURE_MAG_FILTER,
-        gls::gl::NEAREST as i32,
+    edgefirst_gl::gl::TexParameteri(
+        edgefirst_gl::gl::TEXTURE_2D,
+        edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+        edgefirst_gl::gl::NEAREST as i32,
     );
-    gls::gl::TexImage2D(
-        gls::gl::TEXTURE_2D,
+    edgefirst_gl::gl::TexImage2D(
+        edgefirst_gl::gl::TEXTURE_2D,
         0,
         case.internal as i32,
         w,
@@ -196,19 +198,21 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
     );
 
     let mut fbo: u32 = 0;
-    gls::gl::GenFramebuffers(1, &mut fbo);
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-    gls::gl::FramebufferTexture2D(
-        gls::gl::FRAMEBUFFER,
-        gls::gl::COLOR_ATTACHMENT0,
-        gls::gl::TEXTURE_2D,
+    edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+    edgefirst_gl::gl::FramebufferTexture2D(
+        edgefirst_gl::gl::FRAMEBUFFER,
+        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+        edgefirst_gl::gl::TEXTURE_2D,
         tex,
         0,
     );
-    if gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER) != gls::gl::FRAMEBUFFER_COMPLETE {
-        gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-        gls::gl::DeleteFramebuffers(1, &fbo);
-        gls::gl::DeleteTextures(1, &tex);
+    if edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER)
+        != edgefirst_gl::gl::FRAMEBUFFER_COMPLETE
+    {
+        edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+        edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+        edgefirst_gl::gl::DeleteTextures(1, &tex);
         return None;
     }
 
@@ -217,8 +221,14 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
     // strict drivers don't return GL_INVALID_OPERATION from glReadPixels.
     let mut impl_fmt: i32 = 0;
     let mut impl_ty: i32 = 0;
-    gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_FORMAT, &mut impl_fmt);
-    gls::gl::GetIntegerv(gls::gl::IMPLEMENTATION_COLOR_READ_TYPE, &mut impl_ty);
+    edgefirst_gl::gl::GetIntegerv(
+        edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_FORMAT,
+        &mut impl_fmt,
+    );
+    edgefirst_gl::gl::GetIntegerv(
+        edgefirst_gl::gl::IMPLEMENTATION_COLOR_READ_TYPE,
+        &mut impl_ty,
+    );
     let use_impl = impl_fmt != 0
         && impl_ty != 0
         && (impl_fmt as u32 != case.format || impl_ty as u32 != case.ty);
@@ -226,15 +236,15 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
         // Promote to the driver-preferred pair. Compute bytes-per-pixel for the
         // promoted (format, type) so the PBO is sized correctly.
         let comps = match impl_fmt as u32 {
-            gls::gl::RED => 1,
-            gls::gl::RG => 2,
-            gls::gl::RGB => 3,
+            edgefirst_gl::gl::RED => 1,
+            edgefirst_gl::gl::RG => 2,
+            edgefirst_gl::gl::RGB => 3,
             _ => 4, // RGBA and anything else
         };
         let tsize = match impl_ty as u32 {
-            gls::gl::FLOAT => 4,
-            gls::gl::HALF_FLOAT => 2,
-            gls::gl::UNSIGNED_BYTE => 1,
+            edgefirst_gl::gl::FLOAT => 4,
+            edgefirst_gl::gl::HALF_FLOAT => 2,
+            edgefirst_gl::gl::UNSIGNED_BYTE => 1,
             _ => 4,
         };
         log::debug!(
@@ -254,15 +264,15 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
 
     // Pixel-pack buffer for the readback.
     let mut pbo: u32 = 0;
-    gls::gl::GenBuffers(1, &mut pbo);
-    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, pbo);
-    gls::gl::BufferData(
-        gls::gl::PIXEL_PACK_BUFFER,
+    edgefirst_gl::gl::GenBuffers(1, &mut pbo);
+    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, pbo);
+    edgefirst_gl::gl::BufferData(
+        edgefirst_gl::gl::PIXEL_PACK_BUFFER,
         byte_size as isize,
         null(),
-        gls::gl::STREAM_READ,
+        edgefirst_gl::gl::STREAM_READ,
     );
-    gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+    edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
 
     let mut verified = false;
     let mut total = 0.0_f64;
@@ -271,25 +281,25 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
     for i in 0..TIMING_ITERS {
         let start = Instant::now();
 
-        gls::gl::Viewport(0, 0, w, h);
+        edgefirst_gl::gl::Viewport(0, 0, w, h);
         // Distinct per-iteration clear color so a stale-buffer read cannot
         // masquerade as a successful transfer.
         let c = 0.25 + (i % 4) as f32 * 0.1;
-        gls::gl::ClearColor(c, 0.5, 0.75, 1.0);
-        gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
+        edgefirst_gl::gl::ClearColor(c, 0.5, 0.75, 1.0);
+        edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
 
-        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, pbo);
-        gls::gl::ReadPixels(0, 0, w, h, rd_fmt, rd_ty, null::<std::ffi::c_void>() as _);
+        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, pbo);
+        edgefirst_gl::gl::ReadPixels(0, 0, w, h, rd_fmt, rd_ty, null::<std::ffi::c_void>() as _);
 
-        let map = gls::gl::MapBufferRange(
-            gls::gl::PIXEL_PACK_BUFFER,
+        let map = edgefirst_gl::gl::MapBufferRange(
+            edgefirst_gl::gl::PIXEL_PACK_BUFFER,
             0,
             byte_size as isize,
-            gls::gl::MAP_READ_BIT,
+            edgefirst_gl::gl::MAP_READ_BIT,
         );
         if map.is_null() {
             ok = false;
-            gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
             break;
         }
         // Sanity-check the channel actually transferred. The clear color
@@ -302,16 +312,16 @@ unsafe fn pbo_readback_timed(case: &FormatCase, w: i32, h: i32) -> Option<f64> {
             let bytes = std::slice::from_raw_parts(map as *const u8, scan);
             verified = bytes.iter().any(|&b| b != 0);
         }
-        gls::gl::UnmapBuffer(gls::gl::PIXEL_PACK_BUFFER);
-        gls::gl::BindBuffer(gls::gl::PIXEL_PACK_BUFFER, 0);
+        edgefirst_gl::gl::UnmapBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER);
+        edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_PACK_BUFFER, 0);
 
         total += start.elapsed().as_secs_f64() * 1000.0;
     }
 
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::DeleteFramebuffers(1, &fbo);
-    gls::gl::DeleteTextures(1, &tex);
-    gls::gl::DeleteBuffers(1, &pbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+    edgefirst_gl::gl::DeleteTextures(1, &tex);
+    edgefirst_gl::gl::DeleteBuffers(1, &pbo);
 
     if ok && verified {
         Some(total / TIMING_ITERS as f64)
@@ -391,49 +401,52 @@ unsafe fn dmabuf_f16_render(ctx: &GpuContext, w: u32, h: u32) -> DmaF16Status {
     };
 
     let mut rbo: u32 = 0;
-    gls::gl::GenRenderbuffers(1, &mut rbo);
-    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, rbo);
-    gls::gl::EGLImageTargetRenderbufferStorageOES(gls::gl::RENDERBUFFER, egl_image.as_ptr());
+    edgefirst_gl::gl::GenRenderbuffers(1, &mut rbo);
+    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, rbo);
+    edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+        edgefirst_gl::gl::RENDERBUFFER,
+        egl_image.as_ptr(),
+    );
 
     let mut fbo: u32 = 0;
-    gls::gl::GenFramebuffers(1, &mut fbo);
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, fbo);
-    gls::gl::FramebufferRenderbuffer(
-        gls::gl::FRAMEBUFFER,
-        gls::gl::COLOR_ATTACHMENT0,
-        gls::gl::RENDERBUFFER,
+    edgefirst_gl::gl::GenFramebuffers(1, &mut fbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, fbo);
+    edgefirst_gl::gl::FramebufferRenderbuffer(
+        edgefirst_gl::gl::FRAMEBUFFER,
+        edgefirst_gl::gl::COLOR_ATTACHMENT0,
+        edgefirst_gl::gl::RENDERBUFFER,
         rbo,
     );
 
-    let status = gls::gl::CheckFramebufferStatus(gls::gl::FRAMEBUFFER);
-    let complete = status == gls::gl::FRAMEBUFFER_COMPLETE;
+    let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+    let complete = status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE;
     let mut verified = false;
 
     if complete {
-        gls::gl::Viewport(0, 0, w as i32, h as i32);
-        gls::gl::ClearColor(0.5, 0.25, 0.75, 1.0);
-        gls::gl::Clear(gls::gl::COLOR_BUFFER_BIT);
-        gls::gl::Finish();
+        edgefirst_gl::gl::Viewport(0, 0, w as i32, h as i32);
+        edgefirst_gl::gl::ClearColor(0.5, 0.25, 0.75, 1.0);
+        edgefirst_gl::gl::Clear(edgefirst_gl::gl::COLOR_BUFFER_BIT);
+        edgefirst_gl::gl::Finish();
 
         // Read back through the FBO as RGBA16F to confirm the render landed
         // (guards against the silent all-zeros EGLImage trap some drivers hit).
         let mut buf = vec![0u8; (w * h * bpp) as usize];
-        gls::gl::ReadPixels(
+        edgefirst_gl::gl::ReadPixels(
             0,
             0,
             w as i32,
             h as i32,
-            gls::gl::RGBA,
-            gls::gl::HALF_FLOAT,
+            edgefirst_gl::gl::RGBA,
+            edgefirst_gl::gl::HALF_FLOAT,
             buf.as_mut_ptr() as *mut std::ffi::c_void,
         );
         verified = buf.iter().any(|&b| b != 0);
     }
 
-    gls::gl::BindFramebuffer(gls::gl::FRAMEBUFFER, 0);
-    gls::gl::DeleteFramebuffers(1, &fbo);
-    gls::gl::BindRenderbuffer(gls::gl::RENDERBUFFER, 0);
-    gls::gl::DeleteRenderbuffers(1, &rbo);
+    edgefirst_gl::gl::BindFramebuffer(edgefirst_gl::gl::FRAMEBUFFER, 0);
+    edgefirst_gl::gl::DeleteFramebuffers(1, &fbo);
+    edgefirst_gl::gl::BindRenderbuffer(edgefirst_gl::gl::RENDERBUFFER, 0);
+    edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo);
     let _ = ctx.destroy_egl_image(egl_image);
 
     if !complete {
@@ -470,44 +483,44 @@ pub fn run(ctx: &GpuContext) {
     let cases = [
         FormatCase {
             name: "RGBA16F",
-            internal: gls::gl::RGBA16F,
-            format: gls::gl::RGBA,
-            ty: gls::gl::HALF_FLOAT,
+            internal: edgefirst_gl::gl::RGBA16F,
+            format: edgefirst_gl::gl::RGBA,
+            ty: edgefirst_gl::gl::HALF_FLOAT,
             bpp: 8,
         },
         FormatCase {
             name: "R16F",
-            internal: gls::gl::R16F,
-            format: gls::gl::RED,
-            ty: gls::gl::HALF_FLOAT,
+            internal: edgefirst_gl::gl::R16F,
+            format: edgefirst_gl::gl::RED,
+            ty: edgefirst_gl::gl::HALF_FLOAT,
             bpp: 2,
         },
         FormatCase {
             name: "RG16F",
-            internal: gls::gl::RG16F,
-            format: gls::gl::RG,
-            ty: gls::gl::HALF_FLOAT,
+            internal: edgefirst_gl::gl::RG16F,
+            format: edgefirst_gl::gl::RG,
+            ty: edgefirst_gl::gl::HALF_FLOAT,
             bpp: 4,
         },
         FormatCase {
             name: "R32F",
-            internal: gls::gl::R32F,
-            format: gls::gl::RED,
-            ty: gls::gl::FLOAT,
+            internal: edgefirst_gl::gl::R32F,
+            format: edgefirst_gl::gl::RED,
+            ty: edgefirst_gl::gl::FLOAT,
             bpp: 4,
         },
         FormatCase {
             name: "RG32F",
-            internal: gls::gl::RG32F,
-            format: gls::gl::RG,
-            ty: gls::gl::FLOAT,
+            internal: edgefirst_gl::gl::RG32F,
+            format: edgefirst_gl::gl::RG,
+            ty: edgefirst_gl::gl::FLOAT,
             bpp: 8,
         },
         FormatCase {
             name: "RGBA32F",
-            internal: gls::gl::RGBA32F,
-            format: gls::gl::RGBA,
-            ty: gls::gl::FLOAT,
+            internal: edgefirst_gl::gl::RGBA32F,
+            format: edgefirst_gl::gl::RGBA,
+            ty: edgefirst_gl::gl::FLOAT,
             bpp: 16,
         },
     ];
