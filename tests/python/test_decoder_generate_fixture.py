@@ -449,7 +449,10 @@ def test_patch_schema_dshape_does_not_mutate_input():
 
 def test_assemble_and_write_safetensors_round_trips(tmp_path):
     import numpy as np
-    import safetensors
+
+    # safetensors is an optional test dependency (installed in CI); skip cleanly
+    # when it is absent so a local `make test` does not hard-fail.
+    safetensors = pytest.importorskip("safetensors")
 
     mod = _import_generator()
 

@@ -267,6 +267,12 @@ test-capi:
 	@# linking the C tests.
 	@touch crates/capi/src/lib.rs
 	@cargo build --release -p edgefirst-hal-capi
+	@# The capi cdylib sets its soname to libedgefirst_hal.so.<major> (see
+	@# crates/capi/build.rs), so the linked C test binary's NEEDED entry is
+	@# libedgefirst_hal.so.0 — but cargo only writes libedgefirst_hal.so (no
+	@# versioned symlink). Create it so the tests load at runtime (CI does the
+	@# same in .github/workflows/test.yml).
+	@ln -sf libedgefirst_hal.so target/release/libedgefirst_hal.so.0
 	@$(MAKE) -C crates/capi/tests test
 	@echo "✓ C API tests passed"
 
