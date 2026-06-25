@@ -15,7 +15,7 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-version = "0.25.2"
+version = "0.25.3"
 edition = "2021"
 readme = "README.md"
 
@@ -33,17 +33,17 @@ dma-heap = "0.4.1"
 # vendored from fast-math, preserving outputs — see crates/decoder/src/modelpack.rs.
 # Internal crates
 edgefirst-bench = { path = "crates/bench" }
-edgefirst-codec = { version = "0.25.2", path = "crates/codec" }
-edgefirst-hal = { version = "0.25.2", path = "crates/hal" }
-edgefirst-decoder = { version = "0.25.2", path = "crates/decoder" }
+edgefirst-codec = { version = "0.25.3", path = "crates/codec" }
+edgefirst-hal = { version = "0.25.3", path = "crates/hal" }
+edgefirst-decoder = { version = "0.25.3", path = "crates/decoder" }
 # Vendored maintained fork of the abandoned `khronos-egl` 6.0.0; imported as
 # `edgefirst_egl`. Lets us track libloading 0.9+ (see libloading below).
-edgefirst-egl = { version = "0.25.2", path = "crates/egl", features = ["dynamic"] }
+edgefirst-egl = { version = "0.25.3", path = "crates/egl", features = ["dynamic"] }
 # Vendored trimmed fork of the abandoned `gls`; imported as `edgefirst_gl`.
-edgefirst-gl = { version = "0.25.2", path = "crates/gl" }
-edgefirst-image = { version = "0.25.2", path = "crates/image" }
-edgefirst-tensor = { version = "0.25.2", path = "crates/tensor" }
-edgefirst-tracker = { version = "0.25.2", path = "crates/tracker" }
+edgefirst-gl = { version = "0.25.3", path = "crates/gl" }
+edgefirst-image = { version = "0.25.3", path = "crates/image" }
+edgefirst-tensor = { version = "0.25.3", path = "crates/tensor" }
+edgefirst-tracker = { version = "0.25.3", path = "crates/tracker" }
 enum_dispatch = "0.3.13"
 env_logger = "0.11.10"
 fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }

@@ -1099,9 +1099,7 @@ impl DecoderBuilder {
                 Self::build_from_schema(SchemaV2::parse_yaml(&s)?, decode_dtype)?
             }
             Some(ConfigSource::Config(c)) => (c, None, None, None),
-            Some(ConfigSource::Schema(schema)) => {
-                Self::build_from_schema(schema, decode_dtype)?
-            }
+            Some(ConfigSource::Schema(schema)) => Self::build_from_schema(schema, decode_dtype)?,
             None => return Err(DecoderError::NoConfig),
         };
         // Explicit `with_input_dims(W, H)` overrides any schema-derived
