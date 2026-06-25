@@ -56,6 +56,17 @@ def test_tile_grid_frame_smaller_than_tile_single():
     assert (s.x, s.y, s.width, s.height) == (0, 0, 500, 400)
 
 
+def test_tile_grid_rejects_bad_config():
+    # Same validation as TilingConfig / the C API: a degenerate overlap or tile
+    # size raises instead of generating an enormous grid.
+    with pytest.raises(Exception):
+        tile_grid(1920, 1080, 640, 640, 1.0)
+    with pytest.raises(Exception):
+        tile_grid(1920, 1080, 640, 640, -0.1)
+    with pytest.raises(Exception):
+        tile_grid(1920, 1080, 0, 640, 0.2)
+
+
 # --- config ---------------------------------------------------------------
 
 
@@ -114,7 +125,14 @@ def test_alloc_tile_batch_rejects_zero_tile_size():
 
 
 def test_tile_into_round_trip():
-    """tile_into renders each grid tile as a band of a tall packed parent."""
+    """tile_into binding smoke test: it returns one placement per grid tile and
+    the packed parent is shaped to stack the tiles vertically.
+
+    This exercises the Python wiring (config -> grid -> render -> placements),
+    not pixel parity — band-vs-standalone content parity is covered by the Rust
+    ``tile_into_auto_dma_parity`` / ``tile_into_cpu_distinct_content_parity``
+    tests, which can assert exact/structural pixel equality directly.
+    """
     proc = ImageProcessor()
     cfg = TilingConfig(64, 64, overlap=0.0)
 
@@ -129,11 +147,11 @@ def test_tile_into_round_trip():
 
     assert n == 2
 
-    # Paint the source: left half red, right half green (RGBA u8).
+    # Confirm the source is CPU-mappable and at least its logical size (the
+    # buffer may be row-padded); otherwise this backend can't run the render.
     try:
         with src.map() as m:
             buf = np.frombuffer(m.numpy(), dtype=np.uint8)
-            # buffer may be row-padded; only assert it is at least logical size
             assert len(buf) >= 128 * 64 * 4
     except (RuntimeError, NotImplementedError) as e:
         pytest.skip(f"source not CPU-mappable: {e}")

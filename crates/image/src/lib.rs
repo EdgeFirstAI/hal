@@ -3317,12 +3317,16 @@ mod image_tests {
             )
             .unwrap();
             let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
-            let band_bytes = band.as_u8().unwrap().map().unwrap().as_slice().to_vec();
-            let solo_bytes = solo.as_u8().unwrap().map().unwrap().as_slice().to_vec();
-            assert_eq!(
-                band_bytes, solo_bytes,
-                "tile {} band differs from standalone crop-convert (auto/DMA)",
-                p.index
+            // Structural-similarity tolerance (the house GPU-parity bar) rather
+            // than exact bytes: rendering a tile into a viewport band at a
+            // non-zero offset vs. a standalone origin render diverges by sampling
+            // rounding on virtualized GPUs (paravirtual Metal/ANGLE on macOS CI),
+            // the same tolerance class as the other cross-backend parity tests.
+            compare_images(
+                &band,
+                &solo,
+                0.98,
+                &format!("{}_tile{}", function!(), p.index),
             );
         }
     }

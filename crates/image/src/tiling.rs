@@ -78,7 +78,14 @@ impl TilingConfig {
         self
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Validate the config: `overlap_ratio` in `[0.0, 1.0)` and non-zero tile
+    /// size. Called by every tiling method, and exposed so callers (e.g. the
+    /// language bindings) can reject bad input before generating a grid.
+    ///
+    /// # Errors
+    /// Returns [`Error::CropInvalid`] if the overlap is out of range or a tile
+    /// dimension is zero.
+    pub fn validate(&self) -> Result<()> {
         if !(self.overlap_ratio >= 0.0 && self.overlap_ratio < 1.0) {
             return Err(Error::CropInvalid(format!(
                 "tiling overlap_ratio must be in [0.0, 1.0), got {}",

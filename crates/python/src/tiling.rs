@@ -423,6 +423,11 @@ impl PyTiledFrameAccumulator {
 ///
 /// Python args are **width-first** to match :class:`Region` and
 /// :meth:`ImageProcessor.create_image`.
+///
+/// Raises ``RuntimeError`` if ``overlap`` is not in ``[0.0, 1.0)`` or a tile
+/// dimension is zero — the same validation as :class:`TilingConfig` and the C
+/// API (which returns ``EINVAL``), preventing a degenerate config from
+/// generating an enormous grid.
 #[pyfunction]
 #[pyo3(name = "tile_grid", signature = (frame_w, frame_h, tile_w, tile_h, overlap = 0.2))]
 pub fn py_tile_grid(
@@ -431,11 +436,14 @@ pub fn py_tile_grid(
     tile_w: usize,
     tile_h: usize,
     overlap: f32,
-) -> Vec<PyTileSpec> {
-    tile_grid(frame_h, frame_w, tile_h, tile_w, overlap)
+) -> Result<Vec<PyTileSpec>> {
+    TilingConfig::new(tile_w, tile_h)
+        .with_overlap(overlap)
+        .validate()?;
+    Ok(tile_grid(frame_h, frame_w, tile_h, tile_w, overlap)
         .into_iter()
         .map(PyTileSpec)
-        .collect()
+        .collect())
 }
 
 /// Lift tile-local **normalized** ``[0,1]`` xyxy detections (over the model

@@ -357,17 +357,17 @@ impl TiledFrameAccumulator {
     }
 
     /// Lift one tile's per-tile-decoded boxes to full-frame pixels and append
-    /// them. Idempotent per `placement.index`: a duplicate or out-of-range tile
-    /// index is ignored (its boxes are dropped) so out-of-order **and**
-    /// at-least-once delivery both converge to the same result. Returns `true`
-    /// if the tile was newly accepted, `false` if it was a duplicate/out-of-range.
+    /// them. Idempotent per `placement.index`: a duplicate, out-of-range, or
+    /// foreign placement (one whose `count` disagrees with this accumulator's
+    /// `tiles_total`, i.e. from a different plan/frame) is ignored and its boxes
+    /// dropped, so out-of-order **and** at-least-once delivery both converge to
+    /// the same result. Returns `true` if the tile was newly accepted, `false`
+    /// otherwise.
     pub fn push_tile(&mut self, tile_boxes: Vec<DetectBox>, placement: &TilePlacement) -> bool {
-        debug_assert_eq!(
-            placement.count, self.tiles_total,
-            "TilePlacement.count disagrees with accumulator tiles_total"
-        );
         let idx = placement.index;
-        if idx >= self.tiles_total || self.seen[idx] {
+        // Runtime guard (not debug-only): reject placements from a different
+        // plan so a mixed-frame mistake can't corrupt fan-in completion.
+        if placement.count != self.tiles_total || idx >= self.tiles_total || self.seen[idx] {
             return false;
         }
         self.seen[idx] = true;
@@ -770,6 +770,20 @@ mod tests {
         // Out-of-range index is ignored, never over-counts.
         assert!(!acc.push_tile(vec![], &empty_placement(2, 2)));
         assert_eq!(acc.remaining(), 0);
+    }
+
+    #[test]
+    fn accumulator_rejects_foreign_plan_count() {
+        // A placement from a different plan (count != tiles_total) is rejected
+        // at runtime — not just under debug_assert — so a mixed-frame mistake
+        // can't corrupt fan-in completion.
+        let mut acc = TiledFrameAccumulator::new((640.0, 640.0), 3, MergeConfig::default(), 8);
+        assert!(!acc.push_tile(vec![], &empty_placement(0, 4)));
+        assert_eq!(acc.remaining(), 3);
+        assert!(!acc.is_complete());
+        // The same index from the correct plan is still accepted afterward.
+        assert!(acc.push_tile(vec![], &empty_placement(0, 3)));
+        assert_eq!(acc.remaining(), 2);
     }
 
     #[test]

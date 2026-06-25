@@ -2657,6 +2657,10 @@ def tile_grid(
 
     Returns:
         The tile specs in row-major order.
+
+    Raises:
+        RuntimeError: If ``overlap`` is not in ``[0.0, 1.0)`` or a tile
+            dimension is zero.
     """
     ...
 
