@@ -75,6 +75,7 @@ pub mod float;
 pub mod modelpack;
 pub mod per_scale;
 pub mod schema;
+pub mod tiling;
 pub mod yolo;
 
 mod decoder;

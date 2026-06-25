@@ -2053,6 +2053,96 @@ class ImageProcessor:
         """
         ...
 
+    def alloc_tile_batch(
+        self,
+        n: int,
+        cfg: "TilingConfig",
+        format: PixelFormat = PixelFormat.Rgba,
+        dtype: str = "uint8",
+        memory: TensorMemory | None = None,
+    ) -> Tensor:
+        """Allocate the tall packed batch destination ``[tile_w, n*tile_h]``.
+
+        A single GL-importable parent that stacks ``n`` tiles vertically.
+        Uses the same DMA-pitch alignment and ``Dma > Pbo > Mem`` selection
+        as :meth:`create_image`. Caller-owned for pool reuse.
+
+        Args:
+            n: Number of tiles to stack vertically.
+            cfg: Tiling configuration (supplies ``tile_w``/``tile_h``).
+            format: Pixel format (default: ``PixelFormat.Rgba``).
+            dtype: Element data type string (default: ``"uint8"``).
+            memory: Force a specific backing memory kind, or ``None`` to
+                auto-select.
+
+        Returns:
+            A new batched image ``Tensor`` sized ``[tile_w, n*tile_h]``.
+        """
+        ...
+
+    def plan_tiles(
+        self,
+        width: int,
+        height: int,
+        cfg: "TilingConfig",
+    ) -> List["TilePlacement"]:
+        """Compute the tile grid and per-tile placements for a frame.
+
+        Runs **without touching the GPU**. Call once per frame to size pools
+        and drive a tile stream.
+
+        Args:
+            width: Full-frame width in pixels.
+            height: Full-frame height in pixels.
+            cfg: Tiling configuration.
+
+        Returns:
+            The per-tile :class:`TilePlacement` list in tile-index order.
+        """
+        ...
+
+    def tile_into(
+        self,
+        src: Tensor,
+        dst_batched: Tensor,
+        cfg: "TilingConfig",
+    ) -> List["TilePlacement"]:
+        """Render every tile of ``src`` into a tall packed parent.
+
+        Issues one deferred convert per tile into ``dst_batched`` (from
+        :meth:`alloc_tile_batch`), then a single ``flush``.
+
+        Args:
+            src: Whole-frame source image.
+            dst_batched: Tall packed destination from :meth:`alloc_tile_batch`.
+            cfg: Tiling configuration.
+
+        Returns:
+            The per-tile :class:`TilePlacement` list in tile-index order.
+        """
+        ...
+
+    def tile_one(
+        self,
+        src: Tensor,
+        dst_slot: Tensor,
+        placement: "TilePlacement",
+        cfg: "TilingConfig",
+    ) -> None:
+        """Render exactly one tile of ``src`` into a single destination slot.
+
+        Deferred — call :meth:`flush` on your own cadence so tiles overlap
+        with inference. All geometry rides in ``placement`` (from
+        :meth:`plan_tiles`).
+
+        Args:
+            src: Whole-frame source image.
+            dst_slot: A single model-input sized destination.
+            placement: The tile's placement from :meth:`plan_tiles`.
+            cfg: Tiling configuration.
+        """
+        ...
+
     if sys.platform == "linux":
         def import_image(
             self,
@@ -2275,3 +2365,336 @@ class Tracing:
 
     def __enter__(self) -> "Tracing": ...
     def __exit__(self, *args: object) -> bool: ...
+
+# ---------------------------------------------------------------------------
+# SAHI-style tiled inference
+# ---------------------------------------------------------------------------
+
+class Fit(enum.Enum):
+    """How a tile crop is fit into the model input."""
+
+    Stretch: Fit
+    """Stretch the crop to fill the model input (the hot path; identity for
+    the full-square tiles the grid produces)."""
+
+    Letterbox: Fit
+    """Preserve aspect ratio and pad with the :class:`TilingConfig` ``pad``
+    colour."""
+
+class MatchMetric(enum.Enum):
+    """Overlap metric used by the tiled-detection merge."""
+
+    Iou: MatchMetric
+    """Intersection-over-Union (standard NMS metric)."""
+
+    Ios: MatchMetric
+    """Intersection-over-Smaller (default): merges a seam-split fragment into
+    the whole object where IoU would leave duplicates."""
+
+class TilingConfig:
+    """Static tiling configuration for one model. Independent of frame size."""
+
+    def __init__(
+        self,
+        tile_w: int,
+        tile_h: int,
+        overlap: float = 0.2,
+        fit: Fit = Fit.Stretch,
+        pad: Tuple[int, int, int, int] = (114, 114, 114, 255),
+    ) -> None:
+        """Create a tiling config.
+
+        Args:
+            tile_w: Tile width = model input width.
+            tile_h: Tile height = model input height.
+            overlap: Minimum overlap ratio between adjacent tiles, in
+                ``[0.0, 1.0)`` (default ``0.2``). The realized overlap is
+                redistributed evenly and is always ``>=`` this.
+            fit: How a tile crop is fit into the model input
+                (default ``Fit.Stretch``).
+            pad: Letterbox pad colour (RGBA), used only when
+                ``fit == Fit.Letterbox`` (default ``(114, 114, 114, 255)``).
+        """
+        ...
+
+    def with_overlap(self, overlap: float) -> "TilingConfig":
+        """Return a copy with the minimum overlap ratio set (chainable)."""
+        ...
+
+    def with_fit(self, fit: Fit) -> "TilingConfig":
+        """Return a copy with the fit mode set (chainable). ``Fit.Letterbox``
+        uses the configured pad."""
+        ...
+
+    @property
+    def tile_w(self) -> int: ...
+    @property
+    def tile_h(self) -> int: ...
+    @property
+    def overlap(self) -> float: ...
+    @property
+    def fit(self) -> Fit: ...
+    @property
+    def pad(self) -> Tuple[int, int, int, int]: ...
+
+class TileSpec:
+    """One tile's native-frame crop rectangle and its grid coordinates."""
+
+    @property
+    def source(self) -> Region:
+        """Native crop in full-frame pixels."""
+        ...
+
+    @property
+    def index(self) -> int:
+        """Row-major flat tile index, ``0..count``."""
+        ...
+
+    @property
+    def row(self) -> int:
+        """Grid row."""
+        ...
+
+    @property
+    def col(self) -> int:
+        """Grid column."""
+        ...
+
+class TilePlacement:
+    """How one tile was cut from the full frame and fed to the model — the
+    shared input/output contract produced by the tiling grid and consumed by
+    :func:`lift_tile_boxes` and :class:`TiledFrameAccumulator`. All fields are
+    full-frame **pixels** except ``letterbox`` (normalized model-input bounds).
+    """
+
+    def __init__(
+        self,
+        index: int,
+        count: int,
+        origin: Tuple[float, float],
+        crop_size: Tuple[float, float],
+        frame_dims: Tuple[float, float],
+        letterbox: Tuple[float, float, float, float] | None = None,
+    ) -> None:
+        """Create a tile placement.
+
+        Args:
+            index: Tile index within the frame grid, ``0..count``.
+            count: Total tiles for this frame (the streaming fan-in fence).
+            origin: Native crop origin ``(ox, oy)`` in full-frame pixels.
+            crop_size: Native crop size ``(cw, ch)`` in full-frame pixels.
+            frame_dims: Full-frame dimensions ``(frame_w, frame_h)`` in pixels.
+            letterbox: Normalized letterbox content bounds
+                ``(lx0, ly0, lx1, ly1)`` on the model input, or ``None`` when
+                the crop was stretched to fill it.
+        """
+        ...
+
+    @property
+    def index(self) -> int: ...
+    @property
+    def count(self) -> int: ...
+    @property
+    def origin(self) -> Tuple[float, float]: ...
+    @property
+    def crop_size(self) -> Tuple[float, float]: ...
+    @property
+    def letterbox(self) -> Tuple[float, float, float, float] | None: ...
+    @property
+    def frame_dims(self) -> Tuple[float, float]: ...
+
+class MergeConfig:
+    """Configuration for the tiled-detection merge (GREEDYNMM)."""
+
+    def __init__(
+        self,
+        metric: MatchMetric = MatchMetric.Ios,
+        threshold: float = 0.5,
+        class_agnostic: bool = False,
+        max_det: int = 300,
+        score_threshold: float = 0.0,
+    ) -> None:
+        """Create a merge config.
+
+        Args:
+            metric: Overlap metric (default ``MatchMetric.Ios``).
+            threshold: Merge two boxes when ``metric.value(a, b) >= threshold``
+                (default ``0.5``).
+            class_agnostic: Merge across classes when ``True`` (default
+                ``False``).
+            max_det: Cap on returned detections after the merge (default
+                ``300``).
+            score_threshold: Drop merged groups whose max score is below this
+                (default ``0.0`` = keep all; per-tile decode is the real flood
+                control).
+        """
+        ...
+
+    @property
+    def metric(self) -> MatchMetric: ...
+    @property
+    def threshold(self) -> float: ...
+    @property
+    def class_agnostic(self) -> bool: ...
+    @property
+    def max_det(self) -> int: ...
+    @property
+    def score_threshold(self) -> float: ...
+
+class TiledFrameAccumulator:
+    """Streaming collector for one frame's tiled detections.
+
+    Push each tile's per-tile-decoded boxes as inference completes (in any
+    order), then finalize once every tile has arrived. Not thread-safe; keep
+    one accumulator per in-flight frame.
+    """
+
+    def __init__(
+        self,
+        frame_dims: Tuple[float, float],
+        tiles_total: int,
+        cfg: MergeConfig,
+        est_per_tile: int = 16,
+    ) -> None:
+        """Create an accumulator for one frame.
+
+        Args:
+            frame_dims: ``(frame_w, frame_h)`` in pixels, used by
+                :meth:`finalize_normalized`.
+            tiles_total: Number of tiles for the frame.
+            cfg: Merge configuration applied at finalize.
+            est_per_tile: Pre-reserve hint for the detection buffer
+                (default ``16``).
+        """
+        ...
+
+    def push_tile(
+        self,
+        bbox: npt.NDArray[np.float32],
+        scores: npt.NDArray[np.float32],
+        classes: npt.NDArray[np.uintp],
+        placement: TilePlacement,
+    ) -> bool:
+        """Lift one tile's per-tile-decoded boxes to full-frame pixels and
+        append them.
+
+        Idempotent per ``placement.index``: a duplicate or out-of-range tile
+        index is ignored.
+
+        Args:
+            bbox: Tile-local normalized ``(N, 4)`` float32 xyxy boxes.
+            scores: ``(N,)`` float32 scores.
+            classes: ``(N,)`` uintp class indices.
+            placement: The tile's placement from
+                :meth:`ImageProcessor.plan_tiles`.
+
+        Returns:
+            ``True`` if the tile was newly accepted, ``False`` if it was a
+            duplicate/out-of-range.
+
+        Raises:
+            RuntimeError: If the accumulator has already been finalized.
+        """
+        ...
+
+    def is_complete(self) -> bool:
+        """True once every tile of the frame has been pushed (by distinct
+        index).
+
+        Raises:
+            RuntimeError: If the accumulator has already been finalized.
+        """
+        ...
+
+    def remaining(self) -> int:
+        """Tiles still outstanding.
+
+        Raises:
+            RuntimeError: If the accumulator has already been finalized.
+        """
+        ...
+
+    def finalize(self) -> DetectionOutput:
+        """Merge all accumulated detections into full-frame **pixel** boxes.
+
+        Consumes the accumulator and returns the numpy detection triple.
+
+        Raises:
+            RuntimeError: If the accumulator has already been finalized.
+        """
+        ...
+
+    def finalize_normalized(self) -> DetectionOutput:
+        """Merge then renormalize to ``[0, 1]`` by ``frame_dims`` (the
+        non-tiled normalized-detection contract).
+
+        Consumes the accumulator and returns the numpy detection triple.
+
+        Raises:
+            RuntimeError: If the accumulator has already been finalized.
+        """
+        ...
+
+def tile_grid(
+    frame_w: int,
+    frame_h: int,
+    tile_w: int,
+    tile_h: int,
+    overlap: float = 0.2,
+) -> List[TileSpec]:
+    """Uniform overlapping EvenDist tile grid covering a ``frame_w``×``frame_h``
+    frame.
+
+    Row-major. Every tile is full-size unless the frame is smaller than the
+    tile on an axis, in which case that axis yields a single whole-frame crop.
+
+    Args:
+        frame_w: Full-frame width in pixels.
+        frame_h: Full-frame height in pixels.
+        tile_w: Tile width in pixels.
+        tile_h: Tile height in pixels.
+        overlap: Minimum overlap ratio in ``[0.0, 1.0)`` (default ``0.2``).
+
+    Returns:
+        The tile specs in row-major order.
+    """
+    ...
+
+def lift_tile_boxes(
+    bbox: npt.NDArray[np.float32],
+    scores: npt.NDArray[np.float32],
+    classes: npt.NDArray[np.uintp],
+    placement: TilePlacement,
+) -> DetectionOutput:
+    """Lift tile-local normalized ``[0,1]`` xyxy detections (over the model
+    input) to full-frame **pixel** xyxy, inverting the letterbox if present.
+
+    Args:
+        bbox: Tile-local normalized ``(N, 4)`` float32 xyxy boxes.
+        scores: ``(N,)`` float32 scores.
+        classes: ``(N,)`` uintp class indices.
+        placement: The tile's placement.
+
+    Returns:
+        The lifted detections as the numpy detection triple.
+    """
+    ...
+
+def merge_tiled_detections(
+    bbox: npt.NDArray[np.float32],
+    scores: npt.NDArray[np.float32],
+    classes: npt.NDArray[np.uintp],
+    cfg: MergeConfig,
+) -> DetectionOutput:
+    """Greedy Non-Max Merge of lifted full-frame detections (GREEDYNMM).
+
+    Args:
+        bbox: Full-frame ``(N, 4)`` float32 xyxy boxes.
+        scores: ``(N,)`` float32 scores.
+        classes: ``(N,)`` uintp class indices.
+        cfg: Merge configuration.
+
+    Returns:
+        The merged detections as the numpy detection triple.
+    """
+    ...

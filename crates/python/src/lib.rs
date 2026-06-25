@@ -22,6 +22,7 @@ pub mod colorimetry;
 pub mod decoder;
 pub mod image;
 pub mod tensor;
+pub mod tiling;
 pub mod tracker;
 
 pub struct FunctionTimer {
@@ -97,6 +98,17 @@ pub mod edgefirst_hal {
         m.add_class::<decoder::PyDecoderVersion>()?;
         m.add_class::<decoder::PyDimName>()?;
         m.add_class::<decoder::PyOutput>()?;
+
+        m.add_class::<tiling::PyFit>()?;
+        m.add_class::<tiling::PyMatchMetric>()?;
+        m.add_class::<tiling::PyTilingConfig>()?;
+        m.add_class::<tiling::PyTileSpec>()?;
+        m.add_class::<tiling::PyTilePlacement>()?;
+        m.add_class::<tiling::PyMergeConfig>()?;
+        m.add_class::<tiling::PyTiledFrameAccumulator>()?;
+        m.add_function(wrap_pyfunction!(tiling::py_tile_grid, m)?)?;
+        m.add_function(wrap_pyfunction!(tiling::py_lift_tile_boxes, m)?)?;
+        m.add_function(wrap_pyfunction!(tiling::py_merge_tiled_detections, m)?)?;
 
         m.add_class::<tracker::PyTrackInfo>()?;
         m.add_class::<tracker::PyByteTrack>()?;

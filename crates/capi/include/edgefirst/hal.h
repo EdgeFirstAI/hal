@@ -536,6 +536,24 @@ typedef enum HalTensorQuantKind {
 } HalTensorQuantKind;
 
 /**
+ * Overlap metric used by the tiled-detection merge.
+ *
+ * The default (used by `hal_merge_config_default()`) is
+ * `HAL_MATCH_METRIC_IOS`: intersection-over-smaller merges seam-split
+ * fragments that IoU would leave separate.
+ */
+typedef enum hal_match_metric {
+  /**
+   * Intersection-over-Union (standard NMS metric).
+   */
+  HAL_MATCH_METRIC_IOU = 0,
+  /**
+   * Intersection-over-Smaller (default): `inter / min(area_a, area_b)`.
+   */
+  HAL_MATCH_METRIC_IOS = 1,
+} hal_match_metric;
+
+/**
  * Opaque ByteTrack tracker type.
  */
 typedef struct hal_bytetrack hal_bytetrack;
@@ -677,6 +695,27 @@ typedef struct hal_tensor_map hal_tensor_map;
 typedef struct HalTensorQuant HalTensorQuant;
 
 /**
+ * List of tile placements (plan output). Free with
+ * `hal_tile_placement_list_free()`.
+ */
+typedef struct hal_tile_placement_list hal_tile_placement_list;
+
+/**
+ * List of tile specs (grid output). Free with `hal_tile_spec_list_free()`.
+ */
+typedef struct hal_tile_spec_list hal_tile_spec_list;
+
+/**
+ * Streaming collector for one frame's tiled detections.
+ *
+ * Created by `hal_tiled_frame_accumulator_new()`. The `_finalize` /
+ * `_finalize_normalized` calls **consume** the handle (it is freed exactly
+ * once internally); do not call `_free` after finalizing. Use `_free` only to
+ * abandon an accumulator without finalizing.
+ */
+typedef struct hal_tiled_frame_accumulator hal_tiled_frame_accumulator;
+
+/**
  * List of track info results.
  */
 typedef struct hal_track_info_list hal_track_info_list;
@@ -801,6 +840,143 @@ typedef void (*hal_log_callback)(enum hal_log_level level,
                                  const char *target,
                                  const char *message,
                                  void *userdata);
+
+/**
+ * Static tiling configuration (independent of frame size). Passed by value.
+ *
+ * Seed with `hal_tiling_config_default()` then override fields; do **not**
+ * `memset(0)` — a zero `fit` happens to be `HAL_FIT_STRETCH` but a zero
+ * `overlap_ratio` differs from the default 0.2.
+ */
+typedef struct hal_tiling_config {
+  /**
+   * Tile width = model input width (pixels).
+   */
+  size_t tile_w;
+  /**
+   * Tile height = model input height (pixels).
+   */
+  size_t tile_h;
+  /**
+   * Minimum overlap ratio between adjacent tiles, `0.0 <= r < 1.0`.
+   */
+  float overlap_ratio;
+  /**
+   * Letterbox pad colour (RGBA), used only when `fit == HAL_FIT_LETTERBOX`.
+   */
+  uint8_t pad[4];
+  /**
+   * Fit mode: `HAL_FIT_STRETCH` (0) or `HAL_FIT_LETTERBOX` (1).
+   */
+  int fit;
+} hal_tiling_config;
+
+/**
+ * Configuration for the tiled-detection merge. Passed by value.
+ *
+ * Seed with `hal_merge_config_default()` then override fields; do **not**
+ * `memset(0)` — that selects `HAL_MATCH_METRIC_IOU` and `max_det == 0`,
+ * which is **not** the intended default (IOS / 300).
+ */
+typedef struct hal_merge_config {
+  /**
+   * Overlap metric: `HAL_MATCH_METRIC_IOU` (0) or `HAL_MATCH_METRIC_IOS` (1).
+   */
+  int metric;
+  /**
+   * Merge two boxes when `metric(a, b) >= threshold`.
+   */
+  float threshold;
+  /**
+   * Merge across classes when true.
+   */
+  bool class_agnostic;
+  /**
+   * Cap on returned detections after the merge.
+   */
+  size_t max_det;
+  /**
+   * Drop merged groups whose max score is below this (0.0 = keep all).
+   */
+  float score_threshold;
+} hal_merge_config;
+
+/**
+ * How one tile was cut from the full frame and fed to the model. Passed by
+ * value. Produced by `hal_image_processor_plan_tiles()` /
+ * `hal_image_processor_tile_into()`, consumed by `hal_lift_tile_boxes()` and
+ * the accumulator.
+ *
+ * The Rust `Option<[f32; 4]>` letterbox is flattened to a `has_letterbox`
+ * flag plus an inline `letterbox[4]` array — never a pointer in a by-value
+ * struct.
+ */
+typedef struct hal_tile_placement {
+  /**
+   * Tile index within the frame grid, `0..count`.
+   */
+  size_t index;
+  /**
+   * Total tiles for this frame (the streaming fan-in fence).
+   */
+  size_t count;
+  /**
+   * Native crop origin x in full-frame pixels.
+   */
+  float origin_x;
+  /**
+   * Native crop origin y in full-frame pixels.
+   */
+  float origin_y;
+  /**
+   * Native crop width in full-frame pixels.
+   */
+  float crop_w;
+  /**
+   * Native crop height in full-frame pixels.
+   */
+  float crop_h;
+  /**
+   * Full-frame width in pixels.
+   */
+  float frame_w;
+  /**
+   * Full-frame height in pixels.
+   */
+  float frame_h;
+  /**
+   * Whether `letterbox` carries valid content bounds (else the crop was
+   * stretched to fill the model input).
+   */
+  bool has_letterbox;
+  /**
+   * Normalized letterbox content bounds `[lx0, ly0, lx1, ly1]` on the model
+   * input. Only valid when `has_letterbox` is true.
+   */
+  float letterbox[4];
+} hal_tile_placement;
+
+/**
+ * One tile's native-frame crop rectangle and grid coordinates. Passed by value.
+ */
+typedef struct hal_tile_spec {
+  /**
+   * Native crop in full-frame pixels.
+   */
+  struct hal_region source;
+  /**
+   * Row-major flat index, `0..count`.
+   */
+  size_t index;
+  /**
+   * Grid row.
+   */
+  size_t row;
+  /**
+   * Grid column.
+   */
+  size_t col;
+} hal_tile_spec;
 
 /**
  * Track information for a tracked object.
@@ -1549,6 +1725,26 @@ struct hal_tensor *hal_proto_data_take_mask_coefficients(struct hal_proto_data *
  * @return Layout constant, or -1 if `proto` is NULL
  */
 int32_t hal_proto_data_layout(const struct hal_proto_data *proto);
+
+/**
+ * Create a detection box list from a caller-supplied array.
+ *
+ * Copies `count` boxes from `boxes` into a new owned list. Pass `count == 0`
+ * (with any `boxes`, including NULL) to build an empty list. This is the
+ * counterpart to the decoder/tiling functions that *return* box lists: use it
+ * to feed externally-produced detections into `hal_lift_tile_boxes()`,
+ * `hal_merge_tiled_detections()`, or `hal_tiled_frame_accumulator_push_tile()`.
+ *
+ * @param boxes Pointer to an array of `count` detection boxes (may be NULL
+ *        only when `count == 0`)
+ * @param count Number of boxes to copy
+ * @return New detection box list (free with `hal_detect_box_list_free()`),
+ *         or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: `boxes` is NULL while `count > 0`
+ */
+struct hal_detect_box_list *hal_detect_box_list_new(const struct hal_detect_box *boxes,
+                                                    size_t count);
 
 /**
  * Get the number of detections in a list.
@@ -3106,6 +3302,311 @@ void hal_tensor_set_colorimetry(struct hal_tensor *tensor, const struct hal_colo
  * @return 0 on success, -1 on bad args (NULL tensor or NULL out)
  */
 int hal_tensor_colorimetry(const struct hal_tensor *tensor, struct hal_colorimetry *out);
+
+/**
+ * Build a tiling configuration with deploy defaults (overlap 0.2, stretch
+ * fit, `[114,114,114,255]` pad) and the given tile size.
+ *
+ * @param tile_w Tile width = model input width (pixels)
+ * @param tile_h Tile height = model input height (pixels)
+ * @return Fully-initialized tiling configuration by value
+ */
+struct hal_tiling_config hal_tiling_config_default(size_t tile_w, size_t tile_h);
+
+/**
+ * Build a merge configuration with library defaults (IOS metric, threshold
+ * 0.5, class-aware, `max_det` 300, score threshold 0.0).
+ *
+ * @return Fully-initialized merge configuration by value
+ */
+struct hal_merge_config hal_merge_config_default(void);
+
+/**
+ * Compute the uniform overlapping EvenDist tile grid for a frame.
+ *
+ * Row-major (all columns of row 0, then row 1, …). Every tile is full-size
+ * unless the frame is smaller than the tile on an axis, in which case that
+ * axis yields a single whole-frame crop.
+ *
+ * @param frame_h Frame height in pixels
+ * @param frame_w Frame width in pixels
+ * @param tile_h Tile height in pixels (must be non-zero)
+ * @param tile_w Tile width in pixels (must be non-zero)
+ * @param overlap_ratio Minimum overlap ratio, `0.0 <= r < 1.0`
+ * @return Tile spec list (free with `hal_tile_spec_list_free()`), or NULL on
+ *         error
+ * @par Errors (errno):
+ * - EINVAL: Zero tile size or overlap_ratio outside `[0.0, 1.0)`
+ */
+struct hal_tile_spec_list *hal_tile_grid(size_t frame_h,
+                                         size_t frame_w,
+                                         size_t tile_h,
+                                         size_t tile_w,
+                                         float overlap_ratio);
+
+/**
+ * Allocate a tall packed batch destination that stacks `n` tiles vertically.
+ *
+ * @param processor Image processor handle
+ * @param n Number of tiles to stack
+ * @param config Tiling configuration (must be non-NULL)
+ * @param format Pixel format (HAL_PIXEL_FORMAT_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid config (zero tile size, bad overlap)
+ * - ENOTSUP: Unsupported format/operation
+ * - EIO: DMA/GPU buffer allocation failed
+ * - ENOMEM: Memory allocation failed
+ */
+struct hal_tensor *hal_image_processor_alloc_tile_batch(struct hal_image_processor *processor,
+                                                        size_t n,
+                                                        const struct hal_tiling_config *config,
+                                                        enum hal_pixel_format format,
+                                                        enum hal_dtype dtype,
+                                                        enum hal_tensor_memory memory);
+
+/**
+ * Compute the tile grid and per-tile placement metadata for a frame without
+ * touching the GPU.
+ *
+ * @param processor Image processor handle
+ * @param src_w Source frame width in pixels
+ * @param src_h Source frame height in pixels
+ * @param config Tiling configuration (must be non-NULL)
+ * @return Tile placement list (free with `hal_tile_placement_list_free()`),
+ *         or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid config
+ */
+struct hal_tile_placement_list *hal_image_processor_plan_tiles(struct hal_image_processor *processor,
+                                                               size_t src_w,
+                                                               size_t src_h,
+                                                               const struct hal_tiling_config *config);
+
+/**
+ * Render every tile of `src` into `dst` (a tall packed parent from
+ * `hal_image_processor_alloc_tile_batch()`), then flush once.
+ *
+ * @param processor Image processor handle
+ * @param src Source image tensor (whole frame)
+ * @param dst Destination batched tensor (tall parent)
+ * @param config Tiling configuration (must be non-NULL)
+ * @return Tile placement list (free with `hal_tile_placement_list_free()`),
+ *         or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid config / non-image src/dst
+ * - ENOSPC: Destination too small to hold all tile bands
+ * - EIO: Tile convert failed
+ */
+struct hal_tile_placement_list *hal_image_processor_tile_into(struct hal_image_processor *processor,
+                                                              const struct hal_tensor *src,
+                                                              struct hal_tensor *dst,
+                                                              const struct hal_tiling_config *config);
+
+/**
+ * Render exactly one tile of `src` into `dst` (a single model-input sized
+ * slot). Deferred — the caller flushes on its own cadence.
+ *
+ * @param processor Image processor handle
+ * @param src Source image tensor (whole frame)
+ * @param dst Destination slot tensor (model-input sized)
+ * @param placement Tile placement from `hal_image_processor_plan_tiles()`
+ * @param config Tiling configuration (must be non-NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid config
+ * - EIO: Tile convert failed
+ */
+int hal_image_processor_tile_one(struct hal_image_processor *processor,
+                                 const struct hal_tensor *src,
+                                 struct hal_tensor *dst,
+                                 const struct hal_tile_placement *placement,
+                                 const struct hal_tiling_config *config);
+
+/**
+ * Lift tile-local normalized detections to full-frame pixel coordinates.
+ *
+ * The input list is borrowed (cloned internally); the caller still owns it.
+ *
+ * @param boxes Tile-local detection box list (NULL treated as empty)
+ * @param placement Tile placement describing the tile geometry (non-NULL)
+ * @return New detection box list in full-frame pixels (free with
+ *         `hal_detect_box_list_free()`), or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL placement
+ */
+struct hal_detect_box_list *hal_lift_tile_boxes(const struct hal_detect_box_list *boxes,
+                                                const struct hal_tile_placement *placement);
+
+/**
+ * Merge lifted full-frame detections across tiles (greedy non-max merge).
+ *
+ * The input list is borrowed (cloned internally); the caller still owns it.
+ *
+ * @param boxes Lifted full-frame detection box list (NULL treated as empty)
+ * @param config Merge configuration (non-NULL; seed with
+ *        `hal_merge_config_default()`)
+ * @return New merged detection box list (free with
+ *         `hal_detect_box_list_free()`), or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL config
+ */
+struct hal_detect_box_list *hal_merge_tiled_detections(const struct hal_detect_box_list *boxes,
+                                                       const struct hal_merge_config *config);
+
+/**
+ * Create a streaming accumulator for one frame's tiled detections.
+ *
+ * @param frame_w Full-frame width in pixels (for `_finalize_normalized`)
+ * @param frame_h Full-frame height in pixels (for `_finalize_normalized`)
+ * @param tiles_total Total tiles for this frame (the fan-in fence)
+ * @param config Merge configuration (non-NULL; seed with
+ *        `hal_merge_config_default()`)
+ * @param est_per_tile Estimated detections per tile (pre-reserves the buffer)
+ * @return New accumulator handle (free with
+ *         `hal_tiled_frame_accumulator_free()` or consume via a finalize
+ *         call), or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL config
+ */
+struct hal_tiled_frame_accumulator *hal_tiled_frame_accumulator_new(float frame_w,
+                                                                    float frame_h,
+                                                                    size_t tiles_total,
+                                                                    const struct hal_merge_config *config,
+                                                                    size_t est_per_tile);
+
+/**
+ * Push one tile's per-tile-decoded boxes into the accumulator.
+ *
+ * Lifts the boxes to full-frame pixels and appends them. Idempotent per
+ * `placement.index`. The input list is borrowed (cloned internally).
+ *
+ * @param acc Accumulator handle
+ * @param boxes Tile-local detection box list (NULL treated as empty)
+ * @param placement Tile placement for this tile (non-NULL)
+ * @return 1 if the tile was newly accepted, 0 if it was a
+ *         duplicate/out-of-range, -1 on error (errno set)
+ * @par Errors (errno):
+ * - EINVAL: NULL acc or placement
+ */
+int hal_tiled_frame_accumulator_push_tile(struct hal_tiled_frame_accumulator *acc,
+                                          const struct hal_detect_box_list *boxes,
+                                          const struct hal_tile_placement *placement);
+
+/**
+ * Whether every tile of the frame has been pushed.
+ *
+ * @param acc Accumulator handle
+ * @return true if complete, false otherwise (or if acc is NULL)
+ */
+bool hal_tiled_frame_accumulator_is_complete(const struct hal_tiled_frame_accumulator *acc);
+
+/**
+ * Number of tiles still outstanding.
+ *
+ * @param acc Accumulator handle
+ * @return Tiles remaining, or 0 if acc is NULL
+ */
+size_t hal_tiled_frame_accumulator_remaining(const struct hal_tiled_frame_accumulator *acc);
+
+/**
+ * Finalize the accumulator into merged full-frame **pixel** detections.
+ *
+ * **Consumes** the accumulator: the handle is freed internally and must not be
+ * used or freed again after this call.
+ *
+ * @param acc Accumulator handle (consumed)
+ * @return Merged detection box list in full-frame pixels (free with
+ *         `hal_detect_box_list_free()`), or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL acc
+ */
+struct hal_detect_box_list *hal_tiled_frame_accumulator_finalize(struct hal_tiled_frame_accumulator *acc);
+
+/**
+ * Finalize the accumulator into merged detections renormalized to `[0,1]` by
+ * `frame_dims` (the non-tiled normalized-detection contract, e.g. for the
+ * tracker).
+ *
+ * **Consumes** the accumulator: the handle is freed internally and must not be
+ * used or freed again after this call.
+ *
+ * @param acc Accumulator handle (consumed)
+ * @return Merged detection box list in normalized `[0,1]` coordinates (free
+ *         with `hal_detect_box_list_free()`), or NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL acc
+ */
+struct hal_detect_box_list *hal_tiled_frame_accumulator_finalize_normalized(struct hal_tiled_frame_accumulator *acc);
+
+/**
+ * Free an accumulator without finalizing (the abandon path). No-op if NULL.
+ *
+ * Do **not** call this after a finalize call — that would double-free.
+ *
+ * @param acc Accumulator handle to free (can be NULL)
+ */
+void hal_tiled_frame_accumulator_free(struct hal_tiled_frame_accumulator *acc);
+
+/**
+ * Number of tile specs in a list.
+ *
+ * @param list Tile spec list handle
+ * @return Count, or 0 if list is NULL
+ */
+size_t hal_tile_spec_list_len(const struct hal_tile_spec_list *list);
+
+/**
+ * Get a tile spec from a list by index.
+ *
+ * @param list Tile spec list handle
+ * @param index Index (0-based)
+ * @param out_spec Output parameter for the tile spec
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL list/out_spec, or index out of bounds
+ */
+int hal_tile_spec_list_get(const struct hal_tile_spec_list *list,
+                           size_t index,
+                           struct hal_tile_spec *out_spec);
+
+/**
+ * Free a tile spec list (can be NULL, no-op).
+ *
+ * @param list Tile spec list handle to free
+ */
+void hal_tile_spec_list_free(struct hal_tile_spec_list *list);
+
+/**
+ * Number of tile placements in a list.
+ *
+ * @param list Tile placement list handle
+ * @return Count, or 0 if list is NULL
+ */
+size_t hal_tile_placement_list_len(const struct hal_tile_placement_list *list);
+
+/**
+ * Get a tile placement from a list by index.
+ *
+ * @param list Tile placement list handle
+ * @param index Index (0-based)
+ * @param out_placement Output parameter for the tile placement
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: NULL list/out_placement, or index out of bounds
+ */
+int hal_tile_placement_list_get(const struct hal_tile_placement_list *list,
+                                size_t index,
+                                struct hal_tile_placement *out_placement);
+
+/**
+ * Free a tile placement list (can be NULL, no-op).
+ *
+ * @param list Tile placement list handle to free
+ */
+void hal_tile_placement_list_free(struct hal_tile_placement_list *list);
 
 /**
  * Start trace capture, writing Chrome JSON to the file at `path`.

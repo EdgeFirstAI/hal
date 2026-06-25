@@ -71,7 +71,7 @@ else
 endif
 
 # Source files
-TEST_SRCS := test_tensor.c test_image.c test_decoder.c test_tracker.c
+TEST_SRCS := test_tensor.c test_image.c test_decoder.c test_tracker.c test_tiling.c
 TEST_MAIN := test_all.c
 
 # Object files
@@ -86,6 +86,7 @@ TEST_TENSOR := $(BUILD_DIR)/test_tensor
 TEST_IMAGE := $(BUILD_DIR)/test_image
 TEST_DECODER := $(BUILD_DIR)/test_decoder
 TEST_TRACKER := $(BUILD_DIR)/test_tracker
+TEST_TILING := $(BUILD_DIR)/test_tiling
 
 # Benchmark executables
 BENCH_PREPROC := $(BUILD_DIR)/bench_preproc
@@ -112,8 +113,10 @@ $(BUILD_DIR)/%.o: %.c test_common.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Compile standalone test objects (with define)
+# Strip the leading `test_` from the stem so `test_image` -> TEST_IMAGE_STANDALONE,
+# matching the `#ifdef TEST_<MODULE>_STANDALONE` guard each test file uses.
 $(BUILD_DIR)/%_standalone.o: %.c test_common.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -DTEST_$(shell echo $* | tr '[:lower:]' '[:upper:]')_STANDALONE -c $< -o $@
+	$(CC) $(CFLAGS) -DTEST_$(shell echo $* | sed 's/^test_//' | tr '[:lower:]' '[:upper:]')_STANDALONE -c $< -o $@
 
 # Link main test executable
 $(TEST_ALL): $(MAIN_OBJ) $(TEST_OBJS)
@@ -130,6 +133,9 @@ $(TEST_DECODER): $(BUILD_DIR)/test_decoder_standalone.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LIBS)
 
 $(TEST_TRACKER): $(BUILD_DIR)/test_tracker_standalone.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LIBS)
+
+$(TEST_TILING): $(BUILD_DIR)/test_tiling_standalone.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(LIBS)
 
 # Benchmark executable (standalone, does not use test_common.h)
@@ -189,6 +195,10 @@ test_decoder: $(TEST_DECODER)
 .PHONY: test_tracker
 test_tracker: $(TEST_TRACKER)
 	$(TEST_TRACKER)
+
+.PHONY: test_tiling
+test_tiling: $(TEST_TILING)
+	$(TEST_TILING)
 
 # Memory check with valgrind
 .PHONY: valgrind

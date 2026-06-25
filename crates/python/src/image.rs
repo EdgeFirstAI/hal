@@ -31,7 +31,7 @@ use std::{
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Validate numpy bbox/scores/classes shapes and convert to `Vec<DetectBox>`.
-fn numpy_to_detect_boxes(
+pub(crate) fn numpy_to_detect_boxes(
     bbox: &PyReadonlyArray2<f32>,
     scores: &PyReadonlyArray1<f32>,
     classes: &PyReadonlyArray1<usize>,
@@ -1325,6 +1325,93 @@ impl PyImageProcessor {
             .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
             .create_image(width, height, fmt, dt, None)?;
         Ok(PyTensor(dyn_tensor))
+    }
+
+    /// Allocate the tall packed batch destination ``[tile_w, n*tile_h]`` — a
+    /// single GL-importable parent that stacks ``n`` tiles vertically. Uses
+    /// the same DMA-pitch alignment and ``Dma>Pbo>Mem`` selection as
+    /// :meth:`create_image`. Caller-owned for pool reuse.
+    #[pyo3(signature = (n, cfg, format = PyPixelFormat::Rgba, dtype = "uint8", memory = None))]
+    pub fn alloc_tile_batch(
+        &self,
+        n: usize,
+        cfg: &crate::tiling::PyTilingConfig,
+        format: PyPixelFormat,
+        dtype: &str,
+        memory: Option<crate::tensor::PyTensorMemory>,
+    ) -> Result<PyTensor> {
+        let fmt: PixelFormat = format.into();
+        let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
+        let dyn_tensor = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .alloc_tile_batch(n, &cfg.0, fmt, dt, memory.map(Into::into))?;
+        Ok(PyTensor(dyn_tensor))
+    }
+
+    /// Compute the tile grid and per-tile :class:`TilePlacement` metadata for a
+    /// ``width``×``height`` frame **without touching the GPU**. Call once per
+    /// frame to size pools and drive a tile stream.
+    #[pyo3(signature = (width, height, cfg))]
+    pub fn plan_tiles(
+        &self,
+        width: usize,
+        height: usize,
+        cfg: &crate::tiling::PyTilingConfig,
+    ) -> Result<Vec<crate::tiling::PyTilePlacement>> {
+        let placements = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .plan_tiles(width, height, &cfg.0)?;
+        Ok(placements
+            .into_iter()
+            .map(crate::tiling::PyTilePlacement)
+            .collect())
+    }
+
+    /// Render every tile of ``src`` into ``dst_batched`` (a tall packed parent
+    /// from :meth:`alloc_tile_batch`), one deferred convert per tile, then a
+    /// single ``flush``. Returns the per-tile :class:`TilePlacement` list in
+    /// tile-index order.
+    #[pyo3(signature = (src, dst_batched, cfg))]
+    pub fn tile_into(
+        &mut self,
+        src: &PyTensor,
+        dst_batched: &mut PyTensor,
+        cfg: &crate::tiling::PyTilingConfig,
+    ) -> Result<Vec<crate::tiling::PyTilePlacement>> {
+        let _span = tracing::trace_span!("python.tile_into").entered();
+        let placements = self
+            .0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .tile_into(&src.0, &mut dst_batched.0, &cfg.0)?;
+        Ok(placements
+            .into_iter()
+            .map(crate::tiling::PyTilePlacement)
+            .collect())
+    }
+
+    /// Render exactly one tile of ``src`` into ``dst_slot`` (a single
+    /// model-input sized destination). Deferred — call :meth:`flush` on your
+    /// own cadence so tiles overlap with inference. All geometry rides in
+    /// ``placement`` (from :meth:`plan_tiles`).
+    #[pyo3(signature = (src, dst_slot, placement, cfg))]
+    pub fn tile_one(
+        &mut self,
+        src: &PyTensor,
+        dst_slot: &mut PyTensor,
+        placement: &crate::tiling::PyTilePlacement,
+        cfg: &crate::tiling::PyTilingConfig,
+    ) -> Result<()> {
+        let _span = tracing::trace_span!("python.tile_one").entered();
+        self.0
+            .lock()
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
+            .tile_one(&src.0, &mut dst_slot.0, &placement.0, &cfg.0)?;
+        Ok(())
     }
 
     /// Import an external DMA-BUF image.
