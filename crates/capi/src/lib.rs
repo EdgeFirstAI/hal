@@ -30,6 +30,7 @@ mod error;
 mod image;
 mod log;
 mod tensor;
+mod tiling;
 mod trace;
 mod tracker;
 
@@ -40,6 +41,7 @@ pub use error::*;
 pub use image::*;
 pub use log::*;
 pub use tensor::*;
+pub use tiling::*;
 #[cfg(feature = "tracing")]
 pub use trace::*;
 pub use tracker::*;

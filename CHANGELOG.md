@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SAHI-style input tiling (zero-copy) for small-object detection in
+  high-resolution frames.** A frame is covered by a uniform overlapping grid of
+  model-input-sized tiles, each preprocessed zero-copy, decoded per tile, then
+  lifted to full-frame coordinates and merged.
+  - `edgefirst-image`: `TilingConfig`, `TileSpec`, `tile_grid` (EvenDist
+    spacing — `overlap_ratio` is a *minimum*, realized overlap is redistributed
+    evenly so all tiles are full-size), and `ImageProcessor::{alloc_tile_batch,
+    plan_tiles, tile_into, tile_one}`. `tile_into` renders all tiles into one
+    tall GL-importable parent with a single flush; `tile_one` is the deferred
+    per-tile primitive for a pipelined/streaming runtime.
+  - `edgefirst-decoder`: new `tiling` module — `TilePlacement` (the shared
+    input↔output contract), `MatchMetric` (IOU/IOS), `MergeConfig`,
+    `lift_tile_boxes`, `merge_tiled_detections` (GREEDYNMM with IOS, mirroring
+    ModelPack `metrics/tiled.py`), `unletter_norm`, and `TiledFrameAccumulator`
+    (streaming fan-in that collects after the final tile, idempotent per tile
+    index). New `float` helpers `intersection_area`, `box_area`, `iou_value`,
+    `ios_value`.
+  - Fully wired into the Python and C APIs.
+
 ## [0.25.3] - 2026-06-24
 
 ### Changed

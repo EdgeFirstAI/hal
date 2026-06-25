@@ -211,6 +211,61 @@ disambiguation rules, the 2-way split format used by TFLite INT8
 segmentation models, and the `nc=28` edge case are documented in
 [ARCHITECTURE.md § Model-type selection](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md#model-type-selection).
 
+## Tiled Inference (SAHI)
+
+When a frame is preprocessed into an overlapping tile grid (see
+`edgefirst-image`'s tiled preprocessing), each tile is decoded independently and
+its detections are lifted back to full-frame coordinates and merged. A single
+object split across a tile seam has low IoU but high **IoS**
+(intersection-over-smaller), so the default merge metric is `Ios` with a `0.5`
+threshold via a GREEDYNMM pass — canonical SAHI postprocessing.
+
+The input and output sides share one `TilePlacement` (produced by
+`ImageProcessor::plan_tiles`/`tile_into`) describing how each tile was cut.
+
+```rust,ignore
+use edgefirst_decoder::tiling::{MergeConfig, TiledFrameAccumulator};
+
+// One accumulator per in-flight frame; collect tiles in any order.
+let mut acc = TiledFrameAccumulator::new(
+    (frame_w as f32, frame_h as f32),
+    placements.len(),   // tiles_total — the fan-in fence
+    MergeConfig::default(),
+    16,                 // estimated detections per tile (capacity hint)
+);
+
+for (tile_outputs, placement) in tiles {
+    // Decode each tile at a low per-tile score threshold with class-aware NMS,
+    // then hand the tile's boxes to the accumulator.
+    let mut boxes = Vec::new();
+    let mut masks = Vec::new();
+    decoder.decode(&tile_outputs, &mut boxes, &mut masks)?;
+    acc.push_tile(boxes, &placement); // lifts to full-frame pixels + appends
+}
+
+// Once every tile has arrived, merge and normalize to [0,1] for the tracker.
+assert!(acc.is_complete());
+let detections = acc.finalize_normalized(); // full-frame, deduplicated
+```
+
+`push_tile` is idempotent per `placement.index`, so out-of-order **and**
+at-least-once tile delivery both converge to the same result — the merge runs once
+at `finalize`, never per push. This is the "collect after the final tile" contract
+a pipelined runtime needs: `plan_tiles` sizes the ring up front, `tile_one` streams
+tiles through inference, and `is_complete()`/`remaining()` fence the frame.
+
+The free functions `lift_tile_boxes` and `merge_tiled_detections` expose the two
+stages directly if you need to merge without the accumulator. `MergeConfig` tunes
+the metric (`Ios`/`Iou`), threshold, `class_agnostic`, `max_det`, and a final
+`score_threshold`. The same machinery supports standard SAHI with Ultralytics YOLO
+models. Merged boxes can be fed straight to the tracker (next section), which
+expects normalized coordinates — hence `finalize_normalized`.
+
+> **Note:** IoS merge reconstructs the *enclosing union* of fragments and cannot
+> recover an object larger than a single tile; add an optional full-frame
+> downscaled pass (another `push_tile` at `origin=(0,0)`, `crop_size=frame_dims`)
+> for mixed-scale datasets.
+
 ## Tracked Decoding
 
 The `tracker` feature adds `decode_tracked` to integrate object tracking directly into the decode step. Each decoded detection box is matched to a persistent track and assigned a stable UUID for the lifetime of the track.

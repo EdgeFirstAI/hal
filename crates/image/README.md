@@ -209,6 +209,61 @@ let mut dst = TensorDyn::from(model_input);
 processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 ```
 
+## Tiled Preprocessing (SAHI)
+
+For small-object detection in high-resolution frames (e.g. 4K), run the model at
+its native tile resolution over an overlapping grid of native-resolution crops —
+**SAHI** (Slicing Aided Hyper Inference). `ImageProcessor` renders every tile into
+a single tall packed batch tensor with **one** GL import and **one** flush, so the
+N tiles cost roughly one GPU sync rather than N.
+
+```rust,ignore
+use edgefirst_image::TilingConfig;
+
+// 640x640 tiles, >=20% overlap (the minimum; actual overlap is redistributed
+// evenly so every tile is full-size and the last tile lands flush at frame-tile).
+let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
+
+// plan_tiles is pure geometry (no GPU): use its length to size the batch.
+let placements = processor.plan_tiles(src_w, src_h, &cfg)?;
+
+// One tall [N*tile_h, tile_w, C] destination — allocate once, reuse per frame.
+let mut batch = processor.alloc_tile_batch(
+    placements.len(), &cfg,
+    PixelFormat::Rgb, DType::U8, None,
+)?;
+
+// Render all tiles (deferred convert per tile + single flush). Returns the same
+// placements mapping each tile band back to full-frame coordinates.
+let placements = processor.tile_into(&src, &mut batch, &cfg)?;
+```
+
+Each tile selects its source crop by **sampling** the whole-frame tensor (texture
+coordinates), never by viewing it — a viewed source would mint one EGLImage import
+per tile and defeat the zero-copy property. The destination tiles are sibling views
+of one parent buffer rendered as `glViewport`/`glScissor` bands.
+
+For pipelined I/O (overlapping preprocessing, inference, and collection), use
+`tile_one` to render into a caller-owned model-input slot (e.g. one slot of a ring)
+instead of the batched `tile_into`:
+
+```rust,ignore
+let placements = processor.plan_tiles(src_w, src_h, &cfg)?; // pure, no GPU
+let mut slot = processor.create_image(cfg.tile_w, cfg.tile_h,
+                                      PixelFormat::Rgb, DType::U8, None)?;
+for p in &placements {
+    processor.tile_one(&src, &mut slot, p, &cfg)?; // deferred: caller owns sync
+    processor.flush()?;                            // flush per-slot or per-ring cadence
+    // ... submit slot for inference, collect output keyed by p.index ...
+}
+```
+
+`plan_tiles` is pure geometry (no GPU work) so a profiler can size pools up front;
+`tile_one` issues one deferred convert into a caller-owned slot so tiles overlap
+with inference. The returned `TilePlacement` values are consumed by the decoder's
+`lift_tile_boxes` / `TiledFrameAccumulator` to merge per-tile detections back into
+full-frame results (see the `edgefirst-decoder` README).
+
 ## Zero-Copy External Buffer (Linux)
 
 When integrating with an NPU delegate (e.g. VxDelegate) that owns its own

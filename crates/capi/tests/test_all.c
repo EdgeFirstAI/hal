@@ -21,6 +21,7 @@ extern void run_tensor_tests(void);
 extern void run_image_tests(void);
 extern void run_decoder_tests(void);
 extern void run_tracker_tests(void);
+extern void run_tiling_tests(void);
 
 int main(int argc, char* argv[]) {
     printf("EdgeFirst HAL C API Test Suite\n");
@@ -32,6 +33,7 @@ int main(int argc, char* argv[]) {
     int run_image = run_all;
     int run_decoder = run_all;
     int run_tracker = run_all;
+    int run_tiling = run_all;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tensor") == 0 || strcmp(argv[i], "-t") == 0) {
@@ -42,6 +44,8 @@ int main(int argc, char* argv[]) {
             run_decoder = 1;
         } else if (strcmp(argv[i], "--tracker") == 0 || strcmp(argv[i], "-r") == 0) {
             run_tracker = 1;
+        } else if (strcmp(argv[i], "--tiling") == 0 || strcmp(argv[i], "-l") == 0) {
+            run_tiling = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("\nUsage: %s [OPTIONS]\n\n", argv[0]);
             printf("Options:\n");
@@ -49,6 +53,7 @@ int main(int argc, char* argv[]) {
             printf("  -i, --image    Run image tests only\n");
             printf("  -d, --decoder  Run decoder tests only\n");
             printf("  -r, --tracker  Run tracker tests only\n");
+            printf("  -l, --tiling   Run tiling tests only\n");
             printf("  -h, --help     Show this help message\n");
             printf("\nWith no options, all test suites are run.\n");
             return 0;
@@ -70,6 +75,9 @@ int main(int argc, char* argv[]) {
     }
     if (run_tracker) {
         run_tracker_tests();
+    }
+    if (run_tiling) {
+        run_tiling_tests();
     }
 
     // Print summary and return exit code
