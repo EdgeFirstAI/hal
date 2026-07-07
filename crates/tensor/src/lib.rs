@@ -1214,9 +1214,9 @@ where
                             Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     {
-                        // macOS: Try IOSurface -> Mem. IOSurface is the
+                        // macOS/iOS: Try IOSurface -> Mem. IOSurface is the
                         // GPU-shareable backend (zero-copy via ANGLE), filling the
                         // same role as DMA-BUF on Linux.
                         match IoSurfaceTensor::<T>::new(shape, name) {
@@ -1224,7 +1224,10 @@ where
                             Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
-                    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+                    #[cfg(all(
+                        unix,
+                        not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+                    ))]
                     {
                         // Other Unix (BSD): Mem only (no DMA; Shm is explicit-only)
                         MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
@@ -1338,7 +1341,7 @@ where
         }
         #[cfg(all(unix, not(target_os = "linux")))]
         {
-            // On macOS/BSD, always use SHM (no DMA support)
+            // On macOS/iOS/BSD, always use SHM (no DMA-BUF fd import)
             ShmTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Shm)
         }
     }
@@ -3291,8 +3294,8 @@ where
 /// Cached result of the Linux DMA-BUF availability probe.
 #[cfg(target_os = "linux")]
 static DMA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-/// Cached result of the macOS IOSurface availability probe.
-#[cfg(target_os = "macos")]
+/// Cached result of the macOS/iOS IOSurface availability probe.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 static IOSURFACE_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Check if Linux DMA-BUF allocation is available on this system.
@@ -3314,30 +3317,30 @@ pub fn is_dma_available() -> bool {
     false
 }
 
-/// Check if macOS IOSurface allocation is available on this system.
+/// Check if macOS/iOS IOSurface allocation is available on this system.
 ///
-/// IOSurface is part of the macOS OS and is essentially always present;
+/// IOSurface is part of the macOS/iOS OS and is essentially always present;
 /// this probe catches degraded scenarios such as memory pressure or
 /// sandboxed contexts where `IOSurfaceCreate` fails. The result is
 /// cached after the first call.
 ///
-/// Always returns `false` on non-macOS platforms.
-#[cfg(target_os = "macos")]
+/// Always returns `false` on non-Apple platforms.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub fn is_iosurface_available() -> bool {
     *IOSURFACE_AVAILABLE.get_or_init(|| {
-        // Probe via the same Dma path — on macOS this routes through
+        // Probe via the same Dma path — on macOS/iOS this routes through
         // IoSurfaceTensor::new.
         Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub fn is_iosurface_available() -> bool {
     false
 }
 
 /// Portable probe for the platform's native zero-copy GPU buffer
-/// allocator (DMA-BUF on Linux, IOSurface on macOS). Returns `false` on
+/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS). Returns `false` on
 /// Windows and other platforms with no equivalent. Use this when writing
 /// cross-platform code that cares whether the `Dma` tensor variant will
 /// work, not which underlying mechanism is used.
@@ -3346,11 +3349,11 @@ pub fn is_gpu_buffer_available() -> bool {
     {
         is_dma_available()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         is_iosurface_available()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
     {
         false
     }
@@ -3868,22 +3871,25 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
-        // macOS auto-fallback chain: IOSurface (Dma) → Mem. Healthy systems
+        // macOS/iOS auto-fallback chain: IOSurface (Dma) → Mem. Healthy systems
         // return Dma; Mem only appears under memory pressure or sandboxed
         // contexts where IOSurfaceCreate fails. Shm is never auto-selected.
         let m = tensor.memory();
         assert!(
             matches!(m, TensorMemory::Dma | TensorMemory::Mem),
-            "Unexpected auto-fallback result on macOS: {m:?}"
+            "Unexpected auto-fallback result on macOS/iOS: {m:?}"
         );
     }
 
     #[test]
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+    ))]
     fn test_tensor() {
         let shape = vec![1];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");

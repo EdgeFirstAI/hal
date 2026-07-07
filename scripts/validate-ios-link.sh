@@ -31,8 +31,8 @@
 # Prerequisites:
 #   - rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 #   - ANGLE xcframeworks: fetched automatically by scripts/fetch-angle.sh
-#     from the EdgeFirstAI/angle-package release (needs `gh auth login`
-#     locally, or GH_TOKEN/GITHUB_TOKEN in CI for the private repo).
+#     from the public EdgeFirstAI/angle-package release (no credentials
+#     needed — a GH_TOKEN/GITHUB_TOKEN is honored if set but not required).
 #
 # Exit codes:
 #   0  link + nm symbol check both succeeded
@@ -150,17 +150,32 @@ echo "    all ${#REQUIRED_EGL_SYMBOLS[@]} EGL entry points present in libEGL"
 
 # --- Link step ---------------------------------------------------------------
 #
-# Link a no-op main.c against: the Rust staticlib, the ANGLE xcframeworks
-# (via -F + -framework), and the Apple system frameworks the HAL references
-# through `#[link(kind = "framework")]`. `-dead_strip` lets the linker drop
-# unused code; if the closure were incomplete the link would fail with
-# undefined symbols.
+# Link a main.c that CALLS `edgefirst_ios_validation_force_closure()` against:
+# the Rust staticlib, the ANGLE xcframeworks (via -F + -framework), and the
+# Apple system frameworks the HAL references through `#[link(kind =
+# "framework")]`. The call is what makes this a real test: a static-archive
+# member is linked only to resolve an undefined symbol, so without a
+# reference into the `.a`, ld drops the entire archive and the link succeeds
+# no matter how broken the closure is (it would even succeed with
+# `-ledgefirst_ios_validation` removed). Calling `force_closure` pulls the
+# member in; that member in turn references `IOSurfaceCreate` /
+# CoreFoundation (via the tensor IOSurface path) and the GL closure, so
+# `-dead_strip` cannot drop them and dropping any required `-framework`
+# makes the link fail with undefined symbols.
 echo "==> link: ${CLANG_TARGET} main.c + libedgefirst_ios_validation.a + frameworks"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 MAIN_C="${WORKDIR}/main.c"
-printf 'int main(void) { return 0; }\n' > "${MAIN_C}"
+cat > "${MAIN_C}" <<'EOF'
+// Declared here (no header) to match the Rust `#[no_mangle] extern "C"`
+// export. Calling it forces ld to pull libedgefirst_ios_validation.a in.
+extern void edgefirst_ios_validation_force_closure(void);
+int main(void) {
+    edgefirst_ios_validation_force_closure();
+    return 0;
+}
+EOF
 
 OUTPUT="${WORKDIR}/ios-link-check-${VARIANT}"
 

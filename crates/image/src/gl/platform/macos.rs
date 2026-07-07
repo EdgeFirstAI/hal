@@ -100,7 +100,8 @@ impl ApplePlatform {
     /// The actual acquisition is OS-specific ([`Self::load_egl_lib_inner`]):
     /// macOS `dlopen`s a `libEGL.dylib` from the search paths; iOS resolves
     /// from the main image via `Library::this()` (the ANGLE xcframeworks are
-    /// statically linked into the app binary).
+    /// dynamic frameworks the app links against and embeds, so they load into
+    /// the process image at launch).
     pub(in super::super) fn load_egl_lib() -> Result<&'static libloading::Library, Error> {
         if let Some(lib) = EGL_LIB.get() {
             return Ok(lib);
@@ -110,12 +111,15 @@ impl ApplePlatform {
         Ok(EGL_LIB.get_or_init(|| leaked))
     }
 
-    /// iOS: ANGLE EGL/GLES symbols are statically linked into the app binary
-    /// from the embedded `EGL.xcframework` + `GLESv2.xcframework` (see
-    /// `.cargo/config.toml` and README.md § iOS). Resolve them from the main
-    /// image via `Library::this()` — equivalent to `dlopen(NULL)`, which
-    /// returns a handle for the whole process image so `dlsym` finds the
-    /// ANGLE entry points the `edgefirst-egl` `Dynamic` loader requests.
+    /// iOS: ANGLE EGL/GLES symbols come from the `EGL.xcframework` +
+    /// `GLESv2.xcframework` dynamic frameworks that the app links against and
+    /// embeds (see `.cargo/config.toml` and README.md § iOS). Because they are
+    /// linked (not merely bundled), they load into the process image at launch,
+    /// so resolving from the main image via `Library::this()` — equivalent to
+    /// `dlopen(NULL)`, a handle for the whole process image — lets `dlsym` find
+    /// the ANGLE entry points the `edgefirst-egl` `Dynamic` loader requests.
+    /// (The app shell that performs that link/embed is future Swift-bindings
+    /// work; see README.md § iOS.)
     #[cfg(target_os = "ios")]
     fn load_egl_lib_inner() -> Result<libloading::Library, Error> {
         let this = libloading::os::unix::Library::this();

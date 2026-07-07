@@ -18,24 +18,47 @@
 
 use edgefirst_hal as hal;
 
-/// Force the HAL closure into the staticlib's symbol table. The body touches
-/// enough of the public API (tensor construction, image/codec/decoder type
-/// surface) that the linker cannot dead-strip the transitive dependency
-/// graph — including the `#[link(name = "IOSurface"/"CoreFoundation",
-/// kind = "framework")]` references in the tensor and image crates.
+/// Force the Apple framework closure into the staticlib so the link step in
+/// `scripts/validate-ios-link.sh` genuinely validates it.
 ///
-/// This function is never called at runtime by the validation; its mere
-/// presence in the archive is what matters. It is `#[no_mangle]` + `pub`
-/// so the staticlib exports it (exported symbols survive archive dead-
-/// stripping), and a companion `#[used]` static holds its address so the
-/// LTO pass inside this crate cannot drop it either.
+/// The body *calls* real constructors (not `TypeId::of`, which is a
+/// compile-time constant that emits no code and references nothing): the
+/// concrete monomorphizations are codegen'd into this crate's object file,
+/// so the archive carries actual undefined references to `IOSurfaceCreate`,
+/// `CFDictionaryCreateMutable`, etc. That is what makes the `-framework
+/// IOSurface` / `-framework CoreFoundation` flags at the link step
+/// load-bearing — drop either and the link fails with undefined symbols.
+///
+/// This function is never called at runtime by the validation; `main.c` in
+/// the link script calls it only so ld pulls this archive member in (an
+/// archive member is linked only to resolve an undefined symbol — without
+/// this call the whole `.a` is dropped and the check is a false positive).
+/// It is `#[no_mangle]` + `pub` so the staticlib exports it, and a companion
+/// `#[used]` static roots it through this crate's LTO pass.
 #[no_mangle]
 pub extern "C" fn edgefirst_ios_validation_force_closure() {
-    // Reference the facade modules so the whole closure is linked.
-    let _ = std::any::TypeId::of::<hal::tensor::Tensor<u8>>();
-    let _ = std::any::TypeId::of::<hal::image::ImageProcessor>();
-    let _ = std::any::TypeId::of::<hal::codec::ImageDecoder>();
-    let _ = std::any::TypeId::of::<hal::decoder::BoundingBox>();
+    // (1) tensor IOSurface path — `TensorMemory::Dma` routes to
+    // `IoSurfaceTensor::<u8>::new` → `IOSurfaceCreate` +
+    // `CFDictionaryCreateMutable`/`CFNumberCreate` (see
+    // crates/tensor/src/iosurface.rs), pulling that crate's
+    // `#[link(name = "IOSurface"/"CoreFoundation", kind = "framework")]`
+    // extern block into the archive.
+    if let Ok(t) = hal::tensor::Tensor::<u8>::new(&[64], Some(hal::tensor::TensorMemory::Dma), None)
+    {
+        std::hint::black_box(&t);
+    }
+
+    // (2) image GL closure — constructing the ANGLE-backed `ImageProcessor`
+    // (default features include `opengl`) pulls `GLProcessorThreaded` and the
+    // whole `gl/` module — including the IOSurface GL-import path that carries
+    // its own `#[link(kind = "framework")]` refs — into the link, proving the
+    // full iOS GL Rust closure is self-consistent and links. The EGL/GLES
+    // entry points themselves are resolved at runtime via `libloading`
+    // (`Library::this()`), so they carry no link-time reference here and are
+    // validated separately by the `nm` export check in the link script.
+    if let Ok(p) = hal::image::ImageProcessor::new() {
+        std::hint::black_box(&p);
+    }
 }
 
 /// Keep `edgefirst_ios_validation_force_closure` rooted through LTO. The
