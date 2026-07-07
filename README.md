@@ -558,21 +558,25 @@ zero-copy buffer interchange (the role DMA-BUF plays on Linux). ANGLE is
 not part of macOS and must be installed separately. If it is not present
 at runtime the HAL logs a warning and falls back to the CPU backend.
 
-> **ANGLE access:** ANGLE itself is an open-source Google project, but our
+> **ANGLE access:** ANGLE itself is an open-source Google project, and our
 > pre-built, signed + notarized xcframework integration is published from
-> an **internal-only** repository
-> ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package))
-> that is not publicly readable. If you do not have access:
+> the **public** repository
+> ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)).
+> Anyone can fetch it — no credentials or organization membership required.
+> Two ways to get ANGLE:
 >
-> - **macOS** — install ANGLE yourself via the public Homebrew tap:
+> - **Recommended (macOS + iOS)** — fetch the pre-built release with
+>   `scripts/fetch-angle.sh` (see
+>   [Option A](#option-a--edgefirst-pre-built-release-recommended) below).
+>   This is exactly what CI uses.
+> - **macOS alternative** — install ANGLE via the public Homebrew tap:
 >   `brew install startergo/angle/angle` (then re-sign the dylibs — see
->   [Alternative: Homebrew tap](#alternative-homebrew-tap) below). The HAL
->   finds it automatically.
+>   [Option B — Homebrew tap](#option-b--homebrew-tap-macos-alternative)
+>   below). The HAL finds it automatically.
 > - **Build without macOS/iOS GL** — the HAL's default features include
 >   `opengl`, but you can disable it (`--no-default-features --features
 >   ndarray,tracing`) to build the CPU-only path, which needs no ANGLE at
->   all. iOS has no equivalent public ANGLE source, so iOS GL requires
->   internal access.
+>   all.
 
 ### Installing ANGLE (macOS)
 
@@ -580,13 +584,13 @@ The HAL looks for `libEGL.dylib` / `libGLESv2.dylib` via the `EDGEFIRST_ANGLE_PA
 env var, then standard search paths (Homebrew, `@loader_path`,
 `@executable_path`). There are two ways to satisfy this:
 
-#### Option A — EdgeFirst pre-built release (internal access required)
+#### Option A — EdgeFirst pre-built release (recommended)
 
 Our pre-built, **signed + notarized** xcframeworks (built from a pinned
 ANGLE revision) are published in the
 [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
-releases. This repo is **internal-only** (not publicly readable). If you
-have access, a single helper downloads, sha256-verifies, and extracts them
+releases. This repo is **public** — anyone can fetch the release with no
+credentials. A single helper downloads, sha256-verifies, and extracts them
 (into both the xcframework layout for iOS app embedding and a flat-lib
 layout for the macOS runtime `dlopen` path):
 
@@ -596,8 +600,10 @@ EDGEFIRST_ANGLE_PATH=target/angle/macos-flat-lib \
   cargo run --release --example pipeline_demo
 ```
 
-`scripts/fetch-angle.sh` needs `gh auth login` locally, or
-`GH_TOKEN`/`GITHUB_TOKEN` in CI.
+Because the release is public, `scripts/fetch-angle.sh` needs **no
+authentication** — it works out of the box both locally and in CI. (It
+still honors `gh auth login` / `GH_TOKEN` / `GITHUB_TOKEN` if present,
+which raises GitHub's API rate limit, but none are required.)
 
 > **Why a flat-lib dir for macOS?** ANGLE's `libEGL` internally `dlopen`s
 > `libGLESv2.dylib` from its own directory (located via `dladdr`) to
@@ -608,10 +614,10 @@ EDGEFIRST_ANGLE_PATH=target/angle/macos-flat-lib \
 > already Developer-ID-signed + notarized, so they `dlopen` cleanly with
 > **no re-signing** required.
 
-#### Option B — Homebrew tap (public, no internal access needed)
+#### Option B — Homebrew tap (macOS alternative)
 
-ANGLE is also available via a public third-party Homebrew tap. This is the
-path for contributors **without** access to the EdgeFirst internal repos.
+ANGLE is also available via a public third-party Homebrew tap — an
+alternative to Option A if you prefer a package manager on macOS.
 Homebrew's `install_name_tool` step invalidates the bundled code signatures
 and macOS 26 (Tahoe) refuses to load dylibs with broken signatures at
 `dlopen` time (immediate `SIGKILL (Code Signature Invalid)` with no
@@ -673,11 +679,12 @@ the same ANGLE-over-Metal GL backend as macOS. The supported targets are:
 - `aarch64-apple-ios` — iOS devices (arm64)
 - `aarch64-apple-ios-sim` — iOS Simulator on Apple-Silicon Macs (arm64)
 
-> **Access note:** iOS GL requires ANGLE xcframeworks. There is **no
-> public Homebrew equivalent for iOS** (unlike macOS), so iOS GL needs the
-> EdgeFirst internal-only
-> [`angle-package`](https://github.com/EdgeFirstAI/angle-package) release.
-> Contributors without internal access can still build the Rust library
+> **ANGLE note:** iOS GL requires ANGLE xcframeworks. There is **no
+> public Homebrew equivalent for iOS** (unlike macOS), so fetch them from
+> the **public**
+> [`angle-package`](https://github.com/EdgeFirstAI/angle-package) release
+> with `scripts/fetch-angle.sh` (no credentials needed). If you would
+> rather not fetch ANGLE at all, you can still build the Rust library
 > for iOS with the `opengl` feature disabled:
 > `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`.
 > The Rust `cargo build` itself (with `opengl`) succeeds without ANGLE
@@ -687,6 +694,9 @@ the same ANGLE-over-Metal GL backend as macOS. The supported targets are:
 > `angle-package` distribution ships arm64-only slices (see below).
 
 ### Prerequisites
+
+Xcode + the iOS SDKs (`xcode-select --install` or a full Xcode), plus the
+Rust iOS targets:
 
 ```bash
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
@@ -728,7 +738,7 @@ carry no rustflags or linker overrides.
 
 iOS GL requires shipping [ANGLE](https://github.com/google/angle) as
 embedded dynamic frameworks in the app bundle. Our integration uses the
-**signed + notarized** xcframeworks from the internal-only
+**signed + notarized** xcframeworks from the public
 [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
 release (`EGL.xcframework` + `GLESv2.xcframework`, each with `ios-arm64`,
 `ios-arm64-simulator`, `macos-arm64`). `scripts/fetch-angle.sh` downloads
@@ -763,10 +773,9 @@ What is **not** covered by this effort (future work):
 - **Swift bindings** — a C/Swift API surface and a ship-able HAL
   `.xcframework`. The Rust staticlib is the deliverable here.
 - **Runtime validation** — actual EGL initialization on a device or
-  simulator requires the app shell (a future effort). The
-  [`hal-mobile`](../hal-mobile) assessment already proved the ANGLE-over-
-  Metal + IOSurface path works on iPhone 17 Pro
-  (`GL_EXT_color_buffer_half_float` present).
+  simulator requires the app shell (a future effort). The internal
+  `hal-mobile` assessment already proved the ANGLE-over-Metal + IOSurface
+  path works on iPhone 17 Pro (`GL_EXT_color_buffer_half_float` present).
 
 ### fp16 / target features
 

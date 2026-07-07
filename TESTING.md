@@ -74,17 +74,18 @@ OpenGL backend on macOS the test process needs to load ANGLE's
 `libEGL.dylib` / `libGLESv2.dylib` and to be code-signed with
 entitlements that permit loading third-party dylibs.
 
-> **ANGLE is open-source; our integration is internal-only.** ANGLE itself
-> is a public Google project, but the EdgeFirst pre-built + signed
-> xcframeworks live in an internal repo
-> ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)).
-> If you do **not** have access, use the public Homebrew tap instead
-> (Option B below) — or skip the GL tests by building the CPU-only path
+> **ANGLE is open-source; our pre-built integration is public too.** ANGLE
+> itself is a public Google project, and the EdgeFirst pre-built + signed
+> xcframeworks are published from the **public** repo
+> ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)) —
+> fetch them with `scripts/fetch-angle.sh` (no credentials needed). On
+> macOS you can instead use the Homebrew tap (Option B below), or skip the
+> GL tests entirely by building the CPU-only path
 > (`--no-default-features --features ndarray,tracing`).
 
 ### 1. Install ANGLE
 
-**Option A — EdgeFirst pre-built release (internal access required).** The
+**Option A — EdgeFirst pre-built release (recommended).** The
 pre-built, signed + notarized xcframeworks from the
 [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
 release (default tag `v2.1.28252`). The helper downloads, sha256-verifies,
@@ -97,7 +98,7 @@ scripts/fetch-angle.sh
 export EDGEFIRST_ANGLE_PATH=target/angle/macos-flat-lib
 ```
 
-**Option B — Homebrew tap (public, no internal access needed).** Install
+**Option B — Homebrew tap (macOS alternative).** Install
 ANGLE via the third-party tap, then ad-hoc re-sign the dylibs (Homebrew's
 `install_name_tool` breaks the bundled signatures — mandatory on macOS 26):
 
@@ -395,12 +396,12 @@ is:
    the Apple system frameworks the HAL references (`IOSurface`,
    `CoreFoundation`, `Metal`).
 
-> **Access note:** the link-validation step fetches the signed ANGLE
-> xcframeworks from the **internal-only**
+> **ANGLE note:** the link-validation step fetches the signed ANGLE
+> xcframeworks from the **public**
 > [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)
-> release via `scripts/fetch-angle.sh`. There is no public iOS ANGLE
-> source, so contributors without internal access can only do step 1
-> (the `cargo build`), not the link validation:
+> release via `scripts/fetch-angle.sh` (no credentials needed). If you
+> would rather not fetch ANGLE, you can still do step 1 (the `cargo build`)
+> without it:
 >
 > ```bash
 > cargo build --target aarch64-apple-ios     --no-default-features --features ndarray,tracing

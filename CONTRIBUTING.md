@@ -42,18 +42,19 @@ The HAL's CPU path builds and tests on Linux, macOS, and Windows with no
 extra setup. The **OpenGL (GPU) backend on Apple platforms needs ANGLE**
 (Google's GLES→Metal translator), which is *not* part of macOS/iOS.
 
-- ANGLE is an open-source Google project, but the EdgeFirst **pre-built,
-  signed + notarized xcframeworks are published from an internal-only
+- ANGLE is an open-source Google project, and the EdgeFirst **pre-built,
+  signed + notarized xcframeworks are published from the public
   repository** ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)).
-  Contributors **with** internal access use `scripts/fetch-angle.sh` — see
+  Anyone can fetch them with `scripts/fetch-angle.sh` — no credentials or
+  organization membership required. See
   [README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration).
-- Contributors **without** internal access: on **macOS**, install ANGLE
-  via the public Homebrew tap (`brew install startergo/angle/angle`, then
-  re-sign the dylibs — see README). On **iOS**, there is no public ANGLE
-  source, so build the CPU-only path:
-  `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`.
+- Prefer a package manager on **macOS**? Install ANGLE via the public
+  Homebrew tap instead (`brew install startergo/angle/angle`, then re-sign
+  the dylibs — see README). On **iOS** there is no Homebrew equivalent, so
+  use `scripts/fetch-angle.sh` (or build the CPU-only path:
+  `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`).
 - Either way, you can contribute to the Linux/CPU paths without any ANGLE
-  access — just disable the `opengl` feature
+  at all — just disable the `opengl` feature
   (`--no-default-features --features ndarray,tracing`).
 
 ### Clone and Build
@@ -283,20 +284,23 @@ Runs on every push and PR to `main` or `develop`:
 - **Linting**: `cargo clippy --workspace`
 - **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
 - **macOS**: Rust tests (incl. the ANGLE/IOSurface GL render path) +
-  C API. Fetches the signed ANGLE xcframeworks from the internal
+  C API. Fetches the signed ANGLE xcframeworks from the public
   `angle-package` release via `scripts/fetch-angle.sh`.
 - **iOS**: build + link validation for `aarch64-apple-ios` (device) and
   `aarch64-apple-ios-sim` (no runtime tests yet). Also fetches ANGLE from
-  the internal release.
+  the public release.
 - **Windows**: compile check (`cargo check`).
 - **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
 - **SonarCloud analysis**: Static analysis and coverage aggregation
 
-> The macOS and iOS lanes use an internal `GITHUB_TOKEN` to fetch the
-> private `angle-package` release. **Fork PRs** (which get a
-> restricted token) cannot read that repo, so those two lanes are
-> best-effort on forks — the link-validation step will skip with a
-> warning if the download fails. All other lanes run normally on forks.
+> The macOS and iOS lanes fetch the ANGLE xcframeworks from the **public**
+> `angle-package` release (`scripts/fetch-angle.sh`) — no credentials
+> needed, so the download works for pushes, same-repo PRs, and fork PRs
+> alike. The full ANGLE-backed validation (the macOS ANGLE/IOSurface GL
+> render tests and the iOS link closure) therefore runs on every event,
+> forks included — no special-casing. (Fork PRs still require a maintainer
+> to approve the workflow run, per GitHub's default first-time-contributor
+> policy.)
 
 ### Release Workflow (`release.yml`)
 
