@@ -24,9 +24,10 @@
 #   tag       defaults to v2.1.28252  (matches the ANGLE GL_VERSION string)
 #
 # Environment:
-#   GH_TOKEN / GITHUB_TOKEN  required for the private EdgeFirstAI/angle-package
-#                            repo (GitHub Actions sets GITHUB_TOKEN automatically).
-#                            Locally, run `gh auth login` first.
+#   GH_TOKEN / GITHUB_TOKEN  optional. EdgeFirstAI/angle-package is public, so no
+#                            auth is required to download the release. A token (or
+#                            a local `gh auth login`) is still honored if present
+#                            and raises GitHub's API rate limit, but is not needed.
 #
 # Exit codes: 0 success (or already cached + verified); 1 download/verify/extract failure.
 
@@ -50,14 +51,14 @@ SHA_PATH="${CACHE_DIR}/${SHA_NAME}"
 
 # --- Download (if not cached) ------------------------------------------------
 #
-# The EdgeFirstAI/angle-package repo is private, so this needs an authenticated
-# download. Prefer `gh release download` (uses GH_TOKEN/GITHUB_TOKEN or the
-# local `gh auth login` keyring); fall back to curl with a bearer token.
+# The EdgeFirstAI/angle-package repo is public, so no authentication is required.
+# Prefer `gh release download` (handles redirects; uses a token if one happens to
+# be set); fall back to plain curl, which downloads the public asset with no token.
 
 download_asset() {
     local url="$1" out="$2" name="$3"
     if command -v gh >/dev/null 2>&1; then
-        # `gh release download` handles auth + redirects + private repos.
+        # `gh release download` handles redirects (and auth if a token is set).
         # --clobber overwrites a stale cached copy; --output names the file.
         if gh release download "${TAG}" --repo "${REPO}" --pattern "${name}" \
             --dir "${CACHE_DIR}" --clobber 2>/dev/null; then
@@ -65,7 +66,7 @@ download_asset() {
         fi
         echo "fetch-angle: gh download failed for ${name}, trying curl…" >&2
     fi
-    # curl fallback: needs a token in GH_TOKEN or GITHUB_TOKEN for the private repo.
+    # curl fallback: the release is public, so no token is needed (one is used if set).
     local auth=()
     if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
         auth=(-H "Authorization: Bearer ${GH_TOKEN:-${GITHUB_TOKEN}}")
@@ -82,20 +83,33 @@ else
 fi
 
 # Always (re)fetch the checksum — it's tiny and guards against a stale
-# checksum if the release was re-published.
-download_asset "${SHA_URL}" "${SHA_PATH}" "${SHA_NAME}" 2>/dev/null || true
+# checksum if the release was re-published. Capture failure rather than
+# swallowing it: this artifact is linked straight into the app, so verifying
+# it is a supply-chain requirement, not a nicety.
+sha_download_ok=1
+download_asset "${SHA_URL}" "${SHA_PATH}" "${SHA_NAME}" 2>/dev/null || sha_download_ok=0
 
 # --- Verify the checksum -----------------------------------------------------
 #
 # The .sha256 file may be "<hash>  <filename>" (shasum format) or bare "<hash>".
-# Normalize to a shasum -c invocation.
+# We take the first whitespace-delimited token as the hash, which handles both.
+#
+# Fail CLOSED: if the checksum cannot be fetched/read we refuse to use the
+# unverified zip. Set FETCH_ANGLE_ALLOW_UNVERIFIED=1 to override (e.g. an
+# offline dev box working from a trusted cached zip).
 
-if [[ ! -s "${SHA_PATH}" ]]; then
-    echo "fetch-angle: WARNING — no sha256 available; skipping verification" >&2
+if [[ ${sha_download_ok} -eq 0 || ! -s "${SHA_PATH}" ]]; then
+    if [[ "${FETCH_ANGLE_ALLOW_UNVERIFIED:-0}" == "1" ]]; then
+        echo "fetch-angle: WARNING — no sha256 available; proceeding UNVERIFIED (FETCH_ANGLE_ALLOW_UNVERIFIED=1)" >&2
+    else
+        echo "fetch-angle: ERROR — could not fetch/read ${SHA_NAME}; refusing to use an unverified artifact." >&2
+        echo "  This artifact is linked into the app; a missing checksum is treated as a hard failure." >&2
+        echo "  Set FETCH_ANGLE_ALLOW_UNVERIFIED=1 to override (not recommended)." >&2
+        exit 1
+    fi
 else
-    EXPECTED="$(tr -d '[:space:]' < "${SHA_PATH}")"
-    # If the file contained "hash  filename", keep only the first token.
-    EXPECTED="${EXPECTED%% *}"
+    # First whitespace-delimited token = the hash (bare or "hash  filename").
+    EXPECTED="$(awk '{print $1; exit}' "${SHA_PATH}")"
     ACTUAL="$(shasum -a 256 "${ZIP_PATH}" | awk '{print $1}')"
     if [[ "${EXPECTED}" != "${ACTUAL}" ]]; then
         echo "fetch-angle: CHECKSUM MISMATCH" >&2

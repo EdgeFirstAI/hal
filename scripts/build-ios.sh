@@ -23,7 +23,9 @@
 #
 # Prerequisites:
 #   - Xcode + the iOS SDKs (xcode-select)
-#   - ../angle-package/dist/{EGL,GLESv2}.xcframework (for validation only)
+#   - ANGLE xcframeworks (for validation only): fetched automatically by
+#     scripts/fetch-angle.sh from the EdgeFirstAI/angle-package release
+#     (needs `gh auth login` locally, or GH_TOKEN/GITHUB_TOKEN in CI).
 #
 # Exit codes: 0 success; 1 build/validation failure; 2 prerequisites missing.
 
@@ -34,13 +36,22 @@ HAL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${HAL_ROOT}"
 
 VARIANTS=("device" "sim")
+VARIANTS_EXPLICIT=0
 VALIDATE=1
 PROFILE="release"
 EXTRA_CARGO_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        device|sim) VARIANTS=("$1") ;;
+        device|sim)
+            # First explicit variant resets the "both" default, then any
+            # further ones accumulate (so `build-ios.sh device sim` == both).
+            if [[ ${VARIANTS_EXPLICIT} -eq 0 ]]; then
+                VARIANTS=()
+                VARIANTS_EXPLICIT=1
+            fi
+            VARIANTS+=("$1")
+            ;;
         --no-validate) VALIDATE=0 ;;
         --release) PROFILE="release" ;;
         --debug) PROFILE="dev" ;;
@@ -93,5 +104,7 @@ for v in "${VARIANTS[@]}"; do
     fi
 done
 
+VALIDATE_SUFFIX=""
+[[ ${VALIDATE} -eq 1 ]] && VALIDATE_SUFFIX=" + validation"
 echo ""
-echo "==> DONE: iOS build${VALIDATE:+ + validation} complete for: ${VARIANTS[*]}"
+echo "==> DONE: iOS build${VALIDATE_SUFFIX} complete for: ${VARIANTS[*]}"
