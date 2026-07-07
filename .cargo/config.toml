@@ -20,3 +20,21 @@
 # entry cannot misfire on non-ARM hardware.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
+
+# iOS targets (aarch64-apple-ios device, aarch64-apple-ios-sim simulator).
+#
+# Unlike aarch64-apple-darwin, we deliberately do NOT bake
+# `+fp16/+dotprod/+i8mm` here. The iOS 16+ deployment floor still
+# includes A11 (iPhone 8, ARMv8.1-A, no fp16/dotprod/i8mm), so baking
+# those features would SIGILL on real older hardware. Apple's A-series
+# baseline for iOS 16 stays on the guaranteed ARMv8.1-A ISA.
+#
+# ANGLE's EGL/GLES symbols are resolved at RUNTIME via libloading
+# (`Library::this()` on iOS, since the ANGLE xcframeworks are embedded
+# in the app bundle) — so a standalone `cargo build` for these targets
+# succeeds WITHOUT the ANGLE frameworks present. The unresolved-symbol
+# warnings from the linker are expected and are satisfied at app-link
+# time by the embedded `EGL.xcframework` + `GLESv2.xcframework`
+# (see README.md § iOS). No rustflags, no linker overrides needed.
+[target.aarch64-apple-ios]
+[target.aarch64-apple-ios-sim]

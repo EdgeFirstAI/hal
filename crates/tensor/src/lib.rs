@@ -35,7 +35,7 @@ mod dma;
 mod dmabuf;
 mod error;
 mod format;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface;
 mod mem;
 mod pbo;
@@ -67,9 +67,9 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 // image crate, and `image_iosurface_layout` is a public helper.
 #[cfg(target_os = "linux")]
 pub(crate) use crate::dma::{DmaMap, DmaTensor};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use crate::iosurface::image_iosurface_layout;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) use crate::iosurface::{IoSurfaceMap, IoSurfaceTensor};
 pub(crate) use crate::mem::{MemMap, MemTensor};
 pub use crate::pbo::{PboMap, PboMapping, PboOps, PboTensor};
@@ -1132,7 +1132,7 @@ where
     /// public `TensorMemory::Dma` discriminant stable across platforms.
     #[cfg(target_os = "linux")]
     Dma(DmaTensor<T>),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     Dma(IoSurfaceTensor<T>),
     #[cfg(unix)]
     Shm(ShmTensor<T>),
@@ -1158,7 +1158,7 @@ where
             // Only genuine image-formatted IOSurfaces (height > 1) carry a real
             // per-row pitch; a generic byte-bag (height == 1) returns `None` so
             // `configure_image` does not adopt its whole-buffer "row" as a stride.
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.image_backing_row_stride(),
             _ => None,
         }
@@ -1174,13 +1174,13 @@ where
             Some(TensorMemory::Dma) => {
                 DmaTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             Some(TensorMemory::Dma) => {
                 IoSurfaceTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
             Some(TensorMemory::Dma) => Err(crate::error::Error::NotImplemented(
-                "TensorMemory::Dma is only available on Linux (DMA-BUF) and macOS (IOSurface)"
+                "TensorMemory::Dma is only available on Linux (DMA-BUF) and macOS/iOS (IOSurface)"
                     .to_owned(),
             )),
             #[cfg(unix)]
@@ -1293,7 +1293,7 @@ where
     /// `TensorMemory::Dma` and the format has an IOSurface FourCC
     /// mapping (YUYV, RGBA, BGRA today). Falls back to `new_with_byte_size`
     /// otherwise.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) fn new_image_iosurface(
         width: usize,
         height: usize,
@@ -1369,7 +1369,7 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(_) => TensorMemory::Dma,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
@@ -1380,7 +1380,7 @@ where
 
     fn name(&self) -> String {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.name(),
@@ -1391,7 +1391,7 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.shape(),
@@ -1402,7 +1402,7 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.reshape(shape),
@@ -1413,7 +1413,7 @@ where
 
     fn capacity_bytes(&self) -> usize {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.capacity_bytes(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.capacity_bytes(),
@@ -1424,7 +1424,7 @@ where
 
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.set_logical_shape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.set_logical_shape(shape),
@@ -1435,7 +1435,7 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.map(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.map(),
@@ -1446,7 +1446,7 @@ where
 
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.buffer_identity(),
@@ -1463,7 +1463,7 @@ where
     /// here rather than matching the storage itself).
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.view(offset_bytes, shape).map(TensorStorage::Shm),
@@ -1718,7 +1718,7 @@ where
         // fail loudly here with the alignment requirement spelled out
         // so the caller can either pick aligned dimensions, request
         // SHM/Mem explicitly, or pass `memory=None` for auto-select.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if matches!(memory, Some(TensorMemory::Dma)) {
             // For planar formats the IOSurface stacks channels
             // vertically (channels * height rows), so the row stride is
@@ -3095,12 +3095,12 @@ where
                     }
                     return shm.map_with_byte_size(total_bytes);
                 }
-                // macOS: `TensorStorage::Dma` is the IOSurface. The lock yields
+                // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
                 // the full surface base address, and the row pitch
                 // (`IOSurfaceGetBytesPerRow`) is known from the API for both
                 // self-allocated and imported surfaces — unlike a foreign
                 // DMA-BUF — so a strided CPU view is sound and zero-copy.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 TensorStorage::Dma(io) => {
                     // A sub-view's window is `buf_size − view_offset`; the strided
                     // span must fit the window, not the whole surface.
@@ -3157,7 +3157,7 @@ where
             // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF — both
             // apply the offset in their map. (`Dma` is the same variant name on
             // both, hence one `cfg(any(...))` arm rather than two.)
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
             #[cfg(unix)]
             let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
@@ -3181,7 +3181,7 @@ where
 {
     #[cfg(target_os = "linux")]
     Dma(DmaMap<T>),
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     IoSurface(IoSurfaceMap<T>),
     #[cfg(unix)]
     Shm(ShmMap<T>),
@@ -3197,7 +3197,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.shape(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.shape(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
@@ -3210,7 +3210,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.unmap(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.unmap(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
@@ -3223,7 +3223,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_slice(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
@@ -3236,7 +3236,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.as_mut_slice(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
@@ -3256,7 +3256,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
@@ -3274,7 +3274,7 @@ where
         match self {
             #[cfg(target_os = "linux")]
             TensorMap::Dma(map) => map.deref_mut(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),

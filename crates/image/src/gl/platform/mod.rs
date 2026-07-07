@@ -31,11 +31,11 @@
 //! decision tables, never as new `cfg` branches in the engine. Caps are
 //! captured ONCE per processor at worker startup, never per message.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) mod angle;
 #[cfg(target_os = "linux")]
 pub(super) mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) mod macos;
 
 use super::EglDisplayKind;
@@ -241,7 +241,7 @@ pub(super) trait GlPlatform {
 /// The one platform implementation for this build.
 #[cfg(target_os = "linux")]
 pub(super) type Platform = linux::LinuxEgl;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) type Platform = angle::AngleClientBuffer;
 
 // Compile-time check that the selected platform implements the contract —

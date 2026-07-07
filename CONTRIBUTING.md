@@ -36,6 +36,26 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 - `maturin` - For building Python bindings
 - `pytest` - For Python tests
 
+#### Platform-specific notes (macOS / iOS / ANGLE)
+
+The HAL's CPU path builds and tests on Linux, macOS, and Windows with no
+extra setup. The **OpenGL (GPU) backend on Apple platforms needs ANGLE**
+(Google's GLES→Metal translator), which is *not* part of macOS/iOS.
+
+- ANGLE is an open-source Google project, but the EdgeFirst **pre-built,
+  signed + notarized xcframeworks are published from an internal-only
+  repository** ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)).
+  Contributors **with** internal access use `scripts/fetch-angle.sh` — see
+  [README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration).
+- Contributors **without** internal access: on **macOS**, install ANGLE
+  via the public Homebrew tap (`brew install startergo/angle/angle`, then
+  re-sign the dylibs — see README). On **iOS**, there is no public ANGLE
+  source, so build the CPU-only path:
+  `cargo build --target aarch64-apple-ios --no-default-features --features ndarray,tracing`.
+- Either way, you can contribute to the Linux/CPU paths without any ANGLE
+  access — just disable the `opengl` feature
+  (`--no-default-features --features ndarray,tracing`).
+
 ### Clone and Build
 
 ```bash
@@ -262,8 +282,21 @@ Runs on every push and PR to `main` or `develop`:
 - **Formatting check**: `cargo fmt --all -- --check`
 - **Linting**: `cargo clippy --workspace`
 - **Multi-platform testing**: x86_64, aarch64, NXP i.MX8M Plus hardware
+- **macOS**: Rust tests (incl. the ANGLE/IOSurface GL render path) +
+  C API. Fetches the signed ANGLE xcframeworks from the internal
+  `angle-package` release via `scripts/fetch-angle.sh`.
+- **iOS**: build + link validation for `aarch64-apple-ios` (device) and
+  `aarch64-apple-ios-sim` (no runtime tests yet). Also fetches ANGLE from
+  the internal release.
+- **Windows**: compile check (`cargo check`).
 - **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
 - **SonarCloud analysis**: Static analysis and coverage aggregation
+
+> The macOS and iOS lanes use an internal `GITHUB_TOKEN` to fetch the
+> private `angle-package` release. **Fork PRs** (which get a
+> restricted token) cannot read that repo, so those two lanes are
+> best-effort on forks — the link-validation step will skip with a
+> warning if the download fails. All other lanes run normally on forks.
 
 ### Release Workflow (`release.yml`)
 
