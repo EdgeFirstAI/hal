@@ -319,8 +319,11 @@ jobs:
       checks: write
       pull-requests: write
     env:
-      # scripts/fetch-angle.sh reads GH_TOKEN/GITHUB_TOKEN to download the
-      # signed xcframeworks from the private EdgeFirstAI/angle-package repo.
+      # scripts/fetch-angle.sh uses GH_TOKEN to download the signed
+      # xcframeworks from the EdgeFirstAI/angle-package release. Fork PRs get
+      # no usable token and skip the ANGLE-dependent steps (see "Determine
+      # ANGLE access" below), so the GL render path is covered only on pushes
+      # and same-repo PRs.
       GH_TOKEN: ${{ github.token }}
       # Point the HAL's macOS ANGLE loader at the flat-lib staging dir that
       # scripts/fetch-angle.sh produces from the release xcframeworks. ANGLE's
@@ -483,9 +486,10 @@ jobs:
     permissions:
       contents: read
     env:
-      # scripts/fetch-angle.sh reads GH_TOKEN/GITHUB_TOKEN to download the
-      # signed xcframeworks from the private EdgeFirstAI/angle-package repo.
-      # GITHUB_TOKEN can read private repos in the same org.
+      # scripts/fetch-angle.sh downloads the ANGLE xcframeworks from the public
+      # EdgeFirstAI/angle-package release. No token is required (the release is
+      # public); GH_TOKEN is passed only so `gh release download` uses it when
+      # present and gets a higher API rate limit.
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -1376,7 +1380,10 @@ jobs:
     name: SonarCloud Analysis
     needs: [doc-tests, build-and-test-x86, build-and-test-macos, software-gl-coverage, test-arm, process-hardware-coverage]
     runs-on: ubuntu-22.04
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # !cancelled() keeps analysis running even when a needed lane fails or
+    # skips — otherwise a single macOS/ANGLE failure silently skips SonarCloud
+    # for the whole PR. Coverage aggregation globs whatever artifacts exist.
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
       pull-requests: read
