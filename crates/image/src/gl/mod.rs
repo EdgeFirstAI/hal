@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 #![cfg(feature = "opengl")]
 // Several types defined at the `gl` module root (EglDisplayKind,
 // TransferBackend, RegionOfInterest, etc.) are consumed only by the
 // Linux-only inner modules (`context`, `processor`, ...). The macOS
 // path uses its own `MacosGlProcessor` + `iosurface_import` modules and
-// does not touch every shared type, so some appear unused on macOS.
+// does not touch every shared type, so some appear unused on macOS/iOS.
 // Rather than fragmenting the type definitions per platform, suppress
-// the dead-code lint on non-Linux targets.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// the dead-code/unused-import lints on non-Linux targets.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 // Module layout:
 //   - `platform/` — cross-platform display/EGL-loader seam (both OSes)
@@ -64,7 +64,7 @@ mod render;
 // `shaders.rs` and the format code no longer pull in `gbm`.
 #[cfg(target_os = "linux")]
 mod fourcc;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface_import;
 mod platform;
 mod processor;
@@ -169,11 +169,11 @@ pub(crate) enum TransferBackend {
     /// the GPU can actually render through DMA-buf-backed textures.
     DmaBuf,
 
-    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS).
+    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS/iOS).
     /// Available when ANGLE's Metal backend is loaded and the EGL
     /// extension is advertised. The IOSurface is wrapped as an EGL
     /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     IOSurface,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
@@ -199,7 +199,7 @@ impl TransferBackend {
     /// specifically about DMA-BUF semantics (e.g. the render-roundtrip
     /// verification) keep `is_dma`.
     pub(crate) fn is_zero_copy(self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self == TransferBackend::IOSurface {
             return true;
         }

@@ -642,8 +642,11 @@ mod gl_tests {
     #[test]
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_rgba_reference() {
-        if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         // Load PixelFormat::Nv12 source with DMA
@@ -707,8 +710,11 @@ mod gl_tests {
     #[test]
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_rgba_reference() {
-        if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!(
+                "SKIPPED: {} - no zero-copy GPU buffers or OpenGL",
+                function!()
+            );
             return;
         }
         // Load PixelFormat::Yuyv source with DMA
@@ -1789,8 +1795,8 @@ mod gl_tests {
     #[test]
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_nv12_to_bgra() {
-        if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - no zero-copy GPU buffers");
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: test_opengl_nv12_to_bgra - no zero-copy GPU buffers or OpenGL");
             return;
         }
 
@@ -1869,8 +1875,8 @@ mod gl_tests {
     #[test]
     #[cfg(feature = "dma_test_formats")]
     fn test_opengl_yuyv_to_bgra() {
-        if !is_gpu_image_buffer_available() {
-            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - no zero-copy GPU buffers");
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: test_opengl_yuyv_to_bgra - no zero-copy GPU buffers or OpenGL");
             return;
         }
 

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! macOS implementation of [`GlPlatform`]: ANGLE (GLES→Metal) display
-//! bring-up and IOSurface buffer import.
+//! macOS and iOS implementation of [`GlPlatform`]: ANGLE (GLES→Metal)
+//! display bring-up and IOSurface buffer import.
 //!
 //! Owns the **process-global** shared ANGLE display ([`SharedAngleDisplay`]
 //! / [`shared_display`]) — `eglTerminate` is ref-counted but never safely
@@ -30,7 +30,7 @@
 
 use super::super::iosurface_import;
 use super::super::Egl;
-use super::macos::MacosPlatform;
+use super::macos::ApplePlatform;
 use super::GlPlatform;
 use crate::{Error, Result};
 use edgefirst_egl as egl;
@@ -127,11 +127,15 @@ pub(in crate::opengl_headless) fn shared_display() -> Result<&'static SharedAngl
 }
 
 fn init_shared_display() -> Result<SharedAngleDisplay> {
-    let _span =
-        tracing::info_span!("image.gl_init", platform = "macos", backend = "iosurface",).entered();
+    let platform = if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "macos"
+    };
+    let _span = tracing::info_span!("image.gl_init", platform, backend = "iosurface",).entered();
 
     // 1. Load ANGLE libEGL and bring up an EGL instance.
-    let egl_lib = MacosPlatform::load_egl_lib()
+    let egl_lib = ApplePlatform::load_egl_lib()
         .map_err(|e| Error::Io(std::io::Error::other(format!("ANGLE libEGL: {e}"))))?;
     let egl: Egl = unsafe {
         edgefirst_egl::Instance::<
@@ -140,8 +144,8 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
     }
     .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
 
-    // 2. Metal-backed display from MacosPlatform.
-    let display = MacosPlatform::create_display(&egl)?;
+    // 2. Metal-backed display from ApplePlatform.
+    let display = ApplePlatform::create_display(&egl)?;
     let (maj, min) = egl
         .initialize(display)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;

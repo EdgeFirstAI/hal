@@ -74,14 +74,46 @@ OpenGL backend on macOS the test process needs to load ANGLE's
 `libEGL.dylib` / `libGLESv2.dylib` and to be code-signed with
 entitlements that permit loading third-party dylibs.
 
-### 1. Install and re-sign ANGLE
+> **ANGLE is open-source; our pre-built integration is public too.** ANGLE
+> itself is a public Google project, and the EdgeFirst pre-built + signed
+> xcframeworks are published from the **public** repo
+> ([`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)) —
+> fetch them with `scripts/fetch-angle.sh` (no credentials needed). On
+> macOS you can instead use the Homebrew tap (Option B below), or skip the
+> GL tests entirely by building the CPU-only path
+> (`--no-default-features --features ndarray,tracing`).
 
-Follow the install steps in
-[README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration).
-The post-install `codesign --force --sign -` step is mandatory on macOS
-26 (Tahoe) and any earlier release running a hardened-runtime binary —
-without it the test process is killed by the kernel with no stdout and
-exit code 137.
+### 1. Install ANGLE
+
+**Option A — EdgeFirst pre-built release (recommended).** The
+pre-built, signed + notarized xcframeworks from the
+[`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
+release (default tag `v2.1.28252`). The helper downloads, sha256-verifies,
+extracts them into a flat-lib layout the macOS runtime can `dlopen`, and
+ad-hoc re-signs the two flat dylibs (flattening a framework binary
+invalidates its bundle-scoped Developer-ID signature) — so you never
+re-sign manually, unlike the Homebrew path:
+
+```bash
+scripts/fetch-angle.sh
+export EDGEFIRST_ANGLE_PATH=target/angle/macos-flat-lib
+```
+
+**Option B — Homebrew tap (macOS alternative).** Install
+ANGLE via the third-party tap, then ad-hoc re-sign the dylibs (Homebrew's
+`install_name_tool` breaks the bundled signatures — mandatory on macOS 26):
+
+```bash
+brew install startergo/angle/angle
+codesign --force --sign - $(brew --prefix)/opt/angle/lib/libEGL.dylib
+codesign --force --sign - $(brew --prefix)/opt/angle/lib/libGLESv2.dylib
+# No EDGEFIRST_ANGLE_PATH needed — the HAL finds Homebrew's default path.
+```
+
+`scripts/test-macos.sh` and CI set `EDGEFIRST_ANGLE_PATH` automatically
+when using Option A. See
+[README.md § macOS GPU Acceleration](README.md#macos-gpu-acceleration)
+for full details.
 
 If a test dies with no output, check
 `~/Library/Logs/DiagnosticReports/` for a crash report; the failure mode
@@ -351,6 +383,49 @@ CI automates this flow in
 Binaries are stripped on the build host (split debuginfo preserved for
 coverage attribution) and uploaded as the `hardware-test-binaries`
 artifact for the hardware runner to download.
+
+### iOS (build + link validation only)
+
+The HAL builds for `aarch64-apple-ios` (device) and `aarch64-apple-ios-sim`
+(simulator). There is **no runtime test** for iOS — runtime EGL bring-up
+requires the app shell (a future Swift-bindings effort). What CI validates
+is:
+
+1. The Rust library closure compiles for both iOS targets (default features
+   incl. `opengl`).
+2. The native symbol closure links cleanly against the ANGLE xcframeworks +
+   the Apple system frameworks the HAL references (`IOSurface`,
+   `CoreFoundation`, `Metal`).
+
+> **ANGLE note:** the link-validation step fetches the signed ANGLE
+> xcframeworks from the **public**
+> [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package)
+> release via `scripts/fetch-angle.sh` (no credentials needed). If you
+> would rather not fetch ANGLE, you can still do step 1 (the `cargo build`)
+> without it:
+>
+> ```bash
+> cargo build --target aarch64-apple-ios     --no-default-features --features ndarray,tracing
+> cargo build --target aarch64-apple-ios-sim --no-default-features --features ndarray,tracing
+> ```
+
+```bash
+# Build + link-validate both targets:
+scripts/build-ios.sh
+
+# Link validation only (after a build):
+scripts/validate-ios-link.sh device
+scripts/validate-ios-link.sh sim
+```
+
+The link validation auto-fetches the signed ANGLE xcframeworks from the
+[`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
+release via `scripts/fetch-angle.sh` (no credentials needed — the release is
+public; a `GH_TOKEN`/`GITHUB_TOKEN` is honored if set but not required).
+Because ANGLE's EGL/GLES symbols are
+resolved at runtime via `libloading`, the validation additionally runs
+`nm` on the ANGLE binaries to confirm the EGL entry-point names are
+exported — that is the real "ANGLE symbol closure resolves" check.
 
 ---
 

@@ -1,0 +1,22 @@
+[package]
+name = "edgefirst-ios-validation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "iOS link-validation shim — builds the full HAL closure into a staticlib and links it against the ANGLE xcframeworks + Apple system frameworks to prove the native symbol closure is complete. NOT published, NOT in default-members."
+keywords = ["ios", "validation", "hal"]
+categories = ["development-tools::testing"]
+publish = false
+
+[lib]
+# `staticlib` archives the full HAL dependency closure into one `.a` so the
+# link step in `scripts/validate-ios-link.sh` has a single library to resolve
+# against the ANGLE + Apple frameworks. `rlib` lets the crate compile under
+# `cargo check` on non-iOS hosts (the staticlib target only builds on iOS).
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+edgefirst-hal = { workspace = true }

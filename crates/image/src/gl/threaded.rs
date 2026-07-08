@@ -303,7 +303,7 @@ impl GLProcessorThreaded {
                     .unwrap_or_else(|e| e.into_inner());
                 GLProcessorST::new(kind)
             };
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let init_result = GLProcessorST::new(kind);
             let mut gl_converter = match init_result {
                 Ok(gl) => gl,
@@ -353,7 +353,7 @@ impl GLProcessorThreaded {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                 });
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 let _guard = serialize_per_msg.then(|| {
                     static MSG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
                     MSG_MUTEX.lock().unwrap_or_else(|e| e.into_inner())

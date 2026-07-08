@@ -690,6 +690,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefirst-ios-validation"
+version = "0.25.3"
+dependencies = [
+ "edgefirst-hal",
+]
+
+[[package]]
 name = "edgefirst-tensor"
 version = "0.25.3"
 dependencies = [
