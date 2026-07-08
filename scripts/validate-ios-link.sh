@@ -184,8 +184,8 @@ xcrun -sdk "${SDK}" clang \
     -target "${CLANG_TARGET}" \
     -dead_strip \
     "${MAIN_C}" \
-    -ledgefirst_ios_validation \
     -L "${HAL_ROOT}/target/${TRIPLE}/release" \
+    -ledgefirst_ios_validation \
     -F "${EGL_XCFW}/${SLICE}" -framework libEGL \
     -F "${GLESV2_XCFW}/${SLICE}" -framework libGLESv2 \
     -framework IOSurface \

@@ -319,11 +319,12 @@ jobs:
       checks: write
       pull-requests: write
     env:
-      # scripts/fetch-angle.sh uses GH_TOKEN to download the signed
-      # xcframeworks from the EdgeFirstAI/angle-package release. Fork PRs get
-      # no usable token and skip the ANGLE-dependent steps (see "Determine
-      # ANGLE access" below), so the GL render path is covered only on pushes
-      # and same-repo PRs.
+      # scripts/fetch-angle.sh downloads the signed xcframeworks from the
+      # public EdgeFirstAI/angle-package release. The release is public, so no
+      # credentials are required; GH_TOKEN is passed only to raise GitHub's API
+      # rate limit (honored if present, not required). This means the ANGLE
+      # fetch — and the GL render path it enables — works on pushes, same-repo
+      # PRs, and fork PRs alike.
       GH_TOKEN: ${{ github.token }}
       # Point the HAL's macOS ANGLE loader at the flat-lib staging dir that
       # scripts/fetch-angle.sh produces from the release xcframeworks. ANGLE's

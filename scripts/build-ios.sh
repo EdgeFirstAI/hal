@@ -24,8 +24,9 @@
 # Prerequisites:
 #   - Xcode + the iOS SDKs (xcode-select)
 #   - ANGLE xcframeworks (for validation only): fetched automatically by
-#     scripts/fetch-angle.sh from the EdgeFirstAI/angle-package release
-#     (needs `gh auth login` locally, or GH_TOKEN/GITHUB_TOKEN in CI).
+#     scripts/fetch-angle.sh from the public EdgeFirstAI/angle-package release
+#     (no credentials needed — a GH_TOKEN/GITHUB_TOKEN is honored if set but
+#     not required).
 #
 # Exit codes: 0 success; 1 build/validation failure; 2 prerequisites missing.
 

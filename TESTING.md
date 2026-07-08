@@ -420,8 +420,9 @@ scripts/validate-ios-link.sh sim
 
 The link validation auto-fetches the signed ANGLE xcframeworks from the
 [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
-release via `scripts/fetch-angle.sh` (needs `gh auth login` locally, or
-`GH_TOKEN`/`GITHUB_TOKEN` in CI). Because ANGLE's EGL/GLES symbols are
+release via `scripts/fetch-angle.sh` (no credentials needed — the release is
+public; a `GH_TOKEN`/`GITHUB_TOKEN` is honored if set but not required).
+Because ANGLE's EGL/GLES symbols are
 resolved at runtime via `libloading`, the validation additionally runs
 `nm` on the ANGLE binaries to confirm the EGL entry-point names are
 exported — that is the real "ANGLE symbol closure resolves" check.

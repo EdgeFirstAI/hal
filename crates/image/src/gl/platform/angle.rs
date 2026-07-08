@@ -127,8 +127,12 @@ pub(in crate::opengl_headless) fn shared_display() -> Result<&'static SharedAngl
 }
 
 fn init_shared_display() -> Result<SharedAngleDisplay> {
-    let _span =
-        tracing::info_span!("image.gl_init", platform = "macos", backend = "iosurface",).entered();
+    let platform = if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "macos"
+    };
+    let _span = tracing::info_span!("image.gl_init", platform, backend = "iosurface",).entered();
 
     // 1. Load ANGLE libEGL and bring up an EGL instance.
     let egl_lib = ApplePlatform::load_egl_lib()
