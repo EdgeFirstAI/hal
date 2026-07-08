@@ -89,9 +89,10 @@ entitlements that permit loading third-party dylibs.
 pre-built, signed + notarized xcframeworks from the
 [`EdgeFirstAI/angle-package`](https://github.com/EdgeFirstAI/angle-package/releases)
 release (default tag `v2.1.28252`). The helper downloads, sha256-verifies,
-and extracts them into a flat-lib layout the macOS runtime can `dlopen`
-(no re-signing needed — the release dylibs are already Developer-ID-signed
-+ notarized):
+extracts them into a flat-lib layout the macOS runtime can `dlopen`, and
+ad-hoc re-signs the two flat dylibs (flattening a framework binary
+invalidates its bundle-scoped Developer-ID signature) — so you never
+re-sign manually, unlike the Homebrew path:
 
 ```bash
 scripts/fetch-angle.sh

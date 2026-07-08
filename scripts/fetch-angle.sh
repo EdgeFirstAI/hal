@@ -146,8 +146,7 @@ fi
 # `dlopen`s `libGLESv2.dylib` from its OWN directory (located via dladdr).
 # The framework bundle layout (`libEGL.framework/libEGL`) does NOT satisfy
 # this — ANGLE would look for `libEGL.framework/libGLESv2.dylib`, which
-# doesn't exist, and modifying a signed framework to add it breaks its
-# signature. So for the macOS host-test path we stage a flat directory of
+# doesn't exist. So for the macOS host-test path we stage a flat directory of
 # `libEGL.dylib` + `libGLESv2.dylib` siblings copied from the framework
 # binaries. Point `EDGEFIRST_ANGLE_PATH` at this dir.
 #
@@ -163,6 +162,24 @@ else
        "${FLAT_DIR}/libEGL.dylib"
     cp "${DEST}/GLESv2.xcframework/macos-arm64/libGLESv2.framework/libGLESv2" \
        "${FLAT_DIR}/libGLESv2.dylib"
+fi
+
+# Ad-hoc re-sign the flattened dylibs. The release framework binaries are
+# Developer-ID-signed + notarized, but that signature is scoped to the
+# framework BUNDLE (it seals the framework's Info.plist). Pulling the binary
+# out to a flat `libEGL.dylib` invalidates it: `codesign --verify` reports
+# "invalid Info.plist (plist or signature have been modified)" and `dlopen`
+# fails with "code signature invalid" (an invalid signature is rejected more
+# firmly than an unsigned binary). A fresh ad-hoc signature is self-contained
+# (no bundle dependency) and loads cleanly; the macOS test binaries carry the
+# `disable-library-validation` entitlement, so they accept ad-hoc-signed
+# dylibs. This mirrors the Homebrew re-sign step, and only the flat-lib needs
+# it — the xcframework/iOS-embed path keeps the original signed frameworks
+# intact. Runs every time (idempotent) so it also repairs a stale cached copy.
+if command -v codesign >/dev/null 2>&1; then
+    echo "fetch-angle: ad-hoc re-signing flat-lib dylibs (bundle-scoped signature is invalid once flattened)"
+    codesign --force --sign - "${FLAT_DIR}/libGLESv2.dylib"
+    codesign --force --sign - "${FLAT_DIR}/libEGL.dylib"
 fi
 
 echo "fetch-angle: ready at ${DEST}"

@@ -608,11 +608,13 @@ which raises GitHub's API rate limit, but none are required.)
 > **Why a flat-lib dir for macOS?** ANGLE's `libEGL` internally `dlopen`s
 > `libGLESv2.dylib` from its own directory (located via `dladdr`) to
 > resolve GL entry points, so the two must be flat siblings. The signed
-> framework bundles do not satisfy this (and modifying them would break
-> their signature), so the helper stages `libEGL.dylib` + `libGLESv2.dylib`
-> siblings copied out of the framework binaries. The release dylibs are
-> already Developer-ID-signed + notarized, so they `dlopen` cleanly with
-> **no re-signing** required.
+> framework bundles do not satisfy this, so the helper stages
+> `libEGL.dylib` + `libGLESv2.dylib` siblings copied out of the framework
+> binaries. Pulling a binary out of its framework invalidates the
+> Developer-ID signature (it is scoped to the bundle's `Info.plist`, so
+> `dlopen` then fails with *"code signature invalid"*), so
+> `scripts/fetch-angle.sh` **ad-hoc re-signs the two flat dylibs for you** —
+> you never re-sign manually (unlike the Homebrew path below).
 
 #### Option B — Homebrew tap (macOS alternative)
 
