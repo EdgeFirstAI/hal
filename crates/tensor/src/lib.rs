@@ -1363,6 +1363,7 @@ where
     #[cfg(unix)]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.clone_fd(),
             TensorStorage::Shm(t) => t.clone_fd(),
             TensorStorage::Mem(t) => t.clone_fd(),

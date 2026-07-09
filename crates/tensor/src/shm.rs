@@ -6,7 +6,7 @@ use crate::{
     TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use log::{debug, trace, warn};
-use nix::{fcntl::OFlag, sys::stat::fstat, unistd::ftruncate};
+use nix::{sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
     ffi::c_void,
@@ -48,6 +48,41 @@ impl<T> ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Allocate the anonymous POSIX shared-memory segment backing a new
+    /// tensor: `shm_open` with a random name, then immediately `shm_unlink`
+    /// so nothing outlives the process — the library's sharing model is
+    /// file descriptors (`clone_fd`), never names.
+    ///
+    /// Android's bionic libc has no POSIX shared memory (`shm_open` /
+    /// `shm_unlink` do not exist), so allocation reports `NotImplemented`
+    /// there. Receiving a segment created elsewhere still works on Android:
+    /// [`from_fd`](TensorTrait::from_fd) needs only `mmap`/`fstat`, which
+    /// bionic provides. (A `memfd_create`-backed allocator is the planned
+    /// replacement: the syscall exists on all Android kernels, but the
+    /// bionic wrapper appears at API 30 and the HAL floor is 26.)
+    #[cfg(not(target_os = "android"))]
+    fn alloc_anon_fd(name: &str) -> Result<OwnedFd> {
+        use nix::fcntl::OFlag;
+        let shm_fd = nix::sys::mman::shm_open(
+            name,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        if let Err(e) = nix::sys::mman::shm_unlink(name) {
+            warn!("Failed to unlink shared memory: {e}");
+        }
+        Ok(shm_fd)
+    }
+
+    #[cfg(target_os = "android")]
+    fn alloc_anon_fd(_name: &str) -> Result<OwnedFd> {
+        Err(Error::NotImplemented(
+            "TensorMemory::Shm allocation is not available on Android (bionic has no \
+             POSIX shm_open); import an existing segment via from_fd instead"
+                .to_owned(),
+        ))
+    }
+
     /// Create a shared-memory tensor with a logical `shape` but a physical
     /// allocation of `byte_size` bytes (which must be `>= shape.product() *
     /// sizeof(T)`).  Used for image tensors with a 64-byte-aligned row stride
@@ -72,15 +107,7 @@ where
                 format!("/{}", &uuid[..16])
             }
         };
-        let shm_fd = nix::sys::mman::shm_open(
-            name.as_str(),
-            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
-        let err = nix::sys::mman::shm_unlink(name.as_str());
-        if let Err(e) = err {
-            log::warn!("Failed to unlink shared memory: {e}");
-        }
+        let shm_fd = Self::alloc_anon_fd(name.as_str())?;
         ftruncate(&shm_fd, byte_size as i64)?;
         Ok(ShmTensor::<T> {
             name,
@@ -162,21 +189,9 @@ where
             }
         };
 
-        let shm_fd = nix::sys::mman::shm_open(
-            name.as_str(),
-            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
+        let shm_fd = Self::alloc_anon_fd(name.as_str())?;
 
         trace!("Creating shared memory: {name}");
-
-        // We drop the shared memory object name after creating it to avoid
-        // leaving it in the system after the program exits.  The sharing model
-        // for the library is through file descriptors, not names.
-        let err = nix::sys::mman::shm_unlink(name.as_str());
-        if let Err(e) = err {
-            warn!("Failed to unlink shared memory: {e}");
-        }
 
         ftruncate(&shm_fd, size as i64)?;
         let stat = fstat(&shm_fd)?;
