@@ -490,3 +490,93 @@ def test_assemble_and_write_safetensors_round_trips(tmp_path):
     assert loaded_meta["format_version"] == "1"
     assert loaded_input.dtype == np.uint8
     assert loaded_input.shape == (1, 8, 8, 3)
+
+
+def test_build_quant_map_from_synthetic_layout():
+    mod = _import_generator()
+    layout = _synthetic_layout_three_levels()
+    quant_map = mod.build_quant_map(layout)
+    assert set(quant_map) == {
+        "boxes_0",
+        "boxes_1",
+        "boxes_2",
+        "scores_0",
+        "scores_1",
+        "scores_2",
+        "mc_0",
+        "mc_1",
+        "mc_2",
+        "protos",
+    }
+    assert quant_map["boxes_0"] == {
+        "scale": 0.157,
+        "zero_point": -42,
+        "dtype": "int8",
+    }
+    assert quant_map["protos"]["zero_point"] == -119
+
+
+def test_build_stage_intermediates_includes_protos():
+    import numpy as np
+
+    mod = _import_generator()
+    layout = _synthetic_layout_three_levels()
+    # Tiny spatial dims so DFL intermediates stay cheap.
+    layout.fpn_levels = [
+        {
+            "stride": 8.0,
+            "h": 2,
+            "w": 2,
+            "reg_max": 16,
+            "nc": 2,
+            "nm": 4,
+            "box_shape": (1, 2, 2, 64),
+            "score_shape": (1, 2, 2, 2),
+            "mc_shape": (1, 2, 2, 4),
+            "box_quant": (0.1, 0),
+            "score_quant": (0.2, 0),
+            "mc_quant": (0.3, 0),
+            "score_activation": "sigmoid",
+        }
+    ]
+    layout.protos_shape = (1, 4, 4, 4)
+    layout.protos_quant = (0.05, 0)
+    raw = {
+        "raw.boxes_0": np.zeros((1, 2, 2, 64), dtype=np.int8),
+        "raw.scores_0": np.zeros((1, 2, 2, 2), dtype=np.int8),
+        "raw.mc_0": np.zeros((1, 2, 2, 4), dtype=np.int8),
+        "raw.protos": np.zeros((1, 4, 4, 4), dtype=np.int8),
+    }
+    inter = mod.build_stage_intermediates(layout, raw)
+    assert "intermediate.boxes_0.dequant" in inter
+    assert "intermediate.scores_0.dequant" in inter
+    assert "intermediate.mc_0.dequant" in inter
+    assert "intermediate.protos.dequant" in inter
+
+
+def test_build_fixture_metadata_keys():
+    mod = _import_generator()
+    layout = _synthetic_layout_three_levels()
+    cfg = mod.FixtureConfig(
+        model_path=__import__("pathlib").Path("model.tflite"),
+        image_path=__import__("pathlib").Path("image.jpg"),
+        output_path=__import__("pathlib").Path("out.safetensors"),
+        include_stages=True,
+        score_threshold=0.001,
+        iou_threshold=0.7,
+        expected_count_min=10,
+    )
+    meta = mod.build_fixture_metadata(
+        cfg=cfg,
+        layout=layout,
+        edgefirst_metadata={"outputs": []},
+        quant_map=mod.build_quant_map(layout),
+        tensor_keys=["input.image", "decoded.boxes_xyxy"],
+    )
+    assert meta["format_version"] == "1"
+    assert meta["decoder_family"] == "per_scale_yolo_seg"
+    assert meta["model_basename"] == "out"
+    assert "quantization_json" in meta
+    assert "nms_config_json" in meta
+    assert "documentation_md" in meta
+    assert len(meta["reference_script_sha256"]) == 64

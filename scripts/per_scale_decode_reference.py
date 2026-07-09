@@ -256,59 +256,20 @@ class PerScaleLayout:
             if mc_meta else {}
         )
 
-        assert set(box_by_stride) == set(score_by_stride), (
-            f"Stride mismatch: boxes={set(box_by_stride)}, "
-            f"scores={set(score_by_stride)}"
-        )
-        if mc_by_stride:
-            assert set(mc_by_stride) == set(box_by_stride), (
-                f"Stride mismatch: mask_coefs={set(mc_by_stride)}, "
-                f"boxes={set(box_by_stride)}"
-            )
+        _validate_stride_sets(box_by_stride, score_by_stride, mc_by_stride)
 
         self.fpn_levels: List[dict] = []
         self.nc = 0
 
         for stride in sorted(box_by_stride):
-            bx = box_by_stride[stride]
-            sc = score_by_stride[stride]
-
-            bx_ds = _dshape_dict(bx.get("dshape", []))
-            sc_ds = _dshape_dict(sc.get("dshape", []))
-
-            h = bx_ds.get("height", bx["shape"][1])
-            w = bx_ds.get("width", bx["shape"][2])
-            nc = sc_ds.get("num_classes",
-                           sc_ds.get("num_features", sc["shape"][-1]))
-            reg_max = bx_ds.get("num_features", bx["shape"][-1]) // 4
-            self.nc = nc
-
-            level = {
-                "stride": float(stride),
-                "h": int(h),
-                "w": int(w),
-                "reg_max": int(reg_max),
-                "nc": int(nc),
-                "box_shape": tuple(bx["shape"]),
-                "score_shape": tuple(sc["shape"]),
-                "box_quant": _extract_quant(bx),
-                "score_quant": _extract_quant(sc),
-                "score_activation": sc.get("activation_required",
-                                           scores_meta.get(
-                                               "activation_required")),
-            }
-
-            if stride in mc_by_stride:
-                mc = mc_by_stride[stride]
-                mc_ds = _dshape_dict(mc.get("dshape", []))
-                level["nm"] = mc_ds.get("num_features", mc["shape"][-1])
-                level["mc_shape"] = tuple(mc["shape"])
-                level["mc_quant"] = _extract_quant(mc)
-            else:
-                level["nm"] = 0
-                level["mc_shape"] = None
-                level["mc_quant"] = None
-
+            level = _build_fpn_level(
+                stride,
+                box_by_stride[stride],
+                score_by_stride[stride],
+                mc_by_stride.get(stride),
+                scores_meta,
+            )
+            self.nc = level["nc"]
             self.fpn_levels.append(level)
 
         self.total_anchors = sum(
@@ -318,6 +279,68 @@ class PerScaleLayout:
             tuple(protos_meta["shape"]) if protos_meta else None)
         self.protos_quant = (
             _extract_quant(protos_meta) if protos_meta else None)
+
+
+def _validate_stride_sets(
+    box_by_stride: Dict[int, dict],
+    score_by_stride: Dict[int, dict],
+    mc_by_stride: Dict[int, dict],
+) -> None:
+    """Assert boxes/scores/(optional mask_coefs) share the same stride set."""
+    assert set(box_by_stride) == set(score_by_stride), (
+        f"Stride mismatch: boxes={set(box_by_stride)}, "
+        f"scores={set(score_by_stride)}"
+    )
+    if mc_by_stride:
+        assert set(mc_by_stride) == set(box_by_stride), (
+            f"Stride mismatch: mask_coefs={set(mc_by_stride)}, "
+            f"boxes={set(box_by_stride)}"
+        )
+
+
+def _build_fpn_level(
+    stride: int,
+    bx: dict,
+    sc: dict,
+    mc: Optional[dict],
+    scores_meta: dict,
+) -> dict:
+    """Assemble one FPN level dict from per-scale physical output metadata."""
+    bx_ds = _dshape_dict(bx.get("dshape", []))
+    sc_ds = _dshape_dict(sc.get("dshape", []))
+
+    h = bx_ds.get("height", bx["shape"][1])
+    w = bx_ds.get("width", bx["shape"][2])
+    nc = sc_ds.get("num_classes",
+                   sc_ds.get("num_features", sc["shape"][-1]))
+    reg_max = bx_ds.get("num_features", bx["shape"][-1]) // 4
+
+    level = {
+        "stride": float(stride),
+        "h": int(h),
+        "w": int(w),
+        "reg_max": int(reg_max),
+        "nc": int(nc),
+        "box_shape": tuple(bx["shape"]),
+        "score_shape": tuple(sc["shape"]),
+        "box_quant": _extract_quant(bx),
+        "score_quant": _extract_quant(sc),
+        "score_activation": sc.get("activation_required",
+                                   scores_meta.get(
+                                       "activation_required")),
+    }
+
+    if mc is not None:
+        mc_ds = _dshape_dict(mc.get("dshape", []))
+        level["nm"] = mc_ds.get("num_features", mc["shape"][-1])
+        level["mc_shape"] = tuple(mc["shape"])
+        level["mc_quant"] = _extract_quant(mc)
+    else:
+        level["nm"] = 0
+        level["mc_shape"] = None
+        level["mc_quant"] = None
+
+    return level
 
 
 def _index_by_stride(children: List[dict]) -> Dict[int, dict]:

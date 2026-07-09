@@ -494,6 +494,126 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def build_stage_intermediates(layout, raw: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Capture per-level and protos intermediate tensors for a fixture.
+
+    Pure helper extracted from :func:`main` so stage capture can be unit-tested
+    without running TFLite inference.
+    """
+    tensors: dict[str, np.ndarray] = {}
+    for lvl_idx, lvl in enumerate(layout.fpn_levels):
+        box_q_t = raw[f"raw.boxes_{lvl_idx}"]
+        sco_q_t = raw[f"raw.scores_{lvl_idx}"]
+        mc_q_t = raw.get(f"raw.mc_{lvl_idx}")
+        box_scale, box_zp = lvl["box_quant"]
+        sco_scale, sco_zp = lvl["score_quant"]
+        mc_scale = mc_zp = None
+        if mc_q_t is not None and lvl.get("mc_quant") is not None:
+            mc_scale, mc_zp = lvl["mc_quant"]
+        inter = capture_box_score_mc_intermediates(
+            level_index=lvl_idx,
+            encoding=layout.box_encoding,
+            reg_max=lvl.get("reg_max"),
+            h=lvl["h"],
+            w=lvl["w"],
+            stride=int(lvl["stride"]),
+            box_q=box_q_t,
+            box_q_scale=float(box_scale),
+            box_q_zp=int(box_zp),
+            sco_q=sco_q_t,
+            sco_q_scale=float(sco_scale),
+            sco_q_zp=int(sco_zp),
+            mc_q=mc_q_t,
+            mc_q_scale=float(mc_scale) if mc_scale is not None else None,
+            mc_q_zp=int(mc_zp) if mc_zp is not None else None,
+        )
+        tensors.update(inter)
+    if "raw.protos" in raw and layout.protos_quant is not None:
+        p_scale, p_zp = layout.protos_quant
+        tensors.update(
+            capture_protos_intermediate(
+                raw["raw.protos"], float(p_scale), int(p_zp),
+            )
+        )
+    return tensors
+
+
+def build_quant_map(layout) -> dict[str, dict]:
+    """Build the fixture quantization map keyed by loader lookup name."""
+    quant_map: dict[str, dict] = {}
+    for lvl_idx, lvl in enumerate(layout.fpn_levels):
+        if lvl.get("box_quant") is not None:
+            scale, zp = lvl["box_quant"]
+            quant_map[f"boxes_{lvl_idx}"] = {
+                "scale": float(scale),
+                "zero_point": int(zp),
+                "dtype": "int8",
+            }
+        if lvl.get("score_quant") is not None:
+            scale, zp = lvl["score_quant"]
+            quant_map[f"scores_{lvl_idx}"] = {
+                "scale": float(scale),
+                "zero_point": int(zp),
+                "dtype": "int8",
+            }
+        if lvl.get("mc_quant") is not None:
+            scale, zp = lvl["mc_quant"]
+            quant_map[f"mc_{lvl_idx}"] = {
+                "scale": float(scale),
+                "zero_point": int(zp),
+                "dtype": "int8",
+            }
+    if layout.protos_quant is not None:
+        scale, zp = layout.protos_quant
+        quant_map["protos"] = {
+            "scale": float(scale),
+            "zero_point": int(zp),
+            "dtype": "int8",
+        }
+    return quant_map
+
+
+def build_fixture_metadata(
+    *,
+    cfg: FixtureConfig,
+    layout,
+    edgefirst_metadata: dict,
+    quant_map: dict[str, dict],
+    tensor_keys: list[str],
+) -> dict[str, str]:
+    """Assemble string-valued safetensors metadata for a fixture write."""
+    nms_config = {
+        "iou_threshold": cfg.iou_threshold,
+        "score_threshold": cfg.score_threshold,
+        "max_detections": 300,
+    }
+    documentation_md = build_documentation_md(
+        decoder_family="per_scale_yolo_seg",
+        model_basename=cfg.output_path.stem,
+        encoding=layout.box_encoding,
+        keys=tensor_keys,
+        nms_config=nms_config,
+        expected_count_min=cfg.expected_count_min,
+    )
+    return {
+        "format_version": "1",
+        "decoder_family": "per_scale_yolo_seg",
+        "model_basename": cfg.output_path.stem,
+        "model_path": str(cfg.model_path),
+        "image_path": str(cfg.image_path),
+        "schema_json": json.dumps(_patch_schema_dshape(edgefirst_metadata)),
+        "quantization_json": json.dumps(quant_map),
+        "nms_config_json": json.dumps(nms_config),
+        "expected_count_min": str(cfg.expected_count_min),
+        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "reference_script_sha256": _file_sha256(
+            Path(__file__).resolve().parent / "per_scale_decode_reference.py"
+        ),
+        "generator_git_sha": _git_sha(),
+        "documentation_md": documentation_md,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = parse_args(argv)
 
@@ -511,34 +631,8 @@ def main(argv: list[str] | None = None) -> int:
     tensors: dict[str, np.ndarray] = {"input.image": image_uint8[np.newaxis]}
     tensors.update(raw)
 
-    # Per-stage intermediates
     if cfg.include_stages:
-        for lvl_idx, lvl in enumerate(layout.fpn_levels):
-            box_q_t = raw[f"raw.boxes_{lvl_idx}"]
-            sco_q_t = raw[f"raw.scores_{lvl_idx}"]
-            mc_q_t  = raw.get(f"raw.mc_{lvl_idx}")
-            box_scale, box_zp = lvl["box_quant"]
-            sco_scale, sco_zp = lvl["score_quant"]
-            mc_scale = mc_zp = None
-            if mc_q_t is not None and lvl.get("mc_quant") is not None:
-                mc_scale, mc_zp = lvl["mc_quant"]
-            inter = capture_box_score_mc_intermediates(
-                level_index=lvl_idx,
-                encoding=layout.box_encoding,
-                reg_max=lvl.get("reg_max"),
-                h=lvl["h"], w=lvl["w"], stride=int(lvl["stride"]),
-                box_q=box_q_t, box_q_scale=float(box_scale), box_q_zp=int(box_zp),
-                sco_q=sco_q_t, sco_q_scale=float(sco_scale), sco_q_zp=int(sco_zp),
-                mc_q=mc_q_t,
-                mc_q_scale=float(mc_scale) if mc_scale is not None else None,
-                mc_q_zp=int(mc_zp) if mc_zp is not None else None,
-            )
-            tensors.update(inter)
-        if "raw.protos" in raw and layout.protos_quant is not None:
-            p_scale, p_zp = layout.protos_quant
-            tensors.update(capture_protos_intermediate(
-                raw["raw.protos"], float(p_scale), int(p_zp),
-            ))
+        tensors.update(build_stage_intermediates(layout, raw))
 
     # Build shape_map directly (avoid bind_outputs' ndarray dance)
     outputs_in_order = list(raw_outputs_by_shape.values())
@@ -557,61 +651,14 @@ def main(argv: list[str] | None = None) -> int:
     if decoded.get("masks") is not None and decoded["masks"].size > 0:
         tensors["decoded.masks"] = (decoded["masks"] > 0).astype(np.uint8) * 255
 
-    # Build quantization map keyed by lookup name (matches loader's key shape)
-    quant_map: dict[str, dict] = {}
-    for lvl_idx, lvl in enumerate(layout.fpn_levels):
-        if lvl.get("box_quant") is not None:
-            scale, zp = lvl["box_quant"]
-            quant_map[f"boxes_{lvl_idx}"] = {
-                "scale": float(scale), "zero_point": int(zp), "dtype": "int8",
-            }
-        if lvl.get("score_quant") is not None:
-            scale, zp = lvl["score_quant"]
-            quant_map[f"scores_{lvl_idx}"] = {
-                "scale": float(scale), "zero_point": int(zp), "dtype": "int8",
-            }
-        if lvl.get("mc_quant") is not None:
-            scale, zp = lvl["mc_quant"]
-            quant_map[f"mc_{lvl_idx}"] = {
-                "scale": float(scale), "zero_point": int(zp), "dtype": "int8",
-            }
-    if layout.protos_quant is not None:
-        scale, zp = layout.protos_quant
-        quant_map["protos"] = {
-            "scale": float(scale), "zero_point": int(zp), "dtype": "int8",
-        }
-
-    nms_config = {
-        "iou_threshold": cfg.iou_threshold,
-        "score_threshold": cfg.score_threshold,
-        "max_detections": 300,
-    }
-
-    documentation_md = build_documentation_md(
-        decoder_family="per_scale_yolo_seg",
-        model_basename=cfg.output_path.stem,
-        encoding=layout.box_encoding,
-        keys=list(tensors.keys()),
-        nms_config=nms_config,
-        expected_count_min=cfg.expected_count_min,
+    quant_map = build_quant_map(layout)
+    metadata = build_fixture_metadata(
+        cfg=cfg,
+        layout=layout,
+        edgefirst_metadata=edgefirst_metadata,
+        quant_map=quant_map,
+        tensor_keys=list(tensors.keys()),
     )
-
-    metadata: dict[str, str] = {
-        "format_version": "1",
-        "decoder_family": "per_scale_yolo_seg",
-        "model_basename": cfg.output_path.stem,
-        "model_path": str(cfg.model_path),
-        "image_path": str(cfg.image_path),
-        "schema_json": json.dumps(_patch_schema_dshape(edgefirst_metadata)),
-        "quantization_json": json.dumps(quant_map),
-        "nms_config_json": json.dumps(nms_config),
-        "expected_count_min": str(cfg.expected_count_min),
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
-        "reference_script_sha256": _file_sha256(
-            Path(__file__).resolve().parent / "per_scale_decode_reference.py"),
-        "generator_git_sha": _git_sha(),
-        "documentation_md": documentation_md,
-    }
 
     n_det = len(tensors["decoded.boxes_xyxy"])
     if n_det < cfg.expected_count_min:
