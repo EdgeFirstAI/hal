@@ -242,19 +242,17 @@ mod egl1_0 {
     #[cfg(not(target_os = "android"))]
     pub type NativeWindowType = *mut c_void;
 
-    #[repr(C)]
+    // On Android, EGL's native window/pixmap types are opaque pointers that
+    // the C EGL API treats as `void*`. We keep them as `*mut c_void` (not a
+    // distinct opaque struct) so the FFI signatures in the `EGL1_5` trait
+    // (which use `*mut c_void`) type-check. The Android NDK headers define
+    // `struct ANativeWindow` / `struct egl_native_pixmap_t` as opaque, but
+    // passing the pointer through `void*` is the documented Khronos contract.
     #[cfg(target_os = "android")]
-    struct android_native_window_t;
-
-    #[repr(C)]
-    #[cfg(target_os = "android")]
-    struct egl_native_pixmap_t;
-
-    #[cfg(target_os = "android")]
-    pub type NativePixmapType = *mut egl_native_pixmap_t;
+    pub type NativePixmapType = *mut c_void;
 
     #[cfg(target_os = "android")]
-    pub type NativeWindowType = *mut android_native_window_t;
+    pub type NativeWindowType = *mut c_void;
 
     pub const ALPHA_SIZE: Int = 0x3021;
     pub const BAD_ACCESS: Int = 0x3002;
