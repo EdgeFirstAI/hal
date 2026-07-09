@@ -2145,20 +2145,17 @@ impl Decoder {
         // see EDGEAI-1303.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_tensor,
             protos_tensor,
             output_boxes,
             output_masks,
-        );
-
-        output_boxes.extend(old_boxes);
-
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2263,20 +2260,17 @@ impl Decoder {
         // `decode_tracked_proto`) — see EDGEAI-1303.
         crate::yolo::maybe_normalize_boxes_in_place(&mut boxes, self.normalized, self.input_dims);
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_tensor,
             protos_tensor,
             output_boxes,
             output_masks,
-        );
-
-        output_boxes.extend(old_boxes);
-
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2376,20 +2370,18 @@ impl Decoder {
             self.max_det,
         );
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
         // No NMS — model output is already post-NMS
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_coeff,
             protos_tensor,
             output_boxes,
             output_masks,
-        );
-        output_boxes.extend(old_boxes);
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     /// Decodes end-to-end YOLO detection + segmentation outputs (post-NMS from
@@ -2490,21 +2482,18 @@ impl Decoder {
             self.max_det,
         );
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
         // No NMS — model output is already post-NMS
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_coeff,
             protos_tensor,
             output_boxes,
             output_masks,
-        );
-        output_boxes.extend(old_boxes);
-
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     /// Decodes monolithic end-to-end YOLO seg detection from quantized tensors.
@@ -2625,20 +2614,17 @@ impl Decoder {
             self.max_det,
         );
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_coeff,
             protos_tensor,
             output_boxes,
             output_masks,
-        );
-
-        output_boxes.extend(old_boxes);
-
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     /// Decodes split end-to-end YOLO seg detection from float tensors.
@@ -2774,20 +2760,17 @@ impl Decoder {
             self.max_det,
         );
 
-        let (new_boxes, old_boxes) =
-            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
-
-        let mask_data = mask_fn(
-            new_boxes,
+        Ok(Self::finish_tracked_yolo_segdet_with_masks(
+            tracker,
+            timestamp,
+            boxes,
             mask_coeff,
             dequant_p.view(),
             output_boxes,
             output_masks,
-        );
-
-        output_boxes.extend(old_boxes);
-
-        Ok(mask_data)
+            output_tracks,
+            mask_fn,
+        ))
     }
 
     /// Decodes split end-to-end YOLO seg detection from quantized tensors.
@@ -3366,6 +3349,47 @@ impl Decoder {
         )
     }
 
+    /// Shared tracked-segdet finish stage: update the tracker, run `mask_fn`
+    /// on live boxes, then append aged-out boxes without masks.
+    ///
+    /// Extracted from the six `process_tracked_yolo_*` variants so the
+    /// tracker/mask/extend tail is not duplicated (cognitive-complexity).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_tracked_yolo_segdet_with_masks<
+        TR: edgefirst_tracker::Tracker<DetectBox>,
+        MaskT,
+        ProtoT,
+        M,
+    >(
+        tracker: &mut TR,
+        timestamp: u64,
+        boxes: Vec<(DetectBox, usize)>,
+        mask_tensor: ArrayView2<MaskT>,
+        protos_tensor: ArrayView3<ProtoT>,
+        output_boxes: &mut Vec<DetectBox>,
+        output_masks: &mut Vec<Segmentation>,
+        output_tracks: &mut Vec<TrackInfo>,
+        mask_fn: impl FnOnce(
+            Vec<(DetectBox, usize)>,
+            ArrayView2<MaskT>,
+            ArrayView3<ProtoT>,
+            &mut Vec<DetectBox>,
+            &mut Vec<Segmentation>,
+        ) -> M,
+    ) -> M {
+        let (new_boxes, old_boxes) =
+            Self::update_tracker_yolo_segdet(tracker, timestamp, boxes, output_tracks);
+        let mask_data = mask_fn(
+            new_boxes,
+            mask_tensor,
+            protos_tensor,
+            output_boxes,
+            output_masks,
+        );
+        output_boxes.extend(old_boxes);
+        mask_data
+    }
+
     pub(super) fn update_tracker_yolo_segdet<TR: edgefirst_tracker::Tracker<DetectBox>>(
         tracker: &mut TR,
         timestamp: u64,
@@ -3433,5 +3457,78 @@ impl Decoder {
         output_boxes.extend(new_boxes);
         output_tracks.clear();
         output_tracks.extend(new_tracks);
+    }
+}
+
+#[cfg(all(test, feature = "tracker"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tracked_finish_tests {
+    use super::*;
+    use crate::{BoundingBox, DetectBox};
+    use edgefirst_tracker::{ActiveTrackInfo, DetectionBox, TrackInfo, Tracker, Uuid};
+    use ndarray::{Array2, Array3};
+
+    /// Passthrough tracker: every detection becomes a live track at `timestamp`.
+    struct PassthroughTracker;
+
+    impl Tracker<DetectBox> for PassthroughTracker {
+        fn update(&mut self, boxes: &[DetectBox], timestamp: u64) -> Vec<Option<TrackInfo>> {
+            boxes
+                .iter()
+                .map(|b| {
+                    Some(TrackInfo {
+                        uuid: Uuid::nil(),
+                        tracked_location: b.bbox(),
+                        count: 1,
+                        created: timestamp,
+                        last_updated: timestamp,
+                    })
+                })
+                .collect()
+        }
+
+        fn get_active_tracks(&self) -> Vec<ActiveTrackInfo<DetectBox>> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn finish_tracked_yolo_segdet_with_masks_runs_mask_fn_and_keeps_boxes() {
+        let mut tracker = PassthroughTracker;
+        let mut output_boxes = Vec::new();
+        let mut output_masks = Vec::new();
+        let mut output_tracks = Vec::new();
+
+        let boxes = vec![(
+            DetectBox {
+                bbox: BoundingBox::new(0.1, 0.2, 0.3, 0.4),
+                score: 0.9,
+                label: 1,
+            },
+            0usize,
+        )];
+        let mask: Array2<f32> = Array2::zeros((1, 4));
+        let protos: Array3<f32> = Array3::zeros((4, 4, 4));
+
+        let marker = Decoder::finish_tracked_yolo_segdet_with_masks(
+            &mut tracker,
+            42,
+            boxes,
+            mask.view(),
+            protos.view(),
+            &mut output_boxes,
+            &mut output_masks,
+            &mut output_tracks,
+            |new_boxes, _mask, _protos, out_boxes, _out_masks| {
+                assert_eq!(new_boxes.len(), 1);
+                out_boxes.push(new_boxes[0].0);
+                7u8
+            },
+        );
+
+        assert_eq!(marker, 7);
+        assert_eq!(output_boxes.len(), 1);
+        assert_eq!(output_tracks.len(), 1);
+        assert_eq!(output_tracks[0].last_updated, 42);
     }
 }

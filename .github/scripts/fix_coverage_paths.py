@@ -9,13 +9,44 @@ This script post-processes the Cobertura XML to:
 2. Ensure filenames have the correct package prefix
 3. Make paths resolvable by SonarCloud
 
+Known repo-relative roots (``tests/``, ``crates/``, ``scripts/``,
+``.github/``) are left unchanged. Only bare or otherwise ambiguous
+filenames are prefixed with ``source_dir`` (default ``tests``).
+
 Usage:
-    python scripts/fix_coverage_paths.py coverage.xml tests
+    python .github/scripts/fix_coverage_paths.py coverage.xml tests
 """
+
+from __future__ import annotations
 
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+# Paths that are already repo-relative and must not be rewritten.
+KNOWN_ROOTS = ("tests/", "crates/", "scripts/", ".github/")
+
+
+def normalize_coverage_filename(filename: str, source_dir: str = "tests") -> str:
+    """Return a repo-relative coverage filename for SonarCloud.
+
+    Args:
+        filename: Cobertura ``class`` filename attribute.
+        source_dir: Prefix applied only to bare/ambiguous names.
+
+    Returns:
+        Normalized path that should resolve under the repo root.
+    """
+    if filename.startswith("./"):
+        filename = filename[2:]
+
+    if filename.startswith(source_dir + "/"):
+        return filename
+
+    if any(filename.startswith(root) for root in KNOWN_ROOTS):
+        return filename
+
+    return f"{source_dir}/{filename}"
 
 
 def fix_coverage_xml(xml_file: str, source_dir: str = "tests") -> None:
@@ -23,41 +54,29 @@ def fix_coverage_xml(xml_file: str, source_dir: str = "tests") -> None:
 
     Args:
         xml_file: Path to the coverage XML file to fix
-        source_dir: The source directory prefix for Python test files
+        source_dir: The source directory prefix for bare Python filenames
     """
     tree = ET.parse(xml_file)
     root = tree.getroot()
 
-    # Track how many files were fixed
     fixed_count = 0
 
-    # Fix the <source> tags to use current directory (.)
     # Sonar expects <source> to be the root directory where files are located
     sources = root.findall(".//sources/source")
     if sources:
         for source_elem in sources:
-            source_path = source_elem.text
-            if source_path:
-                # Set source to current directory
+            if source_elem.text:
                 source_elem.text = "."
 
-    # Find all class elements and fix their filename attributes
     for class_elem in root.findall(".//class"):
         filename = class_elem.get("filename")
-        if filename:
-            # Normalize path - remove any leading ./
-            if filename.startswith('./'):
-                filename = filename[2:]
-            # Ensure the path starts with the expected prefix
-            if not filename.startswith(source_dir + "/"):
-                # Check if it should be prefixed
-                if not filename.startswith("tests/") and not filename.startswith("crates/"):
-                    class_elem.set("filename", f"{source_dir}/{filename}")
-                    fixed_count += 1
-            else:
-                class_elem.set("filename", filename)
+        if not filename:
+            continue
+        normalized = normalize_coverage_filename(filename, source_dir)
+        if normalized != filename:
+            fixed_count += 1
+        class_elem.set("filename", normalized)
 
-    # Write the fixed XML back
     tree.write(xml_file, encoding="utf-8", xml_declaration=True)
 
     print(f"Fixed {fixed_count} file paths in {xml_file}")

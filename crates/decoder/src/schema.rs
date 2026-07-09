@@ -1273,72 +1273,121 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
         ))
     })?;
 
-    Ok(match ty {
-        LogicalType::Boxes => ConfigOutput::Boxes(configs::Boxes {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-            normalized: logical.normalized,
-        }),
-        LogicalType::Scores => ConfigOutput::Scores(configs::Scores {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        LogicalType::Protos => ConfigOutput::Protos(configs::Protos {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        LogicalType::MaskCoefs => ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        LogicalType::Segmentation => ConfigOutput::Segmentation(configs::Segmentation {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        LogicalType::Masks => ConfigOutput::Mask(configs::Mask {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        LogicalType::Classes => ConfigOutput::Classes(configs::Classes {
-            decoder,
-            quantization,
-            shape,
-            dshape,
-        }),
-        // Detection covers ModelPack anchor-grid and legacy YOLO combined.
-        // Detections (plural) is end-to-end; maps to Detection with the
-        // appropriate dimension layout.
-        LogicalType::Detection | LogicalType::Detections => {
-            ConfigOutput::Detection(configs::Detection {
-                anchors: logical.anchors.clone(),
-                decoder,
-                quantization,
-                shape,
-                dshape,
-                normalized: logical.normalized,
-            })
-        }
+    let ctx = LegacyConvertCtx {
+        decoder,
+        quantization,
+        shape,
+        dshape,
+        normalized: logical.normalized,
+        anchors: logical.anchors.clone(),
+    };
+
+    match ty {
+        LogicalType::Boxes => Ok(boxes_to_legacy(&ctx)),
+        LogicalType::Scores => Ok(scores_to_legacy(&ctx)),
+        LogicalType::Protos => Ok(protos_to_legacy(&ctx)),
+        LogicalType::MaskCoefs => Ok(mask_coefs_to_legacy(&ctx)),
+        LogicalType::Segmentation => Ok(segmentation_to_legacy(&ctx)),
+        LogicalType::Masks => Ok(masks_to_legacy(&ctx)),
+        LogicalType::Classes => Ok(classes_to_legacy(&ctx)),
+        LogicalType::Detection | LogicalType::Detections => Ok(detection_to_legacy(&ctx)),
         // Objectness / Landmarks have no direct v1 equivalent; the v1
         // YOLOv5 path embedded objectness in the combined Detection.
         LogicalType::Objectness | LogicalType::Landmarks => {
-            return Err(DecoderError::NotSupported(format!(
+            Err(DecoderError::NotSupported(format!(
                 "logical type {:?} has no legacy v1 equivalent; use the \
                  native v2 decoder path",
                 ty
-            )));
+            )))
         }
+    }
+}
+
+/// Shared fields for per-`LogicalType` legacy conversion helpers.
+struct LegacyConvertCtx {
+    decoder: configs::DecoderType,
+    quantization: Option<QuantTuple>,
+    shape: Vec<usize>,
+    dshape: Vec<(DimName, usize)>,
+    normalized: Option<bool>,
+    anchors: Option<Vec<[f32; 2]>>,
+}
+
+fn boxes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Boxes(configs::Boxes {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+        normalized: ctx.normalized,
+    })
+}
+
+fn scores_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Scores(configs::Scores {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn protos_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Protos(configs::Protos {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn mask_coefs_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn segmentation_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Segmentation(configs::Segmentation {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn masks_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Mask(configs::Mask {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn classes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    ConfigOutput::Classes(configs::Classes {
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+    })
+}
+
+fn detection_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
+    // Detection covers ModelPack anchor-grid and legacy YOLO combined.
+    // Detections (plural) is end-to-end; maps to Detection with the
+    // appropriate dimension layout.
+    ConfigOutput::Detection(configs::Detection {
+        anchors: ctx.anchors.clone(),
+        decoder: ctx.decoder,
+        quantization: ctx.quantization,
+        shape: ctx.shape.clone(),
+        dshape: ctx.dshape.clone(),
+        normalized: ctx.normalized,
     })
 }
 
@@ -2388,6 +2437,74 @@ outputs:
         let (shape, dshape) = squeeze_padding_dims(vec![1, 4, 8400], vec![]);
         assert_eq!(shape, vec![1, 4, 8400]);
         assert!(dshape.is_empty());
+    }
+
+    fn sample_logical(ty: LogicalType) -> LogicalOutput {
+        LogicalOutput {
+            name: Some("sample".into()),
+            type_: Some(ty),
+            shape: vec![1, 4, 100],
+            dshape: vec![],
+            decoder: None,
+            encoding: None,
+            score_format: None,
+            normalized: Some(true),
+            anchors: None,
+            stride: None,
+            dtype: None,
+            quantization: None,
+            outputs: vec![],
+            activation_applied: None,
+            activation_required: None,
+        }
+    }
+
+    #[test]
+    fn logical_to_legacy_maps_each_supported_type() {
+        let cases = [
+            (LogicalType::Boxes, "Boxes"),
+            (LogicalType::Scores, "Scores"),
+            (LogicalType::Protos, "Protos"),
+            (LogicalType::MaskCoefs, "MaskCoefficients"),
+            (LogicalType::Segmentation, "Segmentation"),
+            (LogicalType::Masks, "Mask"),
+            (LogicalType::Classes, "Classes"),
+            (LogicalType::Detection, "Detection"),
+            (LogicalType::Detections, "Detection"),
+        ];
+        for (ty, expected) in cases {
+            let out = logical_to_legacy_config_output(&sample_logical(ty)).unwrap();
+            let name = match &out {
+                ConfigOutput::Boxes(_) => "Boxes",
+                ConfigOutput::Scores(_) => "Scores",
+                ConfigOutput::Protos(_) => "Protos",
+                ConfigOutput::MaskCoefficients(_) => "MaskCoefficients",
+                ConfigOutput::Segmentation(_) => "Segmentation",
+                ConfigOutput::Mask(_) => "Mask",
+                ConfigOutput::Classes(_) => "Classes",
+                ConfigOutput::Detection(_) => "Detection",
+            };
+            assert_eq!(name, expected, "type {ty:?}");
+        }
+    }
+
+    #[test]
+    fn logical_to_legacy_rejects_objectness_and_landmarks() {
+        for ty in [LogicalType::Objectness, LogicalType::Landmarks] {
+            let err = logical_to_legacy_config_output(&sample_logical(ty)).unwrap_err();
+            assert!(
+                matches!(err, DecoderError::NotSupported(_)),
+                "expected NotSupported for {ty:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn logical_to_legacy_rejects_typeless_output() {
+        let mut logical = sample_logical(LogicalType::Boxes);
+        logical.type_ = None;
+        let err = logical_to_legacy_config_output(&logical).unwrap_err();
+        assert!(matches!(err, DecoderError::InvalidConfig(_)));
     }
 
     #[test]
