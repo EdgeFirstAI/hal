@@ -1293,13 +1293,13 @@ fn logical_to_legacy_config_output(logical: &LogicalOutput) -> DecoderResult<Con
         LogicalType::Detection | LogicalType::Detections => Ok(detection_to_legacy(&ctx)),
         // Objectness / Landmarks have no direct v1 equivalent; the v1
         // YOLOv5 path embedded objectness in the combined Detection.
-        LogicalType::Objectness | LogicalType::Landmarks => Err(DecoderError::NotSupported(
-            format!(
+        LogicalType::Objectness | LogicalType::Landmarks => {
+            Err(DecoderError::NotSupported(format!(
                 "logical type {:?} has no legacy v1 equivalent; use the \
                  native v2 decoder path",
                 ty
-            ),
-        )),
+            )))
+        }
     }
 }
 
@@ -1316,7 +1316,7 @@ struct LegacyConvertCtx {
 fn boxes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Boxes(configs::Boxes {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
         normalized: ctx.normalized,
@@ -1326,7 +1326,7 @@ fn boxes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn scores_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Scores(configs::Scores {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1335,7 +1335,7 @@ fn scores_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn protos_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Protos(configs::Protos {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1344,7 +1344,7 @@ fn protos_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn mask_coefs_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::MaskCoefficients(configs::MaskCoefficients {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1353,7 +1353,7 @@ fn mask_coefs_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn segmentation_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Segmentation(configs::Segmentation {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1362,7 +1362,7 @@ fn segmentation_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn masks_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Mask(configs::Mask {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1371,7 +1371,7 @@ fn masks_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
 fn classes_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Classes(configs::Classes {
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
     })
@@ -1384,7 +1384,7 @@ fn detection_to_legacy(ctx: &LegacyConvertCtx) -> ConfigOutput {
     ConfigOutput::Detection(configs::Detection {
         anchors: ctx.anchors.clone(),
         decoder: ctx.decoder,
-        quantization: ctx.quantization.clone(),
+        quantization: ctx.quantization,
         shape: ctx.shape.clone(),
         dshape: ctx.dshape.clone(),
         normalized: ctx.normalized,
