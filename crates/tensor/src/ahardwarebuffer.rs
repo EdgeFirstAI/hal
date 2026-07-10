@@ -108,7 +108,7 @@ const FORMAT_R16G16B16A16_FLOAT: u32 = 0x16;
 const FORMAT_BLOB: u32 = 0x21;
 
 // AHardwareBuffer_UsageFlags (subset used by the HAL). The CPU flags are
-// enum VALUES within their masks (READ_OFTEN = 3 = RARELY | 2), not
+// enum VALUES within their masks (NEVER=0, RARELY=2, OFTEN=3), not
 // independent bits — lock() must replay the allocated values.
 const USAGE_CPU_READ_OFTEN: u64 = 0x3;
 const USAGE_CPU_READ_MASK: u64 = 0xF;

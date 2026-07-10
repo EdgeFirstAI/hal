@@ -88,7 +88,16 @@ by per-item `cfg` gates:
 
 The zero-copy tier probes `is_gpu_image_buffer_available()`
 (`edgefirst_tensor::is_gpu_buffer_available`) instead of the Linux-flavored
-`is_dma_available()`. **Acceptance bar for newly ported tests:** green under
+`is_dma_available()`.
+
+**Android** deliberately has no `#[cfg(target_os = "android")]` test tier
+in this module: no CI runner can execute Android GL (the `build-android`
+lane is compile + clippy + link-validation only), so on-device correctness
+and performance are gated by the internal hal-mobile Device Farm harness
+driving the `edgefirst-android-validation` C-ABI entry points (GL-vs-CPU
+F16 oracle + convert benchmark with a steady-state import-cache-miss
+gate). The portable tiers above still cover the engine code Android shares
+with Linux/macOS. **Acceptance bar for newly ported tests:** green under
 `EDGEFIRST_GL_SERIALIZE=full` — GitHub's macOS runners expose a
 paravirtualized Metal GPU that takes the Full serialization policy.
 `scripts/test-macos.sh` enables `dma_test_formats` so the macOS lane runs

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Android support: AHardwareBuffer zero-copy tensor storage and a native
+  OpenGL ES backend** (min API 26, `aarch64-linux-android` +
+  `x86_64-linux-android`). Android becomes the third `GlPlatform`
+  implementation, following the architecture validated on-device by the
+  Phase-1 `hal-mobile` probe (Galaxy S26 Ultra):
+  - **`AHardwareBufferTensor`** fills the `TensorMemory::Dma` slot (the role
+    DMA-BUF plays on Linux and IOSurface on macOS/iOS): raw
+    `libnativewindow` FFI (stable NDK ABI since API 26), lock/unlock CPU
+    maps carrying the GPU↔CPU coherency contract, gralloc-stride-aware
+    geometry, BLOB byte-bags for generic tensors, and RGBA8/RGBA16F image
+    buffers sharing the planar-F16 RGBA16F packing with the macOS path. New
+    public API: `Tensor::from_hardware_buffer`, `hardware_buffer_ptr`,
+    `hardware_buffer_physical_dims` (+ `TensorDyn` equivalents),
+    `image_ahardwarebuffer_layout`, `is_ahardwarebuffer_available`.
+  - **`AndroidEgl` GL backend**: native default-display EGL (no ANGLE, no
+    GBM) with per-processor contexts; zero-copy import via
+    `EGL_ANDROID_image_native_buffer` with **persistent** texture bindings
+    (like Linux DMA-BUF, so the binding-skip cache applies). New
+    `TransferBackend::AHardwareBuffer`.
+  - **`edgefirst-android-validation`** crate: link-closure staticlib plus
+    C-ABI entry points that run the real `ImageProcessor` on-device (GL-vs-
+    CPU F16 oracle, convert benchmark with a steady-state import-cache miss
+    gate) for the hal-mobile AWS Device Farm harness. New
+    `scripts/build-android.sh` and `scripts/validate-android-link.sh`, and a
+    `build-android` CI lane (clippy + build + link validation for both ABIs,
+    pinned NDK r27c).
+  - Deferred follow-ups (fall back to CPU today): YUV camera buffers
+    (external-OES sampling), Grey/NV single-plane zero-copy (`R8_UNORM`
+    needs API 29), GL→NPU fence export, and shared-memory *allocation*
+    (bionic has no `shm_open`; importing an existing segment via `from_fd`
+    works).
+
 ## [0.25.3] - 2026-06-24
 
 ### Changed

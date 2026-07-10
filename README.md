@@ -532,22 +532,29 @@ caller code.
 
 ## Platform Support
 
-| Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Windows |
-|---------|--------------|---------------|-------|-----|---------|
-| DMA tensors | Yes | Yes | No | No | No |
-| PBO tensors (GPU) | Yes | Yes | No | No | No |
-| IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No |
-| Shared memory tensors | Yes | Yes | Yes | Yes | No |
-| Heap tensors | Yes | Yes | Yes | Yes | Yes |
-| G2D acceleration | Yes | No | No | No | No |
-| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | No |
-| CPU fallback | Yes | Yes | Yes | Yes | Yes |
+| Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Android | Windows |
+|---------|--------------|---------------|-------|-----|---------|---------|
+| DMA tensors | Yes | Yes | No | No | No | No |
+| PBO tensors (GPU) | Yes | Yes | No | No | No | No |
+| IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No | No |
+| AHardwareBuffer tensors (zero-copy) | No | No | No | No | Yes | No |
+| Shared memory tensors | Yes | Yes | Yes | Yes | Import-only¹ | No |
+| Heap tensors | Yes | Yes | Yes | Yes | Yes | Yes |
+| G2D acceleration | Yes | No | No | No | No | No |
+| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | Yes (native EGL) | No |
+| CPU fallback | Yes | Yes | Yes | Yes | Yes | Yes |
+
+¹ Android's bionic libc has no POSIX `shm_open`, so shared-memory tensor
+*allocation* reports `NotImplemented`; *importing* an existing segment
+received as a file descriptor (`from_fd`) works.
 
 On macOS the OpenGL backend is enabled when [ANGLE](https://github.com/google/angle)
 is installed — see [macOS GPU Acceleration](#macos-gpu-acceleration) below
 for setup. If ANGLE is not present the HAL falls back to the CPU backend.
 On iOS the OpenGL backend uses the same ANGLE-over-Metal path — see
-[iOS](#ios) below.
+[iOS](#ios) below. On Android the OpenGL backend uses the platform's
+native GLES driver directly (no translation layer) — see
+[Android](#android) below.
 
 ## macOS GPU Acceleration
 
@@ -787,6 +794,74 @@ target-feature rustflags. The iOS 16 deployment floor still includes A11
 (iPhone 8, ARMv8.1-A, no fp16/dotprod/i8mm), so enabling them would
 SIGILL on older devices. The deployment target matches the
 `angle-package` build (`IPHONEOS_DEPLOYMENT_TARGET = 16.0`).
+
+## Android
+
+The HAL builds for Android with the default features (including
+`opengl`), using the platform's **native OpenGL ES driver** directly —
+unlike macOS/iOS there is no ANGLE translation layer to install, because
+Android ships a first-class GLES implementation (Adreno, Mali, etc.).
+Zero-copy buffer interchange uses
+[AHardwareBuffer](https://developer.android.com/ndk/reference/group/a-hardware-buffer)
+(the role DMA-BUF plays on Linux and IOSurface on Apple platforms),
+imported into GL via `EGL_ANDROID_image_native_buffer`. The supported
+targets are:
+
+- `aarch64-linux-android` — Android devices (arm64-v8a)
+- `x86_64-linux-android` — the Android emulator on x86_64 hosts
+
+The minimum supported API level is **26** (Android 8.0) — the floor of
+the stable AHardwareBuffer NDK ABI.
+
+### Prerequisites
+
+```bash
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk
+# Android NDK r26+ (r27c LTS recommended); set ANDROID_NDK_HOME or let
+# cargo-ndk auto-detect it under your Android SDK.
+```
+
+### Building
+
+```bash
+# HAL + C API (the future JNI library) for both ABIs at API 26:
+scripts/build-android.sh
+# or directly:
+cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release -p edgefirst-hal
+```
+
+### Link validation
+
+`scripts/validate-android-link.sh [arm64|x86_64]` builds the
+`edgefirst-android-validation` staticlib (the full HAL closure), verifies
+with `llvm-nm` that the archive carries the AHardwareBuffer references
+and that the NDK's API-26 stubs export every EGL/GLES entry point the
+runtime resolves dynamically, then links a test executable against the
+NDK system libraries. CI runs this for both ABIs on every PR
+(`build-android` lane).
+
+What is **not** covered by this effort (future work):
+
+- **Kotlin bindings** — a JNI/Kotlin API surface, like the Swift API on
+  iOS. The `edgefirst-hal-capi` cdylib (`libedgefirst_hal.so`) is the
+  deliverable here.
+- **Runtime validation** — on-device GL correctness and performance run
+  via the internal `hal-mobile` AWS Device Farm harness calling the
+  `edgefirst-android-validation` C-ABI entry points (`_verify`, `_bench`);
+  the Phase-1 assessment already proved the native-GLES + AHardwareBuffer
+  path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
+  letterbox 720p→640×640 F16 in 741 µs).
+- **Deferred zero-copy paths** — YUV camera buffers (external-OES
+  sampling), single-channel Grey/NV imports (`R8_UNORM` needs API 29),
+  and GL→NPU fence export; these fall back to CPU conversion today.
+
+### fp16 / target features
+
+Like iOS, the Android targets carry **no** target-feature rustflags: the
+API-26 device floor spans ARMv8.0-A cores (Cortex-A53 class, no
+fp16/dotprod/i8mm), so baking those features in would SIGILL on real
+older hardware (see `.cargo/config.toml`).
 
 ## Build System
 

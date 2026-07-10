@@ -289,6 +289,14 @@ Runs on every push and PR to `main` or `develop`:
 - **iOS**: build + link validation for `aarch64-apple-ios` (device) and
   `aarch64-apple-ios-sim` (no runtime tests yet). Also fetches ANGLE from
   the public release.
+- **Android**: clippy + build + link validation for `aarch64-linux-android`
+  (device) and `x86_64-linux-android` (emulator) via `cargo-ndk` with a
+  pinned NDK (r27c) at the API-26 floor — no runtime tests in CI (GitHub
+  runners have no Android GPU); on-device correctness/performance is gated
+  separately by the internal Device Farm harness driving the
+  `edgefirst-android-validation` entry points. Local prerequisites:
+  `rustup target add aarch64-linux-android x86_64-linux-android`,
+  `cargo install cargo-ndk`, and an NDK (r26+) via `ANDROID_NDK_HOME`.
 - **Windows**: compile check (`cargo check`).
 - **Coverage collection**: Rust (cargo-llvm-cov) + Python (slipcover)
 - **SonarCloud analysis**: Static analysis and coverage aggregation

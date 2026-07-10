@@ -34,6 +34,8 @@ shutdown quirks of each driver stack.
 | [`gl/platform/angle.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/angle.rs) | local | macOS `GlPlatform`: shared ANGLE/Metal display + per-processor contexts (`AngleDisplay`), IOSurface pbuffer imports (`IoSurfacePbuffer`), per-pass `eglBindTexImage` tracking. |
 | [`gl/platform/macos.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/macos.rs) | local | `ApplePlatform::{load_egl_lib, create_display}` (macOS + iOS) — ANGLE dylib discovery + Metal display bring-up, consumed by `angle.rs`. |
 | [`gl/iosurface_import.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/iosurface_import.rs) | local | macOS/iOS: builds the `EGL_ANGLE_iosurface_client_buffer` attribute list and converts a tensor's IOSurface into an EGL pbuffer (consumed by `platform/angle.rs`). |
+| [`gl/platform/android.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/platform/android.rs) | local | Android `GlPlatform`: native default-display EGL bring-up (no ANGLE, no GBM) + per-processor contexts (`AndroidGlContext`), AHardwareBuffer EGLImage imports (`AndroidEglImage` — persistent bindings, like Linux). |
+| [`gl/ahardwarebuffer_import.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/ahardwarebuffer_import.rs) | local | Android: resolves the `EGL_ANDROID_image_native_buffer` entry points once per process and converts a tensor's AHardwareBuffer into an EGLImage — the thinnest of the three import paths (the buffer is self-describing; no attribute assembly). |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/error.rs) | local | `Error` (with `From<std::io::Error>` for ergonomic `?` propagation in user code) |
 
 ## Key Types and Traits
@@ -210,14 +212,14 @@ trait — the compile-time porting contract, selected per build by the
 `Platform` type alias (static dispatch: no vtable on the per-frame
 path, no type parameters leaking into the engine):
 
-| Contract item | Linux (`platform/linux.rs`) | macOS (`platform/angle.rs`) |
-|---|---|---|
-| `Display` | `GlContext` (GBM/PlatformDevice/Default EGL + surfaceless context) | `AngleDisplay` (private per-processor context on the shared ANGLE/Metal display) |
-| `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` |
-| `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) |
-| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point |
-| `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) |
-| `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) |
+| Contract item | Linux (`platform/linux.rs`) | macOS (`platform/angle.rs`) | Android (`platform/android.rs`) |
+|---|---|---|---|
+| `Display` | `GlContext` (GBM/PlatformDevice/Default EGL + surfaceless context) | `AngleDisplay` (private per-processor context on the shared ANGLE/Metal display) | `AndroidGlContext` (private per-processor context on the shared native default display) |
+| `Import` / `ImportHandle` | `EglImage` / `egl::Image` (DMA-BUF) | `IoSurfacePbuffer` / `egl::Surface` | `AndroidEglImage` / `egl::Image` (AHardwareBuffer) |
+| `import_buffer` / `import_buffer_nv_r8` / `import_buffer_packed` | `eglCreateImageKHR` attribute assembly (`dma_import.rs`, 64-byte stride invariant, multi-plane NV12) | `eglCreatePbufferFromClientBuffer` (`iosurface_import.rs` layouts) | `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` (`ahardwarebuffer_import.rs`; self-describing buffer, no attribute assembly; NV R8 needs the API-29 `R8_UNORM` format and errors today) |
+| `attach_tex_image_2d` (+`_external`, `_renderbuffer`) | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies) | `eglBindTexImage`, recorded and released by `end_gpu_pass` after the engine's sync point | `glEGLImageTargetTexture2DOES` (persistent — binding-skip cache applies, like Linux) |
+| `PERSISTENT_TEX_BINDINGS` / `EXTERNAL_OES` | `true` / `true` | `false` / `false` (no `samplerExternalOES` on ANGLE — those four programs are not even built) | `true` / `false` (the driver exposes external-OES, but the YUV sampling flip awaits on-device camera validation) |
+| `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) |
 
 `PlatformCaps` (transfer backend, float render support, `serialize_gl`,
 `external_oes`) is captured ONCE per processor at worker startup and
@@ -260,6 +262,14 @@ sequenceDiagram
     Driver-->>Backend: EGLSurface (pbuffer)
     Backend->>Driver: eglBindTexImage(<br/>pbuf, EGL_BACK_BUFFER)
     Note right of Backend: cached in ImportCache<br/>by BufferImportKey
+
+    Note over Tensor,Driver: Android (AHardwareBuffer)
+    Tensor->>Backend: hardware_buffer_ptr() → AHardwareBuffer*
+    Backend->>Driver: eglGetNativeClientBufferANDROID(buffer)
+    Backend->>Driver: eglCreateImageKHR(<br/>EGL_NATIVE_BUFFER_ANDROID,<br/>{EGL_IMAGE_PRESERVED})
+    Driver-->>Backend: EGLImage handle
+    Backend->>Driver: glEGLImageTargetTexture2DOES<br/>(tex_id, image)
+    Note right of Backend: cached in ImportCache<br/>by BufferImportKey<br/>(persistent, like Linux)
 ```
 
 The destination handling mirrors the source: on Linux the same
@@ -1016,6 +1026,7 @@ when the worker starts:
 | Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behavior on every platform). |
 | Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
 | Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
+| Android (Adreno/Mali system drivers) | `LifecycleOnly` | Messages run unlocked. Android's system EGL is specification-conformant thread-safe, so there is also no Linux-style lifecycle lock around context bring-up (same reasoning as ANGLE's internal serialization); this claim is device-validated by the Device Farm harness. |
 
 Override with `EDGEFIRST_GL_SERIALIZE=full|lifecycle` — `full` is the
 escape hatch for unknown-bad drivers (or tiny-convert-heavy
@@ -1337,6 +1348,7 @@ in the project README for the user-facing rules and validation patterns.
 | Linux desktop / Mesa x86_64 | OpenGL, CPU | GPU-dependent | DMA-heap permission required for DMA path |
 | macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA, GREY → RGBA, NV12/NV16/NV24 → RGBA, NV12/NV16/NV24 → PlanarRgb F16 (two-pass), and RGBA → PlanarRgb F16 all run on the GPU. IOSurface `width == 64-aligned pitch` (`semi_planar_surface_dims`) is required so ANGLE does not address texels beyond the declared width — NV24's chroma row is 2W bytes and would otherwise spill into padding columns. Other convert pairs fall back to CPU. |
 | macOS (no ANGLE) | CPU | CPU only | `GLProcessorThreaded::new()` fails at `ImageProcessor::new()` time (ANGLE dylib not found); the GPU dispatch is never attempted. |
+| Android (API 26+, Adreno/Mali) | OpenGL (native EGL), CPU | F16 `PlanarRgb` AHardwareBuffer zero-copy (RGBA16F packing, same layout as macOS); F32 gated on `GL_EXT_color_buffer_float` | RGBA8 and RGBA16F are the only zero-copy formats today: Grey/NV single-plane import needs the API-29 `R8_UNORM` format, BGRA has no AHardwareBuffer format, and YUV camera buffers await the external-OES sampling flip — all fall back to CPU conversion. Generic (non-image) tensors allocate as BLOB buffers. Validated on-device via the hal-mobile Device Farm harness (Galaxy S26 Ultra). |
 | Other Unix | CPU | CPU only | No GPU/G2D |
 
 ## Cross-References
