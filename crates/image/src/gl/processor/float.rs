@@ -392,40 +392,48 @@ impl GLProcessorST {
         pad_color: [f32; 3],
         dst_image_size: Option<(f32, f32)>,
     ) -> crate::Result<()> {
+        // Locations resolve once per program (the string lookups previously
+        // ran on every float draw); render programs live for the
+        // processor's life, so ids are never recycled under the cache.
+        let locs = *self
+            .float_quad_locs
+            .entry(program_id)
+            .or_insert_with(|| unsafe {
+                let loc =
+                    |name: &CStr| edgefirst_gl::gl::GetUniformLocation(program_id, name.as_ptr());
+                super::FloatQuadLocs {
+                    sampler: loc(sampler_name),
+                    src_rect_uv: loc(c"src_rect_uv"),
+                    dst_rect_px: loc(c"dst_rect_px"),
+                    pad_color: loc(c"pad_color"),
+                    dst_image_size: loc(c"dst_image_size"),
+                }
+            });
+        let (pos_vbo, uv_vbo) = self.ensure_float_quad_vbos();
         unsafe {
             edgefirst_gl::gl::Viewport(0, 0, packed_w as i32, packed_h as i32);
             edgefirst_gl::gl::UseProgram(program_id);
 
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex_id);
-            let loc_sampler =
-                edgefirst_gl::gl::GetUniformLocation(program_id, sampler_name.as_ptr());
-            edgefirst_gl::gl::Uniform1i(loc_sampler, 0);
-
-            let loc_src_rect =
-                edgefirst_gl::gl::GetUniformLocation(program_id, c"src_rect_uv".as_ptr());
+            edgefirst_gl::gl::Uniform1i(locs.sampler, 0);
             edgefirst_gl::gl::Uniform4f(
-                loc_src_rect,
+                locs.src_rect_uv,
                 src_rect_uv[0],
                 src_rect_uv[1],
                 src_rect_uv[2],
                 src_rect_uv[3],
             );
-            let loc_dst_rect =
-                edgefirst_gl::gl::GetUniformLocation(program_id, c"dst_rect_px".as_ptr());
             edgefirst_gl::gl::Uniform4f(
-                loc_dst_rect,
+                locs.dst_rect_px,
                 dst_rect_px[0],
                 dst_rect_px[1],
                 dst_rect_px[2],
                 dst_rect_px[3],
             );
-            let loc_pad = edgefirst_gl::gl::GetUniformLocation(program_id, c"pad_color".as_ptr());
-            edgefirst_gl::gl::Uniform3f(loc_pad, pad_color[0], pad_color[1], pad_color[2]);
+            edgefirst_gl::gl::Uniform3f(locs.pad_color, pad_color[0], pad_color[1], pad_color[2]);
             if let Some((w, h)) = dst_image_size {
-                let loc_size =
-                    edgefirst_gl::gl::GetUniformLocation(program_id, c"dst_image_size".as_ptr());
-                edgefirst_gl::gl::Uniform2f(loc_size, w, h);
+                edgefirst_gl::gl::Uniform2f(locs.dst_image_size, w, h);
             }
             check_gl_error(function!(), line!())?;
 
@@ -433,29 +441,32 @@ impl GLProcessorST {
             // 0..1 texcoords. The float shaders ignore the interpolated
             // texcoords (they derive sampling from gl_FragCoord + uniforms),
             // but a valid quad is still needed to rasterize every fragment.
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            // The geometry is constant, so it lives in the two STATIC_DRAW
+            // VBOs uploaded once by `ensure_float_quad_vbos` — the attrib
+            // pointers are re-pointed at them for the draw and RESTORED to
+            // the engine's dynamic buffers after (Buffer::new's init-time
+            // contract: attrib N permanently reads vertex_buffer /
+            // texture_buffer, which every other draw path relies on).
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, pos_vbo);
+            edgefirst_gl::gl::VertexAttribPointer(
+                self.vertex_buffer.buffer_index,
+                3,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
             edgefirst_gl::gl::EnableVertexAttribArray(self.vertex_buffer.buffer_index);
-            let quad_pos: [f32; 12] = [
-                -1.0, 1.0, 0.0, // left top
-                1.0, 1.0, 0.0, // right top
-                1.0, -1.0, 0.0, // right bottom
-                -1.0, -1.0, 0.0, // left bottom
-            ];
-            edgefirst_gl::gl::BufferData(
-                edgefirst_gl::gl::ARRAY_BUFFER,
-                (size_of::<f32>() * quad_pos.len()) as isize,
-                quad_pos.as_ptr() as *const c_void,
-                edgefirst_gl::gl::DYNAMIC_DRAW,
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, uv_vbo);
+            edgefirst_gl::gl::VertexAttribPointer(
+                self.texture_buffer.buffer_index,
+                2,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                std::ptr::null(),
             );
-            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
             edgefirst_gl::gl::EnableVertexAttribArray(self.texture_buffer.buffer_index);
-            let quad_uv: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
-            edgefirst_gl::gl::BufferData(
-                edgefirst_gl::gl::ARRAY_BUFFER,
-                (size_of::<f32>() * quad_uv.len()) as isize,
-                quad_uv.as_ptr() as *const c_void,
-                edgefirst_gl::gl::DYNAMIC_DRAW,
-            );
             let quad_index: [u32; 4] = [0, 1, 2, 3];
             edgefirst_gl::gl::DrawElements(
                 edgefirst_gl::gl::TRIANGLE_FAN,
@@ -463,9 +474,64 @@ impl GLProcessorST {
                 edgefirst_gl::gl::UNSIGNED_INT,
                 quad_index.as_ptr() as *const c_void,
             );
+            // Restore the init-time attrib→buffer contract before any other
+            // draw path runs.
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.vertex_buffer.id);
+            edgefirst_gl::gl::VertexAttribPointer(
+                self.vertex_buffer.buffer_index,
+                3,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
+            edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, self.texture_buffer.id);
+            edgefirst_gl::gl::VertexAttribPointer(
+                self.texture_buffer.buffer_index,
+                2,
+                edgefirst_gl::gl::FLOAT,
+                edgefirst_gl::gl::FALSE,
+                0,
+                std::ptr::null(),
+            );
             check_gl_error(function!(), line!())?;
         }
         Ok(())
+    }
+
+    /// Lazily create + upload the constant full-screen quad VBOs used by
+    /// [`Self::draw_float_quad`] (see the field docs on `GLProcessorST`).
+    fn ensure_float_quad_vbos(&mut self) -> (u32, u32) {
+        if self.float_quad_pos_vbo == 0 {
+            const QUAD_POS: [f32; 12] = [
+                -1.0, 1.0, 0.0, // left top
+                1.0, 1.0, 0.0, // right top
+                1.0, -1.0, 0.0, // right bottom
+                -1.0, -1.0, 0.0, // left bottom
+            ];
+            const QUAD_UV: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+            unsafe {
+                let mut ids = [0u32; 2];
+                edgefirst_gl::gl::GenBuffers(2, ids.as_mut_ptr());
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, ids[0]);
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
+                    std::mem::size_of_val(&QUAD_POS) as isize,
+                    QUAD_POS.as_ptr() as *const c_void,
+                    edgefirst_gl::gl::STATIC_DRAW,
+                );
+                edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::ARRAY_BUFFER, ids[1]);
+                edgefirst_gl::gl::BufferData(
+                    edgefirst_gl::gl::ARRAY_BUFFER,
+                    std::mem::size_of_val(&QUAD_UV) as isize,
+                    QUAD_UV.as_ptr() as *const c_void,
+                    edgefirst_gl::gl::STATIC_DRAW,
+                );
+                self.float_quad_pos_vbo = ids[0];
+                self.float_quad_uv_vbo = ids[1];
+            }
+        }
+        (self.float_quad_pos_vbo, self.float_quad_uv_vbo)
     }
 
     /// Render an RGBA8 source into a float PBO destination.

@@ -151,6 +151,20 @@ struct NvUniformLocs {
     c_ub: i32,
 }
 
+/// Uniform locations for one float-path program, resolved once per program
+/// — previously up to five `GetUniformLocation` string lookups per float
+/// draw (`draw_float_quad`). Same pattern as [`NvUniformLocs`]. A location
+/// of `-1` (uniform absent in that program variant) is harmless: GL ignores
+/// `Uniform*` calls with location `-1` by specification.
+#[derive(Clone, Copy)]
+pub(super) struct FloatQuadLocs {
+    pub(super) sampler: i32,
+    pub(super) src_rect_uv: i32,
+    pub(super) dst_rect_px: i32,
+    pub(super) pad_color: i32,
+    pub(super) dst_image_size: i32,
+}
+
 /// Per-program uniform state for one `nv_r8` variant. Uniform values are
 /// per-program GL state and persist across draws, so the constant sampler
 /// binding (`src` = unit 0) is uploaded once at resolve time and
@@ -361,6 +375,14 @@ pub struct GLProcessorST {
     /// first occurrence warns, repeats log at debug — an import that fails
     /// once fails every frame, and a per-frame warn is log spam.
     nv_import_warned: std::collections::HashSet<u64>,
+    /// Uniform locations per float-path program (see [`FloatQuadLocs`]).
+    pub(super) float_quad_locs: std::collections::HashMap<u32, FloatQuadLocs>,
+    /// Static full-screen quad VBOs `(pos, uv)` for the float paths,
+    /// uploaded once (`STATIC_DRAW`) — previously `BufferData`-re-uploaded
+    /// on every float draw. `0` = not yet created (lazy, on the first
+    /// float draw). Deleted in `Drop`.
+    pub(super) float_quad_pos_vbo: u32,
+    pub(super) float_quad_uv_vbo: u32,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
     /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
@@ -390,6 +412,10 @@ impl Drop for GLProcessorST {
             {
                 if self.proto_ssbo != 0 {
                     edgefirst_gl::gl::DeleteBuffers(1, &self.proto_ssbo);
+                }
+                if self.float_quad_pos_vbo != 0 {
+                    let ids = [self.float_quad_pos_vbo, self.float_quad_uv_vbo];
+                    edgefirst_gl::gl::DeleteBuffers(2, ids.as_ptr());
                 }
                 if let Some(program) = self.proto_repack_compute_program {
                     edgefirst_gl::gl::DeleteProgram(program);
@@ -1220,6 +1246,9 @@ impl GLProcessorST {
             last_nv_convert_path: NvConvertPath::None,
             convert_stats: Default::default(),
             nv_import_warned: std::collections::HashSet::new(),
+            float_quad_locs: std::collections::HashMap::new(),
+            float_quad_pos_vbo: 0,
+            float_quad_uv_vbo: 0,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
             colorimetry_env_pinned: colorimetry_env.is_some(),
