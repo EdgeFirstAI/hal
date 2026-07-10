@@ -329,11 +329,14 @@ where
     }
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
-        let new_elems: usize = shape.iter().product();
-        let cur_elems: usize = self.shape.iter().product();
-        if new_elems != cur_elems {
+        // Overflow-checked byte footprints: a wrapped product that happens
+        // to collide with the current count must not smuggle in a bogus
+        // shape (same rule as `set_logical_shape`/`view`).
+        let new_bytes = checked_shape_bytes::<T>(shape)?;
+        let cur_bytes = checked_shape_bytes::<T>(&self.shape)?;
+        if new_bytes != cur_bytes {
             return Err(Error::InvalidShape(format!(
-                "reshape: element count mismatch ({cur_elems} → {new_elems})",
+                "reshape: byte footprint mismatch ({cur_bytes} → {new_bytes})",
             )));
         }
         self.shape = shape.to_vec();
@@ -365,7 +368,7 @@ where
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
         }
-        let needed = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let needed = checked_shape_bytes::<T>(shape)?;
         if needed > self.buf_size {
             return Err(Error::InsufficientCapacity {
                 needed,
@@ -398,7 +401,7 @@ where
             .view_offset
             .checked_add(offset_bytes)
             .ok_or(Error::InvalidSize(offset_bytes))?;
-        let logical = shape.iter().product::<usize>() * std::mem::size_of::<T>();
+        let logical = checked_shape_bytes::<T>(shape)?;
         let needed = abs_offset
             .checked_add(logical)
             .ok_or(Error::InvalidSize(logical))?;
@@ -422,6 +425,23 @@ where
             view_offset: abs_offset,
         })
     }
+}
+
+/// Byte footprint of `shape` for element type `T`, with overflow-checked
+/// arithmetic — a shape whose element product (or its byte size) wraps
+/// `usize` must be rejected, not allowed to slip past a capacity check and
+/// produce an out-of-bounds map later.
+fn checked_shape_bytes<T>(shape: &[usize]) -> Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .and_then(|n| n.checked_mul(std::mem::size_of::<T>()))
+        .ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "shape footprint overflows usize (shape={shape:?}, sizeof T={})",
+                std::mem::size_of::<T>()
+            ))
+        })
 }
 
 impl<T> AHardwareBufferTensor<T>
@@ -625,18 +645,14 @@ where
             ))
         })?;
 
-        let elem_size = std::mem::size_of::<T>();
-        let elems: usize = shape.iter().product();
-        let requested = elems.checked_mul(elem_size).ok_or_else(|| {
-            Error::InvalidShape(format!(
-                "from_hardware_buffer: shape footprint overflows usize (shape={shape:?}, \
-                 sizeof T={elem_size})",
-            ))
-        })?;
+        // Overflow-checked: the element product itself can wrap before a
+        // checked byte multiply would notice.
+        let requested = checked_shape_bytes::<T>(shape)?;
         if requested > buf_size {
             return Err(Error::InvalidShape(format!(
                 "from_hardware_buffer: shape requires {requested} bytes but the buffer only \
-                 has {buf_size} (shape={shape:?}, sizeof T={elem_size})",
+                 has {buf_size} (shape={shape:?}, sizeof T={})",
+                std::mem::size_of::<T>(),
             )));
         }
 
@@ -841,6 +857,29 @@ where
                 "AHardwareBufferMap: buffer was allocated without CPU usage flags".into(),
             ));
         }
+        // Validate the exposed window BEFORE locking: the slice handed out
+        // by `deref` is `elem_count()` elements starting `view_offset`
+        // bytes in, so both the override and the shape-derived length must
+        // fit `buf_size − view_offset`. Callers pre-validate, but the
+        // release-mode `deref` has only a `debug_assert` — this is the
+        // load-bearing bounds check (mirrors `DmaMap`).
+        if view_offset > buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed: view_offset,
+                capacity: buf_size,
+            });
+        }
+        let window = buf_size - view_offset;
+        let exposed_bytes = match byte_size_override {
+            Some(bytes) => bytes,
+            None => checked_shape_bytes::<T>(&shape)?,
+        };
+        if exposed_bytes > window {
+            return Err(Error::InsufficientCapacity {
+                needed: exposed_bytes,
+                capacity: window,
+            });
+        }
         let mut base: *mut c_void = std::ptr::null_mut();
         // fence = -1: no acquire fence to wait on beyond the buffer's own
         // implicit fencing — the lock blocks until pending GPU work that
@@ -862,15 +901,9 @@ where
             ))
         })?;
         // A sub-view window starts `view_offset` bytes into the locked
-        // buffer. Advance the exposed base and shrink the remaining-window
-        // bound so the `deref` length check is against the window.
-        if view_offset > buf_size {
-            unsafe { AHardwareBuffer_unlock(buffer.as_ptr(), std::ptr::null_mut()) };
-            return Err(Error::InsufficientCapacity {
-                needed: view_offset,
-                capacity: buf_size,
-            });
-        }
+        // buffer (bounds-checked above). Advance the exposed base and
+        // shrink the remaining-window bound so the `deref` length check is
+        // against the window.
         let base_ptr = NonNull::new(unsafe { base_ptr.as_ptr().byte_add(view_offset) })
             .expect("offset base within locked buffer is non-null");
         Ok(Self {
