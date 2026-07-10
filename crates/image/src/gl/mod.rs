@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+#![cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+))]
 #![cfg(feature = "opengl")]
 // Several types defined at the `gl` module root (EglDisplayKind,
 // TransferBackend, RegionOfInterest, etc.) are consumed only by the
@@ -13,13 +18,13 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 // Module layout:
-//   - `platform/` — cross-platform display/EGL-loader seam (both OSes)
-//   - Linux-only:  `context`, `processor`, `threaded`, `dma_import`,
-//                  `cache`, `resources`, `shaders`, `tests`
-//   - macOS-only:  `iosurface_import`, `macos_processor`
-// The macOS processor is parallel to (not a refactor of) the Linux
-// threaded processor — see `crates/image/ARCHITECTURE.md` for the
-// rationale and the planned convergence story.
+//   - `platform/` — cross-platform display/EGL-loader seam (all OSes)
+//   - Linux-only:   `context`, `dma_import`, `fourcc`
+//   - macOS/iOS:    `iosurface_import`
+//   - Android-only: `ahardwarebuffer_import`
+// The engine (`processor`, `threaded`, `cache`, `resources`, `shaders`)
+// is portable and reaches platform buffers only through the `GlPlatform`
+// trait — see `crates/image/ARCHITECTURE.md`.
 
 macro_rules! function {
     () => {{
@@ -62,6 +67,8 @@ mod render;
 // `gbm`). DRM FourCC is a Linux/DMA-BUF concept, so this lives with the other
 // Linux graphics modules; the point is that it carries no `gbm` coupling, so
 // `shaders.rs` and the format code no longer pull in `gbm`.
+#[cfg(target_os = "android")]
+mod ahardwarebuffer_import;
 #[cfg(target_os = "linux")]
 mod fourcc;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -176,6 +183,15 @@ pub(crate) enum TransferBackend {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     IOSurface,
 
+    /// Zero-copy via `EGL_ANDROID_image_native_buffer` (Android). The
+    /// AHardwareBuffer is wrapped as an EGLImage via
+    /// `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` and bound
+    /// to a 2D texture via `glEGLImageTargetTexture2DOES` — persistent
+    /// bindings, like Linux DMA-BUF (unlike the per-pass IOSurface
+    /// pbuffer binds).
+    #[cfg(target_os = "android")]
+    AHardwareBuffer,
+
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
     /// but OpenGL is present. Data stays in GPU-accessible memory.
     Pbo,
@@ -201,6 +217,10 @@ impl TransferBackend {
     pub(crate) fn is_zero_copy(self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self == TransferBackend::IOSurface {
+            return true;
+        }
+        #[cfg(target_os = "android")]
+        if self == TransferBackend::AHardwareBuffer {
             return true;
         }
         self == TransferBackend::DmaBuf

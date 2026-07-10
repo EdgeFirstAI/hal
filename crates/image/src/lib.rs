@@ -319,17 +319,32 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "ios"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
     feature = "opengl"
 ))]
 pub use opengl_headless::EglDisplayKind;
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "ios"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
     feature = "opengl"
 ))]
 pub use opengl_headless::GLProcessorThreaded;
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "ios"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
     feature = "opengl"
 ))]
 pub use opengl_headless::Int8InterpolationMode;
@@ -340,7 +355,12 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
 // `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
 // `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "ios"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
     feature = "opengl"
 ))]
 pub use opengl_headless::{CacheStats, GlCacheStats};
@@ -976,7 +996,12 @@ pub struct ImageProcessorConfig {
     /// (ANGLE/Metal is the only display there; a `Some` value logs a
     /// debug note and is otherwise ignored).
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "ios"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
         feature = "opengl"
     ))]
     pub egl_display: Option<EglDisplayKind>,
@@ -1134,13 +1159,14 @@ pub struct ImageProcessor {
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
     pub opengl: Option<GLProcessorThreaded>,
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     #[cfg(feature = "opengl")]
-    /// OpenGL-based image converter for macOS via ANGLE + IOSurface —
-    /// the same unified `GLProcessorThreaded` engine as Linux (its
-    /// worker owns a per-processor ANGLE context). Available when
-    /// ANGLE's libEGL.dylib can be loaded (see README.md § macOS GPU
-    /// Acceleration).
+    /// OpenGL-based image converter — the same unified
+    /// `GLProcessorThreaded` engine as Linux (its worker owns a
+    /// per-processor context). macOS/iOS run it via ANGLE + IOSurface
+    /// (available when ANGLE's libEGL.dylib can be loaded — see
+    /// README.md § macOS GPU Acceleration); Android runs it via the
+    /// native EGL driver + AHardwareBuffer.
     pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
@@ -1192,7 +1218,10 @@ impl ImageProcessor {
     ///
     /// [`create_image`]: Self::create_image
     pub fn supported_render_dtypes(&self) -> RenderDtypeSupport {
-        #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "opengl"))]
+        #[cfg(all(
+            any(target_os = "macos", target_os = "ios", target_os = "android"),
+            feature = "opengl"
+        ))]
         if let Some(gl) = self.opengl.as_ref() {
             return gl.supported_render_dtypes();
         }
@@ -1229,7 +1258,7 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     forced_backend: None,
@@ -1259,7 +1288,7 @@ impl ImageProcessor {
                     log::warn!("G2D requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
-                        #[cfg(any(target_os = "macos", target_os = "ios"))]
+                        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                         #[cfg(feature = "opengl")]
                         opengl: None,
                         forced_backend: None,
@@ -1310,7 +1339,33 @@ impl ImageProcessor {
                     }
                     .apply_colorimetry_mode(config.colorimetry));
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+                #[cfg(target_os = "android")]
+                {
+                    #[cfg(feature = "opengl")]
+                    let opengl = match GLProcessorThreaded::new(config.egl_display) {
+                        Ok(gl) => Some(gl),
+                        Err(e) => {
+                            log::warn!(
+                                "OpenGL requested but native EGL init failed: {e:?}. \
+                                 Falling back to CPU."
+                            );
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        #[cfg(feature = "opengl")]
+                        opengl,
+                        forced_backend: None,
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "android"
+                )))]
                 {
                     log::warn!("OpenGL requested but not available on this platform, using CPU");
                     return Ok(Self {
@@ -1349,7 +1404,7 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
                     forced_backend: Some(ForcedBackend::Cpu),
@@ -1409,8 +1464,28 @@ impl ImageProcessor {
                         }
                         .apply_colorimetry_mode(config.colorimetry))
                     }
+                    #[cfg(target_os = "android")]
+                    #[cfg(feature = "opengl")]
+                    {
+                        let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "opengl forced but native EGL init failed: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            opengl: Some(opengl),
+                            forced_backend: Some(ForcedBackend::OpenGl),
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
+                    }
                     #[cfg(not(all(
-                        any(target_os = "linux", target_os = "macos", target_os = "ios"),
+                        any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "android"
+                        ),
                         feature = "opengl"
                     )))]
                     {
@@ -1460,7 +1535,7 @@ impl ImageProcessor {
             }
         };
 
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -1473,7 +1548,7 @@ impl ImageProcessor {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::debug!(
-                        "macOS GL backend unavailable: {err:?} \
+                        "GL backend unavailable: {err:?} \
                          (CPU fallback will be used)"
                     );
                     None
@@ -1497,7 +1572,7 @@ impl ImageProcessor {
             #[cfg(target_os = "linux")]
             #[cfg(feature = "opengl")]
             opengl,
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
             #[cfg(feature = "opengl")]
             opengl,
             forced_backend: None,
@@ -1510,7 +1585,12 @@ impl ImageProcessor {
     /// plumbing for [`ImageProcessorConfig::colorimetry`].
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
         #[cfg(all(
-            any(target_os = "linux", target_os = "macos", target_os = "ios"),
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ),
             feature = "opengl"
         ))]
         {
@@ -1521,7 +1601,12 @@ impl ImageProcessor {
             me
         }
         #[cfg(not(all(
-            any(target_os = "linux", target_os = "macos", target_os = "ios"),
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ),
             feature = "opengl"
         )))]
         {
@@ -1535,7 +1620,12 @@ impl ImageProcessor {
     /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
     /// it is set, this call logs and keeps the env-selected mode.
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "ios"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
         feature = "opengl"
     ))]
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
@@ -1548,7 +1638,12 @@ impl ImageProcessor {
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
     /// backend. No-op if OpenGL is not available.
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "ios"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
         feature = "opengl"
     ))]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
@@ -1717,10 +1812,11 @@ impl ImageProcessor {
         }
 
         // macOS: when the GL backend is active with the IOSurface
-        // transfer path, prefer Dma (IOSurface) for zero-copy import.
-        // The Tensor allocator falls through to SHM/Mem automatically
-        // for formats without an IOSurface mapping (NV12, planar, etc.).
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // transfer path, prefer Dma (IOSurface on Apple, AHardwareBuffer
+        // on Android) for zero-copy import. The Tensor allocator falls
+        // through to SHM/Mem automatically for formats without a
+        // zero-copy mapping (NV12, planar u8, etc.).
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
             let _ = gl; // probe_transfer_backend lives behind the platform trait
@@ -2207,7 +2303,12 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
                 ForcedBackend::OpenGl => {
-                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android"
+                    ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         let r = opengl.convert(src, dst, rotation, flip, crop);
@@ -2224,7 +2325,12 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             match opengl.convert(src, dst, rotation, flip, crop) {
@@ -2313,7 +2419,12 @@ impl ImageProcessorTrait for ImageProcessor {
         // is forced or auto-selectable; on a GL decline fall back to an eager
         // convert (the auto chain), which is correct everywhere — it completes
         // synchronously and `flush` stays a no-op for non-GL backends.
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         {
             let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
@@ -2340,7 +2451,12 @@ impl ImageProcessorTrait for ImageProcessor {
         let _span = tracing::trace_span!("image.flush").entered();
         // Only the OpenGL backend defers; flushing it issues the single GPU
         // sync. CPU/G2D converts already completed, so there is nothing to flush.
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             return opengl.flush();

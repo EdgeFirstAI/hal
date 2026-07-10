@@ -758,7 +758,8 @@ where
     where
         T: num_traits::Num,
     {
-        let inner = unsafe { AHardwareBufferTensor::<T>::from_hardware_buffer(buffer_ptr, shape, name)? };
+        let inner =
+            unsafe { AHardwareBufferTensor::<T>::from_hardware_buffer(buffer_ptr, shape, name)? };
         Ok(crate::Tensor::wrap(crate::TensorStorage::Dma(inner)))
     }
 }
@@ -845,7 +846,9 @@ where
         // implicit fencing — the lock blocks until pending GPU work that
         // wrote the buffer completes (the coherency contract, mirroring
         // IOSurfaceLock).
-        let rc = unsafe { AHardwareBuffer_lock(buffer.as_ptr(), cpu_usage, -1, std::ptr::null(), &mut base) };
+        let rc = unsafe {
+            AHardwareBuffer_lock(buffer.as_ptr(), cpu_usage, -1, std::ptr::null(), &mut base)
+        };
         if rc != 0 {
             return Err(Error::IoError(std::io::Error::other(format!(
                 "AHardwareBuffer_lock failed (rc={rc})"

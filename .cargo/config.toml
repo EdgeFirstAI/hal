@@ -38,3 +38,20 @@ rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
 # (see README.md § iOS). No rustflags, no linker overrides needed.
 [target.aarch64-apple-ios]
 [target.aarch64-apple-ios-sim]
+
+# Android targets (aarch64-linux-android device, x86_64-linux-android
+# emulator). Minimum supported API level: 26 (Android 8.0) — the
+# AHardwareBuffer NDK ABI floor.
+#
+# As with iOS, we deliberately do NOT bake `+fp16/+dotprod/+i8mm` here:
+# the API-26 device floor spans ARMv8.0-A cores (Cortex-A53-class)
+# without those extensions, so baking them would SIGILL on real older
+# hardware.
+#
+# No linker entries live here either: builds go through `cargo ndk`
+# (cargo-ndk), which supplies the NDK's API-26 clang linker and sysroot
+# — that sysroot is what resolves the `#[link(name = "nativewindow")]`
+# AHardwareBuffer symbols and the runtime-dlopen'd libEGL. See
+# scripts/build-android.sh.
+[target.aarch64-linux-android]
+[target.x86_64-linux-android]

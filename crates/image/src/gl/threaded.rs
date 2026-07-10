@@ -303,7 +303,10 @@ impl GLProcessorThreaded {
                     .unwrap_or_else(|e| e.into_inner());
                 GLProcessorST::new(kind)
             };
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            // macOS: ANGLE serializes internally. Android: the system EGL
+            // is specification-conformant thread-safe. Neither needs the
+            // Linux lifecycle lock.
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
             let init_result = GLProcessorST::new(kind);
             let mut gl_converter = match init_result {
                 Ok(gl) => gl,
@@ -353,7 +356,7 @@ impl GLProcessorThreaded {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                 });
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                 let _guard = serialize_per_msg.then(|| {
                     static MSG_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
                     MSG_MUTEX.lock().unwrap_or_else(|e| e.into_inner())

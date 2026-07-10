@@ -26,9 +26,9 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
-pub mod colorimetry;
 #[cfg(target_os = "android")]
 mod ahardwarebuffer;
+pub mod colorimetry;
 pub mod covguard;
 mod cuda;
 #[cfg(target_os = "linux")]

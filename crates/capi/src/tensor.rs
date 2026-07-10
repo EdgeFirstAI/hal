@@ -81,12 +81,13 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
-            // Dma covers DMA-BUF on Linux and IOSurface on macOS.
-            // On platforms without a GPU-buffer backend, fall back to Mem
-            // so callers don't get a misleading ENOMEM.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            // Dma covers DMA-BUF on Linux, IOSurface on macOS, and
+            // AHardwareBuffer on Android. On platforms without a
+            // GPU-buffer backend, fall back to Mem so callers don't get a
+            // misleading ENOMEM.
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
             HalTensorMemory::Dma => Some(TensorMemory::Mem),
             #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),

@@ -31,6 +31,8 @@
 //! decision tables, never as new `cfg` branches in the engine. Caps are
 //! captured ONCE per processor at worker startup, never per message.
 
+#[cfg(target_os = "android")]
+pub(super) mod android;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) mod angle;
 #[cfg(target_os = "linux")]
@@ -243,6 +245,8 @@ pub(super) trait GlPlatform {
 pub(super) type Platform = linux::LinuxEgl;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) type Platform = angle::AngleClientBuffer;
+#[cfg(target_os = "android")]
+pub(super) type Platform = android::AndroidEgl;
 
 // Compile-time check that the selected platform implements the contract —
 // a partial port fails here, not at a call site deep in the engine.
