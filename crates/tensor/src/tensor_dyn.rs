@@ -656,6 +656,77 @@ impl TensorDyn {
         dispatch!(self, iosurface_physical_dims)
     }
 
+    /// Wrap an externally-allocated AHardwareBuffer as a type-erased
+    /// tensor (Android only). Used to import buffers from
+    /// CameraX/ImageReader (via JNI), NNAPI, or cross-process binder
+    /// transfers.
+    ///
+    /// # Safety
+    ///
+    /// `buffer_ptr` must be a valid live AHardwareBuffer pointer. `shape`
+    /// must match the buffer's dimensions and chosen element type.
+    #[cfg(target_os = "android")]
+    pub unsafe fn from_hardware_buffer(
+        buffer_ptr: *mut std::ffi::c_void,
+        shape: &[usize],
+        dtype: DType,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        unsafe {
+            match dtype {
+                DType::U8 => {
+                    Tensor::<u8>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U8)
+                }
+                DType::I8 => {
+                    Tensor::<i8>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I8)
+                }
+                DType::U16 => {
+                    Tensor::<u16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U16)
+                }
+                DType::I16 => {
+                    Tensor::<i16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I16)
+                }
+                DType::U32 => {
+                    Tensor::<u32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U32)
+                }
+                DType::I32 => {
+                    Tensor::<i32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I32)
+                }
+                DType::U64 => {
+                    Tensor::<u64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U64)
+                }
+                DType::I64 => {
+                    Tensor::<i64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I64)
+                }
+                DType::F16 => {
+                    Tensor::<f16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F16)
+                }
+                DType::F32 => {
+                    Tensor::<f32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F32)
+                }
+                DType::F64 => {
+                    Tensor::<f64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F64)
+                }
+            }
+        }
+    }
+
+    /// Borrow the raw AHardwareBuffer pointer backing this tensor
+    /// (Android only). Returns `None` when the tensor is not
+    /// AHardwareBuffer-backed. The pointer's lifetime is tied to `self`.
+    #[cfg(target_os = "android")]
+    pub fn hardware_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        dispatch!(self, hardware_buffer_ptr)
+    }
+
+    /// Physical AHardwareBuffer dimensions in texels, independent of the
+    /// logical shape (Android only). `None` when not
+    /// AHardwareBuffer-backed.
+    #[cfg(target_os = "android")]
+    pub fn hardware_buffer_physical_dims(&self) -> Option<(usize, usize)> {
+        dispatch!(self, hardware_buffer_physical_dims)
+    }
+
     /// Create a type-erased image tensor.
     ///
     /// # Arguments

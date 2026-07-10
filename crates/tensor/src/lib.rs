@@ -27,6 +27,8 @@ while the `TensorMap` enum provides access to the underlying data. The `TensorDy
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
 pub mod colorimetry;
+#[cfg(target_os = "android")]
+mod ahardwarebuffer;
 pub mod covguard;
 mod cuda;
 #[cfg(target_os = "linux")]
@@ -65,6 +67,10 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 // `TensorStorage` / `TensorMap` enums without leaking into the public API.
 // Exceptions kept public: `Pbo*` is a GL extension point implemented by the
 // image crate, and `image_iosurface_layout` is a public helper.
+#[cfg(target_os = "android")]
+pub use crate::ahardwarebuffer::image_ahardwarebuffer_layout;
+#[cfg(target_os = "android")]
+pub(crate) use crate::ahardwarebuffer::{AHardwareBufferMap, AHardwareBufferTensor};
 #[cfg(target_os = "linux")]
 pub(crate) use crate::dma::{DmaMap, DmaTensor};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1134,6 +1140,8 @@ where
     Dma(DmaTensor<T>),
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     Dma(IoSurfaceTensor<T>),
+    #[cfg(target_os = "android")]
+    Dma(AHardwareBufferTensor<T>),
     #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
@@ -1160,6 +1168,10 @@ where
             // `configure_image` does not adopt its whole-buffer "row" as a stride.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.image_backing_row_stride(),
+            // Android AHardwareBuffer: same rule — only genuine 2D
+            // image-formatted buffers (height > 1) carry a real row pitch.
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(t) => t.image_backing_row_stride(),
             _ => None,
         }
     }
@@ -1178,9 +1190,19 @@ where
             Some(TensorMemory::Dma) => {
                 IoSurfaceTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+            #[cfg(target_os = "android")]
+            Some(TensorMemory::Dma) => {
+                AHardwareBufferTensor::<T>::new(shape, name).map(TensorStorage::Dma)
+            }
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            )))]
             Some(TensorMemory::Dma) => Err(crate::error::Error::NotImplemented(
-                "TensorMemory::Dma is only available on Linux (DMA-BUF) and macOS/iOS (IOSurface)"
+                "TensorMemory::Dma is only available on Linux (DMA-BUF), macOS/iOS (IOSurface), \
+                 and Android (AHardwareBuffer)"
                     .to_owned(),
             )),
             #[cfg(unix)]
@@ -1224,9 +1246,24 @@ where
                             Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
+                    #[cfg(target_os = "android")]
+                    {
+                        // Android: Try AHardwareBuffer -> Mem. AHardwareBuffer is
+                        // the GPU/NPU-shareable backend (zero-copy via EGLImage),
+                        // filling the same role as DMA-BUF on Linux.
+                        match AHardwareBufferTensor::<T>::new(shape, name) {
+                            Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
+                            Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
+                        }
+                    }
                     #[cfg(all(
                         unix,
-                        not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+                        not(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "android"
+                        ))
                     ))]
                     {
                         // Other Unix (BSD): Mem only (no DMA; Shm is explicit-only)
@@ -1309,6 +1346,25 @@ where
             .map(TensorStorage::Dma)
     }
 
+    /// Allocate an image-formatted AHardwareBuffer-backed storage (Android).
+    ///
+    /// Used by `Tensor::image()` when the caller requests
+    /// `TensorMemory::Dma` and the format has an AHardwareBuffer format
+    /// mapping (RGBA8 and the RGBA16F float paths today). Falls back to
+    /// `new_with_byte_size` otherwise.
+    #[cfg(target_os = "android")]
+    pub(crate) fn new_image_ahardwarebuffer(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        shape: &[usize],
+        name: Option<&str>,
+    ) -> Result<Self> {
+        AHardwareBufferTensor::<T>::new_image(width, height, format, dtype, shape, name)
+            .map(TensorStorage::Dma)
+    }
+
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
     #[cfg(unix)]
@@ -1363,7 +1419,12 @@ where
     #[cfg(unix)]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.clone_fd(),
             TensorStorage::Shm(t) => t.clone_fd(),
             TensorStorage::Mem(t) => t.clone_fd(),
@@ -1373,7 +1434,12 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(_) => TensorMemory::Dma,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
@@ -1384,7 +1450,12 @@ where
 
     fn name(&self) -> String {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.name(),
@@ -1395,7 +1466,12 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.shape(),
@@ -1406,7 +1482,12 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.reshape(shape),
@@ -1417,7 +1498,12 @@ where
 
     fn capacity_bytes(&self) -> usize {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.capacity_bytes(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.capacity_bytes(),
@@ -1428,7 +1514,12 @@ where
 
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.set_logical_shape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.set_logical_shape(shape),
@@ -1439,7 +1530,12 @@ where
 
     fn map(&self) -> Result<TensorMap<T>> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.map(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.map(),
@@ -1450,7 +1546,12 @@ where
 
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.buffer_identity(),
@@ -1467,7 +1568,12 @@ where
     /// here rather than matching the storage itself).
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.view(offset_bytes, shape).map(TensorStorage::Shm),
@@ -1824,6 +1930,79 @@ where
             // (only F16 PlanarRgb is wired). Fall through to SHM/Mem
             // since the caller asked for Dma but no image-formatted DMA
             // storage exists for this combination.
+        }
+
+        // Android Dma path: allocate a format-aware AHardwareBuffer so the
+        // GL backend can import it as an EGLImage
+        // (`eglGetNativeClientBufferANDROID` → `eglCreateImageKHR`).
+        //
+        // Geometry: gralloc chooses the row pitch (`desc.stride`) at
+        // allocation. Packed formats tolerate a padded pitch — the tensor
+        // records it below and CPU maps iterate rows via the strided-map
+        // path while the GL import uses the buffer's own pitch. Planar F16
+        // (the RGBA16F packing) is consumed flat as `[1, C, H, W]` — the
+        // NPU handoff contract — so a padded pitch cannot be represented:
+        // fail loudly rather than hand back a tensor whose flat map would
+        // read garbage (the same loud-failure rule as the IOSurface
+        // alignment guard above).
+        #[cfg(target_os = "android")]
+        if matches!(memory, Some(TensorMemory::Dma)) {
+            if let Some(dtype) = dtype_of::<T>() {
+                // Planar F16 requires width % 4 == 0 for the RGBA16F
+                // packing — reject up front with the requirement spelled
+                // out (mirrors the macOS pre-allocation guard) instead of
+                // falling through to a byte-bag GL cannot bind.
+                if format.layout() == PixelLayout::Planar
+                    && dtype == DType::F16
+                    && packed_rgba16f_layout(format, dtype, width, height).is_none()
+                {
+                    return Err(Error::InvalidArgument(format!(
+                        "Tensor::image: {format:?} F16 requires width%4==0 for the RGBA16F \
+                         AHardwareBuffer packing (got width={width}). Pad the width, or pass \
+                         memory=Some(TensorMemory::Mem) for a CPU tensor."
+                    )));
+                }
+                if crate::ahardwarebuffer::image_ahardwarebuffer_layout(format, dtype).is_some() {
+                    if let Ok(storage) = TensorStorage::<T>::new_image_ahardwarebuffer(
+                        width, height, format, dtype, &shape, None,
+                    ) {
+                        let mut t = Self::wrap(storage);
+                        t.format = Some(format);
+                        if let TensorStorage::Dma(ref ahb) = t.storage {
+                            let bpr = ahb.bytes_per_row();
+                            if format.layout() == PixelLayout::Planar {
+                                // Natural pitch of the packed RGBA16F surface:
+                                // (W/4) pixels × 8 bytes = W × sizeof(f16).
+                                let natural = width * std::mem::size_of::<T>();
+                                if bpr != natural {
+                                    return Err(Error::InvalidArgument(format!(
+                                        "Tensor::image: gralloc padded the {format:?} F16 \
+                                         AHardwareBuffer row pitch to {bpr} bytes (natural \
+                                         {natural}); the flat [1, C, H, W] layout cannot \
+                                         represent the padding. Pad the width so the RGBA16F \
+                                         surface pitch matches the allocator's alignment, or \
+                                         pass memory=Some(TensorMemory::Mem) for a CPU tensor."
+                                    )));
+                                }
+                            } else if let Some(natural) = t.effective_row_stride() {
+                                // gralloc pitch exceeds the natural packed
+                                // stride: record it so CPU consumers iterate
+                                // rows correctly (the GL import uses the
+                                // buffer's own pitch regardless).
+                                if bpr > natural {
+                                    t.set_row_stride_unchecked(bpr);
+                                }
+                            }
+                        }
+                        return Ok(t);
+                    }
+                }
+            }
+            // No AHardwareBuffer format mapping (Grey/NV/BGRA/YUYV — see
+            // `image_ahardwarebuffer_layout` for the per-format rationale)
+            // or the allocation failed — fall through: the caller asked for
+            // Dma but no image-formatted zero-copy storage exists for this
+            // combination.
         }
 
         // Compute the **64-byte-aligned** row stride for every image layout.
@@ -3117,6 +3296,23 @@ where
                     }
                     return io.map_with_byte_size(total_bytes);
                 }
+                // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
+                // yields the full buffer base address, and the row pitch is
+                // known from the allocator-filled descriptor — so a strided CPU
+                // view is sound and zero-copy, same as IOSurface.
+                #[cfg(target_os = "android")]
+                TensorStorage::Dma(ahb) => {
+                    // A sub-view's window is `buf_size − view_offset`; the strided
+                    // span must fit the window, not the whole buffer.
+                    let available = ahb.buf_size.saturating_sub(ahb.view_offset);
+                    if total_bytes > available {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity: available,
+                        });
+                    }
+                    return ahb.map_with_byte_size(total_bytes);
+                }
                 TensorStorage::Pbo(pbo) => {
                     // PBO: the GPU-side allocation may have a padded row stride
                     // (e.g. 64-byte aligned). Expose the full padded buffer so a
@@ -3158,10 +3354,16 @@ where
         // a non-zero offset is honoured rather than rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
             let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
-            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF — both
-            // apply the offset in their map. (`Dma` is the same variant name on
-            // both, hence one `cfg(any(...))` arm rather than two.)
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF; Android
+            // `Dma` is the AHardwareBuffer — all apply the offset in their map.
+            // (`Dma` is the same variant name on each, hence one `cfg(any(...))`
+            // arm rather than three.)
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
             #[cfg(unix)]
             let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
@@ -3187,6 +3389,8 @@ where
     Dma(DmaMap<T>),
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     IoSurface(IoSurfaceMap<T>),
+    #[cfg(target_os = "android")]
+    HardwareBuffer(AHardwareBufferMap<T>),
     #[cfg(unix)]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
@@ -3203,6 +3407,8 @@ where
             TensorMap::Dma(map) => map.shape(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.shape(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.shape(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
@@ -3216,6 +3422,8 @@ where
             TensorMap::Dma(map) => map.unmap(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.unmap(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.unmap(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
@@ -3229,6 +3437,8 @@ where
             TensorMap::Dma(map) => map.as_slice(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
@@ -3242,6 +3452,8 @@ where
             TensorMap::Dma(map) => map.as_mut_slice(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
@@ -3262,6 +3474,8 @@ where
             TensorMap::Dma(map) => map.deref(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
@@ -3280,6 +3494,8 @@ where
             TensorMap::Dma(map) => map.deref_mut(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
@@ -3340,8 +3556,34 @@ pub fn is_iosurface_available() -> bool {
     false
 }
 
+/// Cached result of the Android AHardwareBuffer availability probe.
+#[cfg(target_os = "android")]
+static AHARDWAREBUFFER_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Check if Android AHardwareBuffer allocation is available on this system.
+///
+/// AHardwareBuffer is part of the Android OS (public NDK ABI since API
+/// 26) and is essentially always present; this probe catches degraded
+/// scenarios such as memory pressure or gralloc failures. The result is
+/// cached after the first call.
+#[cfg(target_os = "android")]
+pub fn is_ahardwarebuffer_available() -> bool {
+    *AHARDWAREBUFFER_AVAILABLE.get_or_init(|| {
+        // Probe via the same Dma path — on Android this routes through
+        // AHardwareBufferTensor::new.
+        Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
+    })
+}
+
+/// Always returns `false` on non-Android platforms.
+#[cfg(not(target_os = "android"))]
+pub fn is_ahardwarebuffer_available() -> bool {
+    false
+}
+
 /// Portable probe for the platform's native zero-copy GPU buffer
-/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS). Returns `false` on
+/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS, AHardwareBuffer on
+/// Android). Returns `false` on
 /// Windows and other platforms with no equivalent. Use this when writing
 /// cross-platform code that cares whether the `Dma` tensor variant will
 /// work, not which underlying mechanism is used.
@@ -3354,7 +3596,16 @@ pub fn is_gpu_buffer_available() -> bool {
     {
         is_iosurface_available()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    #[cfg(target_os = "android")]
+    {
+        is_ahardwarebuffer_available()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     {
         false
     }
