@@ -222,6 +222,61 @@ pub fn packed_rgba16f_layout(
     })
 }
 
+/// Geometry of the RGBA8888-packed surface backing a packed RGB u8/i8 image
+/// tensor.
+///
+/// GPUs have no 3-channel renderable format, so the GL engine's two-pass
+/// packed-RGB shader writes the tight `[H, W, 3]` byte stream into an
+/// RGBA8888 surface: each texel carries 4 consecutive RGB bytes, giving a
+/// `(W*3/4, H)` surface at 4 bytes/texel whose rows are byte-identical to
+/// tight RGB — consumable flat as `[H, W, 3]` with no rearrangement (the
+/// u8/i8 analog of [`packed_rgba16f_layout`]; i8 shares the layout since
+/// INT8 quantization is a per-byte `^0x80` bias, not a format change).
+///
+/// Returns `Some(layout)` only when `width % 4 == 0` (so `W*3` bytes divide
+/// into whole texels) and the geometry does not overflow `usize`.
+///
+/// # Examples
+///
+/// ```rust
+/// use edgefirst_tensor::packed_rgb888_layout;
+///
+/// let layout = packed_rgb888_layout(640, 480).unwrap();
+/// assert_eq!(layout.surface_w, 480); // 640*3/4
+/// assert_eq!(layout.surface_h, 480);
+/// assert_eq!(layout.bytes_per_texel, 4);
+/// assert_eq!(layout.pitch, 1920); // 640*3
+/// assert!(packed_rgb888_layout(641, 480).is_none());
+/// ```
+pub fn packed_rgb888_layout(width: usize, height: usize) -> Option<PackedRgb888Layout> {
+    if !width.is_multiple_of(4) {
+        return None;
+    }
+    let row_bytes = width.checked_mul(3)?;
+    let surface_w = row_bytes / 4;
+    Some(PackedRgb888Layout {
+        surface_w,
+        surface_h: height,
+        bytes_per_texel: 4,
+        pitch: row_bytes,
+    })
+}
+
+/// Geometry of the RGBA8888 surface backing a packed RGB u8/i8 image tensor.
+///
+/// Obtain via [`packed_rgb888_layout`] — never construct directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRgb888Layout {
+    /// Surface width in texels (`width * 3 / 4`).
+    pub surface_w: usize,
+    /// Surface height in texels (`height`).
+    pub surface_h: usize,
+    /// Bytes per RGBA8888 texel (always 4).
+    pub bytes_per_texel: usize,
+    /// Row pitch in bytes (`surface_w * 4` = `width * 3`).
+    pub pitch: usize,
+}
+
 /// Per-plane DMA-BUF descriptor for external buffer import.
 ///
 /// Owns a duplicated file descriptor plus optional stride and offset metadata.
@@ -1998,6 +2053,18 @@ where
             {
                 return Err(Error::InvalidArgument(format!(
                     "Tensor::image: {format:?} F16 requires width%4==0 for the RGBA16F \
+                     AHardwareBuffer packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
+                )));
+            }
+            // Packed RGB u8 rides an RGBA8888 surface at (W*3/4, H) — the
+            // same whole-texel constraint as the F16 packing above.
+            if format == PixelFormat::Rgb
+                && dtype == DType::U8
+                && packed_rgb888_layout(width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: Rgb u8 requires width%4==0 for the RGBA8888 \
                      AHardwareBuffer packing (got width={width}). Pad the width, or pass \
                      memory=Some(TensorMemory::Mem) for a CPU tensor."
                 )));

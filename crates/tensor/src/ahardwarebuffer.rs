@@ -587,7 +587,9 @@ where
         // Surface geometry per (format, dtype) — same scheme as the macOS
         // IOSurface path (see `iosurface.rs::new_image`): packed formats
         // use (width, height); planar F16 packs into RGBA16F at
-        // `(W/4, C*H)` via the canonical `packed_rgba16f_layout`.
+        // `(W/4, C*H)` via the canonical `packed_rgba16f_layout`; packed
+        // RGB u8 packs into RGBA8888 at `(W*3/4, H)` via
+        // `packed_rgb888_layout`.
         let (surface_width, surface_height) = match (format, dtype) {
             (PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
                 let layout =
@@ -597,6 +599,15 @@ where
                              packing (got width={width})"
                         ))
                     })?;
+                (layout.surface_w, layout.surface_h)
+            }
+            (PixelFormat::Rgb, DType::U8) => {
+                let layout = crate::packed_rgb888_layout(width, height).ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "Rgb u8 AHardwareBuffer requires width%4==0 for RGBA8888 \
+                         packing (got width={width})"
+                    ))
+                })?;
                 (layout.surface_w, layout.surface_h)
             }
             _ => (width, height),

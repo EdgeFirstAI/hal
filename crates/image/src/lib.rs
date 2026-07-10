@@ -1844,9 +1844,10 @@ impl ImageProcessor {
 
         // macOS: when the GL backend is active with the IOSurface
         // transfer path, prefer Dma (IOSurface on Apple, AHardwareBuffer
-        // on Android) for zero-copy import. The Tensor allocator falls
-        // through to SHM/Mem automatically for formats without a
-        // zero-copy mapping (NV12, planar u8, etc.).
+        // on Android) for zero-copy import. Formats without a zero-copy
+        // mapping now ERROR under explicit Dma (the explicit-Dma
+        // contract), so auto-select catches that error here and falls
+        // back to host storage — loudly, via the debug log below.
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {

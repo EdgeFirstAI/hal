@@ -3702,15 +3702,17 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        // Width must satisfy PackedRgba8 constraint: W*3 divisible by 4
-        if !(dst_w * 3).is_multiple_of(4) {
-            return Err(crate::Error::NotSupported(format!(
-                "Packed RGB requires width*3 divisible by 4, got width={dst_w}"
-            )));
-        }
-
-        let render_w = dst_w * 3 / 4;
-        let render_h = dst_h;
+        // Canonical RGBA8888-packed geometry (single source of truth shared
+        // with the Android AHardwareBuffer allocation side — the same rule
+        // that keeps the F16 packing from drifting between crates).
+        let layout = edgefirst_tensor::packed_rgb888_layout(dst_w, dst_h).ok_or_else(|| {
+            crate::Error::NotSupported(format!(
+                "Packed RGB requires width%4==0 (W*3 bytes must divide into \
+                 whole RGBA8888 texels), got width={dst_w}"
+            ))
+        })?;
+        let render_w = layout.surface_w;
+        let render_h = layout.surface_h;
 
         log::debug!(
             "convert_to_packed_rgb: {dst_w}x{dst_h} -> {render_w}x{render_h} two-pass int8={is_int8}",
@@ -4481,9 +4483,24 @@ impl GLProcessorST {
                 self.convert_stats.src_imports += 1;
                 tracing::Span::current().record("src_feed", "import");
             } else {
+                let src_bpp = src_fmt.channels().max(1);
+                // A recorded pitch that is not a whole number of pixels
+                // cannot be expressed via UNPACK_ROW_LENGTH (which counts
+                // pixels) — decline to the CPU backend rather than upload
+                // sheared rows. Reachable on Android, where gralloc may pad
+                // the RGB-in-RGBA8888 surface to a byte pitch that 3 does
+                // not divide.
+                if let Some(s) = src.effective_row_stride() {
+                    if !s.is_multiple_of(src_bpp) {
+                        return Err(Error::NotSupported(format!(
+                            "source row pitch {s} B is not a whole number of \
+                             {src_fmt:?} pixels ({src_bpp} B/px); upload would \
+                             shear rows"
+                        )));
+                    }
+                }
                 self.convert_stats.src_uploads += 1;
                 tracing::Span::current().record("src_feed", "upload");
-                let src_bpp = src_fmt.channels().max(1);
                 let row_len_px = src
                     .effective_row_stride()
                     .map(|s| s / src_bpp)

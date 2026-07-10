@@ -384,14 +384,21 @@ mod device {
         )
     }
 
-    /// Compare two RGBA8 destinations of `dst_size`² — logical geometry:
-    /// `dst_size` rows of `dst_size × 4` bytes.
-    fn compare_u8(a: &TensorDyn, b: &TensorDyn, dst_size: usize, cell: &str) -> i32 {
+    /// Compare two packed-u8 destinations of `dst_size`² with `channels`
+    /// bytes per pixel — logical geometry: `dst_size` rows of
+    /// `dst_size × channels` bytes.
+    fn compare_u8(
+        a: &TensorDyn,
+        b: &TensorDyn,
+        dst_size: usize,
+        channels: usize,
+        cell: &str,
+    ) -> i32 {
         let (Some(ta), Some(tb)) = (a.as_u8(), b.as_u8()) else {
             log::error!("android-validation: {cell}: dst tensors are not U8");
             return ERR_MISMATCH;
         };
-        let row_elems = dst_size * 4;
+        let row_elems = dst_size * channels;
         let stride_a = ta.effective_row_stride().unwrap_or(row_elems);
         let stride_b = tb.effective_row_stride().unwrap_or(row_elems);
         let (Ok(ma), Ok(mb)) = (ta.map(), tb.map()) else {
@@ -462,7 +469,35 @@ mod device {
         if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
             return c;
         }
-        compare_u8(&dst_gl, &dst_cpu, dst_size, "verify_rgba8")
+        compare_u8(&dst_gl, &dst_cpu, dst_size, 4, "verify_rgba8")
+    }
+
+    /// Cell 4 — GL-vs-CPU oracle on the packed RGB u8 INT8-NPU output path
+    /// (RGBA8 AHB source → RGB-in-RGBA8888 AHB destination via the
+    /// two-pass packed-RGB shader). The destination must be zero-copy — a
+    /// Mem fallback would silently verify the CPU repack instead of the
+    /// `packed_rgb888_layout` surface this cell exists to prove.
+    fn verify_rgb8_packed(
+        gl: &mut ImageProcessor,
+        cpu: &mut ImageProcessor,
+        src: &TensorDyn,
+        dst_size: usize,
+    ) -> i32 {
+        let mut dst_gl = match gl_dst(gl, dst_size, PixelFormat::Rgb, DType::U8) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        let mut dst_cpu = match cpu_dst(dst_size, PixelFormat::Rgb, DType::U8) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        if let Err(c) = convert_with(gl, src, &mut dst_gl) {
+            return c;
+        }
+        if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
+            return c;
+        }
+        compare_u8(&dst_gl, &dst_cpu, dst_size, 3, "verify_rgb8_packed")
     }
 
     /// Cell 3 — the external-import route: wrap the source buffer's raw
@@ -519,7 +554,7 @@ mod device {
         if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
             return c;
         }
-        compare_u8(&dst_gl, &dst_cpu, dst_size, "verify_wrapped_import")
+        compare_u8(&dst_gl, &dst_cpu, dst_size, 4, "verify_wrapped_import")
     }
 
     /// Run all verification cells; returns the first failure.
@@ -542,6 +577,10 @@ mod device {
             return rc;
         }
         let rc = verify_rgba8(&mut gl, &mut cpu, &src, dst_size);
+        if rc != OK {
+            return rc;
+        }
+        let rc = verify_rgb8_packed(&mut gl, &mut cpu, &src, dst_size);
         if rc != OK {
             return rc;
         }
