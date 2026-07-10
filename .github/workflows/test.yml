@@ -537,6 +537,85 @@ jobs:
           bash scripts/validate-ios-link.sh sim
 
   # ===========================================================================
+  # Build & Link Check for Android (arm64 device + x86_64 emulator ABIs)
+  #
+  # Mirrors the iOS lane's decision: compile + clippy + link-closure
+  # validation only, no emulator runtime — GitHub runners have no GPU, so
+  # the Android emulator would exercise SwiftShader software GL rather
+  # than a real Adreno/Mali driver and add flakiness without signal.
+  # On-device GL correctness and the performance gates run via the
+  # hal-mobile AWS Device Farm harness (Galaxy S26 Ultra pool) calling the
+  # crates/android-validation C-ABI entry points; see that crate's docs.
+  # ===========================================================================
+  build-android:
+    name: Build & Link (Android)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          targets: aarch64-linux-android,x86_64-linux-android
+          components: clippy
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        # Pin our own NDK rather than using the runner image's preinstalled
+        # copies, whose versions drift with image updates. r27c is the LTS
+        # release; the HAL's API floor (26) is set per-invocation via
+        # cargo-ndk's -P flag and scripts/validate-android-link.sh.
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779  # v1.6.0
+        with:
+          ndk-version: r27c
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-android
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Run Clippy (Android arm64)
+        # Lint the cfg-gated Android code paths (the GL platform seam +
+        # AHardwareBuffer backend) that no other lane compiles. Excludes
+        # Linux-only gpu-probe, the python crate, and the bench harness;
+        # unlike iOS, the C API is INCLUDED — its cdylib is the future JNI
+        # library. -D warnings keeps the lane a hard gate.
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -P 26 clippy \
+            --workspace \
+            --exclude gpu-probe --exclude edgefirst_hal --exclude edgefirst-bench \
+            -- -D warnings
+
+      - name: Build HAL for Android (arm64 device + x86_64 emulator)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release \
+            -p edgefirst-hal -p edgefirst-hal-capi
+
+      - name: Validate Android link closure (arm64 + x86_64)
+        # Builds the edgefirst-android-validation staticlib, verifies the
+        # AHardwareBuffer references and the NDK API-26 stub exports with
+        # llvm-nm, then links against the NDK system libraries.
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          bash scripts/validate-android-link.sh arm64
+          bash scripts/validate-android-link.sh x86_64
+
+  # ===========================================================================
   # Build Check on Windows (verify Windows compilation before release)
   #
   # Catches cfg-gate mismatches between Linux/macOS-only modules (e.g.

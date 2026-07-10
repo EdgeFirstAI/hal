@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-android-validation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Android link-validation shim and on-device validation entry points — builds the full HAL closure into a staticlib, links it against the NDK system libraries to prove the native symbol closure is complete, and exposes C-ABI entry points that exercise the real ImageProcessor on-device (Device Farm). NOT published, NOT in default-members."
+keywords = ["android", "validation", "hal"]
+categories = ["development-tools::testing"]
+publish = false
+
+[lib]
+# `staticlib` archives the full HAL dependency closure into one `.a` so the
+# link step in `scripts/validate-android-link.sh` has a single library to
+# resolve against the NDK system libraries (libnativewindow etc.). `rlib`
+# lets the crate compile under `cargo check` on non-Android hosts. The
+# on-device harness (hal-mobile's Android app) links the same staticlib and
+# calls the C-ABI entry points below through JNI.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+edgefirst-hal = { workspace = true }
+log = { workspace = true }
