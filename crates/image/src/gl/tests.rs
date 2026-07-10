@@ -455,7 +455,10 @@ mod gl_tests {
     /// blocking contract), destination immediately readable. The
     /// fence-returning arm is device-verified on Android
     /// (`verify_fence_handoff` in the Device Farm harness).
+    // dma_test_formats only for the fixture helpers (`rgba_gradient`,
+    // `load_raw_image`) — the tensors here are plain Mem.
     #[test]
+    #[cfg(feature = "dma_test_formats")]
     fn convert_with_fence_blocking_fallback_matches() {
         if !is_opengl_available() {
             eprintln!("SKIPPED: {} - GL not available", function!());
