@@ -1820,14 +1820,23 @@ impl ImageProcessor {
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
             let _ = gl; // probe_transfer_backend lives behind the platform trait
-            if let Ok(img) = TensorDyn::image(
+            match TensorDyn::image(
                 width,
                 height,
                 format,
                 dtype,
                 Some(edgefirst_tensor::TensorMemory::Dma),
             ) {
-                return Ok(img);
+                Ok(img) => return Ok(img),
+                Err(e) => {
+                    // Falling back to a non-zero-copy destination is a real
+                    // perf cliff — never do it silently (on-device triage
+                    // starts from this line).
+                    log::debug!(
+                        "create_image: zero-copy Dma allocation declined \
+                         ({format:?}/{dtype:?} {width}x{height}): {e:?}; using fallback storage"
+                    );
+                }
             }
         }
 

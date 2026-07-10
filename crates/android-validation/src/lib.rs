@@ -303,33 +303,46 @@ mod device {
         })
     }
 
-    fn compare_f16(a: &TensorDyn, b: &TensorDyn, cell: &str) -> i32 {
-        let (Some(ta), Some(tb)) = (a.as_f16(), b.as_f16()) else {
-            log::error!("android-validation: {cell}: dst tensors are not F16");
-            return ERR_MISMATCH;
-        };
-        let (Ok(ma), Ok(mb)) = (ta.map(), tb.map()) else {
-            log::error!("android-validation: {cell}: dst map failed");
-            return ERR_MAP;
-        };
-        let (sa, sb) = (ma.as_slice(), mb.as_slice());
-        if sa.len() != sb.len() {
+    /// Row-walking comparison shared by the typed compares. gralloc may
+    /// pad the GL destination's row pitch (recorded on the tensor as
+    /// `effective_row_stride`), in which case the mapped slice is the full
+    /// padded buffer — comparing flat against the tight CPU reference
+    /// would misalign after the first row. Walks `rows × row_elems`
+    /// logical elements using each side's own stride.
+    // Internal helper with two callers; the argument list mirrors the two
+    // (slice, stride) sides plus geometry — a struct would only rename it.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_rows<T: Copy>(
+        sa: &[T],
+        sb: &[T],
+        stride_a_elems: usize,
+        stride_b_elems: usize,
+        rows: usize,
+        row_elems: usize,
+        cell: &str,
+        mut diff: impl FnMut(T, T) -> f32,
+        tolerance: f32,
+    ) -> i32 {
+        let need_a = (rows - 1) * stride_a_elems + row_elems;
+        let need_b = (rows - 1) * stride_b_elems + row_elems;
+        if rows == 0 || sa.len() < need_a || sb.len() < need_b {
             log::error!(
-                "android-validation: {cell}: dst length mismatch ({} vs {})",
+                "android-validation: {cell}: mapped sizes too small \
+                 (a={} need {need_a}, b={} need {need_b})",
                 sa.len(),
                 sb.len()
             );
             return ERR_MISMATCH;
         }
-        // Normalized [0,1] outputs; GPU linear filtering + f16 rounding vs
-        // the CPU path justifies a small tolerance (the suite uses 4/255 on
-        // u8 paths — mirror it in float space).
-        let tolerance = 4.0 / 255.0;
         let mut max_diff = 0f32;
-        for (va, vb) in sa.iter().zip(sb.iter()) {
-            let d = (va.to_f32() - vb.to_f32()).abs();
-            if d > max_diff {
-                max_diff = d;
+        for r in 0..rows {
+            let ra = &sa[r * stride_a_elems..r * stride_a_elems + row_elems];
+            let rb = &sb[r * stride_b_elems..r * stride_b_elems + row_elems];
+            for (va, vb) in ra.iter().zip(rb.iter()) {
+                let d = diff(*va, *vb);
+                if d > max_diff {
+                    max_diff = d;
+                }
             }
         }
         if max_diff > tolerance {
@@ -340,38 +353,62 @@ mod device {
         OK
     }
 
-    fn compare_u8(a: &TensorDyn, b: &TensorDyn, cell: &str) -> i32 {
-        let (Some(ta), Some(tb)) = (a.as_u8(), b.as_u8()) else {
-            log::error!("android-validation: {cell}: dst tensors are not U8");
+    /// Compare two PlanarRgb F16 destinations of `dst_size`² — logical
+    /// geometry: `3 × dst_size` rows of `dst_size` f16 elements.
+    fn compare_f16(a: &TensorDyn, b: &TensorDyn, dst_size: usize, cell: &str) -> i32 {
+        let (Some(ta), Some(tb)) = (a.as_f16(), b.as_f16()) else {
+            log::error!("android-validation: {cell}: dst tensors are not F16");
             return ERR_MISMATCH;
         };
+        let elem = 2; // sizeof(f16)
+        let row_elems = dst_size;
+        let stride_a = ta.effective_row_stride().map_or(row_elems, |s| s / elem);
+        let stride_b = tb.effective_row_stride().map_or(row_elems, |s| s / elem);
         let (Ok(ma), Ok(mb)) = (ta.map(), tb.map()) else {
             log::error!("android-validation: {cell}: dst map failed");
             return ERR_MAP;
         };
-        let (sa, sb) = (ma.as_slice(), mb.as_slice());
-        if sa.len() != sb.len() {
-            log::error!(
-                "android-validation: {cell}: dst length mismatch ({} vs {})",
-                sa.len(),
-                sb.len()
-            );
+        // Normalized [0,1] outputs; GPU linear filtering + f16 rounding vs
+        // the CPU path justifies a small tolerance (the suite uses 4/255 on
+        // u8 paths — mirror it in float space).
+        compare_rows(
+            ma.as_slice(),
+            mb.as_slice(),
+            stride_a,
+            stride_b,
+            3 * dst_size,
+            row_elems,
+            cell,
+            |va: hal::tensor::f16, vb: hal::tensor::f16| (va.to_f32() - vb.to_f32()).abs(),
+            4.0 / 255.0,
+        )
+    }
+
+    /// Compare two RGBA8 destinations of `dst_size`² — logical geometry:
+    /// `dst_size` rows of `dst_size × 4` bytes.
+    fn compare_u8(a: &TensorDyn, b: &TensorDyn, dst_size: usize, cell: &str) -> i32 {
+        let (Some(ta), Some(tb)) = (a.as_u8(), b.as_u8()) else {
+            log::error!("android-validation: {cell}: dst tensors are not U8");
             return ERR_MISMATCH;
-        }
-        let tolerance: i16 = 4;
-        let mut max_diff: i16 = 0;
-        for (va, vb) in sa.iter().zip(sb.iter()) {
-            let d = (*va as i16 - *vb as i16).abs();
-            if d > max_diff {
-                max_diff = d;
-            }
-        }
-        if max_diff > tolerance {
-            log::error!("android-validation: {cell}: GL vs CPU max diff {max_diff} > {tolerance}");
-            return ERR_MISMATCH;
-        }
-        log::info!("android-validation: {cell}: max diff {max_diff} (tol {tolerance}) — PASS");
-        OK
+        };
+        let row_elems = dst_size * 4;
+        let stride_a = ta.effective_row_stride().unwrap_or(row_elems);
+        let stride_b = tb.effective_row_stride().unwrap_or(row_elems);
+        let (Ok(ma), Ok(mb)) = (ta.map(), tb.map()) else {
+            log::error!("android-validation: {cell}: dst map failed");
+            return ERR_MAP;
+        };
+        compare_rows(
+            ma.as_slice(),
+            mb.as_slice(),
+            stride_a,
+            stride_b,
+            dst_size,
+            row_elems,
+            cell,
+            |va: u8, vb: u8| (va as i16 - vb as i16).unsigned_abs() as f32,
+            4.0,
+        )
     }
 
     /// Cell 1 — GL-vs-CPU oracle on the F16 planar-RGB model-input path
@@ -399,7 +436,7 @@ mod device {
         if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
             return c;
         }
-        compare_f16(&dst_gl, &dst_cpu, "verify_f16_planar")
+        compare_f16(&dst_gl, &dst_cpu, dst_size, "verify_f16_planar")
     }
 
     /// Cell 2 — GL-vs-CPU oracle on the RGBA8 → RGBA8 resize path (the
@@ -425,7 +462,7 @@ mod device {
         if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
             return c;
         }
-        compare_u8(&dst_gl, &dst_cpu, "verify_rgba8")
+        compare_u8(&dst_gl, &dst_cpu, dst_size, "verify_rgba8")
     }
 
     /// Cell 3 — the external-import route: wrap the source buffer's raw
@@ -446,7 +483,7 @@ mod device {
         };
         // SAFETY: `ptr` is borrowed from `src`, which outlives `wrapped`
         // in this scope; from_hardware_buffer acquires its own reference.
-        let wrapped = match unsafe {
+        let mut wrapped = match unsafe {
             TensorDyn::from_hardware_buffer(ptr, &[src_h, src_w, 4], DType::U8, Some("wrapped"))
         } {
             Ok(t) => t,
@@ -455,6 +492,19 @@ mod device {
                 return ERR_ALLOC;
             }
         };
+        // A wrapped buffer carries a shape but no image metadata — exactly
+        // what a CameraX/JNI consumer must also do: declare the pixel
+        // format (and, when padded, the row stride) before convert().
+        if let Err(e) = wrapped.configure_image(src_w, src_h, PixelFormat::Rgba) {
+            log::error!("android-validation: configure_image(wrapped): {e:?}");
+            return ERR_ALLOC;
+        }
+        if let Some(stride) = src.as_u8().and_then(|t| t.row_stride()) {
+            if let Err(e) = wrapped.set_row_stride(stride) {
+                log::error!("android-validation: set_row_stride(wrapped): {e:?}");
+                return ERR_ALLOC;
+            }
+        }
         let mut dst_gl = match gl_dst(gl, dst_size, PixelFormat::Rgba, DType::U8) {
             Ok(d) => d,
             Err(c) => return c,
@@ -469,7 +519,7 @@ mod device {
         if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
             return c;
         }
-        compare_u8(&dst_gl, &dst_cpu, "verify_wrapped_import")
+        compare_u8(&dst_gl, &dst_cpu, dst_size, "verify_wrapped_import")
     }
 
     /// Run all verification cells; returns the first failure.

@@ -548,9 +548,13 @@ where
     /// For planar F16 formats (`PlanarRgb`, `PlanarRgba`) the buffer is
     /// an RGBA16F surface sized `(W/4, C*H)` via `packed_rgba16f_layout`
     /// — 4 contiguous f16 elements of the planar `[C, H, W]` byte stream
-    /// per pixel, identical to the macOS IOSurface geometry, so NPU
-    /// runtimes consume the locked base address as `&[f16]` with shape
-    /// `[1, C, H, W]` without rearrangement.
+    /// per pixel, the same geometry as the macOS IOSurface path. Whether
+    /// the locked base address is consumable FLAT as `&[f16]` shaped
+    /// `[1, C, H, W]` depends on gralloc: when the allocator pads the
+    /// pixel stride (Qualcomm SnapAlloc does, observed on the S26 Ultra),
+    /// `Tensor::image` records the padded pitch and CPU consumers must
+    /// iterate rows via `effective_row_stride()`; flat consumers (the
+    /// future NPU handoff) must check `row_stride()` and repack when set.
     ///
     /// Buffers are allocated with GPU sample + render + CPU read/write
     /// usage (the combination validated on-device by the Phase-1 probe).

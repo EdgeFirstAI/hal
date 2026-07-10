@@ -1947,14 +1947,16 @@ where
         // (`eglGetNativeClientBufferANDROID` → `eglCreateImageKHR`).
         //
         // Geometry: gralloc chooses the row pitch (`desc.stride`) at
-        // allocation. Packed formats tolerate a padded pitch — the tensor
-        // records it below and CPU maps iterate rows via the strided-map
-        // path while the GL import uses the buffer's own pitch. Planar F16
-        // (the RGBA16F packing) is consumed flat as `[1, C, H, W]` — the
-        // NPU handoff contract — so a padded pitch cannot be represented:
-        // fail loudly rather than hand back a tensor whose flat map would
-        // read garbage (the same loud-failure rule as the IOSurface
-        // alignment guard above).
+        // allocation, and pads freely (validated on the Galaxy S26 Ultra,
+        // where SnapAlloc pads the planar-F16 RGBA16F surface). A padded
+        // pitch is recorded on the tensor so CPU maps iterate rows via the
+        // strided-map path; the GL render uses the buffer's own pitch
+        // through the EGLImage either way, so the GPU path stays fully
+        // zero-copy. Consumers needing a FLAT layout (the future NPU
+        // handoff's `[1, C, H, W]` contract) must check `row_stride()` and
+        // repack when set — flatness is a per-device property here, unlike
+        // macOS where IOSurface's 64-BYTE alignment keeps model-sized F16
+        // surfaces naturally flat.
         #[cfg(target_os = "android")]
         if matches!(memory, Some(TensorMemory::Dma)) {
             if let Some(dtype) = dtype_of::<T>() {
@@ -1973,38 +1975,51 @@ where
                     )));
                 }
                 if crate::ahardwarebuffer::image_ahardwarebuffer_layout(format, dtype).is_some() {
-                    if let Ok(storage) = TensorStorage::<T>::new_image_ahardwarebuffer(
+                    match TensorStorage::<T>::new_image_ahardwarebuffer(
                         width, height, format, dtype, &shape, None,
                     ) {
-                        let mut t = Self::wrap(storage);
-                        t.format = Some(format);
-                        if let TensorStorage::Dma(ref ahb) = t.storage {
-                            let bpr = ahb.bytes_per_row();
-                            if format.layout() == PixelLayout::Planar {
-                                // Natural pitch of the packed RGBA16F surface:
-                                // (W/4) pixels × 8 bytes = W × sizeof(f16).
-                                let natural = width * std::mem::size_of::<T>();
-                                if bpr != natural {
-                                    return Err(Error::InvalidArgument(format!(
-                                        "Tensor::image: gralloc padded the {format:?} F16 \
-                                         AHardwareBuffer row pitch to {bpr} bytes (natural \
-                                         {natural}); the flat [1, C, H, W] layout cannot \
-                                         represent the padding. Pad the width so the RGBA16F \
-                                         surface pitch matches the allocator's alignment, or \
-                                         pass memory=Some(TensorMemory::Mem) for a CPU tensor."
-                                    )));
-                                }
-                            } else if let Some(natural) = t.effective_row_stride() {
-                                // gralloc pitch exceeds the natural packed
-                                // stride: record it so CPU consumers iterate
-                                // rows correctly (the GL import uses the
-                                // buffer's own pitch regardless).
-                                if bpr > natural {
-                                    t.set_row_stride_unchecked(bpr);
+                        Ok(storage) => {
+                            let mut t = Self::wrap(storage);
+                            t.format = Some(format);
+                            if let TensorStorage::Dma(ref ahb) = t.storage {
+                                // gralloc chooses the row pitch (Qualcomm's
+                                // SnapAlloc pads e.g. the 160-px-wide RGBA16F
+                                // surface of a 640-wide planar F16 target).
+                                // When it exceeds the natural stride, record
+                                // it so CPU consumers iterate rows correctly
+                                // via `effective_row_stride()` — the GPU
+                                // renders through the EGLImage at the
+                                // buffer's real pitch regardless, so the
+                                // render stays fully zero-copy. Consumers
+                                // that need the FLAT `[1, C, H, W]` layout
+                                // (the future NPU handoff) must check
+                                // `row_stride()` is unset and repack — or
+                                // pick an aligned width — rather than assume
+                                // flatness (see the module docs).
+                                let bpr = ahb.bytes_per_row();
+                                if let Some(natural) = t.effective_row_stride() {
+                                    if bpr > natural {
+                                        log::debug!(
+                                            "Tensor::image: gralloc padded the {format:?} \
+                                             AHardwareBuffer pitch to {bpr} bytes (natural \
+                                             {natural}); recording row stride"
+                                        );
+                                        t.set_row_stride_unchecked(bpr);
+                                    }
                                 }
                             }
+                            return Ok(t);
                         }
-                        return Ok(t);
+                        Err(e) => {
+                            // Fall through to the generic allocation below,
+                            // but never silently: an unexpected gralloc
+                            // refusal is the first thing on-device triage
+                            // needs to see.
+                            log::debug!(
+                                "Tensor::image: AHardwareBuffer image allocation failed \
+                                 ({format:?}/{dtype:?} {width}x{height}): {e:?}; falling back"
+                            );
+                        }
                     }
                 }
             }
@@ -3236,13 +3251,35 @@ where
         // — that was an unimplemented path, not a platform limit; HAL-owned
         // Mem/Shm/PBO are trivially mappable and now are.)
         if let Some(stride) = self.row_stride {
-            // Rows sit at `stride`-byte spacing; the first shape dim is the row
-            // count for packed `[H, W, C]` and semi-planar `[H*k, W]` alike.
-            let rows = *self.shape().first().ok_or_else(|| {
-                Error::InvalidOperation(
-                    "Tensor::map: strided mapping requires a non-empty shape".into(),
-                )
-            })?;
+            // Rows sit at `stride`-byte spacing. The row count is the first
+            // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
+            // but planar `[C, H, W]` stacks C planes of H rows — its surface
+            // row count is `C × H` (`shape[0]` alone would expose a 3-row
+            // window and truncate the map; first hit by Android planar-F16
+            // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
+            // planar pitches happen to be naturally aligned so no stride was
+            // ever recorded there).
+            let rows = match self.format.map(|f| f.layout()) {
+                Some(PixelLayout::Planar) => {
+                    let s = self.shape();
+                    if s.len() < 2 {
+                        return Err(Error::InvalidOperation(
+                            "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
+                        ));
+                    }
+                    s[0].checked_mul(s[1]).ok_or_else(|| {
+                        Error::InvalidOperation(format!(
+                            "Tensor::map: planar rows {} × {} overflows usize",
+                            s[0], s[1]
+                        ))
+                    })?
+                }
+                _ => *self.shape().first().ok_or_else(|| {
+                    Error::InvalidOperation(
+                        "Tensor::map: strided mapping requires a non-empty shape".into(),
+                    )
+                })?,
+            };
             let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
                 Error::InvalidOperation(format!(
                     "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
