@@ -275,10 +275,13 @@ impl GLProcessorST {
                             // Upload-poison (see doc comment): a later
                             // upload frame must TexImage2D fresh storage.
                             self.camera_normal_texture.target = 0;
+                            self.convert_stats.src_imports += 1;
+                            tracing::Span::current().record("src_feed", "import");
                             return Ok(FloatSrcFeed::Import);
                         }
                         Err(e) => {
                             self.camera_normal_texture.invalidate_egl_binding();
+                            self.convert_stats.zero_copy_declines += 1;
                             log::debug!(
                                 "float src zero-copy attach failed ({e:?}); uploading instead"
                             );
@@ -286,6 +289,7 @@ impl GLProcessorST {
                     }
                 }
                 Err(e) => {
+                    self.convert_stats.zero_copy_declines += 1;
                     log::debug!("float src zero-copy import failed ({e:?}); uploading instead");
                 }
             }
@@ -344,12 +348,16 @@ impl GLProcessorST {
                 }
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
             }
+            self.convert_stats.src_pbo_uploads += 1;
+            tracing::Span::current().record("src_feed", "pbo");
             return Ok(FloatSrcFeed::Pbo);
         }
 
         // ── Arm 3: CPU map + upload (the copy fallback) ──
         // The map happens ONLY here — a Dma source that imported above never
         // pays the per-frame lock/sync cache maintenance.
+        self.convert_stats.src_uploads += 1;
+        tracing::Span::current().record("src_feed", "upload");
         let pixels = src_u8.map()?;
         self.camera_normal_texture.update_texture(
             edgefirst_gl::gl::TEXTURE_2D,

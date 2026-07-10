@@ -363,7 +363,7 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
     ),
     feature = "opengl"
 ))]
-pub use opengl_headless::{CacheStats, GlCacheStats};
+pub use opengl_headless::{CacheStats, ConvertStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
 
 mod colorimetry;
@@ -1171,6 +1171,13 @@ pub struct ImageProcessor {
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
+
+    /// Converts where the GL backend declined and the auto chain fell
+    /// through toward G2D/CPU. Owned by the dispatcher (the GL worker never
+    /// sees these frames), unlike the per-feed counters in
+    /// `GLProcessorThreaded::convert_stats`. Read via
+    /// [`convert_fallback_count`](Self::convert_fallback_count).
+    pub(crate) convert_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for ImageProcessor {}
@@ -1203,6 +1210,17 @@ impl ImageProcessor {
     /// ```
     pub fn new() -> Result<Self> {
         Self::with_config(ImageProcessorConfig::default())
+    }
+
+    /// Number of converts where the auto chain's GL backend declined and the
+    /// frame fell through toward G2D/CPU — each one silently lost any
+    /// zero-copy guarantee. A pipeline that expects to stay on the GPU
+    /// asserts this stays flat across its steady-state loop; pair with
+    /// `GLProcessorThreaded::convert_stats` to see how the frames that DID
+    /// reach GL were fed. Always 0 under a forced backend (no chain).
+    pub fn convert_fallback_count(&self) -> u64 {
+        self.convert_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Report which float dtypes the GPU can render to.
@@ -1261,6 +1279,7 @@ impl ImageProcessor {
                     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
+                    convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                     forced_backend: None,
                 });
             }
@@ -1280,6 +1299,7 @@ impl ImageProcessor {
                         g2d,
                         #[cfg(feature = "opengl")]
                         opengl: None,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1291,6 +1311,7 @@ impl ImageProcessor {
                         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                         #[cfg(feature = "opengl")]
                         opengl: None,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1312,6 +1333,7 @@ impl ImageProcessor {
                         g2d: None,
                         #[cfg(feature = "opengl")]
                         opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1335,6 +1357,7 @@ impl ImageProcessor {
                         cpu: Some(CPUProcessor::new()),
                         #[cfg(feature = "opengl")]
                         opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1356,6 +1379,7 @@ impl ImageProcessor {
                         cpu: Some(CPUProcessor::new()),
                         #[cfg(feature = "opengl")]
                         opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
@@ -1370,6 +1394,7 @@ impl ImageProcessor {
                     log::warn!("OpenGL requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1407,6 +1432,7 @@ impl ImageProcessor {
                     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
+                    convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                     forced_backend: Some(ForcedBackend::Cpu),
                 }),
                 ForcedBackend::G2d => {
@@ -1422,6 +1448,7 @@ impl ImageProcessor {
                             g2d: Some(g2d),
                             #[cfg(feature = "opengl")]
                             opengl: None,
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::G2d),
                         })
                     }
@@ -1445,6 +1472,7 @@ impl ImageProcessor {
                             cpu: None,
                             g2d: None,
                             opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -1460,6 +1488,7 @@ impl ImageProcessor {
                         Ok(Self {
                             cpu: None,
                             opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -1475,6 +1504,7 @@ impl ImageProcessor {
                         Ok(Self {
                             cpu: None,
                             opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
@@ -1575,6 +1605,7 @@ impl ImageProcessor {
             #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
             #[cfg(feature = "opengl")]
             opengl,
+            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
             forced_backend: None,
         }
         .apply_colorimetry_mode(config.colorimetry))
@@ -2351,7 +2382,14 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("convert: auto opengl declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                    self.convert_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::debug!(
+                        "convert: auto opengl declined {src_fmt:?}@{:?}→{dst_fmt:?}@{:?}, \
+                         falling back toward G2D/CPU: {e}",
+                        src.memory(),
+                        dst.memory(),
+                    );
                 }
             }
         }

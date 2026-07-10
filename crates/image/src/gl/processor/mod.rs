@@ -354,6 +354,13 @@ pub struct GLProcessorST {
     nv_r8_egl_cache: ImportCache<PlatformImport>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
+    /// Zero-copy feed telemetry (see `ConvertStats`). Plain fields — this
+    /// struct lives on the single-threaded GL worker.
+    pub(super) convert_stats: super::cache::ConvertStats,
+    /// NV import failures already warned about (keyed by buffer identity):
+    /// first occurrence warns, repeats log at debug — an import that fails
+    /// once fails every frame, and a per-frame warn is log spam.
+    nv_import_warned: std::collections::HashSet<u64>,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
     /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
@@ -1211,6 +1218,8 @@ impl GLProcessorST {
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
+            convert_stats: Default::default(),
+            nv_import_warned: std::collections::HashSet::new(),
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
             colorimetry_env_pinned: colorimetry_env.is_some(),
@@ -1260,6 +1269,15 @@ impl GLProcessorST {
         // EGLImage creation succeeds but rendered data is all zeros)
         if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
             log::info!("DMA-buf verification failed — falling back to PBO transfers");
+            // Structured twin of the log line: this downgrade silently costs
+            // every future convert its zero-copy path, so subscribers
+            // (profiler, telemetry) get a machine-readable event too.
+            tracing::event!(
+                tracing::Level::INFO,
+                from = "dmabuf",
+                to = "pbo",
+                "image.convert.gl.transfer_downgrade"
+            );
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
@@ -1432,6 +1450,10 @@ impl GLProcessorST {
         }
     }
 
+    pub(crate) fn convert_stats(&self) -> super::cache::ConvertStats {
+        self.convert_stats
+    }
+
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
 
     #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1475,9 @@ impl GLProcessorST {
             is_int8,
             src_memory = ?src.memory(),
             dst_memory = ?dst.memory(),
+            // Recorded at the source-feed site: import | pbo | upload —
+            // the zero-copy observable (see ConvertStats).
+            src_feed = tracing::field::Empty,
         )
         .entered();
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
@@ -2850,6 +2875,9 @@ impl GLProcessorST {
             }
         };
 
+        self.convert_stats.src_pbo_uploads += 1;
+        tracing::Span::current().record("src_feed", "pbo");
+
         let has_crop = crop
             .dst_rect
             .is_some_and(|x| x.left != 0 || x.top != 0 || x.width != dst_w || x.height != dst_h);
@@ -3356,6 +3384,8 @@ impl GLProcessorST {
                             "image.convert.gl.nv_path"
                         );
                         self.last_nv_convert_path = NvConvertPath::ShaderR8;
+                        self.convert_stats.src_imports += 1;
+                        tracing::Span::current().record("src_feed", "import");
                         self.draw_nv_texture_2d(
                             src,
                             src_fmt,
@@ -3373,14 +3403,28 @@ impl GLProcessorST {
                         // Path B failed — this means no GPU NV* path is available.
                         // Record the CPU fallback so tests/profiler can detect it.
                         self.last_nv_convert_path = NvConvertPath::Cpu;
-                        tracing::warn!(
-                            src_fmt = ?src_fmt,
-                            src_w,
-                            src_h,
-                            error = %e,
-                            "Path B R8 EGLImage creation failed for {src_fmt} \
-                             ({src_w}x{src_h}); falling back to CPU path (no GPU NV16/NV24)"
-                        );
+                        self.convert_stats.zero_copy_declines += 1;
+                        // Warn once per buffer — a steady-state video pipeline
+                        // hits this every frame with the same buffers, and a
+                        // per-frame warn floods the log. Repeats drop to debug.
+                        if self.nv_import_warned.insert(src.buffer_identity().id()) {
+                            tracing::warn!(
+                                src_fmt = ?src_fmt,
+                                src_w,
+                                src_h,
+                                error = %e,
+                                "Path B R8 EGLImage creation failed for {src_fmt} \
+                                 ({src_w}x{src_h}); falling back to CPU path (no GPU NV16/NV24)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                src_fmt = ?src_fmt,
+                                src_w,
+                                src_h,
+                                error = %e,
+                                "Path B R8 EGLImage creation failed (repeat)"
+                            );
+                        }
                         let start = Instant::now();
                         self.draw_src_texture(
                             src,
@@ -3404,6 +3448,8 @@ impl GLProcessorST {
                             tracing::trace!(path = "ExternalSampler", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
                             self.last_nv_convert_path = NvConvertPath::ExternalSampler;
                         }
+                        self.convert_stats.src_imports += 1;
+                        tracing::Span::current().record("src_feed", "import");
                         self.draw_camera_texture_eglimage(
                             src,
                             src_fmt,
@@ -3421,10 +3467,20 @@ impl GLProcessorST {
                         if src_fmt == PixelFormat::Nv12 {
                             self.last_nv_convert_path = NvConvertPath::Cpu;
                         }
-                        log::warn!(
-                            "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
-                             falling back to texture upload (slower): {e}"
-                        );
+                        self.convert_stats.zero_copy_declines += 1;
+                        // Warn once per buffer (see the ShaderR8 arm): repeats
+                        // on the same pooled buffer drop to debug.
+                        if self.nv_import_warned.insert(src.buffer_identity().id()) {
+                            log::warn!(
+                                "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
+                                 falling back to texture upload (slower): {e}"
+                            );
+                        } else {
+                            log::debug!(
+                                "EGL image creation failed for {src_fmt} ({src_w}x{src_h}) \
+                                 (repeat): {e}"
+                            );
+                        }
                         let start = Instant::now();
                         self.draw_src_texture(
                             src,
@@ -3452,6 +3508,8 @@ impl GLProcessorST {
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
             self.last_nv_convert_path = NvConvertPath::ShaderR8;
+            self.convert_stats.src_uploads += 1;
+            tracing::Span::current().record("src_feed", "upload");
             self.draw_nv_texture_2d(
                 src,
                 src_fmt,
@@ -4321,6 +4379,7 @@ impl GLProcessorST {
             match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                 Ok(handle) => Some((key, handle)),
                 Err(e) => {
+                    self.convert_stats.zero_copy_declines += 1;
                     log::debug!("zero-copy source import failed ({e:?}); uploading instead");
                     None
                 }
@@ -4419,7 +4478,11 @@ impl GLProcessorST {
                 // texture must TexImage2D fresh storage, never
                 // TexSubImage2D into the attached client buffer.
                 self.camera_normal_texture.target = 0;
+                self.convert_stats.src_imports += 1;
+                tracing::Span::current().record("src_feed", "import");
             } else {
+                self.convert_stats.src_uploads += 1;
+                tracing::Span::current().record("src_feed", "upload");
                 let src_bpp = src_fmt.channels().max(1);
                 let row_len_px = src
                     .effective_row_stride()

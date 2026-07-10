@@ -25,6 +25,30 @@ pub(super) struct CachedImport<I> {
     pub(super) last_used: u64,
 }
 
+/// Per-processor zero-copy telemetry: how convert sources reached the GPU
+/// and how often a zero-copy opportunity was declined into a copy path.
+///
+/// This is deliberately SEPARATE from [`GlCacheStats`]: that struct is the
+/// steady-state import-cache equality gate (tests assert exact equality on
+/// it), while these counters change on every convert. `src_uploads` staying
+/// at 0 across a Dma-source workload is the "no silent zero-copy drop"
+/// assertion callers (and the on-device validation harness) can make —
+/// EGLImage miss counts alone are blind to uploads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConvertStats {
+    /// Sources fed zero-copy: the tensor's Dma buffer became the sampled
+    /// texture's storage (EGLImage attach / IOSurface pbuffer bind).
+    pub src_imports: u64,
+    /// Sources fed from a PBO (GL-internal copy, no CPU visit).
+    pub src_pbo_uploads: u64,
+    /// Sources fed by CPU map + TexImage upload — the copy path.
+    pub src_uploads: u64,
+    /// Times a zero-copy source feed was attempted and DECLINED into a
+    /// copy path (import/attach failure). A nonzero value with Dma
+    /// sources means the platform/driver refused the fast path.
+    pub zero_copy_declines: u64,
+}
+
 /// Buffer-import cache owned by the GL processor.
 ///
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access

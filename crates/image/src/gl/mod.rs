@@ -91,7 +91,7 @@ mod threaded;
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
-pub use cache::{CacheStats, GlCacheStats};
+pub use cache::{CacheStats, ConvertStats, GlCacheStats};
 pub use threaded::GLProcessorThreaded;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is

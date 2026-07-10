@@ -61,6 +61,8 @@ enum GLProcessorMessage {
     ),
     /// Snapshot the EGLImage cache counters (steady-state import assertions).
     EglCacheStats(tokio::sync::oneshot::Sender<Result<super::cache::GlCacheStats, Error>>),
+    /// Snapshot the per-convert source-feed counters (zero-copy observability).
+    ConvertStats(tokio::sync::oneshot::Sender<Result<super::cache::ConvertStats, Error>>),
     PboCreate(
         usize, // buffer size in bytes
         tokio::sync::oneshot::Sender<Result<u32, Error>>,
@@ -395,6 +397,9 @@ impl GLProcessorThreaded {
                         GLProcessorMessage::EglCacheStats(resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
+                        GLProcessorMessage::ConvertStats(resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
                         GLProcessorMessage::PboCreate(_, resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
@@ -610,6 +615,21 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during EglCacheStats: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
+                    }
+                    GLProcessorMessage::ConvertStats(resp) => {
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            Ok(gl_converter.convert_stats())
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during ConvertStats: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -991,6 +1011,22 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::EglCacheStats(send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Snapshot the per-convert source-feed counters from the GL thread.
+    /// A pipeline that expects end-to-end zero-copy asserts
+    /// [`src_uploads`](super::cache::ConvertStats::src_uploads) stays flat
+    /// (every frame fed by import, never by a CPU map + upload).
+    pub fn convert_stats(&self) -> Result<super::cache::ConvertStats, Error> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::ConvertStats(send))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

@@ -689,16 +689,41 @@ mod gl_tests {
                 .unwrap();
         }
         let warm = gl.egl_cache_stats().unwrap();
+        let warm_feed = gl.convert_stats().unwrap();
         for src in pool.iter().cycle().take(FRAMES) {
             gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
                 .unwrap();
         }
         let steady = gl.egl_cache_stats().unwrap();
+        let steady_feed = gl.convert_stats().unwrap();
         assert_eq!(
             warm.total_misses(),
             steady.total_misses(),
             "float src loop performed new EGLImage imports: warm={warm:?} steady={steady:?}"
         );
+        // Feed telemetry is 1:1 with frames: every convert is counted as
+        // exactly one of import/pbo/upload…
+        let d_imports = steady_feed.src_imports - warm_feed.src_imports;
+        let d_pbo = steady_feed.src_pbo_uploads - warm_feed.src_pbo_uploads;
+        let d_uploads = steady_feed.src_uploads - warm_feed.src_uploads;
+        let d_declines = steady_feed.zero_copy_declines - warm_feed.zero_copy_declines;
+        assert_eq!(
+            d_imports + d_pbo + d_uploads,
+            FRAMES as u64,
+            "feed counters don't account for every frame: \
+             warm={warm_feed:?} steady={steady_feed:?}"
+        );
+        // …and when the driver never declined the import (macOS ANGLE, most
+        // Linux), every Dma-source frame MUST have been fed zero-copy. A
+        // declining driver (e.g. Vivante rejecting TEXTURE_2D dma-buf attach)
+        // is a designed fallback, not a telemetry bug — accounted above.
+        if d_declines == 0 {
+            assert_eq!(
+                d_imports, FRAMES as u64,
+                "no declines yet frames were not import-fed: \
+                 warm={warm_feed:?} steady={steady_feed:?}"
+            );
+        }
     }
 
     /// Regression test for the repeat-convert GL_INVALID_VALUE (0x501) state
