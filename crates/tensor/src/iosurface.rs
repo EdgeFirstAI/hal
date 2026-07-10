@@ -1184,6 +1184,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_dma_unmapped_image_format_errors() {
+        use crate::Tensor;
+
+        // Explicit-Dma contract: `Some(TensorMemory::Dma)` for an image whose
+        // (format, dtype) has no IOSurface FourCC mapping must error loudly —
+        // NOT silently allocate a generic 'L008' byte-bag that every GL
+        // import later rejects with EGL_BAD_ATTRIBUTE. Width 64 keeps the
+        // natural pitch 64-aligned so this exercises the mapping check, not
+        // the alignment guard.
+        for (name, result) in [
+            (
+                "PlanarRgb u8",
+                Tensor::<u8>::image(64, 8, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
+                    .map(drop),
+            ),
+            (
+                "Rgb f32",
+                Tensor::<f32>::image(64, 8, PixelFormat::Rgb, Some(TensorMemory::Dma)).map(drop),
+            ),
+        ] {
+            match result {
+                Err(crate::Error::InvalidArgument(msg)) => {
+                    assert!(
+                        msg.contains("no zero-copy IOSurface mapping"),
+                        "{name}: error must name the missing mapping: {msg}"
+                    );
+                }
+                other => panic!("{name}: expected InvalidArgument, got {other:?}"),
+            }
+        }
+
+        // The designed 'L008' semi-planar arm is a mapping, not a byte-bag:
+        // NV12 u8 with explicit Dma must still allocate (the R8 plane the
+        // YUV shaders sample) — the contract fix must not break it.
+        let nv12 = Tensor::<u8>::image(64, 8, PixelFormat::Nv12, Some(TensorMemory::Dma))
+            .expect("NV12 u8 keeps its designed L008 IOSurface mapping");
+        assert_eq!(nv12.memory(), TensorMemory::Dma);
+    }
+
+    #[test]
     fn surface_id_is_nonzero() {
         let t = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
         assert!(t.surface_id() != 0, "IOSurface IDs should be nonzero");

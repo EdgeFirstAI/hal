@@ -1907,39 +1907,54 @@ where
                      Some(TensorMemory::Mem) explicitly."
                 )));
             }
-            // Alignment OK. Try image-formatted IOSurface; on any
-            // structural failure (unsupported (format, dtype) combo,
-            // out-of-memory, etc.) fall through to SHM. dtype_of
-            // returns None for non-standard numeric T used in tests —
-            // those legitimately have no IOSurface FourCC mapping.
-            if let Some(dtype) = dtype_of::<T>() {
-                if let Ok(storage) = TensorStorage::<T>::new_image_iosurface(
-                    width, height, format, dtype, &shape, None,
-                ) {
-                    let mut t = Self::wrap(storage);
-                    t.format = Some(format);
-                    // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
-                    // pitch exceeds the natural packed/planar row stride, record
-                    // it so CPU consumers iterate rows correctly (the GL import
-                    // already uses the surface's own pitch). For 64-aligned rows
-                    // — the common model-input case — the two match and no stride
-                    // is stored, leaving the flat mapping unchanged.
-                    if let TensorStorage::Dma(ref io) = t.storage {
-                        let bpr = io.bytes_per_row();
-                        if let Some(natural) = t.effective_row_stride() {
-                            if bpr > natural {
-                                t.set_row_stride_unchecked(bpr);
-                            }
-                        }
+            // Alignment OK. Explicit-Dma contract: the caller asked for an
+            // **image-formatted, GL-importable** IOSurface, so every failure
+            // from here on is loud. The old behaviour fell through to the
+            // generic 'L008' byte-bag `Some(other)` arm below, and the caller
+            // only found out when the GL import rejected the bind with
+            // `EGL_BAD_ATTRIBUTE` — the same silent-downgrade anti-pattern as
+            // the alignment case above. (Semi-planar/Grey u8 map to 'L008'
+            // *by design* in `image_iosurface_layout` — the R8-plane
+            // representation the YUV shaders sample — so they return through
+            // the mapped path and never reach these errors.)
+            let dtype = dtype_of::<T>().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Tensor::image: element type {} has no DType, so no \
+                     image-formatted IOSurface exists. Pass memory=None or \
+                     Some(TensorMemory::Mem) for a CPU tensor.",
+                    std::any::type_name::<T>()
+                ))
+            })?;
+            if crate::iosurface::image_iosurface_layout(format, dtype).is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: no zero-copy IOSurface mapping exists for \
+                     {format:?}/{dtype:?} on macOS/iOS (supported: \
+                     Rgba/Bgra/Yuyv/Grey/Nv12/Nv16/Nv24 @ U8, \
+                     Rgba/PlanarRgb/PlanarRgba @ F16). Pass memory=None to \
+                     auto-select, or Some(TensorMemory::Mem) explicitly, for \
+                     a CPU tensor."
+                )));
+            }
+            let storage = TensorStorage::<T>::new_image_iosurface(
+                width, height, format, dtype, &shape, None,
+            )?;
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
+            // pitch exceeds the natural packed/planar row stride, record
+            // it so CPU consumers iterate rows correctly (the GL import
+            // already uses the surface's own pitch). For 64-aligned rows
+            // — the common model-input case — the two match and no stride
+            // is stored, leaving the flat mapping unchanged.
+            if let TensorStorage::Dma(ref io) = t.storage {
+                let bpr = io.bytes_per_row();
+                if let Some(natural) = t.effective_row_stride() {
+                    if bpr > natural {
+                        t.set_row_stride_unchecked(bpr);
                     }
-                    return Ok(t);
                 }
             }
-            // Unsupported (format, dtype) on the IOSurface path —
-            // e.g. PlanarRgb u8 has no IOSurface FourCC mapping today
-            // (only F16 PlanarRgb is wired). Fall through to SHM/Mem
-            // since the caller asked for Dma but no image-formatted DMA
-            // storage exists for this combination.
+            return Ok(t);
         }
 
         // Android Dma path: allocate a format-aware AHardwareBuffer so the
@@ -1959,75 +1974,78 @@ where
         // surfaces naturally flat.
         #[cfg(target_os = "android")]
         if matches!(memory, Some(TensorMemory::Dma)) {
-            if let Some(dtype) = dtype_of::<T>() {
-                // Planar F16 requires width % 4 == 0 for the RGBA16F
-                // packing — reject up front with the requirement spelled
-                // out (mirrors the macOS pre-allocation guard) instead of
-                // falling through to a byte-bag GL cannot bind.
-                if format.layout() == PixelLayout::Planar
-                    && dtype == DType::F16
-                    && packed_rgba16f_layout(format, dtype, width, height).is_none()
-                {
-                    return Err(Error::InvalidArgument(format!(
-                        "Tensor::image: {format:?} F16 requires width%4==0 for the RGBA16F \
-                         AHardwareBuffer packing (got width={width}). Pad the width, or pass \
-                         memory=Some(TensorMemory::Mem) for a CPU tensor."
-                    )));
-                }
-                if crate::ahardwarebuffer::image_ahardwarebuffer_layout(format, dtype).is_some() {
-                    match TensorStorage::<T>::new_image_ahardwarebuffer(
-                        width, height, format, dtype, &shape, None,
-                    ) {
-                        Ok(storage) => {
-                            let mut t = Self::wrap(storage);
-                            t.format = Some(format);
-                            if let TensorStorage::Dma(ref ahb) = t.storage {
-                                // gralloc chooses the row pitch (Qualcomm's
-                                // SnapAlloc pads e.g. the 160-px-wide RGBA16F
-                                // surface of a 640-wide planar F16 target).
-                                // When it exceeds the natural stride, record
-                                // it so CPU consumers iterate rows correctly
-                                // via `effective_row_stride()` — the GPU
-                                // renders through the EGLImage at the
-                                // buffer's real pitch regardless, so the
-                                // render stays fully zero-copy. Consumers
-                                // that need the FLAT `[1, C, H, W]` layout
-                                // (the future NPU handoff) must check
-                                // `row_stride()` is unset and repack — or
-                                // pick an aligned width — rather than assume
-                                // flatness (see the module docs).
-                                let bpr = ahb.bytes_per_row();
-                                if let Some(natural) = t.effective_row_stride() {
-                                    if bpr > natural {
-                                        log::debug!(
-                                            "Tensor::image: gralloc padded the {format:?} \
-                                             AHardwareBuffer pitch to {bpr} bytes (natural \
-                                             {natural}); recording row stride"
-                                        );
-                                        t.set_row_stride_unchecked(bpr);
-                                    }
-                                }
-                            }
-                            return Ok(t);
-                        }
-                        Err(e) => {
-                            // Fall through to the generic allocation below,
-                            // but never silently: an unexpected gralloc
-                            // refusal is the first thing on-device triage
-                            // needs to see.
-                            log::debug!(
-                                "Tensor::image: AHardwareBuffer image allocation failed \
-                                 ({format:?}/{dtype:?} {width}x{height}): {e:?}; falling back"
-                            );
-                        }
+            // Explicit-Dma contract (mirrors the macOS block above): the
+            // caller asked for an image-formatted, GL-importable
+            // AHardwareBuffer, so an unmapped combination or a gralloc
+            // refusal errors here instead of falling through to a BLOB
+            // byte-bag the GL backend can never import — that downgrade
+            // only surfaced as a silent per-frame CPU upload.
+            let dtype = dtype_of::<T>().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Tensor::image: element type {} has no DType, so no \
+                     image-formatted AHardwareBuffer exists. Pass memory=None \
+                     or Some(TensorMemory::Mem) for a CPU tensor.",
+                    std::any::type_name::<T>()
+                ))
+            })?;
+            // Planar F16 requires width % 4 == 0 for the RGBA16F
+            // packing — reject up front with the requirement spelled
+            // out (mirrors the macOS pre-allocation guard) instead of
+            // falling through to a byte-bag GL cannot bind.
+            if format.layout() == PixelLayout::Planar
+                && dtype == DType::F16
+                && packed_rgba16f_layout(format, dtype, width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: {format:?} F16 requires width%4==0 for the RGBA16F \
+                     AHardwareBuffer packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
+                )));
+            }
+            if crate::ahardwarebuffer::image_ahardwarebuffer_layout(format, dtype).is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: no zero-copy AHardwareBuffer mapping exists \
+                     for {format:?}/{dtype:?} on Android (Grey/NV* need \
+                     R8-format buffers, API 29+; the HAL floor is API 26 — see \
+                     `image_ahardwarebuffer_layout`). Pass memory=None to \
+                     auto-select, or Some(TensorMemory::Mem) explicitly, for a \
+                     CPU tensor; camera NV12 stays zero-copy by wrapping the \
+                     camera's own AHardwareBuffer instead of allocating one."
+                )));
+            }
+            let storage = TensorStorage::<T>::new_image_ahardwarebuffer(
+                width, height, format, dtype, &shape, None,
+            )?;
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            if let TensorStorage::Dma(ref ahb) = t.storage {
+                // gralloc chooses the row pitch (Qualcomm's
+                // SnapAlloc pads e.g. the 160-px-wide RGBA16F
+                // surface of a 640-wide planar F16 target).
+                // When it exceeds the natural stride, record
+                // it so CPU consumers iterate rows correctly
+                // via `effective_row_stride()` — the GPU
+                // renders through the EGLImage at the
+                // buffer's real pitch regardless, so the
+                // render stays fully zero-copy. Consumers
+                // that need the FLAT `[1, C, H, W]` layout
+                // (the future NPU handoff) must check
+                // `row_stride()` is unset and repack — or
+                // pick an aligned width — rather than assume
+                // flatness (see the module docs).
+                let bpr = ahb.bytes_per_row();
+                if let Some(natural) = t.effective_row_stride() {
+                    if bpr > natural {
+                        log::debug!(
+                            "Tensor::image: gralloc padded the {format:?} \
+                             AHardwareBuffer pitch to {bpr} bytes (natural \
+                             {natural}); recording row stride"
+                        );
+                        t.set_row_stride_unchecked(bpr);
                     }
                 }
             }
-            // No AHardwareBuffer format mapping (Grey/NV/BGRA/YUYV — see
-            // `image_ahardwarebuffer_layout` for the per-format rationale)
-            // or the allocation failed — fall through: the caller asked for
-            // Dma but no image-formatted zero-copy storage exists for this
-            // combination.
+            return Ok(t);
         }
 
         // Compute the **64-byte-aligned** row stride for every image layout.
