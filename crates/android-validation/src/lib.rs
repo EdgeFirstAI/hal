@@ -557,6 +557,82 @@ mod device {
         compare_u8(&dst_gl, &dst_cpu, dst_size, 4, "verify_wrapped_import")
     }
 
+    /// Cell 5 — the GL→NPU fence handoff: `convert_with_fence` returns a
+    /// sync-fence fd instead of blocking (every S26-class device exposes
+    /// `EGL_ANDROID_native_fence_sync`; a blocking `None` fallback is
+    /// logged loudly but not failed — emulators may lack the extension).
+    /// After the fence signals, the output must match the CPU reference
+    /// exactly like the blocking cell — proving the fence really guards
+    /// the render's completion.
+    fn verify_fence_handoff(
+        gl: &mut ImageProcessor,
+        cpu: &mut ImageProcessor,
+        src: &TensorDyn,
+        dst_size: usize,
+    ) -> i32 {
+        use std::os::fd::AsRawFd as _;
+        let mut dst_gl = match gl_dst(gl, dst_size, PixelFormat::PlanarRgb, DType::F16) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        let mut dst_cpu = match cpu_dst(dst_size, PixelFormat::PlanarRgb, DType::F16) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        let submit_start = std::time::Instant::now();
+        let fence = match gl.convert_with_fence(
+            src,
+            &mut dst_gl,
+            Rotation::None,
+            Flip::None,
+            Crop::default(),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("android-validation: convert_with_fence: {e:?}");
+                return ERR_CONVERT;
+            }
+        };
+        let submit_us = submit_start.elapsed().as_micros();
+        match fence {
+            Some(fd) => {
+                let wait_start = std::time::Instant::now();
+                let mut pfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: pfd is a valid pollfd over an owned live fd.
+                let rc = unsafe { libc::poll(&mut pfd, 1, 1000) };
+                if rc != 1 {
+                    log::error!(
+                        "android-validation: verify_fence_handoff: poll(fence) \
+                         returned {rc} (timeout/error) — fence never signaled"
+                    );
+                    return ERR_CONVERT;
+                }
+                log::info!(
+                    "android-validation: verify_fence_handoff: submit {submit_us}µs, \
+                     fence wait {}µs",
+                    wait_start.elapsed().as_micros()
+                );
+            }
+            None => {
+                // Loud but not fatal: the blocking contract is still
+                // correct, and emulator lanes may lack the extension.
+                log::warn!(
+                    "android-validation: verify_fence_handoff: no native fence on \
+                     this device (blocking fallback, {submit_us}µs) — \
+                     EGL_ANDROID_native_fence_sync missing?"
+                );
+            }
+        }
+        if let Err(c) = convert_with(cpu, src, &mut dst_cpu) {
+            return c;
+        }
+        compare_f16(&dst_gl, &dst_cpu, dst_size, "verify_fence_handoff")
+    }
+
     /// Run all verification cells; returns the first failure.
     pub fn verify(src_w: usize, src_h: usize, dst_size: usize) -> i32 {
         let mut gl = match gl_processor() {
@@ -581,6 +657,10 @@ mod device {
             return rc;
         }
         let rc = verify_rgb8_packed(&mut gl, &mut cpu, &src, dst_size);
+        if rc != OK {
+            return rc;
+        }
+        let rc = verify_fence_handoff(&mut gl, &mut cpu, &src, dst_size);
         if rc != OK {
             return rc;
         }

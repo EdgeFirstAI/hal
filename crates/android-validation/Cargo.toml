@@ -25,4 +25,5 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 edgefirst-hal = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }

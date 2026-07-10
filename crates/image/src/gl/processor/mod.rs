@@ -1454,6 +1454,47 @@ impl GLProcessorST {
         self.convert_stats
     }
 
+    /// Convert without the terminal CPU sync, exporting a native fence fd
+    /// that signals when the GPU work completes — the GL→NPU handoff.
+    ///
+    /// Uses the same `defer_finish` mechanism as batching to skip the
+    /// pure-GPU tails' sync; paths that read back to the CPU (PBO/upload
+    /// destinations) sync internally regardless, so the fence degenerates
+    /// to already-signaled there — correct, just no faster than `convert`.
+    /// When the platform has no native fence (`Ok(None)` / export error)
+    /// the blocking contract is restored with an explicit `glFinish`.
+    pub(crate) fn convert_fenced(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<Option<std::os::fd::OwnedFd>, crate::Error> {
+        use crate::ImageProcessorTrait as _;
+        self.defer_finish = true;
+        let result = self.convert(src, dst, rotation, flip, crop);
+        self.defer_finish = false;
+        result?;
+        match Platform::export_completion_fence(&self.gl_context) {
+            Ok(Some(fd)) => Ok(Some(fd)),
+            Ok(None) => {
+                unsafe { edgefirst_gl::gl::Finish() };
+                check_gl_error(function!(), line!())?;
+                Ok(None)
+            }
+            Err(e) => {
+                // A failed export must not skip the sync — fall back to
+                // the blocking contract rather than hand back a dst the
+                // GPU may still be writing.
+                log::debug!("native fence export failed ({e:?}); falling back to glFinish");
+                unsafe { edgefirst_gl::gl::Finish() };
+                check_gl_error(function!(), line!())?;
+                Ok(None)
+            }
+        }
+    }
+
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
 
     #[allow(clippy::too_many_arguments)]
@@ -6743,6 +6784,7 @@ impl GLProcessorST {
             // virtualized GPUs (paravirtual Metal mis-renders).
             serialize_gl: self.is_vivante() || self.is_virtual_gpu,
             external_oes: Platform::EXTERNAL_OES,
+            native_fence_sync: Platform::native_fence_sync(&self.gl_context),
         }
     }
 }

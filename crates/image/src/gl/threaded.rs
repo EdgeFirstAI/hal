@@ -24,6 +24,17 @@ enum GLProcessorMessage {
         bool, // defer: skip the per-tile glFinish (batch); flush syncs once
         tokio::sync::oneshot::Sender<Result<(), Error>>,
     ),
+    /// Convert without the terminal CPU sync, replying with a native
+    /// fence fd guarding the GPU work (the GL→NPU handoff). `Ok(None)` =
+    /// converted with blocking semantics (no fence on this platform).
+    ImageConvertFenced(
+        SendablePtr<TensorDyn>,
+        SendablePtr<TensorDyn>,
+        Rotation,
+        Flip,
+        Crop,
+        tokio::sync::oneshot::Sender<Result<Option<std::os::fd::OwnedFd>, Error>>,
+    ),
     /// Complete any deferred batch render with a single GPU sync.
     Flush(tokio::sync::oneshot::Sender<Result<(), Error>>),
     SetColors(
@@ -373,6 +384,9 @@ impl GLProcessorThreaded {
                         "GL context is poisoned after a prior panic".to_string(),
                     );
                     match msg {
+                        GLProcessorMessage::ImageConvertFenced(.., resp) => {
+                            let _ = resp.send(Err(poison_err));
+                        }
                         GLProcessorMessage::ImageConvert(.., resp) => {
                             let _ = resp.send(Err(poison_err));
                         }
@@ -455,6 +469,32 @@ impl GLProcessorThreaded {
                                 poisoned = true;
                                 Err(crate::Error::Internal(format!(
                                     "GL thread panicked during ImageConvert: {}",
+                                    panic_message(e.as_ref()),
+                                )))
+                            }
+                        });
+                    }
+                    GLProcessorMessage::ImageConvertFenced(
+                        src,
+                        mut dst,
+                        rotation,
+                        flip,
+                        crop,
+                        resp,
+                    ) => {
+                        // SAFETY: as ImageConvert — convert_with_fence()
+                        // blocks on the reply before the borrows drop.
+                        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let src = unsafe { src.ptr.as_ref() };
+                            let dst = unsafe { dst.ptr.as_mut() };
+                            gl_converter.convert_fenced(src, dst, rotation, flip, crop)
+                        }));
+                        let _ = resp.send(match result {
+                            Ok(res) => res,
+                            Err(e) => {
+                                poisoned = true;
+                                Err(crate::Error::Internal(format!(
+                                    "GL thread panicked during ImageConvertFenced: {}",
                                     panic_message(e.as_ref()),
                                 )))
                             }
@@ -1011,6 +1051,55 @@ impl GLProcessorThreaded {
             .as_ref()
             .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
             .blocking_send(GLProcessorMessage::EglCacheStats(send))
+            .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
+        recv.blocking_recv().map_err(|_| {
+            Error::Internal("GL converter error messaging closed without update".to_string())
+        })?
+    }
+
+    /// Convert and return a native sync-fence fd that signals when the
+    /// GPU work completes, instead of blocking the CPU on `glFinish` —
+    /// the GL→NPU handoff (`EGL_ANDROID_native_fence_sync`).
+    ///
+    /// `Ok(None)` means the convert completed with the normal blocking
+    /// semantics (platform/driver has no native fence, or a pure-CPU-
+    /// readback path was taken) — the destination is already safe to
+    /// read. `Ok(Some(fd))` means the caller (or the NPU runtime, via
+    /// `ANeuralNetworksExecution_startComputeWithDependencies`) must wait
+    /// on the fd before consuming the destination buffer.
+    pub fn convert_with_fence(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<Option<std::os::fd::OwnedFd>, Error> {
+        use crate::ImageProcessorTrait as _;
+        if !self.caps.native_fence_sync {
+            // No fence on this display: the plain blocking convert IS the
+            // fenced contract with `None` — skip the special round-trip.
+            self.convert(src, dst, rotation, flip, crop)?;
+            return Ok(None);
+        }
+        let (send, recv) = tokio::sync::oneshot::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Error::Internal("GL processor is shutting down".to_string()))?
+            .blocking_send(GLProcessorMessage::ImageConvertFenced(
+                SendablePtr {
+                    ptr: NonNull::from(src),
+                    len: 1,
+                },
+                SendablePtr {
+                    ptr: NonNull::from(dst),
+                    len: 1,
+                },
+                rotation,
+                flip,
+                crop,
+                send,
+            ))
             .map_err(|_| Error::Internal("GL converter thread exited".to_string()))?;
         recv.blocking_recv().map_err(|_| {
             Error::Internal("GL converter error messaging closed without update".to_string())

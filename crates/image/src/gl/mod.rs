@@ -73,6 +73,8 @@ mod ahardwarebuffer_import;
 mod fourcc;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface_import;
+#[cfg(target_os = "android")]
+mod native_fence;
 mod platform;
 mod processor;
 mod resources;

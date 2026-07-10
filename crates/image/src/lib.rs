@@ -1223,6 +1223,63 @@ impl ImageProcessor {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Convert and return a native sync-fence fd that signals when the
+    /// GPU work completes, instead of blocking the CPU — the GL→NPU
+    /// handoff (`EGL_ANDROID_native_fence_sync` on Android).
+    ///
+    /// `Ok(Some(fd))`: the destination buffer is still in flight; hand
+    /// the fd to the consumer (e.g.
+    /// `ANeuralNetworksExecution_startComputeWithDependencies`) or
+    /// `poll()` it before reading. `Ok(None)`: the convert completed with
+    /// the normal blocking contract (no native fence on this platform, or
+    /// a non-GL backend handled the frame) — the destination is already
+    /// safe. Semantics are otherwise identical to
+    /// [`convert`](ImageProcessorTrait::convert), including the
+    /// GL→G2D→CPU fallback chain.
+    #[cfg(unix)]
+    pub fn convert_with_fence(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        #[cfg(feature = "opengl")]
+        {
+            let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
+            if self.forced_backend.is_none() || gl_forced {
+                if let Some(opengl) = self.opengl.as_mut() {
+                    match opengl.convert_with_fence(src, dst, rotation, flip, crop) {
+                        Ok(fd) => return Ok(fd),
+                        Err(e) if gl_forced => return Err(e),
+                        Err(e) => {
+                            // Not counted here: the blocking chain below
+                            // re-runs the dispatcher, whose decline arm
+                            // counts the fallback exactly once.
+                            log::debug!(
+                                "convert_with_fence: opengl declined, \
+                                 falling back to the blocking chain: {e}"
+                            );
+                        }
+                    }
+                } else if gl_forced {
+                    return Err(Error::ForcedBackendUnavailable("opengl".into()));
+                }
+            }
+        }
+        // Blocking chain (G2D/CPU, forced non-GL, or non-GL builds):
+        // completion == return, so no fence is needed.
+        self.convert(src, dst, rotation, flip, crop)?;
+        Ok(None)
+    }
+
     /// Report which float dtypes the GPU can render to.
     ///
     /// Probes `GL_EXT_color_buffer_half_float` and

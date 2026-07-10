@@ -40,7 +40,7 @@
 //! that must survive GPU resets should recreate their `ImageProcessor`
 //! in a fresh process.
 
-use super::super::{ahardwarebuffer_import, Egl};
+use super::super::{ahardwarebuffer_import, native_fence, Egl};
 use super::GlPlatform;
 use crate::{Error, Result};
 use edgefirst_egl as egl;
@@ -101,6 +101,12 @@ pub(in crate::opengl_headless) struct SharedAndroidDisplay {
     /// F16 destination tensors (the primary NPU-input path) — confirmed
     /// on Adreno 840 and the API-36 emulator by the Phase-1 probe.
     pub(in crate::opengl_headless) supports_f16_color: bool,
+    /// `EGL_ANDROID_native_fence_sync` (+ `EGL_KHR_fence_sync`) exposed
+    /// by this display. Gates `export_completion_fence` — the GL→NPU
+    /// sync-fence handoff. Probed from the EGL (not GL) extension
+    /// string: `eglGetProcAddress` may return non-NULL stubs for
+    /// unsupported extensions, so the string is the authority.
+    pub(in crate::opengl_headless) supports_native_fence: bool,
 }
 
 // SAFETY: every member is either a leaked static or an EGL handle;
@@ -149,6 +155,22 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         .initialize(display)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglInitialize: {e:?}"))))?;
     debug!("Native Android EGL {maj}.{min} initialised (process-global shared display)");
+
+    // EGL (display-level) extension probe for the GL→NPU fence handoff.
+    // Universal on real Android devices (sync fences underpin SurfaceFlinger)
+    // but probed anyway: emulators/exotic drivers may omit it, and the
+    // fenced convert falls back to the blocking contract there.
+    let egl_extensions = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let supports_native_fence = egl_extensions
+        .split_ascii_whitespace()
+        .any(|e| e == "EGL_ANDROID_native_fence_sync")
+        && egl_extensions
+            .split_ascii_whitespace()
+            .any(|e| e == "EGL_KHR_fence_sync");
+    debug!("Android EGL: EGL_ANDROID_native_fence_sync={supports_native_fence}");
 
     egl.bind_api(egl::OPENGL_ES_API)
         .map_err(|e| Error::Io(std::io::Error::other(format!("eglBindAPI: {e:?}"))))?;
@@ -262,6 +284,7 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
         config,
         supports_f32_color,
         supports_f16_color,
+        supports_native_fence,
     })
 }
 
@@ -452,6 +475,19 @@ impl GlPlatform for AndroidEgl {
 
     fn end_gpu_pass(_display: &AndroidGlContext) {
         // EGLImage texture targets persist by design; nothing to release.
+    }
+
+    fn native_fence_sync(display: &AndroidGlContext) -> bool {
+        display.shared.supports_native_fence
+    }
+
+    fn export_completion_fence(
+        display: &AndroidGlContext,
+    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+        if !display.shared.supports_native_fence {
+            return Ok(None);
+        }
+        native_fence::export_native_fence_fd(&display.shared.egl, display.shared.display).map(Some)
     }
 
     fn import_buffer(

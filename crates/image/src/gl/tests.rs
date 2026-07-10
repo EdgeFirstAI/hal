@@ -449,6 +449,75 @@ mod gl_tests {
         v
     }
 
+    /// Portable contract of the GL→NPU fence entry point on platforms
+    /// WITHOUT `EGL_ANDROID_native_fence_sync` (Linux/macOS): it must
+    /// behave exactly like `convert` — same output, `Ok(None)` (the
+    /// blocking contract), destination immediately readable. The
+    /// fence-returning arm is device-verified on Android
+    /// (`verify_fence_handoff` in the Device Farm harness).
+    #[test]
+    fn convert_with_fence_blocking_fallback_matches() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - GL not available", function!());
+            return;
+        }
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let (sw, sh, dw) = (96usize, 72usize, 64usize);
+        let bytes = rgba_gradient(sw, sh, 3);
+        let src = load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes)
+            .expect("src alloc");
+        let mut dst_fenced = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .expect("dst alloc");
+        let mut dst_blocking = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+        )
+        .expect("dst alloc");
+        let fence = gl
+            .convert_with_fence(
+                &src,
+                &mut dst_fenced,
+                Rotation::None,
+                Flip::None,
+                Crop::no_crop(),
+            )
+            .expect("convert_with_fence");
+        if cfg!(not(target_os = "android")) {
+            assert!(
+                fence.is_none(),
+                "no platform in this test tier has native fence sync"
+            );
+        }
+        gl.convert(
+            &src,
+            &mut dst_blocking,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .expect("convert");
+        let (ma, mb) = (
+            dst_fenced.as_u8().unwrap().map().unwrap(),
+            dst_blocking.as_u8().unwrap().map().unwrap(),
+        );
+        assert_eq!(ma.as_slice(), mb.as_slice(), "fenced vs blocking output");
+    }
+
     /// The float paths' zero-copy source import (`feed_float_src` arm 1) must
     /// produce bit-identical output to the CPU-upload feed of the same bytes:
     /// same shader, same filtering, only the source feed differs. Also proves

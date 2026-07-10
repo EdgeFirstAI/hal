@@ -300,6 +300,7 @@ impl AngleDisplay {
             },
             serialize_gl: false,
             external_oes: false,
+            native_fence_sync: false,
         }
     }
 }
@@ -385,6 +386,18 @@ impl GlPlatform for AngleClientBuffer {
              (EDGEFIRST_OPENGL_RENDERSURFACE has no effect on macOS)"
                 .into(),
         ))
+    }
+
+    fn native_fence_sync(_display: &AngleDisplay) -> bool {
+        // ANGLE's Metal backend has no EGL_ANDROID_native_fence_sync;
+        // CoreML consumers rely on convert() returning ⇒ GPU done.
+        false
+    }
+
+    fn export_completion_fence(
+        _display: &AngleDisplay,
+    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+        Ok(None)
     }
 
     fn end_gpu_pass(display: &AngleDisplay) {

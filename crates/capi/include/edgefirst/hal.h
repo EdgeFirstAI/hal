@@ -1969,6 +1969,44 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
                                 const struct hal_crop *crop);
 
 /**
+ * Convert and export a native sync-fence fd instead of blocking on the
+ * GPU — the GL→NPU handoff (`EGL_ANDROID_native_fence_sync`, Android).
+ *
+ * Identical semantics to [`hal_image_processor_convert`] (including the
+ * GL→CPU fallback chain), except that when the platform supports native
+ * fences the call returns as soon as the GPU commands are submitted and
+ * writes the fence fd to `*fence_fd`. The destination buffer must not
+ * be read until the fence signals — hand the fd to the NPU runtime
+ * (`ANeuralNetworksExecution_startComputeWithDependencies`) or `poll()`
+ * it. When no fence is available (`*fence_fd == -1`) the convert
+ * completed with the blocking contract and the destination is already
+ * safe to read.
+ *
+ * The returned fd is owned by the caller: `close()` it when done (the
+ * NPU runtime duplicates what it needs).
+ *
+ * @param processor Image processor handle
+ * @param src Source image tensor
+ * @param dst Destination image tensor (pre-allocated; reuse across frames)
+ * @param rotation Rotation to apply
+ * @param flip Flip to apply
+ * @param crop Crop configuration (can be NULL for no crop)
+ * @param fence_fd Out: the sync-fence fd, or -1 when the convert
+ *                 completed synchronously (must not be NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/src/dst/fence_fd)
+ * - EIO: Conversion failed
+ */
+int hal_image_processor_convert_fence(struct hal_image_processor *processor,
+                                      const struct hal_tensor *src,
+                                      struct hal_tensor *dst,
+                                      enum hal_rotation rotation,
+                                      enum hal_flip flip,
+                                      const struct hal_crop *crop,
+                                      int *fence_fd);
+
+/**
  * Convert without waiting for the GPU — the batch-preprocessing primitive.
  *
  * Identical to [`hal_image_processor_convert`](hal_image_processor_convert)
