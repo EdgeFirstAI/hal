@@ -138,6 +138,17 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
     } else {
         Some(TensorMemory::Mem)
     };
+    // The DESTINATION auto-selects: explicit Some(Dma) now errors loudly
+    // for (format, dtype) combos with no zero-copy mapping (the
+    // explicit-Dma contract) — e.g. the gpu_bound cell's packed-RGB dst on
+    // macOS, which historically byte-bagged and silently measured the CPU
+    // fallback. Auto-select keeps every platform on its honest best path
+    // (Linux: Dma; macOS packed-RGB: Mem + CPU convert).
+    let dst_mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
+        None
+    } else {
+        Some(TensorMemory::Mem)
+    };
     let barrier = Arc::new(Barrier::new(n_procs));
 
     let handles: Vec<_> = (0..n_procs)
@@ -171,7 +182,7 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                     DType::U8
                 };
                 let mut dst = proc
-                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, dst_dtype, mem)
+                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, dst_dtype, dst_mem)
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
                 let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
                     proc.convert(&src, dst, Rotation::None, Flip::None, crop)

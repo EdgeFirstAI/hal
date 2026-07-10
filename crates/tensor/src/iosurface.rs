@@ -454,6 +454,18 @@ where
                     })?;
                 (layout.surface_w, layout.surface_h)
             }
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // the same canonical rule as the Android allocation and the GL
+            // engine's two-pass packed-RGB render geometry.
+            (PixelFormat::Rgb, DType::U8 | DType::I8) => {
+                let layout = crate::packed_rgb888_layout(width, height).ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "Rgb u8 IOSurface requires width%4==0 for RGBA8888 packing \
+                         (got width={width})"
+                    ))
+                })?;
+                (layout.surface_w, layout.surface_h)
+            }
             (PixelFormat::PlanarRgb, _) => {
                 let sh = height.checked_mul(3).ok_or_else(|| {
                     Error::InvalidShape(format!("PlanarRgb height overflow (height={height})"))
@@ -970,8 +982,22 @@ fn image_fourcc_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize
         // and produces the matching shader output. Mapping both to
         // 'BGRA' would put the IOSurface bytes in BGRA order, which is
         // wrong for the Rgba contract.
-        (PixelFormat::Rgba, DType::U8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
+        // I8 shares the U8 layout for the packed RGB/RGBA arms: INT8 is a
+        // per-byte `^0x80` bias applied in the shader, not a format change.
+        (PixelFormat::Rgba, DType::U8 | DType::I8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         (PixelFormat::Bgra, DType::U8) => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        // Packed RGB u8/i8 (the INT8 NPU input layout): no 3-channel
+        // IOSurface format exists, so the tight `[H, W, 3]` byte stream
+        // lives in an RGBA8888 surface sized `(W*3/4, H)` via
+        // `packed_rgb888_layout` — the same texel-packing trick as the
+        // planar-F16 arm below and the identical representation the
+        // Android AHardwareBuffer side uses. The GL engine's two-pass
+        // packed-RGB shader renders into it zero-copy (the pbuffer bind
+        // carries explicit geometry, so the FourCC only fixes the byte
+        // layout). Historically this combination fell through to a
+        // generic 'L008' byte-bag that happened to bind the same way;
+        // this is the designed replacement.
+        (PixelFormat::Rgb, DType::U8 | DType::I8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         // Single-channel 8-bit (`L008` = kCVPixelFormatType_OneComponent8),
         // sampled as `GL_RED`. Used for GREY images and as the raw byte plane
         // for the semi-planar YUV formats (NV12/NV16/NV24): the GPU binds the
@@ -1310,6 +1336,13 @@ mod tests {
         assert_eq!(
             image_fourcc_and_bpe(PixelFormat::Yuyv, DType::U8),
             Some((u32::from_be_bytes(*b"2C08"), 2))
+        );
+        // Packed RGB u8 rides an RGBA8888 surface at (W*3/4, H) — the
+        // format is RGBA even though the pixel format is Rgb (matches
+        // the Android AHardwareBuffer table).
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Rgb, DType::U8),
+            Some((u32::from_be_bytes(*b"RGBA"), 4))
         );
     }
 

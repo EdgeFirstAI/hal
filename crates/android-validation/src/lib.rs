@@ -687,6 +687,17 @@ mod device {
         pub cache_miss_delta: u64,
     }
 
+    /// Read the GL source-feed telemetry, or fail the bench (an unreadable
+    /// counter would make the zero-upload gate vacuous).
+    fn convert_feed_stats(gl: &ImageProcessor) -> Result<hal::image::ConvertStats, i32> {
+        gl.opengl.as_ref().ok_or(ERR_GL_UNAVAILABLE).and_then(|g| {
+            g.convert_stats().map_err(|e| {
+                log::error!("android-validation: convert_stats: {e:?}");
+                ERR_STATS
+            })
+        })
+    }
+
     /// Read the GL import-cache miss counter, or fail the bench: an
     /// unreadable counter would make the steady-state gate vacuous.
     fn cache_misses(gl: &ImageProcessor) -> Result<u64, i32> {
@@ -734,6 +745,7 @@ mod device {
         // Steady state begins. Pooled cell: the import cache must not miss
         // again. Fresh-dst cell: every iteration re-imports by design.
         let misses_before = cache_misses(&gl)?;
+        let feed_before = convert_feed_stats(&gl)?;
 
         let mut times: Vec<u64> = Vec::with_capacity(iters);
         for _ in 0..iters {
@@ -748,6 +760,20 @@ mod device {
         }
 
         let misses_after = cache_misses(&gl)?;
+        let feed_after = convert_feed_stats(&gl)?;
+        // True-zero-copy gate: every steady-state frame must feed the source
+        // by import — a single CPU map+upload means the float source import
+        // silently degraded (the exact regression this suite exists to
+        // catch; see ConvertStats).
+        let upload_delta = feed_after.src_uploads - feed_before.src_uploads;
+        if upload_delta != 0 {
+            log::error!(
+                "android-validation: bench: {upload_delta} steady-state frames fed the \
+                 source via CPU upload (before={feed_before:?} after={feed_after:?}) — \
+                 the zero-copy source import is not in play"
+            );
+            return Err(ERR_NOT_ZERO_COPY);
+        }
 
         times.sort_unstable();
         warm.sort_unstable();

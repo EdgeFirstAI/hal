@@ -92,15 +92,17 @@ pub(crate) fn desc_layout(desc: &AHardwareBufferDesc) -> Option<(usize, usize)> 
 /// * `Yuyv` u8 — no packed-4:2:2 AHardwareBuffer format exists.
 pub(crate) fn image_format_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
     match (format, dtype) {
-        (PixelFormat::Rgba, DType::U8) => Some((FORMAT_R8G8B8A8_UNORM, 4)),
+        // I8 shares the U8 layout everywhere below: INT8 is a per-byte
+        // `^0x80` bias applied in the shader, not a format change — the
+        // buffer bytes ARE the signed model input.
+        (PixelFormat::Rgba, DType::U8 | DType::I8) => Some((FORMAT_R8G8B8A8_UNORM, 4)),
         // Packed RGB u8/i8 (the INT8 NPU input layout): no 3-channel
         // renderable format exists, so the tight `[H, W, 3]` byte stream
         // lives in an RGBA8888 surface sized `(W*3/4, H)` via
         // `packed_rgb888_layout` — the same texel-packing trick as the
         // planar-F16 arm below, and the geometry the GL engine's two-pass
-        // packed-RGB shader already renders. I8 shares the U8 layout: INT8
-        // is a per-byte `^0x80` bias in the shader, not a format change.
-        (PixelFormat::Rgb, DType::U8) => Some((FORMAT_R8G8B8A8_UNORM, 4)),
+        // packed-RGB shader already renders.
+        (PixelFormat::Rgb, DType::U8 | DType::I8) => Some((FORMAT_R8G8B8A8_UNORM, 4)),
         // The F16 zero-copy path: RGBA16F, both as a packed RGBA image and
         // as the 4-elements-per-pixel packing of planar `[C, H, W]` f16
         // streams (surface sized via `packed_rgba16f_layout`).

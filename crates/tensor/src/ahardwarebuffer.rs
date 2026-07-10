@@ -601,10 +601,10 @@ where
                     })?;
                 (layout.surface_w, layout.surface_h)
             }
-            (PixelFormat::Rgb, DType::U8) => {
+            (PixelFormat::Rgb, DType::U8 | DType::I8) => {
                 let layout = crate::packed_rgb888_layout(width, height).ok_or_else(|| {
                     Error::InvalidShape(format!(
-                        "Rgb u8 AHardwareBuffer requires width%4==0 for RGBA8888 \
+                        "Rgb u8/i8 AHardwareBuffer requires width%4==0 for RGBA8888 \
                          packing (got width={width})"
                     ))
                 })?;

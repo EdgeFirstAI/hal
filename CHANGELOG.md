@@ -37,9 +37,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pinned NDK r27c).
   - Deferred follow-ups (fall back to CPU today): YUV camera buffers
     (external-OES sampling), Grey/NV single-plane zero-copy (`R8_UNORM`
-    needs API 29), GL→NPU fence export, and shared-memory *allocation*
-    (bionic has no `shm_open`; importing an existing segment via `from_fd`
-    works).
+    needs API 29), and shared-memory *allocation* (bionic has no
+    `shm_open`; importing an existing segment via `from_fd` works).
+- **True end-to-end zero-copy on the float convert paths + NPU-direct
+  output surface** (all platforms; measured on macOS/ANGLE and on-device):
+  - **Float-path zero-copy source import**: the F16/F32 render family
+    previously CPU-uploaded its RGBA source every frame on every platform
+    (the largest silent zero-copy degrade found by a full engine audit —
+    ~3.2 ms/frame at 1080p on-device). `feed_float_src` now imports
+    Dma-backed sources as EGLImages with a per-driver fallback chain
+    (escape hatch: `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1`). macOS medians:
+    720p RGBA→PlanarF16 762→363 µs (2.1×), 1080p 1422→351 µs (4.1×).
+  - **`ConvertStats` telemetry**: per-feed counters (`src_imports`,
+    `src_pbo_uploads`, `src_uploads`, `zero_copy_declines`) via
+    `GLProcessorThreaded::convert_stats()`, a `src_feed` field on the
+    `image.convert.gl` span, `ImageProcessor::convert_fallback_count()`,
+    and warn-once (per buffer) NV import failures — every silent fallback
+    is now loud and countable.
+  - **Explicit-Dma contract**: `Some(TensorMemory::Dma)` image requests
+    with no zero-copy mapping now return `InvalidArgument` on
+    macOS/Android instead of silently allocating a byte-bag no GL import
+    can bind (semi-planar u8 on macOS keeps its designed `'L008'` R8
+    mapping).
+  - **Packed RGB u8/i8 zero-copy on Android AND macOS** (the INT8 NPU
+    input layout): new `packed_rgb888_layout` shared by allocation and
+    render ((W·3/4, H) RGBA8888 texels), wired into both the
+    AHardwareBuffer format table and the IOSurface FourCC table (on
+    macOS this replaces the accidental `'L008'` byte-bag the two-pass
+    shader used to bind); I8 rides the same layout on both platforms.
+    The packed-RGB GL correctness tests now run on macOS too.
+  - **NPU-direct C API**: `hal_tensor_from_hardware_buffer`,
+    `hal_tensor_hardware_buffer_ptr`/`_physical_dims`,
+    `hal_tensor_recorded_row_stride`, `hal_tensor_effective_row_stride`,
+    and `hal_tensor_copy_to_flat` (+ `Tensor/TensorDyn::copy_to_flat`) —
+    consume the convert output with zero CPU readback, with the padded-
+    pitch flatness contract documented (README § NPU-direct output).
+  - **GL→NPU fence export**: `convert_with_fence` /
+    `hal_image_processor_convert_fence` return an
+    `EGL_ANDROID_native_fence_sync` fd instead of blocking in `glFinish`,
+    so the NPU waits on the GPU directly
+    (`ANeuralNetworksExecution_startComputeWithDependencies`); platforms
+    without native fences keep the blocking contract and return no fd.
+  - Float-draw micro-optimizations: uniform locations cached per program
+    and the constant full-screen quad moved to static VBOs.
 
 ## [0.25.3] - 2026-06-24
 

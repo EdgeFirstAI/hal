@@ -814,12 +814,13 @@ mod gl_tests {
     /// byte-identical output across iterations, so any texture-unit state leak
     /// between converts surfaces either as an error or as a pixel diff.
     #[test]
-    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
-    // FourCC, so the fixture cannot allocate on macOS.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
+    // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
+    // two-pass packed-RGB pipeline runs zero-copy on both backends.
+    #[cfg(feature = "dma_test_formats")]
     fn repeat_convert_rgba_mem_to_rgb_dma() {
-        if !is_dma_available() {
-            eprintln!("SKIPPED: {} - DMA not available", function!());
+        if !is_gpu_image_buffer_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers", function!());
             return;
         }
         let mut renderer = match GLProcessorThreaded::new(None) {
@@ -1958,11 +1959,12 @@ mod gl_tests {
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 640x640 with letterbox (two-pass packed PixelFormat::Rgb pipeline).
     /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb to validate packing.
     #[test]
-    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
-    // FourCC, so the fixture cannot allocate on macOS.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
+    // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
+    // two-pass packed-RGB pipeline runs zero-copy on both backends.
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_rgb_correctness() {
-        if !is_dma_available() {
+        if !is_gpu_image_buffer_available() {
             return;
         }
         let src_dma = load_raw_image(
@@ -2019,9 +2021,11 @@ mod gl_tests {
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 640x640 with letterbox.
     /// Compares GL PixelFormat::Rgba (alpha-stripped, XOR 0x80) against GL packed PixelFormat::Rgb.
     #[test]
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
+    // (see test_opengl_rgb_correctness).
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_rgb_int8_correctness() {
-        if !is_dma_available() {
+        if !is_gpu_image_buffer_available() {
             return;
         }
         let src_dma = load_raw_image(
@@ -2034,7 +2038,9 @@ mod gl_tests {
         .unwrap();
 
         let crop = letterbox_crop(1920, 1080, 640, 640);
-        let mut gl = match GLProcessorST::new(None) {
+        // GLProcessorThreaded (not ST) so the test runs portably on
+        // macOS/ANGLE too — same shape as the sibling u8 test.
+        let mut gl = match GLProcessorThreaded::new(None) {
             Ok(gl) => gl,
             Err(e) => {
                 eprintln!("SKIPPED: {} - GL not available: {e}", function!());
@@ -2090,11 +2096,12 @@ mod gl_tests {
     /// PixelFormat::Yuyv 1080p → PixelFormat::Rgb 1920x1080 (no letterbox, same size).
     /// Compares GL PixelFormat::Rgba (alpha-stripped) against GL packed PixelFormat::Rgb without scaling.
     #[test]
-    // Stays Linux-gated: packed-RGB @Dma destinations have no IOSurface
-    // FourCC, so the fixture cannot allocate on macOS.
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
+    // Portable since packed-RGB u8 gained its RGBA8888 IOSurface mapping
+    // (`packed_rgb888_layout`): the fixture allocates on macOS too, and the
+    // two-pass packed-RGB pipeline runs zero-copy on both backends.
+    #[cfg(feature = "dma_test_formats")]
     fn test_opengl_rgb_no_letterbox_correctness() {
-        if !is_dma_available() {
+        if !is_gpu_image_buffer_available() {
             return;
         }
         let src_dma = load_raw_image(

@@ -1984,10 +1984,23 @@ where
                 return Err(Error::InvalidArgument(format!(
                     "Tensor::image: no zero-copy IOSurface mapping exists for \
                      {format:?}/{dtype:?} on macOS/iOS (supported: \
-                     Rgba/Bgra/Yuyv/Grey/Nv12/Nv16/Nv24 @ U8, \
+                     Rgba/Rgb @ U8/I8, Bgra/Yuyv/Grey/Nv12/Nv16/Nv24 @ U8, \
                      Rgba/PlanarRgb/PlanarRgba @ F16). Pass memory=None to \
                      auto-select, or Some(TensorMemory::Mem) explicitly, for \
                      a CPU tensor."
+                )));
+            }
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // reject a width the texel packing cannot express up front
+            // (mirrors the Android pre-guard).
+            if format == PixelFormat::Rgb
+                && matches!(dtype, DType::U8 | DType::I8)
+                && packed_rgb888_layout(width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: Rgb {dtype:?} requires width%4==0 for the RGBA8888 \
+                     IOSurface packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
                 )));
             }
             let storage = TensorStorage::<T>::new_image_iosurface(
@@ -2057,14 +2070,14 @@ where
                      memory=Some(TensorMemory::Mem) for a CPU tensor."
                 )));
             }
-            // Packed RGB u8 rides an RGBA8888 surface at (W*3/4, H) — the
-            // same whole-texel constraint as the F16 packing above.
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // the same whole-texel constraint as the F16 packing above.
             if format == PixelFormat::Rgb
-                && dtype == DType::U8
+                && matches!(dtype, DType::U8 | DType::I8)
                 && packed_rgb888_layout(width, height).is_none()
             {
                 return Err(Error::InvalidArgument(format!(
-                    "Tensor::image: Rgb u8 requires width%4==0 for the RGBA8888 \
+                    "Tensor::image: Rgb {dtype:?} requires width%4==0 for the RGBA8888 \
                      AHardwareBuffer packing (got width={width}). Pad the width, or pass \
                      memory=Some(TensorMemory::Mem) for a CPU tensor."
                 )));
@@ -4001,14 +4014,15 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_rejects_indivisible_pixel_pitch_without_pad_hint() {
-        // Width=10 RGB u8 → 30 B/row, not 64-byte aligned. The next
-        // 64-multiple (64 B) isn't an integer multiple of 3 B/pixel,
-        // so the "pad width to N" hint can't produce a valid number
-        // and must be omitted. (Width=640 happens to align — 640*3 =
-        // 1920 = 30*64 — so don't pick that for this regression
-        // guard.)
-        let err = Tensor::<u8>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect_err("RGB u8 with 3 B/pixel and non-aligned width must be rejected");
+        // Width=10 RGB f32 → 120 B/row, not 64-byte aligned, and (Rgb,
+        // F32) has no IOSurface mapping so the padded-stride tolerance
+        // does not apply. The next 64-multiple (128 B) isn't an integer
+        // multiple of 12 B/pixel, so the "pad width to N" hint can't
+        // produce a valid number and must be omitted. (Rgb u8 used to be
+        // this test's subject but now has a real RGBA8888 mapping with
+        // padded-stride tolerance — see the test below.)
+        let err = Tensor::<f32>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect_err("RGB f32 with 12 B/pixel and non-aligned width must be rejected");
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(
@@ -4027,6 +4041,40 @@ mod image_tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn image_tensor_dma_packed_rgb_u8_contract() {
+        // Packed RGB u8 @Dma is a designed RGBA8888 mapping at
+        // (W*3/4, H) — the INT8 NPU input layout, shared with Android.
+        // width%4 != 0 cannot form whole texels → loud InvalidArgument…
+        let err = Tensor::<u8>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect_err("Rgb u8 width%4!=0 must be rejected");
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("width%4==0")),
+            "got {err:?}"
+        );
+        // …width%4 == 0 with a non-64-aligned pitch allocates PADDED
+        // (36 B rows → 64 B surface pitch, recorded on the tensor)…
+        let t = Tensor::<u8>::image(12, 4, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect("width 12 Rgb u8 must allocate padded");
+        assert_eq!(t.memory(), TensorMemory::Dma);
+        assert!(
+            t.row_stride()
+                .is_some_and(|s| s >= 64 && s.is_multiple_of(64)),
+            "padded pitch must be recorded: {:?}",
+            t.row_stride()
+        );
+        // …and the aligned model-input width stays flat (640*3 = 1920 is
+        // 64-aligned → no recorded stride, the buffer IS [H, W, 3]).
+        let t = Tensor::<u8>::image(640, 8, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect("width 640 Rgb u8 must allocate flat");
+        assert_eq!(t.row_stride(), None);
+        // I8 shares the layout (INT8 shader bias, not a format change).
+        let t = Tensor::<i8>::image(640, 8, PixelFormat::Rgb, Some(TensorMemory::Dma))
+            .expect("Rgb i8 shares the RGBA8888 mapping");
+        assert_eq!(t.memory(), TensorMemory::Dma);
     }
 
     #[test]
