@@ -727,6 +727,14 @@ impl TensorDyn {
         dispatch!(self, hardware_buffer_physical_dims)
     }
 
+    /// Copy the tensor's logical bytes into `dst`, compacting away any
+    /// recorded row-stride padding — see [`Tensor::copy_to_flat`] for the
+    /// full contract. `dst.len()` must equal the tight byte footprint
+    /// (`shape` product × element size).
+    pub fn copy_to_flat(&self, dst: &mut [u8]) -> crate::Result<()> {
+        dispatch!(self, copy_to_flat, dst)
+    }
+
     /// Create a type-erased image tensor.
     ///
     /// # Arguments

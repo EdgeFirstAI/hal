@@ -1184,6 +1184,62 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_flat_compacts_padded_rows() {
+        use crate::{Tensor, TensorDyn};
+
+        // Width 17 RGBA u8: natural row = 68 B, IOSurface pads to 128 B —
+        // the recorded-stride case copy_to_flat exists for. Write a
+        // distinct byte per logical pixel via the strided map, then verify
+        // the flat copy is tight and padding-free.
+        let (w, h) = (17usize, 3usize);
+        let t = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma))
+            .expect("padded IOSurface alloc");
+        let stride = t.effective_row_stride().expect("stride");
+        assert!(stride > w * 4, "test requires a padded stride");
+        {
+            let mut m = t.map().expect("map");
+            let buf = m.as_mut_slice();
+            for row in 0..h {
+                for col in 0..w * 4 {
+                    buf[row * stride + col] = (row * 91 + col) as u8;
+                }
+            }
+        }
+        let mut flat = vec![0u8; h * w * 4];
+        t.copy_to_flat(&mut flat).expect("copy_to_flat");
+        for row in 0..h {
+            for col in 0..w * 4 {
+                assert_eq!(
+                    flat[row * w * 4 + col],
+                    (row * 91 + col) as u8,
+                    "flat byte ({row},{col})"
+                );
+            }
+        }
+
+        // Wrong destination size errors instead of truncating.
+        let mut short = vec![0u8; h * w * 4 - 1];
+        assert!(t.copy_to_flat(&mut short).is_err());
+
+        // Tight tensors (no recorded stride) degenerate to one memcpy —
+        // exercised through the TensorDyn dispatch layer.
+        let tight = TensorDyn::image(64, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
+            .expect("tight Mem alloc");
+        {
+            let tu8 = tight.as_u8().unwrap();
+            let mut m = tu8.map().expect("map");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+        let mut flat2 = vec![0u8; 64 * 4 * 4];
+        tight.copy_to_flat(&mut flat2).expect("tight copy_to_flat");
+        for (i, b) in flat2.iter().enumerate() {
+            assert_eq!(*b, (i % 251) as u8, "tight byte {i}");
+        }
+    }
+
+    #[test]
     fn explicit_dma_unmapped_image_format_errors() {
         use crate::Tensor;
 

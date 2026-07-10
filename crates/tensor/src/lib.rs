@@ -2731,6 +2731,97 @@ where
         })
     }
 
+    /// Copy the tensor's logical bytes into `dst`, compacting away any
+    /// recorded row-stride padding.
+    ///
+    /// The flatness helper for NPU handoff: consumers that need a FLAT
+    /// layout (e.g. `[1, C, H, W]` for NNAPI/LiteRT when the runtime cannot
+    /// take a padded pitch) call this when [`row_stride`](Self::row_stride)
+    /// is `Some` — on a tight tensor it degenerates to one memcpy, so it is
+    /// safe to call unconditionally. `dst.len()` must equal the tight byte
+    /// footprint (`shape` product × element size). Zero-copy consumers
+    /// should prefer the buffer handle + [`effective_row_stride`]
+    /// (Self::effective_row_stride) and skip this copy entirely.
+    pub fn copy_to_flat(&self, dst: &mut [u8]) -> Result<()> {
+        let tight_bytes = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(self.shape())?;
+        if dst.len() != tight_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "copy_to_flat: dst is {} bytes but the tensor's tight \
+                 footprint is {tight_bytes} bytes (shape {:?})",
+                dst.len(),
+                self.shape()
+            )));
+        }
+        let map = self.map()?;
+        // SAFETY: T is a plain numeric type (crate-wide bound); viewing the
+        // mapped elements as bytes is sound.
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                map.as_slice().as_ptr() as *const u8,
+                std::mem::size_of_val(map.as_slice()),
+            )
+        };
+        let Some(stride) = self.row_stride else {
+            // Tight layout: the mapped window is exactly the logical bytes.
+            let got = src.len().min(tight_bytes);
+            if got < tight_bytes {
+                return Err(Error::InvalidOperation(format!(
+                    "copy_to_flat: mapped {got} bytes < tight footprint {tight_bytes}"
+                )));
+            }
+            dst.copy_from_slice(&src[..tight_bytes]);
+            return Ok(());
+        };
+        // Strided: row count follows the strided-map convention (planar
+        // stacks C planes of H rows; packed/semi-planar use shape[0]), and
+        // the logical row is tight_bytes / rows for every layout.
+        let rows = match self.format.map(|f| f.layout()) {
+            Some(PixelLayout::Planar) => {
+                let s = self.shape();
+                if s.len() < 2 {
+                    return Err(Error::InvalidOperation(
+                        "copy_to_flat: strided planar tensor requires [C, H, W] shape".into(),
+                    ));
+                }
+                s[0].checked_mul(s[1]).ok_or_else(|| {
+                    Error::InvalidOperation(format!(
+                        "copy_to_flat: planar rows {} × {} overflows usize",
+                        s[0], s[1]
+                    ))
+                })?
+            }
+            _ => *self.shape().first().ok_or_else(|| {
+                Error::InvalidOperation("copy_to_flat: tensor has an empty shape".into())
+            })?,
+        };
+        if rows == 0 || !tight_bytes.is_multiple_of(rows) {
+            return Err(Error::InvalidOperation(format!(
+                "copy_to_flat: tight footprint {tight_bytes} does not divide \
+                 into {rows} rows"
+            )));
+        }
+        let row_bytes = tight_bytes / rows;
+        let need = (rows - 1)
+            .checked_mul(stride)
+            .and_then(|b| b.checked_add(row_bytes))
+            .ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "copy_to_flat: stride {stride} × rows {rows} overflows usize"
+                ))
+            })?;
+        if src.len() < need {
+            return Err(Error::InvalidOperation(format!(
+                "copy_to_flat: mapped {} bytes but strided rows need {need}",
+                src.len()
+            )));
+        }
+        for r in 0..rows {
+            dst[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&src[r * stride..r * stride + row_bytes]);
+        }
+        Ok(())
+    }
+
     /// Set the row stride in bytes for externally allocated buffers with
     /// row padding (e.g. V4L2 or GStreamer allocators).
     ///

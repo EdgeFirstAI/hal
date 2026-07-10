@@ -455,6 +455,260 @@ pub unsafe extern "C" fn hal_tensor_from_iosurface(
     set_error_null(libc::ENOTSUP)
 }
 
+/// Wrap an existing AHardwareBuffer as a tensor (Android only).
+///
+/// The buffer is acquired (refcounted) for the tensor's lifetime; the
+/// caller keeps its own reference and releases it independently
+/// (AHardwareBuffer_release). The Android analog of
+/// hal_tensor_from_iosurface().
+///
+/// Use this to import buffers from CameraX/ImageReader (via
+/// AHardwareBuffer from the Java HardwareBuffer's JNI handle), NNAPI, or
+/// cross-process binder transfers. A wrapped buffer carries a shape but
+/// no image metadata — call hal_tensor_set_format() (and, when the
+/// producer pads rows, hal_tensor_set_row_stride()) before convert().
+///
+/// **GL backend interaction**: the resulting tensor reports
+/// HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by the
+/// GL backend as an EGLImage with no extra copy.
+///
+/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
+/// @param buffer Pointer to a valid AHardwareBuffer (typed as void*)
+/// @param shape Array of dimension sizes (ndim elements). The footprint
+///              must fit the buffer's allocation; HAL rejects mismatched
+///              shapes with EINVAL rather than risking out-of-bounds maps.
+/// @param ndim Number of dimensions (1-8)
+/// @param name Optional tensor name for debugging (can be NULL)
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL shape, NULL buffer, ndim outside [1, 8], or shape
+///   footprint exceeds the buffer allocation
+/// - EIO: Failed to acquire/describe the AHardwareBuffer
+/// - ENOTSUP: Not supported on this platform (non-Android)
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_from_hardware_buffer(
+    dtype: HalDtype,
+    buffer: *mut std::ffi::c_void,
+    shape: *const size_t,
+    ndim: size_t,
+    name: *const c_char,
+) -> *mut HalTensor {
+    check_null_ret_null!(shape, buffer);
+    if ndim == 0 || ndim > 8 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
+    let name_opt = unsafe { c_str_to_option(name) };
+    let dt: DType = dtype.into();
+
+    let tensor = try_or_null!(
+        unsafe { TensorDyn::from_hardware_buffer(buffer, shape_slice, dt, name_opt) },
+        libc::EIO
+    );
+    Box::into_raw(Box::new(HalTensor { inner: tensor }))
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_from_hardware_buffer(
+    _dtype: HalDtype,
+    _buffer: *mut std::ffi::c_void,
+    _shape: *const size_t,
+    _ndim: size_t,
+    _name: *const c_char,
+) -> *mut HalTensor {
+    set_error_null(libc::ENOTSUP)
+}
+
+/// Borrow the raw AHardwareBuffer backing a tensor (Android only).
+///
+/// The NPU-direct handle: pass it to
+/// ANeuralNetworksMemory_createFromAHardwareBuffer (NNAPI) or a LiteRT
+/// delegate so the accelerator consumes the convert output with no CPU
+/// readback. When hal_image_processor_convert() returns, the GPU has
+/// finished writing and the handle is safe to hand off (see
+/// hal_image_processor_convert_fence() for the non-blocking variant).
+/// Check hal_tensor_recorded_row_stride() first: a nonzero value means
+/// the rows are padded and a flat-layout consumer needs
+/// hal_tensor_copy_to_flat() instead.
+///
+/// The returned pointer is borrowed; its lifetime is tied to the tensor
+/// handle. If it must outlive the tensor, call AHardwareBuffer_acquire()
+/// and pair it with AHardwareBuffer_release().
+///
+/// @param tensor Tensor handle
+/// @return Borrowed AHardwareBuffer pointer (typed as void*) on success,
+///         NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+/// - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_ptr(
+    tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    match unsafe { &*tensor }.inner.hardware_buffer_ptr() {
+        Some(ptr) => ptr,
+        None => {
+            set_error(libc::ENOTSUP);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_ptr(
+    _tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    set_error(libc::ENOTSUP);
+    std::ptr::null_mut()
+}
+
+/// Physical AHardwareBuffer dimensions in texels (Android only).
+///
+/// Independent of the logical tensor shape: packed representations (the
+/// planar-F16 RGBA16F surface, the RGB-in-RGBA8888 surface) allocate at
+/// packed dims, and gralloc chooses its own pitch. NPU consumers that
+/// describe the buffer to NNAPI need these, not the logical shape.
+///
+/// @param tensor Tensor handle
+/// @param width Out: physical width in texels (must not be NULL)
+/// @param height Out: physical height in texels (must not be NULL)
+/// @return 0 on success, -1 on error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor or NULL out-pointer
+/// - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_physical_dims(
+    tensor: *const HalTensor,
+    width: *mut size_t,
+    height: *mut size_t,
+) -> c_int {
+    check_null!(tensor, width, height);
+    match unsafe { &*tensor }.inner.hardware_buffer_physical_dims() {
+        Some((w, h)) => {
+            unsafe {
+                *width = w;
+                *height = h;
+            }
+            0
+        }
+        None => set_error(libc::ENOTSUP),
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_physical_dims(
+    _tensor: *const HalTensor,
+    _width: *mut size_t,
+    _height: *mut size_t,
+) -> c_int {
+    set_error(libc::ENOTSUP)
+}
+
+/// Recorded row stride in bytes, or 0 when the tensor is tightly packed.
+///
+/// The flatness check: a nonzero value means the allocator padded the
+/// row pitch (gralloc on Android, IOSurface 64-byte alignment on macOS,
+/// GPU pitch alignment on Linux) and the buffer is NOT flat — CPU
+/// consumers must iterate rows at this stride (or use
+/// hal_tensor_copy_to_flat()), and NPU consumers must either describe
+/// the pitch to the runtime or repack. Unlike hal_tensor_row_stride()
+/// (which reports the effective walk pitch and is nonzero for every
+/// image), 0 here positively means "no padding — the buffer is flat".
+///
+/// @param tensor Tensor handle
+/// @return Recorded stride in bytes; 0 when tightly packed or on error
+///         (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_recorded_row_stride(tensor: *const HalTensor) -> size_t {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return 0;
+    }
+    unsafe { &*tensor }.inner.row_stride().unwrap_or(0)
+}
+
+/// Effective row stride in bytes: the recorded stride if set, otherwise
+/// the tight pitch computed from the image format and width.
+///
+/// This is the pitch to walk rows with regardless of padding — the
+/// clearly-named twin of hal_tensor_row_stride() (which has returned the
+/// effective stride since EDGEAI-1176 and is kept for ABI stability).
+/// Returns 0 when the tensor has no image format and no recorded stride
+/// (a plain non-image tensor).
+///
+/// @param tensor Tensor handle
+/// @return Effective stride in bytes; 0 for non-image tensors or on
+///         error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_effective_row_stride(tensor: *const HalTensor) -> size_t {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return 0;
+    }
+    unsafe { &*tensor }
+        .inner
+        .effective_row_stride()
+        .unwrap_or(0)
+}
+
+/// Copy the tensor's logical bytes into `dst`, compacting away any
+/// recorded row-stride padding.
+///
+/// The flatness helper for NPU handoff: when hal_tensor_row_stride() is
+/// nonzero and the runtime needs a flat layout (e.g. `[1, C, H, W]` for
+/// NNAPI/LiteRT without pitch support), this walks the rows and packs
+/// them tightly into `dst`. On a tight tensor it degenerates to one
+/// memcpy. Zero-copy consumers should prefer
+/// hal_tensor_hardware_buffer_ptr() + the stride and skip this copy.
+///
+/// @param tensor Tensor handle
+/// @param dst Destination buffer (must not be NULL)
+/// @param dst_len Length of `dst` in bytes; must equal the tight
+///                footprint (shape product × element size)
+/// @return 0 on success, -1 on error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor/dst, or dst_len does not match the tight
+///   footprint
+/// - EIO: Mapping the tensor for reading failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_copy_to_flat(
+    tensor: *const HalTensor,
+    dst: *mut u8,
+    dst_len: size_t,
+) -> c_int {
+    check_null!(tensor, dst);
+    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, dst_len) };
+    match unsafe { &*tensor }.inner.copy_to_flat(dst_slice) {
+        Ok(()) => 0,
+        Err(edgefirst_tensor::Error::InvalidArgument(msg)) => {
+            log::debug!("hal_tensor_copy_to_flat: {msg}");
+            set_error(libc::EINVAL)
+        }
+        Err(e) => {
+            log::debug!("hal_tensor_copy_to_flat: {e:?}");
+            set_error(libc::EIO)
+        }
+    }
+}
+
 /// Free a tensor and release its resources.
 ///
 /// After calling this function, the tensor pointer becomes invalid.

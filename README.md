@@ -853,8 +853,66 @@ What is **not** covered by this effort (future work):
   path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
   letterbox 720p→640×640 F16 in 741 µs).
 - **Deferred zero-copy paths** — YUV camera buffers (external-OES
-  sampling), single-channel Grey/NV imports (`R8_UNORM` needs API 29),
-  and GL→NPU fence export; these fall back to CPU conversion today.
+  sampling) and single-channel Grey/NV imports (`R8_UNORM` needs
+  API 29); these fall back to CPU conversion today.
+
+### NPU-direct output (zero CPU readback)
+
+The convert destination is a real AHardwareBuffer, so an NPU runtime can
+consume it directly — no `map()`, no CPU readback:
+
+```c
+// Allocate once, reuse every frame (Rule 1). F16 NCHW model input;
+// auto-select yields an AHardwareBuffer when the GL backend is active —
+// assert hal_tensor_memory_type(dst) == HAL_TENSOR_DMA at startup.
+HalTensor* dst = hal_image_processor_create_image(
+    proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16);
+
+// One-time: hand the SAME buffer to the NPU runtime.
+AHardwareBuffer* ahb = hal_tensor_hardware_buffer_ptr(dst);
+ANeuralNetworksMemory* mem;
+ANeuralNetworksMemory_createFromAHardwareBuffer(ahb, &mem);   // NNAPI
+// (LiteRT: wrap `ahb` via TfLiteAHardwareBufferAttachment instead.)
+
+// Per frame: when convert() returns, the GPU has finished writing and
+// the handle contents are safe to execute against.
+hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE,
+                            HAL_FLIP_NONE, &letterbox);
+// ... ANeuralNetworksExecution_setInputFromMemory(exec, 0, NULL, mem, 0, bytes);
+```
+
+For a pipelined handoff that skips the blocking GPU sync entirely, use
+`hal_image_processor_convert_fence()`: it returns a sync-fence fd
+(`EGL_ANDROID_native_fence_sync`) the NPU runtime waits on instead
+(`ANeuralNetworksExecution_startComputeWithDependencies`), or `-1` with
+the work already synced on drivers without fence support.
+
+**Flatness**: gralloc chooses the row pitch and may pad it (observed on
+the S26 Ultra: 640-px planar F16 → 1536-byte rows, natural 1280). Check
+`hal_tensor_recorded_row_stride(dst)`:
+
+- `0` — the buffer IS the flat `[1, C, H, W]` stream; hand it off as-is.
+- nonzero — describe the pitch to the runtime, pick a width whose pitch
+  the device does not pad, or fall back to
+  `hal_tensor_copy_to_flat(dst, buf, len)` (~0.3 ms at 2.4 MB — still
+  cheaper than a full CPU convert, but no longer zero-copy; profile).
+
+**INT8 NPUs**: allocate the destination as `HAL_PIXEL_FORMAT_RGB` /
+`HAL_PIXEL_FORMAT_RGBA` with `HAL_DTYPE_U8` or `HAL_DTYPE_I8` (NHWC,
+zero-copy on Android via the RGBA8888 texel packing) and attach the
+model's quantization so consumers agree on the scale:
+
+```c
+hal_tensor_set_quantization(dst, /*scale=*/1.0f / 255.0f, /*zero_point=*/0);
+```
+
+The I8 path applies the `^0x80` bias in-shader during the convert — the
+buffer bytes are already signed model input.
+
+**macOS parity**: the same pattern works with
+`hal_tensor_iosurface_ref()` — wrap the IOSurface in a `CVPixelBuffer`
+(`CVPixelBufferCreateWithIOSurface`) for CoreML/ANE input; `convert()`
+returning likewise guarantees GPU completion.
 
 ### fp16 / target features
 
