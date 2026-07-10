@@ -18,15 +18,16 @@
 //!   `convert_float_to_zero_copy`, `render_float_to_zero_copy_tail` (the
 //!   dst-import/draw half, shared with the fused NV→PlanarF16 two-pass —
 //!   its source is the GPU-resident intermediate texture),
-//!   `upload_float_src`, `draw_float_quad`.
+//!   `feed_float_src`, `draw_float_quad`.
 
 use std::ffi::{c_void, CStr};
 
+use super::super::cache::{BufferImportKey, CacheKind};
 use super::super::core::float_crop_uniforms;
 use super::super::platform::GlPlatform;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Error, Flip, ResolvedCrop, Rotation};
-use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
+use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn, TensorMemory, TensorTrait};
 
 // The float render-path decision (`FloatRenderPath` + `classify_float_render`)
 // is defined once in the cfg-agnostic `gl::float_dispatch` module so the Linux
@@ -34,6 +35,30 @@ use edgefirst_tensor::{PixelFormat, TensorDyn, TensorTrait};
 // module's call sites and the `gl::tests` unit tests keep using the
 // `processor::{FloatRenderPath, classify_float_render}` paths unchanged.
 pub(in super::super) use super::super::float_dispatch::{classify_float_render, FloatRenderPath};
+
+/// How the float source reached the GPU this frame — the zero-copy
+/// telemetry primitive (see `ConvertStats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in super::super) enum FloatSrcFeed {
+    /// Zero-copy: the source's Dma buffer is the texture's storage.
+    Import,
+    /// GL-internal copy from the source PBO (no CPU visit).
+    Pbo,
+    /// CPU map + TexImage upload — the copy fallback.
+    Upload,
+}
+
+/// `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables the float-path zero-copy
+/// source import (field escape hatch — a driver that mis-renders TEXTURE_2D
+/// dma-buf attaches can fall back to the upload path without a rebuild).
+fn float_src_import_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 
 /// Decide reportable float render support. Vivante GC7000UL float readback is
 /// 170-320 ms (probe-measured) so GL float is refused there; `ImageProcessor`
@@ -145,23 +170,50 @@ pub(super) unsafe fn finish_via_fence() {
 }
 
 impl GLProcessorST {
-    /// Upload an RGBA8 source image into `camera_normal_texture` for the float
-    /// render paths (PBO and DMA F16).
+    /// Feed the RGBA8 source into `camera_normal_texture` for the float
+    /// render paths (PBO and zero-copy F16), preferring zero-copy.
     ///
-    /// Resets the texture swizzle to identity (a prior Grey/planar conversion
-    /// may have left it non-identity) and uploads either directly from the
-    /// source PBO (`src_pbo_id`, zero CPU copy) or from a mapped CPU slice
-    /// (`src_cpu_pixels`). Exactly one of `src_pbo_id` / `src_cpu_pixels` must
-    /// be `Some`; the PBO branch is preferred when both are present.
-    pub(super) fn upload_float_src(
+    /// Feed order:
+    /// 1. **Import** — a `TensorMemory::Dma` source on a zero-copy backend
+    ///    is attached as the texture's storage (EGLImage on Linux/Android,
+    ///    IOSurface pbuffer bind on macOS) through the same
+    ///    `get_or_create_egl_image(CacheKind::Src)` cache the u8 engine
+    ///    uses. No map, no upload, no per-frame cache-maintenance on the
+    ///    source buffer. NOTE the gate deliberately does NOT carry the u8
+    ///    path's `!is_dma()` exclusion (`draw_src_texture`,
+    ///    `zero_copy_attach`): on Linux `is_dma()` is true and the u8
+    ///    engine samples imports via `GL_TEXTURE_EXTERNAL_OES`, but the
+    ///    float shaders sample plain `sampler2D`, so the float path wants
+    ///    the `TEXTURE_2D` attach on Linux too. Do not "fix" the gates to
+    ///    match.
+    /// 2. **PBO** — uploaded via `GL_PIXEL_UNPACK_BUFFER` (no CPU copy; a
+    ///    PBO `map()` would deadlock the GL worker — see the caller note).
+    /// 3. **Upload** — CPU map + `TexImage2D`/`TexSubImage2D` (the
+    ///    fallback copy path; logged at debug when it follows a failed
+    ///    import).
+    ///
+    /// `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1` disables arm 1 (field escape
+    /// hatch, mirroring `EDGEFIRST_GL_NO_FLOAT_LINEAR`).
+    ///
+    /// Resets the texture swizzle to identity first (a prior Grey/planar
+    /// conversion may have left it non-identity).
+    ///
+    /// Storage-state contract (the "poison", mirroring the u8 attach at
+    /// `draw_src_texture`): after an Import, `camera_normal_texture.target`
+    /// is set to 0 so a later upload frame must re-`TexImage2D` fresh
+    /// storage — `TexSubImage2D` into an EGLImage-sibling texture would
+    /// write through into the client's live buffer. In the reverse
+    /// direction, every `TexImage2D` site already clears `bound_egl_key`
+    /// (resources.rs / the PBO arm below), so a later import frame can
+    /// never be skipped by the binding-skip cache.
+    pub(super) fn feed_float_src(
         &mut self,
-        src_tex_id: u32,
+        src_u8: &Tensor<u8>,
         src_w: usize,
         src_h: usize,
         src_filter: i32,
-        src_pbo_id: Option<u32>,
-        src_cpu_pixels: Option<&[u8]>,
-    ) {
+    ) -> crate::Result<FloatSrcFeed> {
+        let src_tex_id = self.camera_normal_texture.id;
         unsafe {
             edgefirst_gl::gl::ActiveTexture(edgefirst_gl::gl::TEXTURE0);
             edgefirst_gl::gl::BindTexture(edgefirst_gl::gl::TEXTURE_2D, src_tex_id);
@@ -195,7 +247,53 @@ impl GLProcessorST {
             ] {
                 edgefirst_gl::gl::TexParameteri(edgefirst_gl::gl::TEXTURE_2D, swizzle, comp as i32);
             }
-            if let Some(buffer_id) = src_pbo_id {
+        }
+        let _ = src_tex_id; // bound above; arms below operate on the bound unit
+
+        // ── Arm 1: zero-copy import of a Dma-backed source ──
+        if !float_src_import_disabled()
+            && self.gl_context.transfer_backend.is_zero_copy()
+            && src_u8.memory() == TensorMemory::Dma
+        {
+            let key = BufferImportKey::from_tensor(src_u8, PixelFormat::Rgba, false);
+            match self.get_or_create_egl_image(CacheKind::Src, src_u8, PixelFormat::Rgba) {
+                Ok(handle) => {
+                    // SAFETY: camera_normal_texture is bound on the active
+                    // unit (prologue above); the handle's import is owned by
+                    // the src cache.
+                    let attach = unsafe {
+                        self.camera_normal_texture
+                            .bind_egl_image(&self.gl_context, key, handle)
+                    };
+                    // Explicit glGetError: the Linux `attach_tex_image_2d`
+                    // does not check it, and some drivers (Vivante) accept
+                    // dma-buf EGLImages only on EXTERNAL_OES targets —
+                    // GL_INVALID_OPERATION here must fall back to upload,
+                    // not render garbage.
+                    match attach.and_then(|_| check_gl_error(function!(), line!())) {
+                        Ok(()) => {
+                            // Upload-poison (see doc comment): a later
+                            // upload frame must TexImage2D fresh storage.
+                            self.camera_normal_texture.target = 0;
+                            return Ok(FloatSrcFeed::Import);
+                        }
+                        Err(e) => {
+                            self.camera_normal_texture.invalidate_egl_binding();
+                            log::debug!(
+                                "float src zero-copy attach failed ({e:?}); uploading instead"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!("float src zero-copy import failed ({e:?}); uploading instead");
+                }
+            }
+        }
+
+        // ── Arm 2: PBO source (GL-internal copy, no CPU visit) ──
+        if let Some(buffer_id) = src_u8.as_pbo().map(|p| p.buffer_id()) {
+            unsafe {
                 // Upload directly from the source PBO (zero CPU copy). The PBO
                 // path allocates the same RGBA8 storage that `update_texture`
                 // would (internalformat RGBA, GL_RGBA, UNSIGNED_BYTE), so the
@@ -245,17 +343,22 @@ impl GLProcessorST {
                     );
                 }
                 edgefirst_gl::gl::BindBuffer(edgefirst_gl::gl::PIXEL_UNPACK_BUFFER, 0);
-            } else {
-                let pixels = src_cpu_pixels.expect("non-PBO source mapped by caller");
-                self.camera_normal_texture.update_texture(
-                    edgefirst_gl::gl::TEXTURE_2D,
-                    src_w,
-                    src_h,
-                    edgefirst_gl::gl::RGBA,
-                    pixels,
-                );
             }
+            return Ok(FloatSrcFeed::Pbo);
         }
+
+        // ── Arm 3: CPU map + upload (the copy fallback) ──
+        // The map happens ONLY here — a Dma source that imported above never
+        // pays the per-frame lock/sync cache maintenance.
+        let pixels = src_u8.map()?;
+        self.camera_normal_texture.update_texture(
+            edgefirst_gl::gl::TEXTURE_2D,
+            src_w,
+            src_h,
+            edgefirst_gl::gl::RGBA,
+            &pixels,
+        );
+        Ok(FloatSrcFeed::Upload)
     }
 
     /// Run the shared float full-screen-quad draw used by both the PBO and DMA
@@ -483,17 +586,6 @@ impl GLProcessorST {
         let render_tex_id = self.float_render_texture.id;
         let src_tex_id = self.camera_normal_texture.id;
 
-        // PBO sources MUST be uploaded via a GL_PIXEL_UNPACK_BUFFER binding,
-        // not `map()`: this method runs on the GL worker thread, and a PBO
-        // `map()` sends a PboMap message back to this same thread, deadlocking.
-        // Non-PBO (Mem/Dma) sources are mapped directly (no message channel).
-        let src_pbo_id = src_u8.as_pbo().map(|p| p.buffer_id());
-        let src_cpu_pixels = if src_pbo_id.is_none() {
-            Some(src_u8.map()?)
-        } else {
-            None
-        };
-
         // Source sampling filter. Both float shaders sample at output-pixel
         // centers (they add +0.5 to the integer output index before mapping to
         // the source UV), so LINEAR gives a correct bilinear resize on both
@@ -502,15 +594,12 @@ impl GLProcessorST {
         // u8 source texture, not the float render target.
         let src_filter = edgefirst_gl::gl::LINEAR as i32;
 
-        // ── Source RGBA8 texture upload (shared with the DMA F16 path) ──
-        self.upload_float_src(
-            src_tex_id,
-            src_w,
-            src_h,
-            src_filter,
-            src_pbo_id,
-            src_cpu_pixels.as_deref(),
-        );
+        // ── Source RGBA8 feed (shared with the DMA F16 path): zero-copy
+        // import when the source is Dma-backed, PBO upload, or CPU upload —
+        // see `feed_float_src`. (PBO sources must NOT be `map()`ed on this
+        // thread: a PBO map round-trips a message to this same GL worker,
+        // deadlocking — the feed checks `as_pbo()` before mapping.)
+        let _feed = self.feed_float_src(src_u8, src_w, src_h, src_filter)?;
 
         unsafe {
             // ── Float render texture + FBO ──
@@ -656,27 +745,12 @@ impl GLProcessorST {
             float_crop_uniforms(&crop, src_w, src_h, dst_w, dst_h)?;
 
         let src_tex_id = self.camera_normal_texture.id;
-
-        // PBO sources upload via GL_PIXEL_UNPACK_BUFFER (no map() — avoids a
-        // GL-thread deadlock); non-PBO sources map to CPU directly.
-        let src_pbo_id = src_u8.as_pbo().map(|p| p.buffer_id());
-        let src_cpu_pixels = if src_pbo_id.is_none() {
-            Some(src_u8.map()?)
-        } else {
-            None
-        };
         let src_filter = edgefirst_gl::gl::LINEAR as i32;
 
-        // ── Source RGBA8 texture upload (shared with the PBO F16 path) ──
-        self.upload_float_src(
-            src_tex_id,
-            src_w,
-            src_h,
-            src_filter,
-            src_pbo_id,
-            src_cpu_pixels.as_deref(),
-        );
-        drop(src_cpu_pixels);
+        // ── Source RGBA8 feed (shared with the PBO F16 path): zero-copy
+        // import when the source is Dma-backed, else PBO/CPU upload — see
+        // `feed_float_src`.
+        let _feed = self.feed_float_src(src_u8, src_w, src_h, src_filter)?;
 
         self.render_float_to_zero_copy_tail(src_tex_id, src_rect_uv, dst_rect_px, pad_color, dst)
     }

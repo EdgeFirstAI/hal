@@ -52,7 +52,7 @@ struct Cell {
     use_dma: bool,
 }
 
-const CELLS: [Cell; 4] = [
+const CELLS: [Cell; 6] = [
     Cell {
         tag: "gpu_bound",
         src_fmt: PixelFormat::Nv12,
@@ -100,6 +100,33 @@ const CELLS: [Cell; 4] = [
         letterbox: true,
         use_dma: true,
     },
+    // The RGBA→PlanarF16 DIRECT path (not the fused NV two-pass): the only
+    // cells that exercise per-frame float SOURCE feeding — zero-copy source
+    // import vs CPU map+upload (`feed_float_src`). Two sizes because the
+    // upload cost scales with source bytes (~2.5 GB/s): 720p ≈ 3.7 MB,
+    // 1080p ≈ 8.3 MB per frame on the upload path.
+    Cell {
+        tag: "f16_rgba_src",
+        src_fmt: PixelFormat::Rgba,
+        src_w: 1280,
+        src_h: 720,
+        dst_fmt: PixelFormat::PlanarRgb,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
+    Cell {
+        tag: "f16_rgba_src_1080p",
+        src_fmt: PixelFormat::Rgba,
+        src_w: 1920,
+        src_h: 1080,
+        dst_fmt: PixelFormat::PlanarRgb,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
 ];
 
 /// Run one (cell, n_procs) configuration; returns per-thread convert counts.
@@ -138,7 +165,7 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 // Pre-allocate and REUSE the destination: real pipelines pool
                 // buffers, and per-iteration allocation would measure the
                 // allocator (PBO/DMA churn) instead of convert dispatch.
-                let dst_dtype = if cell.tag == "f16_zero_copy" {
+                let dst_dtype = if cell.tag.starts_with("f16_") {
                     DType::F16
                 } else {
                     DType::U8

@@ -433,6 +433,274 @@ mod gl_tests {
         );
     }
 
+    /// RGBA gradient bytes (w*h*4) with distinct R/G/B functions and a salt —
+    /// non-uniform content so a stride/geometry/feed misread cannot pass.
+    #[cfg(feature = "dma_test_formats")]
+    fn rgba_gradient(w: usize, h: usize, salt: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                v.push(((x * 255) / w.max(1)) as u8 ^ salt);
+                v.push(((y * 255) / h.max(1)) as u8);
+                v.push((((x + y) * 255) / (w + h).max(1)) as u8);
+                v.push(255);
+            }
+        }
+        v
+    }
+
+    /// The float paths' zero-copy source import (`feed_float_src` arm 1) must
+    /// produce bit-identical output to the CPU-upload feed of the same bytes:
+    /// same shader, same filtering, only the source feed differs. Also proves
+    /// the imported source buffer is left untouched.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn float_dma_src_import_matches_upload() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            return;
+        }
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let (sw, sh, dw) = (96usize, 72usize, 64usize);
+        let bytes = rgba_gradient(sw, sh, 0);
+        let src_dma =
+            load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Dma), &bytes).unwrap();
+        let src_mem =
+            load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap();
+
+        let mut dst_a = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        let mut dst_b = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &src_dma,
+            &mut dst_a,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+        gl.convert(
+            &src_mem,
+            &mut dst_b,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        let (ma, mb) = (
+            dst_a.as_f16().unwrap().map().unwrap(),
+            dst_b.as_f16().unwrap().map().unwrap(),
+        );
+        assert_eq!(ma.as_slice().len(), mb.as_slice().len());
+        for (i, (a, b)) in ma.as_slice().iter().zip(mb.as_slice().iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "import vs upload diverged at f16 element {i}: {a} vs {b}"
+            );
+        }
+        drop((ma, mb));
+
+        // The imported source must be pristine — an attach that let a later
+        // texture operation write through would corrupt the camera's buffer.
+        let m = src_dma.as_u8().unwrap().map().unwrap();
+        let stride = src_dma.effective_row_stride().unwrap_or(sw * 4);
+        for y in 0..sh {
+            let row = &m.as_slice()[y * stride..y * stride + sw * 4];
+            assert_eq!(
+                row,
+                &bytes[y * sw * 4..(y + 1) * sw * 4],
+                "src row {y} modified"
+            );
+        }
+    }
+
+    /// Alternating Dma → Mem → Dma float frames on one processor: the
+    /// upload-poison must force fresh storage after an attach (a
+    /// TexSubImage2D into the EGLImage sibling would scribble on the Dma
+    /// buffer), and the binding-skip key must clear after an upload (a
+    /// skipped re-attach would sample stale uploaded bytes). A u8 convert is
+    /// interleaved because it shares `camera_normal_texture`.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn float_src_feed_alternating_frames() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            return;
+        }
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let (sw, sh, dw) = (96usize, 72usize, 64usize);
+        let content_a = rgba_gradient(sw, sh, 0x00);
+        let content_b = rgba_gradient(sw, sh, 0x5A);
+        let content_c = rgba_gradient(sw, sh, 0xA5);
+
+        let src_dma = load_raw_image(
+            sw,
+            sh,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            &content_a,
+        )
+        .unwrap();
+
+        let run_float = |gl: &mut GLProcessorThreaded, src: &TensorDyn| -> Vec<u16> {
+            let mut dst = TensorDyn::image(
+                dw,
+                dw,
+                PixelFormat::PlanarRgb,
+                DType::F16,
+                Some(TensorMemory::Dma),
+            )
+            .unwrap();
+            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+            let m = dst.as_f16().unwrap().map().unwrap();
+            m.as_slice().iter().map(|v| v.to_bits()).collect()
+        };
+        let reference = |gl: &mut GLProcessorThreaded, bytes: &[u8]| -> Vec<u16> {
+            let mem =
+                load_raw_image(sw, sh, PixelFormat::Rgba, Some(TensorMemory::Mem), bytes).unwrap();
+            run_float(gl, &mem)
+        };
+
+        // Frame 1: Dma source (attach arm).
+        let out1 = run_float(&mut gl, &src_dma);
+        assert_eq!(out1, reference(&mut gl, &content_a), "frame 1 (Dma A)");
+
+        // Interleaved u8 convert — crosses the shared source texture.
+        let u8_src = load_raw_image(
+            sw,
+            sh,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            &content_b,
+        )
+        .unwrap();
+        let mut u8_dst = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+        gl.convert(
+            &u8_src,
+            &mut u8_dst,
+            Rotation::None,
+            Flip::None,
+            Crop::no_crop(),
+        )
+        .unwrap();
+
+        // Frame 2: Mem source (upload arm; storage must be respecified).
+        let out2 = run_float(&mut gl, &u8_src);
+        assert_eq!(out2, reference(&mut gl, &content_b), "frame 2 (Mem B)");
+
+        // The scribble detector: frame 2's upload must NOT have written into
+        // frame 1's still-attached Dma buffer.
+        {
+            let m = src_dma.as_u8().unwrap().map().unwrap();
+            let stride = src_dma.effective_row_stride().unwrap_or(sw * 4);
+            for y in 0..sh {
+                let row = &m.as_slice()[y * stride..y * stride + sw * 4];
+                assert_eq!(
+                    row,
+                    &content_a[y * sw * 4..(y + 1) * sw * 4],
+                    "Dma source scribbled by the upload frame (row {y})"
+                );
+            }
+        }
+
+        // Frame 3: Dma source again with NEW content (re-attach must not be
+        // skipped; stale uploaded bytes must not be sampled).
+        overwrite_in_place(&src_dma, &content_c);
+        let out3 = run_float(&mut gl, &src_dma);
+        assert_eq!(out3, reference(&mut gl, &content_c), "frame 3 (Dma C)");
+    }
+
+    /// Steady-state: a fixed pool of Dma float sources must import once and
+    /// hit the src cache thereafter — the float analog of the NV pool gate.
+    #[test]
+    #[cfg(feature = "dma_test_formats")]
+    fn float_dma_src_pool_steady_state() {
+        if !is_gpu_image_buffer_available() || !is_opengl_available() {
+            eprintln!("SKIPPED: {} - no zero-copy GPU buffers or GL", function!());
+            return;
+        }
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let (sw, sh, dw) = (128usize, 96usize, 64usize);
+        const FRAMES: usize = 100;
+        let pool: Vec<TensorDyn> = (0..2)
+            .map(|i| {
+                load_raw_image(
+                    sw,
+                    sh,
+                    PixelFormat::Rgba,
+                    Some(TensorMemory::Dma),
+                    &rgba_gradient(sw, sh, i as u8),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut dst = TensorDyn::image(
+            dw,
+            dw,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(TensorMemory::Dma),
+        )
+        .unwrap();
+
+        for src in pool.iter().cycle().take(4) {
+            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let warm = gl.egl_cache_stats().unwrap();
+        for src in pool.iter().cycle().take(FRAMES) {
+            gl.convert(src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
+                .unwrap();
+        }
+        let steady = gl.egl_cache_stats().unwrap();
+        assert_eq!(
+            warm.total_misses(),
+            steady.total_misses(),
+            "float src loop performed new EGLImage imports: warm={warm:?} steady={steady:?}"
+        );
+    }
+
     /// Regression test for the repeat-convert GL_INVALID_VALUE (0x501) state
     /// leak: heap-RGBA source → two-pass packed RGB → DMA destination succeeded
     /// on the FIRST convert and failed on the SECOND on Vivante/Mali/V3D alike.
