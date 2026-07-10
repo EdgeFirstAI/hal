@@ -20,10 +20,13 @@
 //! correctness bug, not an error.
 //!
 //! The three entry points are EGL *extension* functions
-//! (`EGL_ANDROID_image_native_buffer` + `EGL_KHR_image_base`), not core
-//! EGL 1.4, so they are resolved once per process via `eglGetProcAddress`
-//! and cached — the same pattern `context.rs` uses for the Linux KHR
-//! image functions and `macos.rs` for `eglGetPlatformDisplayEXT`.
+//! (`eglGetNativeClientBufferANDROID` from
+//! `EGL_ANDROID_get_native_client_buffer`; `eglCreateImageKHR` /
+//! `eglDestroyImageKHR` from `EGL_KHR_image_base`, accepting the
+//! `EGL_ANDROID_image_native_buffer` target), not core EGL 1.4, so they
+//! are resolved once per process via `eglGetProcAddress` and cached — the
+//! same pattern `context.rs` uses for the Linux KHR image functions and
+//! `macos.rs` for `eglGetPlatformDisplayEXT`.
 //!
 //! ## Locking
 //!
@@ -49,12 +52,19 @@ use std::sync::OnceLock;
 const EGL_NATIVE_BUFFER_ANDROID: u32 = 0x3140;
 
 type FnGetNativeClientBuffer = unsafe extern "C" fn(buffer: *mut c_void) -> egl::EGLClientBuffer;
+// ABI note: `eglCreateImageKHR` (EGL_KHR_image_base) takes `const EGLint*`
+// — 32-bit attributes. Only the EGL 1.5 CORE `eglCreateImage` takes the
+// pointer-width `EGLAttrib*`. Passing a usize-stride array here would make
+// every 64-bit driver misparse the list (EGL_IMAGE_PRESERVED's value read
+// as 0 = FALSE, the next key read from TRUE's low half) — the same reason
+// the Linux funnel (`context.rs::egl_create_image_with_fallback`)
+// down-converts to `egl::Int` before calling the KHR entry point.
 type FnCreateImageKHR = unsafe extern "C" fn(
     dpy: egl::EGLDisplay,
     ctx: egl::EGLContext,
     target: u32,
     buffer: egl::EGLClientBuffer,
-    attribs: *const egl::Attrib,
+    attribs: *const egl::Int,
 ) -> egl::EGLImage;
 type FnDestroyImageKHR = unsafe extern "C" fn(dpy: egl::EGLDisplay, image: egl::EGLImage) -> u32;
 
@@ -78,7 +88,7 @@ fn fns(egl: &Egl) -> Result<&'static AhbEglFns> {
                 .get_proc_address("eglGetNativeClientBufferANDROID")
                 .ok_or_else(|| {
                     "eglGetNativeClientBufferANDROID not exported \
-                     (EGL_ANDROID_image_native_buffer missing)"
+                     (EGL_ANDROID_get_native_client_buffer missing)"
                         .to_string()
                 })?;
             let create_image_khr = egl.get_proc_address("eglCreateImageKHR").ok_or_else(|| {
@@ -143,11 +153,8 @@ pub(super) unsafe fn create_ahardwarebuffer_eglimage(
 
     // EGL_IMAGE_PRESERVED = TRUE: the buffer's existing contents MUST
     // survive the import (see module docs — absence is silent garbage).
-    let attribs: [egl::Attrib; 3] = [
-        egl::IMAGE_PRESERVED as egl::Attrib,
-        egl::TRUE as egl::Attrib,
-        egl::NONE as egl::Attrib,
-    ];
+    // EGLint-typed per the KHR signature — see the FnCreateImageKHR note.
+    let attribs: [egl::Int; 3] = [egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE];
     let image_raw = (fns.create_image_khr)(
         display.as_ptr(),
         egl::NO_CONTEXT,

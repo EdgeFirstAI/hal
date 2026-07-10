@@ -20,18 +20,35 @@
 //! ## CPU access
 //!
 //! `map()` returns `AHardwareBufferMap<T>` which holds the buffer locked
-//! (`AHardwareBuffer_lock` with `fence = -1`, blocking on any pending GPU
-//! work) and exposes the base address as a slice; `unmap()`/`Drop` calls
-//! the matching blocking unlock. Like IOSurface — and unlike Linux
-//! DMA-BUF's explicit `DMA_BUF_IOCTL_SYNC` — the lock/unlock pair carries
-//! the GPU↔CPU cache-coherency contract.
+//! (`AHardwareBuffer_lock`) and exposes the base address as a slice;
+//! `unmap()`/`Drop` performs the matching unlock. The lock/unlock pair
+//! carries the CPU **cache-coherency** contract (invalidate on lock,
+//! flush on unlock) — like IOSurface, and unlike Linux DMA-BUF's explicit
+//! `DMA_BUF_IOCTL_SYNC`.
+//!
+//! **Completion is NOT the lock's job.** For GLES-produced content the
+//! lock's implicit fencing (`fence = -1`) is driver-dependent — plain GL
+//! rendering into an EGLImage sibling does not reliably register a
+//! release fence with gralloc. GPU completion is guaranteed upstream: the
+//! GL worker issues `finish_via_fence()`/`glFinish` before `convert()`
+//! returns, and only then may the CPU map the destination. Do not remove
+//! that GL-side barrier on the assumption that the lock waits.
+//!
+//! The NDK lock contract does not document refcounted nesting (unlike
+//! `IOSurfaceLock`), and locking an already-locked buffer is undefined —
+//! so the shared handle serializes CPU locks itself: the first live map
+//! issues the FFI lock, further maps of the same buffer (e.g. a parent
+//! tensor and a `view()` sibling) reuse the same base address, and only
+//! the last unmap issues the FFI unlock.
 //!
 //! The lock usage flags must match what the buffer was allocated with
 //! (they are enum values under `CPU_READ_MASK`/`CPU_WRITE_MASK`, not
 //! independent bits), so the tensor records its allocation-time CPU flags
 //! and replays them at lock time. A buffer allocated without CPU usage
-//! (a future NPU-direct render target) refuses `map()` instead of
-//! triggering undefined behaviour.
+//! (a future NPU-direct render target) refuses `map()`, and a read-only
+//! buffer (e.g. an imported camera frame allocated without `CPU_WRITE_*`)
+//! maps for reading but panics on `as_mut_slice()` — writing through a
+//! read-only lock is undefined behaviour per the NDK contract.
 //!
 //! ## Geometry
 //!
@@ -51,6 +68,9 @@
 #![cfg(target_os = "android")]
 
 use crate::{
+    ahardwarebuffer_layout::{
+        checked_shape_bytes, desc_layout, image_format_and_bpe, AHardwareBufferDesc, FORMAT_BLOB,
+    },
     error::{Error, Result},
     packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait,
     TensorMemory, TensorTrait,
@@ -63,7 +83,7 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 // ---------------------------------------------------------------------------
@@ -72,22 +92,6 @@ use std::{
 
 /// Opaque AHardwareBuffer handle (`struct AHardwareBuffer` in the NDK).
 pub(crate) type AHardwareBufferRef = *mut c_void;
-
-/// `AHardwareBuffer_Desc` from `<android/hardware_buffer.h>`. Layout must
-/// match the NDK header exactly; `stride` is filled by
-/// `AHardwareBuffer_allocate`/`_describe` (in pixels, not bytes).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct AHardwareBufferDesc {
-    width: u32,
-    height: u32,
-    layers: u32,
-    format: u32,
-    usage: u64,
-    stride: u32,
-    rfu0: u32,
-    rfu1: u64,
-}
 
 /// `ARect` for `AHardwareBuffer_lock` (null = lock the whole buffer).
 #[repr(C)]
@@ -98,14 +102,10 @@ struct ARect {
     bottom: i32,
 }
 
-// AHardwareBuffer_Format values (subset used by the HAL).
-/// RGBA 8:8:8:8 UNORM — API 26+.
-const FORMAT_R8G8B8A8_UNORM: u32 = 1;
-/// RGBA 16:16:16:16 half-float — API 26+. The F16 NCHW render target.
-const FORMAT_R16G16B16A16_FLOAT: u32 = 0x16;
-/// Opaque byte buffer (`width` = length, `height = layers = 1`) — API 26+.
-/// The layout NNAPI uses for tensor blobs; the byte-bag allocation format.
-const FORMAT_BLOB: u32 = 0x21;
+// The AHardwareBuffer_Desc struct, format constants, and the pure layout
+// math (format table, descriptor geometry, checked shape footprints) live
+// in `ahardwarebuffer_layout.rs` — compiled and unit-tested on every host
+// (this FFI module is cfg(android) and no CI lane executes it).
 
 // AHardwareBuffer_UsageFlags (subset used by the HAL). The CPU flags are
 // enum VALUES within their masks (NEVER=0, RARELY=2, OFTEN=3), not
@@ -116,7 +116,9 @@ const USAGE_CPU_WRITE_OFTEN: u64 = 0x30;
 const USAGE_CPU_WRITE_MASK: u64 = 0xF0;
 /// Sampleable as a GPU texture (`glEGLImageTargetTexture2DOES`).
 const USAGE_GPU_SAMPLED_IMAGE: u64 = 0x100;
-/// Renderable as a GPU color attachment (FBO render target).
+/// Renderable as a GPU color attachment (FBO render target). Named
+/// `AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT` in current NDK headers;
+/// `GPU_FRAMEBUFFER` is the original (still-valid) alias, same value.
 const USAGE_GPU_FRAMEBUFFER: u64 = 0x200;
 /// Usable as a GPU data buffer; kept on BLOB allocations for the future
 /// NNAPI/LiteRT zero-copy handoff.
@@ -151,19 +153,48 @@ pub(crate) struct OwnedAHardwareBuffer {
 
 /// Inner wrapper running the actual release in Drop. The Arc means the
 /// buffer is released exactly once when the last clone drops.
+///
+/// Also owns the process-side CPU-lock state: the NDK lock contract does
+/// not document refcounted nesting (unlike `IOSurfaceLock`), and locking
+/// an already-locked buffer is undefined — so the first live map issues
+/// the FFI lock, further concurrent maps of the same buffer (a parent
+/// tensor and its `view()` siblings share this handle) reuse the recorded
+/// base address, and only the last unmap issues the FFI unlock. All maps
+/// of one buffer use the same allocation-time CPU usage flags, so the
+/// first lock's flags are valid for every nested map.
 #[derive(Debug)]
-struct AhbHandle(AHardwareBufferRef);
+struct AhbHandle {
+    ptr: AHardwareBufferRef,
+    lock: Mutex<LockState>,
+}
+
+#[derive(Debug, Default)]
+struct LockState {
+    /// Live `AHardwareBufferMap`s on this buffer.
+    count: usize,
+    /// Base address returned by the (single) FFI lock while `count > 0`.
+    base: *mut c_void,
+}
 
 // SAFETY: AHardwareBuffer is a thread-safe, refcounted kernel object; the
 // pointer may be shared and released from any thread (same contract as
-// `IoSurfaceHandle`).
+// `IoSurfaceHandle`). The lock state is Mutex-guarded.
 unsafe impl Send for AhbHandle {}
 unsafe impl Sync for AhbHandle {}
 
+impl AhbHandle {
+    fn new(ptr: AHardwareBufferRef) -> Self {
+        Self {
+            ptr,
+            lock: Mutex::new(LockState::default()),
+        }
+    }
+}
+
 impl Drop for AhbHandle {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { AHardwareBuffer_release(self.0) };
+        if !self.ptr.is_null() {
+            unsafe { AHardwareBuffer_release(self.ptr) };
         }
     }
 }
@@ -185,7 +216,7 @@ impl OwnedAHardwareBuffer {
         unsafe { AHardwareBuffer_describe(ptr, &mut desc) };
         Ok((
             Self {
-                inner: Arc::new(AhbHandle(ptr)),
+                inner: Arc::new(AhbHandle::new(ptr)),
             },
             desc,
         ))
@@ -218,39 +249,68 @@ impl OwnedAHardwareBuffer {
         AHardwareBuffer_describe(ptr, &mut desc);
         Ok((
             Self {
-                inner: Arc::new(AhbHandle(ptr)),
+                inner: Arc::new(AhbHandle::new(ptr)),
             },
             desc,
         ))
     }
 
     pub(crate) fn as_ptr(&self) -> AHardwareBufferRef {
-        self.inner.0
+        self.inner.ptr
     }
-}
 
-/// Bytes-per-element for a known AHardwareBuffer pixel format, or `None`
-/// for formats the HAL cannot CPU-map linearly (multi-planar YUV etc.).
-fn format_bpe(format: u32) -> Option<usize> {
-    match format {
-        FORMAT_R8G8B8A8_UNORM => Some(4),
-        FORMAT_R16G16B16A16_FLOAT => Some(8),
-        FORMAT_BLOB => Some(1),
-        _ => None,
+    /// Acquire the (refcounted) CPU lock — see [`AhbHandle`]. Returns the
+    /// buffer's base address. Every successful call must be balanced by
+    /// exactly one [`Self::unlock_shared`].
+    fn lock_shared(&self, cpu_usage: u64) -> Result<*mut c_void> {
+        let mut st = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if st.count > 0 {
+            st.count += 1;
+            return Ok(st.base);
+        }
+        let mut base: *mut c_void = std::ptr::null_mut();
+        // fence = -1: no explicit acquire fence. This is a cache-coherency
+        // barrier only — GPU completion for GLES-produced content is
+        // guaranteed by the GL worker's finish/fence before convert()
+        // returns, NOT by this lock (see the module docs).
+        let rc = unsafe {
+            AHardwareBuffer_lock(self.inner.ptr, cpu_usage, -1, std::ptr::null(), &mut base)
+        };
+        if rc != 0 {
+            return Err(Error::IoError(std::io::Error::other(format!(
+                "AHardwareBuffer_lock failed (rc={rc})"
+            ))));
+        }
+        if base.is_null() {
+            // Balance the successful lock before erroring.
+            unsafe { AHardwareBuffer_unlock(self.inner.ptr, std::ptr::null_mut()) };
+            return Err(Error::IoError(std::io::Error::other(
+                "AHardwareBuffer_lock returned a null address",
+            )));
+        }
+        st.base = base;
+        st.count = 1;
+        Ok(base)
     }
-}
 
-/// Byte pitch + allocation size derived from a (post-allocation)
-/// descriptor. BLOB buffers are `width` bytes with a single "row".
-fn desc_layout(desc: &AHardwareBufferDesc) -> Option<(usize, usize)> {
-    let bpe = format_bpe(desc.format)?;
-    if desc.format == FORMAT_BLOB {
-        let len = desc.width as usize;
-        return Some((len, len));
+    /// Release one refcount taken by [`Self::lock_shared`]; the last
+    /// release performs the FFI unlock (null fence pointer = synchronous:
+    /// flushes CPU caches before returning).
+    fn unlock_shared(&self) {
+        let mut st = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
+        match st.count {
+            0 => log::error!("unbalanced AHardwareBuffer unlock (count already 0)"),
+            1 => {
+                let rc = unsafe { AHardwareBuffer_unlock(self.inner.ptr, std::ptr::null_mut()) };
+                if rc != 0 {
+                    log::error!("AHardwareBuffer_unlock failed (rc={rc})");
+                }
+                st.count = 0;
+                st.base = std::ptr::null_mut();
+            }
+            _ => st.count -= 1,
+        }
     }
-    let bytes_per_row = (desc.stride as usize).checked_mul(bpe)?;
-    let buf_size = bytes_per_row.checked_mul(desc.height as usize)?;
-    Some((bytes_per_row, buf_size))
 }
 
 #[derive(Debug)]
@@ -290,10 +350,7 @@ where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
     fn new(shape: &[usize], name: Option<&str>) -> Result<Self> {
-        let byte_size = shape
-            .iter()
-            .product::<usize>()
-            .saturating_mul(std::mem::size_of::<T>());
+        let byte_size = checked_shape_bytes::<T>(shape)?;
         Self::new_with_byte_size(shape, byte_size, name)
     }
 
@@ -369,11 +426,12 @@ where
             return Err(Error::InvalidSize(0));
         }
         let needed = checked_shape_bytes::<T>(shape)?;
-        if needed > self.buf_size {
-            return Err(Error::InsufficientCapacity {
-                needed,
-                capacity: self.buf_size,
-            });
+        // A viewed tensor's window is what remains past its offset — a
+        // shape that fits the whole buffer but not the window would then
+        // fail at map() time; reject it here instead.
+        let capacity = self.buf_size.saturating_sub(self.view_offset);
+        if needed > capacity {
+            return Err(Error::InsufficientCapacity { needed, capacity });
         }
         self.shape = shape.to_vec();
         Ok(())
@@ -425,23 +483,6 @@ where
             view_offset: abs_offset,
         })
     }
-}
-
-/// Byte footprint of `shape` for element type `T`, with overflow-checked
-/// arithmetic — a shape whose element product (or its byte size) wraps
-/// `usize` must be rejected, not allowed to slip past a capacity check and
-/// produce an out-of-bounds map later.
-fn checked_shape_bytes<T>(shape: &[usize]) -> Result<usize> {
-    shape
-        .iter()
-        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-        .and_then(|n| n.checked_mul(std::mem::size_of::<T>()))
-        .ok_or_else(|| {
-            Error::InvalidShape(format!(
-                "shape footprint overflows usize (shape={shape:?}, sizeof T={})",
-                std::mem::size_of::<T>()
-            ))
-        })
 }
 
 impl<T> AHardwareBufferTensor<T>
@@ -801,6 +842,11 @@ where
     byte_size_override: Option<usize>,
     _marker: PhantomData<T>,
     locked: bool,
+    /// Whether the buffer's CPU usage includes a write flag. Writing
+    /// through a lock without CPU_WRITE is undefined behaviour per the
+    /// NDK contract, so the mutable accessors panic instead (a read-only
+    /// imported camera buffer maps fine for reading).
+    writable: bool,
 }
 
 // SAFETY: the locked base address stays valid until unlock, and
@@ -880,26 +926,10 @@ where
                 capacity: window,
             });
         }
-        let mut base: *mut c_void = std::ptr::null_mut();
-        // fence = -1: no acquire fence to wait on beyond the buffer's own
-        // implicit fencing — the lock blocks until pending GPU work that
-        // wrote the buffer completes (the coherency contract, mirroring
-        // IOSurfaceLock).
-        let rc = unsafe {
-            AHardwareBuffer_lock(buffer.as_ptr(), cpu_usage, -1, std::ptr::null(), &mut base)
-        };
-        if rc != 0 {
-            return Err(Error::IoError(std::io::Error::other(format!(
-                "AHardwareBuffer_lock failed (rc={rc})"
-            ))));
-        }
-        let base_ptr = NonNull::new(base).ok_or_else(|| {
-            // Balance the successful lock before erroring.
-            unsafe { AHardwareBuffer_unlock(buffer.as_ptr(), std::ptr::null_mut()) };
-            Error::IoError(std::io::Error::other(
-                "AHardwareBuffer_lock returned a null address",
-            ))
-        })?;
+        // Refcounted lock (see `AhbHandle`): the first live map issues the
+        // FFI lock; nested maps of the same buffer reuse its base address.
+        let base = buffer.lock_shared(cpu_usage)?;
+        let base_ptr = NonNull::new(base).expect("lock_shared validates the base address");
         // A sub-view window starts `view_offset` bytes into the locked
         // buffer (bounds-checked above). Advance the exposed base and
         // shrink the remaining-window bound so the `deref` length check is
@@ -914,6 +944,7 @@ where
             byte_size_override,
             _marker: PhantomData,
             locked: true,
+            writable: cpu_usage & USAGE_CPU_WRITE_MASK != 0,
         })
     }
 
@@ -939,12 +970,9 @@ where
 
     fn unmap(&mut self) {
         if self.locked {
-            // Null fence pointer = synchronous unlock: flushes CPU caches
-            // and blocks until the buffer is safe for GPU consumption.
-            let rc = unsafe { AHardwareBuffer_unlock(self.buffer.as_ptr(), std::ptr::null_mut()) };
-            if rc != 0 {
-                log::error!("AHardwareBuffer_unlock failed (rc={rc})");
-            }
+            // Releases one refcount; the last live map performs the
+            // synchronous FFI unlock (flushing CPU caches).
+            self.buffer.unlock_shared();
             self.locked = false;
         }
     }
@@ -982,6 +1010,14 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
+        // Writing through a lock whose buffer lacks CPU_WRITE usage is
+        // undefined behaviour per the NDK contract — panic with a clear
+        // message instead (read-only imported camera buffers hit this).
+        assert!(
+            self.writable,
+            "AHardwareBufferMap: buffer was allocated/imported without CPU_WRITE usage; \
+             mutable access would be undefined behaviour"
+        );
         let ptr = self.base_ptr.as_ptr() as *mut T;
         let len = self.elem_count();
         // Symmetric with `Deref::deref` — an oversized mutable write must
@@ -1010,41 +1046,13 @@ where
 // (PixelFormat, DType) → AHardwareBuffer format mapping
 // ---------------------------------------------------------------------------
 
-/// AHardwareBuffer format + bytes-per-element mapping for image-formatted
-/// buffers, keyed on `(PixelFormat, DType)`. **This function is the single
-/// source of truth for the mapping** — the image crate's Android GL
-/// backend reads it via [`image_ahardwarebuffer_layout`]; keep the two
-/// layers in sync by not duplicating this table (the same rule that
-/// prevents the macOS R↔B drift documented in `iosurface.rs`).
-///
-/// Combinations not listed have no zero-copy path on Android today and
-/// fall back to SHM/Mem + CPU conversion:
-///
-/// * `Grey`/`Nv12`/`Nv16`/`Nv24` u8 — the single-channel
-///   `AHARDWAREBUFFER_FORMAT_R8_UNORM` requires API 29; the HAL floor is
-///   26. Zero-copy Grey/NV on 29+ is a planned follow-up together with
-///   the external-OES YUV sampling path.
-/// * `Bgra` u8 — AHardwareBuffer has no BGRA format; mapping it to RGBA
-///   would silently swap R↔B (the exact macOS footgun).
-/// * `Yuyv` u8 — no packed-4:2:2 AHardwareBuffer format exists.
-fn image_format_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
-    match (format, dtype) {
-        (PixelFormat::Rgba, DType::U8) => Some((FORMAT_R8G8B8A8_UNORM, 4)),
-        // The F16 zero-copy path: RGBA16F, both as a packed RGBA image and
-        // as the 4-elements-per-pixel packing of planar `[C, H, W]` f16
-        // streams (surface sized via `packed_rgba16f_layout`).
-        (PixelFormat::Rgba | PixelFormat::PlanarRgb | PixelFormat::PlanarRgba, DType::F16) => {
-            Some((FORMAT_R16G16B16A16_FLOAT, 8))
-        }
-        _ => None,
-    }
-}
-
 /// Public re-export of the `(PixelFormat, DType) → (AHardwareBuffer
 /// format, bytes-per-element)` mapping for callers in other crates
 /// (specifically the `edgefirst-image` Android GL backend). Returns `None`
-/// when the pair has no AHardwareBuffer mapping (see
-/// [`image_format_and_bpe`] for the rationale per format).
+/// when the pair has no AHardwareBuffer mapping. The table itself lives in
+/// the host-tested [`ahardwarebuffer_layout`](crate::ahardwarebuffer_layout)
+/// module (single source of truth — see its docs for the per-format
+/// rationale).
 pub fn image_ahardwarebuffer_layout(format: PixelFormat, dtype: DType) -> Option<(u32, usize)> {
     image_format_and_bpe(format, dtype)
 }

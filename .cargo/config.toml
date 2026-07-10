@@ -48,10 +48,20 @@ rustflags = ["-C", "target-feature=+fp16,+dotprod,+i8mm"]
 # without those extensions, so baking them would SIGILL on real older
 # hardware.
 #
-# No linker entries live here either: builds go through `cargo ndk`
+# No linker PATH entries live here: builds go through `cargo ndk`
 # (cargo-ndk), which supplies the NDK's API-26 clang linker and sysroot
 # — that sysroot is what resolves the `#[link(name = "nativewindow")]`
 # AHardwareBuffer symbols and the runtime-dlopen'd libEGL. See
 # scripts/build-android.sh.
+#
+# max-page-size=16384: Google Play requires 16 KB page-size support for
+# apps targeting Android 15+, and devices with 16 KB kernels refuse to
+# load 4 KB-aligned shared objects. NDK r28 makes this the default; r27
+# (the CI pin) still defaults to 4 KB, so bake it here — it is
+# backward-compatible with 4 KB-page devices and matters for the
+# `edgefirst-hal-capi` cdylib (the future JNI library).
 [target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
 [target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

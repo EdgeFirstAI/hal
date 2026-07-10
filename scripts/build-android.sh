@@ -69,6 +69,11 @@ for abi in "${ABIS[@]}"; do
     SO="${HAL_ROOT}/target/${triple}/release/libedgefirst_hal.so"
     if [[ -f "${SO}" ]]; then
         echo "    JNI library: $(du -h "${SO}" | cut -f1) ${SO}"
+    else
+        # cargo succeeding but the expected artifact missing means the
+        # crate/library name drifted — fail loudly, never print SUCCESS.
+        echo "error: expected JNI library not produced: ${SO}" >&2
+        exit 1
     fi
 done
 

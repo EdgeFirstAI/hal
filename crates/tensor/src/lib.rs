@@ -28,6 +28,11 @@ wraps `Tensor<T>` for runtime element-type dispatch.
  */
 #[cfg(target_os = "android")]
 mod ahardwarebuffer;
+// Pure AHardwareBuffer layout logic (format table, descriptor geometry,
+// overflow-checked shape math) — cfg-free so it compiles and unit-tests
+// on every host; the android module above consumes it.
+#[allow(dead_code)]
+mod ahardwarebuffer_layout;
 pub mod colorimetry;
 pub mod covguard;
 mod cuda;
@@ -1248,13 +1253,18 @@ where
                     }
                     #[cfg(target_os = "android")]
                     {
-                        // Android: Try AHardwareBuffer -> Mem. AHardwareBuffer is
-                        // the GPU/NPU-shareable backend (zero-copy via EGLImage),
-                        // filling the same role as DMA-BUF on Linux.
-                        match AHardwareBufferTensor::<T>::new(shape, name) {
-                            Ok(tensor) => Ok(TensorStorage::Dma(tensor)),
-                            Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
-                        }
+                        // Android: Mem. Unlike macOS (where a byte-bag
+                        // IOSurface is still GL-importable as R8) a generic
+                        // BLOB AHardwareBuffer cannot back a GPU texture, so
+                        // auto-selecting it buys nothing and costs plenty: a
+                        // gralloc allocator-HAL ioctl per allocation (orders
+                        // slower than malloc, ≥1 page + a dmabuf fd even for
+                        // tiny tensors) and a lock/unlock cache-maintenance
+                        // round trip on every map(). Zero-copy image tensors
+                        // come from `Tensor::image(..)`; callers that want a
+                        // BLOB (NNAPI handoff) request `TensorMemory::Dma`
+                        // explicitly.
+                        MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
                     }
                     #[cfg(all(
                         unix,

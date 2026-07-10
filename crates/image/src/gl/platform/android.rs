@@ -27,6 +27,18 @@
 //! dummy pbuffer, made current once and held for the worker thread's
 //! life) is the [`super::angle`] shape, productized from the validated
 //! Phase-1 probe (`hal-mobile/crates/edgefirst-android-probe`).
+//!
+//! ## Lifecycle caveat: GPU reset / context loss
+//!
+//! Because the HAL renders offscreen (no window surface), ordinary app
+//! backgrounding does NOT invalidate anything here. A GPU reset /
+//! `EGL_CONTEXT_LOST`, however, would poison the leaked shared display,
+//! every per-processor context, and all cached EGLImages with no rebuild
+//! path — the same (rare, catastrophic) stance as the Linux and macOS
+//! backends, but statistically more likely on mobile. Detection and
+//! rebuild are a known follow-up shared across platforms; embedding apps
+//! that must survive GPU resets should recreate their `ImageProcessor`
+//! in a fresh process.
 
 use super::super::{ahardwarebuffer_import, Egl};
 use super::GlPlatform;
@@ -203,6 +215,24 @@ fn init_shared_display() -> Result<SharedAndroidDisplay> {
                 .into_owned()
         }
     };
+    // GL_OES_EGL_image is the extension behind glEGLImageTargetTexture2DOES
+    // — the ONLY way any AHardwareBuffer reaches the GPU here. Universal on
+    // Android GLES drivers, but if it were ever absent the attach call
+    // would be a null function pointer (segfault); fail the display
+    // bring-up cleanly instead so the engine falls back to CPU.
+    if !extensions
+        .split_ascii_whitespace()
+        .any(|e| e == "GL_OES_EGL_image")
+    {
+        let _ = egl.make_current(display, None, None, None);
+        let _ = egl.destroy_surface(display, dummy);
+        let _ = egl.destroy_context(display, context);
+        return Err(Error::NotSupported(
+            "GL_OES_EGL_image not exposed by this driver — the AHardwareBuffer \
+             import path cannot work"
+                .into(),
+        ));
+    }
     let supports_f32_color = extensions
         .split_ascii_whitespace()
         .any(|e| e == "GL_EXT_color_buffer_float");
