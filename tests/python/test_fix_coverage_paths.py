@@ -38,8 +38,14 @@ def fix_mod():
         ("foo.py", "tests/foo.py"),
         ("tests/python/test_foo.py", "tests/python/test_foo.py"),
         ("crates/python/src/lib.rs", "crates/python/src/lib.rs"),
-        (".github/scripts/fix_coverage_paths.py", ".github/scripts/fix_coverage_paths.py"),
-        ("./scripts/decoder_generate_fixture.py", "scripts/decoder_generate_fixture.py"),
+        (
+            ".github/scripts/fix_coverage_paths.py",
+            ".github/scripts/fix_coverage_paths.py",
+        ),
+        (
+            "./scripts/decoder_generate_fixture.py",
+            "scripts/decoder_generate_fixture.py",
+        ),
         ("./foo.py", "tests/foo.py"),
     ],
 )

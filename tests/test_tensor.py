@@ -262,6 +262,10 @@ def test_shm_no_fd_leaks():
 def tensor_from_fd_func(mem_type: TensorMemory):
     try:
         original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        # Probe .fd here too: some backends for this memory type construct
+        # fine but have no fd (e.g. macOS DMA is IOSurface-backed, whose
+        # clone_fd is NotImplemented — use surface_id() instead).
+        os.close(original.fd)
     except (AttributeError, RuntimeError):
         pytest.skip(f"{mem_type} memory not supported on this platform")
 
@@ -768,7 +772,9 @@ def test_view_partitions_image_via_numpy():
     from edgefirst_hal import Region
 
     # 4x2 RGBA image → shape [H=2, W=4, C=4]; each row is one band.
-    parent = Tensor.image(4, 2, format=PixelFormat.Rgba, mem=TensorMemory.MEM, access="readwrite")
+    parent = Tensor.image(
+        4, 2, format=PixelFormat.Rgba, mem=TensorMemory.MEM, access="readwrite"
+    )
     top = parent.view(Region(0, 0, 4, 1))
     bot = parent.view(Region(0, 1, 4, 1))
     assert top.shape == [1, 4, 4]
@@ -787,7 +793,9 @@ def test_view_rejects_out_of_bounds():
     """A region exceeding the image bounds is rejected at view() creation."""
     from edgefirst_hal import Region
 
-    parent = Tensor.image(8, 8, format=PixelFormat.Rgba, mem=TensorMemory.MEM, access="readwrite")
+    parent = Tensor.image(
+        8, 8, format=PixelFormat.Rgba, mem=TensorMemory.MEM, access="readwrite"
+    )
     with pytest.raises((ValueError, RuntimeError)):
         parent.view(Region(0, 0, 9, 8))
     # An in-bounds region is accepted.
