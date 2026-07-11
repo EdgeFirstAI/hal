@@ -392,7 +392,9 @@ def test_mem_tight_buffer_protocol_contiguous():
     """A tight (non-padded) image tensor still exposes a plain C-contiguous
     buffer — the strided exposure must only engage for padded backings."""
     w, h, c = 600, 400, 3
-    t = Tensor.image(w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite")
+    t = Tensor.image(
+        w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
+    )
     assert t.row_stride == w * c, "Mem image must be tightly packed"
     ref = (np.arange(h * w * c, dtype=np.uint8) % 251).reshape(h, w, c)
     t.from_numpy(ref)
@@ -488,7 +490,9 @@ def test_create_image_formats():
 def test_create_image_dtype_i8():
     """Test create_image with dtype='int8'."""
     converter = ImageProcessor()
-    img = converter.create_image(320, 240, PixelFormat.Rgb, dtype="int8", access="readwrite")
+    img = converter.create_image(
+        320, 240, PixelFormat.Rgb, dtype="int8", access="readwrite"
+    )
     assert img.width == 320
     assert img.height == 240
     assert img.format == PixelFormat.Rgb
@@ -498,7 +502,9 @@ def test_create_image_dtype_i8():
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
-    dst = converter.create_image(640, 640, PixelFormat.Rgb, dtype="int8", access="readwrite")
+    dst = converter.create_image(
+        640, 640, PixelFormat.Rgb, dtype="int8", access="readwrite"
+    )
     converter.convert(src, dst)
 
 
@@ -771,7 +777,9 @@ def test_decode_image_from_bytes():
     """Test decode_image with raw bytes into oversized tensor (strided)."""
     data = open("testdata/zidane.jpg", "rb").read()
     # Color JPEG decodes to its native NV12; the tensor is reconfigured to match.
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite")
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info: ImageInfo = tensor.decode_image(data)
     assert info.width == 1280
     assert info.height == 720
@@ -794,7 +802,9 @@ def test_decode_image_reuse():
     The decoder configures the tensor's format per image, so the same buffer
     is reused across a color JPEG (NV12) and a greyscale JPEG (Grey).
     """
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite")
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
 
     # First decode: zidane.jpg (1280x720) — native NV12, strided into 1920x1080
     info1 = tensor.decode_image_file("testdata/zidane.jpg")
@@ -811,7 +821,9 @@ def test_decode_image_reuse():
 
 def test_decode_image_native_format():
     """Test decode_image emits the source's native format (NV12 for color JPEG)."""
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite")
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info = tensor.decode_image_file("testdata/zidane.jpg")
     assert info.width == 1280
     assert info.height == 720
@@ -820,7 +832,9 @@ def test_decode_image_native_format():
 
 def test_decode_image_grey():
     """Test decoding into Grey format with oversized tensor."""
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey, access="readwrite")
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey, access="readwrite"
+    )
     info = tensor.decode_image_file("testdata/grey.jpg")
     assert info.width == 1024
     assert info.height == 681
@@ -913,7 +927,9 @@ def test_decode_image_strided_pixel_correctness():
         exact_y = np.frombuffer(m.numpy(), dtype=np.uint8)[: w * h].reshape(h, w).copy()
 
     # Oversized decode (strided — the common real-world path).
-    big = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite")
+    big = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info = big.decode_image_file("testdata/zidane.jpg")
 
     # Extract the decoded luma sub-region via map() and the reported row stride.
