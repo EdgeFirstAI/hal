@@ -57,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Device Farm validation cells** for the access/compression/identity
   surface: CPU-usage sweep, write-combined mapping bench, hardware-only
   map contract, getId-interning window, and compressed-render
-  round-trip (`edgefirst-android-validation`).
+  round-trip (internal hal-mobile Device Farm harness).
 - **Android support: AHardwareBuffer zero-copy tensor storage and a native
   OpenGL ES backend** (min API 26, `aarch64-linux-android` +
   `x86_64-linux-android`). Android becomes the third `GlPlatform`
@@ -77,13 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `EGL_ANDROID_image_native_buffer` with **persistent** texture bindings
     (like Linux DMA-BUF, so the binding-skip cache applies). New
     `TransferBackend::AHardwareBuffer`.
-  - **`edgefirst-android-validation`** crate: link-closure staticlib plus
-    C-ABI entry points that run the real `ImageProcessor` on-device (GL-vs-
-    CPU F16 oracle, convert benchmark with a steady-state import-cache miss
-    gate) for the hal-mobile AWS Device Farm harness. New
-    `scripts/build-android.sh` and `scripts/validate-android-link.sh`, and a
-    `build-android` CI lane (clippy + build + link validation for both ABIs,
-    pinned NDK r27c).
+  - **Android build & link validation**: new `scripts/build-android.sh`
+    and `scripts/validate-android-link.sh` (links the production C API
+    staticlib against the NDK system libraries and checks the API-26
+    EGL/GLES stub exports with `llvm-nm`), and a `build-android` CI lane
+    (clippy + build + link validation for both ABIs, pinned NDK r27c).
+    On-device validation (GL-vs-CPU oracles, convert benchmarks with
+    import-cache miss gates) runs via the internal hal-mobile AWS Device
+    Farm harness.
   - Deferred follow-ups (fall back to CPU today): YUV camera buffers
     (external-OES sampling), Grey/NV single-plane zero-copy (`R8_UNORM`
     needs API 29), and shared-memory *allocation* (bionic has no

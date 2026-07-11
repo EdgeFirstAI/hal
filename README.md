@@ -848,12 +848,13 @@ cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release -p edgefirst-hal
 
 ### Link validation
 
-`scripts/validate-android-link.sh [arm64|x86_64]` builds the
-`edgefirst-android-validation` staticlib (the full HAL closure), verifies
-with `llvm-nm` that the archive carries the AHardwareBuffer references
-and that the NDK's API-26 stubs export every EGL/GLES entry point the
-runtime resolves dynamically, then links a test executable against the
-NDK system libraries. CI runs this for both ABIs on every PR
+`scripts/validate-android-link.sh [arm64|x86_64]` builds the production
+C API staticlib (`libedgefirst_hal.a` — a Rust staticlib archives the
+full HAL closure), verifies with `llvm-nm` that the archive carries the
+AHardwareBuffer references and that the NDK's API-26 stubs export every
+EGL/GLES entry point the runtime resolves dynamically, then links a test
+executable referencing real C API entry points against the NDK system
+libraries. CI runs this for both ABIs on every PR
 (`build-android` lane).
 
 What is **not** covered by this effort (future work):
@@ -862,8 +863,9 @@ What is **not** covered by this effort (future work):
   iOS. The `edgefirst-hal-capi` cdylib (`libedgefirst_hal.so`) is the
   deliverable here.
 - **Runtime validation** — on-device GL correctness and performance run
-  via the internal `hal-mobile` AWS Device Farm harness calling the
-  `edgefirst-android-validation` C-ABI entry points (`_verify`, `_bench`);
+  via the internal `hal-mobile` AWS Device Farm harness, whose validation
+  crate drives the real `ImageProcessor` through JNI (see TESTING.md
+  § Android On-Device Validation);
   the Phase-1 assessment already proved the native-GLES + AHardwareBuffer
   path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
   letterbox 720p→640×640 F16 in 741 µs).

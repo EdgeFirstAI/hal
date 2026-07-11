@@ -544,8 +544,8 @@ jobs:
   # the Android emulator would exercise SwiftShader software GL rather
   # than a real Adreno/Mali driver and add flakiness without signal.
   # On-device GL correctness and the performance gates run via the
-  # hal-mobile AWS Device Farm harness (Galaxy S26 Ultra pool) calling the
-  # crates/android-validation C-ABI entry points; see that crate's docs.
+  # internal hal-mobile AWS Device Farm harness (Galaxy S26 Ultra pool);
+  # see TESTING.md § Android On-Device Validation.
   # ===========================================================================
   build-android:
     name: Build & Link (Android)
@@ -606,9 +606,10 @@ jobs:
             -p edgefirst-hal -p edgefirst-hal-capi
 
       - name: Validate Android link closure (arm64 + x86_64)
-        # Builds the edgefirst-android-validation staticlib, verifies the
-        # AHardwareBuffer references and the NDK API-26 stub exports with
-        # llvm-nm, then links against the NDK system libraries.
+        # Links the production C API staticlib (libedgefirst_hal.a, built
+        # by the step above) against the NDK system libraries, after
+        # verifying the AHardwareBuffer references and the NDK API-26 stub
+        # exports with llvm-nm.
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |

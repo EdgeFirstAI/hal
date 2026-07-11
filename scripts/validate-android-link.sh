@@ -4,11 +4,13 @@
 #
 # Validate the Android link closure of the EdgeFirst HAL.
 #
-# Builds the `edgefirst-android-validation` staticlib (which archives the
-# full HAL dependency closure into one `.a`), then links a trivial `main.c`
-# against it + the NDK system-library stubs (`libnativewindow`, `libandroid`,
-# `liblog`) that the HAL references via `#[link(name = "nativewindow")]`.
-# A clean link proves the native symbol closure is complete.
+# Builds the PRODUCTION C API staticlib (`edgefirst-hal-capi` →
+# `libedgefirst_hal.a`; a Rust staticlib archives the full dependency
+# closure into one `.a`), then links a trivial `main.c` that references
+# real C API entry points against it + the NDK system-library stubs
+# (`libnativewindow`, `libandroid`, `liblog`) that the HAL references via
+# `#[link(name = "nativewindow")]`. A clean link proves the native symbol
+# closure of the shipped artifact is complete.
 #
 # Because EGL/GLES symbols are resolved at RUNTIME (`libloading` dlopen of
 # libEGL.so + `eglGetProcAddress`), the Rust staticlib has NO link-time
@@ -18,9 +20,10 @@
 # minimum API level. (The NDK stubs mirror the platform's exported ABI per
 # API level, so this catches "symbol needs a newer API" statically.)
 #
-# Runtime EGL bring-up on a device runs via the hal-mobile Device Farm
-# harness calling this crate's `edgefirst_android_validation_verify`/
-# `_bench` entry points — out of scope for this script.
+# Runtime GL correctness and performance run on-device via the internal
+# hal-mobile Device Farm harness (its `edgefirst-android-validation`
+# crate drives the real ImageProcessor through JNI) — out of scope for
+# this script.
 #
 # Usage:
 #   scripts/validate-android-link.sh arm64    # aarch64-linux-android (device)
@@ -121,14 +124,14 @@ for f in "${CLANG}" "${LLVM_NM}" "${SYSROOT_LIBS}/libEGL.so" \
     fi
 done
 
-# --- Build the validation staticlib -----------------------------------------
+# --- Build the C API staticlib ------------------------------------------------
 
-echo "==> cargo ndk -t ${NDK_ABI} -P ${API_LEVEL} build --release -p edgefirst-android-validation"
+echo "==> cargo ndk -t ${NDK_ABI} -P ${API_LEVEL} build --release -p edgefirst-hal-capi"
 cd "${HAL_ROOT}"
 ANDROID_NDK_HOME="${NDK}" cargo ndk -t "${NDK_ABI}" -P "${API_LEVEL}" \
-    build --release -p edgefirst-android-validation
+    build --release -p edgefirst-hal-capi
 
-STATIC_LIB="${HAL_ROOT}/target/${TRIPLE}/release/libedgefirst_android_validation.a"
+STATIC_LIB="${HAL_ROOT}/target/${TRIPLE}/release/libedgefirst_hal.a"
 if [[ ! -f "${STATIC_LIB}" ]]; then
     echo "error: staticlib not produced: ${STATIC_LIB}" >&2
     exit 1
@@ -138,8 +141,10 @@ echo "    staticlib: $(du -h "${STATIC_LIB}" | cut -f1) ${STATIC_LIB}"
 # --- nm symbol checks ---------------------------------------------------------
 #
 # (1) The staticlib must carry UNDEFINED references to the AHardwareBuffer
-#     entry points — that is what makes `-lnativewindow` at the link step
-#     load-bearing (see the force_closure doc in the crate).
+#     entry points — a Rust staticlib archives every dependency object, so
+#     the tensor crate's Android FFI must show up here. If these refs
+#     vanish, the android module fell out of the build and the link step
+#     below would pass vacuously.
 echo "==> llvm-nm: staticlib references the AHardwareBuffer entry points"
 # Capture once: piping llvm-nm straight into `grep -q` under pipefail turns
 # grep's early-exit SIGPIPE into a spurious pipeline failure.
@@ -186,23 +191,39 @@ echo "    all runtime entry points exported at API ${API_LEVEL}"
 
 # --- Link step ---------------------------------------------------------------
 #
-# Link a main.c that CALLS `edgefirst_android_validation_force_closure()`
-# against the Rust staticlib + the NDK system libraries. The call is what
-# makes this a real test: a static-archive member is linked only to resolve
-# an undefined symbol, so without a reference into the `.a` the linker drops
-# the entire archive and the check is a false positive.
-echo "==> link: ${TRIPLE}${API_LEVEL}-clang main.c + libedgefirst_android_validation.a"
+# Link a main.c that REFERENCES real C API entry points against the Rust
+# staticlib + the NDK system libraries. The references are what make this
+# a real test: a static-archive member is linked only to resolve an
+# undefined symbol, so without them the linker drops the entire archive
+# and the check is a false positive. The chosen entry points pull the deep
+# closure in: `hal_tensor_new_image`/`hal_tensor_from_hardware_buffer`
+# reach the AHardwareBuffer allocation/import FFI (making
+# `-lnativewindow` load-bearing) and `hal_image_processor_new` pulls the
+# whole GL engine.
+#
+# The `.a` is passed by explicit path: `-ledgefirst_hal` would prefer the
+# cdylib `libedgefirst_hal.so` sitting in the same target directory, and a
+# shared-library link defers symbol resolution to load time — silently
+# gutting the check.
+echo "==> link: ${TRIPLE}${API_LEVEL}-clang main.c + libedgefirst_hal.a"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 MAIN_C="${WORKDIR}/main.c"
 cat > "${MAIN_C}" <<'EOF'
-// Declared here (no header) to match the Rust `#[no_mangle] extern "C"`
-// export. Calling it forces the linker to pull the archive in.
-extern void edgefirst_android_validation_force_closure(void);
+// Declared here (no header, signatures irrelevant) — C linkage resolves
+// by name only, and the addresses are never called. Taking the addresses
+// forces undefined references so the linker pulls the archive members in.
+extern void hal_image_processor_new(void);
+extern void hal_tensor_new_image(void);
+extern void hal_tensor_from_hardware_buffer(void);
 int main(void) {
-    edgefirst_android_validation_force_closure();
-    return 0;
+    void (*volatile roots[])(void) = {
+        hal_image_processor_new,
+        hal_tensor_new_image,
+        hal_tensor_from_hardware_buffer,
+    };
+    return roots[0] == roots[1];
 }
 EOF
 
@@ -210,8 +231,7 @@ OUTPUT="${WORKDIR}/android-link-check-${ABI}"
 
 "${CLANG}" \
     "${MAIN_C}" \
-    -L "${HAL_ROOT}/target/${TRIPLE}/release" \
-    -ledgefirst_android_validation \
+    "${STATIC_LIB}" \
     -lnativewindow \
     -landroid \
     -llog \

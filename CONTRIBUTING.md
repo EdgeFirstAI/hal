@@ -293,8 +293,8 @@ Runs on every push and PR to `main` or `develop`:
   (device) and `x86_64-linux-android` (emulator) via `cargo-ndk` with a
   pinned NDK (r27c) at the API-26 floor — no runtime tests in CI (GitHub
   runners have no Android GPU); on-device correctness/performance is gated
-  separately by the internal Device Farm harness driving the
-  `edgefirst-android-validation` entry points. Local prerequisites:
+  separately by the internal hal-mobile Device Farm harness.
+  Local prerequisites:
   `rustup target add aarch64-linux-android x86_64-linux-android`,
   `cargo install cargo-ndk`, and an NDK (r26+) via `ANDROID_NDK_HOME`.
 - **Windows**: compile check (`cargo check`).
