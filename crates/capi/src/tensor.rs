@@ -209,13 +209,23 @@ impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
-            // Dma covers DMA-BUF on Linux, IOSurface on macOS, and
+            // Dma covers DMA-BUF on Linux, IOSurface on macOS/iOS, and
             // AHardwareBuffer on Android. On platforms without a
             // GPU-buffer backend, fall back to Mem so callers don't get a
             // misleading ENOMEM.
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
-            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            )))]
             HalTensorMemory::Dma => Some(TensorMemory::Mem),
             #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
@@ -544,9 +554,9 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
 /// - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
 ///   shape footprint exceeds the IOSurface allocation
 /// - EIO: Failed to import IOSurface (e.g. dead pointer)
-/// - ENOTSUP: Not supported on this platform (non-macOS)
+/// - ENOTSUP: Not supported on this platform (non-Apple)
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_from_iosurface(
     dtype: HalDtype,
     surface_ref: *mut std::ffi::c_void,
@@ -572,7 +582,7 @@ pub unsafe extern "C" fn hal_tensor_from_iosurface(
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_from_iosurface(
     _dtype: HalDtype,
     _surface_ref: *mut std::ffi::c_void,
@@ -1034,9 +1044,9 @@ pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c
 /// @return IOSurfaceID on success, 0 on error (check errno)
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor
-/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_iosurface_id(tensor: *const HalTensor) -> u32 {
     if tensor.is_null() {
         set_error(libc::EINVAL);
@@ -1053,13 +1063,13 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(tensor: *const HalTensor) -> u3
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u32 {
     set_error(libc::ENOTSUP);
     0
 }
 
-/// Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+/// Borrow the raw IOSurfaceRef backing a tensor (macOS/iOS only).
 ///
 /// The returned pointer is borrowed; its lifetime is tied to the tensor
 /// handle. The caller does NOT hold a retain count on the returned
@@ -1069,7 +1079,7 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u
 /// pointer without a matching CFRetain() first; that would drop the
 /// HalTensor's own retain and produce a use-after-free.
 ///
-/// Use this when you need to pass the IOSurface to a native macOS API
+/// Use this when you need to pass the IOSurface to a native Apple API
 /// (e.g. CIImage, AVSampleBufferDisplayLayer,
 /// CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
 /// without going through the IOSurfaceID indirection.
@@ -1081,9 +1091,9 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u
 ///         error. Borrowed — do NOT CFRelease without first CFRetaining.
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor
-/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_iosurface_ref(
     tensor: *const HalTensor,
 ) -> *mut std::ffi::c_void {
@@ -1102,7 +1112,7 @@ pub unsafe extern "C" fn hal_tensor_iosurface_ref(
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_iosurface_ref(
     _tensor: *const HalTensor,
 ) -> *mut std::ffi::c_void {

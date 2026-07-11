@@ -584,13 +584,13 @@ impl TensorDyn {
     }
 
     /// Wrap an externally-allocated IOSurface as a type-erased tensor
-    /// (macOS only).
+    /// (macOS/iOS only).
     ///
     /// # Safety
     ///
     /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must
     /// match the IOSurface's pixel dimensions and chosen element type.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub unsafe fn from_iosurface(
         surface_ref: *mut std::ffi::c_void,
         shape: &[usize],
@@ -632,26 +632,26 @@ impl TensorDyn {
         }
     }
 
-    /// IOSurfaceID for cross-process surface sharing (macOS only).
+    /// IOSurfaceID for cross-process surface sharing (macOS/iOS only).
     /// Returns `None` when the tensor is not IOSurface-backed.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_id(&self) -> Option<u32> {
         dispatch!(self, iosurface_id)
     }
 
-    /// Borrow the raw `IOSurfaceRef` backing this tensor (macOS only).
-    /// Returns `None` when the tensor is not IOSurface-backed. The
-    /// pointer's lifetime is tied to `self`.
-    #[cfg(target_os = "macos")]
+    /// Borrow the raw `IOSurfaceRef` backing this tensor (macOS/iOS
+    /// only). Returns `None` when the tensor is not IOSurface-backed.
+    /// The pointer's lifetime is tied to `self`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_ref(&self) -> Option<*mut std::ffi::c_void> {
         dispatch!(self, iosurface_ref)
     }
 
     /// Physical IOSurface dimensions in texels, independent of the logical
-    /// shape (macOS only). `None` when not IOSurface-backed. The GL backend
-    /// binds the EGL pbuffer at these dims so one cached pbuffer serves every
-    /// frame size a reused pool surface holds.
-    #[cfg(target_os = "macos")]
+    /// shape (macOS/iOS only). `None` when not IOSurface-backed. The GL
+    /// backend binds the EGL pbuffer at these dims so one cached pbuffer
+    /// serves every frame size a reused pool surface holds.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
         dispatch!(self, iosurface_physical_dims)
     }

@@ -2908,7 +2908,7 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
  * - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
  *   shape footprint exceeds the IOSurface allocation
  * - EIO: Failed to import IOSurface (e.g. dead pointer)
- * - ENOTSUP: Not supported on this platform (non-macOS)
+ * - ENOTSUP: Not supported on this platform (non-Apple)
  */
 struct hal_tensor *hal_tensor_from_iosurface(enum hal_dtype dtype,
                                              void *surface_ref,
@@ -3184,12 +3184,12 @@ int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
  * @return IOSurfaceID on success, 0 on error (check errno)
  * @par Errors (errno):
  * - EINVAL: NULL tensor
- * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
  */
 uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
 
 /**
- * Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+ * Borrow the raw IOSurfaceRef backing a tensor (macOS/iOS only).
  *
  * The returned pointer is borrowed; its lifetime is tied to the tensor
  * handle. The caller does NOT hold a retain count on the returned
@@ -3199,7 +3199,7 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
  * pointer without a matching CFRetain() first; that would drop the
  * HalTensor's own retain and produce a use-after-free.
  *
- * Use this when you need to pass the IOSurface to a native macOS API
+ * Use this when you need to pass the IOSurface to a native Apple API
  * (e.g. CIImage, AVSampleBufferDisplayLayer,
  * CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
  * without going through the IOSurfaceID indirection.
@@ -3211,7 +3211,7 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
  *         error. Borrowed — do NOT CFRelease without first CFRetaining.
  * @par Errors (errno):
  * - EINVAL: NULL tensor
- * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
  */
 void *hal_tensor_iosurface_ref(const struct hal_tensor *tensor);
 
