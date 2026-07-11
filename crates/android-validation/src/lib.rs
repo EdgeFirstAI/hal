@@ -804,6 +804,404 @@ mod device {
             cache_miss_delta: misses_after.saturating_sub(misses_before),
         })
     }
+
+    fn median_us(mut samples: Vec<u64>) -> u64 {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// One row of the CPU-usage sweep (see [`usage_sweep`]).
+    #[derive(Default, Clone, Copy)]
+    pub struct UsageSweepRow {
+        pub alloc_ok: i32,
+        /// Median map+full-fill time, µs; -1 = refused or not declared.
+        pub fill_us: i64,
+        /// Median map+full-read time, µs; -1 = refused or not declared.
+        pub read_us: i64,
+        /// Median GL convert into this buffer as destination, µs.
+        pub convert_us: u64,
+    }
+
+    /// Cell — CPU-usage sweep: allocate the same 1080p-class RGBA
+    /// destination under each [`CpuAccess`] declaration and measure the
+    /// mapping and render costs per combination. The per-combo deltas are
+    /// the device's layout signature: a hardware-only (`None`) buffer that
+    /// renders measurably faster than a CPU-mapped one is holding a
+    /// compressed tile layout; `Write` vs `ReadWrite` fill deltas expose
+    /// the write-combined mapping.
+    pub fn usage_sweep(
+        width: usize,
+        height: usize,
+        warmup: usize,
+        iters: usize,
+        rows: &mut [UsageSweepRow; 4],
+    ) -> i32 {
+        if iters == 0 || warmup == 0 || iters > MAX_BENCH_COUNT || warmup > MAX_BENCH_COUNT {
+            return ERR_INVALID_ARG;
+        }
+        let mut gl = match gl_processor() {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let src = match make_gradient_src(width, height) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        let combos = [
+            CpuAccess::None,
+            CpuAccess::Read,
+            CpuAccess::Write,
+            CpuAccess::ReadWrite,
+        ];
+        for (row, access) in rows.iter_mut().zip(combos) {
+            *row = UsageSweepRow {
+                alloc_ok: 0,
+                fill_us: -1,
+                read_us: -1,
+                convert_us: 0,
+            };
+            let mut dst =
+                match gl.create_image(width, height, PixelFormat::Rgba, DType::U8, None, access) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("android-validation: usage_sweep alloc {access:?}: {e:?}");
+                        continue;
+                    }
+                };
+            if require_ahb(&dst, "usage_sweep dst").is_err() {
+                continue;
+            }
+            row.alloc_ok = 1;
+
+            let t = dst.as_u8().expect("u8 image");
+            if access.writes() {
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t0 = std::time::Instant::now();
+                    match t.map_write() {
+                        Ok(mut m) => m.as_mut_slice().fill(0x5a),
+                        Err(e) => {
+                            log::warn!("android-validation: usage_sweep fill {access:?}: {e:?}");
+                            break;
+                        }
+                    }
+                    samples.push(t0.elapsed().as_micros() as u64);
+                }
+                if samples.len() == iters {
+                    row.fill_us = median_us(samples) as i64;
+                }
+            }
+            if access.reads() {
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t0 = std::time::Instant::now();
+                    match t.map_read() {
+                        Ok(m) => {
+                            std::hint::black_box(
+                                m.as_slice().iter().fold(0u64, |a, &b| a + b as u64),
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("android-validation: usage_sweep read {access:?}: {e:?}");
+                            break;
+                        }
+                    }
+                    samples.push(t0.elapsed().as_micros() as u64);
+                }
+                if samples.len() == iters {
+                    row.read_us = median_us(samples) as i64;
+                }
+            }
+
+            // Render into the buffer — the bandwidth-signature sample.
+            let mut ok = true;
+            for _ in 0..warmup {
+                if convert_with(&mut gl, &src, &mut dst).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let mut samples = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t0 = std::time::Instant::now();
+                if convert_with(&mut gl, &src, &mut dst).is_err() {
+                    ok = false;
+                    break;
+                }
+                samples.push(t0.elapsed().as_micros() as u64);
+            }
+            if ok {
+                row.convert_us = median_us(samples);
+            }
+            log::info!(
+                "android-validation: SWEEP|usage|{access:?}|alloc={}|fill_us={}|read_us={}|convert_us={}",
+                row.alloc_ok,
+                row.fill_us,
+                row.read_us,
+                row.convert_us
+            );
+        }
+        OK
+    }
+
+    /// Cell — write-combined mapping bench: the per-frame rewrite loop a
+    /// decode target lives in, under a `Write` declaration (eligible for
+    /// a write-combined mapping) vs `ReadWrite` (cached). The delta is
+    /// the WC dividend; a device where `Write` is SLOWER has a broken
+    /// WC path worth knowing about.
+    pub fn wc_mapping_bench(width: usize, height: usize, iters: usize, out: &mut [u64; 2]) -> i32 {
+        if iters == 0 || iters > MAX_BENCH_COUNT {
+            return ERR_INVALID_ARG;
+        }
+        *out = [0, 0];
+        for (slot, access) in [(0usize, CpuAccess::Write), (1, CpuAccess::ReadWrite)] {
+            let t = match Tensor::<u8>::image(
+                width,
+                height,
+                PixelFormat::Rgba,
+                Some(TensorMemory::Dma),
+                access,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("android-validation: wc_mapping alloc {access:?}: {e:?}");
+                    return ERR_ALLOC;
+                }
+            };
+            let mut samples = Vec::with_capacity(iters);
+            for i in 0..iters {
+                let t0 = std::time::Instant::now();
+                match t.map_write() {
+                    Ok(mut m) => m.as_mut_slice().fill((i & 0xff) as u8),
+                    Err(e) => {
+                        log::error!("android-validation: wc_mapping map {access:?}: {e:?}");
+                        return ERR_MAP;
+                    }
+                }
+                samples.push(t0.elapsed().as_micros() as u64);
+            }
+            out[slot] = median_us(samples);
+            log::info!(
+                "android-validation: SWEEP|wc_mapping|{access:?}|rewrite_us={}",
+                out[slot]
+            );
+        }
+        OK
+    }
+
+    /// Cell — mapping a hardware-only buffer: locking an AHardwareBuffer
+    /// with usage bits it was not allocated with is undefined behaviour
+    /// per the NDK contract, so the HAL refuses deterministically and
+    /// counts the unplanned access. Returns 0 when the device shows
+    /// exactly that contract (refused AND counted); 1 if the map
+    /// unexpectedly succeeded (tolerated — documented, not failed);
+    /// negative on real errors.
+    pub fn map_on_none() -> i32 {
+        let t = match Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            CpuAccess::None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("android-validation: map_on_none alloc: {e:?}");
+                return ERR_ALLOC;
+            }
+        };
+        let before = hal::tensor::unplanned_cpu_access_count();
+        let outcome = t.map();
+        let counted = hal::tensor::unplanned_cpu_access_count() > before;
+        match outcome {
+            Err(e) => {
+                log::info!("android-validation: GATE|map_on_none|refused|counted={counted}|{e:?}");
+                if counted {
+                    OK
+                } else {
+                    ERR_STATS
+                }
+            }
+            Ok(_) => {
+                log::warn!(
+                    "android-validation: GATE|map_on_none|mapped (device tolerated an                      undeclared lock)|counted={counted}"
+                );
+                if counted {
+                    1
+                } else {
+                    ERR_STATS
+                }
+            }
+        }
+    }
+
+    pub struct GetIdOut {
+        pub interned: i32,
+        pub wraps: u64,
+        pub cache_miss_delta: u64,
+    }
+
+    /// Cell — getId interning: the CameraX/ImageReader shape, re-wrapping
+    /// the SAME AHardwareBuffer every frame. With `AHardwareBuffer_getId`
+    /// (API 31+) every wrap shares one interned identity, so the GL
+    /// import cache must not miss across the window; without it (API
+    /// 26-30) each wrap honestly re-imports.
+    pub fn getid_interning(src_w: usize, src_h: usize, wraps: usize) -> Result<GetIdOut, i32> {
+        if wraps == 0 || wraps > MAX_BENCH_COUNT {
+            return Err(ERR_INVALID_ARG);
+        }
+        let mut gl = gl_processor()?;
+        let src = make_gradient_src(src_w, src_h)?;
+        let Some(ptr) = src.hardware_buffer_ptr() else {
+            return Err(ERR_NOT_ZERO_COPY);
+        };
+        let mut dst = gl_dst(&gl, 640, PixelFormat::Rgba, DType::U8)?;
+
+        let wrap = |label: &str| -> Result<TensorDyn, i32> {
+            // SAFETY: `ptr` is borrowed from `src`, which outlives every
+            // wrap in this scope; from_hardware_buffer acquires its own
+            // reference.
+            let mut w = unsafe {
+                TensorDyn::from_hardware_buffer(ptr, &[src_h, src_w, 4], DType::U8, Some(label))
+            }
+            .map_err(|e| {
+                log::error!("android-validation: getid wrap: {e:?}");
+                ERR_ALLOC
+            })?;
+            w.configure_image(src_w, src_h, PixelFormat::Rgba)
+                .map_err(|e| {
+                    log::error!("android-validation: getid configure: {e:?}");
+                    ERR_ALLOC
+                })?;
+            if let Some(stride) = src.as_u8().and_then(|t| t.row_stride()) {
+                w.set_row_stride(stride).map_err(|e| {
+                    log::error!("android-validation: getid stride: {e:?}");
+                    ERR_ALLOC
+                })?;
+            }
+            Ok(w)
+        };
+
+        // Two wraps sharing one identity IS the interning signal (and the
+        // per-device API-level detector).
+        let probe_a = wrap("getid-probe-a")?;
+        let probe_b = wrap("getid-probe-b")?;
+        let interned = probe_a.buffer_identity().id() == probe_b.buffer_identity().id();
+        drop(probe_a);
+        drop(probe_b);
+
+        // Warm the import once so the window below is steady-state.
+        let warm = wrap("getid-warm")?;
+        convert_with(&mut gl, &warm, &mut dst)?;
+        drop(warm);
+
+        let misses_before = cache_misses(&gl)?;
+        for i in 0..wraps {
+            let w = wrap(&format!("getid-{i}"))?;
+            convert_with(&mut gl, &w, &mut dst)?;
+        }
+        let delta = cache_misses(&gl)?.saturating_sub(misses_before);
+
+        log::info!(
+            "android-validation: GATE|getid_interning|interned={interned}|wraps={wraps}|             miss_delta={delta}"
+        );
+        if interned && delta != 0 {
+            log::error!(
+                "android-validation: getid_interning: identities intern but the import                  cache still missed {delta}x across {wraps} re-wraps"
+            );
+            return Err(ERR_STATS);
+        }
+        if !interned && delta < wraps as u64 {
+            // Honest growth expected without getId; fewer misses than
+            // wraps would mean the cache is keying on something unstable.
+            log::warn!(
+                "android-validation: getid_interning: no interning (API<31?) but only                  {delta} misses across {wraps} wraps"
+            );
+        }
+        Ok(GetIdOut {
+            interned: interned as i32,
+            wraps: wraps as u64,
+            cache_miss_delta: delta,
+        })
+    }
+
+    /// Cell — compressed render: convert into a `Compression::Any`
+    /// hardware-only destination, then sample that buffer back through a
+    /// second convert and compare against a direct linear render. Proves
+    /// the (possibly tiled) buffer round-trips through GPU sampling with
+    /// the same pixels; records which scheme the device holds.
+    /// `out_scheme`: 0 linear, 2 UBWC, 3 AFBC, 4 PVRIC, 5 DCC (matches
+    /// the capi HalCompression values).
+    pub fn compressed_render(
+        src_w: usize,
+        src_h: usize,
+        dst_size: usize,
+        out_scheme: &mut i32,
+    ) -> i32 {
+        use hal::tensor::{Compression, CompressionScheme, ImageDesc};
+        *out_scheme = 0;
+        let mut gl = match gl_processor() {
+            Ok(p) => p,
+            Err(c) => return c,
+        };
+        let src = match make_gradient_src(src_w, src_h) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+
+        let desc = ImageDesc::new(dst_size, dst_size, PixelFormat::Rgba, DType::U8)
+            .with_compression(Compression::Any);
+        let mut compressed = match gl.create_image_desc(&desc) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("android-validation: compressed dst alloc: {e:?}");
+                return ERR_ALLOC;
+            }
+        };
+        if let Err(c) = require_ahb(&compressed, "compressed destination") {
+            return c;
+        }
+        *out_scheme = match compressed.compression() {
+            None => 0,
+            Some(CompressionScheme::Ubwc) => 2,
+            Some(CompressionScheme::Afbc) => 3,
+            Some(CompressionScheme::Pvric) => 4,
+            Some(CompressionScheme::Dcc) => 5,
+            Some(_) => 0,
+        };
+        log::info!(
+            "android-validation: GATE|compressed_render|scheme={:?}",
+            compressed.compression()
+        );
+
+        // Direct linear reference (same convert, readable destination).
+        let mut linear = match gl_dst(&gl, dst_size, PixelFormat::Rgba, DType::U8) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        if let Err(c) = convert_with(&mut gl, &src, &mut linear) {
+            return c;
+        }
+
+        // Render into the compressed buffer, then sample it back 1:1.
+        if let Err(c) = convert_with(&mut gl, &src, &mut compressed) {
+            return c;
+        }
+        let mut readback = match cpu_dst(dst_size, PixelFormat::Rgba, DType::U8) {
+            Ok(d) => d,
+            Err(c) => return c,
+        };
+        if let Err(c) = convert_with(&mut gl, &compressed, &mut readback) {
+            return c;
+        }
+        // 1:1 RGBA resample: one extra GPU hop ⇒ tiny tolerance. The
+        // linear destination declared ReadWrite, so compare_u8 maps it
+        // directly.
+        compare_u8(&readback, &linear, dst_size, 4, "compressed_render")
+    }
 }
 
 /// C-ABI benchmark result (see `device::bench_f16_planar`).
@@ -875,6 +1273,170 @@ pub unsafe extern "C" fn edgefirst_android_validation_bench(
         }
         Err(code) => code,
     }
+}
+
+/// One row of the CPU-usage sweep, in [`CpuAccess`] declaration order
+/// (None, Read, Write, ReadWrite). Median times in µs; -1 = refused or
+/// not declared.
+#[repr(C)]
+pub struct EdgefirstAndroidUsageSweepRow {
+    pub alloc_ok: i32,
+    pub fill_us: i64,
+    pub read_us: i64,
+    pub convert_us: u64,
+}
+
+/// Result of the getId-interning cell.
+#[repr(C)]
+pub struct EdgefirstAndroidGetIdOut {
+    /// 1 when two wraps of the same buffer share one identity
+    /// (`AHardwareBuffer_getId` available, API 31+); 0 otherwise.
+    pub interned: i32,
+    pub wraps: u64,
+    /// Import-cache misses across the re-wrap window. Must be 0 when
+    /// interned; ≈wraps otherwise (honest per-wrap re-import).
+    pub cache_miss_delta: u64,
+}
+
+/// Run the CPU-usage sweep cell: allocate the same RGBA destination under
+/// each CpuAccess declaration and record the per-combination mapping and
+/// render medians (the device's layout signature). `rows` must point to a
+/// writable array of FOUR rows, filled in declaration order (None, Read,
+/// Write, ReadWrite). Returns 0 on success.
+///
+/// # Safety
+///
+/// `rows` must point to a writable `[EdgefirstAndroidUsageSweepRow; 4]`.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn edgefirst_android_validation_usage_sweep(
+    width: usize,
+    height: usize,
+    warmup: usize,
+    iters: usize,
+    rows: *mut EdgefirstAndroidUsageSweepRow,
+) -> i32 {
+    alog::init();
+    if rows.is_null() {
+        return device::ERR_INVALID_ARG;
+    }
+    let mut tmp = [device::UsageSweepRow::default(); 4];
+    let rc = device::usage_sweep(width, height, warmup, iters, &mut tmp);
+    for (i, row) in tmp.iter().enumerate() {
+        // SAFETY: caller guarantees four writable rows.
+        unsafe {
+            *rows.add(i) = EdgefirstAndroidUsageSweepRow {
+                alloc_ok: row.alloc_ok,
+                fill_us: row.fill_us,
+                read_us: row.read_us,
+                convert_us: row.convert_us,
+            };
+        }
+    }
+    rc
+}
+
+/// Run the write-combined mapping bench: the decode-target rewrite loop
+/// under a Write declaration vs ReadWrite. Fills `out[0]` (Write median
+/// µs) and `out[1]` (ReadWrite median µs). Returns 0 on success.
+///
+/// # Safety
+///
+/// `out` must point to a writable `[u64; 2]`.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn edgefirst_android_validation_wc_mapping_bench(
+    width: usize,
+    height: usize,
+    iters: usize,
+    out: *mut u64,
+) -> i32 {
+    alog::init();
+    if out.is_null() {
+        return device::ERR_INVALID_ARG;
+    }
+    let mut medians = [0u64; 2];
+    let rc = device::wc_mapping_bench(width, height, iters, &mut medians);
+    // SAFETY: caller guarantees two writable u64s.
+    unsafe {
+        *out = medians[0];
+        *out.add(1) = medians[1];
+    }
+    rc
+}
+
+/// Map a hardware-only (CpuAccess::None) AHardwareBuffer: returns 0 when
+/// the device shows the documented contract (deterministic refusal,
+/// unplanned-access counter incremented), 1 when the device tolerated the
+/// undeclared lock (documented, still counted), negative on real errors.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub extern "C" fn edgefirst_android_validation_map_on_none() -> i32 {
+    alog::init();
+    device::map_on_none()
+}
+
+/// Run the getId-interning cell: re-wrap the same AHardwareBuffer `wraps`
+/// times (the CameraX/ImageReader shape) and gate the GL import cache on
+/// the interned identity. Returns 0 on success.
+///
+/// # Safety
+///
+/// `out` must point to a writable `EdgefirstAndroidGetIdOut`.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn edgefirst_android_validation_getid_interning(
+    src_w: usize,
+    src_h: usize,
+    wraps: usize,
+    out: *mut EdgefirstAndroidGetIdOut,
+) -> i32 {
+    alog::init();
+    if out.is_null() {
+        return device::ERR_INVALID_ARG;
+    }
+    match device::getid_interning(src_w, src_h, wraps) {
+        Ok(r) => {
+            // SAFETY: caller guarantees a writable out struct.
+            unsafe {
+                (*out).interned = r.interned;
+                (*out).wraps = r.wraps;
+                (*out).cache_miss_delta = r.cache_miss_delta;
+            }
+            device::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Run the compressed-render cell: convert into a Compression::Any
+/// hardware-only destination, sample it back through a second convert,
+/// and compare against a direct linear render. `out_scheme` receives the
+/// recorded scheme (0 linear, 2 UBWC, 3 AFBC, 4 PVRIC, 5 DCC — the capi
+/// HalCompression values). Returns 0 on pass.
+///
+/// # Safety
+///
+/// `out_scheme` must point to a writable i32.
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn edgefirst_android_validation_compressed_render(
+    src_w: usize,
+    src_h: usize,
+    dst_size: usize,
+    out_scheme: *mut i32,
+) -> i32 {
+    alog::init();
+    if out_scheme.is_null() {
+        return device::ERR_INVALID_ARG;
+    }
+    let mut scheme = 0i32;
+    let rc = device::compressed_render(src_w, src_h, dst_size, &mut scheme);
+    // SAFETY: caller guarantees a writable i32.
+    unsafe {
+        *out_scheme = scheme;
+    }
+    rc
 }
 
 #[cfg(test)]
