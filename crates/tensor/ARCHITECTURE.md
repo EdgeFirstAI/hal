@@ -158,6 +158,50 @@ The fallback chain is **DMA → SHM → Heap**. `EDGEFIRST_TENSOR_FORCE_MEM=1`
 short-circuits the chain to `MemTensor`, primarily for unit tests on hosts
 without DMA-heap permissions.
 
+### CPU access declaration (CpuAccess)
+
+There is no usage/role enum. The allocation model assumes what is true for
+this SDK's pipelines: image buffers are produced and consumed by hardware
+(ISP, codec, GPU, NPU). Every image tensor allocates GPU-readable **and**
+GPU-writable (`GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER` on Android) —
+simultaneously a valid convert source, destination, and intermediate, and
+compression-eligible on every vendor. Hardware access needs no declaration:
+NPU/DSP consumption rides the dma-buf share itself (layout knowledge, not
+gralloc permission, is the contract), so GPU/NPU read/write is safely
+implied.
+
+CPU involvement is the one thing the caller must declare, as a required
+`CpuAccess` parameter on every image constructor (`Tensor::image`,
+`TensorDyn::image`, `ImageProcessor::create_image`, the capi and Python
+surfaces):
+
+- `None` (default in `ImageDesc`) — hardware-only; on Android the
+  allocation carries no CPU usage bits, making it eligible for gralloc's
+  vendor tile compression.
+- `Read` — cached mapping; macOS takes the read-only IOSurface lock
+  (`kIOSurfaceLockReadOnly`, skips the unlock flush); Linux dma-buf syncs
+  the read direction only.
+- `Write` — decode targets; write-combined mapping where the platform
+  supports it, no cache clean on unlock.
+- `ReadWrite` — both directions (the pre-CpuAccess implicit behavior).
+
+`map()` is access-typed: `map_with(access)` is the one required trait
+method, with `map()` (= ReadWrite, the historical behavior), `map_read()`,
+`map_write()`, and `map_mut()` provided. Every `TensorMap` variant carries
+a `writable` flag and rejects mutable access through a read map with one
+uniform assert on all platforms.
+
+Mapping beyond the declaration is **best-effort, never silent**: the
+platform may refuse (Android refuses deterministically — locking an
+AHardwareBuffer with usage bits it was not allocated with is undefined
+behaviour per the NDK contract, host-tested as `lock_usage_for` /
+`LockDecision` in `ahardwarebuffer_layout.rs`) or may succeed on a slow
+path; either way it logs once per buffer and increments the process-wide
+`unplanned_cpu_access_count()`. Undeclared CPU access is a pipeline smell
+the telemetry surfaces, not hides. Combining `CpuAccess != None` with a
+compression request is `InvalidArgument` at creation — the contradiction
+fails loudly at allocation, not at first map.
+
 ### PBO tensors and the WeakSender pattern
 
 PBO tensors are different from the other three backends: they are not
@@ -211,11 +255,85 @@ ID, so re-imports always miss. The contract is:
 - That keeps `BufferIdentity.id()` constant for the same physical
   buffer, which in turn keeps the in-HAL EGL image cache hitting.
 
+**Android getId interning.** On Android the "every wrap mints a new
+identity" rule has one systematic exception: `from_hardware_buffer` (and
+the allocation paths, so export → re-import unifies) intern on
+`AHardwareBuffer_getId` — the system's stable 64-bit id for the
+allocation (API 31+, resolved lazily via `dlsym` to keep the API-26 link
+floor). Every re-wrap of the same physical buffer resolves to the same
+`BufferIdentity`, so CameraX/ImageReader pipelines that recycle a small
+buffer pool but re-wrap per frame hit the EGLImage import cache instead
+of re-importing every frame. getId is the intern KEY only — the
+identity's `id` is still minted from the process-wide counter, so
+id-space collision with non-AHB identities is impossible. Reuse requires
+the recorded guard to be live: a live guard means a tensor still holds
+its acquire-reference, so the system cannot have recycled the key (the
+ABA case is defused by construction — caches hold weaks, never guards).
+Dead entries are pruned on every insert. On API 26–30 the symbol is
+absent and every wrap keeps the fresh-identity behavior — correct but
+uncached, visible in the miss counters. The intern policy is host-tested
+(`IdentityInternTable` in `ahardwarebuffer_layout.rs`).
+
 See
 [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 for the EGL image cache implementation and
 [the project ARCHITECTURE Appendix C](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
 for the full cross-cutting story.
+
+### Tile compression metadata
+
+Vendor GPUs store textures in proprietary compressed tile layouts that cut
+memory bandwidth; gralloc selects them by usage bits (no public NDK flag
+forces or queries the choice), and EGLImage sampling/rendering consumes
+both layouts transparently:
+
+| Vendor / GPU | Scheme | Engages when |
+|---|---|---|
+| Qualcomm Adreno | UBWC | GPU-only usage (no `CPU_*_OFTEN`) |
+| Arm Mali / Immortalis | AFBC | same mechanism |
+| Imagination PowerVR (Tensor G5+) | PVRIC | same mechanism |
+| Samsung Xclipse | DCC | same mechanism |
+| Apple | not exposed | linear IOSurface is the terminal GPU/ANE format |
+
+Compression is image-format **metadata**, a sibling to `row_stride`,
+`plane_offset`, quantization, and colorimetry: requested at creation
+(`Compression::{Any, Scheme(..)}` on `ImageDesc`) and recorded as
+allocated (`Tensor::compression() -> Option<CompressionScheme>`, one of
+`Ubwc`/`Afbc`/`Pvric`/`Dcc`; both enums `#[non_exhaustive]`). Semantics:
+
+- `Any` never fails for compression reasons: it records the scheme when
+  the allocation is eligible (Android, hardware-only, RGBA8888 u8/i8
+  initially, positively identified vendor) and otherwise resolves linear,
+  counted by `compression_fallback_count()` — loud and countable, the
+  `ConvertStats` philosophy.
+- `Scheme(s)` is for consumers whose ABI names a layout (e.g. a QNN
+  context binary declaring `QNN_TENSOR_DATA_FORMAT_UBWC_RGBA8888`
+  inputs): allocation fails with `InvalidArgument` when the device's
+  scheme differs and `NotImplemented` on platforms without vendor tile
+  compression.
+- The scheme is inferred from the `ro.hardware.egl` system property via
+  the host-tested `scheme_for_egl_vendor()` classifier (adreno → UBWC,
+  mali/immortalis → AFBC, powervr → PVRIC, xclipse → DCC;
+  emulation/angle/unknown → linear — there is deliberately no `Unknown`
+  variant; a scheme is recorded only on positive identification).
+- `compression().is_some()` ⇒ the row-stride accessors describe no
+  meaningful linear layout (tiles are opaque) and CPU maps follow the
+  best-effort CpuAccess contract. `configure_image` **preserves** the
+  recorded scheme (physical layout, unlike colorimetry); views and
+  composed planes inherit it.
+- `compression_support(format, dtype)` (capi
+  `hal_platform_compression_support`) reports whether a request can be
+  honored on this platform.
+
+The recording is best knowledge: gralloc does not report its choice, so
+the recorded scheme asserts "this allocation is compression-eligible on a
+device whose vendor compresses this class", validated per device by the
+Device Farm usage sweep and compressed-render cells (see
+[`TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)).
+Only Qualcomm's NPU stack consumes compressed input natively today
+(QNN UBWC data formats, declared per tensor at context-binary
+preparation); every other NPU stack takes linear zero-copy dma-buf —
+which is exactly what `Compression: None` (the default) produces.
 
 ## Zero-copy CUDA Tensor Mapping
 
@@ -389,6 +507,7 @@ in the project ARCHITECTURE.md for the full two-layer story.
 |----------|-----|-----|-----|-----|
 | Linux (NXP i.MX, x86_64, aarch64) | Yes (DMA-BUF) | Yes | Yes | Yes (with OpenGL feature) |
 | macOS | Yes (IOSurface) | Yes | Yes | No |
+| Android | Yes (AHardwareBuffer) | Yes | Yes | No |
 | Other Unix | No | Yes | Yes | No |
 | Windows | No | No | Yes | No |
 
@@ -422,6 +541,39 @@ handles:
 `from_iosurface()` (the import-side constructor) is macOS-only and
 mirrors `from_fd()` — the receiver retains the surface for the
 tensor's lifetime; the producer keeps its own retain count.
+
+### AHardwareBuffer (Android)
+
+Android's `TensorMemory::Dma` is
+`TensorStorage::Dma(AHardwareBufferTensor<T>)`, backed by an NDK
+`AHardwareBuffer` (stable C ABI since API 26 — the HAL's Android link
+floor). It mirrors the IOSurface story with Android-specific rules:
+
+- **Allocation** carries `GPU_SAMPLED_IMAGE | GPU_FRAMEBUFFER` always
+  (hardware access is implied) plus CPU usage bits derived from the
+  declared `CpuAccess` (`*_OFTEN` values). A hardware-only allocation
+  that gralloc refuses is retried once with CPU r/w bits — degrading to
+  linear-but-working, loudly, for budget-tier devices.
+- **Geometry** per (format, dtype) mirrors `iosurface.rs::new_image`:
+  packed formats allocate `(width, height)`; planar F16 packs into
+  RGBA16F at `(W/4, C·H)`; packed RGB u8 rides RGBA8888 at `(W·3/4, H)`.
+  The format table (`image_format_and_bpe`) is the single source of
+  truth, host-tested in `ahardwarebuffer_layout.rs` — the module that
+  holds every pure decision the FFI layer must not drift on (lock usage,
+  descriptor geometry, vendor classifier, identity interning), because
+  no CI lane can *execute* Android code.
+- **Mapping** replays the allocation's CPU usage VALUES masked to the
+  requested direction (the NDK lock contract: flags are enum values
+  within masks, not independent bits). A `CpuAccess::None` buffer
+  refuses deterministically — locking with undeclared bits is undefined
+  behaviour. Nested maps reuse the first lock only when its direction
+  covers the request.
+- **Import** (`from_hardware_buffer`) derives the declared `CpuAccess`
+  from the imported allocation's usage bits, and identities intern on
+  `AHardwareBuffer_getId` (see *BufferIdentity and EGL image caching*).
+- **Export**: `hardware_buffer_ptr()` returns the `AHardwareBuffer*` for
+  NNAPI/LiteRT/QNN registration; the GL backend imports via
+  `EGL_ANDROID_get_native_client_buffer` + EGLImage.
 
 ### Cross-platform availability probes
 

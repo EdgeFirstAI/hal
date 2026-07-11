@@ -34,7 +34,10 @@ processor = ef.ImageProcessor()
 # Allocate a GPU-optimal output buffer — always use create_image() for
 # destinations passed to convert(), so the processor can select the best
 # memory type (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
-dst = processor.create_image(640, 640, ef.PixelFormat.Rgb)
+# access declares CPU involvement (hardware access is implied): this
+# script reads the pixels below, so declare "readwrite". Hardware-only
+# pipelines keep the strict default access="none".
+dst = processor.create_image(640, 640, ef.PixelFormat.Rgb, access="readwrite")
 
 # Convert with a letterbox resize (preserves aspect ratio, pads with grey).
 # Omit `letterbox=` to stretch-to-fill instead.
@@ -79,6 +82,10 @@ HAL Rust workspace:
   padding color, rotation, and flip
 - **Int8 output** — `create_image(..., dtype="int8")` for direct signed
   int8 tensor output with GPU-accelerated XOR bias
+- **Declared CPU access** — `create_image(..., access="readwrite")` for
+  scripts that touch pixels (map/numpy); the strict `"none"` default
+  keeps hardware pipelines eligible for vendor tile compression
+  (`compression="any"` on Android, outcome on `Tensor.compression`)
 - **YOLO decoding** — YOLOv5, YOLOv8, YOLO11, and YOLO26 detection and
   instance segmentation (including end-to-end models)
 - **Object tracking** — ByteTrack multi-object tracker with Kalman filtering

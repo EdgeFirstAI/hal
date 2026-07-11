@@ -50,14 +50,14 @@ primitives. The `TensorMemory` enum is shared across all tiers (same
 discriminants over the C ABI); the underlying storage and the GL
 transfer backend differ.
 
-| Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) |
-|------------|--------------------------------------|------------------------|------------------------|
-| `TensorMemory::Mem` | Heap | Heap | Heap |
-| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` |
-| `TensorMemory::Dma` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) |
-| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) |
-| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE |
-| GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal |
+| Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) | Android (API 26+) |
+|------------|--------------------------------------|------------------------|------------------------|--------------------|
+| `TensorMemory::Mem` | Heap | Heap | Heap | Heap |
+| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | `shm_open` |
+| `TensorMemory::Dma` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) |
+| `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) |
+| GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) |
+| GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) |
 | Hardware 2D blitter | G2D on NXP i.MX | — | — |
 | Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` |
 | Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) |
@@ -721,6 +721,25 @@ HAL emits a "swept dead entry" log line when a tensor is dropped
 while its EGL image is still in the cache; a steady stream of these
 in a running pipeline is a sign that the calling code is churning
 tensors.
+
+### Android: AHardwareBuffer identity and getId interning
+
+Android has the same shape of problem with a different system primitive.
+CameraX/ImageReader pipelines recycle a small pool of AHardwareBuffers
+but hand a fresh wrap across JNI every frame — the moral equivalent of
+re-importing the same DMA-BUF. Unlike Linux, the HAL solves it
+internally: `from_hardware_buffer` (and the allocation paths, so
+export → re-import unifies) interns identities on
+`AHardwareBuffer_getId`, the system's stable 64-bit allocation id
+(API 31+, resolved via `dlsym` to keep the API-26 link floor). Every
+re-wrap of the same physical buffer resolves to the same
+`BufferIdentity`, and the EGLImage cache hits in steady state exactly as
+the pooled-tensor contract above. The pointer is deliberately NOT used
+as a key on older APIs (a released buffer's address can be reallocated —
+the ABA aliasing class); API 26–30 keeps fresh-per-wrap identities,
+correct but uncached, visible in the miss counters. See
+[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#bufferidentity-and-egl-image-caching)
+for the intern-table mechanics.
 
 **The fix is at the calling layer** (the GStreamer / V4L2 / libcamera
 adaptor that hands buffers to the HAL): maintain a cache of

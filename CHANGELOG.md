@@ -7,8 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: image constructors require a `CpuAccess` declaration.**
+  `Tensor::image`/`image_with_stride`/`image_with_capacity`,
+  `TensorDyn::image`/`image_with_stride`, `ImageProcessor::create_image`,
+  capi `hal_tensor_new_image` + `hal_image_processor_create_image` (new
+  `HalCpuAccess` enum), and Python `create_image`/`Tensor.image`
+  (keyword `access`, strict `"none"` default) all take the declared CPU
+  involvement. Hardware (GPU/NPU/ISP/codec) access is always implied;
+  CPU access is the opt-in that selects the mapping mode (write-combined
+  for `Write`, cached/read-only locks and dma-buf sync direction for
+  `Read`) and, on Android, the gralloc CPU usage bits — a hardware-only
+  (`None`) buffer is eligible for vendor tile compression. Mapping
+  beyond the declaration stays best-effort but warns once per buffer and
+  counts in the new `unplanned_cpu_access_count()`
+  (`hal_unplanned_cpu_access_count`); Android hardware-only buffers
+  refuse CPU maps deterministically.
+
+  Migration: append the access argument to every image-constructor call —
+  `CpuAccess::ReadWrite` reproduces the previous implicit behavior
+  byte-for-byte; declare precisely (`Write` for decode targets, `Read`
+  for verification readers, `None` for hardware-only destinations) to
+  pick up the cheaper mappings. `map()` itself is unchanged (ReadWrite
+  semantics); the new `map_with`/`map_read`/`map_write`/`map_mut` are
+  opt-in. Python scripts that call `map()`/`numpy()` must pass
+  `access="readwrite"` (the default is strict `"none"`).
+
 ### Added
 
+- **Tile-compression image metadata and the `ImageDesc` creation path.**
+  `Compression::{Any, Scheme(..)}` requests and the recorded
+  `CompressionScheme::{Ubwc, Afbc, Pvric, Dcc}` become optional image
+  metadata (sibling to colorimetry; preserved by `configure_image`,
+  inherited by views). `ImageDesc` + `Tensor::image_desc` /
+  `TensorDyn::image_desc` / `ImageProcessor::create_image_desc` carry
+  the request (capi: opaque `hal_image_desc_*` handle,
+  `hal_tensor_new_image_desc`, `hal_image_processor_create_image_desc`,
+  `hal_tensor_compression`, `hal_platform_compression_support`; Python:
+  `compression=` keyword + `Tensor.compression`). `Any` resolves linear
+  with a counted fallback (`compression_fallback_count()`); `Scheme`
+  errors on mismatch. The device scheme is classified from
+  `ro.hardware.egl` (host-tested table).
+- **Android `BufferIdentity` interning on `AHardwareBuffer_getId`**
+  (API 31+, dlsym-resolved): every re-wrap of the same buffer shares one
+  identity, so CameraX/ImageReader re-wrap pipelines hit the EGLImage
+  import cache in steady state; API 26–30 keeps fresh-per-wrap
+  identities (correct, uncached, visible in miss counters).
+- **Device Farm validation cells** for the access/compression/identity
+  surface: CPU-usage sweep, write-combined mapping bench, hardware-only
+  map contract, getId-interning window, and compressed-render
+  round-trip (`edgefirst-android-validation`).
 - **Android support: AHardwareBuffer zero-copy tensor storage and a native
   OpenGL ES backend** (min API 26, `aarch64-linux-android` +
   `x86_64-linux-android`). Android becomes the third `GlPlatform`

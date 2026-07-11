@@ -312,6 +312,19 @@ The probe runs once at `ImageProcessor::new()` time. All subsequent
 every destination passed to `convert()`; direct `Tensor::new(memory=...)`
 bypasses the probe.
 
+**Declare CPU access.** Every image constructor takes a required
+`CpuAccess` parameter: hardware (GPU/NPU/ISP/codec) access is always
+implied, CPU access is the opt-in. Declare `Write` for decode targets,
+`Read` for buffers you verify/consume on the CPU, `ReadWrite` when both,
+and `CpuAccess::None` for pure hardware pipelines — on Android a
+hardware-only buffer is eligible for gralloc's vendor tile compression
+(UBWC/AFBC/PVRIC/DCC), and on every platform the declaration selects the
+cheapest mapping mode (write-combined for `Write`, read-only IOSurface
+locks / dma-buf sync direction for `Read`). Mapping beyond the
+declaration still works best-effort but warns once per buffer and counts
+in `unplanned_cpu_access_count()`; on Android hardware-only buffers
+refuse CPU maps deterministically.
+
 For DMA-buf access, the process needs `/dev/dma_heap/{linux,cma|system}`
 and a DRM render/card node — the GL backend probes
 `/dev/dri/renderD128`, then `/dev/dri/card0`, then `/dev/dri/card1` and
@@ -910,6 +923,26 @@ hal_tensor_set_quantization(dst, /*scale=*/1.0f / 255.0f, /*zero_point=*/0);
 
 The I8 path applies the `^0x80` bias in-shader during the convert — the
 buffer bytes are already signed model input.
+
+**Tile compression** (bandwidth): a hardware-only destination can
+additionally request the device's vendor tile layout through the
+image-descriptor path — the GPU renders into it and Qualcomm's QNN can
+consume it natively (UBWC data formats declared at context-binary
+preparation); other NPU stacks take the linear default:
+
+```c
+HalImageDesc* desc = hal_image_desc_new(640, 640, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+hal_image_desc_set_compression(desc, HAL_COMPRESSION_ANY);   // linear fallback is counted
+HalTensor* dst = hal_image_processor_create_image_desc(proc, desc);
+hal_image_desc_free(desc);
+// hal_tensor_compression(dst) records the scheme actually allocated
+// (HAL_COMPRESSION_UBWC on Adreno, ..._NONE = linear fallback — see
+// hal_compression_fallback_count()).
+```
+
+Compression requires `HAL_CPU_ACCESS_NONE` (CPU mapping pins the layout
+linear) and a compressed tensor has no meaningful linear row stride —
+it is a hardware-to-hardware handle only.
 
 **macOS parity**: the same pattern works with
 `hal_tensor_iosurface_ref()` — wrap the IOSurface in a `CVPixelBuffer`

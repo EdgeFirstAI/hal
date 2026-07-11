@@ -190,6 +190,35 @@ Without PBO, every `convert()` would fall back to CPU `memcpy` for upload and
 readback. PBO keeps the data in GPU-accessible memory, enabling the same
 zero-copy shader pipeline used on DMA platforms.
 
+**CPU access and the ImageDesc path.** Every constructor takes a required
+`CpuAccess` declaration (hardware access is implied; see
+[`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess)).
+`create_image_desc(&ImageDesc)` is the full-featured variant: without a
+compression request it is exactly `create_image` (the negotiation above
+applies); with `Compression::{Any, Scheme(..)}` the allocation goes
+straight to the platform allocator — the layout decision belongs to
+gralloc, and the request's guards and fallback counting live in
+`Tensor::image_desc`. A compression request with auto memory promotes to
+the platform's zero-copy allocation first.
+
+### Zero-copy telemetry
+
+The zero-copy contract is guarded by process- and processor-level
+counters, all designed for the same steady-state assertion: a healthy
+pipeline holds them flat after warmup.
+
+| Counter | Scope | Fires when |
+|---|---|---|
+| `convert_fallback_count()` | processor | the auto chain's GL backend declined and the frame fell through toward G2D/CPU |
+| `ConvertStats.src_uploads` (via `convert_stats()`) | GL backend | a convert fed its source by CPU map+upload instead of zero-copy import |
+| `egl_cache_stats().total_misses()` | GL backend | an EGLImage import was created rather than reused (per-frame re-import churn when it grows in steady state) |
+| `compression_fallback_count()` (mirror of `edgefirst_tensor::compression_fallback_count`) | process | a `Compression::Any` request resolved linear |
+| `edgefirst_tensor::unplanned_cpu_access_count()` (capi `hal_unplanned_cpu_access_count`) | process | a tensor map exceeded the buffer's declared `CpuAccess` (warn-once per buffer) |
+
+The Device Farm bench cells assert `src_uploads == 0` and
+`cache_misses == 0` across their steady-state windows; the same
+assertions are available to applications.
+
 ### GL transfer backend selection
 
 | Backend | Detection | GPU upload | GPU readback |
@@ -1348,7 +1377,7 @@ in the project README for the user-facing rules and validation patterns.
 | Linux desktop / Mesa x86_64 | OpenGL, CPU | GPU-dependent | DMA-heap permission required for DMA path |
 | macOS (Apple Silicon, ANGLE installed) | OpenGL (ANGLE → Metal), CPU | F16 `PlanarRgb` IOSurface zero-copy; F32 not supported | YUYV → RGBA, GREY → RGBA, NV12/NV16/NV24 → RGBA, NV12/NV16/NV24 → PlanarRgb F16 (two-pass), and RGBA → PlanarRgb F16 all run on the GPU. IOSurface `width == 64-aligned pitch` (`semi_planar_surface_dims`) is required so ANGLE does not address texels beyond the declared width — NV24's chroma row is 2W bytes and would otherwise spill into padding columns. Other convert pairs fall back to CPU. |
 | macOS (no ANGLE) | CPU | CPU only | `GLProcessorThreaded::new()` fails at `ImageProcessor::new()` time (ANGLE dylib not found); the GPU dispatch is never attempted. |
-| Android (API 26+, Adreno/Mali) | OpenGL (native EGL), CPU | F16 `PlanarRgb` AHardwareBuffer zero-copy (RGBA16F packing, same layout as macOS); F32 gated on `GL_EXT_color_buffer_float` | Zero-copy formats: RGBA8, packed RGB u8/i8 (RGB-in-RGBA8888 texel packing via `packed_rgb888_layout`, the INT8 NPU input layout), and RGBA16F/planar-F16. Sources import zero-copy on the same formats; the float family imports its RGBA source per-frame (see `feed_float_src`). NPU handoff is direct: `hardware_buffer_ptr()` + `convert_with_fence()` (`EGL_ANDROID_native_fence_sync`); gralloc pitch padding is recorded on the tensor (`recorded_row_stride`/`copy_to_flat` for flat consumers). Grey/NV single-plane import needs the API-29 `R8_UNORM` format, BGRA has no AHardwareBuffer format, and YUV camera buffers await the external-OES sampling flip — those fall back to CPU conversion; explicit `Some(Dma)` requests for unmapped formats error (`InvalidArgument`) instead of degrading. Generic (non-image) tensors allocate as BLOB buffers. Validated on-device via the hal-mobile Device Farm harness (Galaxy S26 Ultra). |
+| Android (API 26+, Adreno/Mali) | OpenGL (native EGL), CPU | F16 `PlanarRgb` AHardwareBuffer zero-copy (RGBA16F packing, same layout as macOS); F32 gated on `GL_EXT_color_buffer_float` | Zero-copy formats: RGBA8, packed RGB u8/i8 (RGB-in-RGBA8888 texel packing via `packed_rgb888_layout`, the INT8 NPU input layout), and RGBA16F/planar-F16. Sources import zero-copy on the same formats; the float family imports its RGBA source per-frame (see `feed_float_src`). NPU handoff is direct: `hardware_buffer_ptr()` + `convert_with_fence()` (`EGL_ANDROID_native_fence_sync`); gralloc pitch padding is recorded on the tensor (`recorded_row_stride`/`copy_to_flat` for flat consumers). Grey/NV single-plane import needs the API-29 `R8_UNORM` format, BGRA has no AHardwareBuffer format, and YUV camera buffers await the external-OES sampling flip — those fall back to CPU conversion; explicit `Some(Dma)` requests for unmapped formats error (`InvalidArgument`) instead of degrading. Generic (non-image) tensors allocate as BLOB buffers. Hardware-only destinations (`CpuAccess::None`) are eligible for gralloc vendor tile compression (UBWC/AFBC/PVRIC/DCC — request via `create_image_desc` + `Compression::Any`, outcome on `Tensor::compression()`); only Qualcomm's QNN consumes compressed input natively (UBWC data formats declared at context-binary preparation) — every other NPU stack takes the linear zero-copy dma-buf that the default produces. Validated on-device via the hal-mobile Device Farm harness (Galaxy S26 Ultra). |
 | Other Unix | CPU | CPU only | No GPU/G2D |
 
 ## Cross-References
