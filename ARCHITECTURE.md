@@ -29,9 +29,9 @@ this document does not reproduce it.
 
 Each sub-crate has a single responsibility in the inference pipeline:
 
-- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with four interchangeable backends (DMA / SHM / Mem / PBO), multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
+- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::Dma` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
 - [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — Image decoding (JPEG, PNG) into pre-allocated tensor buffers with support for u8, u16, i8, i16, and f32 pixel types. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch.
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the five functional crates and owns the optional Chrome JSON tracing subscriber.
@@ -45,10 +45,10 @@ The internal dependency graph and external dependency list live in
 
 ## Platform Support Matrix
 
-The HAL targets three tiers of platforms with different acceleration
-primitives. The `TensorMemory` enum is shared across all tiers (same
-discriminants over the C ABI); the underlying storage and the GL
-transfer backend differ.
+The HAL spans embedded Linux, desktop Linux, macOS/iOS, and Android,
+with different acceleration primitives per tier. The `TensorMemory`
+enum is shared across all tiers (same discriminants over the C ABI);
+the underlying storage and the GL transfer backend differ.
 
 | Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) | Android (API 26+) |
 |------------|--------------------------------------|------------------------|------------------------|--------------------|
@@ -58,11 +58,11 @@ transfer backend differ.
 | `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) |
 | GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) |
 | GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) |
-| Hardware 2D blitter | G2D on NXP i.MX | — | — |
-| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` |
-| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) |
-| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` |
-| Portable probe | `is_gpu_buffer_available()` — works on all three |
+| Hardware 2D blitter | G2D on NXP i.MX | — | — | — |
+| Zero-copy import API | `EGL_EXT_image_dma_buf_import` | Same, when available | `EGL_ANGLE_iosurface_client_buffer` | `EGL_ANDROID_image_native_buffer` |
+| Cross-process buffer handle | DMA-BUF fd (over `SCM_RIGHTS`) | Same | IOSurfaceID (`u32` via Mach port or XPC) | `AHardwareBuffer` (Binder / `sendHandleToUnixSocket`) |
+| Probe function | `is_dma_available()` | Same | `is_iosurface_available()` | `is_ahardwarebuffer_available()` |
+| Portable probe | `is_gpu_buffer_available()` — works on all four | | | |
 
 The portable `is_gpu_buffer_available()` is the recommended cross-platform
 gate when the question is "can I ask for `TensorMemory::Dma` and expect a
@@ -70,6 +70,23 @@ zero-copy GPU-importable buffer?" The platform-specific probes
 (`is_dma_available`, `is_iosurface_available`) remain when callers need
 to know *which* primitive is in use — e.g. to decide whether to call
 `hal_tensor_clone_fd` (Linux) vs `hal_tensor_iosurface_id` (macOS).
+
+**iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
+via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::Dma`
+tensors. CI builds and link-validates `aarch64-apple-ios` and
+`aarch64-apple-ios-sim` on every PR (`scripts/validate-ios-link.sh`, the
+`crates/ios-validation` shim); runtime execution on-device awaits the
+Swift app-shell effort.
+
+**Image allocation on every tier declares CPU access.** `Tensor::image`
+/ `ImageProcessor::create_image` take a required `CpuAccess`
+(`None`/`Read`/`Write`/`ReadWrite`): hardware access is implied, CPU
+mapping is the opt-in, and `None` keeps Android allocations eligible for
+vendor tile compression. The `ImageDesc` builder additionally requests
+compression metadata (`Compression::Any` / a specific scheme). This is a
+cross-crate contract (tensor → image → capi → python); the normative
+description lives in
+[crates/tensor/ARCHITECTURE.md § CPU access declaration](crates/tensor/ARCHITECTURE.md).
 
 ### Float preprocessing capability
 
@@ -323,7 +340,7 @@ invariants in `.build()` rather than scattering checks across setters.
 
 Used pervasively to avoid per-frame allocations:
 
-- Memory-mapped file descriptors (DMA-BUF, SHM)
+- Memory-mapped hardware buffers (DMA-BUF, SHM, IOSurface, AHardwareBuffer)
 - `&[T]` slice views into tensor maps
 - ndarray `ArrayView` for math operations
 - `WeakSender<T>` for cross-thread channels that should not extend lifetime

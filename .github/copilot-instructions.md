@@ -2,8 +2,8 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.4
-**Last Updated:** May 2026
+**Version:** 1.5
+**Last Updated:** July 2026
 
 ---
 
@@ -357,27 +357,34 @@ pytest tests/                   # Python only
 
 ### Project Overview
 
-EdgeFirst HAL is a Rust-based hardware abstraction layer with Python bindings, providing zero-copy memory management, hardware-accelerated image processing, and ML model post-processing for embedded Linux platforms.
+EdgeFirst HAL is a Rust-based hardware abstraction layer with Python bindings, providing zero-copy memory management, hardware-accelerated image processing, and ML model post-processing for embedded Linux, macOS, iOS, and Android platforms.
 
 ### Technology Stack
 
 - **Language:** Rust 1.70+ with Python 3.8+ bindings
 - **Build system:** Cargo workspace, maturin for Python
 - **Key dependencies:** ndarray, rayon, pyo3, enum_dispatch
-- **Target platforms:** Linux x86_64, ARM64 (NXP i.MX, generic embedded)
+- **Target platforms:** Linux x86_64, ARM64 (NXP i.MX, generic embedded); macOS Apple Silicon (ANGLE + IOSurface); iOS 16+ (build + link validated in CI); Android API 26+ (native GLES + AHardwareBuffer via cargo-ndk)
 
 ### Workspace Structure
 
 ```
 crates/
-├── tensor/     # Zero-copy tensor abstractions
-├── codec/      # Image decode into tensors (JPEG, PNG)
-├── image/      # Hardware-accelerated image processing
-├── decoder/    # YOLO and model output decoding
-├── tracker/    # Object tracking algorithms
-├── hal/        # Top-level re-export crate
-├── capi/       # C API bindings (cbindgen)
-└── python/     # PyO3 Python bindings
+├── tensor/         # Zero-copy tensor abstractions (DMA-BUF, IOSurface,
+│                   # AHardwareBuffer, SHM, heap, PBO backends)
+├── codec/          # Image decode into tensors (JPEG, PNG)
+├── image/          # Hardware-accelerated image processing (GL / G2D / CPU)
+├── decoder/        # YOLO and model output decoding
+├── tracker/        # Object tracking algorithms
+├── egl/            # Vendored khronos-egl fork (dynamic loading)
+├── gl/             # Vendored trimmed GLES bindings
+├── bench/          # Shared benchmark harness + testdata helpers
+├── gpu-probe/      # Standalone Linux GPU capability probe
+├── hal/            # Top-level re-export crate
+├── capi/           # C API bindings (cbindgen); the cdylib is the Android
+│                   # JNI library, the staticlib anchors iOS/Android link checks
+├── ios-validation/ # iOS link-closure shim for scripts/validate-ios-link.sh
+└── python/         # PyO3 Python bindings
 ```
 
 ### Naming Conventions
@@ -397,16 +404,31 @@ The HAL uses a fallback chain for memory allocation:
 
 ```rust
 // Automatic fallback: DMA → Shared Memory → Heap
-let tensor = Tensor::<u8>::new(&[height, width, channels], None)?;
+let tensor = Tensor::<u8>::new(&[height, width, channels], None, None)?;
 
-// Explicit type selection
-let tensor = Tensor::<u8>::new(&[height, width, channels], Some(TensorType::Dma))?;
+// Explicit backend selection
+let tensor = Tensor::<u8>::new(&[height, width, channels], Some(TensorMemory::Dma), None)?;
 ```
 
-- `DmaTensor<T>`: Linux DMA-heap for zero-copy hardware access
+- `TensorMemory::Dma` is the zero-copy hardware slot on every OS:
+  `DmaTensor<T>` (Linux DMA-heap), `IoSurfaceTensor<T>` (macOS/iOS
+  IOSurface), `AHardwareBufferTensor<T>` (Android gralloc)
 - `ShmTensor<T>`: POSIX shared memory for IPC
 - `MemTensor<T>`: Standard heap allocation as fallback
+- `PboTensor<T>`: GL pixel-buffer objects (allocated via `create_image`)
 - Environment variable `EDGEFIRST_TENSOR_FORCE_MEM=1` forces heap allocation
+
+**Image tensors declare CPU access.** `Tensor::image(...)` and
+`ImageProcessor::create_image(...)` take a required `CpuAccess`
+(`None`/`Read`/`Write`/`ReadWrite`) — hardware (GPU/NPU) access is always
+implied, CPU mapping is the opt-in. `None` keeps Android allocations
+eligible for vendor tile compression (UBWC/AFBC/…); precise declarations
+buy cheaper mappings everywhere (read-only IOSurface locks, dma-buf sync
+direction, write-combined maps). Mapping beyond the declaration is
+best-effort: warn-once + `unplanned_cpu_access_count()`. The
+`ImageDesc` builder (`Tensor::image_desc`/`create_image_desc`) is the
+full-featured path and can request `Compression::Any`. See
+`crates/tensor/ARCHITECTURE.md` § CPU access declaration.
 
 ### Error Handling
 
@@ -440,6 +462,11 @@ impl ImageProcessorTrait for ImageProcessor {
 }
 ```
 
+The GL backend is a single engine behind the compile-time `GlPlatform`
+seam (`crates/image/src/gl/platform/`): native EGL + DMA-BUF import on
+Linux, ANGLE (EGL→Metal) + IOSurface on macOS/iOS, native EGL +
+AHardwareBuffer EGLImage import on Android.
+
 ### Cross-Compilation with zigbuild
 
 **Always cross-compile for aarch64 using `cargo-zigbuild` during development.**
@@ -462,6 +489,16 @@ ssh <target> 'cd /tmp/hal-tests && ./edgefirst_image-<hash> --test-threads=1'
 The Python crate (`edgefirst_hal`) must be excluded from zigbuild cross-compilation
 because PyO3 requires `PYO3_CROSS_PYTHON_VERSION` or a target Python installation.
 Python wheels are built separately via `maturin` in CI.
+
+**Mobile targets use their native toolchains, not zigbuild:** Android
+builds via `cargo ndk` at the API-26 floor (`scripts/build-android.sh`;
+CI package scope excludes `gpu-probe`, `edgefirst_hal`, and
+`edgefirst-bench`), iOS via `cargo build --target aarch64-apple-ios[-sim]`
+with the ANGLE xcframeworks (`scripts/build-ios.sh`). Link closures are
+validated by `scripts/validate-android-link.sh` (links the C API
+staticlib against the NDK system libraries) and
+`scripts/validate-ios-link.sh` (links the `ios-validation` shim against
+ANGLE + Apple frameworks).
 
 ### Pre-Commit Verification (MANDATORY)
 
@@ -576,9 +613,17 @@ cargo bench -p edgefirst_image
 
 ### Platform Considerations
 
-- **Linux (NXP i.MX)**: Full hardware acceleration via G2D
-- **Linux (Generic)**: DMA-heap and OpenGL available
-- **macOS/Windows**: CPU-only fallback paths
+- **Linux (NXP i.MX)**: Full hardware acceleration via G2D + native EGL/DMA-BUF
+- **Linux (Generic)**: DMA-heap and OpenGL (native EGL; PBO transfer on NVIDIA)
+- **macOS (Apple Silicon)**: full GL acceleration via ANGLE (EGL→Metal)
+  with zero-copy IOSurface tensors — NOT CPU-only
+- **iOS 16+**: same ANGLE + IOSurface architecture as macOS; CI validates
+  build + link closure; the runtime app shell is a future Swift effort
+- **Android (API 26+)**: native EGL/GLES backend with zero-copy
+  AHardwareBuffer tensors; CI validates clippy + build + link closure;
+  on-device correctness/performance gates run in the internal hal-mobile
+  Device Farm harness (see TESTING.md § Android On-Device Validation)
+- **Windows**: compile check only (CPU fallback paths)
 
 When adding features:
 - Always provide CPU fallback
@@ -638,6 +683,7 @@ for details.
 8. **Don't run tests in parallel** - Always use `--test-threads=1` or `-j 1` (see above)
 9. **Don't skip `eglTerminate`** - Omitting it leaks EGL display connections
 10. **Don't `dlclose` GPU libraries** - Use `Box::leak` to keep driver code mapped
+11. **Don't over-declare CPU access** - `CpuAccess::ReadWrite` on image constructors pins a linear layout on Android and forfeits vendor tile compression; use `None` for GPU/NPU-only buffers, `Write` for decode targets, `Read` for readback paths
 
 ---
 
@@ -667,7 +713,7 @@ All public APIs must include:
 /// ```rust
 /// use edgefirst_hal::tensor::Tensor;
 ///
-/// let tensor = Tensor::<u8>::new(&[640, 480, 3], None)?;
+/// let tensor = Tensor::<u8>::new(&[640, 480, 3], None, None)?;
 /// ```
 pub fn function_name(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
     // Implementation
@@ -692,22 +738,22 @@ MUST update the affected documents to stay in sync with the implementation.
 
 | Document | Scope |
 |----------|-------|
-| [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Cross-crate** architecture: shared design patterns, performance-tracing infrastructure, DMA-BUF identity, tensor caching, source organization |
-| [`crates/tensor/ARCHITECTURE.md`](../crates/tensor/ARCHITECTURE.md) | Backend dispatch (`Tensor<T>` → DMA/SHM/Mem/PBO), multi-plane DMA-BUF, `BufferIdentity` cache key |
+| [`ARCHITECTURE.md`](../ARCHITECTURE.md) | **Cross-crate** architecture: shared design patterns, platform support matrix (Linux / macOS / iOS / Android), performance-tracing infrastructure, DMA-BUF + AHardwareBuffer identity, tensor caching, source organization |
+| [`crates/tensor/ARCHITECTURE.md`](../crates/tensor/ARCHITECTURE.md) | Backend dispatch (`Tensor<T>` → DMA-BUF/IOSurface/AHardwareBuffer/SHM/Mem/PBO), multi-plane DMA-BUF, `BufferIdentity` cache key + Android getId interning, CPU access declaration (`CpuAccess`), tile-compression metadata |
 | [`crates/codec/ARCHITECTURE.md`](../crates/codec/ARCHITECTURE.md) | Image decode pipeline, strided output strategy, `ImageLoad` trait, multi-dtype support, allocation profiling |
-| [`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) | GL/G2D/CPU backend chain, EGL image cache, `GL_MUTEX`, Vivante workarounds, shutdown safety |
+| [`crates/image/ARCHITECTURE.md`](../crates/image/ARCHITECTURE.md) | GL/G2D/CPU backend chain, `GlPlatform` porting seam (Linux / macOS-ANGLE / Android), EGL image cache, zero-copy telemetry counters, `GL_MUTEX`, Vivante workarounds, shutdown safety |
 | [`crates/decoder/ARCHITECTURE.md`](../crates/decoder/ARCHITECTURE.md) | Model-type selection, `dshape` contract, per-scale framework, fused proto path, NMS modes |
 | [`crates/tracker/ARCHITECTURE.md`](../crates/tracker/ARCHITECTURE.md) | ByteTrack two-pass association, Kalman state, `DetectionBox` trait |
 | [`crates/hal/ARCHITECTURE.md`](../crates/hal/ARCHITECTURE.md) | Umbrella re-export layer, tracing subscriber |
-| [`crates/capi/ARCHITECTURE.md`](../crates/capi/ARCHITECTURE.md) | Opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework |
+| [`crates/capi/ARCHITECTURE.md`](../crates/capi/ARCHITECTURE.md) | Opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework, mobile zero-copy surface (`HalCpuAccess`, `HalImageDesc`, NPU-direct AHardwareBuffer) |
 | [`crates/python/ARCHITECTURE.md`](../crates/python/ARCHITECTURE.md) | PyO3 bindings, numpy 3-path copy strategy, abi3 wheels |
 
 #### Testing Documents
 
 | Document | Scope |
 |----------|-------|
-| [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: single-threaded execution rules, on-target gating, cross-compilation, coverage, CI matrix |
-| [`crates/tensor/TESTING.md`](../crates/tensor/TESTING.md) | Per-backend unit tests, DMA/SHM gating, allocation benchmarks |
+| [`TESTING.md`](../TESTING.md) | **Cross-crate** testing: single-threaded execution rules, on-target gating, cross-compilation, coverage, CI matrix, Android on-device validation (Device Farm) |
+| [`crates/tensor/TESTING.md`](../crates/tensor/TESTING.md) | Per-backend unit tests, DMA/SHM/IOSurface gating, host-tested Android layout + intern-policy tables, allocation benchmarks |
 | [`crates/codec/TESTING.md`](../crates/codec/TESTING.md) | JPEG/PNG decode tests, strided output validation, hot-loop reuse pattern, allocation profiling, benchmark methodology |
 | [`crates/image/TESTING.md`](../crates/image/TESTING.md) | GL gating via OnceLock probe, G2D gating on `/dev/galcore`, fp16 benchmarks |
 | [`crates/decoder/TESTING.md`](../crates/decoder/TESTING.md) | Builder/segmentation/parity tests, per-scale NEON kernel tests, integration suites |

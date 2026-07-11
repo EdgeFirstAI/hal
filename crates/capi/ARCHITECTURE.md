@@ -9,7 +9,11 @@ delegate DMA-BUF framework as a stable C ABI suitable for consumption from
 C, C++, GStreamer plugins, OpenCV pipelines, NPU delegates, and Python
 extensions written outside PyO3. Headers are generated from Rust source
 annotations via `cbindgen`; the implementation builds as both `staticlib`
-and `cdylib`.
+and `cdylib`. On mobile the two artifacts have distinct roles: the
+`cdylib` (`libedgefirst_hal.so`) is the Android JNI library, and the
+`staticlib` (`libedgefirst_hal.a`) is the iOS static-embedding artifact
+and the link-closure anchor for `scripts/validate-android-link.sh` in CI
+(a Rust staticlib archives the full HAL dependency closure).
 
 This crate is the highest-stakes ABI surface in the workspace. Performance
 recommendations and lifecycle rules are not advisory — getting them wrong
@@ -24,8 +28,8 @@ that downstream integrators must follow.
 | Module | Source | Responsibility |
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/lib.rs) | local | crate-wide setup, panic-safe FFI helpers, error reporting |
-| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
+| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `HalCpuAccess`/`HalCompression` enums, AHardwareBuffer wrap + handle surface, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, `hal_image_desc_*` builder, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
 | [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | ~3.2k lines — `hal_decoder_*` create / decode detection / decode segmentation |
 | [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | ~300 lines — `hal_bytetrack_*` create / update / get_active_tracks |
 | [`delegate.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/delegate.rs) | local | ~200 lines — Delegate DMA-BUF ABI types and camera adaptor format info |
@@ -47,6 +51,7 @@ struct churn — only the function signatures form the stable contract.
 | `struct hal_tensor_map *` | `TensorMap<T>` (RAII guard) | `hal_tensor_map_unmap` |
 | `struct hal_plane_descriptor *` | `edgefirst_tensor::PlaneDescriptor` | `hal_plane_descriptor_free` ONLY if the descriptor was never passed to `hal_import_image`. The import call consumes both descriptors unconditionally (success and failure paths alike — see `hal_import_image` docs), so calling `_free` after `_import_image` is a double-free. |
 | `struct hal_image_processor *` | `edgefirst_image::ImageProcessor` | `hal_image_processor_free` |
+| `struct HalImageDesc *` | `edgefirst_tensor::ImageDesc` (builder) | `hal_image_desc_free`. NOT consumed by `hal_tensor_new_image_desc` / `hal_image_processor_create_image_desc` (unlike plane descriptors) — a desc is reusable across create calls and independent of the tensors it created. |
 | `struct hal_decoder *` | `edgefirst_decoder::Decoder` | `hal_decoder_free` |
 | `struct hal_decoder_params *` | `edgefirst_decoder::DecoderBuilder` (in-progress) | `hal_decoder_params_free`. The handle is **not** consumed by `hal_decoder_new` — that call takes `const struct hal_decoder_params *` and clones the configuration into the new decoder, so the caller still owns the params and must free them after `hal_decoder_new` returns. |
 | `struct hal_detect_box_list *` | `Vec<DetectBox>` | `hal_detect_box_list_free` |
@@ -103,6 +108,65 @@ For the DMA-BUF path (`try_init_dma_cuda` on a DmaTensor), the import uses
 `cudaImportExternalMemory` with `cudaExternalMemoryHandleTypeOpaqueFd`. The
 fd is consumed by the import call; subsequent maps reuse the imported memory
 object without further kernel involvement.
+
+## Mobile Zero-Copy (IOSurface / AHardwareBuffer)
+
+`TensorMemory::Dma` tensors are IOSurface-backed on macOS/iOS
+(`hal_tensor_iosurface_id` exposes the cross-process handle) and
+AHardwareBuffer-backed on Android. The C ABI carries the full mobile
+allocation contract:
+
+### CPU access declaration (breaking, all platforms)
+
+`hal_tensor_new_image` and `hal_image_processor_create_image` take a
+required `enum HalCpuAccess` (`HAL_CPU_ACCESS_NONE` / `_READ` / `_WRITE`
+/ `_READ_WRITE`). Hardware (GPU/NPU) access is always implied; the enum
+declares intended **CPU** mapping. `HAL_CPU_ACCESS_READ_WRITE`
+reproduces the pre-declaration behavior byte-for-byte;
+`HAL_CPU_ACCESS_NONE` keeps the allocation eligible for vendor tile
+compression on Android (UBWC/AFBC/PVRIC/DCC) and costs nothing on
+Linux/macOS. Precise declarations select cheaper mappings (read-only
+IOSurface locks, dma-buf sync direction, write-combined maps). Mapping
+beyond the declaration is best-effort — it may be refused or slow, warns
+once per buffer, and increments `hal_unplanned_cpu_access_count()`.
+
+### ImageDesc creation path and compression metadata
+
+`hal_image_desc_new(width, height, format, dtype)` plus
+`hal_image_desc_set_memory` / `_set_access` / `_set_compression` feed
+`hal_tensor_new_image_desc` and
+`hal_image_processor_create_image_desc` — the full-featured allocation
+front door (opaque builder, so future fields are ABI-non-breaking).
+`HAL_COMPRESSION_ANY` requests a vendor-compressed layout where the
+device supports it: the recorded scheme is readable via
+`hal_tensor_compression` (never `HAL_COMPRESSION_ANY`), linear fallbacks
+are counted by `hal_compression_fallback_count()`, and
+`hal_platform_compression_support(format, dtype)` is the conservative
+capability probe. Requesting a specific scheme that the device cannot
+provide is an error, and compression requires `HAL_CPU_ACCESS_NONE` —
+a CPU-mapped buffer pins a linear layout by definition.
+
+### NPU-direct AHardwareBuffer surface (Android)
+
+For NPU runtimes that consume AHardwareBuffers natively (e.g. QNN):
+
+- `hal_tensor_from_hardware_buffer` wraps an externally produced buffer
+  zero-copy. Buffer identities are interned on `AHardwareBuffer_getId`
+  (API 31+), so CameraX/ImageReader-style re-wraps of the same buffer
+  share one `BufferIdentity` and hit the EGLImage import cache.
+- `hal_tensor_hardware_buffer_ptr` /
+  `hal_tensor_hardware_buffer_physical_dims` /
+  `hal_tensor_recorded_row_stride` expose the raw handle and
+  gralloc-padded geometry for the runtime's own import call.
+- `hal_tensor_copy_to_flat` is the checked escape hatch when a consumer
+  requires packed rows.
+- `hal_image_processor_convert_fence` renders and returns an
+  `EGL_ANDROID_native_fence_sync` fd, enabling GPU→NPU handoff without a
+  CPU stall.
+
+On-device behavior of this surface is validated by the internal
+hal-mobile Device Farm harness (see the root
+[TESTING.md § Android On-Device Validation](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)).
 
 ## Error Convention
 
