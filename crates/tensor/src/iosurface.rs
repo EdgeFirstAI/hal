@@ -257,13 +257,14 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        let _span = tracing::trace_span!("tensor.map", memory = "iosurface",).entered();
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        let _span = tracing::trace_span!("tensor.map", memory = "iosurface", ?access).entered();
         let m = IoSurfaceMap::new(
             self.surface.clone(),
             self.shape.clone(),
             self.buf_size,
             self.view_offset,
+            access,
         )?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -631,13 +632,18 @@ where
     /// `byte_size <= buf_size` first. The IOSurface lock yields the full
     /// surface base address, so the strided view is genuinely zero-copy — no
     /// staging buffer, just a wider slice over the same locked allocation.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let m = IoSurfaceMap::new_with_byte_size(
             self.surface.clone(),
             self.shape.clone(),
             self.buf_size,
             byte_size,
             self.view_offset,
+            access,
         )?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -760,6 +766,8 @@ where
     _marker: PhantomData<T>,
     /// Lock options used at map time, replayed in unmap for symmetry.
     lock_options: u32,
+    /// Whether mutable access is permitted (`map_read()` maps are not).
+    writable: bool,
     locked: bool,
 }
 
@@ -775,8 +783,9 @@ where
         shape: Vec<usize>,
         buf_size: usize,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, None, view_offset)
+        Self::new_inner(surface, shape, buf_size, None, view_offset, access)
     }
 
     /// Lock the surface and expose `byte_size` bytes via `as_slice()` rather
@@ -789,8 +798,16 @@ where
         buf_size: usize,
         byte_size: usize,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, Some(byte_size), view_offset)
+        Self::new_inner(
+            surface,
+            shape,
+            buf_size,
+            Some(byte_size),
+            view_offset,
+            access,
+        )
     }
 
     fn new_inner(
@@ -799,13 +816,19 @@ where
         buf_size: usize,
         byte_size_override: Option<usize>,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        // Default to read-write (options = 0). The read-only path
-        // (K_IOSURFACE_LOCK_READ_ONLY) skips a CPU cache flush when the
-        // caller only reads — a measurable savings if it becomes a hot
-        // path. Left as a future enhancement once we have call-site
-        // information about read-vs-write intent.
-        let options: u32 = 0;
+        // Read-only locks (K_IOSURFACE_LOCK_READ_ONLY) skip the CPU cache
+        // flush at unlock — the caller promised not to write, so there is
+        // nothing to make visible to the GPU. Write-including access uses
+        // the read-write lock (options = 0). The chosen options are stored
+        // and replayed at IOSurfaceUnlock (the lock/unlock options MUST
+        // match per the IOSurface contract).
+        let options: u32 = if access.writes() {
+            0
+        } else {
+            K_IOSURFACE_LOCK_READ_ONLY
+        };
         let mut seed: u32 = 0;
         let lock_rc = unsafe { IOSurfaceLock(surface.as_ptr(), options, &mut seed) };
         if lock_rc != 0 {
@@ -841,6 +864,7 @@ where
             byte_size_override,
             _marker: PhantomData,
             lock_options: options,
+            writable: access.writes(),
             locked: true,
         })
     }
@@ -908,6 +932,7 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "IoSurface");
         let ptr = self.base_ptr.as_ptr() as *mut T;
         let len = self.elem_count();
         // Symmetric with `Deref::deref` — without this an oversized
@@ -1125,7 +1150,6 @@ unsafe fn build_props(
         CFRelease(dict as *const c_void);
         return Err(e);
     }
-    let _ = K_IOSURFACE_LOCK_READ_ONLY; // silence unused on bring-up
     Ok(dict)
 }
 

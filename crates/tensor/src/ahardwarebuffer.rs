@@ -41,14 +41,18 @@
 //! tensor and a `view()` sibling) reuse the same base address, and only
 //! the last unmap issues the FFI unlock.
 //!
-//! The lock usage flags must match what the buffer was allocated with
-//! (they are enum values under `CPU_READ_MASK`/`CPU_WRITE_MASK`, not
-//! independent bits), so the tensor records its allocation-time CPU flags
-//! and replays them at lock time. A buffer allocated without CPU usage
-//! (a future NPU-direct render target) refuses `map()`, and a read-only
-//! buffer (e.g. an imported camera frame allocated without `CPU_WRITE_*`)
-//! maps for reading but panics on `as_mut_slice()` — writing through a
-//! read-only lock is undefined behaviour per the NDK contract.
+//! The lock usage flags must be a subset of what the buffer was allocated
+//! with (they are enum values under `CPU_READ_MASK`/`CPU_WRITE_MASK`, not
+//! independent bits). The tensor records its allocation-time CPU flags;
+//! at lock time the map's requested [`CpuAccess`](crate::CpuAccess)
+//! selects the DIRECTION (read-only maps skip the writeback, write-only
+//! maps can take a write-combined path) while the recorded VALUES
+//! (RARELY/OFTEN) replay exactly. A buffer allocated `CpuAccess::None`
+//! (hardware-only — NPU-direct targets, compressed layouts) refuses
+//! `map()` loudly (`InvalidOperation` + the `unplanned_cpu_access` counter),
+//! and a read-only map or read-only import panics on `as_mut_slice()` —
+//! writing through a read-only lock is undefined behaviour per the NDK
+//! contract.
 //!
 //! ## Geometry
 //!
@@ -69,7 +73,9 @@
 
 use crate::{
     ahardwarebuffer_layout::{
-        checked_shape_bytes, desc_layout, image_format_and_bpe, AHardwareBufferDesc, FORMAT_BLOB,
+        checked_shape_bytes, desc_layout, image_format_and_bpe, lock_usage_for,
+        AHardwareBufferDesc, LockDecision, FORMAT_BLOB, USAGE_CPU_READ_MASK, USAGE_CPU_READ_OFTEN,
+        USAGE_CPU_WRITE_MASK, USAGE_CPU_WRITE_OFTEN,
     },
     error::{Error, Result},
     packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait,
@@ -107,13 +113,9 @@ struct ARect {
 // in `ahardwarebuffer_layout.rs` — compiled and unit-tested on every host
 // (this FFI module is cfg(android) and no CI lane executes it).
 
-// AHardwareBuffer_UsageFlags (subset used by the HAL). The CPU flags are
-// enum VALUES within their masks (NEVER=0, RARELY=2, OFTEN=3), not
-// independent bits — lock() must replay the allocated values.
-const USAGE_CPU_READ_OFTEN: u64 = 0x3;
-const USAGE_CPU_READ_MASK: u64 = 0xF;
-const USAGE_CPU_WRITE_OFTEN: u64 = 0x30;
-const USAGE_CPU_WRITE_MASK: u64 = 0xF0;
+// AHardwareBuffer_UsageFlags GPU bits (subset used by the HAL). The CPU
+// usage bits + the lock-usage decision live in `ahardwarebuffer_layout.rs`
+// (host-compiled + unit-tested).
 /// Sampleable as a GPU texture (`glEGLImageTargetTexture2DOES`).
 const USAGE_GPU_SAMPLED_IMAGE: u64 = 0x100;
 /// Renderable as a GPU color attachment (FBO render target). Named
@@ -159,9 +161,9 @@ pub(crate) struct OwnedAHardwareBuffer {
 /// an already-locked buffer is undefined — so the first live map issues
 /// the FFI lock, further concurrent maps of the same buffer (a parent
 /// tensor and its `view()` siblings share this handle) reuse the recorded
-/// base address, and only the last unmap issues the FFI unlock. All maps
-/// of one buffer use the same allocation-time CPU usage flags, so the
-/// first lock's flags are valid for every nested map.
+/// base address, and only the last unmap issues the FFI unlock. Nested
+/// maps reuse the live lock only when its usage direction covers theirs
+/// (the lock cannot be widened while held — see `lock_shared`).
 #[derive(Debug)]
 struct AhbHandle {
     ptr: AHardwareBufferRef,
@@ -174,6 +176,11 @@ struct LockState {
     count: usize,
     /// Base address returned by the (single) FFI lock while `count > 0`.
     base: *mut c_void,
+    /// CPU usage bits of the live FFI lock. A nested map may reuse the
+    /// lock only when its requested direction is covered by these bits —
+    /// widening would require re-locking, which the NDK contract does not
+    /// allow while locked.
+    usage: u64,
 }
 
 // SAFETY: AHardwareBuffer is a thread-safe, refcounted kernel object; the
@@ -265,6 +272,18 @@ impl OwnedAHardwareBuffer {
     fn lock_shared(&self, cpu_usage: u64) -> Result<*mut c_void> {
         let mut st = self.inner.lock.lock().unwrap_or_else(|e| e.into_inner());
         if st.count > 0 {
+            // Nested maps reuse the live lock ONLY when its direction
+            // covers the request — the NDK lock cannot be widened while
+            // held, and pretending otherwise would hand out a base whose
+            // cache maintenance does not match the promised access.
+            if cpu_usage & st.usage != cpu_usage {
+                return Err(Error::InvalidOperation(format!(
+                    "concurrent AHardwareBuffer map with wider access \
+                     (live lock usage {:#x}, requested {:#x}) — take the wider \
+                     map first or drop the narrower one",
+                    st.usage, cpu_usage
+                )));
+            }
             st.count += 1;
             return Ok(st.base);
         }
@@ -290,6 +309,7 @@ impl OwnedAHardwareBuffer {
         }
         st.base = base;
         st.count = 1;
+        st.usage = cpu_usage;
         Ok(base)
     }
 
@@ -401,14 +421,17 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        let _span = tracing::trace_span!("tensor.map", memory = "ahardwarebuffer",).entered();
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        let _span =
+            tracing::trace_span!("tensor.map", memory = "ahardwarebuffer", ?access).entered();
         let m = AHardwareBufferMap::new(
             self.buffer.clone(),
             self.shape.clone(),
             self.buf_size,
             self.cpu_usage,
             self.view_offset,
+            access,
+            self.identity.id(),
         )?;
         Ok(TensorMap::HardwareBuffer(m))
     }
@@ -760,7 +783,11 @@ where
     /// strided row iteration. The caller (`Tensor::map`) validates
     /// `byte_size <= buf_size` first. The lock yields the full buffer base
     /// address, so the strided view is genuinely zero-copy.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let m = AHardwareBufferMap::new_with_byte_size(
             self.buffer.clone(),
             self.shape.clone(),
@@ -768,6 +795,8 @@ where
             byte_size,
             self.cpu_usage,
             self.view_offset,
+            access,
+            self.identity.id(),
         )?;
         Ok(TensorMap::HardwareBuffer(m))
     }
@@ -873,16 +902,29 @@ impl<T> AHardwareBufferMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         buffer: OwnedAHardwareBuffer,
         shape: Vec<usize>,
         buf_size: usize,
         cpu_usage: u64,
         view_offset: usize,
+        access: crate::CpuAccess,
+        identity_id: u64,
     ) -> Result<Self> {
-        Self::new_inner(buffer, shape, buf_size, None, cpu_usage, view_offset)
+        Self::new_inner(
+            buffer,
+            shape,
+            buf_size,
+            None,
+            cpu_usage,
+            view_offset,
+            access,
+            identity_id,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_byte_size(
         buffer: OwnedAHardwareBuffer,
         shape: Vec<usize>,
@@ -890,6 +932,8 @@ where
         byte_size: usize,
         cpu_usage: u64,
         view_offset: usize,
+        access: crate::CpuAccess,
+        identity_id: u64,
     ) -> Result<Self> {
         Self::new_inner(
             buffer,
@@ -898,9 +942,12 @@ where
             Some(byte_size),
             cpu_usage,
             view_offset,
+            access,
+            identity_id,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_inner(
         buffer: OwnedAHardwareBuffer,
         shape: Vec<usize>,
@@ -908,16 +955,37 @@ where
         byte_size_override: Option<usize>,
         cpu_usage: u64,
         view_offset: usize,
+        access: crate::CpuAccess,
+        identity_id: u64,
     ) -> Result<Self> {
-        // The lock usage must replay the allocation-time CPU flags (they
-        // are enum values under the CPU masks — see module docs). A buffer
-        // without CPU usage cannot be mapped; refuse instead of invoking
-        // undefined behaviour.
-        if cpu_usage & (USAGE_CPU_READ_MASK | USAGE_CPU_WRITE_MASK) == 0 {
-            return Err(Error::InvalidOperation(
-                "AHardwareBufferMap: buffer was allocated without CPU usage flags".into(),
-            ));
-        }
+        // Lock usage flags must be a subset of the allocation-time CPU
+        // flags — the decision (direction vs declared values, refusal for
+        // CpuAccess::None buffers) is the host-tested `lock_usage_for`.
+        let declared_writes = cpu_usage & USAGE_CPU_WRITE_MASK != 0;
+        let lock_usage = match lock_usage_for(cpu_usage, access.reads(), access.writes()) {
+            LockDecision::Refuse => {
+                crate::note_unplanned_cpu_access(
+                    identity_id,
+                    "AHardwareBuffer",
+                    "buffer was allocated CpuAccess::None (hardware-only)",
+                );
+                return Err(Error::InvalidOperation(
+                    "AHardwareBuffer was allocated without CPU access \
+                     (CpuAccess::None) — allocate with CpuAccess::Read/Write/\
+                     ReadWrite to map it on the CPU"
+                        .into(),
+                ));
+            }
+            LockDecision::Covered(bits) => bits,
+            LockDecision::Unplanned(bits) => {
+                crate::note_unplanned_cpu_access(
+                    identity_id,
+                    "AHardwareBuffer",
+                    "map access exceeds the declared CpuAccess direction",
+                );
+                bits
+            }
+        };
         // Validate the exposed window BEFORE locking: the slice handed out
         // by `deref` is `elem_count()` elements starting `view_offset`
         // bytes in, so both the override and the shape-derived length must
@@ -942,8 +1010,9 @@ where
             });
         }
         // Refcounted lock (see `AhbHandle`): the first live map issues the
-        // FFI lock; nested maps of the same buffer reuse its base address.
-        let base = buffer.lock_shared(cpu_usage)?;
+        // FFI lock; nested maps of the same buffer reuse its base address
+        // (only when its direction covers theirs).
+        let base = buffer.lock_shared(lock_usage)?;
         let base_ptr = NonNull::new(base).expect("lock_shared validates the base address");
         // A sub-view window starts `view_offset` bytes into the locked
         // buffer (bounds-checked above). Advance the exposed base and
@@ -959,7 +1028,12 @@ where
             byte_size_override,
             _marker: PhantomData,
             locked: true,
-            writable: cpu_usage & USAGE_CPU_WRITE_MASK != 0,
+            // Mutable access needs BOTH the request and the declaration to
+            // include writes: a map_read() on a writable buffer is
+            // read-only by intent; an RW request on a read-only import
+            // must not write through a lock without CPU_WRITE (undefined
+            // behaviour per the NDK contract).
+            writable: access.writes() && declared_writes,
         })
     }
 
@@ -1025,14 +1099,11 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
-        // Writing through a lock whose buffer lacks CPU_WRITE usage is
-        // undefined behaviour per the NDK contract — panic with a clear
-        // message instead (read-only imported camera buffers hit this).
-        assert!(
-            self.writable,
-            "AHardwareBufferMap: buffer was allocated/imported without CPU_WRITE usage; \
-             mutable access would be undefined behaviour"
-        );
+        // Writing through a read-only lock (a `map_read()` map, or a
+        // buffer allocated/imported without CPU_WRITE usage) is undefined
+        // behaviour per the NDK contract — fail uniformly like every
+        // other backend instead.
+        crate::assert_map_writable(self.writable, "AHardwareBuffer");
         let ptr = self.base_ptr.as_ptr() as *mut T;
         let len = self.elem_count();
         // Symmetric with `Deref::deref` — an oversized mutable write must

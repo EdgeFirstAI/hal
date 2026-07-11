@@ -123,11 +123,19 @@ where
     /// Map exposing `byte_size` bytes via `as_slice()` for self-allocated
     /// strided tensors whose rows are padded. The caller (`Tensor::map`)
     /// validates `byte_size <= capacity_bytes()` first.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
-        self.map_inner(Some(byte_size))
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size), access)
     }
 
-    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+    fn map_inner(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let exposed = byte_size_override.unwrap_or_else(|| self.size());
         // Map the whole segment from fd offset 0 and apply `self.offset` in
         // `ShmMap::as_slice` — mmap cannot take a non-page-aligned fd offset,
@@ -170,6 +178,7 @@ where
             offset: self.offset,
             mmap_size,
             byte_size_override,
+            writable: access.writes(),
             _marker: std::marker::PhantomData,
         }))
     }
@@ -267,8 +276,8 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        self.map_inner(None)
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        self.map_inner(None, access)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -370,6 +379,10 @@ where
     /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
     /// (the full padded window) instead of `shape.product()`.
     byte_size_override: Option<usize>,
+    /// Whether mutable access is permitted (`map_read()` maps are not).
+    /// The mmap itself stays PROT_READ|PROT_WRITE (protection narrowing is
+    /// a follow-up); this enforces the API contract uniformly.
+    writable: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -437,6 +450,7 @@ where
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "Shm");
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.len()) }

@@ -37,6 +37,57 @@ pub(crate) struct AHardwareBufferDesc {
     pub(crate) rfu1: u64,
 }
 
+// AHardwareBuffer_UsageFlags CPU bits (subset used by the HAL). The CPU
+// flags are enum VALUES within their masks (NEVER=0, RARELY=2, OFTEN=3),
+// not independent bits — lock() must replay allocated values. Kept here
+// (host-compiled) so the lock-usage decision below is unit-testable; the
+// FFI module re-uses these.
+pub(crate) const USAGE_CPU_READ_OFTEN: u64 = 0x3;
+pub(crate) const USAGE_CPU_READ_MASK: u64 = 0xF;
+pub(crate) const USAGE_CPU_WRITE_OFTEN: u64 = 0x30;
+pub(crate) const USAGE_CPU_WRITE_MASK: u64 = 0xF0;
+
+/// Outcome of matching a map request against the allocation-time CPU
+/// usage — the pure half of `AHardwareBufferMap::new_inner`'s lock logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockDecision {
+    /// Buffer has no CPU usage at all (`CpuAccess::None`): locking with
+    /// undeclared bits is undefined behaviour per the NDK contract, so
+    /// the best-effort map contract resolves to a deterministic refusal.
+    Refuse,
+    /// The declared usage covers the requested direction: lock with the
+    /// declared VALUE bits masked to the requested direction (read-only
+    /// maps skip the writeback; write-only maps can go write-combined).
+    Covered(u64),
+    /// Requested beyond the declaration: replay the full declared flags
+    /// (the pre-CpuAccess behavior — correct cache maintenance for what
+    /// the buffer CAN do), counted as unplanned by the caller.
+    Unplanned(u64),
+}
+
+/// Decide the `AHardwareBuffer_lock` usage bits for a map request of
+/// direction `(reads, writes)` against the allocation's CPU usage bits.
+pub(crate) fn lock_usage_for(cpu_usage: u64, reads: bool, writes: bool) -> LockDecision {
+    let declared = cpu_usage & (USAGE_CPU_READ_MASK | USAGE_CPU_WRITE_MASK);
+    if declared == 0 {
+        return LockDecision::Refuse;
+    }
+    let declared_reads = cpu_usage & USAGE_CPU_READ_MASK != 0;
+    let declared_writes = cpu_usage & USAGE_CPU_WRITE_MASK != 0;
+    if (!reads || declared_reads) && (!writes || declared_writes) {
+        let mut bits = 0;
+        if reads {
+            bits |= cpu_usage & USAGE_CPU_READ_MASK;
+        }
+        if writes {
+            bits |= cpu_usage & USAGE_CPU_WRITE_MASK;
+        }
+        LockDecision::Covered(bits)
+    } else {
+        LockDecision::Unplanned(declared)
+    }
+}
+
 // AHardwareBuffer_Format values (subset used by the HAL).
 /// RGBA 8:8:8:8 UNORM — API 26+.
 pub(crate) const FORMAT_R8G8B8A8_UNORM: u32 = 1;
@@ -145,6 +196,39 @@ mod tests {
             rfu0: 0,
             rfu1: 0,
         }
+    }
+
+    #[test]
+    fn lock_usage_decision_table() {
+        use LockDecision::*;
+        const R: u64 = USAGE_CPU_READ_OFTEN;
+        const W: u64 = USAGE_CPU_WRITE_OFTEN;
+        const GPU: u64 = 0x300; // non-CPU bits must be ignored
+
+        // CpuAccess::None allocations refuse every direction.
+        assert_eq!(lock_usage_for(GPU, true, false), Refuse);
+        assert_eq!(lock_usage_for(GPU, false, true), Refuse);
+        assert_eq!(lock_usage_for(0, true, true), Refuse);
+
+        // Covered requests lock with the declared VALUES masked to the
+        // requested direction.
+        assert_eq!(lock_usage_for(R | W | GPU, true, false), Covered(R));
+        assert_eq!(lock_usage_for(R | W | GPU, false, true), Covered(W));
+        assert_eq!(lock_usage_for(R | W | GPU, true, true), Covered(R | W));
+        assert_eq!(lock_usage_for(R | GPU, true, false), Covered(R));
+        assert_eq!(lock_usage_for(W | GPU, false, true), Covered(W));
+
+        // RARELY (=2 / =0x20) values replay exactly, never upgraded to
+        // OFTEN — the lock must be a subset of the allocation.
+        assert_eq!(lock_usage_for(0x2 | GPU, true, false), Covered(0x2));
+        assert_eq!(lock_usage_for(0x20 | GPU, false, true), Covered(0x20));
+
+        // Beyond-declaration requests replay the full declared flags
+        // (pre-CpuAccess behavior) and are flagged Unplanned.
+        assert_eq!(lock_usage_for(R | GPU, false, true), Unplanned(R));
+        assert_eq!(lock_usage_for(R | GPU, true, true), Unplanned(R));
+        assert_eq!(lock_usage_for(W | GPU, true, false), Unplanned(W));
+        assert_eq!(lock_usage_for(W | GPU, true, true), Unplanned(W));
     }
 
     #[test]

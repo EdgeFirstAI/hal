@@ -941,6 +941,100 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
 /// Monotonic counter for buffer identity IDs.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Count of tensor maps requested beyond the buffer's declared
+/// [`CpuAccess`] (including any CPU map of a `CpuAccess::None` buffer).
+/// Undeclared CPU access is a pipeline smell: it forfeits layout
+/// optimizations (write-combined mappings, tile compression) and may be
+/// slow or refused on Android. Read via [`unplanned_cpu_access_count`];
+/// each offending buffer also logs one warning.
+static UNPLANNED_CPU_ACCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of tensor maps that exceeded the buffer's declared
+/// [`CpuAccess`] since process start. A pipeline that declares its CPU
+/// access correctly holds this flat; see [`CpuAccess`] for the contract.
+pub fn unplanned_cpu_access_count() -> u64 {
+    UNPLANNED_CPU_ACCESS.load(Ordering::Relaxed)
+}
+
+/// Record an unplanned CPU access on `identity_id`, warning once per
+/// buffer (a steady-state pipeline maps the same buffer every frame — a
+/// per-map warn would flood the log; repeats count silently).
+// Only the Android backend detects unplanned access in this commit; the
+// wrapper-level declared-access check (which uses this on every platform)
+// arrives with the CpuAccess constructor parameter.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
+    UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    if warned.lock().is_ok_and(|mut s| s.insert(identity_id)) {
+        log::warn!(
+            "unplanned CPU access on {backend} buffer (identity {identity_id}): {detail} — \
+             declare the intent at allocation (CpuAccess::Read/Write/ReadWrite) to make \
+             this a planned, optimized mapping"
+        );
+    }
+}
+
+/// Uniform guard for mutable access through a read-only map. Every
+/// `TensorMap` backend calls this from `as_mut_slice`/`deref_mut` so a
+/// `map_read()` misuse fails identically on all platforms instead of
+/// passing on tolerant ones and exploding only on Android.
+#[inline]
+pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
+    assert!(
+        writable,
+        "{backend} map is read-only (obtained via map_read()/CpuAccess::Read) — \
+         use map_mut() or map_write() for mutable access"
+    );
+}
+
+/// Declared CPU involvement for an image tensor, chosen at allocation.
+///
+/// The HAL assumes buffers are produced and consumed by hardware (ISP,
+/// codec, GPU, NPU) — hardware access needs no declaration. CPU access is
+/// the opt-in: it selects the CPU usage/mapping mode at allocation
+/// (write-combined for `Write`, cached for `Read`) and, on Android, pins
+/// the layout linear (vendor tile compression requires `None`).
+///
+/// Mapping beyond the declared access is best-effort, never silent: it
+/// may be refused (`Error::NotSupported`) or take a slow path, and it
+/// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
+/// warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpuAccess {
+    /// Hardware-only buffer (the default): no CPU mapping declared.
+    /// Compression-eligible on platforms with vendor tile layouts.
+    #[default]
+    None,
+    /// CPU reads (verification, CPU consumers) — cached mapping.
+    Read,
+    /// CPU writes (decode targets) — write-combined mapping where the
+    /// platform supports it; reading through a `Write` map is undeclared.
+    Write,
+    /// CPU reads and writes — the pre-CpuAccess implicit behavior.
+    ReadWrite,
+}
+
+impl CpuAccess {
+    /// Whether this declaration includes CPU reads.
+    pub fn reads(self) -> bool {
+        matches!(self, CpuAccess::Read | CpuAccess::ReadWrite)
+    }
+
+    /// Whether this declaration includes CPU writes.
+    pub fn writes(self) -> bool {
+        matches!(self, CpuAccess::Write | CpuAccess::ReadWrite)
+    }
+
+    /// Whether this declaration covers `requested` (every direction the
+    /// request needs is declared).
+    pub fn covers(self, requested: CpuAccess) -> bool {
+        (!requested.reads() || self.reads()) && (!requested.writes() || self.writes())
+    }
+}
+
 /// Unique identity for a tensor's underlying buffer.
 ///
 /// Created fresh on every buffer allocation or import. The `id` is a monotonic
@@ -1046,9 +1140,45 @@ where
         self.reshape(shape)
     }
 
-    /// Map the tensor into memory and return a TensorMap for accessing the
-    /// data.
-    fn map(&self) -> Result<TensorMap<T>>;
+    /// Map the tensor into memory with the given access direction and
+    /// return a TensorMap for accessing the data.
+    ///
+    /// `access` selects the platform mapping mode (read-only IOSurface
+    /// lock, dma-buf sync direction, AHardwareBuffer lock usage) and the
+    /// map's mutability: a map obtained with [`CpuAccess::Read`] rejects
+    /// `as_mut_slice`. [`CpuAccess::None`] is not a mappable direction
+    /// and returns [`Error::InvalidArgument`].
+    ///
+    /// Prefer the typed wrappers [`map_read`](Self::map_read) /
+    /// [`map_write`](Self::map_write) / [`map_mut`](Self::map_mut).
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>>;
+
+    /// Map the tensor read-write (equivalent to
+    /// `map_with(CpuAccess::ReadWrite)` — the historical `map()`
+    /// behavior).
+    fn map(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::ReadWrite)
+    }
+
+    /// Map the tensor for CPU reading only. The returned map rejects
+    /// `as_mut_slice`; on macOS this takes the read-only IOSurface lock
+    /// (skips the unlock flush), on Linux the dma-buf read-direction
+    /// sync.
+    fn map_read(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::Read)
+    }
+
+    /// Map the tensor for CPU writing (fill-only: reading through a
+    /// write map may see write-combined memory — do not read the slice).
+    fn map_write(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::Write)
+    }
+
+    /// Map the tensor read-write (alias of [`map`](Self::map) with the
+    /// intent spelled out).
+    fn map_mut(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::ReadWrite)
+    }
 
     /// Get the buffer identity for cache keying and liveness tracking.
     fn buffer_identity(&self) -> &BufferIdentity;
@@ -1593,7 +1723,7 @@ where
         }
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
         match self {
             #[cfg(any(
                 target_os = "linux",
@@ -1601,11 +1731,11 @@ where
                 target_os = "ios",
                 target_os = "android"
             ))]
-            TensorStorage::Dma(t) => t.map(),
+            TensorStorage::Dma(t) => t.map_with(access),
             #[cfg(unix)]
-            TensorStorage::Shm(t) => t.map(),
-            TensorStorage::Mem(t) => t.map(),
-            TensorStorage::Pbo(t) => t.map(),
+            TensorStorage::Shm(t) => t.map_with(access),
+            TensorStorage::Mem(t) => t.map_with(access),
+            TensorStorage::Pbo(t) => t.map_with(access),
         }
     }
 
@@ -3411,12 +3541,20 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
         let _span = tracing::trace_span!(
             "tensor.map",
             memory = ?self.storage.memory(),
+            ?access,
         )
         .entered();
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "map_with(CpuAccess::None) is not a mappable direction — use \
+                 map_read()/map_write()/map_mut()"
+                    .into(),
+            ));
+        }
         // CPU mapping of a strided tensor exposes the full padded buffer
         // (`row_stride × rows`) so callers can iterate rows via
         // `effective_row_stride()` without running past the slice. This is sound
@@ -3491,7 +3629,9 @@ where
                             dma.buf_size, dma.mmap_offset
                         )));
                     }
-                    return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
+                    return dma
+                        .map_with_byte_size(total_bytes, access)
+                        .map(TensorMap::Dma);
                 }
                 TensorStorage::Mem(mem) => {
                     let capacity = self.storage.capacity_bytes();
@@ -3501,7 +3641,7 @@ where
                             capacity,
                         });
                     }
-                    return mem.map_with_byte_size(total_bytes);
+                    return mem.map_with_byte_size(total_bytes, access);
                 }
                 #[cfg(unix)]
                 TensorStorage::Shm(shm) => {
@@ -3512,7 +3652,7 @@ where
                             capacity,
                         });
                     }
-                    return shm.map_with_byte_size(total_bytes);
+                    return shm.map_with_byte_size(total_bytes, access);
                 }
                 // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
                 // the full surface base address, and the row pitch
@@ -3530,7 +3670,7 @@ where
                             capacity: available,
                         });
                     }
-                    return io.map_with_byte_size(total_bytes);
+                    return io.map_with_byte_size(total_bytes, access);
                 }
                 // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
                 // yields the full buffer base address, and the row pitch is
@@ -3547,7 +3687,7 @@ where
                             capacity: available,
                         });
                     }
-                    return ahb.map_with_byte_size(total_bytes);
+                    return ahb.map_with_byte_size(total_bytes, access);
                 }
                 TensorStorage::Pbo(pbo) => {
                     // PBO: the GPU-side allocation may have a padded row stride
@@ -3564,7 +3704,7 @@ where
                             capacity: available,
                         });
                     }
-                    return pbo.map_with_byte_size(total_bytes);
+                    return pbo.map_with_byte_size(total_bytes, access);
                 }
                 // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
                 // is guarded `if !dma.is_imported`). On macOS/Windows every
@@ -3609,7 +3749,7 @@ where
                 ));
             }
         }
-        self.storage.map()
+        self.storage.map_with(access)
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
@@ -4341,6 +4481,96 @@ mod image_tests {
         let mut img = Tensor::from_planes(y, uv, PixelFormat::Nv12).unwrap();
         let err = img.reshape(&[480 * 640 + 240 * 640]);
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod cpu_access_tests {
+    use super::*;
+
+    #[test]
+    fn covers_matrix() {
+        use CpuAccess::*;
+        // Every declaration covers a narrower or equal request…
+        for a in [None, Read, Write, ReadWrite] {
+            assert!(a.covers(None), "{a:?} must cover None");
+            assert!(ReadWrite.covers(a), "ReadWrite must cover {a:?}");
+        }
+        assert!(Read.covers(Read));
+        assert!(Write.covers(Write));
+        // …and never a wider one.
+        assert!(!None.covers(Read));
+        assert!(!None.covers(Write));
+        assert!(!Read.covers(Write));
+        assert!(!Read.covers(ReadWrite));
+        assert!(!Write.covers(Read));
+        assert!(!Write.covers(ReadWrite));
+    }
+
+    #[test]
+    fn map_with_none_is_invalid() {
+        let t = Tensor::<u8>::new(&[16], Some(TensorMemory::Mem), None).unwrap();
+        match t.map_with(CpuAccess::None) {
+            Err(Error::InvalidArgument(_)) => {}
+            Err(other) => panic!("expected InvalidArgument, got {other:?}"),
+            Ok(_) => panic!("map_with(CpuAccess::None) must not succeed"),
+        }
+    }
+
+    #[test]
+    fn read_map_rejects_mutation_uniformly() {
+        // Mem backend: map_read yields a working read view whose mutable
+        // accessor panics (the uniform cross-backend contract).
+        let t = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
+        t.map_mut().unwrap().as_mut_slice().copy_from_slice(&[7; 8]);
+        let ro = t.map_read().unwrap();
+        assert_eq!(ro.as_slice(), &[7; 8]);
+        drop(ro);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ro = t.map_read().unwrap();
+            let _ = ro.as_mut_slice();
+        }));
+        assert!(result.is_err(), "as_mut_slice through map_read must panic");
+    }
+
+    #[test]
+    fn write_and_rw_maps_stay_mutable() {
+        let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+        t.map_write()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[1; 4]);
+        t.map().unwrap().as_mut_slice().copy_from_slice(&[2; 4]);
+        assert_eq!(t.map_read().unwrap().as_slice(), &[2; 4]);
+    }
+
+    /// The read-only IOSurface lock path: a `map_read` must observe data
+    /// written through a prior read-write lock, and its unlock (which
+    /// skips the cache flush) must not disturb subsequent reads.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn iosurface_read_only_lock_roundtrip() {
+        let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None) else {
+            eprintln!("SKIPPED: IOSurface unavailable");
+            return;
+        };
+        {
+            let mut m = t.map_mut().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i * 3) as u8;
+            }
+        }
+        for _ in 0..2 {
+            let ro = t.map_read().unwrap();
+            for (i, b) in ro.as_slice().iter().enumerate() {
+                assert_eq!(*b, (i * 3) as u8, "byte {i} through read-only lock");
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ro = t.map_read().unwrap();
+            let _ = ro.as_mut_slice();
+        }));
+        assert!(result.is_err(), "IOSurface read map must reject mutation");
     }
 }
 
