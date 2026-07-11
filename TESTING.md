@@ -865,10 +865,8 @@ No CI runner can execute Android GL — the `build-android` lane is
 compile + clippy + link-validation only (`validate-android-link.sh`
 proves the native symbol closure against the NDK stubs). On-device
 correctness and performance are therefore gated by the internal
-hal-mobile Device Farm harness, whose `edgefirst-android-validation`
-crate (in that repo, built against the HAL through path dependencies)
-drives its C-ABI validation cells through JNI from an instrumented
-test. Every pure decision the Android FFI layer relies on (lock-usage
+hal-mobile Device Farm harness, which builds against the HAL and
+drives its validation cells through JNI from an instrumented test. Every pure decision the Android FFI layer relies on (lock-usage
 mapping, descriptor geometry,
 the vendor classifier, identity interning) is additionally host-tested
 in `crates/tensor/src/ahardwarebuffer_layout.rs`, so drift is caught on

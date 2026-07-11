@@ -21,9 +21,8 @@
 # API level, so this catches "symbol needs a newer API" statically.)
 #
 # Runtime GL correctness and performance run on-device via the internal
-# hal-mobile Device Farm harness (its `edgefirst-android-validation`
-# crate drives the real ImageProcessor through JNI) — out of scope for
-# this script.
+# hal-mobile Device Farm harness (driving the real ImageProcessor
+# through JNI) — out of scope for this script.
 #
 # Usage:
 #   scripts/validate-android-link.sh arm64    # aarch64-linux-android (device)
@@ -153,7 +152,7 @@ for sym in AHardwareBuffer_allocate AHardwareBuffer_lock AHardwareBuffer_unlock 
            AHardwareBuffer_release AHardwareBuffer_acquire AHardwareBuffer_describe; do
     if ! grep -q " U ${sym}$" <<< "${UNDEF_SYMS}"; then
         echo "    MISSING: staticlib carries no undefined ref to ${sym}" >&2
-        echo "             (force_closure no longer reaches the FFI — false-positive risk)" >&2
+        echo "             (the android FFI module fell out of the build — false-positive risk)" >&2
         exit 1
     fi
 done

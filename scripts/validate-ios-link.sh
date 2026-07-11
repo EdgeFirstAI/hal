@@ -22,9 +22,8 @@
 # closure resolves" check; the link step itself only exercises the Rust +
 # Apple-system-framework closure.
 #
-# Runtime EGL initialization on a device/simulator is out of scope (it needs
-# the app shell — a future Swift-bindings effort; the on-device validation
-# seed lives in the internal hal-mobile project).
+# Runtime EGL initialization on a device/simulator is out of scope (it
+# needs the app shell — a future Swift-bindings effort).
 #
 # Usage:
 #   scripts/validate-ios-link.sh device   # aarch64-apple-ios (arm64 device)

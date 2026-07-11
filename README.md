@@ -865,9 +865,9 @@ What is **not** covered by this effort (future work):
   iOS. The `edgefirst-hal-capi` cdylib (`libedgefirst_hal.so`) is the
   deliverable here.
 - **Runtime validation** — on-device GL correctness and performance run
-  via the internal `hal-mobile` AWS Device Farm harness, whose validation
-  crate drives the real `ImageProcessor` through JNI (see TESTING.md
-  § Android On-Device Validation);
+  via the internal `hal-mobile` AWS Device Farm harness, which drives
+  the real `ImageProcessor` through JNI (see TESTING.md § Android
+  On-Device Validation);
   the Phase-1 assessment already proved the native-GLES + AHardwareBuffer
   path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
   letterbox 720p→640×640 F16 in 741 µs).
