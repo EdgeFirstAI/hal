@@ -10,13 +10,13 @@ sub-crate's `ARCHITECTURE.md`:
 
 | Crate | Per-crate architecture |
 |-------|------------------------|
-| `tensor` | [crates/tensor/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) — backend dispatch, multi-plane DMA-BUF, BufferIdentity |
+| `tensor` | [crates/tensor/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) — backend dispatch (DMA-BUF/IOSurface/AHardwareBuffer/SHM/Mem/PBO), multi-plane DMA-BUF, BufferIdentity, CpuAccess + compression metadata |
 | `codec` | [crates/codec/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) — custom baseline JPEG decoder, SIMD dispatch (NEON/SSE4.1/SSSE3/SSE2), zero-allocation scratch model, strided/EXIF-rotated output |
-| `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — unified GL engine (one `GLProcessorST`, Linux DMA-BUF + macOS ANGLE), `GlPlatform` porting seam, EGL image cache, batch engine (`convert_deferred`/`flush`), G2D, CPU, Vivante workarounds, shutdown safety |
+| `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — unified GL engine (one `GLProcessorST`; Linux DMA-BUF, macOS/iOS ANGLE + IOSurface, Android AHardwareBuffer), `GlPlatform` porting seam, EGL image cache, batch engine (`convert_deferred`/`flush`), G2D, CPU, Vivante workarounds, shutdown safety |
 | `decoder` | [crates/decoder/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) — model-type selection, dshape contract, per-scale framework, fused proto path |
 | `tracker` | [crates/tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) — ByteTrack two-pass association, Kalman state |
 | `hal` (umbrella) | [crates/hal/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/ARCHITECTURE.md) — re-export layer + tracing subscriber |
-| `capi` (C API) | [crates/capi/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md) — opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework |
+| `capi` (C API) | [crates/capi/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md) — opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework, mobile zero-copy surface |
 | `python` | [crates/python/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/ARCHITECTURE.md) — PyO3 bindings, numpy 3-path copy strategy, abi3 wheels |
 
 The high-level system diagram lives at the top of
@@ -74,9 +74,10 @@ to know *which* primitive is in use — e.g. to decide whether to call
 **iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
 via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::Dma`
 tensors. CI builds and link-validates `aarch64-apple-ios` and
-`aarch64-apple-ios-sim` on every PR (`scripts/validate-ios-link.sh`, the
-`crates/ios-validation` shim); runtime execution on-device awaits the
-Swift app-shell effort.
+`aarch64-apple-ios-sim` on every PR — `scripts/validate-ios-link.sh`
+links the production C API staticlib against the ANGLE + Apple
+frameworks; runtime execution on-device awaits the Swift app-shell
+effort.
 
 **Image allocation on every tier declares CPU access.** `Tensor::image`
 / `ImageProcessor::create_image` take a required `CpuAccess`

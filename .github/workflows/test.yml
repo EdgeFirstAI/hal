@@ -478,8 +478,10 @@ jobs:
   # is no runtime test (no device/simulator in CI) — runtime EGL bring-up on
   # device is a future Swift-bindings effort. See README.md § iOS.
   #
-  # gpu-probe (Linux-only binary), edgefirst-hal-capi, edgefirst_hal (python),
-  # and edgefirst-bench are excluded from the workspace build.
+  # gpu-probe (Linux-only binary), edgefirst_hal (python), and
+  # edgefirst-bench are excluded from the workspace build. The C API is
+  # INCLUDED — its staticlib is the iOS embedding artifact and the
+  # link-closure anchor.
   # ===========================================================================
   build-ios:
     name: Build & Link (iOS)
@@ -514,24 +516,26 @@ jobs:
       - name: Run Clippy (iOS device)
         # Lint the cfg-gated iOS code paths (the GL platform seam + IOSurface
         # backend) that no other lane compiles. Excludes Linux-only / python /
-        # capi crates. -D warnings keeps the lane a hard gate.
+        # bench crates; the C API is included. -D warnings keeps the lane a
+        # hard gate.
         run: |
           cargo clippy --target aarch64-apple-ios \
             --workspace \
-            --exclude gpu-probe --exclude edgefirst-hal-capi \
+            --exclude gpu-probe \
             --exclude edgefirst_hal --exclude edgefirst-bench \
             -- -D warnings
 
       - name: Build HAL for iOS (device + simulator)
         run: |
-          cargo build --target aarch64-apple-ios      --release -p edgefirst-hal
-          cargo build --target aarch64-apple-ios-sim  --release -p edgefirst-hal
+          cargo build --target aarch64-apple-ios      --release -p edgefirst-hal -p edgefirst-hal-capi
+          cargo build --target aarch64-apple-ios-sim  --release -p edgefirst-hal -p edgefirst-hal-capi
 
       - name: Validate iOS link closure (device + simulator)
         # scripts/validate-ios-link.sh fetches the signed ANGLE xcframeworks
         # from the EdgeFirstAI/angle-package release via scripts/fetch-angle.sh,
-        # builds the edgefirst-ios-validation staticlib, and links it against
-        # the xcframeworks + Apple system frameworks.
+        # then links the production C API staticlib (libedgefirst_hal.a,
+        # built by the step above) against the xcframeworks + Apple system
+        # frameworks.
         run: |
           bash scripts/validate-ios-link.sh device
           bash scripts/validate-ios-link.sh sim
@@ -588,8 +592,8 @@ jobs:
         # Lint the cfg-gated Android code paths (the GL platform seam +
         # AHardwareBuffer backend) that no other lane compiles. Excludes
         # Linux-only gpu-probe, the python crate, and the bench harness;
-        # unlike iOS, the C API is INCLUDED — its cdylib is the future JNI
-        # library. -D warnings keeps the lane a hard gate.
+        # the C API is INCLUDED — its cdylib is the future JNI library.
+        # -D warnings keeps the lane a hard gate.
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |

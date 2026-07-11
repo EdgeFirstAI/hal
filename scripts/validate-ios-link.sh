@@ -4,12 +4,14 @@
 #
 # Validate the iOS link closure of the EdgeFirst HAL.
 #
-# Builds the `edgefirst-ios-validation` staticlib (which archives the full
-# HAL dependency closure into one `.a`), then links a trivial `main.c`
-# against it + the ANGLE xcframeworks (downloaded via scripts/fetch-angle.sh
-# from the EdgeFirstAI/angle-package release) + the Apple system frameworks
-# the HAL references via `#[link(kind = "framework")]` (IOSurface,
-# CoreFoundation, Metal). A clean link proves the native symbol closure is
+# Builds the PRODUCTION C API staticlib (`edgefirst-hal-capi` →
+# `libedgefirst_hal.a`; a Rust staticlib archives the full dependency
+# closure into one `.a`), then links a trivial `main.c` that references
+# real C API entry points against it + the ANGLE xcframeworks (downloaded
+# via scripts/fetch-angle.sh from the EdgeFirstAI/angle-package release)
+# + the Apple system frameworks the HAL references via
+# `#[link(kind = "framework")]` (IOSurface, CoreFoundation, Metal). A
+# clean link proves the native symbol closure of the shipped artifact is
 # complete.
 #
 # Because EGL/GLES symbols are resolved at RUNTIME via `libloading`
@@ -21,7 +23,8 @@
 # Apple-system-framework closure.
 #
 # Runtime EGL initialization on a device/simulator is out of scope (it needs
-# the app shell — a future Swift-bindings effort).
+# the app shell — a future Swift-bindings effort; the on-device validation
+# seed lives in the internal hal-mobile project).
 #
 # Usage:
 #   scripts/validate-ios-link.sh device   # aarch64-apple-ios (arm64 device)
@@ -96,18 +99,34 @@ if [[ ! -f "${EGL_FW}" || ! -f "${GLESV2_FW}" ]]; then
     exit 2
 fi
 
-# --- Build the validation staticlib -----------------------------------------
+# --- Build the C API staticlib ------------------------------------------------
 
-echo "==> cargo build --target ${TRIPLE} --release -p edgefirst-ios-validation"
+echo "==> cargo build --target ${TRIPLE} --release -p edgefirst-hal-capi"
 cd "${HAL_ROOT}"
-cargo build --target "${TRIPLE}" --release -p edgefirst-ios-validation
+cargo build --target "${TRIPLE}" --release -p edgefirst-hal-capi
 
-STATIC_LIB="${HAL_ROOT}/target/${TRIPLE}/release/libedgefirst_ios_validation.a"
+STATIC_LIB="${HAL_ROOT}/target/${TRIPLE}/release/libedgefirst_hal.a"
 if [[ ! -f "${STATIC_LIB}" ]]; then
     echo "error: staticlib not produced: ${STATIC_LIB}" >&2
     exit 1
 fi
 echo "    staticlib: $(du -h "${STATIC_LIB}" | cut -f1) ${STATIC_LIB}"
+
+# --- nm symbol check: the archive references the IOSurface entry points ------
+#
+# A Rust staticlib archives every dependency object, so the tensor crate's
+# IOSurface FFI must show up as undefined references. If these vanish, the
+# Apple-gated module fell out of the build and the link step below would
+# pass vacuously. (Mach-O prepends an underscore to C symbols.)
+echo "==> nm: staticlib references the IOSurface entry points"
+UNDEF_SYMS="$(nm -u "${STATIC_LIB}" 2>/dev/null || true)"
+for sym in _IOSurfaceCreate _IOSurfaceLock _IOSurfaceUnlock _IOSurfaceGetID; do
+    if ! grep -q "^${sym}$" <<< "${UNDEF_SYMS}"; then
+        echo "    MISSING: staticlib carries no undefined ref to ${sym}" >&2
+        exit 1
+    fi
+done
+echo "    all IOSurface references present in the archive"
 
 # --- nm symbol check: confirm ANGLE exports the EGL entry points -------------
 #
@@ -150,30 +169,43 @@ echo "    all ${#REQUIRED_EGL_SYMBOLS[@]} EGL entry points present in libEGL"
 
 # --- Link step ---------------------------------------------------------------
 #
-# Link a main.c that CALLS `edgefirst_ios_validation_force_closure()` against:
-# the Rust staticlib, the ANGLE xcframeworks (via -F + -framework), and the
-# Apple system frameworks the HAL references through `#[link(kind =
-# "framework")]`. The call is what makes this a real test: a static-archive
-# member is linked only to resolve an undefined symbol, so without a
-# reference into the `.a`, ld drops the entire archive and the link succeeds
-# no matter how broken the closure is (it would even succeed with
-# `-ledgefirst_ios_validation` removed). Calling `force_closure` pulls the
-# member in; that member in turn references `IOSurfaceCreate` /
-# CoreFoundation (via the tensor IOSurface path) and the GL closure, so
-# `-dead_strip` cannot drop them and dropping any required `-framework`
-# makes the link fail with undefined symbols.
-echo "==> link: ${CLANG_TARGET} main.c + libedgefirst_ios_validation.a + frameworks"
+# Link a main.c that REFERENCES real C API entry points against: the Rust
+# staticlib, the ANGLE xcframeworks (via -F + -framework), and the Apple
+# system frameworks the HAL references through `#[link(kind =
+# "framework")]`. The references are what make this a real test: a
+# static-archive member is linked only to resolve an undefined symbol, so
+# without them ld drops the entire archive and the link succeeds no
+# matter how broken the closure is. The chosen entry points pull the deep
+# closure in: `hal_tensor_new_image` reaches the IOSurface allocation
+# path and `hal_tensor_iosurface_id` the handle surface (making
+# `-framework IOSurface` / CoreFoundation load-bearing), and
+# `hal_image_processor_new` pulls the whole GL engine — so `-dead_strip`
+# cannot drop them and removing any required `-framework` fails the link
+# with undefined symbols.
+#
+# The `.a` is passed by explicit path: `-ledgefirst_hal` would prefer the
+# cdylib `libedgefirst_hal.dylib` sitting in the same target directory,
+# and a shared-library link defers symbol resolution to load time —
+# silently gutting the check.
+echo "==> link: ${CLANG_TARGET} main.c + libedgefirst_hal.a + frameworks"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "${WORKDIR}"' EXIT
 MAIN_C="${WORKDIR}/main.c"
 cat > "${MAIN_C}" <<'EOF'
-// Declared here (no header) to match the Rust `#[no_mangle] extern "C"`
-// export. Calling it forces ld to pull libedgefirst_ios_validation.a in.
-extern void edgefirst_ios_validation_force_closure(void);
+// Declared here (no header, signatures irrelevant) — C linkage resolves
+// by name only, and the addresses are never called. Taking the addresses
+// forces undefined references so ld pulls the archive members in.
+extern void hal_image_processor_new(void);
+extern void hal_tensor_new_image(void);
+extern void hal_tensor_iosurface_id(void);
 int main(void) {
-    edgefirst_ios_validation_force_closure();
-    return 0;
+    void (*volatile roots[])(void) = {
+        hal_image_processor_new,
+        hal_tensor_new_image,
+        hal_tensor_iosurface_id,
+    };
+    return roots[0] == roots[1];
 }
 EOF
 
@@ -184,8 +216,7 @@ xcrun -sdk "${SDK}" clang \
     -target "${CLANG_TARGET}" \
     -dead_strip \
     "${MAIN_C}" \
-    -L "${HAL_ROOT}/target/${TRIPLE}/release" \
-    -ledgefirst_ios_validation \
+    "${STATIC_LIB}" \
     -F "${EGL_XCFW}/${SLICE}" -framework libEGL \
     -F "${GLESV2_XCFW}/${SLICE}" -framework libGLESv2 \
     -framework IOSurface \

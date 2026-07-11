@@ -382,8 +382,8 @@ crates/
 ├── gpu-probe/      # Standalone Linux GPU capability probe
 ├── hal/            # Top-level re-export crate
 ├── capi/           # C API bindings (cbindgen); the cdylib is the Android
-│                   # JNI library, the staticlib anchors iOS/Android link checks
-├── ios-validation/ # iOS link-closure shim for scripts/validate-ios-link.sh
+│                   # JNI library, the staticlib is the iOS embedding artifact
+│                   # and the anchor for both mobile link-closure checks
 └── python/         # PyO3 Python bindings
 ```
 
@@ -497,7 +497,7 @@ CI package scope excludes `gpu-probe`, `edgefirst_hal`, and
 with the ANGLE xcframeworks (`scripts/build-ios.sh`). Link closures are
 validated by `scripts/validate-android-link.sh` (links the C API
 staticlib against the NDK system libraries) and
-`scripts/validate-ios-link.sh` (links the `ios-validation` shim against
+`scripts/validate-ios-link.sh` (links the same staticlib against the
 ANGLE + Apple frameworks).
 
 ### Pre-Commit Verification (MANDATORY)

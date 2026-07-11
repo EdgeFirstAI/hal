@@ -784,13 +784,15 @@ dependencies:
 
 ### What is validated vs. deferred
 
-`scripts/validate-ios-link.sh` builds the `edgefirst-ios-validation`
-staticlib (the full HAL closure archived into one `.a`) and links it
-against the ANGLE xcframeworks + the Apple system frameworks the HAL
-references via `#[link(kind = "framework")]` (`IOSurface`,
-`CoreFoundation`, `Metal`). It also runs `nm` on the ANGLE binaries to
-confirm the EGL entry-point names the runtime loader will look up are
-exported. This proves the native symbol closure is complete.
+`scripts/validate-ios-link.sh` builds the production C API staticlib
+(`libedgefirst_hal.a` — a Rust staticlib archives the full HAL closure)
+and links a test executable referencing real C API entry points against
+the ANGLE xcframeworks + the Apple system frameworks the HAL references
+via `#[link(kind = "framework")]` (`IOSurface`, `CoreFoundation`,
+`Metal`). It also verifies with `nm` that the archive carries the
+IOSurface references and that the ANGLE binaries export the EGL
+entry-point names the runtime loader will look up. This proves the
+native symbol closure of the shipped artifact is complete.
 
 What is **not** covered by this effort (future work):
 
