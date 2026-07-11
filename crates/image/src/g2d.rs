@@ -683,7 +683,14 @@ mod g2d_tests {
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(
+            1280,
+            720,
+            g2d_in_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -705,6 +712,7 @@ mod g2d_tests {
             g2d_out_fmt,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
@@ -723,8 +731,14 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        let mut cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
+        let mut cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -810,6 +824,7 @@ mod g2d_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         cpu_converter.convert(
             &src,
@@ -820,7 +835,14 @@ mod g2d_tests {
         )?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(
+            1280,
+            720,
+            g2d_in_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
@@ -840,6 +862,7 @@ mod g2d_tests {
             g2d_out_fmt,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d_converter = G2DProcessor::new()?;
         let src2_dyn = src2;
@@ -858,8 +881,14 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        let mut cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
+        let mut cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -898,6 +927,7 @@ mod g2d_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         reference
             .as_u8()
@@ -915,7 +945,14 @@ mod g2d_tests {
         )?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(
+            1280,
+            720,
+            g2d_in_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
 
         // For PixelFormat::Nv12 input, load from file since CPU doesn't support PixelFormat::Rgb→PixelFormat::Nv12
         if g2d_in_fmt == PixelFormat::Nv12 {
@@ -935,6 +972,7 @@ mod g2d_tests {
             g2d_out_fmt,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         g2d_dst
             .as_u8()
@@ -960,8 +998,14 @@ mod g2d_tests {
             TensorDyn::from(__t)
         };
 
-        let mut cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgb, DType::U8, None)?;
+        let mut cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_converter.convert(
             &g2d_dst,
             &mut cpu_dst,
@@ -1061,7 +1105,14 @@ mod g2d_tests {
         memory: Option<TensorMemory>,
         bytes: &[u8],
     ) -> Result<TensorDyn, crate::Error> {
-        let img = TensorDyn::image(width, height, format, DType::U8, memory)?;
+        let img = TensorDyn::image(
+            width,
+            height,
+            format,
+            DType::U8,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         let mut map = img.as_u8().unwrap().map()?;
         let dst = map.as_mut_slice();
         if bytes.len() > dst.len() {
@@ -1107,6 +1158,7 @@ mod g2d_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
@@ -1126,7 +1178,14 @@ mod g2d_tests {
         };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_dst
             .as_u8()
             .unwrap()
@@ -1169,6 +1228,7 @@ mod g2d_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
@@ -1188,7 +1248,14 @@ mod g2d_tests {
         };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None)?;
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_dst
             .as_u8()
             .unwrap()
@@ -1231,6 +1298,7 @@ mod g2d_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
@@ -1250,7 +1318,14 @@ mod g2d_tests {
         };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_dst
             .as_u8()
             .unwrap()
@@ -1293,6 +1368,7 @@ mod g2d_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let mut g2d = G2DProcessor::new()?;
         let src_dyn = src;
@@ -1312,7 +1388,14 @@ mod g2d_tests {
         };
 
         // Copy to CPU for comparison
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None)?;
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         cpu_dst
             .as_u8()
             .unwrap()
@@ -1346,7 +1429,14 @@ mod g2d_tests {
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgb), None)?;
 
         // Create DMA buffer for G2D input
-        let mut src2 = TensorDyn::image(1280, 720, g2d_in_fmt, DType::U8, Some(TensorMemory::Dma))?;
+        let mut src2 = TensorDyn::image(
+            1280,
+            720,
+            g2d_in_fmt,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         let mut cpu_converter = CPUProcessor::new();
 
         if g2d_in_fmt == PixelFormat::Nv12 {
@@ -1369,6 +1459,7 @@ mod g2d_tests {
             PixelFormat::Bgra,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let src2_dyn = src2;
         let mut bgra_dst_dyn = bgra_dst;
@@ -1401,6 +1492,7 @@ mod g2d_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         let src2_dyn2 = src2;
         let mut rgba_dst_dyn = rgba_dst;
@@ -1419,7 +1511,14 @@ mod g2d_tests {
         };
 
         // Copy both to CPU memory for comparison
-        let bgra_cpu = TensorDyn::image(1280, 720, PixelFormat::Bgra, DType::U8, None)?;
+        let bgra_cpu = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Bgra,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         bgra_cpu
             .as_u8()
             .unwrap()
@@ -1427,7 +1526,14 @@ mod g2d_tests {
             .as_mut_slice()
             .copy_from_slice(bgra_dst.as_u8().unwrap().map()?.as_slice());
 
-        let rgba_cpu = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
+        let rgba_cpu = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         rgba_cpu
             .as_u8()
             .unwrap()
@@ -1485,7 +1591,13 @@ mod g2d_tests {
         row_stride: Option<usize>,
     ) -> Result<G2DSurface, crate::Error> {
         use edgefirst_tensor::TensorMemory;
-        let mut t = Tensor::<u8>::image(width, height, fmt, Some(TensorMemory::Dma))?;
+        let mut t = Tensor::<u8>::image(
+            width,
+            height,
+            fmt,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         if let Some(o) = offset {
             t.set_plane_offset(o);
         }
@@ -1512,8 +1624,14 @@ mod g2d_tests {
             return;
         }
         use edgefirst_tensor::TensorMemory;
-        let mut t =
-            Tensor::<u8>::image(640, 480, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let s0 = tensor_to_g2d_surface(&t).unwrap();
         t.set_plane_offset(4096);
         let s1 = tensor_to_g2d_surface(&t).unwrap();
@@ -1526,8 +1644,14 @@ mod g2d_tests {
             return;
         }
         use edgefirst_tensor::TensorMemory;
-        let mut t =
-            Tensor::<u8>::image(640, 480, PixelFormat::Rgba, Some(TensorMemory::Dma)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let s_none = tensor_to_g2d_surface(&t).unwrap();
         t.set_plane_offset(0);
         let s_zero = tensor_to_g2d_surface(&t).unwrap();
@@ -1583,8 +1707,14 @@ mod g2d_tests {
             return;
         }
         use edgefirst_tensor::TensorMemory;
-        let mut t =
-            Tensor::<u8>::image(640, 480, PixelFormat::Nv12, Some(TensorMemory::Dma)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let s0 = tensor_to_g2d_surface(&t).unwrap();
 
         t.set_plane_offset(8192);
@@ -1775,15 +1905,37 @@ mod g2d_tests {
         }
         let (w, h) = (65usize, 64usize);
 
-        let src_dma =
-            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)).unwrap();
-        let src_mem =
-            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src_dma = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let src_mem = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         fill_patterned_nv12(&src_dma);
         fill_patterned_nv12(&src_mem);
 
         // CPU reference: Nv12 → Rgba.
-        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         CPUProcessor::new()
             .convert(
                 &src_mem,
@@ -1795,8 +1947,15 @@ mod g2d_tests {
             .unwrap();
 
         // G2D convert: Nv12 → Rgba.
-        let mut g2d_dst =
-            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {
@@ -1859,15 +2018,37 @@ mod g2d_tests {
         }
         let (w, h) = (65usize, 63usize);
 
-        let src_dma =
-            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)).unwrap();
-        let src_mem =
-            TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src_dma = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let src_mem = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         fill_patterned_nv12(&src_dma);
         fill_patterned_nv12(&src_mem);
 
         // CPU reference: Nv12 → Rgba.
-        let mut cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         CPUProcessor::new()
             .convert(
                 &src_mem,
@@ -1879,8 +2060,15 @@ mod g2d_tests {
             .unwrap();
 
         // G2D convert: Nv12 → Rgba.
-        let mut g2d_dst =
-            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut g2d_dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut g2d = match G2DProcessor::new() {
             Ok(g) => g,
             Err(e) => {

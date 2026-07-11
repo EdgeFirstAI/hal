@@ -491,6 +491,7 @@ mod tests {
             PixelFormat::Rgba,
             320,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(_) => {
@@ -1225,6 +1226,7 @@ mod tests {
                 PixelFormat::Rgba,
                 aligned,
                 Some(edgefirst_tensor::TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1262,6 +1264,7 @@ mod tests {
             PixelFormat::Bgra,
             aligned,
             Some(edgefirst_tensor::TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {

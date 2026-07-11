@@ -278,7 +278,7 @@ static void run_repeated_inferences(
     hal_tensor *src = preloaded_src;
     int src_owned = 0;
     if (!src) {
-        src = hal_image_processor_create_image(proc, src_w, src_h, src_fmt, HAL_DTYPE_U8);
+        src = hal_image_processor_create_image(proc, src_w, src_h, src_fmt, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         src_owned = 1;
         if (!src) {
             fprintf(stderr, "    SKIP (src alloc failed)\n");
@@ -359,7 +359,7 @@ static int run_inference(TfLiteInterpreter *interp, const TfliteAPI *api,
     hal_tensor *src = preloaded_src;
     int src_owned = 0;
     if (!src) {
-        src = hal_image_processor_create_image(proc, src_w, src_h, src_fmt, HAL_DTYPE_U8);
+        src = hal_image_processor_create_image(proc, src_w, src_h, src_fmt, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         src_owned = 1;
         if (!src) {
             fprintf(stderr, "SKIP (src alloc failed)\n");
@@ -531,7 +531,7 @@ int main(int argc, char **argv)
         struct hal_image_processor *ref_proc = hal_image_processor_new_with_backend(HAL_COMPUTE_BACKEND_CPU);
         if (!ref_proc) FAIL("CPU processor unavailable");
         file_src = hal_image_processor_create_image(ref_proc, src_w, src_h,
-                                                     HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+                                                     HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         hal_image_processor_free(ref_proc);
         if (!file_src) FAIL("file_src alloc failed");
 

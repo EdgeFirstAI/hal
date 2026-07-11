@@ -233,7 +233,7 @@ static bench_result bench_import_reuse(struct hal_image_processor *proc,
 
     // Allocate destination (reused across all frames)
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -328,7 +328,7 @@ static bench_result bench_import_pool(struct hal_image_processor *proc,
     }
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         for (int i = 0; i < POOL_SIZE; i++) hal_tensor_free(pool[i]);
         res.skip_reason = "dst allocation failed";
@@ -420,7 +420,7 @@ static bench_result bench_import_stride(struct hal_image_processor *proc,
     }
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -515,7 +515,7 @@ static bench_result bench_import_multiplane(struct hal_image_processor *proc,
     }
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -613,7 +613,7 @@ static bench_result bench_import_multiplane_strided(
     }
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -676,7 +676,7 @@ static bench_result bench_import_render_target(struct hal_image_processor *proc,
 
     // Source: internal HAL allocation (simulates camera input)
     struct hal_tensor *src = hal_image_processor_create_image(
-        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!src) {
         res.skip_reason = "src allocation failed";
         return res;
@@ -761,7 +761,7 @@ static bench_result bench_import_recreate(struct hal_image_processor *proc,
     };
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         res.skip_reason = "dst allocation failed";
         return res;
@@ -878,11 +878,11 @@ static bench_result bench_reuse(struct hal_image_processor *proc,
     };
 
     struct hal_tensor *src = hal_image_processor_create_image(
-        proc, SRC_W, SRC_H, src_fmt, HAL_DTYPE_U8);
+        proc, SRC_W, SRC_H, src_fmt, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!src) { res.skip_reason = "src allocation failed"; return res; }
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, dst_fmt, dst_dtype);
+        proc, DST_W, DST_H, dst_fmt, dst_dtype, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) {
         hal_tensor_free(src);
         res.skip_reason = "dst allocation failed";
@@ -943,11 +943,11 @@ static bench_result bench_chained(struct hal_image_processor *proc,
     };
 
     struct hal_tensor *src = hal_image_processor_create_image(
-        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     struct hal_tensor *mid = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_I8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_I8, HAL_CPU_ACCESS_READ_WRITE);
 
     if (!src || !mid || !dst) {
         if (src) hal_tensor_free(src);
@@ -1016,7 +1016,7 @@ static bench_result bench_recreate(struct hal_image_processor *proc,
     };
 
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+        proc, DST_W, DST_H, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!dst) { res.skip_reason = "dst allocation failed"; return res; }
 
     struct hal_crop crop = make_letterbox_crop();
@@ -1024,7 +1024,7 @@ static bench_result bench_recreate(struct hal_image_processor *proc,
     // Pre-flight
     {
         struct hal_tensor *test = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         if (!test) {
             hal_tensor_free(dst);
             res.skip_reason = "src allocation failed";
@@ -1042,7 +1042,7 @@ static bench_result bench_recreate(struct hal_image_processor *proc,
 
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
         struct hal_tensor *src = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         if (src) {
             hal_image_processor_convert(proc, src, dst,
                                          HAL_ROTATION_NONE, HAL_FLIP_NONE, &crop);
@@ -1054,7 +1054,7 @@ static bench_result bench_recreate(struct hal_image_processor *proc,
     int measured = 0;
     for (int i = 0; i < iterations; i++) {
         struct hal_tensor *src = hal_image_processor_create_image(
-            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+            proc, SRC_W, SRC_H, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
         if (!src) break;
 
         struct timespec t0, t1;

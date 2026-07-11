@@ -13,7 +13,7 @@
 static void test_tensor_image_new_rgb(void) {
     TEST("tensor_image_new_rgb");
 
-    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(640, hal_tensor_width(img));
@@ -27,7 +27,7 @@ static void test_tensor_image_new_rgb(void) {
 static void test_tensor_image_new_rgba(void) {
     TEST("tensor_image_new_rgba");
 
-    struct hal_tensor* img = hal_tensor_new_image(1920, 1080, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(1920, 1080, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(1920, hal_tensor_width(img));
@@ -41,7 +41,7 @@ static void test_tensor_image_new_rgba(void) {
 static void test_tensor_image_new_nv12(void) {
     TEST("tensor_image_new_nv12");
 
-    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(640, hal_tensor_width(img));
@@ -55,7 +55,7 @@ static void test_tensor_image_new_nv12(void) {
 static void test_tensor_image_new_grey(void) {
     TEST("tensor_image_new_grey");
 
-    struct hal_tensor* img = hal_tensor_new_image(256, 256, HAL_PIXEL_FORMAT_GREY, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(256, 256, HAL_PIXEL_FORMAT_GREY, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(256, hal_tensor_width(img));
@@ -71,13 +71,13 @@ static void test_tensor_image_new_invalid(void) {
 
     // Zero width
     errno = 0;
-    struct hal_tensor* img = hal_tensor_new_image(0, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(0, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NULL(img);
     ASSERT_ERRNO(EINVAL);
 
     // Zero height
     errno = 0;
-    img = hal_tensor_new_image(640, 0, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    img = hal_tensor_new_image(640, 0, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NULL(img);
     ASSERT_ERRNO(EINVAL);
 
@@ -202,11 +202,11 @@ static void test_image_processor_convert_rgb_to_rgb(void) {
     }
 
     // Create source image
-    struct hal_tensor* src = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(src);
 
     // Create destination image (same size)
-    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(dst);
 
     // Convert with no rotation/flip/crop
@@ -230,11 +230,11 @@ static void test_image_processor_convert_scale(void) {
     }
 
     // Create source image
-    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(src);
 
     // Create destination image (different size - scaling)
-    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(dst);
 
     // Scale down
@@ -257,11 +257,11 @@ static void test_image_processor_convert_with_rotation(void) {
         return;
     }
 
-    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* src = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(src);
 
     // For 90-degree rotation, dst should be 480x640
-    struct hal_tensor* dst = hal_tensor_new_image(480, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* dst = hal_tensor_new_image(480, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(dst);
 
     int result = hal_image_processor_convert(proc, src, dst,
@@ -283,7 +283,7 @@ static void test_image_processor_convert_invalid(void) {
         return;
     }
 
-    struct hal_tensor* img = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* img = hal_tensor_new_image(320, 240, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     // NULL processor
@@ -333,12 +333,12 @@ static void test_cuda_devptr_roundtrip(void) {
 
     const size_t w = 64, h = 64;
     struct hal_tensor* src =
-        hal_tensor_new_image(w, h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+        hal_tensor_new_image(w, h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(src);
     // create_image selects the optimal memory (a GPU PBO on the GL backend),
     // which is what makes the destination CUDA-mappable.
     struct hal_tensor* dst =
-        hal_image_processor_create_image(proc, w, h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_F32);
+        hal_image_processor_create_image(proc, w, h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_F32, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(dst);
     if (hal_tensor_memory_type(dst) != HAL_TENSOR_MEMORY_PBO) {
         TEST_SKIP("dst not a PBO (no CUDA-GL allocation on this host)");
@@ -389,7 +389,7 @@ static void test_tensor_image_dma(void) {
     // FourCC (Yuyv / Rgba / Bgra today); RGB falls through to SHM and
     // there's no fd or IOSurface to inspect. Use RGBA so the test
     // exercises the Dma path on both Linux DMA-buf and macOS IOSurface.
-    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_DMA);
+    struct hal_tensor* img = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_DMA, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(img);
 
     ASSERT_EQ(640, hal_tensor_width(img));
@@ -429,7 +429,7 @@ static void test_tensor_decode_image_jpeg(void) {
 
     // Create a pre-allocated tensor large enough for zidane.jpg (1280x720).
     // JPEG decodes to its native NV12 format, so allocate NV12.
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -487,7 +487,7 @@ static void test_tensor_decode_image_file_jpeg(void) {
     TEST("tensor_decode_image_file_jpeg");
 
     // JPEG decodes to its native NV12 format.
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -519,7 +519,7 @@ static void test_tensor_decode_image_file_jpeg(void) {
     // Consumers that need RGBA convert the native result themselves.
     struct hal_image_processor* proc = hal_image_processor_new();
     if (proc) {
-        struct hal_tensor* rgba = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+        struct hal_tensor* rgba = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
         ASSERT_NOT_NULL(rgba);
         int cret = hal_image_processor_convert(proc, tensor, rgba, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
         ASSERT_EQ(0, cret);
@@ -537,7 +537,7 @@ static void test_tensor_decode_image_native_format(void) {
 
     // The decoder always emits the source's native format; for a colour JPEG
     // that is NV12. The tensor is configured to that format on decode.
-    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* tensor = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(tensor);
 
     const char* path = test_image_jpeg_path();
@@ -616,7 +616,7 @@ static void test_tensor_decode_image_exif_orientation(void) {
             continue;
         }
         struct hal_tensor* tensor = hal_tensor_new_image(
-            1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+            1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
         ASSERT_NOT_NULL(tensor);
 
         size_t width = 0, height = 0;
@@ -651,7 +651,7 @@ static void test_tensor_decode_image_null_handling(void) {
     ASSERT_EQ(-1, ret);
 
     // NULL data
-    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(tensor);
     ret = hal_tensor_decode_image(tensor, NULL, 100, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
@@ -670,7 +670,7 @@ static void test_tensor_decode_image_file_null_handling(void) {
     int ret = hal_tensor_decode_image_file(NULL, "testdata/zidane.jpg", NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
 
-    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* tensor = hal_tensor_new_image(640, 480, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(tensor);
     ret = hal_tensor_decode_image_file(tensor, NULL, NULL, NULL, NULL, NULL);
     ASSERT_EQ(-1, ret);
