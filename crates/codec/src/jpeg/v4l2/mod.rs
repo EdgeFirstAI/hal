@@ -834,7 +834,10 @@ impl V4l2Context {
             rows,
             PixelFormat::Grey,
             Some(TensorMemory::Dma),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            // The decoder hardware writes the capture planes; the CPU only
+            // reads them during copy-out (`map_read` syncs the read
+            // direction).
+            edgefirst_tensor::CpuAccess::Read,
         ) {
             Ok(t) => {
                 log::debug!(
@@ -942,7 +945,7 @@ impl V4l2Context {
             .scratch
             .as_mut()
             .ok_or_else(|| DecodeErr::Reset("capture scratch missing".into()))?
-            .map()
+            .map_read()
             .map_err(|e| DecodeErr::Fatal(e.into()))?;
         write_planes(
             &stream.cap,
@@ -1030,7 +1033,7 @@ fn write_planes<T: ImagePixel>(
                 "4:4:4 YUV3 capture but output format is {output_fmt:?} (expected Nv24)"
             )));
         }
-        let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
+        let mut map = dst.map_write().map_err(|e| DecodeErr::Fatal(e.into()))?;
         let dst_bytes: &mut [T] = &mut map;
         // SAFETY: NV24 is u8; JPEG entry guarantees T == u8.
         let d: &mut [u8] = unsafe {
@@ -1078,7 +1081,7 @@ fn write_planes<T: ImagePixel>(
             .map_err(|e| DecodeErr::Fatal(e.into()))?;
     }
 
-    let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
+    let mut map = dst.map_write().map_err(|e| DecodeErr::Fatal(e.into()))?;
     let dst_bytes: &mut [T] = &mut map;
     // SAFETY: native NV12/GREY are u8; the JPEG entry guarantees T == u8.
     let d: &mut [u8] = unsafe {

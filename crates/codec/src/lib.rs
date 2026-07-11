@@ -16,9 +16,10 @@
 //! use edgefirst_codec::{ImageDecoder, ImageLoad};
 //! use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 //!
-//! // Allocate once (at init), sized for the largest expected image.
+//! // Allocate once (at init), sized for the largest expected image. The
+//! // decoder CPU-writes the pixels: declare `CpuAccess::Write`.
 //! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
-//!                                       CpuAccess::ReadWrite)
+//!                                       CpuAccess::Write)
 //!     .expect("allocation");
 //! let mut decoder = ImageDecoder::new();
 //!

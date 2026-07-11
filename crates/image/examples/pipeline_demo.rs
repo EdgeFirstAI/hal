@@ -233,7 +233,9 @@ fn main() {
             PixelFormat::Nv12,
             DType::U8,
             mem_type,
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            // The codec CPU-writes the decode; nothing reads it back on the
+            // CPU (convert consumes it on the GPU).
+            edgefirst_tensor::CpuAccess::Write,
         )
         .expect("Failed to create input tensor");
     let input_stride = input.effective_row_stride().unwrap_or(0);
@@ -256,7 +258,10 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             mem_type,
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            // Convert destinations feed hardware consumers; no CPU access —
+            // the None declaration keeps them eligible for vendor tile
+            // compression on platforms that support it.
+            edgefirst_tensor::CpuAccess::None,
         )
         .expect("Failed to create packed output tensor");
     let packed_stride = output_packed.effective_row_stride().unwrap_or(0);
@@ -277,7 +282,7 @@ fn main() {
             PixelFormat::PlanarRgb,
             DType::U8,
             mem_type,
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            edgefirst_tensor::CpuAccess::None,
         )
         .expect("Failed to create planar output tensor");
     eprintln!(

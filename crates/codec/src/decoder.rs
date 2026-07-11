@@ -28,9 +28,10 @@ use std::io::Read;
 /// use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 ///
 /// let mut decoder = ImageDecoder::new();
-/// // Allocate a buffer large enough for the biggest expected image.
+/// // Allocate a buffer large enough for the biggest expected image. The
+/// // decoder CPU-writes the pixels, so declare `CpuAccess::Write`.
 /// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
-///                                       CpuAccess::ReadWrite)
+///                                       CpuAccess::Write)
 ///     .expect("alloc");
 ///
 /// for _ in 0..100 {
@@ -191,7 +192,7 @@ impl Default for ImageDecoder {
 /// let info = peek_info(&data).unwrap();
 /// let mut tensor = Tensor::<u8>::image(info.width, info.height, info.format,
 ///                                       Some(TensorMemory::Mem),
-///                                       CpuAccess::ReadWrite).unwrap();
+///                                       CpuAccess::Write).unwrap();
 /// let mut decoder = ImageDecoder::new();
 /// tensor.load_image(&mut decoder, &data).unwrap();
 /// ```

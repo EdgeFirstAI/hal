@@ -29,7 +29,8 @@ fn main() {
         1080,
         PixelFormat::Nv12,
         Some(TensorMemory::Mem),
-        edgefirst_tensor::CpuAccess::ReadWrite,
+        // Decode target: the codec CPU-writes it; nothing reads it back.
+        edgefirst_tensor::CpuAccess::Write,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();

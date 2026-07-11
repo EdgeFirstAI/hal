@@ -132,7 +132,7 @@ def main():
         outputs.append(t)
 
     processor = ImageProcessor(egl_display=gpu_display)
-    dst = Tensor.image(640, 640, PixelFormat.Rgba)
+    dst = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     decoder = Decoder(metadata, score_threshold=args.threshold, iou_threshold=0.45)
 
     # --- Warmup ---

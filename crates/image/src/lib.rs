@@ -33,6 +33,10 @@ let image = edgefirst_bench::testdata::read("zidane.jpg");
 // The codec emits the source's native format (a colour JPEG decodes to NV12)
 // and configures the destination tensor's dims+format during the decode.
 let info = peek_info(&image).expect("peek");
+// Heap tensors are CPU-touched on both sides (codec decode writes, the
+// engine's upload/CPU-fallback paths read), so declare ReadWrite. Pure
+// hardware pipelines allocate their convert destinations with
+// `CpuAccess::None` instead.
 let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
                                    Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
 let mut decoder = ImageDecoder::new();
@@ -3043,7 +3047,7 @@ pub fn save_jpeg(tensor: &TensorDyn, path: impl AsRef<std::path::Path>, quality:
     let w = t.width().ok_or(Error::NotAnImage)?;
     let h = t.height().ok_or(Error::NotAnImage)?;
     let encoder = jpeg_encoder::Encoder::new_file(path, quality)?;
-    let tensor_map = t.map()?;
+    let tensor_map = t.map_read()?;
 
     encoder.encode(&tensor_map, w as u16, h as u16, colour)?;
 

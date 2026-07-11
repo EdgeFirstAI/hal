@@ -479,7 +479,7 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
     # centre the scaled image in the 640x640 destination, pad with grey. The
     # backend computes the placement (the old manual dst_crop rect is gone).
     t0 = time.perf_counter()
-    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
+    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb, access="readwrite")
     processor.convert(src, dst_rgb, letterbox=[114, 114, 114, 255])
 
     input_data = np.zeros((1, 640, 640, 3), dtype=np.uint8)
@@ -532,7 +532,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["load"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb)
+    dst_rgb = Tensor.image(640, 640, PixelFormat.Rgb, access="readwrite")
     # `letterbox=` preserves aspect ratio and pads to the 640x640 destination.
     processor.convert(src, dst_rgb, letterbox=[114, 114, 114, 255])
     input_data = np.zeros((1, 640, 640, 3), dtype=np.uint8)
@@ -544,7 +544,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     timings["inference"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    render_dst = Tensor.image(640, 640, PixelFormat.Rgba)
+    render_dst = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
     processor.draw_masks(decoder, outputs, render_dst)

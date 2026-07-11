@@ -935,13 +935,18 @@ impl PyTensor {
     // ── Image-specific methods ──────────────────────────────────────────
 
     /// Create an image tensor with the given dimensions and pixel format.
+    ///
+    /// `access` declares CPU access (`"none"`, `"read"`, `"write"`,
+    /// `"readwrite"`); hardware access is always implied. Scripts that
+    /// `map()` or `numpy()` the tensor should pass `access="readwrite"`.
     #[staticmethod]
-    #[pyo3(signature = (width, height, format, mem = None))]
+    #[pyo3(signature = (width, height, format, mem = None, access = "none"))]
     fn image(
         width: usize,
         height: usize,
         format: crate::image::PyPixelFormat,
         mem: Option<PyTensorMemory>,
+        access: &str,
     ) -> Result<Self> {
         use edgefirst_hal::tensor::PixelFormat;
         let fmt: PixelFormat = format.into();
@@ -952,7 +957,7 @@ impl PyTensor {
             fmt,
             DType::U8,
             memory,
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            parse_cpu_access(access)?,
         )?;
         Ok(PyTensor(tensor))
     }

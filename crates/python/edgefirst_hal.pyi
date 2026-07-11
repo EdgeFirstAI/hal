@@ -1096,6 +1096,7 @@ class Tensor:
         height: int,
         format: PixelFormat,
         mem: TensorMemory | None = None,
+        access: str = "none",
     ) -> Tensor:
         """Create an image tensor with the given dimensions and pixel format.
 
@@ -1105,6 +1106,10 @@ class Tensor:
             format: Pixel format for the image data.
             mem: Optional memory type override. If None, the best available
                 memory type is chosen automatically.
+            access: Declared CPU access — ``"none"`` (default), ``"read"``,
+                ``"write"``, or ``"readwrite"``. Hardware access is always
+                implied; pass ``"readwrite"`` (or the precise direction) when
+                the script will ``map()`` or ``numpy()`` the tensor.
         """
         ...
 

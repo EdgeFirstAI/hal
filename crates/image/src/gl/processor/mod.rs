@@ -1363,7 +1363,7 @@ impl GLProcessorST {
             64,
             PixelFormat::Rgba,
             Some(TensorMemory::Dma),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            edgefirst_tensor::CpuAccess::Write,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -1373,7 +1373,7 @@ impl GLProcessorST {
         };
 
         {
-            let mut map = match src.map() {
+            let mut map = match src.map_write() {
                 Ok(m) => m,
                 Err(e) => {
                     log::info!("verify_dma_buf_roundtrip: failed to map DMA source: {e}");
@@ -1394,7 +1394,7 @@ impl GLProcessorST {
             64,
             PixelFormat::Rgba,
             Some(TensorMemory::Dma),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            edgefirst_tensor::CpuAccess::Read,
         ) {
             Ok(img) => img,
             Err(e) => {
@@ -1420,7 +1420,7 @@ impl GLProcessorST {
         }
 
         // Read back the center pixel at (32, 32) from the destination
-        let map = match dst.map() {
+        let map = match dst.map_read() {
             Ok(m) => m,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to map DMA destination: {e}");
@@ -1888,13 +1888,13 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    let mut dst_map = dst.map()?;
+                    let mut dst_map = dst.map_mut()?;
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
                     }
                 }
             } else {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 unsafe {
                     edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
@@ -2072,13 +2072,13 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    let mut dst_map = dst.map()?;
+                    let mut dst_map = dst.map_mut()?;
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
                     }
                 }
             } else {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 unsafe {
                     edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
@@ -2563,7 +2563,7 @@ impl GLProcessorST {
         let len = dst.len();
         match pbo_id {
             None => unsafe {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                 read_pixels_into(
                     dst_w,
@@ -2685,7 +2685,7 @@ impl GLProcessorST {
         }) {
             std::ptr::null()
         } else {
-            map = dst.map()?;
+            map = dst.map_read()?;
             if is_bgra {
                 // Swap R↔B to convert BGRA→RGBA for the RGBA texture.
                 swapped_buf = map.as_slice().to_vec();
@@ -2757,7 +2757,7 @@ impl GLProcessorST {
         dst_h: usize,
     ) -> crate::Result<()> {
         use edgefirst_tensor::TensorMapTrait;
-        let map = src.map()?;
+        let map = src.map_read()?;
         let src_slice = map.as_slice();
         let format = match src_fmt {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
@@ -4596,7 +4596,7 @@ impl GLProcessorST {
                     src_w,
                     src_h,
                     texture_format,
-                    &src.map()?,
+                    &src.map_read()?,
                 );
                 edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             }
@@ -4930,7 +4930,7 @@ impl GLProcessorST {
                     })?;
                     let offset = src.plane_offset().unwrap_or(0);
                     let needed = tex_width as usize * combined_h;
-                    let map = src.map()?;
+                    let map = src.map_read()?;
                     let bytes = map.as_slice();
                     if offset + needed > bytes.len() {
                         return Err(Error::InvalidShape(format!(
@@ -5737,18 +5737,18 @@ impl GLProcessorST {
         let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
-                mc_map_f32 = t.map()?;
+                mc_map_f32 = t.map_read()?;
                 mc_map_f32.as_slice()
             }
             DType::F16 => {
                 let t = proto_data.mask_coefficients.as_f16().expect("F16");
-                mc_map_f16 = t.map()?;
+                mc_map_f16 = t.map_read()?;
                 coeff_widen_f16 = mc_map_f16.as_slice().iter().map(|v| v.to_f32()).collect();
                 &coeff_widen_f16[..]
             }
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
-                mc_map_i8 = t.map()?;
+                mc_map_i8 = t.map_read()?;
                 let quant = t.quantization();
                 coeff_dequant = super::proto_dispatch::dequant_coeffs(
                     mc_map_i8.as_slice(),
@@ -5759,7 +5759,7 @@ impl GLProcessorST {
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
-                let mc_map_i16 = t.map()?;
+                let mc_map_i16 = t.map_read()?;
                 let quant = t.quantization();
                 coeff_dequant = super::proto_dispatch::dequant_coeffs(
                     mc_map_i16.as_slice(),
@@ -5781,7 +5781,7 @@ impl GLProcessorST {
         match proto_data.protos.dtype() {
             DType::I8 => {
                 let t = proto_data.protos.as_i8().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
@@ -5820,7 +5820,7 @@ impl GLProcessorST {
             }
             DType::F32 => {
                 let t = proto_data.protos.as_f32().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_view = ndarray::ArrayView3::<f32>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
@@ -5840,7 +5840,7 @@ impl GLProcessorST {
             }
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_view = ndarray::ArrayView3::<half::f16>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),

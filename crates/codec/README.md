@@ -38,9 +38,10 @@ use edgefirst_codec::{ImageDecoder, ImageLoad};
 use edgefirst_tensor::{CpuAccess, Tensor, PixelFormat, TensorMemory};
 
 // Allocate once at init (prefer ImageProcessor::create_image() for DMA/PBO).
-// A colour JPEG decodes to NV12, so allocate an NV12 tensor.
+// A colour JPEG decodes to NV12, so allocate an NV12 tensor. The decoder
+// CPU-writes the pixels: declare CpuAccess::Write.
 let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12,
-    Some(TensorMemory::Mem), CpuAccess::ReadWrite).unwrap();
+    Some(TensorMemory::Mem), CpuAccess::Write).unwrap();
 let mut decoder = ImageDecoder::new();
 
 // Decode in the hot loop — zero allocations after warmup for JPEG.

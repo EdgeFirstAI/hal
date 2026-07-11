@@ -63,7 +63,8 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             None,
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            // CUDA writes device-side; Write covers the CPU decode fallback.
+            edgefirst_tensor::CpuAccess::Write,
         )
         .expect("create_image");
     println!("destination tensor memory = {:?}", tensor.memory());
@@ -122,7 +123,8 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
-            edgefirst_tensor::CpuAccess::ReadWrite,
+            // Only mapped to verify the pixels below.
+            edgefirst_tensor::CpuAccess::Read,
         )
         .expect("create dst");
     match processor.convert(

@@ -358,7 +358,7 @@ impl GLProcessorST {
         // pays the per-frame lock/sync cache maintenance.
         self.convert_stats.src_uploads += 1;
         tracing::Span::current().record("src_feed", "upload");
-        let pixels = src_u8.map()?;
+        let pixels = src_u8.map_read()?;
         self.camera_normal_texture.update_texture(
             edgefirst_gl::gl::TEXTURE_2D,
             src_w,

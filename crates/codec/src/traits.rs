@@ -28,7 +28,7 @@ use std::path::Path;
 /// use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 ///
 /// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
-///                                       CpuAccess::ReadWrite)
+///                                       CpuAccess::Write)
 ///     .expect("alloc");
 /// let mut decoder = ImageDecoder::new();
 ///
