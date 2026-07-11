@@ -1239,6 +1239,21 @@ impl BufferIdentity {
     pub fn weak(&self) -> Weak<()> {
         Arc::downgrade(&self.guard)
     }
+
+    /// Rebuild an identity from interned parts — crate-private: only the
+    /// Android `AHardwareBuffer_getId` intern table may resurrect an
+    /// existing identity (arbitrary construction would forge cache hits).
+    // Only the Android AHardwareBuffer intern path uses these today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn from_parts(id: u64, guard: Arc<()>) -> Self {
+        Self { id, guard }
+    }
+
+    /// The strong guard handle (for the intern table's mint path).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn guard_arc(&self) -> Arc<()> {
+        Arc::clone(&self.guard)
+    }
 }
 
 impl Default for BufferIdentity {

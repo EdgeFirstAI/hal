@@ -123,6 +123,57 @@ pub(crate) fn compression_eligible(format: PixelFormat, dtype: DType) -> bool {
     matches!(format, PixelFormat::Rgba) && matches!(dtype, DType::U8 | DType::I8)
 }
 
+/// Identity-intern policy — the pure half of the Android
+/// `AHardwareBuffer_getId` interning (host-tested; the FFI module owns
+/// the `dlsym` lookup and the process-wide table).
+///
+/// Maps a stable system buffer key (the 64-bit `AHardwareBuffer_getId`)
+/// to the HAL's own `BufferIdentity` parts. Reuse requires the recorded
+/// guard to still be LIVE: a live guard means some tensor still holds
+/// its acquire-reference on the underlying buffer, so the system cannot
+/// have recycled that id (the ABA case is defused by construction —
+/// guards are held only by tensors, never by caches, which hold weaks).
+/// Dead entries are pruned on every insert, bounding the table to the
+/// number of live buffers.
+pub(crate) struct IdentityInternTable {
+    map: std::collections::HashMap<u64, (u64, std::sync::Weak<()>)>,
+}
+
+impl IdentityInternTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Resolve `key` to identity parts: a live recorded entry is reused
+    /// verbatim; otherwise `mint` supplies fresh parts which are
+    /// recorded (after pruning dead entries). Returns `(id, guard,
+    /// reused)`.
+    pub(crate) fn resolve(
+        &mut self,
+        key: u64,
+        mint: impl FnOnce() -> (u64, std::sync::Arc<()>),
+    ) -> (u64, std::sync::Arc<()>, bool) {
+        if let Some((id, weak)) = self.map.get(&key) {
+            if let Some(guard) = weak.upgrade() {
+                return (*id, guard, true);
+            }
+        }
+        self.map.retain(|_, (_, weak)| weak.strong_count() > 0);
+        let (id, guard) = mint();
+        self.map
+            .insert(key, (id, std::sync::Arc::downgrade(&guard)));
+        (id, guard, false)
+    }
+
+    /// Number of recorded entries (test observability).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 // AHardwareBuffer_Format values (subset used by the HAL).
 /// RGBA 8:8:8:8 UNORM — API 26+.
 pub(crate) const FORMAT_R8G8B8A8_UNORM: u32 = 1;
@@ -231,6 +282,50 @@ mod tests {
             rfu0: 0,
             rfu1: 0,
         }
+    }
+
+    #[test]
+    fn identity_intern_reuses_live_and_remints_dead() {
+        use std::sync::Arc;
+        let mut table = IdentityInternTable::new();
+        let mint = |id: u64| move || (id, Arc::new(()));
+
+        // First sight of key 42 mints.
+        let (id1, guard1, reused) = table.resolve(42, mint(100));
+        assert_eq!((id1, reused), (100, false));
+
+        // Same key while the guard lives → the SAME identity (the
+        // CameraX re-wrap hit that makes the EGL import cache work).
+        let (id2, _guard2, reused) = table.resolve(42, mint(101));
+        assert_eq!((id2, reused), (100, true));
+
+        // Guard dead (all tensors dropped) → fresh identity; a fresh id
+        // is always safe even if the system recycled the key.
+        drop(guard1);
+        drop(_guard2);
+        let (id3, _guard3, reused) = table.resolve(42, mint(102));
+        assert_eq!((id3, reused), (102, false));
+    }
+
+    #[test]
+    fn identity_intern_prunes_dead_entries_on_insert() {
+        use std::sync::Arc;
+        let mut table = IdentityInternTable::new();
+        // Dead entries never accumulate: every insert prunes, so a
+        // wrap-drop churn loop holds the table at one entry…
+        for key in 0..8u64 {
+            let (_, guard, _) = table.resolve(key, || (key + 100, Arc::new(())));
+            drop(guard);
+            assert_eq!(table.len(), 1);
+        }
+        // …while live entries are all retained.
+        let guards: Vec<_> = (100..104u64)
+            .map(|key| table.resolve(key, || (key, Arc::new(()))).1)
+            .collect();
+        assert_eq!(table.len(), 4);
+        drop(guards);
+        let (_, _live, _) = table.resolve(999, || (999, Arc::new(())));
+        assert_eq!(table.len(), 1);
     }
 
     #[test]

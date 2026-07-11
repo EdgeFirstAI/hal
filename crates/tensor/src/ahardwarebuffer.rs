@@ -166,6 +166,78 @@ extern "C" {
     ) -> i32;
 }
 
+/// `AHardwareBuffer_getId` (API 31+): the system's stable 64-bit id for
+/// a buffer, identical across every wrap/import of the same allocation
+/// in the process. Resolved lazily via `dlsym` so the HAL keeps its
+/// API-26 link floor — `None` on API 26–30 (symbol absent) and every
+/// wrap keeps today's fresh-identity behavior.
+fn ahardwarebuffer_get_id(buffer: AHardwareBufferRef) -> Option<u64> {
+    type GetIdFn = unsafe extern "C" fn(AHardwareBufferRef, *mut u64) -> i32;
+    static GET_ID: std::sync::OnceLock<Option<GetIdFn>> = std::sync::OnceLock::new();
+    let get_id = (*GET_ID.get_or_init(|| {
+        extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+        }
+        // Bionic RTLD_DEFAULT: null on LP64, 0xffffffff on LP32.
+        #[cfg(target_pointer_width = "64")]
+        let rtld_default = std::ptr::null_mut();
+        #[cfg(target_pointer_width = "32")]
+        let rtld_default = 0xffff_ffffusize as *mut c_void;
+        // SAFETY: dlsym with a NUL-terminated name; a null result means
+        // the symbol is absent (API < 31).
+        let sym = unsafe { dlsym(rtld_default, c"AHardwareBuffer_getId".as_ptr()) };
+        if sym.is_null() {
+            log::debug!("AHardwareBuffer_getId unavailable (API < 31): identities stay fresh");
+            None
+        } else {
+            // SAFETY: the NDK declares this exact signature for the symbol.
+            Some(unsafe { std::mem::transmute::<*mut c_void, GetIdFn>(sym) })
+        }
+    }))?;
+    let mut id = 0u64;
+    // SAFETY: buffer is a live acquired AHardwareBuffer; out param is valid.
+    (unsafe { get_id(buffer, &mut id) } == 0).then_some(id)
+}
+
+/// Resolve the [`BufferIdentity`] for `buffer`, interning on the
+/// system's `AHardwareBuffer_getId` so every wrap of the same
+/// allocation (CameraX/ImageReader re-wraps, export → re-import) shares
+/// one identity — and therefore hits the GL backend's EGLImage import
+/// cache instead of re-importing per frame.
+///
+/// The intern KEY is the system id; the identity's own `id` is still
+/// minted from the process-wide counter (id-space collision with
+/// non-AHB identities is impossible). Reuse requires the recorded guard
+/// to be live — a live guard means a tensor still holds its
+/// acquire-reference, so the system cannot have recycled the key (see
+/// `IdentityInternTable`). Without `getId` (API 26–30) every wrap gets
+/// a fresh identity, exactly the pre-interning behavior.
+fn interned_identity(buffer: &OwnedAHardwareBuffer) -> BufferIdentity {
+    let Some(key) = ahardwarebuffer_get_id(buffer.as_ptr()) else {
+        return BufferIdentity::new();
+    };
+    static INTERN: std::sync::LazyLock<Mutex<crate::ahardwarebuffer_layout::IdentityInternTable>> =
+        std::sync::LazyLock::new(|| {
+            Mutex::new(crate::ahardwarebuffer_layout::IdentityInternTable::new())
+        });
+    let mut table = match INTERN.lock() {
+        Ok(t) => t,
+        // A poisoned table only means some thread panicked mid-resolve;
+        // the map itself is still structurally sound (resolve never
+        // leaves partial state) — keep interning rather than degrading
+        // every future wrap to fresh identities.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let (id, guard, reused) = table.resolve(key, || {
+        let fresh = BufferIdentity::new();
+        (fresh.id(), fresh.guard_arc())
+    });
+    if reused {
+        trace!("AHardwareBuffer getId={key:#x} interned → identity {id} (EGL cache hit)");
+    }
+    BufferIdentity::from_parts(id, guard)
+}
+
 /// The device's native tile-compression scheme, classified from the
 /// `ro.hardware.egl` system property (`scheme_for_egl_vendor`). Cached:
 /// `ro.*` properties are fixed at boot. `None` on emulators and
@@ -601,10 +673,10 @@ where
 
         Ok(Self {
             name,
+            identity: interned_identity(&buffer),
             buffer,
             shape: shape.to_vec(),
             _marker: PhantomData,
-            identity: BufferIdentity::new(),
             buf_size,
             bytes_per_row,
             physical_dims: (desc.width as usize, desc.height as usize),
@@ -750,10 +822,10 @@ where
 
         Ok(Self {
             name,
+            identity: interned_identity(&buffer),
             buffer,
             shape: shape.to_vec(),
             _marker: PhantomData,
-            identity: BufferIdentity::new(),
             buf_size,
             bytes_per_row,
             physical_dims: (desc.width as usize, desc.height as usize),
@@ -817,10 +889,10 @@ where
         };
         Ok(Self {
             name,
+            identity: interned_identity(&buffer),
             buffer,
             shape: shape.to_vec(),
             _marker: PhantomData,
-            identity: BufferIdentity::new(),
             buf_size,
             bytes_per_row,
             physical_dims: (desc.width as usize, desc.height as usize),
