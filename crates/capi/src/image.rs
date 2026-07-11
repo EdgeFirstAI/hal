@@ -395,6 +395,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
     format: HalPixelFormat,
     dtype: HalDtype,
     memory: HalTensorMemory,
+    access: crate::tensor::HalCpuAccess,
 ) -> *mut HalTensor {
     if width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
@@ -408,6 +409,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
             format.to_pixel_format(),
             dtype.into(),
             mem_opt,
+            access.into(),
         ),
         libc::ENOMEM
     );
@@ -1489,6 +1491,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
     height: size_t,
     format: HalPixelFormat,
     dtype: HalDtype,
+    access: crate::tensor::HalCpuAccess,
 ) -> *mut HalTensor {
     if processor.is_null() || width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
@@ -1500,6 +1503,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
         format.to_pixel_format(),
         dtype.into(),
         None,
+        access.into(),
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1940,6 +1944,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -1970,7 +1975,14 @@ mod tests {
 
             for fmt in formats {
                 // Use dimensions that work for all formats (divisible by 2 for YUV)
-                let image = hal_tensor_new_image(320, 240, fmt, HalDtype::U8, HalTensorMemory::Mem);
+                let image = hal_tensor_new_image(
+                    320,
+                    240,
+                    fmt,
+                    HalDtype::U8,
+                    HalTensorMemory::Mem,
+                    crate::tensor::HalCpuAccess::ReadWrite,
+                );
                 assert!(
                     !image.is_null(),
                     "Failed to create image with format {:?}",
@@ -2133,6 +2145,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             let dst = hal_tensor_new_image(
                 100,
@@ -2140,6 +2153,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!src.is_null());
             assert!(!dst.is_null());
@@ -2198,6 +2212,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2234,6 +2249,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert!(!hal_tensor_is_planar(rgb));
@@ -2245,6 +2261,7 @@ mod tests {
                 HalPixelFormat::Nv12,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!nv12.is_null());
             assert!(hal_tensor_is_planar(nv12));
@@ -2256,6 +2273,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!planar.is_null());
             assert!(hal_tensor_is_planar(planar));
@@ -2275,6 +2293,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_channels(rgb), 3);
@@ -2286,6 +2305,7 @@ mod tests {
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgba.is_null());
             assert_eq!(hal_tensor_channels(rgba), 4);
@@ -2297,6 +2317,7 @@ mod tests {
                 HalPixelFormat::Grey,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!grey.is_null());
             assert_eq!(hal_tensor_channels(grey), 1);
@@ -2316,6 +2337,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_row_stride(rgb), 300); // 100 * 3
@@ -2327,6 +2349,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!planar.is_null());
             assert_eq!(hal_tensor_row_stride(planar), 100); // planar: width
@@ -2350,6 +2373,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!dst.is_null());
 
@@ -2442,6 +2466,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2473,6 +2498,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2548,6 +2574,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2562,6 +2589,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2572,6 +2600,7 @@ mod tests {
                 0,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2600,7 +2629,14 @@ mod tests {
             ];
 
             for (fmt, channels) in formats {
-                let img = hal_image_processor_create_image(processor, 320, 240, fmt, HalDtype::U8);
+                let img = hal_image_processor_create_image(
+                    processor,
+                    320,
+                    240,
+                    fmt,
+                    HalDtype::U8,
+                    crate::tensor::HalCpuAccess::ReadWrite,
+                );
                 assert!(!img.is_null(), "create_image failed for {:?}", fmt);
 
                 assert_eq!(hal_tensor_width(img), 320);
@@ -2637,6 +2673,7 @@ mod tests {
                 240,
                 HalPixelFormat::Rgb,
                 HalDtype::I8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!img.is_null(), "create_image with I8 dtype failed");
             assert_eq!(hal_tensor_dtype(img), HalDtype::I8);
@@ -2666,6 +2703,7 @@ mod tests {
                 240,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!src.is_null());
 
@@ -2676,6 +2714,7 @@ mod tests {
                 120,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!dst.is_null());
 
@@ -2993,6 +3032,7 @@ mod tests {
                 edgefirst_tensor::PixelFormat::Rgba,
                 edgefirst_tensor::DType::U8,
                 None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             t.set_row_stride(512).unwrap();

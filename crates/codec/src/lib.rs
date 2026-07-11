@@ -14,10 +14,11 @@
 //!
 //! ```rust,no_run
 //! use edgefirst_codec::{ImageDecoder, ImageLoad};
-//! use edgefirst_tensor::{Tensor, TensorTrait, TensorMemory, PixelFormat};
+//! use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 //!
 //! // Allocate once (at init), sized for the largest expected image.
-//! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem))
+//! let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
+//!                                       CpuAccess::ReadWrite)
 //!     .expect("allocation");
 //! let mut decoder = ImageDecoder::new();
 //!

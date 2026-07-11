@@ -67,7 +67,15 @@ fn bench_decode_strided(suite: &mut BenchSuite) {
     // Use an oversized tensor to demonstrate strided decode
     let max_w = TEST_IMAGES.iter().map(|i| i.width).max().unwrap();
     let max_h = TEST_IMAGES.iter().map(|i| i.height).max().unwrap();
-    let mut input = TensorDyn::image(max_w, max_h, PixelFormat::Nv12, DType::U8, None).unwrap();
+    let mut input = TensorDyn::image(
+        max_w,
+        max_h,
+        PixelFormat::Nv12,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let stride = input.effective_row_stride().unwrap_or(0);
 
     for img in TEST_IMAGES {
@@ -107,10 +115,24 @@ fn bench_decode_convert(
     // to native NV12; the convert step below handles the NV12 -> RGB/RGBA
     // colour conversion as part of the realistic decode + letterbox pipeline.
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Nv12, DType::U8, None)
+        .create_image(
+            max_w,
+            max_h,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
         .expect("Failed to create input tensor");
     let mut output = proc
-        .create_image(MODEL_W, MODEL_H, output_fmt, DType::U8, None)
+        .create_image(
+            MODEL_W,
+            MODEL_H,
+            output_fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
         .expect("Failed to create output tensor");
 
     for img in TEST_IMAGES {

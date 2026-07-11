@@ -1196,8 +1196,14 @@ mod tests {
         // IOSurface and records the stride, so CPU access is correct + zero-copy.
         let h = 3usize;
         let w = 17usize;
-        let t = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect("non-aligned packed RGBA should allocate a padded IOSurface");
+        let t = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("non-aligned packed RGBA should allocate a padded IOSurface");
 
         let stride = t.effective_row_stride().expect("stride");
         assert!(stride >= w * 4, "stride {stride} >= natural {}", w * 4);
@@ -1242,8 +1248,14 @@ mod tests {
         // distinct byte per logical pixel via the strided map, then verify
         // the flat copy is tight and padding-free.
         let (w, h) = (17usize, 3usize);
-        let t = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect("padded IOSurface alloc");
+        let t = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("padded IOSurface alloc");
         let stride = t.effective_row_stride().expect("stride");
         assert!(stride > w * 4, "test requires a padded stride");
         {
@@ -1273,8 +1285,15 @@ mod tests {
 
         // Tight tensors (no recorded stride) degenerate to one memcpy —
         // exercised through the TensorDyn dispatch layer.
-        let tight = TensorDyn::image(64, 4, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
-            .expect("tight Mem alloc");
+        let tight = TensorDyn::image(
+            64,
+            4,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("tight Mem alloc");
         {
             let tu8 = tight.as_u8().unwrap();
             let mut m = tu8.map().expect("map");
@@ -1302,12 +1321,25 @@ mod tests {
         for (name, result) in [
             (
                 "PlanarRgb u8",
-                Tensor::<u8>::image(64, 8, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
-                    .map(drop),
+                Tensor::<u8>::image(
+                    64,
+                    8,
+                    PixelFormat::PlanarRgb,
+                    Some(TensorMemory::Dma),
+                    crate::CpuAccess::ReadWrite,
+                )
+                .map(drop),
             ),
             (
                 "Rgb f32",
-                Tensor::<f32>::image(64, 8, PixelFormat::Rgb, Some(TensorMemory::Dma)).map(drop),
+                Tensor::<f32>::image(
+                    64,
+                    8,
+                    PixelFormat::Rgb,
+                    Some(TensorMemory::Dma),
+                    crate::CpuAccess::ReadWrite,
+                )
+                .map(drop),
             ),
         ] {
             match result {
@@ -1324,8 +1356,14 @@ mod tests {
         // The designed 'L008' semi-planar arm is a mapping, not a byte-bag:
         // NV12 u8 with explicit Dma must still allocate (the R8 plane the
         // YUV shaders sample) — the contract fix must not break it.
-        let nv12 = Tensor::<u8>::image(64, 8, PixelFormat::Nv12, Some(TensorMemory::Dma))
-            .expect("NV12 u8 keeps its designed L008 IOSurface mapping");
+        let nv12 = Tensor::<u8>::image(
+            64,
+            8,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("NV12 u8 keeps its designed L008 IOSurface mapping");
         assert_eq!(nv12.memory(), TensorMemory::Dma);
     }
 

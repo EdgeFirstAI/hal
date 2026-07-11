@@ -532,6 +532,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
@@ -549,6 +550,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)
@@ -707,6 +709,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
@@ -724,6 +727,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)

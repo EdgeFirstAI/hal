@@ -54,6 +54,7 @@ fn main() {
             info.height,
             PixelFormat::Nv24,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .expect("tensor alloc");
         let t0 = Instant::now();

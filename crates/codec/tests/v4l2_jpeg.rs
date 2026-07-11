@@ -58,7 +58,14 @@ fn decode(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2: bool)
     } else {
         std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     }
-    let mut tensor = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        w,
+        h,
+        fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, jpeg).unwrap();
     let map = tensor.map().unwrap();
@@ -126,8 +133,14 @@ fn v4l2_persistent_loop() {
 
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     let mut decoder = ImageDecoder::new();
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     // 5 iterations prove the persistent stream survives multiple reuses
     // (the correctness property). Throughput measurement moves to the
     // codec_benchmark bench cell `codec/jpeg/nv12/zidane_720p_persistent_stream`.
@@ -158,6 +171,7 @@ fn v4l2_geometry_change_rebuilds() {
             peeked.height,
             PixelFormat::Nv12,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let info = t.load_image(&mut decoder, data).unwrap();
@@ -188,7 +202,14 @@ fn decode_tight(jpeg: &[u8], w: usize, h: usize, fmt: PixelFormat, disable_v4l2:
     } else {
         std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
     }
-    let mut tensor = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        w,
+        h,
+        fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, jpeg).unwrap();
     assert_eq!((info.width, info.height), (w, h));
@@ -245,8 +266,14 @@ fn v4l2_geometry_change_reconfigures() {
             (&z, 1280usize, 720usize, &cpu_z, "zidane"),
             (&g, 640, 640, &cpu_g, "giraffe"),
         ] {
-            let mut t =
-                Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+            let mut t = Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Nv12,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             let info = t.load_image(&mut decoder, jpeg).unwrap();
             assert_eq!((info.width, info.height), (w, h));
             let stride = info.row_stride;
@@ -309,13 +336,27 @@ fn v4l2_reconfigure_loop_stable() {
     let mut decoder = ImageDecoder::new();
     // Warm-up pass establishes the device fd and the persistent allocations.
     for (jpeg, w, h, fmt) in &images {
-        let mut t = Tensor::<u8>::image(*w, *h, *fmt, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            *w,
+            *h,
+            *fmt,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.load_image(&mut decoder, jpeg).unwrap();
     }
     let baseline = fd_count();
     for round in 0..5 {
         for (jpeg, w, h, fmt) in &images {
-            let mut t = Tensor::<u8>::image(*w, *h, *fmt, Some(TensorMemory::Mem)).unwrap();
+            let mut t = Tensor::<u8>::image(
+                *w,
+                *h,
+                *fmt,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             let info = t.load_image(&mut decoder, jpeg).unwrap();
             assert_eq!((info.width, info.height), (*w, *h), "round {round}");
             let map = t.map().unwrap();
@@ -341,7 +382,13 @@ fn v4l2_zero_copy_dma_nv12() {
     // zidane is 1280×720 — both MCU(16)-aligned, so zero-copy is eligible.
     let jpeg = testdata("zidane.jpg");
     std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
-    let mut dma = match Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Dma)) {
+    let mut dma = match Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Dma),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("skip v4l2_zero_copy_dma_nv12: no DMA allocation ({e})");

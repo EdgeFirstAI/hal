@@ -834,6 +834,7 @@ impl V4l2Context {
             rows,
             PixelFormat::Grey,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => {
                 log::debug!(
@@ -1707,14 +1708,19 @@ mod tests {
 
         // Persistent CAPTURE scratch: 4 MiB DMA buffer — larger than any
         // sizeimage in this probe, to confirm question 3.
-        let scratch =
-            match Tensor::<u8>::image(4096, 1024, PixelFormat::Grey, Some(TensorMemory::Dma)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("skip: no DMA heap ({e})");
-                    return;
-                }
-            };
+        let scratch = match Tensor::<u8>::image(
+            4096,
+            1024,
+            PixelFormat::Grey,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip: no DMA heap ({e})");
+                return;
+            }
+        };
         let scratch_fd = scratch.dmabuf().unwrap().as_raw_fd();
         let scratch_cap = scratch.capacity_bytes();
 
@@ -2005,8 +2011,14 @@ mod tests {
         let mut scratches = Vec::new();
         for _ in 0..depth {
             let rows = sizeimage.div_ceil(4096);
-            let t =
-                Tensor::<u8>::image(4096, rows, PixelFormat::Grey, Some(TensorMemory::Dma)).ok()?;
+            let t = Tensor::<u8>::image(
+                4096,
+                rows,
+                PixelFormat::Grey,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .ok()?;
             scratches.push(t);
         }
         let scratch_fds: Vec<RawFd> = scratches

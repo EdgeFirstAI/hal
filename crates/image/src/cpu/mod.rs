@@ -709,7 +709,14 @@ impl CPUProcessor {
                 let mut tmp = if scratch_matches {
                     self.widen_scratch.take().unwrap()
                 } else {
-                    TensorDyn::image(dw, dh, dst_fmt, DType::U8, Some(TensorMemory::Mem))?
+                    TensorDyn::image(
+                        dw,
+                        dh,
+                        dst_fmt,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )?
                 };
                 {
                     let tmp_u8 = tmp.as_u8_mut().unwrap();
@@ -769,7 +776,13 @@ impl CPUProcessor {
                 return Ok(t);
             }
         }
-        Ok(Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem))?)
+        Ok(Tensor::<u8>::image(
+            w,
+            h,
+            fmt,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?)
     }
 
     /// U8-to-U8 conversion: the full format conversion + resize pipeline.

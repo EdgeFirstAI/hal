@@ -57,7 +57,14 @@ fn main() {
 
     let mut processor = ImageProcessor::new().expect("ImageProcessor::new");
     let mut tensor = processor
-        .create_image(probe.width, probe.height, PixelFormat::Rgb, DType::U8, None)
+        .create_image(
+            probe.width,
+            probe.height,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
         .expect("create_image");
     println!("destination tensor memory = {:?}", tensor.memory());
     println!(
@@ -115,6 +122,7 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .expect("create dst");
     match processor.convert(

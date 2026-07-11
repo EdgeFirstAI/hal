@@ -34,6 +34,7 @@ fn decode_tensordyn_u8_nv12() {
         PixelFormat::Nv12,
         DType::U8,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -53,6 +54,7 @@ fn decode_tensordyn_jpeg_f32_unsupported() {
         PixelFormat::Nv12,
         DType::F32,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -73,6 +75,7 @@ fn decode_tensordyn_unsupported_dtype() {
         PixelFormat::Nv12,
         DType::I32,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -90,6 +93,7 @@ fn decode_tensordyn_png_f32() {
         PixelFormat::Rgb,
         DType::F32,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -108,6 +112,7 @@ fn decode_tensordyn_png_i16() {
         PixelFormat::Rgb,
         DType::I16,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -136,6 +141,7 @@ fn decode_file_path() {
         PixelFormat::Nv12,
         DType::U8,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();

@@ -158,7 +158,14 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 let mut proc = ImageProcessor::new()
                     .map_err(|e| format!("processor {i} creation failed: {e}"))?;
                 let src = proc
-                    .create_image(cell.src_w, cell.src_h, cell.src_fmt, DType::U8, mem)
+                    .create_image(
+                        cell.src_w,
+                        cell.src_h,
+                        cell.src_fmt,
+                        DType::U8,
+                        mem,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
                     .map_err(|e| format!("src alloc failed: {e}"))?;
                 {
                     use edgefirst_tensor::TensorMapTrait;
@@ -182,7 +189,14 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                     DType::U8
                 };
                 let mut dst = proc
-                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, dst_dtype, dst_mem)
+                    .create_image(
+                        cell.dst_w,
+                        cell.dst_h,
+                        cell.dst_fmt,
+                        dst_dtype,
+                        dst_mem,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
                 let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
                     proc.convert(&src, dst, Rotation::None, Flip::None, crop)

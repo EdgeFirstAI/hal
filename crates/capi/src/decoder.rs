@@ -3254,6 +3254,7 @@ outputs:
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -3520,6 +3521,7 @@ outputs:
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 

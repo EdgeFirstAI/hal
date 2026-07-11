@@ -992,6 +992,7 @@ mod tests {
             4,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let err = float_pbo_buffer_id(&t).unwrap_err();

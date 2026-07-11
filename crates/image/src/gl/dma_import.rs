@@ -1285,6 +1285,7 @@ mod tests {
             64,
             PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Rgb, false)
@@ -1306,6 +1307,7 @@ mod tests {
             64,
             PixelFormat::Grey,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let err = DmaImportAttrs::from_tensor(&t, PixelFormat::Grey, false)

@@ -959,10 +959,6 @@ pub fn unplanned_cpu_access_count() -> u64 {
 /// Record an unplanned CPU access on `identity_id`, warning once per
 /// buffer (a steady-state pipeline maps the same buffer every frame — a
 /// per-map warn would flood the log; repeats count silently).
-// Only the Android backend detects unplanned access in this commit; the
-// wrapper-level declared-access check (which uses this on every platform)
-// arrives with the CpuAccess constructor parameter.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
     UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
@@ -1555,8 +1551,9 @@ where
         dtype: DType,
         shape: &[usize],
         name: Option<&str>,
+        access: CpuAccess,
     ) -> Result<Self> {
-        AHardwareBufferTensor::<T>::new_image(width, height, format, dtype, shape, name)
+        AHardwareBufferTensor::<T>::new_image(width, height, format, dtype, shape, name, access)
             .map(TensorStorage::Dma)
     }
 
@@ -1810,6 +1807,11 @@ where
     pub(crate) quantization: Option<Quantization>,
     /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
     colorimetry: Option<crate::Colorimetry>,
+    /// Declared CPU access (see [`CpuAccess`]). Image constructors set it
+    /// from their `access` parameter; non-image tensors (`new`, imports,
+    /// numpy) default to `ReadWrite` — they are CPU-centric by nature.
+    /// `map_with` counts requests beyond this declaration as unplanned.
+    cpu_access: CpuAccess,
     /// Parent-image snapshot when this tensor is a [`view`](Self::view)/
     /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. Lets the GL
     /// backend key its import on the parent and render the view as a
@@ -1832,6 +1834,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            cpu_access: CpuAccess::ReadWrite,
             view_origin: None,
         }
     }
@@ -1986,6 +1989,7 @@ where
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self>
     where
         T: 'static,
@@ -2152,6 +2156,7 @@ where
                     }
                 }
             }
+            t.cpu_access = access;
             return Ok(t);
         }
 
@@ -2224,7 +2229,7 @@ where
                 )));
             }
             let storage = TensorStorage::<T>::new_image_ahardwarebuffer(
-                width, height, format, dtype, &shape, None,
+                width, height, format, dtype, &shape, None, access,
             )?;
             let mut t = Self::wrap(storage);
             t.format = Some(format);
@@ -2255,6 +2260,7 @@ where
                     }
                 }
             }
+            t.cpu_access = access;
             return Ok(t);
         }
 
@@ -2318,6 +2324,7 @@ where
                 return {
                     let mut t = Self::new(&shape, Some(other), None)?;
                     t.format = Some(format);
+                    t.cpu_access = access;
                     Ok(t)
                 };
             }
@@ -2368,6 +2375,7 @@ where
             t.row_stride.is_some() || !semi,
             "image() must always set row_stride for semi-planar tensors"
         );
+        t.cpu_access = access;
         #[cfg(target_os = "linux")]
         t.try_init_dma_cuda();
         Ok(t)
@@ -2414,7 +2422,10 @@ where
         format: PixelFormat,
         row_stride_bytes: usize,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = access;
         // DMA backing (the only thing this constructor produces) is
         // Linux-only. On macOS/BSD/Windows the non-Linux block below is
         // the only compiled body and returns `NotImplemented` directly;
@@ -2479,6 +2490,7 @@ where
             let mut t = Self::wrap(storage);
             t.format = Some(format);
             t.row_stride = Some(row_stride_bytes);
+            t.cpu_access = access;
             // Match new()/from_fd(): a DMA tensor must attempt CUDA external-
             // memory import so a strided DMA buffer is also zero-copy
             // CUDA-mappable (no-op when libcudart is absent).
@@ -2695,11 +2707,12 @@ where
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self>
     where
         T: 'static,
     {
-        Self::image(width, height, format, memory)
+        Self::image(width, height, format, memory, access)
     }
 
     /// Pixel format (None if not an image).
@@ -2822,6 +2835,7 @@ where
             // multiplane data must import each plane independently.
             cuda: None,
             colorimetry: luma.colorimetry,
+            cpu_access: luma.cpu_access,
             // A composed multiplane tensor is a whole image, not a sub-view.
             view_origin: None,
         })
@@ -3067,6 +3081,23 @@ where
     }
 
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    /// The CPU access declared for this tensor at allocation (see
+    /// [`CpuAccess`]). Views share their parent's declaration.
+    pub fn cpu_access(&self) -> CpuAccess {
+        self.cpu_access
+    }
+
+    /// Set the declared CPU access without re-allocating — crate-private:
+    /// the declaration must reflect the underlying allocation's real
+    /// capabilities (constructors and importers set it; arbitrary widening
+    /// would defeat the contract).
+    // Only the Android AHardwareBuffer importer derives a declaration from
+    // an existing allocation's usage bits today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn set_cpu_access_unchecked(&mut self, access: CpuAccess) {
+        self.cpu_access = access;
+    }
+
     pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
         self.colorimetry
     }
@@ -3138,6 +3169,9 @@ where
         // same pixels, same color encoding. Inherit it like the other image
         // metadata above so a sub-view is a faithful convert() source/target.
         t.set_colorimetry(self.colorimetry);
+        // The declared CPU access is a property of the underlying
+        // allocation, so every view shares the parent's declaration.
+        t.cpu_access = self.cpu_access;
         if abs_offset > 0 {
             t.set_plane_offset(abs_offset);
         }
@@ -3366,6 +3400,7 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            cpu_access: CpuAccess::ReadWrite,
             view_origin: None,
         }
     }
@@ -3554,6 +3589,18 @@ where
                  map_read()/map_write()/map_mut()"
                     .into(),
             ));
+        }
+        // Declared-vs-requested telemetry (all platforms): mapping beyond
+        // the allocation-time declaration is best-effort — tolerated where
+        // the backing is CPU-mappable regardless (Mem/Shm/dma-buf/
+        // IOSurface), refused by the Android backend for CpuAccess::None
+        // buffers — but always loud and counted, never silent.
+        if !self.cpu_access.covers(access) {
+            note_unplanned_cpu_access(
+                self.buffer_identity().id(),
+                &format!("{:?}", self.storage.memory()),
+                "map access exceeds the declared CpuAccess",
+            );
         }
         // CPU mapping of a strided tensor exposes the full padded buffer
         // (`row_stride × rows`) so callers can iterate rows via
@@ -4103,7 +4150,14 @@ mod image_tests {
 
     #[test]
     fn image_tensor_packed() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -4113,7 +4167,14 @@ mod image_tests {
 
     #[test]
     fn image_tensor_planar() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::PlanarRgb, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::PlanarRgb,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -4130,8 +4191,14 @@ mod image_tests {
         // can bind and the CPU can map via the strided path. (Previously this
         // failed loudly to avoid an 'L008' byte-bag downgrade; with a real
         // FourCC surface that concern no longer applies.)
-        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect("padded RGBA IOSurface should allocate");
+        let t = Tensor::<u8>::image(
+            4,
+            4,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("padded RGBA IOSurface should allocate");
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         assert_eq!(t.width(), Some(4));
         assert_eq!(t.height(), Some(4));
@@ -4161,8 +4228,14 @@ mod image_tests {
         // produce a valid number and must be omitted. (Rgb u8 used to be
         // this test's subject but now has a real RGBA8888 mapping with
         // padded-stride tolerance — see the test below.)
-        let err = Tensor::<f32>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect_err("RGB f32 with 12 B/pixel and non-aligned width must be rejected");
+        let err = Tensor::<f32>::image(
+            10,
+            10,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("RGB f32 with 12 B/pixel and non-aligned width must be rejected");
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(
@@ -4189,16 +4262,28 @@ mod image_tests {
         // Packed RGB u8 @Dma is a designed RGBA8888 mapping at
         // (W*3/4, H) — the INT8 NPU input layout, shared with Android.
         // width%4 != 0 cannot form whole texels → loud InvalidArgument…
-        let err = Tensor::<u8>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect_err("Rgb u8 width%4!=0 must be rejected");
+        let err = Tensor::<u8>::image(
+            10,
+            10,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("Rgb u8 width%4!=0 must be rejected");
         assert!(
             matches!(&err, Error::InvalidArgument(m) if m.contains("width%4==0")),
             "got {err:?}"
         );
         // …width%4 == 0 with a non-64-aligned pitch allocates PADDED
         // (36 B rows → 64 B surface pitch, recorded on the tensor)…
-        let t = Tensor::<u8>::image(12, 4, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect("width 12 Rgb u8 must allocate padded");
+        let t = Tensor::<u8>::image(
+            12,
+            4,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width 12 Rgb u8 must allocate padded");
         assert_eq!(t.memory(), TensorMemory::Dma);
         assert!(
             t.row_stride()
@@ -4208,12 +4293,24 @@ mod image_tests {
         );
         // …and the aligned model-input width stays flat (640*3 = 1920 is
         // 64-aligned → no recorded stride, the buffer IS [H, W, 3]).
-        let t = Tensor::<u8>::image(640, 8, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect("width 640 Rgb u8 must allocate flat");
+        let t = Tensor::<u8>::image(
+            640,
+            8,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width 640 Rgb u8 must allocate flat");
         assert_eq!(t.row_stride(), None);
         // I8 shares the layout (INT8 shader bias, not a format change).
-        let t = Tensor::<i8>::image(640, 8, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect("Rgb i8 shares the RGBA8888 mapping");
+        let t = Tensor::<i8>::image(
+            640,
+            8,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("Rgb i8 shares the RGBA8888 mapping");
         assert_eq!(t.memory(), TensorMemory::Dma);
     }
 
@@ -4222,19 +4319,37 @@ mod image_tests {
     fn image_tensor_dma_planar_f16_alignment() {
         // PlanarRgb F16 uses single-channel row pitch (width * 2 bytes).
         // Width=16 → 32 bytes/row (not aligned); width=32 → 64 bytes/row (aligned).
-        let err =
-            Tensor::<half::f16>::image(16, 16, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
-                .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
+        let err = Tensor::<half::f16>::image(
+            16,
+            16,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         // 32 wide should work.
-        let t = Tensor::<half::f16>::image(32, 8, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
-            .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
+        let t = Tensor::<half::f16>::image(
+            32,
+            8,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
         assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
     }
 
     #[test]
     fn image_tensor_semi_planar_contiguous() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::Nv12, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -4259,6 +4374,7 @@ mod image_tests {
             PixelFormat::Rgba,
             stride,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         )
         .unwrap();
         // Logical dimensions unchanged by padding — this is the contract.
@@ -4361,6 +4477,7 @@ mod image_tests {
             PixelFormat::Rgba,
             3072,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         )
         .unwrap();
         // Tamper: push the stride up to 4 × the original. This is >=
@@ -4406,6 +4523,7 @@ mod image_tests {
             PixelFormat::Rgba,
             2400,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::InvalidArgument(_))));
     }
@@ -4421,6 +4539,7 @@ mod image_tests {
             PixelFormat::Nv12,
             640,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::NotImplemented(_))));
     }
@@ -4447,7 +4566,14 @@ mod image_tests {
 
     #[test]
     fn reshape_clears_format() {
-        let mut t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         // Reshape to flat — format cleared
         t.reshape(&[480 * 640 * 4]).unwrap();
@@ -4891,8 +5017,14 @@ mod tests {
     #[test]
     fn view_origin_snapshots_parent_and_composes() {
         // view() on a whole image snapshots the parent dims + the view's origin.
-        let parent =
-            Tensor::<u8>::image(100, 80, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let parent = Tensor::<u8>::image(
+            100,
+            80,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(
             parent.view_origin(),
             None,
@@ -5048,8 +5180,14 @@ mod tests {
         // pixel format and (crucially) its padded row stride, so a strided
         // parent yields strided windows. Set a stride wider than the tight row
         // to exercise the row_stride inheritance path specifically.
-        let mut parent =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let mut parent = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         parent.set_row_stride_unchecked(512); // padded stride (> 100*4)
         let view = parent.subview(4096, &[10, 10, 4]).unwrap();
         assert_eq!(view.format(), Some(PixelFormat::Rgba), "format inherited");
@@ -5231,6 +5369,7 @@ mod tests {
             PixelFormat::Rgba,
             64,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(_) => {
@@ -5693,8 +5832,14 @@ mod tests {
     #[test]
     fn colorimetry_defaults_none_and_roundtrips_without_auto_fill() {
         use crate::{ColorEncoding, ColorRange, Colorimetry, PixelFormat, TensorMemory};
-        let mut t =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.colorimetry(), None); // default undefined
         let c = Colorimetry::default()
             .with_encoding(ColorEncoding::Bt709)
@@ -5708,7 +5853,14 @@ mod tests {
 
     #[test]
     fn configure_image_within_capacity() {
-        let mut t = Tensor::<u8>::image_with_capacity(640, 480, PixelFormat::Rgb, None).unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            640,
+            480,
+            PixelFormat::Rgb,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!(t.width(), Some(320));
@@ -5718,7 +5870,14 @@ mod tests {
 
     #[test]
     fn configure_image_too_large_errors() {
-        let mut t = Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Grey, None).unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            64,
+            64,
+            PixelFormat::Grey,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let err = t
             .configure_image(1920, 1080, PixelFormat::Nv12)
             .unwrap_err();
@@ -5732,8 +5891,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn configure_image_preserves_iosurface_physical_stride() {
         // Pool: GREY/R8 IOSurface 100 wide → bytesPerRow padded to 128.
-        let mut pool =
-            Tensor::<u8>::image(100, 64, PixelFormat::Grey, Some(TensorMemory::Dma)).unwrap();
+        let mut pool = Tensor::<u8>::image(
+            100,
+            64,
+            PixelFormat::Grey,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let pitch = pool.effective_row_stride().unwrap();
         assert!(
             pitch >= 128 && pitch.is_multiple_of(64),
@@ -5764,9 +5929,14 @@ mod tests {
     /// (64×64×4 RGBA = 16 KiB) easily holds the 24×64 = 1.5 KiB NV12 layout.
     #[test]
     fn configure_image_mem_aligns_stride() {
-        let mut t =
-            Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
-                .unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.configure_image(32, 16, PixelFormat::Nv12).unwrap();
         let s = t.effective_row_stride().unwrap();
         assert_eq!(s % 64, 0, "stride must be 64-aligned");
@@ -5781,9 +5951,14 @@ mod tests {
         // 16 px), narrow the logical width, then record the padded stride.
         // Previously `map()` rejected this on non-Linux with
         // "DMA backing is Linux-only"; HAL-owned Mem is now mappable.
-        let mut t =
-            Tensor::<u8>::image_with_capacity(16, 3, PixelFormat::Rgba, Some(TensorMemory::Mem))
-                .unwrap(); // capacity 3 × 16 × 4 = 192 B
+        let mut t = Tensor::<u8>::image_with_capacity(
+            16,
+            3,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap(); // capacity 3 × 16 × 4 = 192 B
         t.configure_image(8, 3, PixelFormat::Rgba).unwrap(); // logical [3, 8, 4] = 96 B
         t.set_row_stride(48).unwrap(); // padded stride (>= 32 B min)
 

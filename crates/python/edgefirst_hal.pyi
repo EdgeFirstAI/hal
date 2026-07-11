@@ -2026,6 +2026,7 @@ class ImageProcessor:
         height: int,
         format: PixelFormat = PixelFormat.Rgba,
         dtype: str = "uint8",
+        access: str = "none",
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
@@ -2047,6 +2048,13 @@ class ImageProcessor:
                 ``"float32"`` (for GPU float model-input paths); other types
                 still prefer DMA-buf when available and otherwise use system
                 memory.
+            access: Declared CPU access — ``"none"`` (default), ``"read"``,
+                ``"write"``, or ``"readwrite"``. Hardware (GPU/NPU) access is
+                always implied; declare CPU access only when the script will
+                touch the pixels directly (``map()``, ``numpy()``, buffer
+                protocol). The strict ``"none"`` default keeps hardware
+                pipelines eligible for vendor tile compression; undeclared
+                CPU access still works best-effort but is logged and counted.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

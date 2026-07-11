@@ -303,8 +303,14 @@ mod tests {
         // identically to the whole parent. The per-tile offset is render state,
         // never part of the key.
         use edgefirst_tensor::{Region, Tensor, TensorMemory};
-        let parent =
-            Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let parent = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let a = parent.view(Region::new(0, 0, 32, 32)).unwrap();
         let b = parent.view(Region::new(0, 32, 32, 32)).unwrap();
         // Destinations (`for_dst = true`) collapse onto the parent key.

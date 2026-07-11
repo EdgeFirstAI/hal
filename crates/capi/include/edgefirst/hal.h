@@ -409,6 +409,35 @@ typedef enum hal_tensor_memory {
 } hal_tensor_memory;
 
 /**
+ * Declared CPU involvement for an image tensor, chosen at allocation.
+ *
+ * Hardware (GPU/NPU/ISP/codec) access is always implied; CPU access is
+ * the opt-in. HAL_CPU_ACCESS_NONE (the default for hardware pipelines)
+ * makes the buffer eligible for vendor tile compression on Android and
+ * skips CPU cache maintenance; mapping such a tensor is best-effort and
+ * counted (see hal_unplanned_cpu_access_count). Write selects a
+ * write-combined mapping where supported; Read a cached mapping.
+ */
+typedef enum HalCpuAccess {
+  /**
+   * Hardware-only buffer: no CPU mapping declared.
+   */
+  HAL_CPU_ACCESS_NONE = 0,
+  /**
+   * CPU reads (verification, CPU consumers).
+   */
+  HAL_CPU_ACCESS_READ = 1,
+  /**
+   * CPU writes (decode targets).
+   */
+  HAL_CPU_ACCESS_WRITE = 2,
+  /**
+   * CPU reads and writes (the pre-CpuAccess implicit behavior).
+   */
+  HAL_CPU_ACCESS_READ_WRITE = 3,
+} HalCpuAccess;
+
+/**
  * Compute backend selection for image processing.
  *
  * @see hal_image_processor_new_with_backend
@@ -1725,7 +1754,8 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
                                         size_t height,
                                         enum hal_pixel_format format,
                                         enum hal_dtype dtype,
-                                        enum hal_tensor_memory memory);
+                                        enum hal_tensor_memory memory,
+                                        enum HalCpuAccess access);
 
 /**
  * Decode image data (JPEG/PNG) into a pre-allocated tensor.
@@ -2306,7 +2336,8 @@ struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *
                                                     size_t width,
                                                     size_t height,
                                                     enum hal_pixel_format format,
-                                                    enum hal_dtype dtype);
+                                                    enum hal_dtype dtype,
+                                                    enum HalCpuAccess access);
 
 /**
  * Pitch alignment in bytes that DMA-BUF EGLImage imports require on the
@@ -2548,6 +2579,16 @@ int hal_log_init_file(FILE *stream, enum hal_log_level max_level);
  * @endcode
  */
 int hal_log_init_callback(hal_log_callback cb, void *userdata, enum hal_log_level max_level);
+
+/**
+ * Number of tensor maps that exceeded the buffer's declared CPU access
+ * since process start (including any map of a HAL_CPU_ACCESS_NONE
+ * buffer). A pipeline that declares its CPU access correctly holds this
+ * flat; each offending buffer also logs one warning.
+ *
+ * @return Monotonic process-wide counter
+ */
+uint64_t hal_unplanned_cpu_access_count(void);
 
 /**
  * Check if Linux DMA-BUF buffer allocation is available.

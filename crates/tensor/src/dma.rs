@@ -748,7 +748,7 @@ mod tests {
         let fd = dummy_fd();
         // shape=[4096] u8 → logical_size=4096; offset=4096 → total_needed=8192
         // buf_size=4096 < 8192 → error
-        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096);
+        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096, crate::CpuAccess::ReadWrite);
         match result {
             Err(Error::InvalidSize(n)) => assert_eq!(n, 8192),
             other => panic!("expected InvalidSize(8192), got {:?}", other),
@@ -762,7 +762,7 @@ mod tests {
         let fd = dummy_fd();
         // shape=[1024] u32 → logical_size=4096; offset=3 (not aligned to 4)
         // buf_size=8192 so total_needed check passes; alignment check fires
-        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3);
+        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3, crate::CpuAccess::ReadWrite);
         assert!(
             matches!(result, Err(Error::InvalidOperation(_))),
             "expected InvalidOperation for misaligned offset, got {:?}",
@@ -776,7 +776,13 @@ mod tests {
     fn test_dma_map_offset_overflow() {
         let fd = dummy_fd();
         // offset=usize::MAX, shape=[1] u8 → checked_add overflows
-        let result = DmaMap::<u8>::new(fd, &[1], usize::MAX, usize::MAX);
+        let result = DmaMap::<u8>::new(
+            fd,
+            &[1],
+            usize::MAX,
+            usize::MAX,
+            crate::CpuAccess::ReadWrite,
+        );
         assert!(
             matches!(result, Err(Error::InvalidSize(0))),
             "expected InvalidSize(0) on overflow, got {:?}",

@@ -29,8 +29,14 @@ fn testdata(name: &str) -> Vec<u8> {
 #[test]
 fn decode_zidane_png_rgb() {
     let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
@@ -52,8 +58,14 @@ fn decode_zidane_png_rgb() {
 #[test]
 fn decode_png_f32() {
     let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<f32>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<f32>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
@@ -69,8 +81,14 @@ fn decode_png_f32() {
 #[test]
 fn decode_png_into_larger_tensor() {
     let png = testdata("zidane.png"); // 1280×720
-    let mut tensor =
-        Tensor::<u8>::image(1920, 1080, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1920,
+        1080,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     // The decoder reconfigures the oversized tensor to the image's true dims,
@@ -85,8 +103,14 @@ fn decode_png_into_larger_tensor() {
 #[test]
 fn decode_png_capacity_error() {
     let png = testdata("zidane.png"); // 1280×720
-    let mut tensor =
-        Tensor::<u8>::image(640, 480, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        640,
+        480,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &png);
     assert!(result.is_err());
@@ -95,8 +119,14 @@ fn decode_png_capacity_error() {
 #[test]
 fn decode_png_u16() {
     let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<u16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u16>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
@@ -116,8 +146,14 @@ fn decode_png_u16() {
 #[test]
 fn decode_png_i8() {
     let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<i8>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
@@ -136,8 +172,14 @@ fn decode_png_i8() {
 #[test]
 fn decode_png_i16() {
     let png = testdata("zidane.png");
-    let mut tensor =
-        Tensor::<i16>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<i16>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &png).unwrap();
     assert_eq!(info.width, 1280);
@@ -157,10 +199,22 @@ fn decode_png_i8_xor_consistency() {
     // Verify PNG i8 decode matches manual u8→i8 XOR conversion.
     let png = testdata("zidane.png");
 
-    let mut u8_tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
-    let mut i8_tensor =
-        Tensor::<i8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut u8_tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    let mut i8_tensor = Tensor::<i8>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
 
     u8_tensor.load_image(&mut decoder, &png).unwrap();
@@ -184,7 +238,14 @@ fn decode_png_i8_xor_consistency() {
 #[test]
 fn png_decode_tags_native_colorimetry() {
     // RGB/RGBA PNG → sRGB primaries+transfer, Full range, encoding None.
-    let mut t = Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut d = ImageDecoder::new();
     t.load_image(&mut d, &testdata("zidane.png")).unwrap();
     let c = t.colorimetry().expect("colorimetry set");

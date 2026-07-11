@@ -69,7 +69,14 @@ fn main() {
     let lb_crop = Crop::letterbox([114, 114, 114, 255]);
 
     for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
-        let src = match proc.create_image(in_w, in_h, fmt, DType::U8, None) {
+        let src = match proc.create_image(
+            in_w,
+            in_h,
+            fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 println!("  {fmt:?}: [skipped: source alloc failed: {e}]");
@@ -84,7 +91,14 @@ fn main() {
         let src_bytes = nv_len(fmt, in_w, in_h) as u64;
 
         // (1) Convert, same size → RGBA (sampling cost, no resize).
-        if let Ok(mut dst) = proc.create_image(in_w, in_h, PixelFormat::Rgba, DType::U8, None) {
+        if let Ok(mut dst) = proc.create_image(
+            in_w,
+            in_h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             let name = format!("{path}/{fmt:?}/convert_720p_rgba").to_lowercase();
             if let Err(e) =
                 proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::no_crop())
@@ -101,7 +115,14 @@ fn main() {
         }
 
         // (2) Letterbox 720p → 640x640 packed RGB (the profiler op).
-        if let Ok(mut dst) = proc.create_image(out_w, out_h, PixelFormat::Rgb, DType::U8, None) {
+        if let Ok(mut dst) = proc.create_image(
+            out_w,
+            out_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             let name = format!("{path}/{fmt:?}/letterbox_720p_to_640_rgb").to_lowercase();
             if let Err(e) = proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb_crop) {
                 println!("  {name:50} [unsupported: {e}]");

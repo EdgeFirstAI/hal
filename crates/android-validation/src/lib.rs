@@ -166,7 +166,8 @@ mod device {
         Rotation,
     };
     use hal::tensor::{
-        DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait as _, TensorMemory, TensorTrait,
+        CpuAccess, DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait as _, TensorMemory,
+        TensorTrait,
     };
 
     /// Result codes for the C-ABI entry points. 0 = pass; negative =
@@ -237,11 +238,17 @@ mod device {
     /// Fails loudly if the buffer is not AHB-backed — no silent Mem
     /// fallback (see module docs).
     fn make_gradient_src(w: usize, h: usize) -> Result<TensorDyn, i32> {
-        let src =
-            Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma)).map_err(|e| {
-                log::error!("android-validation: AHardwareBuffer src alloc {w}x{h}: {e:?}");
-                ERR_ALLOC
-            })?;
+        let src = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            CpuAccess::ReadWrite,
+        )
+        .map_err(|e| {
+            log::error!("android-validation: AHardwareBuffer src alloc {w}x{h}: {e:?}");
+            ERR_ALLOC
+        })?;
         {
             let mut m = src.map().map_err(|e| {
                 log::error!("android-validation: src map: {e:?}");
@@ -285,7 +292,7 @@ mod device {
         dtype: DType,
     ) -> Result<TensorDyn, i32> {
         let dst = gl
-            .create_image(size, size, format, dtype, None)
+            .create_image(size, size, format, dtype, None, CpuAccess::ReadWrite)
             .map_err(|e| {
                 log::error!("android-validation: GL dst alloc ({format:?}/{dtype:?}): {e:?}");
                 ERR_ALLOC
@@ -297,7 +304,15 @@ mod device {
     }
 
     fn cpu_dst(size: usize, format: PixelFormat, dtype: DType) -> Result<TensorDyn, i32> {
-        TensorDyn::image(size, size, format, dtype, Some(TensorMemory::Mem)).map_err(|e| {
+        TensorDyn::image(
+            size,
+            size,
+            format,
+            dtype,
+            Some(TensorMemory::Mem),
+            CpuAccess::ReadWrite,
+        )
+        .map_err(|e| {
             log::error!("android-validation: CPU dst alloc ({format:?}/{dtype:?}): {e:?}");
             ERR_ALLOC
         })

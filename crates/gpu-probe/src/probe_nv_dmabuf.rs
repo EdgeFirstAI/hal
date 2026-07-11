@@ -376,8 +376,14 @@ struct Buffers {
 /// Allocate the source NV buffer (real padded stride) and a destination RGBA
 /// buffer with either a 64-aligned or a tightly-packed row stride.
 fn alloc_buffers(f: &NvFormat, w: usize, h: usize, dst_aligned: bool) -> Result<Buffers, String> {
-    let src = Tensor::<u8>::image(w, h, f.fmt, Some(TensorMemory::Dma))
-        .map_err(|e| format!("src alloc: {e}"))?;
+    let src = Tensor::<u8>::image(
+        w,
+        h,
+        f.fmt,
+        Some(TensorMemory::Dma),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .map_err(|e| format!("src alloc: {e}"))?;
     let stride = src
         .effective_row_stride()
         .ok_or_else(|| "src has no row stride".to_string())?;
@@ -399,6 +405,7 @@ fn alloc_buffers(f: &NvFormat, w: usize, h: usize, dst_aligned: bool) -> Result<
         PixelFormat::Rgba,
         dst_stride,
         Some(TensorMemory::Dma),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .map_err(|e| format!("dst alloc (stride {dst_stride}): {e}"))?;
 
@@ -677,9 +684,15 @@ fn run_odd_dst_case(ctx: &GpuContext, w: usize, h: usize, preserved: bool) -> Re
     while unsafe { edgefirst_gl::gl::GetError() } != edgefirst_gl::gl::NO_ERROR {}
 
     let stride = (w * 4).next_multiple_of(64);
-    let dst =
-        Tensor::<u8>::image_with_stride(w, h, PixelFormat::Rgba, stride, Some(TensorMemory::Dma))
-            .map_err(|e| format!("dst alloc: {e}"))?;
+    let dst = Tensor::<u8>::image_with_stride(
+        w,
+        h,
+        PixelFormat::Rgba,
+        stride,
+        Some(TensorMemory::Dma),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .map_err(|e| format!("dst alloc: {e}"))?;
     let dst_fd = dst.clone_fd().map_err(|e| format!("clone_fd: {e}"))?;
     let fourcc = gbm::drm::buffer::DrmFourcc::Abgr8888 as u32;
     let plane0 = EglPlane {

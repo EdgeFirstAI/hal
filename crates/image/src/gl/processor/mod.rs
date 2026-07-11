@@ -1358,7 +1358,13 @@ impl GLProcessorST {
     /// `dma_heap` fds succeeds but the rendered data is all zeros.
     fn verify_dma_buf_roundtrip(&mut self) -> bool {
         // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
-        let src = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma)) {
+        let src = match Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA source: {e}");
@@ -1383,8 +1389,13 @@ impl GLProcessorST {
         }
 
         // Allocate a 64x64 RGBA DMA destination tensor
-        let mut dst = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma))
-        {
+        let mut dst = match Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA destination: {e}");

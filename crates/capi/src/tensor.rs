@@ -77,6 +77,49 @@ pub enum HalTensorMemory {
     Pbo = 3,
 }
 
+/// Declared CPU involvement for an image tensor, chosen at allocation.
+///
+/// Hardware (GPU/NPU/ISP/codec) access is always implied; CPU access is
+/// the opt-in. HAL_CPU_ACCESS_NONE (the default for hardware pipelines)
+/// makes the buffer eligible for vendor tile compression on Android and
+/// skips CPU cache maintenance; mapping such a tensor is best-effort and
+/// counted (see hal_unplanned_cpu_access_count). Write selects a
+/// write-combined mapping where supported; Read a cached mapping.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalCpuAccess {
+    /// Hardware-only buffer: no CPU mapping declared.
+    None = 0,
+    /// CPU reads (verification, CPU consumers).
+    Read = 1,
+    /// CPU writes (decode targets).
+    Write = 2,
+    /// CPU reads and writes (the pre-CpuAccess implicit behavior).
+    ReadWrite = 3,
+}
+
+impl From<HalCpuAccess> for edgefirst_tensor::CpuAccess {
+    fn from(a: HalCpuAccess) -> Self {
+        match a {
+            HalCpuAccess::None => edgefirst_tensor::CpuAccess::None,
+            HalCpuAccess::Read => edgefirst_tensor::CpuAccess::Read,
+            HalCpuAccess::Write => edgefirst_tensor::CpuAccess::Write,
+            HalCpuAccess::ReadWrite => edgefirst_tensor::CpuAccess::ReadWrite,
+        }
+    }
+}
+
+/// Number of tensor maps that exceeded the buffer's declared CPU access
+/// since process start (including any map of a HAL_CPU_ACCESS_NONE
+/// buffer). A pipeline that declares its CPU access correctly holds this
+/// flat; each offending buffer also logs one warning.
+///
+/// @return Monotonic process-wide counter
+#[no_mangle]
+pub extern "C" fn hal_unplanned_cpu_access_count() -> u64 {
+    edgefirst_tensor::unplanned_cpu_access_count()
+}
+
 impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {

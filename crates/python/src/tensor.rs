@@ -173,6 +173,19 @@ pub(crate) fn parse_dtype(dtype: &str) -> Result<DType> {
     }
 }
 
+/// Parse a Python CPU-access string into a `CpuAccess` declaration.
+pub(crate) fn parse_cpu_access(access: &str) -> Result<tensor::CpuAccess> {
+    match access {
+        "none" => Ok(tensor::CpuAccess::None),
+        "read" => Ok(tensor::CpuAccess::Read),
+        "write" => Ok(tensor::CpuAccess::Write),
+        "readwrite" => Ok(tensor::CpuAccess::ReadWrite),
+        _ => Err(Error::Format(format!(
+            "access must be one of none|read|write|readwrite, got {access:?}"
+        ))),
+    }
+}
+
 /// Convert a `DType` to a Python dtype string.
 fn dtype_to_str(dtype: DType) -> &'static str {
     match dtype {
@@ -933,7 +946,14 @@ impl PyTensor {
         use edgefirst_hal::tensor::PixelFormat;
         let fmt: PixelFormat = format.into();
         let memory = mem.map(|x| x.into());
-        let tensor = TensorDyn::image(width, height, fmt, DType::U8, memory)?;
+        let tensor = TensorDyn::image(
+            width,
+            height,
+            fmt,
+            DType::U8,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         Ok(PyTensor(tensor))
     }
 

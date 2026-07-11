@@ -81,11 +81,13 @@ let mut processor = ImageProcessor::new()?;
 let mut decoder = ImageDecoder::new();
 
 // JPEG decodes to its native NV12 (colour); decode into an NV12 source tensor.
-let mut input = processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None)?;
+let mut input =
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::ReadWrite)?;
 let info = input.load_image(&mut decoder, &bytes)?;
 
 // convert() handles NV12 -> RGB, resize, and any EXIF rotation the decode reported.
-let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut output =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 processor.convert(&input, &mut output, Rotation::None, Flip::None,
     Crop::new(0, 0, info.width, info.height))?;
 ```
@@ -106,7 +108,7 @@ struct hal_image_processor *proc = hal_image_processor_new();
  * see the C API README for hal_tensor_load_file / hal_import_image. */
 struct hal_tensor *src = /* ... */;
 struct hal_tensor *dst = hal_image_processor_create_image(
-    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -278,7 +280,7 @@ re-import, no re-allocation.
 
 ```rust
 let mut proc = ImageProcessor::new()?;
-let mut dst = proc.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst = proc.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 
 for frame in camera_frames {
     proc.convert(&frame, &mut dst, Rotation::None, Flip::None, Crop::default())?;
@@ -866,7 +868,7 @@ consume it directly — no `map()`, no CPU readback:
 // auto-select yields an AHardwareBuffer when the GL backend is active —
 // assert hal_tensor_memory_type(dst) == HAL_TENSOR_DMA at startup.
 HalTensor* dst = hal_image_processor_create_image(
-    proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16);
+    proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16, HAL_CPU_ACCESS_NONE);
 
 // One-time: hand the SAME buffer to the NPU runtime.
 AHardwareBuffer* ahb = hal_tensor_hardware_buffer_ptr(dst);

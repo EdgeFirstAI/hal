@@ -126,6 +126,20 @@ const USAGE_GPU_FRAMEBUFFER: u64 = 0x200;
 /// NNAPI/LiteRT zero-copy handoff.
 const USAGE_GPU_DATA_BUFFER: u64 = 0x1000000;
 
+/// CPU usage bits for a declared [`CpuAccess`](crate::CpuAccess) — the
+/// allocation-time half of the access contract (the lock-time half is
+/// `lock_usage_for` in `ahardwarebuffer_layout.rs`).
+fn cpu_usage_bits_for(access: crate::CpuAccess) -> u64 {
+    let mut bits = 0;
+    if access.reads() {
+        bits |= USAGE_CPU_READ_OFTEN;
+    }
+    if access.writes() {
+        bits |= USAGE_CPU_WRITE_OFTEN;
+    }
+    bits
+}
+
 #[link(name = "nativewindow")]
 extern "C" {
     fn AHardwareBuffer_allocate(
@@ -590,6 +604,7 @@ where
         dtype: DType,
         shape: &[usize],
         name: Option<&str>,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
         let _span = tracing::trace_span!(
             "tensor.alloc",
@@ -645,15 +660,40 @@ where
                 .map_err(|_| Error::InvalidSize(surface_height))?,
             layers: 1,
             format: ahb_format,
-            usage: USAGE_GPU_SAMPLED_IMAGE
-                | USAGE_GPU_FRAMEBUFFER
-                | USAGE_CPU_READ_OFTEN
-                | USAGE_CPU_WRITE_OFTEN,
+            // Hardware access is implied (GPU sample + render covers
+            // source, destination, and intermediate roles); CPU usage
+            // bits come from the caller's declared CpuAccess. A
+            // hardware-only allocation (CpuAccess::None) is what makes
+            // the buffer eligible for gralloc's vendor tile compression.
+            usage: USAGE_GPU_SAMPLED_IMAGE | USAGE_GPU_FRAMEBUFFER | cpu_usage_bits_for(access),
             stride: 0,
             rfu0: 0,
             rfu1: 0,
         };
-        let (buffer, desc) = OwnedAHardwareBuffer::allocate(desc)?;
+        let (buffer, desc) = match OwnedAHardwareBuffer::allocate(desc) {
+            Ok(ok) => ok,
+            Err(e) if access == crate::CpuAccess::None => {
+                // Some gralloc implementations reject hardware-only image
+                // allocations for certain formats (observed risk class on
+                // budget-tier devices). Retry once with CPU r/w bits so
+                // the allocation degrades to linear-but-working rather
+                // than failing outright — loudly, never silently.
+                log::warn!(
+                    "AHardwareBuffer hardware-only allocation failed for \
+                     {format:?}/{dtype:?} {width}x{height} ({e:?}); retrying \
+                     with CPU access bits (linear layout)"
+                );
+                let retry = AHardwareBufferDesc {
+                    usage: USAGE_GPU_SAMPLED_IMAGE
+                        | USAGE_GPU_FRAMEBUFFER
+                        | USAGE_CPU_READ_OFTEN
+                        | USAGE_CPU_WRITE_OFTEN,
+                    ..desc
+                };
+                OwnedAHardwareBuffer::allocate(retry)?
+            }
+            Err(e) => return Err(e),
+        };
         let (bytes_per_row, buf_size) = desc_layout(&desc).ok_or_else(|| {
             Error::InvalidShape(format!(
                 "AHardwareBuffer layout overflow ({surface_width}x{surface_height}, bpe={bpe})"
@@ -861,7 +901,21 @@ where
     {
         let inner =
             unsafe { AHardwareBufferTensor::<T>::from_hardware_buffer(buffer_ptr, shape, name)? };
-        Ok(crate::Tensor::wrap(crate::TensorStorage::Dma(inner)))
+        // The imported buffer's usage bits ARE its CPU-access declaration:
+        // derive it so `map_with` treats wrapped external buffers (camera,
+        // NNAPI) with the same declared-vs-requested telemetry as ours.
+        let declared = match (
+            inner.cpu_usage & USAGE_CPU_READ_MASK != 0,
+            inner.cpu_usage & USAGE_CPU_WRITE_MASK != 0,
+        ) {
+            (true, true) => crate::CpuAccess::ReadWrite,
+            (true, false) => crate::CpuAccess::Read,
+            (false, true) => crate::CpuAccess::Write,
+            (false, false) => crate::CpuAccess::None,
+        };
+        let mut t = crate::Tensor::wrap(crate::TensorStorage::Dma(inner));
+        t.set_cpu_access_unchecked(declared);
+        Ok(t)
     }
 }
 
@@ -964,11 +1018,9 @@ where
         let declared_writes = cpu_usage & USAGE_CPU_WRITE_MASK != 0;
         let lock_usage = match lock_usage_for(cpu_usage, access.reads(), access.writes()) {
             LockDecision::Refuse => {
-                crate::note_unplanned_cpu_access(
-                    identity_id,
-                    "AHardwareBuffer",
-                    "buffer was allocated CpuAccess::None (hardware-only)",
-                );
+                // Counted at the Tensor wrapper level (declared-vs-
+                // requested); this is the platform-enforced refusal.
+                let _ = identity_id;
                 return Err(Error::InvalidOperation(
                     "AHardwareBuffer was allocated without CPU access \
                      (CpuAccess::None) — allocate with CpuAccess::Read/Write/\
@@ -978,10 +1030,11 @@ where
             }
             LockDecision::Covered(bits) => bits,
             LockDecision::Unplanned(bits) => {
-                crate::note_unplanned_cpu_access(
-                    identity_id,
-                    "AHardwareBuffer",
-                    "map access exceeds the declared CpuAccess direction",
+                // Counted at the Tensor wrapper level; replaying the full
+                // declared flags is the pre-CpuAccess behavior.
+                log::debug!(
+                    "AHardwareBuffer map exceeds declared access; replaying \
+                     allocated usage {bits:#x}"
                 );
                 bits
             }

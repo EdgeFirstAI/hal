@@ -25,11 +25,12 @@ use std::io::Read;
 ///
 /// ```rust,no_run
 /// use edgefirst_codec::{ImageDecoder, ImageLoad};
-/// use edgefirst_tensor::{Tensor, TensorTrait, TensorMemory, PixelFormat};
+/// use edgefirst_tensor::{CpuAccess, Tensor, TensorTrait, TensorMemory, PixelFormat};
 ///
 /// let mut decoder = ImageDecoder::new();
 /// // Allocate a buffer large enough for the biggest expected image.
-/// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem))
+/// let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem),
+///                                       CpuAccess::ReadWrite)
 ///     .expect("alloc");
 ///
 /// for _ in 0..100 {
@@ -184,12 +185,13 @@ impl Default for ImageDecoder {
 ///
 /// ```rust,no_run
 /// use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
-/// use edgefirst_tensor::{Tensor, TensorMemory};
+/// use edgefirst_tensor::{CpuAccess, Tensor, TensorMemory};
 ///
 /// let data = std::fs::read("image.jpg").unwrap();
 /// let info = peek_info(&data).unwrap();
 /// let mut tensor = Tensor::<u8>::image(info.width, info.height, info.format,
-///                                       Some(TensorMemory::Mem)).unwrap();
+///                                       Some(TensorMemory::Mem),
+///                                       CpuAccess::ReadWrite).unwrap();
 /// let mut decoder = ImageDecoder::new();
 /// tensor.load_image(&mut decoder, &data).unwrap();
 /// ```
@@ -242,6 +244,7 @@ mod tests {
             100,
             edgefirst_tensor::PixelFormat::Nv12,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let result = decoder.decode_into(b"not an image", &mut tensor);
