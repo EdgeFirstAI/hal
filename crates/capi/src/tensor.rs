@@ -120,6 +120,91 @@ pub extern "C" fn hal_unplanned_cpu_access_count() -> u64 {
     edgefirst_tensor::unplanned_cpu_access_count()
 }
 
+/// Tile-compression request/recording for image tensors.
+///
+/// As a request (hal_image_desc_set_compression): HAL_COMPRESSION_ANY
+/// asks for the device's native scheme with a counted linear fallback;
+/// a specific scheme value requires exactly that scheme (allocation
+/// fails otherwise); HAL_COMPRESSION_NONE clears the request.
+///
+/// As a recording (hal_tensor_compression): the scheme the allocation
+/// actually holds — HAL_COMPRESSION_NONE means linear. A compressed
+/// tensor has no meaningful linear row stride and CPU maps are
+/// best-effort.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalCompression {
+    /// Linear layout (recording) / no compression request (request).
+    None = 0,
+    /// Request only: the device's native scheme, linear fallback counted.
+    Any = 1,
+    /// Qualcomm Adreno Universal Bandwidth Compression.
+    Ubwc = 2,
+    /// Arm Mali/Immortalis Framebuffer Compression.
+    Afbc = 3,
+    /// Imagination PowerVR Image Compression.
+    Pvric = 4,
+    /// Samsung Xclipse Delta Color Compression.
+    Dcc = 5,
+}
+
+impl From<HalCompression> for Option<edgefirst_tensor::Compression> {
+    fn from(c: HalCompression) -> Self {
+        use edgefirst_tensor::{Compression, CompressionScheme};
+        match c {
+            HalCompression::None => None,
+            HalCompression::Any => Some(Compression::Any),
+            HalCompression::Ubwc => Some(Compression::Scheme(CompressionScheme::Ubwc)),
+            HalCompression::Afbc => Some(Compression::Scheme(CompressionScheme::Afbc)),
+            HalCompression::Pvric => Some(Compression::Scheme(CompressionScheme::Pvric)),
+            HalCompression::Dcc => Some(Compression::Scheme(CompressionScheme::Dcc)),
+        }
+    }
+}
+
+impl From<Option<edgefirst_tensor::CompressionScheme>> for HalCompression {
+    fn from(s: Option<edgefirst_tensor::CompressionScheme>) -> Self {
+        use edgefirst_tensor::CompressionScheme;
+        match s {
+            None => HalCompression::None,
+            Some(CompressionScheme::Ubwc) => HalCompression::Ubwc,
+            Some(CompressionScheme::Afbc) => HalCompression::Afbc,
+            Some(CompressionScheme::Pvric) => HalCompression::Pvric,
+            Some(CompressionScheme::Dcc) => HalCompression::Dcc,
+            // CompressionScheme is #[non_exhaustive]: record unknown
+            // future schemes as linear at this ABI level rather than
+            // inventing a value the header doesn't name.
+            #[allow(unreachable_patterns)]
+            Some(_) => HalCompression::None,
+        }
+    }
+}
+
+/// The vendor tile-compression scheme recorded on a tensor at
+/// allocation, or HAL_COMPRESSION_NONE for a linear layout (also
+/// returned for NULL).
+///
+/// @param tensor Tensor handle
+/// @return Recorded scheme (never HAL_COMPRESSION_ANY)
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_compression(tensor: *const HalTensor) -> HalCompression {
+    let Some(tensor) = (unsafe { tensor.as_ref() }) else {
+        return HalCompression::None;
+    };
+    tensor.inner.compression().into()
+}
+
+/// Number of HAL_COMPRESSION_ANY requests since process start that
+/// resolved to a linear layout instead of a vendor tile scheme. A
+/// pipeline that expects compressed destinations asserts this stays
+/// flat after warmup.
+///
+/// @return Monotonic process-wide counter
+#[no_mangle]
+pub extern "C" fn hal_compression_fallback_count() -> u64 {
+    edgefirst_tensor::compression_fallback_count()
+}
+
 impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {

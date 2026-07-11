@@ -186,6 +186,23 @@ pub(crate) fn parse_cpu_access(access: &str) -> Result<tensor::CpuAccess> {
     }
 }
 
+/// Parse a Python compression-request string into a [`Compression`]
+/// request (`None` input = no request).
+pub(crate) fn parse_compression(compression: Option<&str>) -> Result<Option<tensor::Compression>> {
+    use tensor::{Compression, CompressionScheme};
+    match compression {
+        None => Ok(None),
+        Some("any") => Ok(Some(Compression::Any)),
+        Some("ubwc") => Ok(Some(Compression::Scheme(CompressionScheme::Ubwc))),
+        Some("afbc") => Ok(Some(Compression::Scheme(CompressionScheme::Afbc))),
+        Some("pvric") => Ok(Some(Compression::Scheme(CompressionScheme::Pvric))),
+        Some("dcc") => Ok(Some(Compression::Scheme(CompressionScheme::Dcc))),
+        Some(other) => Err(Error::Format(format!(
+            "compression must be one of any|ubwc|afbc|pvric|dcc, got {other:?}"
+        ))),
+    }
+}
+
 /// Convert a `DType` to a Python dtype string.
 fn dtype_to_str(dtype: DType) -> &'static str {
     match dtype {
@@ -783,6 +800,22 @@ impl PyTensor {
     #[getter]
     fn memory(&self) -> PyTensorMemory {
         self.0.memory().into()
+    }
+
+    /// The vendor tile-compression scheme recorded at allocation
+    /// (``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"``), or ``None`` for a
+    /// linear layout. A compressed tensor has no meaningful linear row
+    /// stride and CPU maps are best-effort.
+    #[getter]
+    fn compression(&self) -> Option<&'static str> {
+        use edgefirst_hal::tensor::CompressionScheme;
+        match self.0.compression()? {
+            CompressionScheme::Ubwc => Some("ubwc"),
+            CompressionScheme::Afbc => Some("afbc"),
+            CompressionScheme::Pvric => Some("pvric"),
+            CompressionScheme::Dcc => Some("dcc"),
+            _ => None,
+        }
     }
 
     #[getter]

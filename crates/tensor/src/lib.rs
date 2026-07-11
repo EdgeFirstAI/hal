@@ -1031,6 +1031,184 @@ impl CpuAccess {
     }
 }
 
+/// Requested tile-compression behavior for an image allocation (set via
+/// [`ImageDesc::with_compression`]).
+///
+/// Vendor GPUs store textures in proprietary compressed tile layouts
+/// (UBWC, AFBC, PVRIC, DCC) that cut memory bandwidth; eligibility
+/// requires a hardware-only buffer ([`CpuAccess::None`]) because CPU
+/// mapping pins the layout linear. The request records best knowledge on
+/// the tensor ([`Tensor::compression`]); it never changes what bytes a
+/// consumer sees through the GPU/NPU.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// Let the platform use its native scheme when the format is
+    /// eligible; otherwise allocate linear and count the fallback
+    /// ([`compression_fallback_count`]). The right default for pipelines
+    /// that want the bandwidth win without portability failures.
+    Any,
+    /// Require one specific scheme: allocation fails with
+    /// [`Error::InvalidArgument`] when the device's scheme differs and
+    /// [`Error::NotSupported`] on platforms without vendor tile
+    /// compression. For consumers whose ABI names a layout (e.g. a
+    /// QNN context binary declaring UBWC inputs).
+    Scheme(CompressionScheme),
+}
+
+/// Vendor tile-compression schemes the HAL recognizes and records.
+///
+/// Unrecognized platforms record `None` (linear) — there is deliberately
+/// no `Unknown` variant; a scheme is only recorded when the vendor is
+/// positively identified.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionScheme {
+    /// Qualcomm Adreno Universal Bandwidth Compression.
+    Ubwc,
+    /// Arm Mali/Immortalis Framebuffer Compression.
+    Afbc,
+    /// Imagination PowerVR Image Compression (Google Tensor G5+).
+    Pvric,
+    /// Samsung Xclipse (AMD RDNA) Delta Color Compression.
+    Dcc,
+}
+
+/// Count of image allocations that requested [`Compression::Any`] but
+/// resolved to a linear layout (ineligible format/dtype, unrecognized
+/// vendor, or a platform without vendor tile compression). Read via
+/// [`compression_fallback_count`].
+static COMPRESSION_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of [`Compression::Any`] requests since process start that
+/// resolved to a linear layout instead of a vendor tile scheme. A
+/// steady-state pipeline holds this flat after warmup; growth means an
+/// allocation path keeps requesting compression it never gets.
+pub fn compression_fallback_count() -> u64 {
+    COMPRESSION_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Record a `Compression::Any` request resolving linear.
+pub(crate) fn note_compression_fallback(detail: &str) {
+    COMPRESSION_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    log::debug!("compression request fell back to linear: {detail}");
+}
+
+/// Whether this platform can allocate `(format, dtype)` images in a
+/// vendor tile-compressed layout. `true` requires an Android build, an
+/// eligible format (RGBA8888 `u8`/`i8` initially), and a positively
+/// identified GPU vendor; everywhere else the answer is `false` and
+/// [`Compression::Any`] requests fall back to linear.
+pub fn compression_support(format: PixelFormat, dtype: DType) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        crate::ahardwarebuffer_layout::compression_eligible(format, dtype)
+            && crate::ahardwarebuffer::device_compression_scheme().is_some()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (format, dtype);
+        false
+    }
+}
+
+/// Declarative image-allocation request — the full-featured front door
+/// for image tensors ([`TensorDyn::image_desc`] and the image crate's
+/// `ImageProcessor::create_image_desc`).
+///
+/// The classic constructors (`image`, `create_image`) cover the common
+/// cases; the desc carries the optional requests — today the
+/// [`Compression`] request — without another constructor-parameter
+/// sweep. Fields are private and the builders consume/return by value,
+/// so future options are non-breaking.
+///
+/// ```
+/// use edgefirst_tensor::{Compression, CpuAccess, DType, ImageDesc, PixelFormat};
+/// let desc = ImageDesc::new(640, 640, PixelFormat::Rgba, DType::U8)
+///     .with_access(CpuAccess::None)
+///     .with_compression(Compression::Any);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ImageDesc {
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+    dtype: DType,
+    memory: Option<TensorMemory>,
+    access: CpuAccess,
+    compression: Option<Compression>,
+}
+
+impl ImageDesc {
+    /// A new image request: auto-selected memory, [`CpuAccess::None`]
+    /// (hardware-only), no compression request.
+    pub fn new(width: usize, height: usize, format: PixelFormat, dtype: DType) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            dtype,
+            memory: None,
+            access: CpuAccess::None,
+            compression: None,
+        }
+    }
+
+    /// Request a specific memory backing (`None` = auto-select).
+    pub fn with_memory(mut self, memory: Option<TensorMemory>) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// Declare the CPU access (see [`CpuAccess`]). Any declaration other
+    /// than `None` makes a compression request invalid.
+    pub fn with_access(mut self, access: CpuAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Request a tile-compressed layout (see [`Compression`]).
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
+    /// Requested width in pixels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Requested height in pixels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Requested pixel format.
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    /// Requested element type.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Requested memory backing (`None` = auto-select).
+    pub fn memory(&self) -> Option<TensorMemory> {
+        self.memory
+    }
+
+    /// Declared CPU access.
+    pub fn access(&self) -> CpuAccess {
+        self.access
+    }
+
+    /// The compression request, if any.
+    pub fn compression(&self) -> Option<Compression> {
+        self.compression
+    }
+}
+
 /// Unique identity for a tensor's underlying buffer.
 ///
 /// Created fresh on every buffer allocation or import. The `id` is a monotonic
@@ -1812,6 +1990,14 @@ where
     /// numpy) default to `ReadWrite` — they are CPU-centric by nature.
     /// `map_with` counts requests beyond this declaration as unplanned.
     cpu_access: CpuAccess,
+    /// Recorded vendor tile-compression scheme — best knowledge from
+    /// allocation time (see [`Compression`]). `Some` only for Android
+    /// hardware-only AHardwareBuffers whose allocation requested
+    /// compression on an eligible format with a recognized vendor. When
+    /// set, the row-stride accessors describe no meaningful linear
+    /// layout. `configure_image` preserves it (physical layout, unlike
+    /// colorimetry); views inherit it.
+    compression: Option<CompressionScheme>,
     /// Parent-image snapshot when this tensor is a [`view`](Self::view)/
     /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. Lets the GL
     /// backend key its import on the parent and render the view as a
@@ -1835,6 +2021,7 @@ where
             cuda: None,
             colorimetry: None,
             cpu_access: CpuAccess::ReadWrite,
+            compression: None,
             view_origin: None,
         }
     }
@@ -1984,6 +2171,153 @@ where
     }
 
     /// Create an image tensor with the given format.
+    /// Allocate an image tensor from a declarative request — the
+    /// full-featured constructor behind [`Self::image`] and friends.
+    ///
+    /// Adds the [`Compression`] request to the classic parameters:
+    ///
+    /// - a request with any CPU access other than [`CpuAccess::None`] is
+    ///   [`Error::InvalidArgument`] (CPU mapping pins the layout linear);
+    /// - [`Compression::Scheme`] fails with [`Error::NotImplemented`] on
+    ///   platforms without vendor tile compression, and with
+    ///   [`Error::InvalidArgument`] when the device's native scheme or
+    ///   the format eligibility doesn't match;
+    /// - [`Compression::Any`] never fails for compression reasons: it
+    ///   records the scheme when the allocation is eligible and
+    ///   otherwise resolves linear, incrementing
+    ///   [`compression_fallback_count`].
+    ///
+    /// The recorded outcome is readable via [`Tensor::compression`].
+    pub fn image_desc(desc: &ImageDesc) -> Result<Self>
+    where
+        T: 'static,
+    {
+        let Some(t_dtype) = dtype_of::<T>() else {
+            return Err(Error::InvalidArgument(
+                "image_desc: element type has no DType mapping".into(),
+            ));
+        };
+        if t_dtype != desc.dtype {
+            return Err(Error::InvalidArgument(format!(
+                "image_desc: desc.dtype is {:?} but the tensor element type is {t_dtype:?}",
+                desc.dtype
+            )));
+        }
+
+        // Compression-request guards. CPU access pins the layout linear,
+        // so a request combined with any declared access is a
+        // contradiction the caller should hear about immediately.
+        if desc.compression.is_some() && desc.access != CpuAccess::None {
+            return Err(Error::InvalidArgument(format!(
+                "image_desc: a compression request requires CpuAccess::None                  (declared {:?}) — CPU mapping pins the layout linear",
+                desc.access
+            )));
+        }
+        if let Some(Compression::Scheme(requested)) = desc.compression {
+            #[cfg(not(target_os = "android"))]
+            {
+                return Err(Error::NotImplemented(format!(
+                    "image_desc: Compression::Scheme({requested:?}) — no vendor tile                      compression on this platform (request Compression::Any for a                      portable fallback)"
+                )));
+            }
+            #[cfg(target_os = "android")]
+            {
+                if matches!(
+                    desc.memory,
+                    Some(TensorMemory::Mem) | Some(TensorMemory::Shm) | Some(TensorMemory::Pbo)
+                ) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: Compression::Scheme({requested:?}) requires                          hardware memory (TensorMemory::Dma or auto-select), got {:?}",
+                        desc.memory
+                    )));
+                }
+                if !crate::ahardwarebuffer_layout::compression_eligible(desc.format, desc.dtype) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: ({:?}, {:?}) is not compression-eligible                          (RGBA8888 u8/i8 initially)",
+                        desc.format, desc.dtype
+                    )));
+                }
+                let device = crate::ahardwarebuffer::device_compression_scheme();
+                if device != Some(requested) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: Compression::Scheme({requested:?}) but the device's                          native scheme is {device:?}"
+                    )));
+                }
+            }
+        }
+
+        // A compression request implies a hardware pipeline, so auto
+        // memory promotes to the platform's zero-copy allocation first
+        // (`Tensor::image` only takes the AHardwareBuffer/IOSurface path
+        // under an explicit Dma request). `Scheme` propagates the Dma
+        // failure — the caller demanded a layout only that allocator can
+        // produce; `Any` falls back to plain auto-select.
+        #[allow(unused_mut)]
+        let mut t = match (desc.memory, desc.compression) {
+            (None, Some(request)) => {
+                match Self::image(
+                    desc.width,
+                    desc.height,
+                    desc.format,
+                    Some(TensorMemory::Dma),
+                    desc.access,
+                ) {
+                    Ok(t) => t,
+                    Err(e) if matches!(request, Compression::Scheme(_)) => return Err(e),
+                    Err(_) => Self::image(desc.width, desc.height, desc.format, None, desc.access)?,
+                }
+            }
+            (memory, _) => Self::image(desc.width, desc.height, desc.format, memory, desc.access)?,
+        };
+
+        // Record best knowledge / count fallbacks. Only an Android
+        // hardware-only AHardwareBuffer allocation can actually hold a
+        // vendor tile layout; everywhere else an Any request resolves
+        // linear and is counted.
+        if let Some(request) = desc.compression {
+            #[cfg(target_os = "android")]
+            {
+                let eligible =
+                    crate::ahardwarebuffer_layout::compression_eligible(desc.format, desc.dtype);
+                let scheme = crate::ahardwarebuffer::device_compression_scheme();
+                let is_ahb = t.memory() == TensorMemory::Dma;
+                match (request, scheme) {
+                    (_, Some(s)) if eligible && is_ahb => {
+                        t.set_compression_unchecked(Some(s));
+                    }
+                    (Compression::Scheme(requested), _) => {
+                        // Pre-validated eligible + scheme match, so the only
+                        // way here is the allocation resolving off-AHB.
+                        return Err(Error::InvalidOperation(format!(
+                            "image_desc: Compression::Scheme({requested:?}) requested but                              the allocation resolved to {:?} (not an AHardwareBuffer)",
+                            t.memory()
+                        )));
+                    }
+                    (Compression::Any, _) => {
+                        note_compression_fallback(&format!(
+                            "({:?}, {:?}) {}x{}: eligible={eligible}, scheme={scheme:?},                              memory={:?}",
+                            desc.format,
+                            desc.dtype,
+                            desc.width,
+                            desc.height,
+                            t.memory()
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                debug_assert!(matches!(request, Compression::Any));
+                let _ = request;
+                note_compression_fallback(&format!(
+                    "({:?}, {:?}) {}x{}: no vendor tile compression on this platform",
+                    desc.format, desc.dtype, desc.width, desc.height
+                ));
+            }
+        }
+        Ok(t)
+    }
+
     pub fn image(
         width: usize,
         height: usize,
@@ -2836,6 +3170,7 @@ where
             cuda: None,
             colorimetry: luma.colorimetry,
             cpu_access: luma.cpu_access,
+            compression: luma.compression,
             // A composed multiplane tensor is a whole image, not a sub-view.
             view_origin: None,
         })
@@ -3098,6 +3433,25 @@ where
         self.cpu_access = access;
     }
 
+    /// The vendor tile-compression scheme recorded at allocation, or
+    /// `None` for a linear layout. `Some` means the pixels live in a
+    /// proprietary tile order: the row-stride accessors describe no
+    /// meaningful linear layout and CPU maps are best-effort (see
+    /// [`Compression`]). Only Android hardware-only allocations that
+    /// requested compression record a scheme.
+    pub fn compression(&self) -> Option<CompressionScheme> {
+        self.compression
+    }
+
+    /// Record the compression scheme — crate-private: recording is an
+    /// allocation-time fact ([`Tensor::image_desc`] sets it; arbitrary
+    /// mutation would misdescribe the physical layout).
+    // Only the Android allocation path records a scheme today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn set_compression_unchecked(&mut self, scheme: Option<CompressionScheme>) {
+        self.compression = scheme;
+    }
+
     pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
         self.colorimetry
     }
@@ -3172,6 +3526,9 @@ where
         // The declared CPU access is a property of the underlying
         // allocation, so every view shares the parent's declaration.
         t.cpu_access = self.cpu_access;
+        // Likewise the recorded compression scheme: the view shares the
+        // parent's physical layout.
+        t.compression = self.compression;
         if abs_offset > 0 {
             t.set_plane_offset(abs_offset);
         }
@@ -3401,6 +3758,7 @@ where
             cuda: None,
             colorimetry: None,
             cpu_access: CpuAccess::ReadWrite,
+            compression: None,
             view_origin: None,
         }
     }
@@ -4607,6 +4965,119 @@ mod image_tests {
         let mut img = Tensor::from_planes(y, uv, PixelFormat::Nv12).unwrap();
         let err = img.reshape(&[480 * 640 + 240 * 640]);
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn desc_builder_roundtrips() {
+        let desc = ImageDesc::new(640, 480, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::Read)
+            .with_compression(Compression::Any);
+        assert_eq!(desc.width(), 640);
+        assert_eq!(desc.height(), 480);
+        assert_eq!(desc.format(), PixelFormat::Rgba);
+        assert_eq!(desc.dtype(), DType::U8);
+        assert_eq!(desc.memory(), Some(TensorMemory::Mem));
+        assert_eq!(desc.access(), CpuAccess::Read);
+        assert_eq!(desc.compression(), Some(Compression::Any));
+
+        // Defaults: auto memory, hardware-only, no request.
+        let plain = ImageDesc::new(2, 2, PixelFormat::Grey, DType::U8);
+        assert_eq!(plain.memory(), None);
+        assert_eq!(plain.access(), CpuAccess::None);
+        assert_eq!(plain.compression(), None);
+    }
+
+    #[test]
+    fn desc_dtype_must_match_element_type() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::F32);
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("dtype")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_with_cpu_access_is_invalid() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::U8)
+            .with_access(CpuAccess::ReadWrite)
+            .with_compression(Compression::Any);
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("CpuAccess::None")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn scheme_request_off_android_is_not_implemented() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::U8)
+            .with_compression(Compression::Scheme(CompressionScheme::Ubwc));
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::NotImplemented(msg)) => assert!(msg.contains("Ubwc")),
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn any_request_off_android_resolves_linear_and_counts() {
+        let before = compression_fallback_count();
+        let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_compression(Compression::Any);
+        let t = Tensor::<u8>::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert!(compression_fallback_count() > before);
+    }
+
+    #[test]
+    fn desc_without_request_matches_classic_constructor() {
+        let desc = ImageDesc::new(32, 32, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::ReadWrite);
+        let t = Tensor::<u8>::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert_eq!(t.cpu_access(), CpuAccess::ReadWrite);
+        assert_eq!(t.width(), Some(32));
+        // Mappable exactly like the classic constructor's result.
+        let m = t.map_read().unwrap();
+        assert_eq!(m.as_slice().len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn configure_image_preserves_compression_and_views_inherit() {
+        // No host platform records a scheme, so emulate the recording to
+        // pin the preserve/inherit semantics (the physical layout does
+        // not change when the logical image is reconfigured).
+        let mut t = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            CpuAccess::None,
+        )
+        .unwrap();
+        t.compression = Some(CompressionScheme::Ubwc);
+        t.configure_image(32, 32, PixelFormat::Rgba).unwrap();
+        assert_eq!(t.compression(), Some(CompressionScheme::Ubwc));
+        let view = t.subview(0, &[16, 32, 4]).unwrap();
+        assert_eq!(view.compression(), Some(CompressionScheme::Ubwc));
+    }
+
+    #[test]
+    fn tensor_dyn_dispatches_desc_and_compression() {
+        let desc = ImageDesc::new(16, 16, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::ReadWrite);
+        let t = TensorDyn::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert!(matches!(t, TensorDyn::U8(_)));
     }
 }
 

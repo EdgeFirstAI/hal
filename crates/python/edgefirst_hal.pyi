@@ -859,6 +859,16 @@ class Tensor:
     """The size of the tensor in bytes."""
 
     @property
+    def compression(self) -> str | None:
+        """Vendor tile-compression scheme recorded at allocation.
+
+        ``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"``, or ``None`` for a
+        linear layout. A compressed tensor has no meaningful linear row
+        stride and CPU maps are best-effort.
+        """
+        ...
+
+    @property
     def memory(self) -> TensorMemory: ...
     """The memory type of the tensor."""
 
@@ -2032,6 +2042,7 @@ class ImageProcessor:
         format: PixelFormat = PixelFormat.Rgba,
         dtype: str = "uint8",
         access: str = "none",
+        compression: str | None = None,
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
@@ -2060,6 +2071,13 @@ class ImageProcessor:
                 protocol). The strict ``"none"`` default keeps hardware
                 pipelines eligible for vendor tile compression; undeclared
                 CPU access still works best-effort but is logged and counted.
+            compression: Tile-compression request — ``None`` (default,
+                linear), ``"any"`` (device's native scheme when eligible,
+                counted linear fallback), or a specific scheme (``"ubwc"``,
+                ``"afbc"``, ``"pvric"``, ``"dcc"`` — allocation fails unless
+                the device's native scheme matches). Requires
+                ``access="none"``. Read the outcome via
+                ``Tensor.compression``.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

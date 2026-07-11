@@ -1229,6 +1229,18 @@ impl ImageProcessor {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Number of [`Compression::Any`](edgefirst_tensor::Compression)
+    /// requests since process start that resolved to a linear layout
+    /// (process-wide mirror of
+    /// [`edgefirst_tensor::compression_fallback_count`], surfaced here
+    /// beside [`convert_fallback_count`](Self::convert_fallback_count)
+    /// so pipeline telemetry reads from one place). A pipeline that
+    /// expects compressed convert destinations asserts this stays flat
+    /// after warmup.
+    pub fn compression_fallback_count(&self) -> u64 {
+        edgefirst_tensor::compression_fallback_count()
+    }
+
     /// Convert and return a native sync-fence fd that signals when the
     /// GPU work completes, instead of blocking the CPU — the GL→NPU
     /// handoff (`EGL_ANDROID_native_fence_sync` on Android).
@@ -1814,6 +1826,30 @@ impl ImageProcessor {
     /// # Errors
     ///
     /// Returns an error if all allocation strategies fail.
+    /// Allocate an image tensor from a declarative
+    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
+    /// full-featured variant of [`create_image`](Self::create_image).
+    ///
+    /// Without a compression request this is exactly `create_image` (the
+    /// processor's memory negotiation applies). With one, the allocation
+    /// rides the tensor desc path un-negotiated: the layout decision
+    /// belongs to the platform allocator, and the request's guards and
+    /// fallback counting live there (see
+    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)).
+    pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
+        if desc.compression().is_none() {
+            return self.create_image(
+                desc.width(),
+                desc.height(),
+                desc.format(),
+                desc.dtype(),
+                desc.memory(),
+                desc.access(),
+            );
+        }
+        Ok(TensorDyn::image_desc(desc)?)
+    }
+
     pub fn create_image(
         &self,
         width: usize,
@@ -10736,6 +10772,45 @@ mod image_tests {
     // =========================================================================
     // GAP-5: create_image F32 + DMA must return NotSupported
     // =========================================================================
+
+    /// `create_image_desc` without a compression request is exactly
+    /// `create_image` (the processor's memory negotiation applies); with
+    /// `Compression::Any` off-Android it resolves linear and counts the
+    /// fallback in the processor-visible mirror.
+    #[test]
+    fn create_image_desc_negotiates_and_counts_fallbacks() {
+        use edgefirst_tensor::{Compression, CpuAccess, ImageDesc};
+        let proc = ImageProcessor::new().unwrap();
+
+        let desc =
+            ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8).with_access(CpuAccess::ReadWrite);
+        let plain = proc.create_image_desc(&desc).unwrap();
+        let classic = proc
+            .create_image(
+                64,
+                64,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        assert_eq!(plain.memory(), classic.memory(), "same negotiation path");
+        assert_eq!(plain.compression(), None);
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let before = proc.compression_fallback_count();
+            let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+                .with_compression(Compression::Any);
+            let t = proc.create_image_desc(&desc).unwrap();
+            assert_eq!(t.compression(), None, "no vendor tile scheme off-Android");
+            assert!(
+                proc.compression_fallback_count() > before,
+                "Any resolving linear must count"
+            );
+        }
+    }
 
     /// There is no DRM FourCC for F32 images, so `create_image` with
     /// `TensorMemory::Dma` and `DType::F32` must return `Err(NotSupported)`.

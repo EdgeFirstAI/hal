@@ -88,6 +88,41 @@ pub(crate) fn lock_usage_for(cpu_usage: u64, reads: bool, writes: bool) -> LockD
     }
 }
 
+/// Classify a GPU vendor string (the `ro.hardware.egl` system property)
+/// into its native tile-compression scheme. Pure so the mapping is
+/// host-testable; the Android module feeds it the live property value.
+///
+/// Emulation stacks (`angle`, `emulation`, `swiftshader`) and unknown
+/// vendors return `None` — a scheme is recorded only on positive
+/// identification (there is deliberately no `Unknown` variant).
+pub(crate) fn scheme_for_egl_vendor(vendor: &str) -> Option<crate::CompressionScheme> {
+    use crate::CompressionScheme::*;
+    let v = vendor.trim().to_ascii_lowercase();
+    if v.is_empty() || v.contains("emulation") || v.contains("angle") || v.contains("swiftshader") {
+        return None;
+    }
+    if v.contains("adreno") {
+        Some(Ubwc)
+    } else if v.contains("mali") || v.contains("immortalis") {
+        Some(Afbc)
+    } else if v.contains("powervr") {
+        Some(Pvric)
+    } else if v.contains("xclipse") {
+        Some(Dcc)
+    } else {
+        None
+    }
+}
+
+/// Whether `(format, dtype)` is eligible for a vendor tile-compressed
+/// allocation. Conservative by design: RGBA8888 `u8`/`i8` initially —
+/// the layout every vendor compresses and the one QNN names in its UBWC
+/// data formats. Growing this table is a per-format, per-device
+/// validation exercise (Device Farm), not a code change alone.
+pub(crate) fn compression_eligible(format: PixelFormat, dtype: DType) -> bool {
+    matches!(format, PixelFormat::Rgba) && matches!(dtype, DType::U8 | DType::I8)
+}
+
 // AHardwareBuffer_Format values (subset used by the HAL).
 /// RGBA 8:8:8:8 UNORM — API 26+.
 pub(crate) const FORMAT_R8G8B8A8_UNORM: u32 = 1;
@@ -196,6 +231,35 @@ mod tests {
             rfu0: 0,
             rfu1: 0,
         }
+    }
+
+    #[test]
+    fn egl_vendor_classifier_table() {
+        use crate::CompressionScheme::*;
+        // Real ro.hardware.egl values seen in the wild.
+        assert_eq!(scheme_for_egl_vendor("adreno"), Some(Ubwc));
+        assert_eq!(scheme_for_egl_vendor("Adreno735"), Some(Ubwc));
+        assert_eq!(scheme_for_egl_vendor("mali"), Some(Afbc));
+        assert_eq!(scheme_for_egl_vendor("immortalis-g925"), Some(Afbc));
+        assert_eq!(scheme_for_egl_vendor("powervr"), Some(Pvric));
+        assert_eq!(scheme_for_egl_vendor("xclipse"), Some(Dcc));
+        // Emulation stacks and unknown vendors record linear.
+        assert_eq!(scheme_for_egl_vendor("emulation"), None);
+        assert_eq!(scheme_for_egl_vendor("angle"), None);
+        assert_eq!(scheme_for_egl_vendor("swiftshader"), None);
+        assert_eq!(scheme_for_egl_vendor(""), None);
+        assert_eq!(scheme_for_egl_vendor("llvmpipe"), None);
+    }
+
+    #[test]
+    fn compression_eligibility_table() {
+        // Initial table: RGBA8888 u8/i8 only.
+        assert!(compression_eligible(PixelFormat::Rgba, DType::U8));
+        assert!(compression_eligible(PixelFormat::Rgba, DType::I8));
+        assert!(!compression_eligible(PixelFormat::Rgba, DType::F16));
+        assert!(!compression_eligible(PixelFormat::Rgb, DType::U8));
+        assert!(!compression_eligible(PixelFormat::Nv12, DType::U8));
+        assert!(!compression_eligible(PixelFormat::PlanarRgb, DType::U8));
     }
 
     #[test]

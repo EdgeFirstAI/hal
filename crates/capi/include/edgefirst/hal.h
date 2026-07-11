@@ -438,6 +438,46 @@ typedef enum HalCpuAccess {
 } HalCpuAccess;
 
 /**
+ * Tile-compression request/recording for image tensors.
+ *
+ * As a request (hal_image_desc_set_compression): HAL_COMPRESSION_ANY
+ * asks for the device's native scheme with a counted linear fallback;
+ * a specific scheme value requires exactly that scheme (allocation
+ * fails otherwise); HAL_COMPRESSION_NONE clears the request.
+ *
+ * As a recording (hal_tensor_compression): the scheme the allocation
+ * actually holds — HAL_COMPRESSION_NONE means linear. A compressed
+ * tensor has no meaningful linear row stride and CPU maps are
+ * best-effort.
+ */
+typedef enum HalCompression {
+  /**
+   * Linear layout (recording) / no compression request (request).
+   */
+  HAL_COMPRESSION_NONE = 0,
+  /**
+   * Request only: the device's native scheme, linear fallback counted.
+   */
+  HAL_COMPRESSION_ANY = 1,
+  /**
+   * Qualcomm Adreno Universal Bandwidth Compression.
+   */
+  HAL_COMPRESSION_UBWC = 2,
+  /**
+   * Arm Mali/Immortalis Framebuffer Compression.
+   */
+  HAL_COMPRESSION_AFBC = 3,
+  /**
+   * Imagination PowerVR Image Compression.
+   */
+  HAL_COMPRESSION_PVRIC = 4,
+  /**
+   * Samsung Xclipse Delta Color Compression.
+   */
+  HAL_COMPRESSION_DCC = 5,
+} HalCompression;
+
+/**
  * Compute backend selection for image processing.
  *
  * @see hal_image_processor_new_with_backend
@@ -628,6 +668,18 @@ typedef struct hal_decoder_params hal_decoder_params;
  * List of detection boxes.
  */
 typedef struct hal_detect_box_list hal_detect_box_list;
+
+/**
+ * Opaque declarative image-allocation request.
+ *
+ * Create with hal_image_desc_new(), refine with the hal_image_desc_set_*
+ * functions, allocate via hal_tensor_new_image_desc() or
+ * hal_image_processor_create_image_desc(), and release with
+ * hal_image_desc_free(). The desc is the full-featured front door — the
+ * classic constructors cover the common cases; the desc adds optional
+ * requests (tile compression) without new positional parameters.
+ */
+typedef struct HalImageDesc HalImageDesc;
 
 /**
  * Opaque image processor type.
@@ -1758,6 +1810,73 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
                                         enum HalCpuAccess access);
 
 /**
+ * Create an image-allocation request. Defaults: auto-selected memory,
+ * HAL_CPU_ACCESS_NONE (hardware-only), no compression request.
+ *
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @param format Pixel format (HAL_PIXEL_FORMAT_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @return New desc handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: zero dimensions
+ */
+struct HalImageDesc *hal_image_desc_new(size_t width,
+                                        size_t height,
+                                        enum hal_pixel_format format,
+                                        enum hal_dtype dtype);
+
+/**
+ * Request a specific memory backing (the default is auto-select).
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param memory Memory allocation type
+ */
+void hal_image_desc_set_memory(struct HalImageDesc *desc, enum hal_tensor_memory memory);
+
+/**
+ * Declare the CPU access (see HalCpuAccess). Any declaration other than
+ * HAL_CPU_ACCESS_NONE makes a compression request invalid.
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param access Declared CPU access
+ */
+void hal_image_desc_set_access(struct HalImageDesc *desc, enum HalCpuAccess access);
+
+/**
+ * Request a tile-compressed layout (see HalCompression).
+ * HAL_COMPRESSION_NONE clears the request.
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param compression Compression request
+ */
+void hal_image_desc_set_compression(struct HalImageDesc *desc, enum HalCompression compression);
+
+/**
+ * Free an image-allocation request handle. NULL is a no-op. Descs are
+ * independent of the tensors they created — freeing a desc never
+ * affects a tensor.
+ *
+ * @param desc Desc handle
+ */
+void hal_image_desc_free(struct HalImageDesc *desc);
+
+/**
+ * Allocate an image tensor from a declarative request — the
+ * full-featured variant of hal_tensor_new_image(). See HalCompression
+ * for the request semantics; read the outcome back with
+ * hal_tensor_compression().
+ *
+ * @param desc Desc handle
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL desc, or an invalid compression request (declared CPU
+ *   access, ineligible format, or scheme mismatch)
+ * - ENOMEM: allocation failed
+ */
+struct hal_tensor *hal_tensor_new_image_desc(const struct HalImageDesc *desc);
+
+/**
  * Decode image data (JPEG/PNG) into a pre-allocated tensor.
  *
  * The tensor must have sufficient capacity for the decoded image.
@@ -2340,6 +2459,40 @@ struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *
                                                     enum HalCpuAccess access);
 
 /**
+ * Allocate an image tensor from a declarative request — the
+ * full-featured variant of hal_image_processor_create_image().
+ *
+ * Without a compression request the processor's memory negotiation
+ * applies (identical to hal_image_processor_create_image with
+ * auto-selected memory); with one, the allocation goes straight to the
+ * platform allocator and the request's guards apply (see
+ * HalCompression). Read the outcome back with hal_tensor_compression().
+ *
+ * @param processor Image processor handle
+ * @param desc Desc handle
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid compression request
+ * - ENOTSUP: a specific scheme was requested on a platform without it
+ * - ENOMEM: allocation failed
+ */
+struct hal_tensor *hal_image_processor_create_image_desc(struct hal_image_processor *processor,
+                                                         const struct HalImageDesc *desc);
+
+/**
+ * Whether this platform can allocate (format, dtype) images in a vendor
+ * tile-compressed layout. True requires an Android build, an eligible
+ * format (RGBA8888 u8/i8 initially), and a positively identified GPU
+ * vendor; everywhere else HAL_COMPRESSION_ANY requests fall back to
+ * linear (counted by hal_compression_fallback_count()).
+ *
+ * @param format Pixel format
+ * @param dtype Data type
+ * @return true when a compression request can be honored
+ */
+bool hal_platform_compression_support(enum hal_pixel_format format, enum hal_dtype dtype);
+
+/**
  * Pitch alignment in bytes that DMA-BUF EGLImage imports require on the
  * GL backend.
  *
@@ -2589,6 +2742,26 @@ int hal_log_init_callback(hal_log_callback cb, void *userdata, enum hal_log_leve
  * @return Monotonic process-wide counter
  */
 uint64_t hal_unplanned_cpu_access_count(void);
+
+/**
+ * The vendor tile-compression scheme recorded on a tensor at
+ * allocation, or HAL_COMPRESSION_NONE for a linear layout (also
+ * returned for NULL).
+ *
+ * @param tensor Tensor handle
+ * @return Recorded scheme (never HAL_COMPRESSION_ANY)
+ */
+enum HalCompression hal_tensor_compression(const struct hal_tensor *tensor);
+
+/**
+ * Number of HAL_COMPRESSION_ANY requests since process start that
+ * resolved to a linear layout instead of a vendor tile scheme. A
+ * pipeline that expects compressed destinations asserts this stays
+ * flat after warmup.
+ *
+ * @return Monotonic process-wide counter
+ */
+uint64_t hal_compression_fallback_count(void);
 
 /**
  * Check if Linux DMA-BUF buffer allocation is available.

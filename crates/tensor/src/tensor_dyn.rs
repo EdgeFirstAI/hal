@@ -793,6 +793,31 @@ impl TensorDyn {
         }
     }
 
+    /// Allocate an image tensor from a declarative [`ImageDesc`]
+    /// request — dispatching on `desc.dtype()`. See
+    /// [`Tensor::image_desc`] for the compression-request semantics.
+    pub fn image_desc(desc: &crate::ImageDesc) -> crate::Result<Self> {
+        match desc.dtype() {
+            DType::U8 => Tensor::<u8>::image_desc(desc).map(Self::U8),
+            DType::I8 => Tensor::<i8>::image_desc(desc).map(Self::I8),
+            DType::U16 => Tensor::<u16>::image_desc(desc).map(Self::U16),
+            DType::I16 => Tensor::<i16>::image_desc(desc).map(Self::I16),
+            DType::U32 => Tensor::<u32>::image_desc(desc).map(Self::U32),
+            DType::I32 => Tensor::<i32>::image_desc(desc).map(Self::I32),
+            DType::U64 => Tensor::<u64>::image_desc(desc).map(Self::U64),
+            DType::I64 => Tensor::<i64>::image_desc(desc).map(Self::I64),
+            DType::F16 => Tensor::<f16>::image_desc(desc).map(Self::F16),
+            DType::F32 => Tensor::<f32>::image_desc(desc).map(Self::F32),
+            DType::F64 => Tensor::<f64>::image_desc(desc).map(Self::F64),
+        }
+    }
+
+    /// The recorded vendor tile-compression scheme (see
+    /// [`Tensor::compression`]).
+    pub fn compression(&self) -> Option<crate::CompressionScheme> {
+        dispatch!(self, compression)
+    }
+
     /// Create a DMA-backed image tensor with an explicit row stride that
     /// may exceed the natural `width * channels * sizeof(T)` pitch.
     ///

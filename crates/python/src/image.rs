@@ -1318,7 +1318,14 @@ impl PyImageProcessor {
     /// pipelines eligible for tile compression and skips CPU cache
     /// maintenance, but mapping such a tensor is best-effort and counted
     /// as unplanned.
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none"))]
+    ///
+    /// ``compression`` requests a vendor tile-compressed layout:
+    /// ``None`` (default, linear), ``"any"`` (native scheme when
+    /// eligible, counted linear fallback), or a specific scheme
+    /// (``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"`` — allocation fails
+    /// unless the device's native scheme matches). Requires
+    /// ``access="none"``. Read the outcome via ``Tensor.compression``.
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none", compression = None))]
     pub fn create_image(
         &self,
         width: usize,
@@ -1326,16 +1333,27 @@ impl PyImageProcessor {
         format: PyPixelFormat,
         dtype: &str,
         access: &str,
+        compression: Option<&str>,
     ) -> Result<PyTensor> {
         let fmt: PixelFormat = format.into();
         let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
         let acc = crate::tensor::parse_cpu_access(access)
             .map_err(|e| Error::InvalidArg(e.to_string()))?;
-        let dyn_tensor = self
+        let proc = self
             .0
             .lock()
-            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image(width, height, fmt, dt, None, acc)?;
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        let dyn_tensor = match crate::tensor::parse_compression(compression)
+            .map_err(|e| Error::InvalidArg(e.to_string()))?
+        {
+            Some(request) => {
+                let desc = tensor::ImageDesc::new(width, height, fmt, dt)
+                    .with_access(acc)
+                    .with_compression(request);
+                proc.create_image_desc(&desc)?
+            }
+            None => proc.create_image(width, height, fmt, dt, None, acc)?,
+        };
         Ok(PyTensor(dyn_tensor))
     }
 

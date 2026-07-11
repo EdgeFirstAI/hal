@@ -157,6 +157,42 @@ extern "C" {
         out_virtual_address: *mut *mut c_void,
     ) -> i32;
     fn AHardwareBuffer_unlock(buffer: AHardwareBufferRef, fence: *mut i32) -> i32;
+    /// Bionic system-property read (`<sys/system_properties.h>`); writes
+    /// at most `PROP_VALUE_MAX` (92) bytes into `value` and returns the
+    /// string length.
+    fn __system_property_get(
+        name: *const std::os::raw::c_char,
+        value: *mut std::os::raw::c_char,
+    ) -> i32;
+}
+
+/// The device's native tile-compression scheme, classified from the
+/// `ro.hardware.egl` system property (`scheme_for_egl_vendor`). Cached:
+/// `ro.*` properties are fixed at boot. `None` on emulators and
+/// unrecognized vendors — compression requests then resolve linear.
+pub(crate) fn device_compression_scheme() -> Option<crate::CompressionScheme> {
+    static SCHEME: std::sync::OnceLock<Option<crate::CompressionScheme>> =
+        std::sync::OnceLock::new();
+    *SCHEME.get_or_init(|| {
+        const PROP_VALUE_MAX: usize = 92;
+        let mut buf = [0u8; PROP_VALUE_MAX];
+        // SAFETY: bionic writes at most PROP_VALUE_MAX bytes (including
+        // the NUL terminator) and returns the value length.
+        let len = unsafe {
+            __system_property_get(
+                c"ro.hardware.egl".as_ptr(),
+                buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            )
+        };
+        let vendor = usize::try_from(len)
+            .ok()
+            .filter(|&n| n <= PROP_VALUE_MAX)
+            .and_then(|n| std::str::from_utf8(&buf[..n]).ok())
+            .unwrap_or("");
+        let scheme = crate::ahardwarebuffer_layout::scheme_for_egl_vendor(vendor);
+        log::debug!("ro.hardware.egl={vendor:?} → compression scheme {scheme:?}");
+        scheme
+    })
 }
 
 /// Owned AHardwareBuffer handle. Releases on Drop via
