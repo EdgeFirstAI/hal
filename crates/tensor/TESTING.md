@@ -10,6 +10,9 @@ crates/tensor/
 │   ├── shm.rs           # POSIX shared-memory backend unit tests
 │   ├── mem.rs           # Heap backend unit tests
 │   ├── pbo.rs           # PboTensor + WeakSender behavior
+│   ├── iosurface.rs     # IOSurface backend (macOS/iOS) — runs on macOS hosts
+│   ├── ahardwarebuffer.rs        # AHardwareBuffer backend (Android) — FFI, on-device only
+│   ├── ahardwarebuffer_layout.rs # Pure Android layout/policy logic — host-tested everywhere
 │   ├── tensor_dyn.rs    # TensorDyn metadata, multi-plane, format/stride checks
 │   └── format.rs        # PixelFormat + DType compatibility
 └── benches/
@@ -53,6 +56,23 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   are not gated on any feature — `cargo test -p edgefirst-tensor` runs
   them on every host. End-to-end PBO behavior (real GL thread, EGL
   context) is additionally exercised by the image crate's tests.
+- **IOSurface tests** (`iosurface.rs`) are macOS-gated and run on the
+  macOS CI leg: allocation, wrap-by-`IOSurfaceID`, stride/geometry, and
+  the read-only lock round-trip (`map_read` locks with
+  `kIOSurfaceLockReadOnly`; write through a read map asserts).
+- **Android logic is host-tested; Android FFI is device-tested.** Every
+  pure decision the AHardwareBuffer backend makes lives in
+  `ahardwarebuffer_layout.rs` — the CpuAccess→lock-usage mapping,
+  descriptor geometry and gralloc stride handling, packed RGB u8/i8
+  RGBA8888 mapping, the `ro.hardware.egl` compression-scheme classifier
+  and format-eligibility table, and the `BufferIdentity` intern policy —
+  and runs as ordinary host tests on every CI lane, so drift is caught
+  without a device. The FFI shell (`ahardwarebuffer.rs`) executes only
+  on-device via the internal hal-mobile Device Farm harness (root
+  TESTING.md § Android On-Device Validation).
+- **CpuAccess map-contract tests** are host-portable: the declared-vs-
+  requested map-mode table, the `writable` assert on read-only maps, and
+  the `unplanned_cpu_access_count()` warn-once telemetry.
 - **No LFS testdata.** All shapes and inputs are synthesized in-test.
   `tensor_benchmark` does not use `edgefirst_bench::testdata`; it
   generates its inputs in memory.
@@ -81,7 +101,11 @@ cargo-zigbuild zigbuild --target aarch64-unknown-linux-gnu --release \
   appears under `crates/tensor/`.
 - `cfg(target_os = "linux")`-gated code (`dma.rs`, `dmabuf.rs`) is only
   exercised on the Linux host runners and on the i.MX 8M Plus hardware
-  runner. The macOS CI leg covers the heap path. There is no Windows
+  runner. The macOS CI leg covers the heap and IOSurface paths.
+  `cfg(target_os = "android")` code (`ahardwarebuffer.rs`) is excluded
+  from Sonar coverage (no CI lane can execute it) and is covered
+  on-device by the hal-mobile harness; its pure logic is host-covered
+  via `ahardwarebuffer_layout.rs`. There is no Windows
   test job today; SHM coverage comes from the Linux runners (where
   `shm.rs` is `#[cfg(unix)]`-gated and active).
 - The `procfs` dev-dependency on Linux is used to read open-fd counts

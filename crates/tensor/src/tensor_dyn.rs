@@ -584,13 +584,13 @@ impl TensorDyn {
     }
 
     /// Wrap an externally-allocated IOSurface as a type-erased tensor
-    /// (macOS only).
+    /// (macOS/iOS only).
     ///
     /// # Safety
     ///
     /// `surface_ref` must be a valid live `IOSurfaceRef`. `shape` must
     /// match the IOSurface's pixel dimensions and chosen element type.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub unsafe fn from_iosurface(
         surface_ref: *mut std::ffi::c_void,
         shape: &[usize],
@@ -632,28 +632,107 @@ impl TensorDyn {
         }
     }
 
-    /// IOSurfaceID for cross-process surface sharing (macOS only).
+    /// IOSurfaceID for cross-process surface sharing (macOS/iOS only).
     /// Returns `None` when the tensor is not IOSurface-backed.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_id(&self) -> Option<u32> {
         dispatch!(self, iosurface_id)
     }
 
-    /// Borrow the raw `IOSurfaceRef` backing this tensor (macOS only).
-    /// Returns `None` when the tensor is not IOSurface-backed. The
-    /// pointer's lifetime is tied to `self`.
-    #[cfg(target_os = "macos")]
+    /// Borrow the raw `IOSurfaceRef` backing this tensor (macOS/iOS
+    /// only). Returns `None` when the tensor is not IOSurface-backed.
+    /// The pointer's lifetime is tied to `self`.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_ref(&self) -> Option<*mut std::ffi::c_void> {
         dispatch!(self, iosurface_ref)
     }
 
     /// Physical IOSurface dimensions in texels, independent of the logical
-    /// shape (macOS only). `None` when not IOSurface-backed. The GL backend
-    /// binds the EGL pbuffer at these dims so one cached pbuffer serves every
-    /// frame size a reused pool surface holds.
-    #[cfg(target_os = "macos")]
+    /// shape (macOS/iOS only). `None` when not IOSurface-backed. The GL
+    /// backend binds the EGL pbuffer at these dims so one cached pbuffer
+    /// serves every frame size a reused pool surface holds.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn iosurface_physical_dims(&self) -> Option<(usize, usize)> {
         dispatch!(self, iosurface_physical_dims)
+    }
+
+    /// Wrap an externally-allocated AHardwareBuffer as a type-erased
+    /// tensor (Android only). Used to import buffers from
+    /// CameraX/ImageReader (via JNI), NNAPI, or cross-process binder
+    /// transfers.
+    ///
+    /// # Safety
+    ///
+    /// `buffer_ptr` must be a valid live AHardwareBuffer pointer. `shape`
+    /// must match the buffer's dimensions and chosen element type.
+    #[cfg(target_os = "android")]
+    pub unsafe fn from_hardware_buffer(
+        buffer_ptr: *mut std::ffi::c_void,
+        shape: &[usize],
+        dtype: DType,
+        name: Option<&str>,
+    ) -> crate::Result<Self> {
+        unsafe {
+            match dtype {
+                DType::U8 => {
+                    Tensor::<u8>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U8)
+                }
+                DType::I8 => {
+                    Tensor::<i8>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I8)
+                }
+                DType::U16 => {
+                    Tensor::<u16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U16)
+                }
+                DType::I16 => {
+                    Tensor::<i16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I16)
+                }
+                DType::U32 => {
+                    Tensor::<u32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U32)
+                }
+                DType::I32 => {
+                    Tensor::<i32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I32)
+                }
+                DType::U64 => {
+                    Tensor::<u64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::U64)
+                }
+                DType::I64 => {
+                    Tensor::<i64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::I64)
+                }
+                DType::F16 => {
+                    Tensor::<f16>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F16)
+                }
+                DType::F32 => {
+                    Tensor::<f32>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F32)
+                }
+                DType::F64 => {
+                    Tensor::<f64>::from_hardware_buffer(buffer_ptr, shape, name).map(Self::F64)
+                }
+            }
+        }
+    }
+
+    /// Borrow the raw AHardwareBuffer pointer backing this tensor
+    /// (Android only). Returns `None` when the tensor is not
+    /// AHardwareBuffer-backed. The pointer's lifetime is tied to `self`.
+    #[cfg(target_os = "android")]
+    pub fn hardware_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        dispatch!(self, hardware_buffer_ptr)
+    }
+
+    /// Physical AHardwareBuffer dimensions in texels, independent of the
+    /// logical shape (Android only). `None` when not
+    /// AHardwareBuffer-backed.
+    #[cfg(target_os = "android")]
+    pub fn hardware_buffer_physical_dims(&self) -> Option<(usize, usize)> {
+        dispatch!(self, hardware_buffer_physical_dims)
+    }
+
+    /// Copy the tensor's logical bytes into `dst`, compacting away any
+    /// recorded row-stride padding — see [`Tensor::copy_to_flat`] for the
+    /// full contract. `dst.len()` must equal the tight byte footprint
+    /// (`shape` product × element size).
+    pub fn copy_to_flat(&self, dst: &mut [u8]) -> crate::Result<()> {
+        dispatch!(self, copy_to_flat, dst)
     }
 
     /// Create a type-erased image tensor.
@@ -679,20 +758,64 @@ impl TensorDyn {
         format: PixelFormat,
         dtype: DType,
         memory: Option<TensorMemory>,
+        access: crate::CpuAccess,
     ) -> crate::Result<Self> {
         match dtype {
-            DType::U8 => Tensor::<u8>::image(width, height, format, memory).map(Self::U8),
-            DType::I8 => Tensor::<i8>::image(width, height, format, memory).map(Self::I8),
-            DType::U16 => Tensor::<u16>::image(width, height, format, memory).map(Self::U16),
-            DType::I16 => Tensor::<i16>::image(width, height, format, memory).map(Self::I16),
-            DType::U32 => Tensor::<u32>::image(width, height, format, memory).map(Self::U32),
-            DType::I32 => Tensor::<i32>::image(width, height, format, memory).map(Self::I32),
-            DType::U64 => Tensor::<u64>::image(width, height, format, memory).map(Self::U64),
-            DType::I64 => Tensor::<i64>::image(width, height, format, memory).map(Self::I64),
-            DType::F16 => Tensor::<f16>::image(width, height, format, memory).map(Self::F16),
-            DType::F32 => Tensor::<f32>::image(width, height, format, memory).map(Self::F32),
-            DType::F64 => Tensor::<f64>::image(width, height, format, memory).map(Self::F64),
+            DType::U8 => Tensor::<u8>::image(width, height, format, memory, access).map(Self::U8),
+            DType::I8 => Tensor::<i8>::image(width, height, format, memory, access).map(Self::I8),
+            DType::U16 => {
+                Tensor::<u16>::image(width, height, format, memory, access).map(Self::U16)
+            }
+            DType::I16 => {
+                Tensor::<i16>::image(width, height, format, memory, access).map(Self::I16)
+            }
+            DType::U32 => {
+                Tensor::<u32>::image(width, height, format, memory, access).map(Self::U32)
+            }
+            DType::I32 => {
+                Tensor::<i32>::image(width, height, format, memory, access).map(Self::I32)
+            }
+            DType::U64 => {
+                Tensor::<u64>::image(width, height, format, memory, access).map(Self::U64)
+            }
+            DType::I64 => {
+                Tensor::<i64>::image(width, height, format, memory, access).map(Self::I64)
+            }
+            DType::F16 => {
+                Tensor::<f16>::image(width, height, format, memory, access).map(Self::F16)
+            }
+            DType::F32 => {
+                Tensor::<f32>::image(width, height, format, memory, access).map(Self::F32)
+            }
+            DType::F64 => {
+                Tensor::<f64>::image(width, height, format, memory, access).map(Self::F64)
+            }
         }
+    }
+
+    /// Allocate an image tensor from a declarative [`ImageDesc`]
+    /// request — dispatching on `desc.dtype()`. See
+    /// [`Tensor::image_desc`] for the compression-request semantics.
+    pub fn image_desc(desc: &crate::ImageDesc) -> crate::Result<Self> {
+        match desc.dtype() {
+            DType::U8 => Tensor::<u8>::image_desc(desc).map(Self::U8),
+            DType::I8 => Tensor::<i8>::image_desc(desc).map(Self::I8),
+            DType::U16 => Tensor::<u16>::image_desc(desc).map(Self::U16),
+            DType::I16 => Tensor::<i16>::image_desc(desc).map(Self::I16),
+            DType::U32 => Tensor::<u32>::image_desc(desc).map(Self::U32),
+            DType::I32 => Tensor::<i32>::image_desc(desc).map(Self::I32),
+            DType::U64 => Tensor::<u64>::image_desc(desc).map(Self::U64),
+            DType::I64 => Tensor::<i64>::image_desc(desc).map(Self::I64),
+            DType::F16 => Tensor::<f16>::image_desc(desc).map(Self::F16),
+            DType::F32 => Tensor::<f32>::image_desc(desc).map(Self::F32),
+            DType::F64 => Tensor::<f64>::image_desc(desc).map(Self::F64),
+        }
+    }
+
+    /// The recorded vendor tile-compression scheme (see
+    /// [`Tensor::compression`]).
+    pub fn compression(&self) -> Option<crate::CompressionScheme> {
+        dispatch!(self, compression)
     }
 
     /// Create a DMA-backed image tensor with an explicit row stride that
@@ -705,7 +828,7 @@ impl TensorDyn {
     /// # Example
     ///
     /// ```no_run
-    /// use edgefirst_tensor::{TensorDyn, PixelFormat, DType, TensorMemory};
+    /// use edgefirst_tensor::{CpuAccess, TensorDyn, PixelFormat, DType, TensorMemory};
     /// # fn main() -> edgefirst_tensor::Result<()> {
     /// // Allocate a 3004×1688 RGBA8 canvas with 64-byte pitch alignment
     /// // (12032 bytes per row instead of the natural 12016).
@@ -714,6 +837,7 @@ impl TensorDyn {
     ///     PixelFormat::Rgba, DType::U8,
     ///     12032,
     ///     Some(TensorMemory::Dma),
+    ///     CpuAccess::ReadWrite,
     /// )?;
     /// assert_eq!(img.width(), Some(3004));       // logical, unchanged
     /// assert_eq!(img.effective_row_stride(), Some(12032)); // padded
@@ -727,52 +851,108 @@ impl TensorDyn {
         dtype: DType,
         row_stride_bytes: usize,
         memory: Option<TensorMemory>,
+        access: crate::CpuAccess,
     ) -> crate::Result<Self> {
         match dtype {
-            DType::U8 => {
-                Tensor::<u8>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::U8)
-            }
-            DType::I8 => {
-                Tensor::<i8>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::I8)
-            }
-            DType::U16 => {
-                Tensor::<u16>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::U16)
-            }
-            DType::I16 => {
-                Tensor::<i16>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::I16)
-            }
-            DType::U32 => {
-                Tensor::<u32>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::U32)
-            }
-            DType::I32 => {
-                Tensor::<i32>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::I32)
-            }
-            DType::U64 => {
-                Tensor::<u64>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::U64)
-            }
-            DType::I64 => {
-                Tensor::<i64>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::I64)
-            }
-            DType::F16 => {
-                Tensor::<f16>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::F16)
-            }
-            DType::F32 => {
-                Tensor::<f32>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::F32)
-            }
-            DType::F64 => {
-                Tensor::<f64>::image_with_stride(width, height, format, row_stride_bytes, memory)
-                    .map(Self::F64)
-            }
+            DType::U8 => Tensor::<u8>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::U8),
+            DType::I8 => Tensor::<i8>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::I8),
+            DType::U16 => Tensor::<u16>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::U16),
+            DType::I16 => Tensor::<i16>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::I16),
+            DType::U32 => Tensor::<u32>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::U32),
+            DType::I32 => Tensor::<i32>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::I32),
+            DType::U64 => Tensor::<u64>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::U64),
+            DType::I64 => Tensor::<i64>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::I64),
+            DType::F16 => Tensor::<f16>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::F16),
+            DType::F32 => Tensor::<f32>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::F32),
+            DType::F64 => Tensor::<f64>::image_with_stride(
+                width,
+                height,
+                format,
+                row_stride_bytes,
+                memory,
+                access,
+            )
+            .map(Self::F64),
         }
     }
 }
@@ -968,7 +1148,14 @@ mod tests {
 
     #[test]
     fn image_accessors() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let dyn_t: TensorDyn = t.into();
         assert_eq!(dyn_t.format(), Some(PixelFormat::Rgba));
         assert_eq!(dyn_t.width(), Some(640));
@@ -978,7 +1165,15 @@ mod tests {
 
     #[test]
     fn image_constructor() {
-        let dyn_t = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dyn_t = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(dyn_t.dtype(), DType::U8);
         assert_eq!(dyn_t.format(), Some(PixelFormat::Rgb));
         assert_eq!(dyn_t.width(), Some(640));
@@ -986,7 +1181,15 @@ mod tests {
 
     #[test]
     fn image_constructor_i8() {
-        let dyn_t = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::I8, None).unwrap();
+        let dyn_t = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::I8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(dyn_t.dtype(), DType::I8);
         assert_eq!(dyn_t.format(), Some(PixelFormat::Rgb));
     }
@@ -1098,7 +1301,15 @@ mod tests {
     #[test]
     fn set_row_stride_valid() {
         // RGBA 100px wide: min stride = 400, set 512
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_row_stride(512).unwrap();
         assert_eq!(t.row_stride(), Some(512));
         assert_eq!(t.effective_row_stride(), Some(512));
@@ -1107,7 +1318,15 @@ mod tests {
     #[test]
     fn set_row_stride_equals_min() {
         // RGB 100px: min stride = 300, set exactly 300
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_row_stride(300).unwrap();
         assert_eq!(t.row_stride(), Some(300));
     }
@@ -1118,14 +1337,30 @@ mod tests {
         // carries no implicit stride. min stride = 256; setting 200 must error
         // and leave row_stride unset. (Non-64-aligned widths now record the
         // padded stride at allocation — see `Tensor::image`.)
-        let mut t = TensorDyn::image(64, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            64,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert!(t.set_row_stride(200).is_err());
         assert_eq!(t.row_stride(), None);
     }
 
     #[test]
     fn set_row_stride_zero() {
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert!(t.set_row_stride(0).is_err());
     }
 
@@ -1141,7 +1376,15 @@ mod tests {
         // effective stride falls back to the computed tight pitch. (Width 64
         // RGB → 64*3 = 192, already a multiple of 64, so no padding is added.
         // Non-aligned widths now record the padded stride — see `Tensor::image`.)
-        let t = TensorDyn::image(64, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let t = TensorDyn::image(
+            64,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.row_stride(), None);
         assert_eq!(t.effective_row_stride(), Some(192)); // 64 * 3
     }
@@ -1159,6 +1402,7 @@ mod tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         ) {
             Ok(t) if t.memory() == TensorMemory::Dma => t,
             _ => return,
@@ -1175,19 +1419,33 @@ mod tests {
 
     #[test]
     fn with_row_stride_builder() {
-        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
-            .unwrap()
-            .with_row_stride(512)
-            .unwrap();
+        let t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+        .with_row_stride(512)
+        .unwrap();
         assert_eq!(t.row_stride(), Some(512));
         assert_eq!(t.effective_row_stride(), Some(512));
     }
 
     #[test]
     fn with_row_stride_rejects_small() {
-        let result = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None)
-            .unwrap()
-            .with_row_stride(200);
+        let result = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap()
+        .with_row_stride(200);
         assert!(result.is_err());
     }
 
@@ -1229,7 +1487,15 @@ mod tests {
 
     #[test]
     fn set_format_same_preserves_stride() {
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_row_stride(512).unwrap();
         // Re-setting the same format should not clear stride
         t.set_format(PixelFormat::Rgb).unwrap();
@@ -1238,20 +1504,42 @@ mod tests {
 
     #[test]
     fn effective_row_stride_planar() {
-        let t = TensorDyn::image(640, 480, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let t = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.effective_row_stride(), Some(640)); // planar: width only
     }
 
     #[test]
     fn effective_row_stride_nv12() {
-        let t = TensorDyn::image(640, 480, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let t = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.effective_row_stride(), Some(640)); // semi-planar: width only
     }
 
     #[test]
     fn map_rejects_strided_tensor() {
-        let mut t =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // Map works before stride is set
         assert!(t.map().is_ok());
         // After setting stride, map should be rejected
@@ -1264,20 +1552,44 @@ mod tests {
 
     #[test]
     fn plane_offset_default_none() {
-        let t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.plane_offset(), None);
     }
 
     #[test]
     fn set_plane_offset_basic() {
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_plane_offset(4096);
         assert_eq!(t.plane_offset(), Some(4096));
     }
 
     #[test]
     fn set_plane_offset_zero() {
-        let mut t = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_plane_offset(0);
         assert_eq!(t.plane_offset(), Some(0));
     }
@@ -1309,8 +1621,14 @@ mod tests {
 
     #[test]
     fn map_rejects_out_of_bounds_offset() {
-        let mut t =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // Map works before offset is set.
         assert!(t.map().is_ok());
         // Heap offsets are now honored, but an offset that pushes the full
@@ -1323,8 +1641,14 @@ mod tests {
     fn mem_subview_in_bounds_maps_at_offset() {
         // An in-bounds heap sub-view now maps at its offset (previously every
         // non-zero heap offset was rejected outright).
-        let parent =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let parent = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // A 10x10 RGBA window (400 bytes) at byte offset 4096 fits in 40000.
         let view = parent.subview(4096, &[10, 10, 4]).unwrap();
         assert_eq!(view.plane_offset(), Some(4096));
@@ -1347,8 +1671,14 @@ mod tests {
 
     #[test]
     fn map_accepts_zero_offset_tensor() {
-        let mut t =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_plane_offset(0);
         // Zero offset is fine for CPU mapping
         assert!(t.map().is_ok());
@@ -1356,7 +1686,15 @@ mod tests {
 
     #[test]
     fn dyn_configure_image_nv12() {
-        let mut t = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!((t.width(), t.height()), (Some(320), Some(240)));
@@ -1365,7 +1703,15 @@ mod tests {
     #[test]
     fn tensordyn_colorimetry_roundtrip() {
         use crate::{ColorEncoding, Colorimetry, DType, PixelFormat};
-        let mut t = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.colorimetry(), None);
         let c = Colorimetry::default().with_encoding(ColorEncoding::Bt709);
         t.set_colorimetry(Some(c));

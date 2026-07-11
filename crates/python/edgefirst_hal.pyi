@@ -859,6 +859,16 @@ class Tensor:
     """The size of the tensor in bytes."""
 
     @property
+    def compression(self) -> str | None:
+        """Vendor tile-compression scheme recorded at allocation.
+
+        ``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"``, or ``None`` for a
+        linear layout. A compressed tensor has no meaningful linear row
+        stride and CPU maps are best-effort.
+        """
+        ...
+
+    @property
     def memory(self) -> TensorMemory: ...
     """The memory type of the tensor."""
 
@@ -1096,6 +1106,7 @@ class Tensor:
         height: int,
         format: PixelFormat,
         mem: TensorMemory | None = None,
+        access: str = "none",
     ) -> Tensor:
         """Create an image tensor with the given dimensions and pixel format.
 
@@ -1105,6 +1116,10 @@ class Tensor:
             format: Pixel format for the image data.
             mem: Optional memory type override. If None, the best available
                 memory type is chosen automatically.
+            access: Declared CPU access — ``"none"`` (default), ``"read"``,
+                ``"write"``, or ``"readwrite"``. Hardware access is always
+                implied; pass ``"readwrite"`` (or the precise direction) when
+                the script will ``map()`` or ``numpy()`` the tensor.
         """
         ...
 
@@ -2026,6 +2041,8 @@ class ImageProcessor:
         height: int,
         format: PixelFormat = PixelFormat.Rgba,
         dtype: str = "uint8",
+        access: str = "none",
+        compression: str | None = None,
     ) -> Tensor:
         """Create an image tensor with the processor's optimal memory backend.
 
@@ -2047,6 +2064,20 @@ class ImageProcessor:
                 ``"float32"`` (for GPU float model-input paths); other types
                 still prefer DMA-buf when available and otherwise use system
                 memory.
+            access: Declared CPU access — ``"none"`` (default), ``"read"``,
+                ``"write"``, or ``"readwrite"``. Hardware (GPU/NPU) access is
+                always implied; declare CPU access only when the script will
+                touch the pixels directly (``map()``, ``numpy()``, buffer
+                protocol). The strict ``"none"`` default keeps hardware
+                pipelines eligible for vendor tile compression; undeclared
+                CPU access still works best-effort but is logged and counted.
+            compression: Tile-compression request — ``None`` (default,
+                linear), ``"any"`` (device's native scheme when eligible,
+                counted linear fallback), or a specific scheme (``"ubwc"``,
+                ``"afbc"``, ``"pvric"``, ``"dcc"`` — allocation fails unless
+                the device's native scheme matches). Requires
+                ``access="none"``. Read the outcome via
+                ``Tensor.compression``.
 
         Returns:
             A new image ``Tensor`` backed by the optimal memory type.

@@ -43,8 +43,14 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
 
     // JPEG: zidane.jpg (1280×720) → NV12
     {
-        let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
 
@@ -58,8 +64,14 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
 
     // JPEG: giraffe.jpg (640×640) — smaller baseline image → NV12
     {
-        let mut tensor =
-            Tensor::<u8>::image(640, 640, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            640,
+            640,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         tensor.load_image(&mut decoder, &GIRAFFE_JPG).unwrap();
 
@@ -73,8 +85,14 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
 
     // PNG: zidane.png (1280×720) → RGB
     {
-        let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         tensor.load_image(&mut decoder, &ZIDANE_PNG).unwrap();
 
@@ -88,8 +106,14 @@ fn bench_codec_decode(suite: &mut BenchSuite) {
 
     // Strided decode: decode 1280×720 JPEG into a 1920×1080 NV12 tensor
     {
-        let mut tensor =
-            Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            1920,
+            1080,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();
 
@@ -212,8 +236,14 @@ fn bench_exif_overhead(suite: &mut BenchSuite) {
     for o in 1..=8u32 {
         let name = format!("codec/exif/jpeg/orient_{o}");
         let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.jpg"));
-        let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         // Warm scratch with one decode before timing.
         tensor.load_image(&mut decoder, &data).unwrap();
@@ -229,8 +259,14 @@ fn bench_exif_overhead(suite: &mut BenchSuite) {
     for o in 1..=8u32 {
         let name = format!("codec/exif/png/orient_{o}");
         let data = edgefirst_bench::testdata::read(format!("zidane_exif_{o}.png"));
-        let mut tensor =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+        let mut tensor = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut decoder = ImageDecoder::new();
         tensor.load_image(&mut decoder, &data).unwrap();
         let r = run_bench(&name, exif_warmup, exif_iters, || {
@@ -284,8 +320,14 @@ fn bench_v4l2_persistent_stream(suite: &mut BenchSuite) {
     // ONE decoder reused across warmup + all measured iterations: this is the
     // persistent-stream path where the V4L2 stream is built once and then kept
     // alive for subsequent frames.
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     // First decode triggers stream setup; subsequent ones exercise the reuse path.
     tensor.load_image(&mut decoder, &ZIDANE_JPG).unwrap();

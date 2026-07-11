@@ -226,7 +226,7 @@ fn decode_png_u8<T: ImagePixel>(
     };
     let src_stride = img_w * channels;
 
-    let mut map = dst.map()?;
+    let mut map = dst.map_write()?;
     let dst_elems: &mut [T] = &mut map;
     match T::dtype() {
         edgefirst_tensor::DType::U8 => {
@@ -288,7 +288,7 @@ fn decode_png_wide<T: ImagePixel>(
     let src_stride = img_w * channels;
     let dse = dst_stride / elem_or_one::<T>();
 
-    let mut map = dst.map()?;
+    let mut map = dst.map_write()?;
     let dst_elems: &mut [T] = &mut map;
 
     match result {

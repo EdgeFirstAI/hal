@@ -257,13 +257,14 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        let _span = tracing::trace_span!("tensor.map", memory = "iosurface",).entered();
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        let _span = tracing::trace_span!("tensor.map", memory = "iosurface", ?access).entered();
         let m = IoSurfaceMap::new(
             self.surface.clone(),
             self.shape.clone(),
             self.buf_size,
             self.view_offset,
+            access,
         )?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -454,6 +455,18 @@ where
                     })?;
                 (layout.surface_w, layout.surface_h)
             }
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // the same canonical rule as the Android allocation and the GL
+            // engine's two-pass packed-RGB render geometry.
+            (PixelFormat::Rgb, DType::U8 | DType::I8) => {
+                let layout = crate::packed_rgb888_layout(width, height).ok_or_else(|| {
+                    Error::InvalidShape(format!(
+                        "Rgb u8 IOSurface requires width%4==0 for RGBA8888 packing \
+                         (got width={width})"
+                    ))
+                })?;
+                (layout.surface_w, layout.surface_h)
+            }
             (PixelFormat::PlanarRgb, _) => {
                 let sh = height.checked_mul(3).ok_or_else(|| {
                     Error::InvalidShape(format!("PlanarRgb height overflow (height={height})"))
@@ -619,13 +632,18 @@ where
     /// `byte_size <= buf_size` first. The IOSurface lock yields the full
     /// surface base address, so the strided view is genuinely zero-copy — no
     /// staging buffer, just a wider slice over the same locked allocation.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let m = IoSurfaceMap::new_with_byte_size(
             self.surface.clone(),
             self.shape.clone(),
             self.buf_size,
             byte_size,
             self.view_offset,
+            access,
         )?;
         Ok(TensorMap::IoSurface(m))
     }
@@ -748,6 +766,8 @@ where
     _marker: PhantomData<T>,
     /// Lock options used at map time, replayed in unmap for symmetry.
     lock_options: u32,
+    /// Whether mutable access is permitted (`map_read()` maps are not).
+    writable: bool,
     locked: bool,
 }
 
@@ -763,8 +783,9 @@ where
         shape: Vec<usize>,
         buf_size: usize,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, None, view_offset)
+        Self::new_inner(surface, shape, buf_size, None, view_offset, access)
     }
 
     /// Lock the surface and expose `byte_size` bytes via `as_slice()` rather
@@ -777,8 +798,16 @@ where
         buf_size: usize,
         byte_size: usize,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        Self::new_inner(surface, shape, buf_size, Some(byte_size), view_offset)
+        Self::new_inner(
+            surface,
+            shape,
+            buf_size,
+            Some(byte_size),
+            view_offset,
+            access,
+        )
     }
 
     fn new_inner(
@@ -787,13 +816,19 @@ where
         buf_size: usize,
         byte_size_override: Option<usize>,
         view_offset: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        // Default to read-write (options = 0). The read-only path
-        // (K_IOSURFACE_LOCK_READ_ONLY) skips a CPU cache flush when the
-        // caller only reads — a measurable savings if it becomes a hot
-        // path. Left as a future enhancement once we have call-site
-        // information about read-vs-write intent.
-        let options: u32 = 0;
+        // Read-only locks (K_IOSURFACE_LOCK_READ_ONLY) skip the CPU cache
+        // flush at unlock — the caller promised not to write, so there is
+        // nothing to make visible to the GPU. Write-including access uses
+        // the read-write lock (options = 0). The chosen options are stored
+        // and replayed at IOSurfaceUnlock (the lock/unlock options MUST
+        // match per the IOSurface contract).
+        let options: u32 = if access.writes() {
+            0
+        } else {
+            K_IOSURFACE_LOCK_READ_ONLY
+        };
         let mut seed: u32 = 0;
         let lock_rc = unsafe { IOSurfaceLock(surface.as_ptr(), options, &mut seed) };
         if lock_rc != 0 {
@@ -829,6 +864,7 @@ where
             byte_size_override,
             _marker: PhantomData,
             lock_options: options,
+            writable: access.writes(),
             locked: true,
         })
     }
@@ -896,6 +932,7 @@ where
     T: Num + Clone + fmt::Debug,
 {
     fn deref_mut(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "IoSurface");
         let ptr = self.base_ptr.as_ptr() as *mut T;
         let len = self.elem_count();
         // Symmetric with `Deref::deref` — without this an oversized
@@ -970,8 +1007,22 @@ fn image_fourcc_and_bpe(format: PixelFormat, dtype: DType) -> Option<(u32, usize
         // and produces the matching shader output. Mapping both to
         // 'BGRA' would put the IOSurface bytes in BGRA order, which is
         // wrong for the Rgba contract.
-        (PixelFormat::Rgba, DType::U8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
+        // I8 shares the U8 layout for the packed RGB/RGBA arms: INT8 is a
+        // per-byte `^0x80` bias applied in the shader, not a format change.
+        (PixelFormat::Rgba, DType::U8 | DType::I8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         (PixelFormat::Bgra, DType::U8) => Some((u32::from_be_bytes(*b"BGRA"), 4)),
+        // Packed RGB u8/i8 (the INT8 NPU input layout): no 3-channel
+        // IOSurface format exists, so the tight `[H, W, 3]` byte stream
+        // lives in an RGBA8888 surface sized `(W*3/4, H)` via
+        // `packed_rgb888_layout` — the same texel-packing trick as the
+        // planar-F16 arm below and the identical representation the
+        // Android AHardwareBuffer side uses. The GL engine's two-pass
+        // packed-RGB shader renders into it zero-copy (the pbuffer bind
+        // carries explicit geometry, so the FourCC only fixes the byte
+        // layout). Historically this combination fell through to a
+        // generic 'L008' byte-bag that happened to bind the same way;
+        // this is the designed replacement.
+        (PixelFormat::Rgb, DType::U8 | DType::I8) => Some((u32::from_be_bytes(*b"RGBA"), 4)),
         // Single-channel 8-bit (`L008` = kCVPixelFormatType_OneComponent8),
         // sampled as `GL_RED`. Used for GREY images and as the raw byte plane
         // for the semi-planar YUV formats (NV12/NV16/NV24): the GPU binds the
@@ -1099,7 +1150,6 @@ unsafe fn build_props(
         CFRelease(dict as *const c_void);
         return Err(e);
     }
-    let _ = K_IOSURFACE_LOCK_READ_ONLY; // silence unused on bring-up
     Ok(dict)
 }
 
@@ -1146,8 +1196,14 @@ mod tests {
         // IOSurface and records the stride, so CPU access is correct + zero-copy.
         let h = 3usize;
         let w = 17usize;
-        let t = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect("non-aligned packed RGBA should allocate a padded IOSurface");
+        let t = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("non-aligned packed RGBA should allocate a padded IOSurface");
 
         let stride = t.effective_row_stride().expect("stride");
         assert!(stride >= w * 4, "stride {stride} >= natural {}", w * 4);
@@ -1184,6 +1240,134 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_flat_compacts_padded_rows() {
+        use crate::{Tensor, TensorDyn};
+
+        // Width 17 RGBA u8: natural row = 68 B, IOSurface pads to 128 B —
+        // the recorded-stride case copy_to_flat exists for. Write a
+        // distinct byte per logical pixel via the strided map, then verify
+        // the flat copy is tight and padding-free.
+        let (w, h) = (17usize, 3usize);
+        let t = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("padded IOSurface alloc");
+        let stride = t.effective_row_stride().expect("stride");
+        assert!(stride > w * 4, "test requires a padded stride");
+        {
+            let mut m = t.map().expect("map");
+            let buf = m.as_mut_slice();
+            for row in 0..h {
+                for col in 0..w * 4 {
+                    buf[row * stride + col] = (row * 91 + col) as u8;
+                }
+            }
+        }
+        let mut flat = vec![0u8; h * w * 4];
+        t.copy_to_flat(&mut flat).expect("copy_to_flat");
+        for row in 0..h {
+            for col in 0..w * 4 {
+                assert_eq!(
+                    flat[row * w * 4 + col],
+                    (row * 91 + col) as u8,
+                    "flat byte ({row},{col})"
+                );
+            }
+        }
+
+        // Wrong destination size errors instead of truncating.
+        let mut short = vec![0u8; h * w * 4 - 1];
+        assert!(t.copy_to_flat(&mut short).is_err());
+
+        // Tight tensors (no recorded stride) degenerate to one memcpy —
+        // exercised through the TensorDyn dispatch layer.
+        let tight = TensorDyn::image(
+            64,
+            4,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("tight Mem alloc");
+        {
+            let tu8 = tight.as_u8().unwrap();
+            let mut m = tu8.map().expect("map");
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+        let mut flat2 = vec![0u8; 64 * 4 * 4];
+        tight.copy_to_flat(&mut flat2).expect("tight copy_to_flat");
+        for (i, b) in flat2.iter().enumerate() {
+            assert_eq!(*b, (i % 251) as u8, "tight byte {i}");
+        }
+    }
+
+    #[test]
+    fn explicit_dma_unmapped_image_format_errors() {
+        use crate::Tensor;
+
+        // Explicit-Dma contract: `Some(TensorMemory::Dma)` for an image whose
+        // (format, dtype) has no IOSurface FourCC mapping must error loudly —
+        // NOT silently allocate a generic 'L008' byte-bag that every GL
+        // import later rejects with EGL_BAD_ATTRIBUTE. Width 64 keeps the
+        // natural pitch 64-aligned so this exercises the mapping check, not
+        // the alignment guard.
+        for (name, result) in [
+            (
+                "PlanarRgb u8",
+                Tensor::<u8>::image(
+                    64,
+                    8,
+                    PixelFormat::PlanarRgb,
+                    Some(TensorMemory::Dma),
+                    crate::CpuAccess::ReadWrite,
+                )
+                .map(drop),
+            ),
+            (
+                "Rgb f32",
+                Tensor::<f32>::image(
+                    64,
+                    8,
+                    PixelFormat::Rgb,
+                    Some(TensorMemory::Dma),
+                    crate::CpuAccess::ReadWrite,
+                )
+                .map(drop),
+            ),
+        ] {
+            match result {
+                Err(crate::Error::InvalidArgument(msg)) => {
+                    assert!(
+                        msg.contains("no zero-copy IOSurface mapping"),
+                        "{name}: error must name the missing mapping: {msg}"
+                    );
+                }
+                other => panic!("{name}: expected InvalidArgument, got {other:?}"),
+            }
+        }
+
+        // The designed 'L008' semi-planar arm is a mapping, not a byte-bag:
+        // NV12 u8 with explicit Dma must still allocate (the R8 plane the
+        // YUV shaders sample) — the contract fix must not break it.
+        let nv12 = Tensor::<u8>::image(
+            64,
+            8,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("NV12 u8 keeps its designed L008 IOSurface mapping");
+        assert_eq!(nv12.memory(), TensorMemory::Dma);
+    }
+
+    #[test]
     fn surface_id_is_nonzero() {
         let t = IoSurfaceTensor::<u8>::new(&[64], None).expect("alloc");
         assert!(t.surface_id() != 0, "IOSurface IDs should be nonzero");
@@ -1214,6 +1398,13 @@ mod tests {
         assert_eq!(
             image_fourcc_and_bpe(PixelFormat::Yuyv, DType::U8),
             Some((u32::from_be_bytes(*b"2C08"), 2))
+        );
+        // Packed RGB u8 rides an RGBA8888 surface at (W*3/4, H) — the
+        // format is RGBA even though the pixel format is Rgb (matches
+        // the Android AHardwareBuffer table).
+        assert_eq!(
+            image_fourcc_and_bpe(PixelFormat::Rgb, DType::U8),
+            Some((u32::from_be_bytes(*b"RGBA"), 4))
         );
     }
 

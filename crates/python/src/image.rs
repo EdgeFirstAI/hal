@@ -1309,21 +1309,51 @@ impl PyImageProcessor {
     /// Selects the best available backing storage based on hardware capabilities:
     /// DMA-buf > PBO (GPU buffer) > system memory. Images created this way benefit
     /// from zero-copy GPU paths when used with this processor's convert().
-    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8"))]
+    ///
+    /// ``access`` declares CPU involvement (``"none"`` — the default,
+    /// hardware-only — ``"read"``, ``"write"``, or ``"readwrite"``).
+    /// Scripts that touch the pixels from Python (``map()``, numpy
+    /// interop) must pass ``access="readwrite"`` (or ``"read"``/
+    /// ``"write"``): the strict ``"none"`` default keeps hardware
+    /// pipelines eligible for tile compression and skips CPU cache
+    /// maintenance, but mapping such a tensor is best-effort and counted
+    /// as unplanned.
+    ///
+    /// ``compression`` requests a vendor tile-compressed layout:
+    /// ``None`` (default, linear), ``"any"`` (native scheme when
+    /// eligible, counted linear fallback), or a specific scheme
+    /// (``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"`` — allocation fails
+    /// unless the device's native scheme matches). Requires
+    /// ``access="none"``. Read the outcome via ``Tensor.compression``.
+    #[pyo3(signature = (width, height, format = PyPixelFormat::Rgba, dtype = "uint8", access = "none", compression = None))]
     pub fn create_image(
         &self,
         width: usize,
         height: usize,
         format: PyPixelFormat,
         dtype: &str,
+        access: &str,
+        compression: Option<&str>,
     ) -> Result<PyTensor> {
         let fmt: PixelFormat = format.into();
         let dt = crate::tensor::parse_dtype(dtype).map_err(|e| Error::InvalidArg(e.to_string()))?;
-        let dyn_tensor = self
+        let acc = crate::tensor::parse_cpu_access(access)
+            .map_err(|e| Error::InvalidArg(e.to_string()))?;
+        let proc = self
             .0
             .lock()
-            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?
-            .create_image(width, height, fmt, dt, None)?;
+            .map_err(|_| Error::InvalidArg("ImageProcessor lock poisoned".to_string()))?;
+        let dyn_tensor = match crate::tensor::parse_compression(compression)
+            .map_err(|e| Error::InvalidArg(e.to_string()))?
+        {
+            Some(request) => {
+                let desc = tensor::ImageDesc::new(width, height, fmt, dt)
+                    .with_access(acc)
+                    .with_compression(request);
+                proc.create_image_desc(&desc)?
+            }
+            None => proc.create_image(width, height, fmt, dt, None, acc)?,
+        };
         Ok(PyTensor(dyn_tensor))
     }
 

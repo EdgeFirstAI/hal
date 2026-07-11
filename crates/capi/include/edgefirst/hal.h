@@ -409,6 +409,75 @@ typedef enum hal_tensor_memory {
 } hal_tensor_memory;
 
 /**
+ * Declared CPU involvement for an image tensor, chosen at allocation.
+ *
+ * Hardware (GPU/NPU/ISP/codec) access is always implied; CPU access is
+ * the opt-in. HAL_CPU_ACCESS_NONE (the default for hardware pipelines)
+ * makes the buffer eligible for vendor tile compression on Android and
+ * skips CPU cache maintenance; mapping such a tensor is best-effort and
+ * counted (see hal_unplanned_cpu_access_count). Write selects a
+ * write-combined mapping where supported; Read a cached mapping.
+ */
+typedef enum HalCpuAccess {
+  /**
+   * Hardware-only buffer: no CPU mapping declared.
+   */
+  HAL_CPU_ACCESS_NONE = 0,
+  /**
+   * CPU reads (verification, CPU consumers).
+   */
+  HAL_CPU_ACCESS_READ = 1,
+  /**
+   * CPU writes (decode targets).
+   */
+  HAL_CPU_ACCESS_WRITE = 2,
+  /**
+   * CPU reads and writes (the pre-CpuAccess implicit behavior).
+   */
+  HAL_CPU_ACCESS_READ_WRITE = 3,
+} HalCpuAccess;
+
+/**
+ * Tile-compression request/recording for image tensors.
+ *
+ * As a request (hal_image_desc_set_compression): HAL_COMPRESSION_ANY
+ * asks for the device's native scheme with a counted linear fallback;
+ * a specific scheme value requires exactly that scheme (allocation
+ * fails otherwise); HAL_COMPRESSION_NONE clears the request.
+ *
+ * As a recording (hal_tensor_compression): the scheme the allocation
+ * actually holds — HAL_COMPRESSION_NONE means linear. A compressed
+ * tensor has no meaningful linear row stride and CPU maps are
+ * best-effort.
+ */
+typedef enum HalCompression {
+  /**
+   * Linear layout (recording) / no compression request (request).
+   */
+  HAL_COMPRESSION_NONE = 0,
+  /**
+   * Request only: the device's native scheme, linear fallback counted.
+   */
+  HAL_COMPRESSION_ANY = 1,
+  /**
+   * Qualcomm Adreno Universal Bandwidth Compression.
+   */
+  HAL_COMPRESSION_UBWC = 2,
+  /**
+   * Arm Mali/Immortalis Framebuffer Compression.
+   */
+  HAL_COMPRESSION_AFBC = 3,
+  /**
+   * Imagination PowerVR Image Compression.
+   */
+  HAL_COMPRESSION_PVRIC = 4,
+  /**
+   * Samsung Xclipse Delta Color Compression.
+   */
+  HAL_COMPRESSION_DCC = 5,
+} HalCompression;
+
+/**
  * Compute backend selection for image processing.
  *
  * @see hal_image_processor_new_with_backend
@@ -599,6 +668,18 @@ typedef struct hal_decoder_params hal_decoder_params;
  * List of detection boxes.
  */
 typedef struct hal_detect_box_list hal_detect_box_list;
+
+/**
+ * Opaque declarative image-allocation request.
+ *
+ * Create with hal_image_desc_new(), refine with the hal_image_desc_set_*
+ * functions, allocate via hal_tensor_new_image_desc() or
+ * hal_image_processor_create_image_desc(), and release with
+ * hal_image_desc_free(). The desc is the full-featured front door — the
+ * classic constructors cover the common cases; the desc adds optional
+ * requests (tile compression) without new positional parameters.
+ */
+typedef struct HalImageDesc HalImageDesc;
 
 /**
  * Opaque image processor type.
@@ -1725,7 +1806,75 @@ struct hal_tensor *hal_tensor_new_image(size_t width,
                                         size_t height,
                                         enum hal_pixel_format format,
                                         enum hal_dtype dtype,
-                                        enum hal_tensor_memory memory);
+                                        enum hal_tensor_memory memory,
+                                        enum HalCpuAccess access);
+
+/**
+ * Create an image-allocation request. Defaults: auto-selected memory,
+ * HAL_CPU_ACCESS_NONE (hardware-only), no compression request.
+ *
+ * @param width Image width in pixels
+ * @param height Image height in pixels
+ * @param format Pixel format (HAL_PIXEL_FORMAT_*)
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @return New desc handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: zero dimensions
+ */
+struct HalImageDesc *hal_image_desc_new(size_t width,
+                                        size_t height,
+                                        enum hal_pixel_format format,
+                                        enum hal_dtype dtype);
+
+/**
+ * Request a specific memory backing (the default is auto-select).
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param memory Memory allocation type
+ */
+void hal_image_desc_set_memory(struct HalImageDesc *desc, enum hal_tensor_memory memory);
+
+/**
+ * Declare the CPU access (see HalCpuAccess). Any declaration other than
+ * HAL_CPU_ACCESS_NONE makes a compression request invalid.
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param access Declared CPU access
+ */
+void hal_image_desc_set_access(struct HalImageDesc *desc, enum HalCpuAccess access);
+
+/**
+ * Request a tile-compressed layout (see HalCompression).
+ * HAL_COMPRESSION_NONE clears the request.
+ *
+ * @param desc Desc handle (NULL is ignored)
+ * @param compression Compression request
+ */
+void hal_image_desc_set_compression(struct HalImageDesc *desc, enum HalCompression compression);
+
+/**
+ * Free an image-allocation request handle. NULL is a no-op. Descs are
+ * independent of the tensors they created — freeing a desc never
+ * affects a tensor.
+ *
+ * @param desc Desc handle
+ */
+void hal_image_desc_free(struct HalImageDesc *desc);
+
+/**
+ * Allocate an image tensor from a declarative request — the
+ * full-featured variant of hal_tensor_new_image(). See HalCompression
+ * for the request semantics; read the outcome back with
+ * hal_tensor_compression().
+ *
+ * @param desc Desc handle
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL desc, or an invalid compression request (declared CPU
+ *   access, ineligible format, or scheme mismatch)
+ * - ENOMEM: allocation failed
+ */
+struct hal_tensor *hal_tensor_new_image_desc(const struct HalImageDesc *desc);
 
 /**
  * Decode image data (JPEG/PNG) into a pre-allocated tensor.
@@ -1967,6 +2116,44 @@ int hal_image_processor_convert(struct hal_image_processor *processor,
                                 enum hal_rotation rotation,
                                 enum hal_flip flip,
                                 const struct hal_crop *crop);
+
+/**
+ * Convert and export a native sync-fence fd instead of blocking on the
+ * GPU — the GL→NPU handoff (`EGL_ANDROID_native_fence_sync`, Android).
+ *
+ * Identical semantics to [`hal_image_processor_convert`] (including the
+ * GL→CPU fallback chain), except that when the platform supports native
+ * fences the call returns as soon as the GPU commands are submitted and
+ * writes the fence fd to `*fence_fd`. The destination buffer must not
+ * be read until the fence signals — hand the fd to the NPU runtime
+ * (`ANeuralNetworksExecution_startComputeWithDependencies`) or `poll()`
+ * it. When no fence is available (`*fence_fd == -1`) the convert
+ * completed with the blocking contract and the destination is already
+ * safe to read.
+ *
+ * The returned fd is owned by the caller: `close()` it when done (the
+ * NPU runtime duplicates what it needs).
+ *
+ * @param processor Image processor handle
+ * @param src Source image tensor
+ * @param dst Destination image tensor (pre-allocated; reuse across frames)
+ * @param rotation Rotation to apply
+ * @param flip Flip to apply
+ * @param crop Crop configuration (can be NULL for no crop)
+ * @param fence_fd Out: the sync-fence fd, or -1 when the convert
+ *                 completed synchronously (must not be NULL)
+ * @return 0 on success, -1 on error
+ * @par Errors (errno):
+ * - EINVAL: Invalid argument (NULL processor/src/dst/fence_fd)
+ * - EIO: Conversion failed
+ */
+int hal_image_processor_convert_fence(struct hal_image_processor *processor,
+                                      const struct hal_tensor *src,
+                                      struct hal_tensor *dst,
+                                      enum hal_rotation rotation,
+                                      enum hal_flip flip,
+                                      const struct hal_crop *crop,
+                                      int *fence_fd);
 
 /**
  * Convert without waiting for the GPU — the batch-preprocessing primitive.
@@ -2268,7 +2455,42 @@ struct hal_tensor *hal_image_processor_create_image(struct hal_image_processor *
                                                     size_t width,
                                                     size_t height,
                                                     enum hal_pixel_format format,
-                                                    enum hal_dtype dtype);
+                                                    enum hal_dtype dtype,
+                                                    enum HalCpuAccess access);
+
+/**
+ * Allocate an image tensor from a declarative request — the
+ * full-featured variant of hal_image_processor_create_image().
+ *
+ * Without a compression request the processor's memory negotiation
+ * applies (identical to hal_image_processor_create_image with
+ * auto-selected memory); with one, the allocation goes straight to the
+ * platform allocator and the request's guards apply (see
+ * HalCompression). Read the outcome back with hal_tensor_compression().
+ *
+ * @param processor Image processor handle
+ * @param desc Desc handle
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL argument or invalid compression request
+ * - ENOTSUP: a specific scheme was requested on a platform without it
+ * - ENOMEM: allocation failed
+ */
+struct hal_tensor *hal_image_processor_create_image_desc(struct hal_image_processor *processor,
+                                                         const struct HalImageDesc *desc);
+
+/**
+ * Whether this platform can allocate (format, dtype) images in a vendor
+ * tile-compressed layout. True requires an Android build, an eligible
+ * format (RGBA8888 u8/i8 initially), and a positively identified GPU
+ * vendor; everywhere else HAL_COMPRESSION_ANY requests fall back to
+ * linear (counted by hal_compression_fallback_count()).
+ *
+ * @param format Pixel format
+ * @param dtype Data type
+ * @return true when a compression request can be honored
+ */
+bool hal_platform_compression_support(enum hal_pixel_format format, enum hal_dtype dtype);
 
 /**
  * Pitch alignment in bytes that DMA-BUF EGLImage imports require on the
@@ -2512,6 +2734,36 @@ int hal_log_init_file(FILE *stream, enum hal_log_level max_level);
 int hal_log_init_callback(hal_log_callback cb, void *userdata, enum hal_log_level max_level);
 
 /**
+ * Number of tensor maps that exceeded the buffer's declared CPU access
+ * since process start (including any map of a HAL_CPU_ACCESS_NONE
+ * buffer). A pipeline that declares its CPU access correctly holds this
+ * flat; each offending buffer also logs one warning.
+ *
+ * @return Monotonic process-wide counter
+ */
+uint64_t hal_unplanned_cpu_access_count(void);
+
+/**
+ * The vendor tile-compression scheme recorded on a tensor at
+ * allocation, or HAL_COMPRESSION_NONE for a linear layout (also
+ * returned for NULL).
+ *
+ * @param tensor Tensor handle
+ * @return Recorded scheme (never HAL_COMPRESSION_ANY)
+ */
+enum HalCompression hal_tensor_compression(const struct hal_tensor *tensor);
+
+/**
+ * Number of HAL_COMPRESSION_ANY requests since process start that
+ * resolved to a linear layout instead of a vendor tile scheme. A
+ * pipeline that expects compressed destinations asserts this stays
+ * flat after warmup.
+ *
+ * @return Monotonic process-wide counter
+ */
+uint64_t hal_compression_fallback_count(void);
+
+/**
  * Check if Linux DMA-BUF buffer allocation is available.
  *
  * DMA-BUF buffers enable zero-copy data sharing between CPU and hardware
@@ -2656,13 +2908,158 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
  * - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
  *   shape footprint exceeds the IOSurface allocation
  * - EIO: Failed to import IOSurface (e.g. dead pointer)
- * - ENOTSUP: Not supported on this platform (non-macOS)
+ * - ENOTSUP: Not supported on this platform (non-Apple)
  */
 struct hal_tensor *hal_tensor_from_iosurface(enum hal_dtype dtype,
                                              void *surface_ref,
                                              const size_t *shape,
                                              size_t ndim,
                                              const char *name);
+
+/**
+ * Wrap an existing AHardwareBuffer as a tensor (Android only).
+ *
+ * The buffer is acquired (refcounted) for the tensor's lifetime; the
+ * caller keeps its own reference and releases it independently
+ * (AHardwareBuffer_release). The Android analog of
+ * hal_tensor_from_iosurface().
+ *
+ * Use this to import buffers from CameraX/ImageReader (via
+ * AHardwareBuffer from the Java HardwareBuffer's JNI handle), NNAPI, or
+ * cross-process binder transfers. A wrapped buffer carries a shape but
+ * no image metadata — call hal_tensor_set_format() (and, when the
+ * producer pads rows, hal_tensor_set_row_stride()) before convert().
+ *
+ * **GL backend interaction**: the resulting tensor reports
+ * HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by the
+ * GL backend as an EGLImage with no extra copy.
+ *
+ * @param dtype Data type of tensor elements (HAL_DTYPE_*)
+ * @param buffer Pointer to a valid AHardwareBuffer (typed as void*)
+ * @param shape Array of dimension sizes (ndim elements). The footprint
+ *              must fit the buffer's allocation; HAL rejects mismatched
+ *              shapes with EINVAL rather than risking out-of-bounds maps.
+ * @param ndim Number of dimensions (1-8)
+ * @param name Optional tensor name for debugging (can be NULL)
+ * @return New tensor handle on success, NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL shape, NULL buffer, ndim outside [1, 8], or shape
+ *   footprint exceeds the buffer allocation
+ * - EIO: Failed to acquire/describe the AHardwareBuffer
+ * - ENOTSUP: Not supported on this platform (non-Android)
+ */
+struct hal_tensor *hal_tensor_from_hardware_buffer(enum hal_dtype dtype,
+                                                   void *buffer,
+                                                   const size_t *shape,
+                                                   size_t ndim,
+                                                   const char *name);
+
+/**
+ * Borrow the raw AHardwareBuffer backing a tensor (Android only).
+ *
+ * The NPU-direct handle: pass it to
+ * ANeuralNetworksMemory_createFromAHardwareBuffer (NNAPI) or a LiteRT
+ * delegate so the accelerator consumes the convert output with no CPU
+ * readback. When hal_image_processor_convert() returns, the GPU has
+ * finished writing and the handle is safe to hand off (see
+ * hal_image_processor_convert_fence() for the non-blocking variant).
+ * Check hal_tensor_recorded_row_stride() first: a nonzero value means
+ * the rows are padded and a flat-layout consumer needs
+ * hal_tensor_copy_to_flat() instead.
+ *
+ * The returned pointer is borrowed; its lifetime is tied to the tensor
+ * handle. If it must outlive the tensor, call AHardwareBuffer_acquire()
+ * and pair it with AHardwareBuffer_release().
+ *
+ * @param tensor Tensor handle
+ * @return Borrowed AHardwareBuffer pointer (typed as void*) on success,
+ *         NULL on error
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ * - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+ */
+void *hal_tensor_hardware_buffer_ptr(const struct hal_tensor *tensor);
+
+/**
+ * Physical AHardwareBuffer dimensions in texels (Android only).
+ *
+ * Independent of the logical tensor shape: packed representations (the
+ * planar-F16 RGBA16F surface, the RGB-in-RGBA8888 surface) allocate at
+ * packed dims, and gralloc chooses its own pitch. NPU consumers that
+ * describe the buffer to NNAPI need these, not the logical shape.
+ *
+ * @param tensor Tensor handle
+ * @param width Out: physical width in texels (must not be NULL)
+ * @param height Out: physical height in texels (must not be NULL)
+ * @return 0 on success, -1 on error (check errno)
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor or NULL out-pointer
+ * - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+ */
+int hal_tensor_hardware_buffer_physical_dims(const struct hal_tensor *tensor,
+                                             size_t *width,
+                                             size_t *height);
+
+/**
+ * Recorded row stride in bytes, or 0 when the tensor is tightly packed.
+ *
+ * The flatness check: a nonzero value means the allocator padded the
+ * row pitch (gralloc on Android, IOSurface 64-byte alignment on macOS,
+ * GPU pitch alignment on Linux) and the buffer is NOT flat — CPU
+ * consumers must iterate rows at this stride (or use
+ * hal_tensor_copy_to_flat()), and NPU consumers must either describe
+ * the pitch to the runtime or repack. Unlike hal_tensor_row_stride()
+ * (which reports the effective walk pitch and is nonzero for every
+ * image), 0 here positively means "no padding — the buffer is flat".
+ *
+ * @param tensor Tensor handle
+ * @return Recorded stride in bytes; 0 when tightly packed or on error
+ *         (check errno)
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ */
+size_t hal_tensor_recorded_row_stride(const struct hal_tensor *tensor);
+
+/**
+ * Effective row stride in bytes: the recorded stride if set, otherwise
+ * the tight pitch computed from the image format and width.
+ *
+ * This is the pitch to walk rows with regardless of padding — the
+ * clearly-named twin of hal_tensor_row_stride() (which has returned the
+ * effective stride since EDGEAI-1176 and is kept for ABI stability).
+ * Returns 0 when the tensor has no image format and no recorded stride
+ * (a plain non-image tensor).
+ *
+ * @param tensor Tensor handle
+ * @return Effective stride in bytes; 0 for non-image tensors or on
+ *         error (check errno)
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor
+ */
+size_t hal_tensor_effective_row_stride(const struct hal_tensor *tensor);
+
+/**
+ * Copy the tensor's logical bytes into `dst`, compacting away any
+ * recorded row-stride padding.
+ *
+ * The flatness helper for NPU handoff: when hal_tensor_row_stride() is
+ * nonzero and the runtime needs a flat layout (e.g. `[1, C, H, W]` for
+ * NNAPI/LiteRT without pitch support), this walks the rows and packs
+ * them tightly into `dst`. On a tight tensor it degenerates to one
+ * memcpy. Zero-copy consumers should prefer
+ * hal_tensor_hardware_buffer_ptr() + the stride and skip this copy.
+ *
+ * @param tensor Tensor handle
+ * @param dst Destination buffer (must not be NULL)
+ * @param dst_len Length of `dst` in bytes; must equal the tight
+ *                footprint (shape product × element size)
+ * @return 0 on success, -1 on error (check errno)
+ * @par Errors (errno):
+ * - EINVAL: NULL tensor/dst, or dst_len does not match the tight
+ *   footprint
+ * - EIO: Mapping the tensor for reading failed
+ */
+int hal_tensor_copy_to_flat(const struct hal_tensor *tensor, uint8_t *dst, size_t dst_len);
 
 /**
  * Free a tensor and release its resources.
@@ -2787,12 +3184,12 @@ int hal_tensor_dmabuf_clone(const struct hal_tensor *tensor);
  * @return IOSurfaceID on success, 0 on error (check errno)
  * @par Errors (errno):
  * - EINVAL: NULL tensor
- * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
  */
 uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
 
 /**
- * Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+ * Borrow the raw IOSurfaceRef backing a tensor (macOS/iOS only).
  *
  * The returned pointer is borrowed; its lifetime is tied to the tensor
  * handle. The caller does NOT hold a retain count on the returned
@@ -2802,7 +3199,7 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
  * pointer without a matching CFRetain() first; that would drop the
  * HalTensor's own retain and produce a use-after-free.
  *
- * Use this when you need to pass the IOSurface to a native macOS API
+ * Use this when you need to pass the IOSurface to a native Apple API
  * (e.g. CIImage, AVSampleBufferDisplayLayer,
  * CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
  * without going through the IOSurfaceID indirection.
@@ -2814,7 +3211,7 @@ uint32_t hal_tensor_iosurface_id(const struct hal_tensor *tensor);
  *         error. Borrowed — do NOT CFRelease without first CFRetaining.
  * @par Errors (errno):
  * - EINVAL: NULL tensor
- * - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+ * - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
  */
 void *hal_tensor_iosurface_ref(const struct hal_tensor *tensor);
 

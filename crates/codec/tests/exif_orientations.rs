@@ -84,7 +84,14 @@ fn check_jpeg_orientation(o: u32) {
 
     // A full decode reports the same dims and orientation; the codec never
     // rotates, so the destination tensor is sized for the source dims.
-    let mut tensor = Tensor::<u8>::image(W, H, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        W,
+        H,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor
         .load_image(&mut decoder, &data)
@@ -163,7 +170,14 @@ fn check_png_orientation(o: u32) {
         "PNG orientation {o}: peek orientation mismatch"
     );
 
-    let mut tensor = Tensor::<u8>::image(W, H, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        W,
+        H,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor
         .load_image(&mut decoder, &data)

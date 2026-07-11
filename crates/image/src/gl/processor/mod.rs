@@ -151,6 +151,20 @@ struct NvUniformLocs {
     c_ub: i32,
 }
 
+/// Uniform locations for one float-path program, resolved once per program
+/// — previously up to five `GetUniformLocation` string lookups per float
+/// draw (`draw_float_quad`). Same pattern as [`NvUniformLocs`]. A location
+/// of `-1` (uniform absent in that program variant) is harmless: GL ignores
+/// `Uniform*` calls with location `-1` by specification.
+#[derive(Clone, Copy)]
+pub(super) struct FloatQuadLocs {
+    pub(super) sampler: i32,
+    pub(super) src_rect_uv: i32,
+    pub(super) dst_rect_px: i32,
+    pub(super) pad_color: i32,
+    pub(super) dst_image_size: i32,
+}
+
 /// Per-program uniform state for one `nv_r8` variant. Uniform values are
 /// per-program GL state and persist across draws, so the constant sampler
 /// binding (`src` = unit 0) is uploaded once at resolve time and
@@ -354,6 +368,21 @@ pub struct GLProcessorST {
     nv_r8_egl_cache: ImportCache<PlatformImport>,
     /// Which path ran for the most recent NV* convert (instrumentation).
     pub(super) last_nv_convert_path: NvConvertPath,
+    /// Zero-copy feed telemetry (see `ConvertStats`). Plain fields — this
+    /// struct lives on the single-threaded GL worker.
+    pub(super) convert_stats: super::cache::ConvertStats,
+    /// NV import failures already warned about (keyed by buffer identity):
+    /// first occurrence warns, repeats log at debug — an import that fails
+    /// once fails every frame, and a per-frame warn is log spam.
+    nv_import_warned: std::collections::HashSet<u64>,
+    /// Uniform locations per float-path program (see [`FloatQuadLocs`]).
+    pub(super) float_quad_locs: std::collections::HashMap<u32, FloatQuadLocs>,
+    /// Static full-screen quad VBOs `(pos, uv)` for the float paths,
+    /// uploaded once (`STATIC_DRAW`) — previously `BufferData`-re-uploaded
+    /// on every float draw. `0` = not yet created (lazy, on the first
+    /// float draw). Deleted in `Drop`.
+    pub(super) float_quad_pos_vbo: u32,
+    pub(super) float_quad_uv_vbo: u32,
     /// Client preference for NV* path selection (`EDGEFIRST_NV_CONVERT_PATH`).
     nv_path_pref: NvPathPref,
     /// Colorimetry/performance trade-off (see [`crate::ColorimetryMode`]).
@@ -383,6 +412,10 @@ impl Drop for GLProcessorST {
             {
                 if self.proto_ssbo != 0 {
                     edgefirst_gl::gl::DeleteBuffers(1, &self.proto_ssbo);
+                }
+                if self.float_quad_pos_vbo != 0 {
+                    let ids = [self.float_quad_pos_vbo, self.float_quad_uv_vbo];
+                    edgefirst_gl::gl::DeleteBuffers(2, ids.as_ptr());
                 }
                 if let Some(program) = self.proto_repack_compute_program {
                     edgefirst_gl::gl::DeleteProgram(program);
@@ -1211,6 +1244,11 @@ impl GLProcessorST {
             nv_r8_texture: Texture::new(),
             nv_r8_egl_cache: ImportCache::new(egl_cache_capacity),
             last_nv_convert_path: NvConvertPath::None,
+            convert_stats: Default::default(),
+            nv_import_warned: std::collections::HashSet::new(),
+            float_quad_locs: std::collections::HashMap::new(),
+            float_quad_pos_vbo: 0,
+            float_quad_uv_vbo: 0,
             nv_path_pref,
             colorimetry_mode: colorimetry_env.unwrap_or_default(),
             colorimetry_env_pinned: colorimetry_env.is_some(),
@@ -1260,6 +1298,15 @@ impl GLProcessorST {
         // EGLImage creation succeeds but rendered data is all zeros)
         if converter.gl_context.transfer_backend.is_dma() && !converter.verify_dma_buf_roundtrip() {
             log::info!("DMA-buf verification failed — falling back to PBO transfers");
+            // Structured twin of the log line: this downgrade silently costs
+            // every future convert its zero-copy path, so subscribers
+            // (profiler, telemetry) get a machine-readable event too.
+            tracing::event!(
+                tracing::Level::INFO,
+                from = "dmabuf",
+                to = "pbo",
+                "image.convert.gl.transfer_downgrade"
+            );
             converter.gl_context.transfer_backend = TransferBackend::Pbo;
         }
 
@@ -1311,7 +1358,13 @@ impl GLProcessorST {
     /// `dma_heap` fds succeeds but the rendered data is all zeros.
     fn verify_dma_buf_roundtrip(&mut self) -> bool {
         // Allocate a 64x64 RGBA DMA source tensor and fill it with solid red
-        let src = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma)) {
+        let src = match Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::Write,
+        ) {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA source: {e}");
@@ -1320,7 +1373,7 @@ impl GLProcessorST {
         };
 
         {
-            let mut map = match src.map() {
+            let mut map = match src.map_write() {
                 Ok(m) => m,
                 Err(e) => {
                     log::info!("verify_dma_buf_roundtrip: failed to map DMA source: {e}");
@@ -1336,8 +1389,13 @@ impl GLProcessorST {
         }
 
         // Allocate a 64x64 RGBA DMA destination tensor
-        let mut dst = match Tensor::<u8>::image(64, 64, PixelFormat::Rgba, Some(TensorMemory::Dma))
-        {
+        let mut dst = match Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::Read,
+        ) {
             Ok(img) => img,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to allocate DMA destination: {e}");
@@ -1362,7 +1420,7 @@ impl GLProcessorST {
         }
 
         // Read back the center pixel at (32, 32) from the destination
-        let map = match dst.map() {
+        let map = match dst.map_read() {
             Ok(m) => m,
             Err(e) => {
                 log::info!("verify_dma_buf_roundtrip: failed to map DMA destination: {e}");
@@ -1432,6 +1490,51 @@ impl GLProcessorST {
         }
     }
 
+    pub(crate) fn convert_stats(&self) -> super::cache::ConvertStats {
+        self.convert_stats
+    }
+
+    /// Convert without the terminal CPU sync, exporting a native fence fd
+    /// that signals when the GPU work completes — the GL→NPU handoff.
+    ///
+    /// Uses the same `defer_finish` mechanism as batching to skip the
+    /// pure-GPU tails' sync; paths that read back to the CPU (PBO/upload
+    /// destinations) sync internally regardless, so the fence degenerates
+    /// to already-signaled there — correct, just no faster than `convert`.
+    /// When the platform has no native fence (`Ok(None)` / export error)
+    /// the blocking contract is restored with an explicit `glFinish`.
+    pub(crate) fn convert_fenced(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: crate::Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<Option<std::os::fd::OwnedFd>, crate::Error> {
+        use crate::ImageProcessorTrait as _;
+        self.defer_finish = true;
+        let result = self.convert(src, dst, rotation, flip, crop);
+        self.defer_finish = false;
+        result?;
+        match Platform::export_completion_fence(&self.gl_context) {
+            Ok(Some(fd)) => Ok(Some(fd)),
+            Ok(None) => {
+                unsafe { edgefirst_gl::gl::Finish() };
+                check_gl_error(function!(), line!())?;
+                Ok(None)
+            }
+            Err(e) => {
+                // A failed export must not skip the sync — fall back to
+                // the blocking contract rather than hand back a dst the
+                // GPU may still be writing.
+                log::debug!("native fence export failed ({e:?}); falling back to glFinish");
+                unsafe { edgefirst_gl::gl::Finish() };
+                check_gl_error(function!(), line!())?;
+                Ok(None)
+            }
+        }
+    }
+
     // Internal methods operating on Tensor<u8> + PixelFormat directly.
 
     #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1556,9 @@ impl GLProcessorST {
             is_int8,
             src_memory = ?src.memory(),
             dst_memory = ?dst.memory(),
+            // Recorded at the source-feed site: import | pbo | upload —
+            // the zero-copy observable (see ConvertStats).
+            src_feed = tracing::field::Empty,
         )
         .entered();
         if !Self::check_src_format_supported(self.gl_context.transfer_backend, src, src_fmt) {
@@ -1782,13 +1888,13 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    let mut dst_map = dst.map()?;
+                    let mut dst_map = dst.map_mut()?;
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
                     }
                 }
             } else {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 unsafe {
                     edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
@@ -1966,13 +2072,13 @@ impl GLProcessorST {
                 }
                 check_gl_error(function!(), line!())?;
                 if dst_fmt == PixelFormat::Bgra {
-                    let mut dst_map = dst.map()?;
+                    let mut dst_map = dst.map_mut()?;
                     for chunk in dst_map.as_mut_slice().chunks_exact_mut(4) {
                         chunk.swap(0, 2);
                     }
                 }
             } else {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 unsafe {
                     edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                     read_pixels_into(
@@ -2457,7 +2563,7 @@ impl GLProcessorST {
         let len = dst.len();
         match pbo_id {
             None => unsafe {
-                let mut dst_map = dst.map()?;
+                let mut dst_map = dst.map_mut()?;
                 edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                 read_pixels_into(
                     dst_w,
@@ -2579,7 +2685,7 @@ impl GLProcessorST {
         }) {
             std::ptr::null()
         } else {
-            map = dst.map()?;
+            map = dst.map_read()?;
             if is_bgra {
                 // Swap R↔B to convert BGRA→RGBA for the RGBA texture.
                 swapped_buf = map.as_slice().to_vec();
@@ -2651,7 +2757,7 @@ impl GLProcessorST {
         dst_h: usize,
     ) -> crate::Result<()> {
         use edgefirst_tensor::TensorMapTrait;
-        let map = src.map()?;
+        let map = src.map_read()?;
         let src_slice = map.as_slice();
         let format = match src_fmt {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
@@ -2849,6 +2955,9 @@ impl GLProcessorST {
                 )));
             }
         };
+
+        self.convert_stats.src_pbo_uploads += 1;
+        tracing::Span::current().record("src_feed", "pbo");
 
         let has_crop = crop
             .dst_rect
@@ -3356,6 +3465,8 @@ impl GLProcessorST {
                             "image.convert.gl.nv_path"
                         );
                         self.last_nv_convert_path = NvConvertPath::ShaderR8;
+                        self.convert_stats.src_imports += 1;
+                        tracing::Span::current().record("src_feed", "import");
                         self.draw_nv_texture_2d(
                             src,
                             src_fmt,
@@ -3373,14 +3484,28 @@ impl GLProcessorST {
                         // Path B failed — this means no GPU NV* path is available.
                         // Record the CPU fallback so tests/profiler can detect it.
                         self.last_nv_convert_path = NvConvertPath::Cpu;
-                        tracing::warn!(
-                            src_fmt = ?src_fmt,
-                            src_w,
-                            src_h,
-                            error = %e,
-                            "Path B R8 EGLImage creation failed for {src_fmt} \
-                             ({src_w}x{src_h}); falling back to CPU path (no GPU NV16/NV24)"
-                        );
+                        self.convert_stats.zero_copy_declines += 1;
+                        // Warn once per buffer — a steady-state video pipeline
+                        // hits this every frame with the same buffers, and a
+                        // per-frame warn floods the log. Repeats drop to debug.
+                        if self.nv_import_warned.insert(src.buffer_identity().id()) {
+                            tracing::warn!(
+                                src_fmt = ?src_fmt,
+                                src_w,
+                                src_h,
+                                error = %e,
+                                "Path B R8 EGLImage creation failed for {src_fmt} \
+                                 ({src_w}x{src_h}); falling back to CPU path (no GPU NV16/NV24)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                src_fmt = ?src_fmt,
+                                src_w,
+                                src_h,
+                                error = %e,
+                                "Path B R8 EGLImage creation failed (repeat)"
+                            );
+                        }
                         let start = Instant::now();
                         self.draw_src_texture(
                             src,
@@ -3404,6 +3529,8 @@ impl GLProcessorST {
                             tracing::trace!(path = "ExternalSampler", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
                             self.last_nv_convert_path = NvConvertPath::ExternalSampler;
                         }
+                        self.convert_stats.src_imports += 1;
+                        tracing::Span::current().record("src_feed", "import");
                         self.draw_camera_texture_eglimage(
                             src,
                             src_fmt,
@@ -3421,10 +3548,20 @@ impl GLProcessorST {
                         if src_fmt == PixelFormat::Nv12 {
                             self.last_nv_convert_path = NvConvertPath::Cpu;
                         }
-                        log::warn!(
-                            "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
-                             falling back to texture upload (slower): {e}"
-                        );
+                        self.convert_stats.zero_copy_declines += 1;
+                        // Warn once per buffer (see the ShaderR8 arm): repeats
+                        // on the same pooled buffer drop to debug.
+                        if self.nv_import_warned.insert(src.buffer_identity().id()) {
+                            log::warn!(
+                                "EGL image creation failed for {src_fmt} ({src_w}x{src_h}), \
+                                 falling back to texture upload (slower): {e}"
+                            );
+                        } else {
+                            log::debug!(
+                                "EGL image creation failed for {src_fmt} ({src_w}x{src_h}) \
+                                 (repeat): {e}"
+                            );
+                        }
                         let start = Instant::now();
                         self.draw_src_texture(
                             src,
@@ -3452,6 +3589,8 @@ impl GLProcessorST {
             // buffers) cannot be uploaded as one R8 texture → CPU below.
             tracing::trace!(path = "ShaderR8-upload", src_fmt = ?src_fmt, "image.convert.gl.nv_path");
             self.last_nv_convert_path = NvConvertPath::ShaderR8;
+            self.convert_stats.src_uploads += 1;
+            tracing::Span::current().record("src_feed", "upload");
             self.draw_nv_texture_2d(
                 src,
                 src_fmt,
@@ -3644,15 +3783,17 @@ impl GLProcessorST {
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
 
-        // Width must satisfy PackedRgba8 constraint: W*3 divisible by 4
-        if !(dst_w * 3).is_multiple_of(4) {
-            return Err(crate::Error::NotSupported(format!(
-                "Packed RGB requires width*3 divisible by 4, got width={dst_w}"
-            )));
-        }
-
-        let render_w = dst_w * 3 / 4;
-        let render_h = dst_h;
+        // Canonical RGBA8888-packed geometry (single source of truth shared
+        // with the Android AHardwareBuffer allocation side — the same rule
+        // that keeps the F16 packing from drifting between crates).
+        let layout = edgefirst_tensor::packed_rgb888_layout(dst_w, dst_h).ok_or_else(|| {
+            crate::Error::NotSupported(format!(
+                "Packed RGB requires width%4==0 (W*3 bytes must divide into \
+                 whole RGBA8888 texels), got width={dst_w}"
+            ))
+        })?;
+        let render_w = layout.surface_w;
+        let render_h = layout.surface_h;
 
         log::debug!(
             "convert_to_packed_rgb: {dst_w}x{dst_h} -> {render_w}x{render_h} two-pass int8={is_int8}",
@@ -4321,6 +4462,7 @@ impl GLProcessorST {
             match self.get_or_create_egl_image(CacheKind::Src, src, src_fmt) {
                 Ok(handle) => Some((key, handle)),
                 Err(e) => {
+                    self.convert_stats.zero_copy_declines += 1;
                     log::debug!("zero-copy source import failed ({e:?}); uploading instead");
                     None
                 }
@@ -4419,8 +4561,27 @@ impl GLProcessorST {
                 // texture must TexImage2D fresh storage, never
                 // TexSubImage2D into the attached client buffer.
                 self.camera_normal_texture.target = 0;
+                self.convert_stats.src_imports += 1;
+                tracing::Span::current().record("src_feed", "import");
             } else {
                 let src_bpp = src_fmt.channels().max(1);
+                // A recorded pitch that is not a whole number of pixels
+                // cannot be expressed via UNPACK_ROW_LENGTH (which counts
+                // pixels) — decline to the CPU backend rather than upload
+                // sheared rows. Reachable on Android, where gralloc may pad
+                // the RGB-in-RGBA8888 surface to a byte pitch that 3 does
+                // not divide.
+                if let Some(s) = src.effective_row_stride() {
+                    if !s.is_multiple_of(src_bpp) {
+                        return Err(Error::NotSupported(format!(
+                            "source row pitch {s} B is not a whole number of \
+                             {src_fmt:?} pixels ({src_bpp} B/px); upload would \
+                             shear rows"
+                        )));
+                    }
+                }
+                self.convert_stats.src_uploads += 1;
+                tracing::Span::current().record("src_feed", "upload");
                 let row_len_px = src
                     .effective_row_stride()
                     .map(|s| s / src_bpp)
@@ -4435,7 +4596,7 @@ impl GLProcessorST {
                     src_w,
                     src_h,
                     texture_format,
-                    &src.map()?,
+                    &src.map_read()?,
                 );
                 edgefirst_gl::gl::PixelStorei(edgefirst_gl::gl::UNPACK_ROW_LENGTH, 0);
             }
@@ -4769,7 +4930,7 @@ impl GLProcessorST {
                     })?;
                     let offset = src.plane_offset().unwrap_or(0);
                     let needed = tex_width as usize * combined_h;
-                    let map = src.map()?;
+                    let map = src.map_read()?;
                     let bytes = map.as_slice();
                     if offset + needed > bytes.len() {
                         return Err(Error::InvalidShape(format!(
@@ -5576,18 +5737,18 @@ impl GLProcessorST {
         let coeff_slice: &[f32] = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
-                mc_map_f32 = t.map()?;
+                mc_map_f32 = t.map_read()?;
                 mc_map_f32.as_slice()
             }
             DType::F16 => {
                 let t = proto_data.mask_coefficients.as_f16().expect("F16");
-                mc_map_f16 = t.map()?;
+                mc_map_f16 = t.map_read()?;
                 coeff_widen_f16 = mc_map_f16.as_slice().iter().map(|v| v.to_f32()).collect();
                 &coeff_widen_f16[..]
             }
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
-                mc_map_i8 = t.map()?;
+                mc_map_i8 = t.map_read()?;
                 let quant = t.quantization();
                 coeff_dequant = super::proto_dispatch::dequant_coeffs(
                     mc_map_i8.as_slice(),
@@ -5598,7 +5759,7 @@ impl GLProcessorST {
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
-                let mc_map_i16 = t.map()?;
+                let mc_map_i16 = t.map_read()?;
                 let quant = t.quantization();
                 coeff_dequant = super::proto_dispatch::dequant_coeffs(
                     mc_map_i16.as_slice(),
@@ -5620,7 +5781,7 @@ impl GLProcessorST {
         match proto_data.protos.dtype() {
             DType::I8 => {
                 let t = proto_data.protos.as_i8().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let quant = t.quantization().ok_or_else(|| {
                     crate::Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;
@@ -5659,7 +5820,7 @@ impl GLProcessorST {
             }
             DType::F32 => {
                 let t = proto_data.protos.as_f32().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_view = ndarray::ArrayView3::<f32>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
@@ -5679,7 +5840,7 @@ impl GLProcessorST {
             }
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let protos_view = ndarray::ArrayView3::<half::f16>::from_shape(
                     (height, width, num_protos),
                     m.as_slice(),
@@ -6663,6 +6824,7 @@ impl GLProcessorST {
             // virtualized GPUs (paravirtual Metal mis-renders).
             serialize_gl: self.is_vivante() || self.is_virtual_gpu,
             external_oes: Platform::EXTERNAL_OES,
+            native_fence_sync: Platform::native_fence_sync(&self.gl_context),
         }
     }
 }

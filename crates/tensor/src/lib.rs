@@ -26,6 +26,13 @@ The `Tensor<T>` struct wraps a backend-specific storage with optional image form
 while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
 wraps `Tensor<T>` for runtime element-type dispatch.
  */
+#[cfg(target_os = "android")]
+mod ahardwarebuffer;
+// Pure AHardwareBuffer layout logic (format table, descriptor geometry,
+// overflow-checked shape math) — cfg-free so it compiles and unit-tests
+// on every host; the android module above consumes it.
+#[allow(dead_code)]
+mod ahardwarebuffer_layout;
 pub mod colorimetry;
 pub mod covguard;
 mod cuda;
@@ -65,6 +72,10 @@ static __EDGEFIRST_COV_INSTALL: extern "C" fn() = {
 // `TensorStorage` / `TensorMap` enums without leaking into the public API.
 // Exceptions kept public: `Pbo*` is a GL extension point implemented by the
 // image crate, and `image_iosurface_layout` is a public helper.
+#[cfg(target_os = "android")]
+pub use crate::ahardwarebuffer::image_ahardwarebuffer_layout;
+#[cfg(target_os = "android")]
+pub(crate) use crate::ahardwarebuffer::{AHardwareBufferMap, AHardwareBufferTensor};
 #[cfg(target_os = "linux")]
 pub(crate) use crate::dma::{DmaMap, DmaTensor};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -209,6 +220,61 @@ pub fn packed_rgba16f_layout(
         bytes_per_texel,
         pitch,
     })
+}
+
+/// Geometry of the RGBA8888-packed surface backing a packed RGB u8/i8 image
+/// tensor.
+///
+/// GPUs have no 3-channel renderable format, so the GL engine's two-pass
+/// packed-RGB shader writes the tight `[H, W, 3]` byte stream into an
+/// RGBA8888 surface: each texel carries 4 consecutive RGB bytes, giving a
+/// `(W*3/4, H)` surface at 4 bytes/texel whose rows are byte-identical to
+/// tight RGB — consumable flat as `[H, W, 3]` with no rearrangement (the
+/// u8/i8 analog of [`packed_rgba16f_layout`]; i8 shares the layout since
+/// INT8 quantization is a per-byte `^0x80` bias, not a format change).
+///
+/// Returns `Some(layout)` only when `width % 4 == 0` (so `W*3` bytes divide
+/// into whole texels) and the geometry does not overflow `usize`.
+///
+/// # Examples
+///
+/// ```rust
+/// use edgefirst_tensor::packed_rgb888_layout;
+///
+/// let layout = packed_rgb888_layout(640, 480).unwrap();
+/// assert_eq!(layout.surface_w, 480); // 640*3/4
+/// assert_eq!(layout.surface_h, 480);
+/// assert_eq!(layout.bytes_per_texel, 4);
+/// assert_eq!(layout.pitch, 1920); // 640*3
+/// assert!(packed_rgb888_layout(641, 480).is_none());
+/// ```
+pub fn packed_rgb888_layout(width: usize, height: usize) -> Option<PackedRgb888Layout> {
+    if !width.is_multiple_of(4) {
+        return None;
+    }
+    let row_bytes = width.checked_mul(3)?;
+    let surface_w = row_bytes / 4;
+    Some(PackedRgb888Layout {
+        surface_w,
+        surface_h: height,
+        bytes_per_texel: 4,
+        pitch: row_bytes,
+    })
+}
+
+/// Geometry of the RGBA8888 surface backing a packed RGB u8/i8 image tensor.
+///
+/// Obtain via [`packed_rgb888_layout`] — never construct directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedRgb888Layout {
+    /// Surface width in texels (`width * 3 / 4`).
+    pub surface_w: usize,
+    /// Surface height in texels (`height`).
+    pub surface_h: usize,
+    /// Bytes per RGBA8888 texel (always 4).
+    pub bytes_per_texel: usize,
+    /// Row pitch in bytes (`surface_w * 4` = `width * 3`).
+    pub pitch: usize,
 }
 
 /// Per-plane DMA-BUF descriptor for external buffer import.
@@ -875,6 +941,274 @@ fn deserialize_opt_scalar_or_vec_i32<'de, D: serde::Deserializer<'de>>(
 /// Monotonic counter for buffer identity IDs.
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Count of tensor maps requested beyond the buffer's declared
+/// [`CpuAccess`] (including any CPU map of a `CpuAccess::None` buffer).
+/// Undeclared CPU access is a pipeline smell: it forfeits layout
+/// optimizations (write-combined mappings, tile compression) and may be
+/// slow or refused on Android. Read via [`unplanned_cpu_access_count`];
+/// each offending buffer also logs one warning.
+static UNPLANNED_CPU_ACCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of tensor maps that exceeded the buffer's declared
+/// [`CpuAccess`] since process start. A pipeline that declares its CPU
+/// access correctly holds this flat; see [`CpuAccess`] for the contract.
+pub fn unplanned_cpu_access_count() -> u64 {
+    UNPLANNED_CPU_ACCESS.load(Ordering::Relaxed)
+}
+
+/// Record an unplanned CPU access on `identity_id`, warning once per
+/// buffer (a steady-state pipeline maps the same buffer every frame — a
+/// per-map warn would flood the log; repeats count silently).
+pub(crate) fn note_unplanned_cpu_access(identity_id: u64, backend: &str, detail: &str) {
+    UNPLANNED_CPU_ACCESS.fetch_add(1, Ordering::Relaxed);
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    if warned.lock().is_ok_and(|mut s| s.insert(identity_id)) {
+        log::warn!(
+            "unplanned CPU access on {backend} buffer (identity {identity_id}): {detail} — \
+             declare the intent at allocation (CpuAccess::Read/Write/ReadWrite) to make \
+             this a planned, optimized mapping"
+        );
+    }
+}
+
+/// Uniform guard for mutable access through a read-only map. Every
+/// `TensorMap` backend calls this from `as_mut_slice`/`deref_mut` so a
+/// `map_read()` misuse fails identically on all platforms instead of
+/// passing on tolerant ones and exploding only on Android.
+#[inline]
+pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
+    assert!(
+        writable,
+        "{backend} map is read-only (obtained via map_read()/CpuAccess::Read) — \
+         use map_mut() or map_write() for mutable access"
+    );
+}
+
+/// Declared CPU involvement for an image tensor, chosen at allocation.
+///
+/// The HAL assumes buffers are produced and consumed by hardware (ISP,
+/// codec, GPU, NPU) — hardware access needs no declaration. CPU access is
+/// the opt-in: it selects the CPU usage/mapping mode at allocation
+/// (write-combined for `Write`, cached for `Read`) and, on Android, pins
+/// the layout linear (vendor tile compression requires `None`).
+///
+/// Mapping beyond the declared access is best-effort, never silent: it
+/// may be refused (`Error::NotSupported`) or take a slow path, and it
+/// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
+/// warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CpuAccess {
+    /// Hardware-only buffer (the default): no CPU mapping declared.
+    /// Compression-eligible on platforms with vendor tile layouts.
+    #[default]
+    None,
+    /// CPU reads (verification, CPU consumers) — cached mapping.
+    Read,
+    /// CPU writes (decode targets) — write-combined mapping where the
+    /// platform supports it; reading through a `Write` map is undeclared.
+    Write,
+    /// CPU reads and writes — the pre-CpuAccess implicit behavior.
+    ReadWrite,
+}
+
+impl CpuAccess {
+    /// Whether this declaration includes CPU reads.
+    pub fn reads(self) -> bool {
+        matches!(self, CpuAccess::Read | CpuAccess::ReadWrite)
+    }
+
+    /// Whether this declaration includes CPU writes.
+    pub fn writes(self) -> bool {
+        matches!(self, CpuAccess::Write | CpuAccess::ReadWrite)
+    }
+
+    /// Whether this declaration covers `requested` (every direction the
+    /// request needs is declared).
+    pub fn covers(self, requested: CpuAccess) -> bool {
+        (!requested.reads() || self.reads()) && (!requested.writes() || self.writes())
+    }
+}
+
+/// Requested tile-compression behavior for an image allocation (set via
+/// [`ImageDesc::with_compression`]).
+///
+/// Vendor GPUs store textures in proprietary compressed tile layouts
+/// (UBWC, AFBC, PVRIC, DCC) that cut memory bandwidth; eligibility
+/// requires a hardware-only buffer ([`CpuAccess::None`]) because CPU
+/// mapping pins the layout linear. The request records best knowledge on
+/// the tensor ([`Tensor::compression`]); it never changes what bytes a
+/// consumer sees through the GPU/NPU.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// Let the platform use its native scheme when the format is
+    /// eligible; otherwise allocate linear and count the fallback
+    /// ([`compression_fallback_count`]). The right default for pipelines
+    /// that want the bandwidth win without portability failures.
+    Any,
+    /// Require one specific scheme: allocation fails with
+    /// [`Error::InvalidArgument`] when the device's scheme differs and
+    /// [`Error::NotSupported`] on platforms without vendor tile
+    /// compression. For consumers whose ABI names a layout (e.g. a
+    /// QNN context binary declaring UBWC inputs).
+    Scheme(CompressionScheme),
+}
+
+/// Vendor tile-compression schemes the HAL recognizes and records.
+///
+/// Unrecognized platforms record `None` (linear) — there is deliberately
+/// no `Unknown` variant; a scheme is only recorded when the vendor is
+/// positively identified.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionScheme {
+    /// Qualcomm Adreno Universal Bandwidth Compression.
+    Ubwc,
+    /// Arm Mali/Immortalis Framebuffer Compression.
+    Afbc,
+    /// Imagination PowerVR Image Compression (Google Tensor G5+).
+    Pvric,
+    /// Samsung Xclipse (AMD RDNA) Delta Color Compression.
+    Dcc,
+}
+
+/// Count of image allocations that requested [`Compression::Any`] but
+/// resolved to a linear layout (ineligible format/dtype, unrecognized
+/// vendor, or a platform without vendor tile compression). Read via
+/// [`compression_fallback_count`].
+static COMPRESSION_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of [`Compression::Any`] requests since process start that
+/// resolved to a linear layout instead of a vendor tile scheme. A
+/// steady-state pipeline holds this flat after warmup; growth means an
+/// allocation path keeps requesting compression it never gets.
+pub fn compression_fallback_count() -> u64 {
+    COMPRESSION_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Record a `Compression::Any` request resolving linear.
+pub(crate) fn note_compression_fallback(detail: &str) {
+    COMPRESSION_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    log::debug!("compression request fell back to linear: {detail}");
+}
+
+/// Whether this platform can allocate `(format, dtype)` images in a
+/// vendor tile-compressed layout. `true` requires an Android build, an
+/// eligible format (RGBA8888 `u8`/`i8` initially), and a positively
+/// identified GPU vendor; everywhere else the answer is `false` and
+/// [`Compression::Any`] requests fall back to linear.
+pub fn compression_support(format: PixelFormat, dtype: DType) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        crate::ahardwarebuffer_layout::compression_eligible(format, dtype)
+            && crate::ahardwarebuffer::device_compression_scheme().is_some()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (format, dtype);
+        false
+    }
+}
+
+/// Declarative image-allocation request — the full-featured front door
+/// for image tensors ([`TensorDyn::image_desc`] and the image crate's
+/// `ImageProcessor::create_image_desc`).
+///
+/// The classic constructors (`image`, `create_image`) cover the common
+/// cases; the desc carries the optional requests — today the
+/// [`Compression`] request — without another constructor-parameter
+/// sweep. Fields are private and the builders consume/return by value,
+/// so future options are non-breaking.
+///
+/// ```
+/// use edgefirst_tensor::{Compression, CpuAccess, DType, ImageDesc, PixelFormat};
+/// let desc = ImageDesc::new(640, 640, PixelFormat::Rgba, DType::U8)
+///     .with_access(CpuAccess::None)
+///     .with_compression(Compression::Any);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ImageDesc {
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+    dtype: DType,
+    memory: Option<TensorMemory>,
+    access: CpuAccess,
+    compression: Option<Compression>,
+}
+
+impl ImageDesc {
+    /// A new image request: auto-selected memory, [`CpuAccess::None`]
+    /// (hardware-only), no compression request.
+    pub fn new(width: usize, height: usize, format: PixelFormat, dtype: DType) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            dtype,
+            memory: None,
+            access: CpuAccess::None,
+            compression: None,
+        }
+    }
+
+    /// Request a specific memory backing (`None` = auto-select).
+    pub fn with_memory(mut self, memory: Option<TensorMemory>) -> Self {
+        self.memory = memory;
+        self
+    }
+
+    /// Declare the CPU access (see [`CpuAccess`]). Any declaration other
+    /// than `None` makes a compression request invalid.
+    pub fn with_access(mut self, access: CpuAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Request a tile-compressed layout (see [`Compression`]).
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
+    /// Requested width in pixels.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Requested height in pixels.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Requested pixel format.
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    /// Requested element type.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Requested memory backing (`None` = auto-select).
+    pub fn memory(&self) -> Option<TensorMemory> {
+        self.memory
+    }
+
+    /// Declared CPU access.
+    pub fn access(&self) -> CpuAccess {
+        self.access
+    }
+
+    /// The compression request, if any.
+    pub fn compression(&self) -> Option<Compression> {
+        self.compression
+    }
+}
+
 /// Unique identity for a tensor's underlying buffer.
 ///
 /// Created fresh on every buffer allocation or import. The `id` is a monotonic
@@ -904,6 +1238,21 @@ impl BufferIdentity {
     /// owning Tensor is dropped (and no clones remain).
     pub fn weak(&self) -> Weak<()> {
         Arc::downgrade(&self.guard)
+    }
+
+    /// Rebuild an identity from interned parts — crate-private: only the
+    /// Android `AHardwareBuffer_getId` intern table may resurrect an
+    /// existing identity (arbitrary construction would forge cache hits).
+    // Only the Android AHardwareBuffer intern path uses these today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn from_parts(id: u64, guard: Arc<()>) -> Self {
+        Self { id, guard }
+    }
+
+    /// The strong guard handle (for the intern table's mint path).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn guard_arc(&self) -> Arc<()> {
+        Arc::clone(&self.guard)
     }
 }
 
@@ -980,9 +1329,45 @@ where
         self.reshape(shape)
     }
 
-    /// Map the tensor into memory and return a TensorMap for accessing the
-    /// data.
-    fn map(&self) -> Result<TensorMap<T>>;
+    /// Map the tensor into memory with the given access direction and
+    /// return a TensorMap for accessing the data.
+    ///
+    /// `access` selects the platform mapping mode (read-only IOSurface
+    /// lock, dma-buf sync direction, AHardwareBuffer lock usage) and the
+    /// map's mutability: a map obtained with [`CpuAccess::Read`] rejects
+    /// `as_mut_slice`. [`CpuAccess::None`] is not a mappable direction
+    /// and returns [`Error::InvalidArgument`].
+    ///
+    /// Prefer the typed wrappers [`map_read`](Self::map_read) /
+    /// [`map_write`](Self::map_write) / [`map_mut`](Self::map_mut).
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>>;
+
+    /// Map the tensor read-write (equivalent to
+    /// `map_with(CpuAccess::ReadWrite)` — the historical `map()`
+    /// behavior).
+    fn map(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::ReadWrite)
+    }
+
+    /// Map the tensor for CPU reading only. The returned map rejects
+    /// `as_mut_slice`; on macOS this takes the read-only IOSurface lock
+    /// (skips the unlock flush), on Linux the dma-buf read-direction
+    /// sync.
+    fn map_read(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::Read)
+    }
+
+    /// Map the tensor for CPU writing (fill-only: reading through a
+    /// write map may see write-combined memory — do not read the slice).
+    fn map_write(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::Write)
+    }
+
+    /// Map the tensor read-write (alias of [`map`](Self::map) with the
+    /// intent spelled out).
+    fn map_mut(&self) -> Result<TensorMap<T>> {
+        self.map_with(CpuAccess::ReadWrite)
+    }
 
     /// Get the buffer identity for cache keying and liveness tracking.
     fn buffer_identity(&self) -> &BufferIdentity;
@@ -1134,6 +1519,8 @@ where
     Dma(DmaTensor<T>),
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     Dma(IoSurfaceTensor<T>),
+    #[cfg(target_os = "android")]
+    Dma(AHardwareBufferTensor<T>),
     #[cfg(unix)]
     Shm(ShmTensor<T>),
     Mem(MemTensor<T>),
@@ -1160,6 +1547,10 @@ where
             // `configure_image` does not adopt its whole-buffer "row" as a stride.
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorStorage::Dma(t) => t.image_backing_row_stride(),
+            // Android AHardwareBuffer: same rule — only genuine 2D
+            // image-formatted buffers (height > 1) carry a real row pitch.
+            #[cfg(target_os = "android")]
+            TensorStorage::Dma(t) => t.image_backing_row_stride(),
             _ => None,
         }
     }
@@ -1178,9 +1569,19 @@ where
             Some(TensorMemory::Dma) => {
                 IoSurfaceTensor::<T>::new(shape, name).map(TensorStorage::Dma)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+            #[cfg(target_os = "android")]
+            Some(TensorMemory::Dma) => {
+                AHardwareBufferTensor::<T>::new(shape, name).map(TensorStorage::Dma)
+            }
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            )))]
             Some(TensorMemory::Dma) => Err(crate::error::Error::NotImplemented(
-                "TensorMemory::Dma is only available on Linux (DMA-BUF) and macOS/iOS (IOSurface)"
+                "TensorMemory::Dma is only available on Linux (DMA-BUF), macOS/iOS (IOSurface), \
+                 and Android (AHardwareBuffer)"
                     .to_owned(),
             )),
             #[cfg(unix)]
@@ -1224,9 +1625,29 @@ where
                             Err(_) => MemTensor::<T>::new(shape, name).map(TensorStorage::Mem),
                         }
                     }
+                    #[cfg(target_os = "android")]
+                    {
+                        // Android: Mem. Unlike macOS (where a byte-bag
+                        // IOSurface is still GL-importable as R8) a generic
+                        // BLOB AHardwareBuffer cannot back a GPU texture, so
+                        // auto-selecting it buys nothing and costs plenty: a
+                        // gralloc allocator-HAL ioctl per allocation (orders
+                        // slower than malloc, ≥1 page + a dmabuf fd even for
+                        // tiny tensors) and a lock/unlock cache-maintenance
+                        // round trip on every map(). Zero-copy image tensors
+                        // come from `Tensor::image(..)`; callers that want a
+                        // BLOB (NNAPI handoff) request `TensorMemory::Dma`
+                        // explicitly.
+                        MemTensor::<T>::new(shape, name).map(TensorStorage::Mem)
+                    }
                     #[cfg(all(
                         unix,
-                        not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+                        not(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "android"
+                        ))
                     ))]
                     {
                         // Other Unix (BSD): Mem only (no DMA; Shm is explicit-only)
@@ -1309,6 +1730,26 @@ where
             .map(TensorStorage::Dma)
     }
 
+    /// Allocate an image-formatted AHardwareBuffer-backed storage (Android).
+    ///
+    /// Used by `Tensor::image()` when the caller requests
+    /// `TensorMemory::Dma` and the format has an AHardwareBuffer format
+    /// mapping (RGBA8 and the RGBA16F float paths today). Falls back to
+    /// `new_with_byte_size` otherwise.
+    #[cfg(target_os = "android")]
+    pub(crate) fn new_image_ahardwarebuffer(
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+        dtype: DType,
+        shape: &[usize],
+        name: Option<&str>,
+        access: CpuAccess,
+    ) -> Result<Self> {
+        AHardwareBufferTensor::<T>::new_image(width, height, format, dtype, shape, name, access)
+            .map(TensorStorage::Dma)
+    }
+
     /// Create a new tensor storage using the given file descriptor, shape,
     /// and optional name.
     #[cfg(unix)]
@@ -1363,6 +1804,12 @@ where
     #[cfg(unix)]
     fn clone_fd(&self) -> Result<OwnedFd> {
         match self {
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.clone_fd(),
             TensorStorage::Shm(t) => t.clone_fd(),
             TensorStorage::Mem(t) => t.clone_fd(),
@@ -1372,7 +1819,12 @@ where
 
     fn memory(&self) -> TensorMemory {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(_) => TensorMemory::Dma,
             #[cfg(unix)]
             TensorStorage::Shm(_) => TensorMemory::Shm,
@@ -1383,7 +1835,12 @@ where
 
     fn name(&self) -> String {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.name(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.name(),
@@ -1394,7 +1851,12 @@ where
 
     fn shape(&self) -> &[usize] {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.shape(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.shape(),
@@ -1405,7 +1867,12 @@ where
 
     fn reshape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.reshape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.reshape(shape),
@@ -1416,7 +1883,12 @@ where
 
     fn capacity_bytes(&self) -> usize {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.capacity_bytes(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.capacity_bytes(),
@@ -1427,7 +1899,12 @@ where
 
     fn set_logical_shape(&mut self, shape: &[usize]) -> Result<()> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.set_logical_shape(shape),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.set_logical_shape(shape),
@@ -1436,20 +1913,30 @@ where
         }
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
-            TensorStorage::Dma(t) => t.map(),
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
+            TensorStorage::Dma(t) => t.map_with(access),
             #[cfg(unix)]
-            TensorStorage::Shm(t) => t.map(),
-            TensorStorage::Mem(t) => t.map(),
-            TensorStorage::Pbo(t) => t.map(),
+            TensorStorage::Shm(t) => t.map_with(access),
+            TensorStorage::Mem(t) => t.map_with(access),
+            TensorStorage::Pbo(t) => t.map_with(access),
         }
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.buffer_identity(),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.buffer_identity(),
@@ -1466,7 +1953,12 @@ where
     /// here rather than matching the storage itself).
     fn view(&self, offset_bytes: usize, shape: &[usize]) -> Result<Self> {
         match self {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             TensorStorage::Dma(t) => t.view(offset_bytes, shape).map(TensorStorage::Dma),
             #[cfg(unix)]
             TensorStorage::Shm(t) => t.view(offset_bytes, shape).map(TensorStorage::Shm),
@@ -1508,6 +2000,19 @@ where
     pub(crate) quantization: Option<Quantization>,
     /// Optional colorimetry metadata. `None` = undefined; never auto-filled.
     colorimetry: Option<crate::Colorimetry>,
+    /// Declared CPU access (see [`CpuAccess`]). Image constructors set it
+    /// from their `access` parameter; non-image tensors (`new`, imports,
+    /// numpy) default to `ReadWrite` — they are CPU-centric by nature.
+    /// `map_with` counts requests beyond this declaration as unplanned.
+    cpu_access: CpuAccess,
+    /// Recorded vendor tile-compression scheme — best knowledge from
+    /// allocation time (see [`Compression`]). `Some` only for Android
+    /// hardware-only AHardwareBuffers whose allocation requested
+    /// compression on an eligible format with a recognized vendor. When
+    /// set, the row-stride accessors describe no meaningful linear
+    /// layout. `configure_image` preserves it (physical layout, unlike
+    /// colorimetry); views inherit it.
+    compression: Option<CompressionScheme>,
     /// Parent-image snapshot when this tensor is a [`view`](Self::view)/
     /// [`batch`](Self::batch) sub-region; `None` for a whole tensor. Lets the GL
     /// backend key its import on the parent and render the view as a
@@ -1530,6 +2035,8 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            cpu_access: CpuAccess::ReadWrite,
+            compression: None,
             view_origin: None,
         }
     }
@@ -1679,11 +2186,159 @@ where
     }
 
     /// Create an image tensor with the given format.
+    /// Allocate an image tensor from a declarative request — the
+    /// full-featured constructor behind [`Self::image`] and friends.
+    ///
+    /// Adds the [`Compression`] request to the classic parameters:
+    ///
+    /// - a request with any CPU access other than [`CpuAccess::None`] is
+    ///   [`Error::InvalidArgument`] (CPU mapping pins the layout linear);
+    /// - [`Compression::Scheme`] fails with [`Error::NotImplemented`] on
+    ///   platforms without vendor tile compression, and with
+    ///   [`Error::InvalidArgument`] when the device's native scheme or
+    ///   the format eligibility doesn't match;
+    /// - [`Compression::Any`] never fails for compression reasons: it
+    ///   records the scheme when the allocation is eligible and
+    ///   otherwise resolves linear, incrementing
+    ///   [`compression_fallback_count`].
+    ///
+    /// The recorded outcome is readable via [`Tensor::compression`].
+    pub fn image_desc(desc: &ImageDesc) -> Result<Self>
+    where
+        T: 'static,
+    {
+        let Some(t_dtype) = dtype_of::<T>() else {
+            return Err(Error::InvalidArgument(
+                "image_desc: element type has no DType mapping".into(),
+            ));
+        };
+        if t_dtype != desc.dtype {
+            return Err(Error::InvalidArgument(format!(
+                "image_desc: desc.dtype is {:?} but the tensor element type is {t_dtype:?}",
+                desc.dtype
+            )));
+        }
+
+        // Compression-request guards. CPU access pins the layout linear,
+        // so a request combined with any declared access is a
+        // contradiction the caller should hear about immediately.
+        if desc.compression.is_some() && desc.access != CpuAccess::None {
+            return Err(Error::InvalidArgument(format!(
+                "image_desc: a compression request requires CpuAccess::None                  (declared {:?}) — CPU mapping pins the layout linear",
+                desc.access
+            )));
+        }
+        if let Some(Compression::Scheme(requested)) = desc.compression {
+            #[cfg(not(target_os = "android"))]
+            {
+                return Err(Error::NotImplemented(format!(
+                    "image_desc: Compression::Scheme({requested:?}) — no vendor tile                      compression on this platform (request Compression::Any for a                      portable fallback)"
+                )));
+            }
+            #[cfg(target_os = "android")]
+            {
+                if matches!(
+                    desc.memory,
+                    Some(TensorMemory::Mem) | Some(TensorMemory::Shm) | Some(TensorMemory::Pbo)
+                ) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: Compression::Scheme({requested:?}) requires                          hardware memory (TensorMemory::Dma or auto-select), got {:?}",
+                        desc.memory
+                    )));
+                }
+                if !crate::ahardwarebuffer_layout::compression_eligible(desc.format, desc.dtype) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: ({:?}, {:?}) is not compression-eligible                          (RGBA8888 u8/i8 initially)",
+                        desc.format, desc.dtype
+                    )));
+                }
+                let device = crate::ahardwarebuffer::device_compression_scheme();
+                if device != Some(requested) {
+                    return Err(Error::InvalidArgument(format!(
+                        "image_desc: Compression::Scheme({requested:?}) but the device's                          native scheme is {device:?}"
+                    )));
+                }
+            }
+        }
+
+        // A compression request implies a hardware pipeline, so auto
+        // memory promotes to the platform's zero-copy allocation first
+        // (`Tensor::image` only takes the AHardwareBuffer/IOSurface path
+        // under an explicit Dma request). `Scheme` propagates the Dma
+        // failure — the caller demanded a layout only that allocator can
+        // produce; `Any` falls back to plain auto-select.
+        #[allow(unused_mut)]
+        let mut t = match (desc.memory, desc.compression) {
+            (None, Some(request)) => {
+                match Self::image(
+                    desc.width,
+                    desc.height,
+                    desc.format,
+                    Some(TensorMemory::Dma),
+                    desc.access,
+                ) {
+                    Ok(t) => t,
+                    Err(e) if matches!(request, Compression::Scheme(_)) => return Err(e),
+                    Err(_) => Self::image(desc.width, desc.height, desc.format, None, desc.access)?,
+                }
+            }
+            (memory, _) => Self::image(desc.width, desc.height, desc.format, memory, desc.access)?,
+        };
+
+        // Record best knowledge / count fallbacks. Only an Android
+        // hardware-only AHardwareBuffer allocation can actually hold a
+        // vendor tile layout; everywhere else an Any request resolves
+        // linear and is counted.
+        if let Some(request) = desc.compression {
+            #[cfg(target_os = "android")]
+            {
+                let eligible =
+                    crate::ahardwarebuffer_layout::compression_eligible(desc.format, desc.dtype);
+                let scheme = crate::ahardwarebuffer::device_compression_scheme();
+                let is_ahb = t.memory() == TensorMemory::Dma;
+                match (request, scheme) {
+                    (_, Some(s)) if eligible && is_ahb => {
+                        t.set_compression_unchecked(Some(s));
+                    }
+                    (Compression::Scheme(requested), _) => {
+                        // Pre-validated eligible + scheme match, so the only
+                        // way here is the allocation resolving off-AHB.
+                        return Err(Error::InvalidOperation(format!(
+                            "image_desc: Compression::Scheme({requested:?}) requested but                              the allocation resolved to {:?} (not an AHardwareBuffer)",
+                            t.memory()
+                        )));
+                    }
+                    (Compression::Any, _) => {
+                        note_compression_fallback(&format!(
+                            "({:?}, {:?}) {}x{}: eligible={eligible}, scheme={scheme:?},                              memory={:?}",
+                            desc.format,
+                            desc.dtype,
+                            desc.width,
+                            desc.height,
+                            t.memory()
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                debug_assert!(matches!(request, Compression::Any));
+                let _ = request;
+                note_compression_fallback(&format!(
+                    "({:?}, {:?}) {}x{}: no vendor tile compression on this platform",
+                    desc.format, desc.dtype, desc.width, desc.height
+                ));
+            }
+        }
+        Ok(t)
+    }
+
     pub fn image(
         width: usize,
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self>
     where
         T: 'static,
@@ -1790,39 +2445,172 @@ where
                      Some(TensorMemory::Mem) explicitly."
                 )));
             }
-            // Alignment OK. Try image-formatted IOSurface; on any
-            // structural failure (unsupported (format, dtype) combo,
-            // out-of-memory, etc.) fall through to SHM. dtype_of
-            // returns None for non-standard numeric T used in tests —
-            // those legitimately have no IOSurface FourCC mapping.
-            if let Some(dtype) = dtype_of::<T>() {
-                if let Ok(storage) = TensorStorage::<T>::new_image_iosurface(
-                    width, height, format, dtype, &shape, None,
-                ) {
-                    let mut t = Self::wrap(storage);
-                    t.format = Some(format);
-                    // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
-                    // pitch exceeds the natural packed/planar row stride, record
-                    // it so CPU consumers iterate rows correctly (the GL import
-                    // already uses the surface's own pitch). For 64-aligned rows
-                    // — the common model-input case — the two match and no stride
-                    // is stored, leaving the flat mapping unchanged.
-                    if let TensorStorage::Dma(ref io) = t.storage {
-                        let bpr = io.bytes_per_row();
-                        if let Some(natural) = t.effective_row_stride() {
-                            if bpr > natural {
-                                t.set_row_stride_unchecked(bpr);
-                            }
-                        }
+            // Alignment OK. Explicit-Dma contract: the caller asked for an
+            // **image-formatted, GL-importable** IOSurface, so every failure
+            // from here on is loud. The old behaviour fell through to the
+            // generic 'L008' byte-bag `Some(other)` arm below, and the caller
+            // only found out when the GL import rejected the bind with
+            // `EGL_BAD_ATTRIBUTE` — the same silent-downgrade anti-pattern as
+            // the alignment case above. (Semi-planar/Grey u8 map to 'L008'
+            // *by design* in `image_iosurface_layout` — the R8-plane
+            // representation the YUV shaders sample — so they return through
+            // the mapped path and never reach these errors.)
+            let dtype = dtype_of::<T>().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Tensor::image: element type {} has no DType, so no \
+                     image-formatted IOSurface exists. Pass memory=None or \
+                     Some(TensorMemory::Mem) for a CPU tensor.",
+                    std::any::type_name::<T>()
+                ))
+            })?;
+            if crate::iosurface::image_iosurface_layout(format, dtype).is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: no zero-copy IOSurface mapping exists for \
+                     {format:?}/{dtype:?} on macOS/iOS (supported: \
+                     Rgba/Rgb @ U8/I8, Bgra/Yuyv/Grey/Nv12/Nv16/Nv24 @ U8, \
+                     Rgba/PlanarRgb/PlanarRgba @ F16). Pass memory=None to \
+                     auto-select, or Some(TensorMemory::Mem) explicitly, for \
+                     a CPU tensor."
+                )));
+            }
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // reject a width the texel packing cannot express up front
+            // (mirrors the Android pre-guard).
+            if format == PixelFormat::Rgb
+                && matches!(dtype, DType::U8 | DType::I8)
+                && packed_rgb888_layout(width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: Rgb {dtype:?} requires width%4==0 for the RGBA8888 \
+                     IOSurface packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
+                )));
+            }
+            let storage = TensorStorage::<T>::new_image_iosurface(
+                width, height, format, dtype, &shape, None,
+            )?;
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            // IOSurface rounds `bytes_per_row` up to 64 bytes. When that
+            // pitch exceeds the natural packed/planar row stride, record
+            // it so CPU consumers iterate rows correctly (the GL import
+            // already uses the surface's own pitch). For 64-aligned rows
+            // — the common model-input case — the two match and no stride
+            // is stored, leaving the flat mapping unchanged.
+            if let TensorStorage::Dma(ref io) = t.storage {
+                let bpr = io.bytes_per_row();
+                if let Some(natural) = t.effective_row_stride() {
+                    if bpr > natural {
+                        t.set_row_stride_unchecked(bpr);
                     }
-                    return Ok(t);
                 }
             }
-            // Unsupported (format, dtype) on the IOSurface path —
-            // e.g. PlanarRgb u8 has no IOSurface FourCC mapping today
-            // (only F16 PlanarRgb is wired). Fall through to SHM/Mem
-            // since the caller asked for Dma but no image-formatted DMA
-            // storage exists for this combination.
+            t.cpu_access = access;
+            return Ok(t);
+        }
+
+        // Android Dma path: allocate a format-aware AHardwareBuffer so the
+        // GL backend can import it as an EGLImage
+        // (`eglGetNativeClientBufferANDROID` → `eglCreateImageKHR`).
+        //
+        // Geometry: gralloc chooses the row pitch (`desc.stride`) at
+        // allocation, and pads freely (validated on the Galaxy S26 Ultra,
+        // where SnapAlloc pads the planar-F16 RGBA16F surface). A padded
+        // pitch is recorded on the tensor so CPU maps iterate rows via the
+        // strided-map path; the GL render uses the buffer's own pitch
+        // through the EGLImage either way, so the GPU path stays fully
+        // zero-copy. Consumers needing a FLAT layout (the future NPU
+        // handoff's `[1, C, H, W]` contract) must check `row_stride()` and
+        // repack when set — flatness is a per-device property here, unlike
+        // macOS where IOSurface's 64-BYTE alignment keeps model-sized F16
+        // surfaces naturally flat.
+        #[cfg(target_os = "android")]
+        if matches!(memory, Some(TensorMemory::Dma)) {
+            // Explicit-Dma contract (mirrors the macOS block above): the
+            // caller asked for an image-formatted, GL-importable
+            // AHardwareBuffer, so an unmapped combination or a gralloc
+            // refusal errors here instead of falling through to a BLOB
+            // byte-bag the GL backend can never import — that downgrade
+            // only surfaced as a silent per-frame CPU upload.
+            let dtype = dtype_of::<T>().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "Tensor::image: element type {} has no DType, so no \
+                     image-formatted AHardwareBuffer exists. Pass memory=None \
+                     or Some(TensorMemory::Mem) for a CPU tensor.",
+                    std::any::type_name::<T>()
+                ))
+            })?;
+            // Planar F16 requires width % 4 == 0 for the RGBA16F
+            // packing — reject up front with the requirement spelled
+            // out (mirrors the macOS pre-allocation guard) instead of
+            // falling through to a byte-bag GL cannot bind.
+            if format.layout() == PixelLayout::Planar
+                && dtype == DType::F16
+                && packed_rgba16f_layout(format, dtype, width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: {format:?} F16 requires width%4==0 for the RGBA16F \
+                     AHardwareBuffer packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
+                )));
+            }
+            // Packed RGB u8/i8 rides an RGBA8888 surface at (W*3/4, H) —
+            // the same whole-texel constraint as the F16 packing above.
+            if format == PixelFormat::Rgb
+                && matches!(dtype, DType::U8 | DType::I8)
+                && packed_rgb888_layout(width, height).is_none()
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: Rgb {dtype:?} requires width%4==0 for the RGBA8888 \
+                     AHardwareBuffer packing (got width={width}). Pad the width, or pass \
+                     memory=Some(TensorMemory::Mem) for a CPU tensor."
+                )));
+            }
+            if crate::ahardwarebuffer::image_ahardwarebuffer_layout(format, dtype).is_none() {
+                return Err(Error::InvalidArgument(format!(
+                    "Tensor::image: no zero-copy AHardwareBuffer mapping exists \
+                     for {format:?}/{dtype:?} on Android (Grey/NV* need \
+                     R8-format buffers, API 29+; the HAL floor is API 26 — see \
+                     `image_ahardwarebuffer_layout`). Pass memory=None to \
+                     auto-select, or Some(TensorMemory::Mem) explicitly, for a \
+                     CPU tensor; camera NV12 stays zero-copy by wrapping the \
+                     camera's own AHardwareBuffer instead of allocating one."
+                )));
+            }
+            let storage = TensorStorage::<T>::new_image_ahardwarebuffer(
+                width, height, format, dtype, &shape, None, access,
+            )?;
+            let mut t = Self::wrap(storage);
+            t.format = Some(format);
+            if let TensorStorage::Dma(ref ahb) = t.storage {
+                // gralloc chooses the row pitch (Qualcomm's
+                // SnapAlloc pads e.g. the 160-px-wide RGBA16F
+                // surface of a 640-wide planar F16 target).
+                // When it exceeds the natural stride, record
+                // it so CPU consumers iterate rows correctly
+                // via `effective_row_stride()` — the GPU
+                // renders through the EGLImage at the
+                // buffer's real pitch regardless, so the
+                // render stays fully zero-copy. Consumers
+                // that need the FLAT `[1, C, H, W]` layout
+                // (the future NPU handoff) must check
+                // `row_stride()` is unset and repack — or
+                // pick an aligned width — rather than assume
+                // flatness (see the module docs).
+                let bpr = ahb.bytes_per_row();
+                if let Some(natural) = t.effective_row_stride() {
+                    if bpr > natural {
+                        log::debug!(
+                            "Tensor::image: gralloc padded the {format:?} \
+                             AHardwareBuffer pitch to {bpr} bytes (natural \
+                             {natural}); recording row stride"
+                        );
+                        t.set_row_stride_unchecked(bpr);
+                    }
+                }
+            }
+            t.cpu_access = access;
+            return Ok(t);
         }
 
         // Compute the **64-byte-aligned** row stride for every image layout.
@@ -1885,6 +2673,7 @@ where
                 return {
                     let mut t = Self::new(&shape, Some(other), None)?;
                     t.format = Some(format);
+                    t.cpu_access = access;
                     Ok(t)
                 };
             }
@@ -1935,6 +2724,7 @@ where
             t.row_stride.is_some() || !semi,
             "image() must always set row_stride for semi-planar tensors"
         );
+        t.cpu_access = access;
         #[cfg(target_os = "linux")]
         t.try_init_dma_cuda();
         Ok(t)
@@ -1981,7 +2771,10 @@ where
         format: PixelFormat,
         row_stride_bytes: usize,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = access;
         // DMA backing (the only thing this constructor produces) is
         // Linux-only. On macOS/BSD/Windows the non-Linux block below is
         // the only compiled body and returns `NotImplemented` directly;
@@ -2046,6 +2839,7 @@ where
             let mut t = Self::wrap(storage);
             t.format = Some(format);
             t.row_stride = Some(row_stride_bytes);
+            t.cpu_access = access;
             // Match new()/from_fd(): a DMA tensor must attempt CUDA external-
             // memory import so a strided DMA buffer is also zero-copy
             // CUDA-mappable (no-op when libcudart is absent).
@@ -2262,11 +3056,12 @@ where
         height: usize,
         format: PixelFormat,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<Self>
     where
         T: 'static,
     {
-        Self::image(width, height, format, memory)
+        Self::image(width, height, format, memory, access)
     }
 
     /// Pixel format (None if not an image).
@@ -2389,6 +3184,8 @@ where
             // multiplane data must import each plane independently.
             cuda: None,
             colorimetry: luma.colorimetry,
+            cpu_access: luma.cpu_access,
+            compression: luma.compression,
             // A composed multiplane tensor is a whole image, not a sub-view.
             view_origin: None,
         })
@@ -2439,6 +3236,97 @@ where
             // interleaved chroma columns are byte-aligned on odd-width images.
             PixelLayout::SemiPlanar => w.next_multiple_of(2) * elem,
         })
+    }
+
+    /// Copy the tensor's logical bytes into `dst`, compacting away any
+    /// recorded row-stride padding.
+    ///
+    /// The flatness helper for NPU handoff: consumers that need a FLAT
+    /// layout (e.g. `[1, C, H, W]` for NNAPI/LiteRT when the runtime cannot
+    /// take a padded pitch) call this when [`row_stride`](Self::row_stride)
+    /// is `Some` — on a tight tensor it degenerates to one memcpy, so it is
+    /// safe to call unconditionally. `dst.len()` must equal the tight byte
+    /// footprint (`shape` product × element size). Zero-copy consumers
+    /// should prefer the buffer handle + [`effective_row_stride`]
+    /// (Self::effective_row_stride) and skip this copy entirely.
+    pub fn copy_to_flat(&self, dst: &mut [u8]) -> Result<()> {
+        let tight_bytes = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(self.shape())?;
+        if dst.len() != tight_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "copy_to_flat: dst is {} bytes but the tensor's tight \
+                 footprint is {tight_bytes} bytes (shape {:?})",
+                dst.len(),
+                self.shape()
+            )));
+        }
+        let map = self.map()?;
+        // SAFETY: T is a plain numeric type (crate-wide bound); viewing the
+        // mapped elements as bytes is sound.
+        let src: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                map.as_slice().as_ptr() as *const u8,
+                std::mem::size_of_val(map.as_slice()),
+            )
+        };
+        let Some(stride) = self.row_stride else {
+            // Tight layout: the mapped window is exactly the logical bytes.
+            let got = src.len().min(tight_bytes);
+            if got < tight_bytes {
+                return Err(Error::InvalidOperation(format!(
+                    "copy_to_flat: mapped {got} bytes < tight footprint {tight_bytes}"
+                )));
+            }
+            dst.copy_from_slice(&src[..tight_bytes]);
+            return Ok(());
+        };
+        // Strided: row count follows the strided-map convention (planar
+        // stacks C planes of H rows; packed/semi-planar use shape[0]), and
+        // the logical row is tight_bytes / rows for every layout.
+        let rows = match self.format.map(|f| f.layout()) {
+            Some(PixelLayout::Planar) => {
+                let s = self.shape();
+                if s.len() < 2 {
+                    return Err(Error::InvalidOperation(
+                        "copy_to_flat: strided planar tensor requires [C, H, W] shape".into(),
+                    ));
+                }
+                s[0].checked_mul(s[1]).ok_or_else(|| {
+                    Error::InvalidOperation(format!(
+                        "copy_to_flat: planar rows {} × {} overflows usize",
+                        s[0], s[1]
+                    ))
+                })?
+            }
+            _ => *self.shape().first().ok_or_else(|| {
+                Error::InvalidOperation("copy_to_flat: tensor has an empty shape".into())
+            })?,
+        };
+        if rows == 0 || !tight_bytes.is_multiple_of(rows) {
+            return Err(Error::InvalidOperation(format!(
+                "copy_to_flat: tight footprint {tight_bytes} does not divide \
+                 into {rows} rows"
+            )));
+        }
+        let row_bytes = tight_bytes / rows;
+        let need = (rows - 1)
+            .checked_mul(stride)
+            .and_then(|b| b.checked_add(row_bytes))
+            .ok_or_else(|| {
+                Error::InvalidOperation(format!(
+                    "copy_to_flat: stride {stride} × rows {rows} overflows usize"
+                ))
+            })?;
+        if src.len() < need {
+            return Err(Error::InvalidOperation(format!(
+                "copy_to_flat: mapped {} bytes but strided rows need {need}",
+                src.len()
+            )));
+        }
+        for r in 0..rows {
+            dst[r * row_bytes..(r + 1) * row_bytes]
+                .copy_from_slice(&src[r * stride..r * stride + row_bytes]);
+        }
+        Ok(())
     }
 
     /// Set the row stride in bytes for externally allocated buffers with
@@ -2543,6 +3431,42 @@ where
     }
 
     /// Colorimetry metadata (`None` = undefined; never auto-filled).
+    /// The CPU access declared for this tensor at allocation (see
+    /// [`CpuAccess`]). Views share their parent's declaration.
+    pub fn cpu_access(&self) -> CpuAccess {
+        self.cpu_access
+    }
+
+    /// Set the declared CPU access without re-allocating — crate-private:
+    /// the declaration must reflect the underlying allocation's real
+    /// capabilities (constructors and importers set it; arbitrary widening
+    /// would defeat the contract).
+    // Only the Android AHardwareBuffer importer derives a declaration from
+    // an existing allocation's usage bits today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn set_cpu_access_unchecked(&mut self, access: CpuAccess) {
+        self.cpu_access = access;
+    }
+
+    /// The vendor tile-compression scheme recorded at allocation, or
+    /// `None` for a linear layout. `Some` means the pixels live in a
+    /// proprietary tile order: the row-stride accessors describe no
+    /// meaningful linear layout and CPU maps are best-effort (see
+    /// [`Compression`]). Only Android hardware-only allocations that
+    /// requested compression record a scheme.
+    pub fn compression(&self) -> Option<CompressionScheme> {
+        self.compression
+    }
+
+    /// Record the compression scheme — crate-private: recording is an
+    /// allocation-time fact ([`Tensor::image_desc`] sets it; arbitrary
+    /// mutation would misdescribe the physical layout).
+    // Only the Android allocation path records a scheme today.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub(crate) fn set_compression_unchecked(&mut self, scheme: Option<CompressionScheme>) {
+        self.compression = scheme;
+    }
+
     pub fn colorimetry(&self) -> Option<crate::Colorimetry> {
         self.colorimetry
     }
@@ -2614,6 +3538,12 @@ where
         // same pixels, same color encoding. Inherit it like the other image
         // metadata above so a sub-view is a faithful convert() source/target.
         t.set_colorimetry(self.colorimetry);
+        // The declared CPU access is a property of the underlying
+        // allocation, so every view shares the parent's declaration.
+        t.cpu_access = self.cpu_access;
+        // Likewise the recorded compression scheme: the view shares the
+        // parent's physical layout.
+        t.compression = self.compression;
         if abs_offset > 0 {
             t.set_plane_offset(abs_offset);
         }
@@ -2842,6 +3772,8 @@ where
             quantization: None,
             cuda: None,
             colorimetry: None,
+            cpu_access: CpuAccess::ReadWrite,
+            compression: None,
             view_origin: None,
         }
     }
@@ -3017,12 +3949,32 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map_with(&self, access: CpuAccess) -> Result<TensorMap<T>> {
         let _span = tracing::trace_span!(
             "tensor.map",
             memory = ?self.storage.memory(),
+            ?access,
         )
         .entered();
+        if access == CpuAccess::None {
+            return Err(Error::InvalidArgument(
+                "map_with(CpuAccess::None) is not a mappable direction — use \
+                 map_read()/map_write()/map_mut()"
+                    .into(),
+            ));
+        }
+        // Declared-vs-requested telemetry (all platforms): mapping beyond
+        // the allocation-time declaration is best-effort — tolerated where
+        // the backing is CPU-mappable regardless (Mem/Shm/dma-buf/
+        // IOSurface), refused by the Android backend for CpuAccess::None
+        // buffers — but always loud and counted, never silent.
+        if !self.cpu_access.covers(access) {
+            note_unplanned_cpu_access(
+                self.buffer_identity().id(),
+                &format!("{:?}", self.storage.memory()),
+                "map access exceeds the declared CpuAccess",
+            );
+        }
         // CPU mapping of a strided tensor exposes the full padded buffer
         // (`row_stride × rows`) so callers can iterate rows via
         // `effective_row_stride()` without running past the slice. This is sound
@@ -3046,13 +3998,35 @@ where
         // — that was an unimplemented path, not a platform limit; HAL-owned
         // Mem/Shm/PBO are trivially mappable and now are.)
         if let Some(stride) = self.row_stride {
-            // Rows sit at `stride`-byte spacing; the first shape dim is the row
-            // count for packed `[H, W, C]` and semi-planar `[H*k, W]` alike.
-            let rows = *self.shape().first().ok_or_else(|| {
-                Error::InvalidOperation(
-                    "Tensor::map: strided mapping requires a non-empty shape".into(),
-                )
-            })?;
+            // Rows sit at `stride`-byte spacing. The row count is the first
+            // shape dim for packed `[H, W, C]` and semi-planar `[H*k, W]`,
+            // but planar `[C, H, W]` stacks C planes of H rows — its surface
+            // row count is `C × H` (`shape[0]` alone would expose a 3-row
+            // window and truncate the map; first hit by Android planar-F16
+            // AHardwareBuffers, whose gralloc pads the pitch — macOS/Linux
+            // planar pitches happen to be naturally aligned so no stride was
+            // ever recorded there).
+            let rows = match self.format.map(|f| f.layout()) {
+                Some(PixelLayout::Planar) => {
+                    let s = self.shape();
+                    if s.len() < 2 {
+                        return Err(Error::InvalidOperation(
+                            "Tensor::map: strided planar mapping requires [C, H, W] shape".into(),
+                        ));
+                    }
+                    s[0].checked_mul(s[1]).ok_or_else(|| {
+                        Error::InvalidOperation(format!(
+                            "Tensor::map: planar rows {} × {} overflows usize",
+                            s[0], s[1]
+                        ))
+                    })?
+                }
+                _ => *self.shape().first().ok_or_else(|| {
+                    Error::InvalidOperation(
+                        "Tensor::map: strided mapping requires a non-empty shape".into(),
+                    )
+                })?,
+            };
             let total_bytes = stride.checked_mul(rows).ok_or_else(|| {
                 Error::InvalidOperation(format!(
                     "Tensor::map: row_stride {stride} × rows {rows} overflows usize"
@@ -3075,7 +4049,9 @@ where
                             dma.buf_size, dma.mmap_offset
                         )));
                     }
-                    return dma.map_with_byte_size(total_bytes).map(TensorMap::Dma);
+                    return dma
+                        .map_with_byte_size(total_bytes, access)
+                        .map(TensorMap::Dma);
                 }
                 TensorStorage::Mem(mem) => {
                     let capacity = self.storage.capacity_bytes();
@@ -3085,7 +4061,7 @@ where
                             capacity,
                         });
                     }
-                    return mem.map_with_byte_size(total_bytes);
+                    return mem.map_with_byte_size(total_bytes, access);
                 }
                 #[cfg(unix)]
                 TensorStorage::Shm(shm) => {
@@ -3096,7 +4072,7 @@ where
                             capacity,
                         });
                     }
-                    return shm.map_with_byte_size(total_bytes);
+                    return shm.map_with_byte_size(total_bytes, access);
                 }
                 // macOS/iOS: `TensorStorage::Dma` is the IOSurface. The lock yields
                 // the full surface base address, and the row pitch
@@ -3114,7 +4090,24 @@ where
                             capacity: available,
                         });
                     }
-                    return io.map_with_byte_size(total_bytes);
+                    return io.map_with_byte_size(total_bytes, access);
+                }
+                // Android: `TensorStorage::Dma` is the AHardwareBuffer. The lock
+                // yields the full buffer base address, and the row pitch is
+                // known from the allocator-filled descriptor — so a strided CPU
+                // view is sound and zero-copy, same as IOSurface.
+                #[cfg(target_os = "android")]
+                TensorStorage::Dma(ahb) => {
+                    // A sub-view's window is `buf_size − view_offset`; the strided
+                    // span must fit the window, not the whole buffer.
+                    let available = ahb.buf_size.saturating_sub(ahb.view_offset);
+                    if total_bytes > available {
+                        return Err(Error::InsufficientCapacity {
+                            needed: total_bytes,
+                            capacity: available,
+                        });
+                    }
+                    return ahb.map_with_byte_size(total_bytes, access);
                 }
                 TensorStorage::Pbo(pbo) => {
                     // PBO: the GPU-side allocation may have a padded row stride
@@ -3131,7 +4124,7 @@ where
                             capacity: available,
                         });
                     }
-                    return pbo.map_with_byte_size(total_bytes);
+                    return pbo.map_with_byte_size(total_bytes, access);
                 }
                 // Reachable on Linux for an IMPORTED DMA-BUF (the `Dma` arm above
                 // is guarded `if !dma.is_imported`). On macOS/Windows every
@@ -3157,10 +4150,16 @@ where
         // a non-zero offset is honoured rather than rejected.
         if self.plane_offset.is_some_and(|o| o > 0) {
             let supported = matches!(self.storage, TensorStorage::Mem(_) | TensorStorage::Pbo(_));
-            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF — both
-            // apply the offset in their map. (`Dma` is the same variant name on
-            // both, hence one `cfg(any(...))` arm rather than two.)
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+            // macOS `Dma` is the IOSurface; Linux `Dma` is the DMA-BUF; Android
+            // `Dma` is the AHardwareBuffer — all apply the offset in their map.
+            // (`Dma` is the same variant name on each, hence one `cfg(any(...))`
+            // arm rather than three.)
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             let supported = supported || matches!(self.storage, TensorStorage::Dma(_));
             #[cfg(unix)]
             let supported = supported || matches!(self.storage, TensorStorage::Shm(_));
@@ -3170,7 +4169,7 @@ where
                 ));
             }
         }
-        self.storage.map()
+        self.storage.map_with(access)
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
@@ -3186,6 +4185,8 @@ where
     Dma(DmaMap<T>),
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     IoSurface(IoSurfaceMap<T>),
+    #[cfg(target_os = "android")]
+    HardwareBuffer(AHardwareBufferMap<T>),
     #[cfg(unix)]
     Shm(ShmMap<T>),
     Mem(MemMap<T>),
@@ -3202,6 +4203,8 @@ where
             TensorMap::Dma(map) => map.shape(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.shape(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.shape(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.shape(),
             TensorMap::Mem(map) => map.shape(),
@@ -3215,6 +4218,8 @@ where
             TensorMap::Dma(map) => map.unmap(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.unmap(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.unmap(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.unmap(),
             TensorMap::Mem(map) => map.unmap(),
@@ -3228,6 +4233,8 @@ where
             TensorMap::Dma(map) => map.as_slice(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_slice(),
             TensorMap::Mem(map) => map.as_slice(),
@@ -3241,6 +4248,8 @@ where
             TensorMap::Dma(map) => map.as_mut_slice(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.as_mut_slice(),
             TensorMap::Mem(map) => map.as_mut_slice(),
@@ -3261,6 +4270,8 @@ where
             TensorMap::Dma(map) => map.deref(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref(),
             TensorMap::Mem(map) => map.deref(),
@@ -3279,6 +4290,8 @@ where
             TensorMap::Dma(map) => map.deref_mut(),
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             TensorMap::IoSurface(map) => map.deref_mut(),
+            #[cfg(target_os = "android")]
+            TensorMap::HardwareBuffer(map) => map.deref_mut(),
             #[cfg(unix)]
             TensorMap::Shm(map) => map.deref_mut(),
             TensorMap::Mem(map) => map.deref_mut(),
@@ -3339,8 +4352,34 @@ pub fn is_iosurface_available() -> bool {
     false
 }
 
+/// Cached result of the Android AHardwareBuffer availability probe.
+#[cfg(target_os = "android")]
+static AHARDWAREBUFFER_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Check if Android AHardwareBuffer allocation is available on this system.
+///
+/// AHardwareBuffer is part of the Android OS (public NDK ABI since API
+/// 26) and is essentially always present; this probe catches degraded
+/// scenarios such as memory pressure or gralloc failures. The result is
+/// cached after the first call.
+#[cfg(target_os = "android")]
+pub fn is_ahardwarebuffer_available() -> bool {
+    *AHARDWAREBUFFER_AVAILABLE.get_or_init(|| {
+        // Probe via the same Dma path — on Android this routes through
+        // AHardwareBufferTensor::new.
+        Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None).is_ok()
+    })
+}
+
+/// Always returns `false` on non-Android platforms.
+#[cfg(not(target_os = "android"))]
+pub fn is_ahardwarebuffer_available() -> bool {
+    false
+}
+
 /// Portable probe for the platform's native zero-copy GPU buffer
-/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS). Returns `false` on
+/// allocator (DMA-BUF on Linux, IOSurface on macOS/iOS, AHardwareBuffer on
+/// Android). Returns `false` on
 /// Windows and other platforms with no equivalent. Use this when writing
 /// cross-platform code that cares whether the `Dma` tensor variant will
 /// work, not which underlying mechanism is used.
@@ -3353,7 +4392,16 @@ pub fn is_gpu_buffer_available() -> bool {
     {
         is_iosurface_available()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+    #[cfg(target_os = "android")]
+    {
+        is_ahardwarebuffer_available()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     {
         false
     }
@@ -3475,7 +4523,14 @@ mod image_tests {
 
     #[test]
     fn image_tensor_packed() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -3485,7 +4540,14 @@ mod image_tests {
 
     #[test]
     fn image_tensor_planar() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::PlanarRgb, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::PlanarRgb,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -3502,8 +4564,14 @@ mod image_tests {
         // can bind and the CPU can map via the strided path. (Previously this
         // failed loudly to avoid an 'L008' byte-bag downgrade; with a real
         // FourCC surface that concern no longer applies.)
-        let t = Tensor::<u8>::image(4, 4, PixelFormat::Rgba, Some(TensorMemory::Dma))
-            .expect("padded RGBA IOSurface should allocate");
+        let t = Tensor::<u8>::image(
+            4,
+            4,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("padded RGBA IOSurface should allocate");
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         assert_eq!(t.width(), Some(4));
         assert_eq!(t.height(), Some(4));
@@ -3526,14 +4594,21 @@ mod image_tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_rejects_indivisible_pixel_pitch_without_pad_hint() {
-        // Width=10 RGB u8 → 30 B/row, not 64-byte aligned. The next
-        // 64-multiple (64 B) isn't an integer multiple of 3 B/pixel,
-        // so the "pad width to N" hint can't produce a valid number
-        // and must be omitted. (Width=640 happens to align — 640*3 =
-        // 1920 = 30*64 — so don't pick that for this regression
-        // guard.)
-        let err = Tensor::<u8>::image(10, 10, PixelFormat::Rgb, Some(TensorMemory::Dma))
-            .expect_err("RGB u8 with 3 B/pixel and non-aligned width must be rejected");
+        // Width=10 RGB f32 → 120 B/row, not 64-byte aligned, and (Rgb,
+        // F32) has no IOSurface mapping so the padded-stride tolerance
+        // does not apply. The next 64-multiple (128 B) isn't an integer
+        // multiple of 12 B/pixel, so the "pad width to N" hint can't
+        // produce a valid number and must be omitted. (Rgb u8 used to be
+        // this test's subject but now has a real RGBA8888 mapping with
+        // padded-stride tolerance — see the test below.)
+        let err = Tensor::<f32>::image(
+            10,
+            10,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("RGB f32 with 12 B/pixel and non-aligned width must be rejected");
         match err {
             Error::InvalidArgument(msg) => {
                 assert!(
@@ -3556,22 +4631,98 @@ mod image_tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn image_tensor_dma_packed_rgb_u8_contract() {
+        // Packed RGB u8 @Dma is a designed RGBA8888 mapping at
+        // (W*3/4, H) — the INT8 NPU input layout, shared with Android.
+        // width%4 != 0 cannot form whole texels → loud InvalidArgument…
+        let err = Tensor::<u8>::image(
+            10,
+            10,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("Rgb u8 width%4!=0 must be rejected");
+        assert!(
+            matches!(&err, Error::InvalidArgument(m) if m.contains("width%4==0")),
+            "got {err:?}"
+        );
+        // …width%4 == 0 with a non-64-aligned pitch allocates PADDED
+        // (36 B rows → 64 B surface pitch, recorded on the tensor)…
+        let t = Tensor::<u8>::image(
+            12,
+            4,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width 12 Rgb u8 must allocate padded");
+        assert_eq!(t.memory(), TensorMemory::Dma);
+        assert!(
+            t.row_stride()
+                .is_some_and(|s| s >= 64 && s.is_multiple_of(64)),
+            "padded pitch must be recorded: {:?}",
+            t.row_stride()
+        );
+        // …and the aligned model-input width stays flat (640*3 = 1920 is
+        // 64-aligned → no recorded stride, the buffer IS [H, W, 3]).
+        let t = Tensor::<u8>::image(
+            640,
+            8,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width 640 Rgb u8 must allocate flat");
+        assert_eq!(t.row_stride(), None);
+        // I8 shares the layout (INT8 shader bias, not a format change).
+        let t = Tensor::<i8>::image(
+            640,
+            8,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("Rgb i8 shares the RGBA8888 mapping");
+        assert_eq!(t.memory(), TensorMemory::Dma);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn image_tensor_dma_planar_f16_alignment() {
         // PlanarRgb F16 uses single-channel row pitch (width * 2 bytes).
         // Width=16 → 32 bytes/row (not aligned); width=32 → 64 bytes/row (aligned).
-        let err =
-            Tensor::<half::f16>::image(16, 16, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
-                .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
+        let err = Tensor::<half::f16>::image(
+            16,
+            16,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect_err("width=16 PlanarRgb F16 is 32-byte row, must reject");
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
         // 32 wide should work.
-        let t = Tensor::<half::f16>::image(32, 8, PixelFormat::PlanarRgb, Some(TensorMemory::Dma))
-            .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
+        let t = Tensor::<half::f16>::image(
+            32,
+            8,
+            PixelFormat::PlanarRgb,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .expect("width=32 PlanarRgb F16 is 64-byte row, must succeed");
         assert_eq!(t.format(), Some(PixelFormat::PlanarRgb));
     }
 
     #[test]
     fn image_tensor_semi_planar_contiguous() {
-        let t = Tensor::<u8>::image(640, 480, PixelFormat::Nv12, None).unwrap();
+        let t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!(t.width(), Some(640));
         assert_eq!(t.height(), Some(480));
@@ -3596,6 +4747,7 @@ mod image_tests {
             PixelFormat::Rgba,
             stride,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         )
         .unwrap();
         // Logical dimensions unchanged by padding — this is the contract.
@@ -3698,6 +4850,7 @@ mod image_tests {
             PixelFormat::Rgba,
             3072,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         )
         .unwrap();
         // Tamper: push the stride up to 4 × the original. This is >=
@@ -3743,6 +4896,7 @@ mod image_tests {
             PixelFormat::Rgba,
             2400,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::InvalidArgument(_))));
     }
@@ -3758,6 +4912,7 @@ mod image_tests {
             PixelFormat::Nv12,
             640,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         );
         assert!(matches!(err, Err(Error::NotImplemented(_))));
     }
@@ -3784,7 +4939,14 @@ mod image_tests {
 
     #[test]
     fn reshape_clears_format() {
-        let mut t = Tensor::<u8>::image(640, 480, PixelFormat::Rgba, None).unwrap();
+        let mut t = Tensor::<u8>::image(
+            640,
+            480,
+            PixelFormat::Rgba,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Rgba));
         // Reshape to flat — format cleared
         t.reshape(&[480 * 640 * 4]).unwrap();
@@ -3818,6 +4980,209 @@ mod image_tests {
         let mut img = Tensor::from_planes(y, uv, PixelFormat::Nv12).unwrap();
         let err = img.reshape(&[480 * 640 + 240 * 640]);
         assert!(err.is_err());
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+
+    #[test]
+    fn desc_builder_roundtrips() {
+        let desc = ImageDesc::new(640, 480, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::Read)
+            .with_compression(Compression::Any);
+        assert_eq!(desc.width(), 640);
+        assert_eq!(desc.height(), 480);
+        assert_eq!(desc.format(), PixelFormat::Rgba);
+        assert_eq!(desc.dtype(), DType::U8);
+        assert_eq!(desc.memory(), Some(TensorMemory::Mem));
+        assert_eq!(desc.access(), CpuAccess::Read);
+        assert_eq!(desc.compression(), Some(Compression::Any));
+
+        // Defaults: auto memory, hardware-only, no request.
+        let plain = ImageDesc::new(2, 2, PixelFormat::Grey, DType::U8);
+        assert_eq!(plain.memory(), None);
+        assert_eq!(plain.access(), CpuAccess::None);
+        assert_eq!(plain.compression(), None);
+    }
+
+    #[test]
+    fn desc_dtype_must_match_element_type() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::F32);
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("dtype")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compression_with_cpu_access_is_invalid() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::U8)
+            .with_access(CpuAccess::ReadWrite)
+            .with_compression(Compression::Any);
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("CpuAccess::None")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn scheme_request_off_android_is_not_implemented() {
+        let desc = ImageDesc::new(4, 4, PixelFormat::Rgba, DType::U8)
+            .with_compression(Compression::Scheme(CompressionScheme::Ubwc));
+        match Tensor::<u8>::image_desc(&desc) {
+            Err(Error::NotImplemented(msg)) => assert!(msg.contains("Ubwc")),
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn any_request_off_android_resolves_linear_and_counts() {
+        let before = compression_fallback_count();
+        let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_compression(Compression::Any);
+        let t = Tensor::<u8>::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert!(compression_fallback_count() > before);
+    }
+
+    #[test]
+    fn desc_without_request_matches_classic_constructor() {
+        let desc = ImageDesc::new(32, 32, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::ReadWrite);
+        let t = Tensor::<u8>::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert_eq!(t.cpu_access(), CpuAccess::ReadWrite);
+        assert_eq!(t.width(), Some(32));
+        // Mappable exactly like the classic constructor's result.
+        let m = t.map_read().unwrap();
+        assert_eq!(m.as_slice().len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn configure_image_preserves_compression_and_views_inherit() {
+        // No host platform records a scheme, so emulate the recording to
+        // pin the preserve/inherit semantics (the physical layout does
+        // not change when the logical image is reconfigured).
+        let mut t = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            CpuAccess::None,
+        )
+        .unwrap();
+        t.compression = Some(CompressionScheme::Ubwc);
+        t.configure_image(32, 32, PixelFormat::Rgba).unwrap();
+        assert_eq!(t.compression(), Some(CompressionScheme::Ubwc));
+        let view = t.subview(0, &[16, 32, 4]).unwrap();
+        assert_eq!(view.compression(), Some(CompressionScheme::Ubwc));
+    }
+
+    #[test]
+    fn tensor_dyn_dispatches_desc_and_compression() {
+        let desc = ImageDesc::new(16, 16, PixelFormat::Rgba, DType::U8)
+            .with_memory(Some(TensorMemory::Mem))
+            .with_access(CpuAccess::ReadWrite);
+        let t = TensorDyn::image_desc(&desc).unwrap();
+        assert_eq!(t.compression(), None);
+        assert!(matches!(t, TensorDyn::U8(_)));
+    }
+}
+
+#[cfg(test)]
+mod cpu_access_tests {
+    use super::*;
+
+    #[test]
+    fn covers_matrix() {
+        use CpuAccess::*;
+        // Every declaration covers a narrower or equal request…
+        for a in [None, Read, Write, ReadWrite] {
+            assert!(a.covers(None), "{a:?} must cover None");
+            assert!(ReadWrite.covers(a), "ReadWrite must cover {a:?}");
+        }
+        assert!(Read.covers(Read));
+        assert!(Write.covers(Write));
+        // …and never a wider one.
+        assert!(!None.covers(Read));
+        assert!(!None.covers(Write));
+        assert!(!Read.covers(Write));
+        assert!(!Read.covers(ReadWrite));
+        assert!(!Write.covers(Read));
+        assert!(!Write.covers(ReadWrite));
+    }
+
+    #[test]
+    fn map_with_none_is_invalid() {
+        let t = Tensor::<u8>::new(&[16], Some(TensorMemory::Mem), None).unwrap();
+        match t.map_with(CpuAccess::None) {
+            Err(Error::InvalidArgument(_)) => {}
+            Err(other) => panic!("expected InvalidArgument, got {other:?}"),
+            Ok(_) => panic!("map_with(CpuAccess::None) must not succeed"),
+        }
+    }
+
+    #[test]
+    fn read_map_rejects_mutation_uniformly() {
+        // Mem backend: map_read yields a working read view whose mutable
+        // accessor panics (the uniform cross-backend contract).
+        let t = Tensor::<u8>::new(&[8], Some(TensorMemory::Mem), None).unwrap();
+        t.map_mut().unwrap().as_mut_slice().copy_from_slice(&[7; 8]);
+        let ro = t.map_read().unwrap();
+        assert_eq!(ro.as_slice(), &[7; 8]);
+        drop(ro);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ro = t.map_read().unwrap();
+            let _ = ro.as_mut_slice();
+        }));
+        assert!(result.is_err(), "as_mut_slice through map_read must panic");
+    }
+
+    #[test]
+    fn write_and_rw_maps_stay_mutable() {
+        let t = Tensor::<u8>::new(&[4], Some(TensorMemory::Mem), None).unwrap();
+        t.map_write()
+            .unwrap()
+            .as_mut_slice()
+            .copy_from_slice(&[1; 4]);
+        t.map().unwrap().as_mut_slice().copy_from_slice(&[2; 4]);
+        assert_eq!(t.map_read().unwrap().as_slice(), &[2; 4]);
+    }
+
+    /// The read-only IOSurface lock path: a `map_read` must observe data
+    /// written through a prior read-write lock, and its unlock (which
+    /// skips the cache flush) must not disturb subsequent reads.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn iosurface_read_only_lock_roundtrip() {
+        let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None) else {
+            eprintln!("SKIPPED: IOSurface unavailable");
+            return;
+        };
+        {
+            let mut m = t.map_mut().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i * 3) as u8;
+            }
+        }
+        for _ in 0..2 {
+            let ro = t.map_read().unwrap();
+            for (i, b) in ro.as_slice().iter().enumerate() {
+                assert_eq!(*b, (i * 3) as u8, "byte {i} through read-only lock");
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ro = t.map_read().unwrap();
+            let _ = ro.as_mut_slice();
+        }));
+        assert!(result.is_err(), "IOSurface read map must reject mutation");
     }
 }
 
@@ -4138,8 +5503,14 @@ mod tests {
     #[test]
     fn view_origin_snapshots_parent_and_composes() {
         // view() on a whole image snapshots the parent dims + the view's origin.
-        let parent =
-            Tensor::<u8>::image(100, 80, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let parent = Tensor::<u8>::image(
+            100,
+            80,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(
             parent.view_origin(),
             None,
@@ -4295,8 +5666,14 @@ mod tests {
         // pixel format and (crucially) its padded row stride, so a strided
         // parent yields strided windows. Set a stride wider than the tight row
         // to exercise the row_stride inheritance path specifically.
-        let mut parent =
-            Tensor::<u8>::image(100, 100, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+        let mut parent = Tensor::<u8>::image(
+            100,
+            100,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         parent.set_row_stride_unchecked(512); // padded stride (> 100*4)
         let view = parent.subview(4096, &[10, 10, 4]).unwrap();
         assert_eq!(view.format(), Some(PixelFormat::Rgba), "format inherited");
@@ -4478,6 +5855,7 @@ mod tests {
             PixelFormat::Rgba,
             64,
             Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(_) => {
@@ -4940,8 +6318,14 @@ mod tests {
     #[test]
     fn colorimetry_defaults_none_and_roundtrips_without_auto_fill() {
         use crate::{ColorEncoding, ColorRange, Colorimetry, PixelFormat, TensorMemory};
-        let mut t =
-            Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut t = Tensor::<u8>::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(t.colorimetry(), None); // default undefined
         let c = Colorimetry::default()
             .with_encoding(ColorEncoding::Bt709)
@@ -4955,7 +6339,14 @@ mod tests {
 
     #[test]
     fn configure_image_within_capacity() {
-        let mut t = Tensor::<u8>::image_with_capacity(640, 480, PixelFormat::Rgb, None).unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            640,
+            480,
+            PixelFormat::Rgb,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.configure_image(320, 240, PixelFormat::Nv12).unwrap();
         assert_eq!(t.format(), Some(PixelFormat::Nv12));
         assert_eq!(t.width(), Some(320));
@@ -4965,7 +6356,14 @@ mod tests {
 
     #[test]
     fn configure_image_too_large_errors() {
-        let mut t = Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Grey, None).unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            64,
+            64,
+            PixelFormat::Grey,
+            None,
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let err = t
             .configure_image(1920, 1080, PixelFormat::Nv12)
             .unwrap_err();
@@ -4979,8 +6377,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn configure_image_preserves_iosurface_physical_stride() {
         // Pool: GREY/R8 IOSurface 100 wide → bytesPerRow padded to 128.
-        let mut pool =
-            Tensor::<u8>::image(100, 64, PixelFormat::Grey, Some(TensorMemory::Dma)).unwrap();
+        let mut pool = Tensor::<u8>::image(
+            100,
+            64,
+            PixelFormat::Grey,
+            Some(TensorMemory::Dma),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let pitch = pool.effective_row_stride().unwrap();
         assert!(
             pitch >= 128 && pitch.is_multiple_of(64),
@@ -5011,9 +6415,14 @@ mod tests {
     /// (64×64×4 RGBA = 16 KiB) easily holds the 24×64 = 1.5 KiB NV12 layout.
     #[test]
     fn configure_image_mem_aligns_stride() {
-        let mut t =
-            Tensor::<u8>::image_with_capacity(64, 64, PixelFormat::Rgba, Some(TensorMemory::Mem))
-                .unwrap();
+        let mut t = Tensor::<u8>::image_with_capacity(
+            64,
+            64,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.configure_image(32, 16, PixelFormat::Nv12).unwrap();
         let s = t.effective_row_stride().unwrap();
         assert_eq!(s % 64, 0, "stride must be 64-aligned");
@@ -5028,9 +6437,14 @@ mod tests {
         // 16 px), narrow the logical width, then record the padded stride.
         // Previously `map()` rejected this on non-Linux with
         // "DMA backing is Linux-only"; HAL-owned Mem is now mappable.
-        let mut t =
-            Tensor::<u8>::image_with_capacity(16, 3, PixelFormat::Rgba, Some(TensorMemory::Mem))
-                .unwrap(); // capacity 3 × 16 × 4 = 192 B
+        let mut t = Tensor::<u8>::image_with_capacity(
+            16,
+            3,
+            PixelFormat::Rgba,
+            Some(TensorMemory::Mem),
+            crate::CpuAccess::ReadWrite,
+        )
+        .unwrap(); // capacity 3 × 16 × 4 = 192 B
         t.configure_image(8, 3, PixelFormat::Rgba).unwrap(); // logical [3, 8, 4] = 96 B
         t.set_row_stride(48).unwrap(); // padded stride (>= 32 B min)
 

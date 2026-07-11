@@ -859,6 +859,63 @@ G2D and DMA-BUF tests are fully exercised. Hardware-gated tests that
 return early on x86 and arm runners are counted as passed (not skipped)
 because the gate is an explicit probe, not a `#[ignore]` attribute.
 
+## Android On-Device Validation (Device Farm)
+
+No CI runner can execute Android GL — the `build-android` lane is
+compile + clippy + link-validation only (`validate-android-link.sh`
+proves the native symbol closure against the NDK stubs). On-device
+correctness and performance are therefore gated by the internal
+hal-mobile Device Farm harness, which builds against the HAL and
+drives its validation cells through JNI from an instrumented test. Every pure decision the Android FFI layer relies on (lock-usage
+mapping, descriptor geometry,
+the vendor classifier, identity interning) is additionally host-tested
+in `crates/tensor/src/ahardwarebuffer_layout.rs`, so drift is caught on
+every CI run even though the FFI itself only runs on-device.
+
+**Run-level PASSED is not the gate.** Device Farm reports the RUN as
+passed when the app harness completes; always pull the artifacts
+(logcat + the exported `halvalidation-results.json`) and judge the
+`GATE|`/`SWEEP|` lines and JSON.
+
+### Validation cells
+
+| Cell | Entry point | Gate |
+|---|---|---|
+| GL-vs-CPU correctness (F16 planar, RGBA8, packed RGB u8, fence handoff, wrapped import) | `_verify` | exact/tolerance oracle vs the CPU engine |
+| Convert bench (pooled) | `_bench(fresh_dst=false)` | steady-state import-cache misses == 0 AND `src_uploads == 0` |
+| Convert bench (fresh dst) | `_bench(fresh_dst=true)` | re-import churn recorded (expected misses == iters) |
+| CPU-usage sweep | `_usage_sweep` | per-`CpuAccess` map/render medians — the device's layout signature (reported) |
+| Write-combined mapping | `_wc_mapping_bench` | Write vs ReadWrite rewrite medians (reported) |
+| Hardware-only map contract | `_map_on_none` | deterministic refusal + unplanned-access counter increments |
+| getId interning | `_getid_interning` | re-wrap window misses == 0 on API 31+; honest growth pre-31 |
+| Compressed render | `_compressed_render` | `Compression::Any` destination renders and samples back to pixel parity; scheme recorded |
+| QNN UBWC end-to-end | *(planned)* | UBWC-tagged context binary consumes a `Scheme(Ubwc)` destination (needs QAIRT SDK integration) |
+| CL compressed-image interop | *(planned)* | `cl_qcom_compressed_image` read of the convert output (needs CL harness) |
+
+### Device matrix
+
+The S26 Ultra pool exists today; the rest are the target pools, chosen
+to cover every (SoC vendor × GPU family × compression scheme × NPU
+stack × gralloc generation) the SDK will meet — substitute same-silicon
+alternatives freely against Device Farm inventory:
+
+| Device (class) | SoC | GPU / compression | NPU / native stack | Uniquely validates |
+|---|---|---|---|---|
+| Samsung Galaxy S26 Ultra *(existing pool)* | Snapdragon 8 Elite gen | Adreno 8xx / UBWC | Hexagon HTP / QNN | Flagship reference; QNN UBWC end-to-end; CL compressed-image extensions |
+| Samsung Galaxy S24/S25 | Snapdragon 8 Gen 3 / 8 Elite | Adreno 750/830 / UBWC | HTP / QNN | Prior-gen HTP floor for UBWC tensors (capability gating) |
+| Google Pixel 8/9 | Tensor G3/G4 | Mali-G715 / AFBC | EdgeTPU via LiteRT | AFBC gralloc policy on Mali; linear-destination path; getId interning under CameraX |
+| Google Pixel 10 | Tensor G5 | PowerVR DXT / PVRIC | EdgeTPU via LiteRT | PVRIC gralloc policy; least-tested driver stack |
+| Samsung Galaxy A54/A55 | Exynos 1380/1480 | Mali-G68 / Xclipse 530 | ENN or NNAPI | Non-QTI Samsung gralloc; midrange bandwidth (compression wins larger, thermals tighter) |
+| Galaxy S22/S23 Exynos (EU SKU) | Exynos 2200+ | Xclipse (RDNA) / DCC | ENN | DCC policy on an RDNA-derived mobile GPU |
+| Dimensity 8xxx/9xxx device | MediaTek | Mali/Immortalis / AFBC | MediaTek APU / NeuroPilot | MTK gralloc AFBC policy; Neuron SDK linear zero-copy import |
+| Budget floor (Galaxy A1x class) | entry Exynos/MTK/SD 6xx | Mali-G5x / Adreno 6xx | NNAPI-only | API-26/28-era gralloc; devices where compression may NOT engage — proves the linear fallback + telemetry honesty |
+
+The sweep runs identically on every pool; per-device results become the
+"compression engages for these (format, usage) classes on this silicon"
+table in SDK release notes. The budget row is deliberately adversarial —
+it proves `compression_fallback_count` and the correctness probes catch
+devices where the optimization silently can't engage.
+
 The x86_64, aarch64, and macOS lanes each publish a "Test Results (…)"
 check on the PR via `EnricoMi/publish-unit-test-result-action` (the
 macOS lane uses the `/macos` composite sub-action — the root action is

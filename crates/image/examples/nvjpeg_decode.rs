@@ -57,7 +57,15 @@ fn main() {
 
     let mut processor = ImageProcessor::new().expect("ImageProcessor::new");
     let mut tensor = processor
-        .create_image(probe.width, probe.height, PixelFormat::Rgb, DType::U8, None)
+        .create_image(
+            probe.width,
+            probe.height,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            // CUDA writes device-side; Write covers the CPU decode fallback.
+            edgefirst_tensor::CpuAccess::Write,
+        )
         .expect("create_image");
     println!("destination tensor memory = {:?}", tensor.memory());
     println!(
@@ -115,6 +123,8 @@ fn main() {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
+            // Only mapped to verify the pixels below.
+            edgefirst_tensor::CpuAccess::Read,
         )
         .expect("create dst");
     match processor.convert(

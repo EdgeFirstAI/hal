@@ -29,8 +29,14 @@ fn testdata(name: &str) -> Vec<u8> {
 #[test]
 fn decode_zidane_nv12() {
     let jpeg = testdata("zidane.jpg");
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.width, 1280);
@@ -54,8 +60,14 @@ fn decode_zidane_nv12() {
 fn decode_grey_jpeg() {
     let jpeg = testdata("grey.jpg");
     // grey.jpg is 1024×681 greyscale.
-    let mut tensor =
-        Tensor::<u8>::image(1024, 681, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1024,
+        681,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert!(info.width > 0 && info.height > 0);
@@ -78,8 +90,14 @@ fn decode_person_rejected() {
     let jpeg = testdata("person.jpg");
     // person.jpg is a progressive JPEG — our baseline-only decoder rejects it.
     // person.jpg is 4256×2532 (even dims) so allocate an Nv12 tensor of that size.
-    let mut tensor =
-        Tensor::<u8>::image(4256, 2532, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        4256,
+        2532,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(
@@ -92,8 +110,14 @@ fn decode_person_rejected() {
 fn decode_f32_jpeg_unsupported_dtype() {
     // NV12/GREY are u8 formats; the codec rejects non-u8 tensors for JPEG.
     let jpeg = testdata("zidane.jpg");
-    let mut tensor =
-        Tensor::<f32>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<f32>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(
@@ -106,8 +130,14 @@ fn decode_f32_jpeg_unsupported_dtype() {
 fn decode_capacity_error() {
     let jpeg = testdata("zidane.jpg"); // 1280×720
                                        // Allocate far too small.
-    let mut tensor =
-        Tensor::<u8>::image(100, 100, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        100,
+        100,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &jpeg);
     assert!(result.is_err());
@@ -127,8 +157,14 @@ fn decode_reuse_pattern() {
     // colour JPEGs → NV12). jaguar.jpg has a smaller odd width and is excluded
     // here — not because NV12 rejects odd widths (it doesn't), but because a
     // 1280×720 pool reconfigured for a smaller image exercises configure_image.
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
 
     let images = ["zidane.jpg", "giraffe.jpg"];
@@ -150,8 +186,14 @@ fn decode_reuse_pattern() {
 fn pixel_accuracy_grey_vs_image_crate() {
     let jpeg_data = testdata("grey.jpg");
 
-    let mut tensor =
-        Tensor::<u8>::image(1024, 681, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1024,
+        681,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg_data).unwrap();
     assert_eq!(info.format, PixelFormat::Grey);
@@ -201,8 +243,14 @@ fn decode_strided_oversized_tensor() {
     let jpeg = testdata("zidane.jpg");
 
     // Allocate larger than the image.
-    let mut tensor =
-        Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1920,
+        1080,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
 
     // Fill tensor with sentinel value.
     {
@@ -239,8 +287,14 @@ fn decode_strided_oversized_tensor() {
 fn decode_truncated_jpeg() {
     let jpeg = testdata("zidane.jpg");
     let truncated = &jpeg[..100];
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, truncated);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
@@ -251,8 +305,14 @@ fn decode_not_jpeg() {
     let mut bogus = testdata("zidane.png");
     bogus[..4].copy_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0]);
 
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &bogus);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
@@ -260,8 +320,14 @@ fn decode_not_jpeg() {
 
 #[test]
 fn decode_empty_data() {
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &[]);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
@@ -270,8 +336,14 @@ fn decode_empty_data() {
 #[test]
 fn decode_corrupt_markers() {
     let corrupt = [0xFF, 0xD8, 0xFF, 0x00];
-    let mut tensor =
-        Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let result = tensor.load_image(&mut decoder, &corrupt);
     assert!(matches!(result, Err(CodecError::InvalidData(_))));
@@ -291,6 +363,7 @@ fn decode_exact_size_tensor() {
         height as usize,
         PixelFormat::Nv12,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut decoder = ImageDecoder::new();
@@ -307,8 +380,14 @@ fn decode_nv12_output() {
     let width = 1280usize;
     let height = 720usize;
 
-    let mut tensor =
-        Tensor::<u8>::image(width, height, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        width,
+        height,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
 
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
@@ -359,7 +438,14 @@ fn unsupported_progressive_jpeg_returns_typed_variant() {
 #[test]
 fn jpeg_decode_tags_jfif_colorimetry() {
     use edgefirst_tensor::Colorimetry;
-    let mut t = Tensor::<u8>::image(1280, 720, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        1280,
+        720,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut d = ImageDecoder::new();
     t.load_image(&mut d, &testdata("zidane.jpg")).unwrap();
     assert_eq!(t.colorimetry(), Some(Colorimetry::jfif()));
@@ -380,8 +466,14 @@ fn odd_width_nv12_jpeg_decodes_with_logical_width() {
     );
 
     // Allocating at the odd width preserves the logical width.
-    let mut tensor =
-        Tensor::<u8>::image(789, 384, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        789,
+        384,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     // Contract: width() reports the LOGICAL visible size, not the even-padded buffer width.
     assert_eq!(tensor.width(), Some(789), "logical width must be preserved");
     assert_eq!(tensor.height(), Some(384));
@@ -444,8 +536,14 @@ fn check_native_decode_dims(
     // real shape/format from the bitstream.
     let alloc_w = expect_w.max(1280);
     let alloc_h = expect_h.max(720);
-    let mut tensor =
-        Tensor::<u8>::image(alloc_w, alloc_h, expect_fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        alloc_w,
+        alloc_h,
+        expect_fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.format, expect_fmt, "{fixture}: native format");
@@ -578,7 +676,14 @@ fn decode_coco_grey_odd_width() {
     // logical dims, and that the luma plane matches the image crate tightly.
     let jpeg = testdata("coco_grey_odd.jpg");
     let (w, h) = (595usize, 438usize);
-    let mut tensor = Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
     let info = tensor.load_image(&mut decoder, &jpeg).unwrap();
     assert_eq!(info.format, PixelFormat::Grey, "native greyscale format");

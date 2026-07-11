@@ -46,14 +46,27 @@ fn load_image_bench(
     let w = info.width;
     let h = info.height;
 
-    let mut t = Tensor::<u8>::image(w, h, native_fmt, memory)?;
+    let mut t = Tensor::<u8>::image(
+        w,
+        h,
+        native_fmt,
+        memory,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )?;
     let mut decoder = ImageDecoder::new();
     t.load_image(&mut decoder, data)?;
     let native_src = TensorDyn::from(t);
 
     match format {
         Some(f) if f != native_fmt => {
-            let mut dst = TensorDyn::image(w, h, f, DType::U8, memory)?;
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                f,
+                DType::U8,
+                memory,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )?;
             // `..Default::default()` is a real update on Linux (extra GL/G2D
             // fields) but covers no remaining fields on macOS where `backend`
             // is the only field — allow needless_update for cross-platform
@@ -181,7 +194,14 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGBA->RGBA", w, h);
             let throughput = (sw * sh * 4) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgba, DType::U8, None) else {
+            let Ok(mut dst) = proc.create_image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -222,7 +242,14 @@ fn bench_resize(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         for &(w, h) in target_sizes {
             let name = format!("resize/zidane/{}x{}/RGB->RGB", w, h);
             let throughput = (sw * sh * 3) as u64;
-            let Ok(mut dst) = proc.create_image(w, h, PixelFormat::Rgb, DType::U8, None) else {
+            let Ok(mut dst) = proc.create_image(
+                w,
+                h,
+                PixelFormat::Rgb,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ) else {
                 println!("  {:50} [skipped: allocation failed]", name);
                 continue;
             };
@@ -341,12 +368,26 @@ fn bench_convert(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         );
         let throughput = w as u64 * h as u64 * bpp;
 
-        let Ok(src) = proc.create_image(w, h, in_fmt, DType::U8, None) else {
+        let Ok(src) = proc.create_image(
+            w,
+            h,
+            in_fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[..data.len()].copy_from_slice(data);
-        let Ok(mut dst) = proc.create_image(w, h, out_fmt, DType::U8, None) else {
+        let Ok(mut dst) = proc.create_image(
+            w,
+            h,
+            out_fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -395,8 +436,14 @@ fn bench_rotate(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
         let name = format!("rotate/{}deg/PixelFormat::Rgba", deg);
         let throughput = (w * h * 4) as u64;
 
-        let Ok(mut dst) = proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
-        else {
+        let Ok(mut dst) = proc.create_image(
+            dst_w,
+            dst_h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -494,7 +541,14 @@ fn run_hires_configs(
 
     // PixelFormat::Yuyv source
     let yuyv_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Yuyv, DType::U8, None) else {
+        let Ok(src) = proc.create_image(
+            src_w,
+            src_h,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Yuyv source {}x{}]",
                 src_w, src_h
@@ -508,7 +562,14 @@ fn run_hires_configs(
 
     // PixelFormat::Rgba source
     let rgba_src = {
-        let Ok(src) = proc.create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None) else {
+        let Ok(src) = proc.create_image(
+            src_w,
+            src_h,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Rgba source {}x{}]",
                 src_w, src_h
@@ -526,7 +587,14 @@ fn run_hires_configs(
 
     // PixelFormat::Rgb source — convert from PixelFormat::Rgba
     let rgb_src = {
-        let Ok(mut rgb) = proc.create_image(src_w, src_h, PixelFormat::Rgb, DType::U8, None) else {
+        let Ok(mut rgb) = proc.create_image(
+            src_w,
+            src_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!(
                 "  [skipped: could not allocate PixelFormat::Rgb source {}x{}]",
                 src_w, src_h
@@ -557,9 +625,14 @@ fn run_hires_configs(
             _ => continue,
         };
 
-        let Ok(mut dst) =
-            proc.create_image(config.out_w, config.out_h, config.out_fmt, DType::U8, None)
-        else {
+        let Ok(mut dst) = proc.create_image(
+            config.out_w,
+            config.out_h,
+            config.out_fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) else {
             println!("  {:50} [skipped: allocation failed]", name);
             continue;
         };
@@ -609,8 +682,14 @@ fn bench_import(proc: &ImageProcessor, suite: &mut BenchSuite) {
 
         for &(w, h, fmt, name) in configs {
             // Allocate a DMA-backed tensor to obtain a valid DMA-BUF fd.
-            let Ok(src_tensor) = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
-            else {
+            let Ok(src_tensor) = TensorDyn::image(
+                w,
+                h,
+                fmt,
+                DType::U8,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ) else {
                 println!("  {:50} [skipped: DMA allocation failed]", name);
                 continue;
             };

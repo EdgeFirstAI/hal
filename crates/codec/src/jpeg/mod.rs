@@ -285,7 +285,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     let mcu_scratch = state.mcu_scratch.as_mut().unwrap();
 
     {
-        let mut map = dst.map()?;
+        let mut map = dst.map_write()?;
         let dst_bytes: &mut [T] = &mut map;
         // SAFETY: T is u8 (checked above) — layout-identical reinterpret.
         let dst_u8: &mut [u8] = unsafe {

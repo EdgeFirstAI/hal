@@ -81,11 +81,13 @@ let mut processor = ImageProcessor::new()?;
 let mut decoder = ImageDecoder::new();
 
 // JPEG decodes to its native NV12 (colour); decode into an NV12 source tensor.
-let mut input = processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None)?;
+let mut input =
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::ReadWrite)?;
 let info = input.load_image(&mut decoder, &bytes)?;
 
 // convert() handles NV12 -> RGB, resize, and any EXIF rotation the decode reported.
-let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut output =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 processor.convert(&input, &mut output, Rotation::None, Flip::None,
     Crop::new(0, 0, info.width, info.height))?;
 ```
@@ -106,7 +108,7 @@ struct hal_image_processor *proc = hal_image_processor_new();
  * see the C API README for hal_tensor_load_file / hal_import_image. */
 struct hal_tensor *src = /* ... */;
 struct hal_tensor *dst = hal_image_processor_create_image(
-    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+    proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
 hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE, HAL_FLIP_NONE, NULL);
 ```
 
@@ -278,7 +280,7 @@ re-import, no re-allocation.
 
 ```rust
 let mut proc = ImageProcessor::new()?;
-let mut dst = proc.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst = proc.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 
 for frame in camera_frames {
     proc.convert(&frame, &mut dst, Rotation::None, Flip::None, Crop::default())?;
@@ -309,6 +311,19 @@ The probe runs once at `ImageProcessor::new()` time. All subsequent
 `create_image()` calls reuse the same backend. Use `create_image()` for
 every destination passed to `convert()`; direct `Tensor::new(memory=...)`
 bypasses the probe.
+
+**Declare CPU access.** Every image constructor takes a required
+`CpuAccess` parameter: hardware (GPU/NPU/ISP/codec) access is always
+implied, CPU access is the opt-in. Declare `Write` for decode targets,
+`Read` for buffers you verify/consume on the CPU, `ReadWrite` when both,
+and `CpuAccess::None` for pure hardware pipelines — on Android a
+hardware-only buffer is eligible for gralloc's vendor tile compression
+(UBWC/AFBC/PVRIC/DCC), and on every platform the declaration selects the
+cheapest mapping mode (write-combined for `Write`, read-only IOSurface
+locks / dma-buf sync direction for `Read`). Mapping beyond the
+declaration still works best-effort but warns once per buffer and counts
+in `unplanned_cpu_access_count()`; on Android hardware-only buffers
+refuse CPU maps deterministically.
 
 For DMA-buf access, the process needs `/dev/dma_heap/{linux,cma|system}`
 and a DRM render/card node — the GL backend probes
@@ -532,22 +547,29 @@ caller code.
 
 ## Platform Support
 
-| Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Windows |
-|---------|--------------|---------------|-------|-----|---------|
-| DMA tensors | Yes | Yes | No | No | No |
-| PBO tensors (GPU) | Yes | Yes | No | No | No |
-| IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No |
-| Shared memory tensors | Yes | Yes | Yes | Yes | No |
-| Heap tensors | Yes | Yes | Yes | Yes | Yes |
-| G2D acceleration | Yes | No | No | No | No |
-| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | No |
-| CPU fallback | Yes | Yes | Yes | Yes | Yes |
+| Feature | Linux (i.MX) | Linux (other) | macOS | iOS | Android | Windows |
+|---------|--------------|---------------|-------|-----|---------|---------|
+| DMA tensors | Yes | Yes | No | No | No | No |
+| PBO tensors (GPU) | Yes | Yes | No | No | No | No |
+| IOSurface tensors (zero-copy) | No | No | Yes (with ANGLE) | Yes (with ANGLE) | No | No |
+| AHardwareBuffer tensors (zero-copy) | No | No | No | No | Yes | No |
+| Shared memory tensors | Yes | Yes | Yes | Yes | Import-only¹ | No |
+| Heap tensors | Yes | Yes | Yes | Yes | Yes | Yes |
+| G2D acceleration | Yes | No | No | No | No | No |
+| OpenGL acceleration | Yes (optional) | Yes (optional) | Yes (with ANGLE) | Yes (with ANGLE) | Yes (native EGL) | No |
+| CPU fallback | Yes | Yes | Yes | Yes | Yes | Yes |
+
+¹ Android's bionic libc has no POSIX `shm_open`, so shared-memory tensor
+*allocation* reports `NotImplemented`; *importing* an existing segment
+received as a file descriptor (`from_fd`) works.
 
 On macOS the OpenGL backend is enabled when [ANGLE](https://github.com/google/angle)
 is installed — see [macOS GPU Acceleration](#macos-gpu-acceleration) below
 for setup. If ANGLE is not present the HAL falls back to the CPU backend.
 On iOS the OpenGL backend uses the same ANGLE-over-Metal path — see
-[iOS](#ios) below.
+[iOS](#ios) below. On Android the OpenGL backend uses the platform's
+native GLES driver directly (no translation layer) — see
+[Android](#android) below.
 
 ## macOS GPU Acceleration
 
@@ -762,13 +784,15 @@ dependencies:
 
 ### What is validated vs. deferred
 
-`scripts/validate-ios-link.sh` builds the `edgefirst-ios-validation`
-staticlib (the full HAL closure archived into one `.a`) and links it
-against the ANGLE xcframeworks + the Apple system frameworks the HAL
-references via `#[link(kind = "framework")]` (`IOSurface`,
-`CoreFoundation`, `Metal`). It also runs `nm` on the ANGLE binaries to
-confirm the EGL entry-point names the runtime loader will look up are
-exported. This proves the native symbol closure is complete.
+`scripts/validate-ios-link.sh` builds the production C API staticlib
+(`libedgefirst_hal.a` — a Rust staticlib archives the full HAL closure)
+and links a test executable referencing real C API entry points against
+the ANGLE xcframeworks + the Apple system frameworks the HAL references
+via `#[link(kind = "framework")]` (`IOSurface`, `CoreFoundation`,
+`Metal`). It also verifies with `nm` that the archive carries the
+IOSurface references and that the ANGLE binaries export the EGL
+entry-point names the runtime loader will look up. This proves the
+native symbol closure of the shipped artifact is complete.
 
 What is **not** covered by this effort (future work):
 
@@ -787,6 +811,154 @@ target-feature rustflags. The iOS 16 deployment floor still includes A11
 (iPhone 8, ARMv8.1-A, no fp16/dotprod/i8mm), so enabling them would
 SIGILL on older devices. The deployment target matches the
 `angle-package` build (`IPHONEOS_DEPLOYMENT_TARGET = 16.0`).
+
+## Android
+
+The HAL builds for Android with the default features (including
+`opengl`), using the platform's **native OpenGL ES driver** directly —
+unlike macOS/iOS there is no ANGLE translation layer to install, because
+Android ships a first-class GLES implementation (Adreno, Mali, etc.).
+Zero-copy buffer interchange uses
+[AHardwareBuffer](https://developer.android.com/ndk/reference/group/a-hardware-buffer)
+(the role DMA-BUF plays on Linux and IOSurface on Apple platforms),
+imported into GL via `EGL_ANDROID_image_native_buffer`. The supported
+targets are:
+
+- `aarch64-linux-android` — Android devices (arm64-v8a)
+- `x86_64-linux-android` — the Android emulator on x86_64 hosts
+
+The minimum supported API level is **26** (Android 8.0) — the floor of
+the stable AHardwareBuffer NDK ABI.
+
+### Prerequisites
+
+```bash
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk
+# Android NDK r26+ (r27c LTS recommended); set ANDROID_NDK_HOME or let
+# cargo-ndk auto-detect it under your Android SDK.
+```
+
+### Building
+
+```bash
+# HAL + C API (the future JNI library) for both ABIs at API 26:
+scripts/build-android.sh
+# or directly:
+cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release -p edgefirst-hal
+```
+
+### Link validation
+
+`scripts/validate-android-link.sh [arm64|x86_64]` builds the production
+C API staticlib (`libedgefirst_hal.a` — a Rust staticlib archives the
+full HAL closure), verifies with `llvm-nm` that the archive carries the
+AHardwareBuffer references and that the NDK's API-26 stubs export every
+EGL/GLES entry point the runtime resolves dynamically, then links a test
+executable referencing real C API entry points against the NDK system
+libraries. CI runs this for both ABIs on every PR
+(`build-android` lane).
+
+What is **not** covered by this effort (future work):
+
+- **Kotlin bindings** — a JNI/Kotlin API surface, like the Swift API on
+  iOS. The `edgefirst-hal-capi` cdylib (`libedgefirst_hal.so`) is the
+  deliverable here.
+- **Runtime validation** — on-device GL correctness and performance run
+  via the internal `hal-mobile` AWS Device Farm harness, which drives
+  the real `ImageProcessor` through JNI (see TESTING.md § Android
+  On-Device Validation);
+  the Phase-1 assessment already proved the native-GLES + AHardwareBuffer
+  path on a Galaxy S26 Ultra (`GL_EXT_color_buffer_half_float` present,
+  letterbox 720p→640×640 F16 in 741 µs).
+- **Deferred zero-copy paths** — YUV camera buffers (external-OES
+  sampling) and single-channel Grey/NV imports (`R8_UNORM` needs
+  API 29); these fall back to CPU conversion today.
+
+### NPU-direct output (zero CPU readback)
+
+The convert destination is a real AHardwareBuffer, so an NPU runtime can
+consume it directly — no `map()`, no CPU readback:
+
+```c
+// Allocate once, reuse every frame (Rule 1). F16 NCHW model input;
+// auto-select yields an AHardwareBuffer when the GL backend is active —
+// assert hal_tensor_memory_type(dst) == HAL_TENSOR_DMA at startup.
+HalTensor* dst = hal_image_processor_create_image(
+    proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16, HAL_CPU_ACCESS_NONE);
+
+// One-time: hand the SAME buffer to the NPU runtime.
+AHardwareBuffer* ahb = hal_tensor_hardware_buffer_ptr(dst);
+ANeuralNetworksMemory* mem;
+ANeuralNetworksMemory_createFromAHardwareBuffer(ahb, &mem);   // NNAPI
+// (LiteRT: wrap `ahb` via TfLiteAHardwareBufferAttachment instead.)
+
+// Per frame: when convert() returns, the GPU has finished writing and
+// the handle contents are safe to execute against.
+hal_image_processor_convert(proc, src, dst, HAL_ROTATION_NONE,
+                            HAL_FLIP_NONE, &letterbox);
+// ... ANeuralNetworksExecution_setInputFromMemory(exec, 0, NULL, mem, 0, bytes);
+```
+
+For a pipelined handoff that skips the blocking GPU sync entirely, use
+`hal_image_processor_convert_fence()`: it returns a sync-fence fd
+(`EGL_ANDROID_native_fence_sync`) the NPU runtime waits on instead
+(`ANeuralNetworksExecution_startComputeWithDependencies`), or `-1` with
+the work already synced on drivers without fence support.
+
+**Flatness**: gralloc chooses the row pitch and may pad it (observed on
+the S26 Ultra: 640-px planar F16 → 1536-byte rows, natural 1280). Check
+`hal_tensor_recorded_row_stride(dst)`:
+
+- `0` — the buffer IS the flat `[1, C, H, W]` stream; hand it off as-is.
+- nonzero — describe the pitch to the runtime, pick a width whose pitch
+  the device does not pad, or fall back to
+  `hal_tensor_copy_to_flat(dst, buf, len)` (~0.3 ms at 2.4 MB — still
+  cheaper than a full CPU convert, but no longer zero-copy; profile).
+
+**INT8 NPUs**: allocate the destination as `HAL_PIXEL_FORMAT_RGB` /
+`HAL_PIXEL_FORMAT_RGBA` with `HAL_DTYPE_U8` or `HAL_DTYPE_I8` (NHWC,
+zero-copy on Android via the RGBA8888 texel packing) and attach the
+model's quantization so consumers agree on the scale:
+
+```c
+hal_tensor_set_quantization(dst, /*scale=*/1.0f / 255.0f, /*zero_point=*/0);
+```
+
+The I8 path applies the `^0x80` bias in-shader during the convert — the
+buffer bytes are already signed model input.
+
+**Tile compression** (bandwidth): a hardware-only destination can
+additionally request the device's vendor tile layout through the
+image-descriptor path — the GPU renders into it and Qualcomm's QNN can
+consume it natively (UBWC data formats declared at context-binary
+preparation); other NPU stacks take the linear default:
+
+```c
+HalImageDesc* desc = hal_image_desc_new(640, 640, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+hal_image_desc_set_compression(desc, HAL_COMPRESSION_ANY);   // linear fallback is counted
+HalTensor* dst = hal_image_processor_create_image_desc(proc, desc);
+hal_image_desc_free(desc);
+// hal_tensor_compression(dst) records the scheme actually allocated
+// (HAL_COMPRESSION_UBWC on Adreno, ..._NONE = linear fallback — see
+// hal_compression_fallback_count()).
+```
+
+Compression requires `HAL_CPU_ACCESS_NONE` (CPU mapping pins the layout
+linear) and a compressed tensor has no meaningful linear row stride —
+it is a hardware-to-hardware handle only.
+
+**macOS parity**: the same pattern works with
+`hal_tensor_iosurface_ref()` — wrap the IOSurface in a `CVPixelBuffer`
+(`CVPixelBufferCreateWithIOSurface`) for CoreML/ANE input; `convert()`
+returning likewise guarantees GPU completion.
+
+### fp16 / target features
+
+Like iOS, the Android targets carry **no** target-feature rustflags: the
+API-26 device floor spans ARMv8.0-A cores (Cortex-A53 class, no
+fp16/dotprod/i8mm), so baking those features in would SIGILL on real
+older hardware (see `.cargo/config.toml`).
 
 ## Build System
 

@@ -67,7 +67,14 @@ fn bench_nvjpeg(suite: &mut BenchSuite) {
 
     for (w, h, jpeg, name) in cases {
         // RGB PBO destination — auto-selected backend (PBO + CUDA on Jetson).
-        let mut tensor = match processor.create_image(w, h, PixelFormat::Rgb, DType::U8, None) {
+        let mut tensor = match processor.create_image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 println!("{name} SKIP: create_image failed: {e}");

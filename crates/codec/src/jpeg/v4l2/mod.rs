@@ -834,6 +834,10 @@ impl V4l2Context {
             rows,
             PixelFormat::Grey,
             Some(TensorMemory::Dma),
+            // The decoder hardware writes the capture planes; the CPU only
+            // reads them during copy-out (`map_read` syncs the read
+            // direction).
+            edgefirst_tensor::CpuAccess::Read,
         ) {
             Ok(t) => {
                 log::debug!(
@@ -941,7 +945,7 @@ impl V4l2Context {
             .scratch
             .as_mut()
             .ok_or_else(|| DecodeErr::Reset("capture scratch missing".into()))?
-            .map()
+            .map_read()
             .map_err(|e| DecodeErr::Fatal(e.into()))?;
         write_planes(
             &stream.cap,
@@ -1029,7 +1033,7 @@ fn write_planes<T: ImagePixel>(
                 "4:4:4 YUV3 capture but output format is {output_fmt:?} (expected Nv24)"
             )));
         }
-        let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
+        let mut map = dst.map_write().map_err(|e| DecodeErr::Fatal(e.into()))?;
         let dst_bytes: &mut [T] = &mut map;
         // SAFETY: NV24 is u8; JPEG entry guarantees T == u8.
         let d: &mut [u8] = unsafe {
@@ -1077,7 +1081,7 @@ fn write_planes<T: ImagePixel>(
             .map_err(|e| DecodeErr::Fatal(e.into()))?;
     }
 
-    let mut map = dst.map().map_err(|e| DecodeErr::Fatal(e.into()))?;
+    let mut map = dst.map_write().map_err(|e| DecodeErr::Fatal(e.into()))?;
     let dst_bytes: &mut [T] = &mut map;
     // SAFETY: native NV12/GREY are u8; the JPEG entry guarantees T == u8.
     let d: &mut [u8] = unsafe {
@@ -1707,14 +1711,19 @@ mod tests {
 
         // Persistent CAPTURE scratch: 4 MiB DMA buffer — larger than any
         // sizeimage in this probe, to confirm question 3.
-        let scratch =
-            match Tensor::<u8>::image(4096, 1024, PixelFormat::Grey, Some(TensorMemory::Dma)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("skip: no DMA heap ({e})");
-                    return;
-                }
-            };
+        let scratch = match Tensor::<u8>::image(
+            4096,
+            1024,
+            PixelFormat::Grey,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip: no DMA heap ({e})");
+                return;
+            }
+        };
         let scratch_fd = scratch.dmabuf().unwrap().as_raw_fd();
         let scratch_cap = scratch.capacity_bytes();
 
@@ -2005,8 +2014,14 @@ mod tests {
         let mut scratches = Vec::new();
         for _ in 0..depth {
             let rows = sizeimage.div_ceil(4096);
-            let t =
-                Tensor::<u8>::image(4096, rows, PixelFormat::Grey, Some(TensorMemory::Dma)).ok()?;
+            let t = Tensor::<u8>::image(
+                4096,
+                rows,
+                PixelFormat::Grey,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .ok()?;
             scratches.push(t);
         }
         let scratch_fds: Vec<RawFd> = scratches

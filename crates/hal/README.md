@@ -25,7 +25,7 @@ This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
 ```rust,ignore
 use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{PixelFormat, DType};
+use edgefirst_tensor::{CpuAccess, PixelFormat, DType};
 
 // Load a source image
 let bytes = std::fs::read("image.jpg")?;
@@ -37,7 +37,8 @@ let mut processor = ImageProcessor::new()?;
 // Allocate a GPU-optimal output buffer — always use create_image() for
 // destinations passed to convert(). This selects the best memory type
 // (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
-let mut output = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut output =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 
 // Convert with letterbox resize
 processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;

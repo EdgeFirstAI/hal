@@ -501,7 +501,7 @@ static void test_cuda_availability_and_fallback(void) {
 
 static void test_tensor_colorimetry_roundtrip(void) {
     TEST("tensor_colorimetry_roundtrip");
-    struct hal_tensor* t = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* t = hal_tensor_new_image(1280, 720, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(t);
     struct hal_colorimetry c;
     ASSERT_EQ(0, hal_colorimetry_from_v4l2(3, 1, 2, 1, &c)); // REC709, XFER709, ENC709, FULL
@@ -520,7 +520,7 @@ static void test_tensor_colorimetry_roundtrip(void) {
 
 static void test_tensor_colorimetry_clear_and_unset(void) {
     TEST("tensor_colorimetry_clear_and_unset");
-    struct hal_tensor* t = hal_tensor_new_image(64, 64, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM);
+    struct hal_tensor* t = hal_tensor_new_image(64, 64, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM, HAL_CPU_ACCESS_READ_WRITE);
     ASSERT_NOT_NULL(t);
 
     // Freshly created tensor has no colorimetry: all axes read back as 0.

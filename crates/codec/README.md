@@ -35,12 +35,13 @@ SoC accelerator when one is present. PNG decoding uses `zune-png`.
 
 ```rust
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_tensor::{Tensor, PixelFormat, TensorMemory};
+use edgefirst_tensor::{CpuAccess, Tensor, PixelFormat, TensorMemory};
 
 // Allocate once at init (prefer ImageProcessor::create_image() for DMA/PBO).
-// A colour JPEG decodes to NV12, so allocate an NV12 tensor.
+// A colour JPEG decodes to NV12, so allocate an NV12 tensor. The decoder
+// CPU-writes the pixels: declare CpuAccess::Write.
 let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12,
-    Some(TensorMemory::Mem)).unwrap();
+    Some(TensorMemory::Mem), CpuAccess::Write).unwrap();
 let mut decoder = ImageDecoder::new();
 
 // Decode in the hot loop — zero allocations after warmup for JPEG.
@@ -64,8 +65,10 @@ use edgefirst_codec::{ImageDecoder, ImageLoad};
 let mut processor = ImageProcessor::new()?;
 // Source tensor holds the codec's native NV12; destination is the RGB the
 // model consumes.
-let mut src = processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None)?;
-let mut dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut src =
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::ReadWrite)?;
+let mut dst =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 let mut decoder = ImageDecoder::new();
 
 loop {

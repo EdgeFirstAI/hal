@@ -335,7 +335,7 @@ def main():
 
     # --- Create processor and image ---
     processor = ImageProcessor(egl_display=gpu_display)
-    dst = Tensor.image(640, 640, PixelFormat.Rgba)
+    dst = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     print(f"Iterations: {args.iterations} (warmup: {args.warmup})")
 
     # Determine interpolation modes to test

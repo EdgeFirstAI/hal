@@ -137,8 +137,8 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
             }
             let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
             let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-            let bg_map = bg_u8.map()?;
-            let mut dst_map = dst_u8.map()?;
+            let bg_map = bg_u8.map_read()?;
+            let mut dst_map = dst_u8.map_mut()?;
             let bg_slice = bg_map.as_slice();
             let dst_slice = dst_map.as_mut_slice();
             if bg_slice.len() != dst_slice.len() {
@@ -150,7 +150,7 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
         }
         None => {
             let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
-            let mut dst_map = dst_u8.map()?;
+            let mut dst_map = dst_u8.map_mut()?;
             dst_map.as_mut_slice().fill(0);
         }
     }
@@ -485,7 +485,7 @@ impl CPUProcessor {
                 Self::swizzle_rb_4chan(dst)
             }
             (Rgba, Bgra) => {
-                dst.map()?.copy_from_slice(&src.map()?);
+                dst.map_mut()?.copy_from_slice(&src.map_read()?);
                 Self::swizzle_rb_4chan(dst)
             }
             (Rgb, Bgra) => {
@@ -530,7 +530,7 @@ impl CPUProcessor {
             src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
             dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
         };
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h);
         Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop, cp)
     }
@@ -691,7 +691,7 @@ impl CPUProcessor {
                     src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
                 )?;
                 // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
-                let mut map = dst_u8.map()?;
+                let mut map = dst_u8.map_mut()?;
                 apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
                 Ok(())
             }
@@ -709,7 +709,14 @@ impl CPUProcessor {
                 let mut tmp = if scratch_matches {
                     self.widen_scratch.take().unwrap()
                 } else {
-                    TensorDyn::image(dw, dh, dst_fmt, DType::U8, Some(TensorMemory::Mem))?
+                    TensorDyn::image(
+                        dw,
+                        dh,
+                        dst_fmt,
+                        DType::U8,
+                        Some(TensorMemory::Mem),
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )?
                 };
                 {
                     let tmp_u8 = tmp.as_u8_mut().unwrap();
@@ -722,11 +729,11 @@ impl CPUProcessor {
                 // the scratch for reuse on the next call.
                 {
                     let tmp_u8 = tmp.as_u8().unwrap();
-                    let src_map = tmp_u8.map()?;
+                    let src_map = tmp_u8.map_read()?;
                     match d {
                         DType::F32 => {
                             let dst_t = dst.as_f32_mut().unwrap();
-                            let mut dst_map = dst_t.map()?;
+                            let mut dst_map = dst_t.map_mut()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
                             // NEON-accelerated u8→f32 `/255` widen (bit-identical
                             // to the scalar `b as f32 / 255.0`); the scalar
@@ -735,7 +742,7 @@ impl CPUProcessor {
                         }
                         DType::F16 => {
                             let dst_t = dst.as_f16_mut().unwrap();
-                            let mut dst_map = dst_t.map()?;
+                            let mut dst_map = dst_t.map_mut()?;
                             debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
                             // u8→f16 `/255` widen; uses native FP16
                             // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
@@ -769,7 +776,13 @@ impl CPUProcessor {
                 return Ok(t);
             }
         }
-        Ok(Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem))?)
+        Ok(Tensor::<u8>::image(
+            w,
+            h,
+            fmt,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?)
     }
 
     /// U8-to-U8 conversion: the full format conversion + resize pipeline.
@@ -1042,7 +1055,7 @@ impl CPUProcessor {
         let dst_rs = tensor_row_stride(dst);
         let dst_c = dst_fmt.channels();
 
-        let mut map = dst.map()?;
+        let mut map = dst.map_mut()?;
         let dst_slice = map.as_mut_slice();
 
         self.render_box(dst_w, dst_h, dst_rs, dst_c, dst_slice, detect, color_mode)?;
@@ -1107,7 +1120,7 @@ impl CPUProcessor {
         let dst_rs = tensor_row_stride(dst);
         let channels = dst_fmt.channels();
 
-        let mut map = dst.map()?;
+        let mut map = dst.map_mut()?;
         let dst_slice = map.as_mut_slice();
 
         self.render_box(
@@ -1147,17 +1160,17 @@ impl CPUProcessor {
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
                 let t = proto_data.mask_coefficients.as_f32().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 m.as_slice().to_vec()
             }
             DType::F16 => {
                 let t = proto_data.mask_coefficients.as_f16().expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 m.as_slice().iter().map(|v| v.to_f32()).collect()
             }
             DType::I8 => {
                 let t = proto_data.mask_coefficients.as_i8().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
@@ -1179,7 +1192,7 @@ impl CPUProcessor {
             }
             DType::I16 => {
                 let t = proto_data.mask_coefficients.as_i16().expect("I16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
                     let (scale, zp) = match q.mode() {
@@ -1217,7 +1230,7 @@ impl CPUProcessor {
         match proto_data.protos.dtype() {
             DType::F32 => {
                 let t = proto_data.protos.as_f32().expect("F32");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 self.draw_proto_masks_inner(
                     dst_slice,
                     dst_w,
@@ -1239,7 +1252,7 @@ impl CPUProcessor {
             }
             DType::F16 => {
                 let t = proto_data.protos.as_f16().expect("F16");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 self.draw_proto_masks_inner(
                     dst_slice,
                     dst_w,
@@ -1262,7 +1275,7 @@ impl CPUProcessor {
             DType::I8 => {
                 use edgefirst_tensor::QuantMode;
                 let t = proto_data.protos.as_i8().expect("I8");
-                let m = t.map()?;
+                let m = t.map_read()?;
                 let quant = t.quantization().ok_or_else(|| {
                     Error::InvalidShape("I8 protos require quantization metadata".into())
                 })?;

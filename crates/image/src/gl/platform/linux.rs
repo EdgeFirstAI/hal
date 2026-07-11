@@ -113,6 +113,18 @@ impl GlPlatform for LinuxEgl {
         // EGLImage texture targets persist by design; nothing to release.
     }
 
+    fn native_fence_sync(_display: &GlContext) -> bool {
+        // Some Linux drivers do expose EGL_ANDROID_native_fence_sync, but
+        // no Linux consumer takes a sync-fence fd today — out of scope.
+        false
+    }
+
+    fn export_completion_fence(
+        _display: &GlContext,
+    ) -> crate::Result<Option<std::os::fd::OwnedFd>> {
+        Ok(None)
+    }
+
     fn import_buffer_packed<T>(
         display: &GlContext,
         img: &Tensor<T>,

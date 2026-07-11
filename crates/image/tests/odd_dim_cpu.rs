@@ -94,7 +94,14 @@ fn assert_part1(tensor: &Tensor<u8>, logical_w: usize, logical_h: usize, fmt: Pi
 #[test]
 fn d1_part1_nv12_odd_w() {
     let jpeg = testdata("jaguar.jpg");
-    let mut t = Tensor::<u8>::image(789, 384, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        789,
+        384,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_part1(&t, 789, 384, PixelFormat::Nv12);
@@ -114,7 +121,14 @@ fn d1_part1_nv12_odd_w() {
 #[test]
 fn d1_part1_nv16_odd_w() {
     let jpeg = testdata("jaguar_422.jpg");
-    let mut t = Tensor::<u8>::image(789, 384, PixelFormat::Nv16, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        789,
+        384,
+        PixelFormat::Nv16,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_part1(&t, 789, 384, PixelFormat::Nv16);
@@ -123,7 +137,14 @@ fn d1_part1_nv16_odd_w() {
 #[test]
 fn d1_part1_nv24_odd_w() {
     let jpeg = testdata("jaguar_444.jpg");
-    let mut t = Tensor::<u8>::image(789, 384, PixelFormat::Nv24, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        789,
+        384,
+        PixelFormat::Nv24,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_part1(&t, 789, 384, PixelFormat::Nv24);
@@ -132,7 +153,14 @@ fn d1_part1_nv24_odd_w() {
 #[test]
 fn d1_part1_grey_odd_h() {
     let jpeg = testdata("grey.jpg");
-    let mut t = Tensor::<u8>::image(1024, 681, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        1024,
+        681,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_part1(&t, 1024, 681, PixelFormat::Grey);
@@ -141,7 +169,14 @@ fn d1_part1_grey_odd_h() {
 #[test]
 fn d1_part1_nv12_odd_h() {
     let jpeg = testdata("grey-rgb.jpg");
-    let mut t = Tensor::<u8>::image(1024, 681, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut t = Tensor::<u8>::image(
+        1024,
+        681,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     t.load_image(&mut dec, &jpeg).unwrap();
     assert_part1(&t, 1024, 681, PixelFormat::Nv12);
@@ -154,8 +189,14 @@ fn d1_part1_nv12_odd_h() {
 #[test]
 fn d1_reuse_cell_max_alloc_decode_small() {
     // Allocate at max size (1920×1088 NV12) and record the large buffer stride.
-    let mut pool =
-        Tensor::<u8>::image(1920, 1088, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut pool = Tensor::<u8>::image(
+        1920,
+        1088,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let large_stride = pool.effective_row_stride().unwrap();
     assert_eq!(large_stride % 64, 0);
     assert!(large_stride >= 1920);
@@ -234,15 +275,29 @@ fn jpeg_nv_to_rgb_mae(fixture: &str, fmt: PixelFormat, w: usize, h: usize) -> (f
     let ref_rgb = image::load_from_memory(&jpeg).unwrap().to_rgb8();
     assert_eq!(ref_rgb.dimensions(), (w as u32, h as u32));
 
-    let mut src = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut src = Tensor::<u8>::image(
+        w,
+        h,
+        fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     src.load_image(&mut dec, &jpeg).unwrap();
     assert_eq!(src.width(), Some(w));
     assert_eq!(src.height(), Some(h));
 
     let src_dyn = TensorDyn::from(src);
-    let mut dst_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut proc = CPUProcessor::default();
     proc.convert(
         &src_dyn,
@@ -310,13 +365,27 @@ fn c02_grey_odd_h_to_rgb() {
     let ref_luma = image::load_from_memory(&jpeg).unwrap().to_luma8();
     assert_eq!(ref_luma.dimensions(), (w as u32, h as u32));
 
-    let mut src = Tensor::<u8>::image(w, h, PixelFormat::Grey, Some(TensorMemory::Mem)).unwrap();
+    let mut src = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Grey,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     src.load_image(&mut dec, &jpeg).unwrap();
 
     let src_dyn = TensorDyn::from(src);
-    let mut dst_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut proc = CPUProcessor::default();
     proc.convert(
         &src_dyn,
@@ -460,7 +529,14 @@ fn bt601_ycbcr_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
 ///          `Cr(cc,cr) = (cc*13 + cr*3 + 80) % 256`
 /// where `cc`/`cr` are chroma-cell coordinates (divided by subsampling factor).
 fn make_odd_both_source(w: usize, h: usize, fmt: PixelFormat) -> (Tensor<u8>, Vec<[u8; 3]>) {
-    let mut src = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut src = Tensor::<u8>::image(
+        w,
+        h,
+        fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let stride = src.effective_row_stride().unwrap();
 
     let (cw_shift, ch_shift) = match fmt {
@@ -572,8 +648,15 @@ fn check_analytic_rgb(
 fn run_odd_both(w: usize, h: usize, fmt: PixelFormat, label: &str) {
     let (src, expected) = make_odd_both_source(w, h, fmt);
     let src_dyn = TensorDyn::from(src);
-    let mut dst_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut proc = CPUProcessor::default();
     proc.convert(
         &src_dyn,
@@ -635,14 +718,28 @@ fn c10_nv12_to_rgb_i8() {
     let h = 384usize;
 
     // i8 output path
-    let mut src_i8 = Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut src_i8 = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let mut dec = ImageDecoder::new();
         src_i8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_i8_dyn = TensorDyn::from(src_i8);
-    let mut dst_i8_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::I8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_i8_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::I8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut proc = CPUProcessor::default();
     proc.convert(
         &src_i8_dyn,
@@ -654,14 +751,28 @@ fn c10_nv12_to_rgb_i8() {
     .unwrap();
 
     // u8 reference path
-    let mut src_u8 = Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut src_u8 = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let mut dec = ImageDecoder::new();
         src_u8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_u8_dyn = TensorDyn::from(src_u8);
-    let mut dst_u8_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_u8_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &src_u8_dyn,
         &mut dst_u8_dyn,
@@ -707,15 +818,28 @@ fn c11_nv12_to_rgb_f16() {
     let h = 384usize;
 
     // f16 output path
-    let mut src_f16 =
-        Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut src_f16 = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let mut dec = ImageDecoder::new();
         src_f16.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_f16_dyn = TensorDyn::from(src_f16);
-    let mut dst_f16_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::F16, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_f16_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::F16,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut proc = CPUProcessor::default();
     proc.convert(
         &src_f16_dyn,
@@ -727,14 +851,28 @@ fn c11_nv12_to_rgb_f16() {
     .unwrap();
 
     // u8 reference path
-    let mut src_u8 = Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut src_u8 = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let mut dec = ImageDecoder::new();
         src_u8.load_image(&mut dec, &jpeg).unwrap();
     }
     let src_u8_dyn = TensorDyn::from(src_u8);
-    let mut dst_u8_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst_u8_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &src_u8_dyn,
         &mut dst_u8_dyn,
@@ -780,7 +918,14 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
     let w = 789usize;
     let h = 384usize;
 
-    let mut src = Tensor::<u8>::image(w, h, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut src = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut dec = ImageDecoder::new();
     src.load_image(&mut dec, &jpeg).unwrap();
 
@@ -795,6 +940,7 @@ fn letterbox_resize_sanity_nv12_to_rgb_640() {
         PixelFormat::Rgb,
         DType::U8,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     let mut proc = CPUProcessor::default();
@@ -840,7 +986,14 @@ fn d3_rgb_to_nv16_stride_round_trip() {
 
     // Build reference RGB (tight)
     let build_ref_rgb = || -> Tensor<u8> {
-        let mut s = Tensor::<u8>::image(w, h, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+        let mut s = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let src_stride = s.effective_row_stride().unwrap_or(w * 3);
         let mut map = s.map().unwrap();
         let buf = map.as_mut_slice();
@@ -856,7 +1009,14 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     };
 
     // --- Strided NV16 path ---
-    let mut nv16 = Tensor::<u8>::image(w, h, PixelFormat::Nv16, Some(TensorMemory::Mem)).unwrap();
+    let mut nv16 = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv16,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let nv16_stride = nv16.effective_row_stride().unwrap();
     assert_eq!(nv16_stride % 64, 0, "NV16 stride must be 64-byte aligned");
     assert!(
@@ -877,8 +1037,15 @@ fn d3_rgb_to_nv16_stride_round_trip() {
     .unwrap();
 
     // NV16 → RGB
-    let mut out_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut out_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &nv16_dyn,
         &mut out_dyn,
@@ -890,12 +1057,25 @@ fn d3_rgb_to_nv16_stride_round_trip() {
 
     // --- Reference: direct RGB→RGB (no NV16 intermediate), same pattern ---
     let src2_dyn = TensorDyn::from(build_ref_rgb());
-    let mut ref_dyn =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut ref_dyn = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     // To get the same YUV round-trip losses, also go through NV16→RGB using a
     // fresh NV16 tensor (identical code path, tight or strided).
-    let mut nv16_ref =
-        Tensor::<u8>::image(w, h, PixelFormat::Nv16, Some(TensorMemory::Mem)).unwrap();
+    let mut nv16_ref = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Nv16,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     let mut nv16_ref_dyn = TensorDyn::from(nv16_ref);
     proc.convert(
         &src2_dyn,
@@ -965,7 +1145,14 @@ fn d3_resize_strided_rgb_source() {
 
     // Tight source (natural stride = w*3 = 192)
     let tight_src = {
-        let mut s = Tensor::<u8>::image(w, h, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+        let mut s = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let stride = s.effective_row_stride().unwrap_or(w * 3);
         assert_eq!(stride, w * 3);
         {
@@ -981,8 +1168,14 @@ fn d3_resize_strided_rgb_source() {
     // fall back to the tight allocation (the resize path is still exercised,
     // just without the copy-to-tight branch — a no-op is fine there).
     let padded_stride = 256usize; // 64-aligned, > w*3=192
-    let strided_src_result =
-        Tensor::<u8>::image_with_stride(w, h, PixelFormat::Rgb, padded_stride, None);
+    let strided_src_result = Tensor::<u8>::image_with_stride(
+        w,
+        h,
+        PixelFormat::Rgb,
+        padded_stride,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    );
     let (strided_src, strided_stride) = match strided_src_result {
         Ok(mut s) => {
             let stride = s.effective_row_stride().unwrap_or(padded_stride);
@@ -994,8 +1187,14 @@ fn d3_resize_strided_rgb_source() {
         }
         Err(_) => {
             // Platform doesn't support image_with_stride (non-Linux); use tight.
-            let mut s =
-                Tensor::<u8>::image(w, h, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+            let mut s = Tensor::<u8>::image(
+                w,
+                h,
+                PixelFormat::Rgb,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             let stride = s.effective_row_stride().unwrap_or(w * 3);
             {
                 let mut map = s.map().unwrap();
@@ -1015,6 +1214,7 @@ fn d3_resize_strided_rgb_source() {
         PixelFormat::Rgb,
         DType::U8,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     proc.convert(
@@ -1034,6 +1234,7 @@ fn d3_resize_strided_rgb_source() {
         PixelFormat::Rgb,
         DType::U8,
         Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .unwrap();
     proc.convert(
@@ -1082,8 +1283,15 @@ fn d3_resize_strided_rgb_source() {
 fn cpu_to_grey_packed(src: Tensor<u8>, w: usize, h: usize) -> Vec<u8> {
     let mut proc = CPUProcessor::default();
     let src_dyn = TensorDyn::from(src);
-    let mut dst =
-        TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut dst = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Grey,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &src_dyn,
         &mut dst,
@@ -1123,7 +1331,14 @@ fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
     };
 
     let tight = {
-        let mut s = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+        let mut s = Tensor::<u8>::image(
+            w,
+            h,
+            fmt,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let stride = s.effective_row_stride().unwrap_or(w * 2);
         {
             let mut m = s.map().unwrap();
@@ -1136,7 +1351,14 @@ fn packed_yuv_to_grey_strided_matches_tight(fmt: PixelFormat, luma_off: usize) {
     // Strided source is DMA-backed (Linux only); elsewhere `image_with_stride`
     // returns NotImplemented and the tight path above is the whole assertion.
     let padded = 192usize; // 64-aligned, > w*2 = 128
-    if let Ok(mut s) = Tensor::<u8>::image_with_stride(w, h, fmt, padded, None) {
+    if let Ok(mut s) = Tensor::<u8>::image_with_stride(
+        w,
+        h,
+        fmt,
+        padded,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) {
         let stride = s.effective_row_stride().unwrap_or(padded);
         assert!(stride > w * 2, "expected a padded stride, got {stride}");
         {
@@ -1172,7 +1394,15 @@ fn d6_planar_packed_roundtrip() {
 
     let convert = |src: &TensorDyn, dst_fmt: PixelFormat, dst_ch: usize| -> TensorDyn {
         let mut proc = CPUProcessor::default();
-        let mut dst = TensorDyn::image(w, h, dst_fmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            dst_fmt,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let _ = dst_ch;
         proc.convert(src, &mut dst, Rotation::None, Flip::None, Crop::default())
             .unwrap();
@@ -1192,7 +1422,14 @@ fn d6_planar_packed_roundtrip() {
     };
 
     // RGB → PlanarRgb → RGB is the identity.
-    let mut rgb = Tensor::<u8>::image(w, h, PixelFormat::Rgb, Some(TensorMemory::Mem)).unwrap();
+    let mut rgb = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let stride = rgb.effective_row_stride().unwrap_or(w * 3);
         let mut m = rgb.map().unwrap();
@@ -1217,7 +1454,14 @@ fn d6_planar_packed_roundtrip() {
     );
 
     // RGBA → PlanarRgba → RGBA is the identity (exercises the alpha plane).
-    let mut rgba = Tensor::<u8>::image(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem)).unwrap();
+    let mut rgba = Tensor::<u8>::image(
+        w,
+        h,
+        PixelFormat::Rgba,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let stride = rgba.effective_row_stride().unwrap_or(w * 4);
         let mut m = rgba.map().unwrap();
@@ -1258,7 +1502,14 @@ fn d6_planar_packed_roundtrip() {
 // ---------------------------------------------------------------------------
 
 fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool, label: &str) {
-    let mut src = Tensor::<u8>::image(w, h, fmt, Some(TensorMemory::Mem)).unwrap();
+    let mut src = Tensor::<u8>::image(
+        w,
+        h,
+        fmt,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     {
         let mut m = src.map().unwrap();
         for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
@@ -1273,7 +1524,15 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
     } else {
         PixelFormat::PlanarRgb
     };
-    let mut planar = TensorDyn::image(w, h, pfmt, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut planar = TensorDyn::image(
+        w,
+        h,
+        pfmt,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &src_dyn,
         &mut planar,
@@ -1284,8 +1543,15 @@ fn fused_nv_planar_parity(w: usize, h: usize, fmt: PixelFormat, with_alpha: bool
     .unwrap();
 
     // Reference: the proven NV→RGB packed conversion (unchanged path).
-    let mut rgb =
-        TensorDyn::image(w, h, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+    let mut rgb = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Rgb,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
     proc.convert(
         &src_dyn,
         &mut rgb,

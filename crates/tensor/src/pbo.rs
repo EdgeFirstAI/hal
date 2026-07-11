@@ -243,8 +243,8 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        self.map_internal(None)
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        self.map_internal(None, access)
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
@@ -304,11 +304,19 @@ where
     /// or a strided convert source iterates rows via `effective_row_stride()`
     /// without running past the slice. Crate-private; the only caller is
     /// `Tensor::map()`, which already checks `byte_size <= capacity_bytes()`.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
-        self.map_internal(Some(byte_size))
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
+        self.map_internal(Some(byte_size), access)
     }
 
-    fn map_internal(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+    fn map_internal(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         if self.handle.mapped.swap(true, Ordering::AcqRel) {
             return Err(Error::PboMapped);
         }
@@ -330,6 +338,7 @@ where
                     handle: Arc::clone(&self.handle),
                     byte_size_override,
                     view_offset: self.view_offset,
+                    writable: access.writes(),
                     _marker: PhantomData,
                 }))
             }
@@ -371,6 +380,10 @@ where
     /// Byte offset of the sub-view window into the mapped GL buffer. `as_slice`
     /// advances the base pointer by this many bytes before exposing the slice.
     view_offset: usize,
+    /// Whether mutable access is permitted (`map_read()` maps are not).
+    /// The GL mapping itself stays MAP_READ|MAP_WRITE (bit narrowing is a
+    /// follow-up); this enforces the API contract uniformly.
+    writable: bool,
     _marker: PhantomData<T>,
 }
 
@@ -409,6 +422,7 @@ where
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "Pbo");
         let ptr = self.ptr.lock().expect("Failed to lock PboMap pointer");
         let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.view_offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.slice_len_elems()) }

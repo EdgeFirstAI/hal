@@ -497,8 +497,14 @@ fn bench_draw_proto_masks_forced_opengl(suite: &mut BenchSuite) {
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
     let name = "draw_proto_masks/forced_opengl";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
+    let Ok(mut dst) = proc.create_image(
+        OUTPUT_W,
+        OUTPUT_H,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -632,8 +638,14 @@ fn bench_draw_proto_masks_gl_dtypes(suite: &mut BenchSuite) {
     let (proto_f32, proto_f16) = build_proto_dtypes(&detect, &proto_i8);
     println!("  {} detections decoded from fixture\n", detect.len());
 
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
+    let Ok(mut dst) = proc.create_image(
+        OUTPUT_W,
+        OUTPUT_H,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) else {
         println!("  [skipped: destination allocation failed]");
         return;
     };
@@ -725,8 +737,14 @@ fn bench_draw_decoded_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("  Materialized {n_detect} detection masks for benchmarking\n");
 
     let name = "draw_decoded_masks";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
+    let Ok(mut dst) = proc.create_image(
+        OUTPUT_W,
+        OUTPUT_H,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -756,8 +774,14 @@ fn bench_draw_proto_masks(proc: &mut ImageProcessor, suite: &mut BenchSuite) {
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
     let name = "draw_proto_masks";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
+    let Ok(mut dst) = proc.create_image(
+        OUTPUT_W,
+        OUTPUT_H,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -787,8 +811,14 @@ fn bench_hybrid_materialize_and_draw(proc: &mut ImageProcessor, suite: &mut Benc
     println!("  Decoded {n_detect} detections for benchmarking\n");
 
     let name = "hybrid_materialize_and_draw";
-    let Ok(mut dst) = proc.create_image(OUTPUT_W, OUTPUT_H, PixelFormat::Rgba, DType::U8, None)
-    else {
+    let Ok(mut dst) = proc.create_image(
+        OUTPUT_W,
+        OUTPUT_H,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) else {
         println!("  {:50} [skipped: allocation failed]", name);
         return;
     };
@@ -849,7 +879,14 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
 
     // ---- draw_decoded_masks ----
     println!("\n--- draw_decoded_masks ---");
-    let mut dst = match proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None) {
+    let mut dst = match proc.create_image(
+        dst_w,
+        dst_h,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) {
         Ok(t) => t,
         Err(e) => {
             println!("  create_image failed: {e:?}");
@@ -926,7 +963,14 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
 
     // ---- draw_proto_masks (fused) ----
     println!("\n--- draw_proto_masks (fused) ---");
-    let mut dst2 = match proc.create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None) {
+    let mut dst2 = match proc.create_image(
+        dst_w,
+        dst_h,
+        PixelFormat::Rgba,
+        DType::U8,
+        None,
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    ) {
         Ok(t) => t,
         Err(e) => {
             println!("  create_image failed: {e:?}");

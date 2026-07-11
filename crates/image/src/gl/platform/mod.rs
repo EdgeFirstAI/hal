@@ -31,6 +31,8 @@
 //! decision tables, never as new `cfg` branches in the engine. Caps are
 //! captured ONCE per processor at worker startup, never per message.
 
+#[cfg(target_os = "android")]
+pub(super) mod android;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) mod angle;
 #[cfg(target_os = "linux")]
@@ -68,6 +70,11 @@ pub(crate) struct PlatformCaps {
     /// macOS (PR-A step A7); until then only constructed.
     #[allow(dead_code)]
     pub(crate) external_oes: bool,
+    /// Whether `convert_with_fence` can export a real native fence fd
+    /// (`EGL_ANDROID_native_fence_sync` on this display). When false the
+    /// fenced entry points silently take the blocking path and return
+    /// no fd.
+    pub(crate) native_fence_sync: bool,
 }
 
 /// Platform-neutral identity of a "packed" render surface: the float
@@ -236,6 +243,21 @@ pub(super) trait GlPlatform {
     /// sync funnel (eager convert boundary, batch flush) is the call
     /// site. No-op on Linux (bindings persist by design).
     fn end_gpu_pass(display: &Self::Display);
+
+    /// Whether [`Self::export_completion_fence`] can return a real fence
+    /// on this display (Android with `EGL_ANDROID_native_fence_sync`;
+    /// false on Linux/ANGLE). Callers use this to short-circuit to the
+    /// blocking convert without a special message round-trip.
+    fn native_fence_sync(display: &Self::Display) -> bool;
+
+    /// Export a kernel sync-fence fd guarding every GL command submitted
+    /// so far on the CURRENT context (the GL→NPU handoff — the consumer
+    /// waits on the fd instead of the CPU blocking in `glFinish`).
+    /// `Ok(None)` where native fence sync does not exist; the caller then
+    /// falls back to the blocking sync. Must run on the GL worker thread.
+    fn export_completion_fence(
+        display: &Self::Display,
+    ) -> crate::Result<Option<std::os::fd::OwnedFd>>;
 }
 
 /// The one platform implementation for this build.
@@ -243,6 +265,8 @@ pub(super) trait GlPlatform {
 pub(super) type Platform = linux::LinuxEgl;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) type Platform = angle::AngleClientBuffer;
+#[cfg(target_os = "android")]
+pub(super) type Platform = android::AndroidEgl;
 
 // Compile-time check that the selected platform implements the contract —
 // a partial port fails here, not at a call site deep in the engine.

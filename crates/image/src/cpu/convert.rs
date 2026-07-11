@@ -175,9 +175,9 @@ fn pack_to_planar(
     let h = src.height().unwrap_or(0);
     let src_stride = super::tensor_row_stride(src);
     let dst_stride = super::tensor_row_stride(dst);
-    let src_map = src.map()?;
+    let src_map = src.map_read()?;
     let src_bytes = src_map.as_slice();
-    let mut dst_map = dst.map()?;
+    let mut dst_map = dst.map_mut()?;
     let dst_bytes = dst_map.as_mut_slice();
 
     // Validate the mapped buffers against the derived geometry before indexing,
@@ -342,7 +342,7 @@ impl CPUProcessor {
             height: height as u32,
         };
         let dst_stride = super::tensor_row_stride(dst) as u32;
-        Ok(decode(&src, dst.map()?.as_mut_slice(), dst_stride)?)
+        Ok(decode(&src, dst.map_mut()?.as_mut_slice(), dst_stride)?)
     }
 
     /// Resolve an NV12 (4:2:0) source's planes/strides and decode. The chroma
@@ -365,8 +365,8 @@ impl CPUProcessor {
             .effective_row_stride()
             .unwrap_or(src_w.next_multiple_of(2));
         if src.is_multiplane() {
-            let y_map = src.map()?;
-            let uv_map = src.chroma().unwrap().map()?;
+            let y_map = src.map_read()?;
+            let uv_map = src.chroma().unwrap().map_read()?;
             let uv_stride = src
                 .chroma()
                 .unwrap()
@@ -383,7 +383,7 @@ impl CPUProcessor {
                 decode,
             )
         } else {
-            let map = src.map()?;
+            let map = src.map_read()?;
             let (y_plane, uv_plane) = super::split_semi_planar(
                 map.as_slice(),
                 stride,
@@ -448,9 +448,9 @@ impl CPUProcessor {
         // Full-range luma is copied directly; limited-range luma is expanded.
         let luma = luma_mapper(cp.src_full_range);
 
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         super::guard_plane(src_bytes.len(), src_stride, src_h, src_w, "nv12→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "nv12→grey dst")?;
@@ -480,7 +480,7 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
-            yuy: &src.map()?,
+            yuy: &src.map_read()?,
             yuy_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
@@ -489,7 +489,7 @@ impl CPUProcessor {
         let dst_w = dst.width().unwrap();
         Ok(yuv::yuyv422_to_rgb(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             dst_w as u32 * 3,
             cp.range,
             cp.matrix,
@@ -505,7 +505,7 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
-            yuy: &src.map()?,
+            yuy: &src.map_read()?,
             yuy_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
@@ -513,7 +513,7 @@ impl CPUProcessor {
 
         Ok(yuv::yuyv422_to_rgba(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             cp.range,
             cp.matrix,
@@ -532,6 +532,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
@@ -549,6 +550,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_yuyv_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)
@@ -574,9 +576,9 @@ impl CPUProcessor {
         let src_row = src_w.checked_mul(2).ok_or_else(|| {
             Error::InvalidShape(format!("yuyv→grey src row overflow (w={src_w})"))
         })?;
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         super::guard_plane(src_bytes.len(), src_stride, src_h, src_row, "yuyv→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "yuyv→grey dst")?;
@@ -603,9 +605,9 @@ impl CPUProcessor {
         } else {
             dst.shape()[0] / 2
         };
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         // Split at the stride-aligned luma plane boundary, not the tight one,
         // validating the destination holds the full combined plane first.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
@@ -655,7 +657,7 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
-            yuy: &src.map()?,
+            yuy: &src.map_read()?,
             yuy_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
@@ -664,7 +666,7 @@ impl CPUProcessor {
         let dst_w = dst.width().unwrap();
         Ok(yuv::vyuy422_to_rgb(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             dst_w as u32 * 3,
             cp.range,
             cp.matrix,
@@ -680,7 +682,7 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvPackedImage::<u8> {
-            yuy: &src.map()?,
+            yuy: &src.map_read()?,
             yuy_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
@@ -688,7 +690,7 @@ impl CPUProcessor {
 
         Ok(yuv::vyuy422_to_rgba(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             cp.range,
             cp.matrix,
@@ -707,6 +709,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_8bps(&tmp, dst)
@@ -724,6 +727,7 @@ impl CPUProcessor {
             src_h,
             edgefirst_tensor::PixelFormat::Rgb,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )?;
         Self::convert_vyuy_to_rgb(src, &mut tmp, cp)?;
         Self::convert_rgb_to_prgba(&tmp, dst)
@@ -748,9 +752,9 @@ impl CPUProcessor {
         let src_row = src_w.checked_mul(2).ok_or_else(|| {
             Error::InvalidShape(format!("vyuy→grey src row overflow (w={src_w})"))
         })?;
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         super::guard_plane(src_bytes.len(), src_stride, src_h, src_row, "vyuy→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "vyuy→grey dst")?;
@@ -777,9 +781,9 @@ impl CPUProcessor {
         } else {
             dst.shape()[0] / 2
         };
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         // Split at the stride-aligned luma plane boundary, not the tight one,
         // validating the destination holds the full combined plane first.
         let (y_plane, uv_plane) = super::split_semi_planar_mut(
@@ -823,14 +827,14 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvGrayImage::<u8> {
-            y_plane: &src.map()?,
+            y_plane: &src.map_read()?,
             y_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
         };
         Ok(yuv::yuv400_to_rgb(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt601,
@@ -842,14 +846,14 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_rs = super::tensor_row_stride(src);
         let src = yuv::YuvGrayImage::<u8> {
-            y_plane: &src.map()?,
+            y_plane: &src.map_read()?,
             y_stride: src_rs as u32,
             width: src_w as u32,
             height: src_h as u32,
         };
         Ok(yuv::yuv400_to_rgba(
             &src,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             super::tensor_row_stride(dst) as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt601,
@@ -873,10 +877,10 @@ impl CPUProcessor {
     ) -> Result<()> {
         // Full-range luma maps directly into Y; limited-range compresses it.
         let y_enc = luma_encoder(cp.dst_full_range);
-        let src = src.map()?;
+        let src = src.map_read()?;
         let src = src.as_slice();
 
-        let mut dst = dst.map()?;
+        let mut dst = dst.map_mut()?;
         let dst = dst.as_mut_slice();
         for (s, d) in src
             .as_chunks::<2>()
@@ -903,9 +907,9 @@ impl CPUProcessor {
         let src_h = src.height().unwrap();
         let src_stride = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         // NV16 luma plane: src_h rows, then UV plane: another src_h rows.
         // Validate the destination holds the full combined plane before splitting.
@@ -935,9 +939,9 @@ impl CPUProcessor {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         Ok(yuv::rgba_to_rgb(
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             (src_w * 4) as u32,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             (dst.width().unwrap() * 3) as u32,
             src_w as u32,
             src_h as u32,
@@ -950,14 +954,14 @@ impl CPUProcessor {
         let dst_rs = super::tensor_row_stride(dst);
         let src_rs = super::tensor_row_stride(src);
         let mut dst = yuv::YuvGrayImageMut::<u8> {
-            y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map()?),
+            y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map_mut()?),
             y_stride: dst_rs as u32,
             width: dst_w as u32,
             height: dst_h as u32,
         };
         Ok(yuv::rgba_to_yuv400(
             &mut dst,
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             src_rs as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt601,
@@ -979,10 +983,10 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        let src = src.map()?;
+        let src = src.map_read()?;
         let src = src.as_slice();
 
-        let mut dst = dst.map()?;
+        let mut dst = dst.map_mut()?;
         let dst = dst.as_mut_slice();
 
         // RGB→YUV coefficients resolved from the destination colorimetry.
@@ -1028,7 +1032,7 @@ impl CPUProcessor {
         };
         let src_rs = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
 
         // Split at the stride-aligned luma plane boundary, not the tight one,
         // validating the destination holds the full combined plane first.
@@ -1049,7 +1053,7 @@ impl CPUProcessor {
 
         Ok(yuv::rgba_to_yuv_nv16(
             &mut bi_planar_image,
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             src_rs as u32,
             cp.range,
             cp.matrix,
@@ -1061,9 +1065,9 @@ impl CPUProcessor {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
         Ok(yuv::rgb_to_rgba(
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             (src_w * 3) as u32,
-            dst.map()?.as_mut_slice(),
+            dst.map_mut()?.as_mut_slice(),
             (dst.width().unwrap() * 4) as u32,
             src_w as u32,
             src_h as u32,
@@ -1076,14 +1080,14 @@ impl CPUProcessor {
         let dst_rs = super::tensor_row_stride(dst);
         let src_rs = super::tensor_row_stride(src);
         let mut dst = yuv::YuvGrayImageMut::<u8> {
-            y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map()?),
+            y_plane: yuv::BufferStoreMut::Borrowed(&mut dst.map_mut()?),
             y_stride: dst_rs as u32,
             width: dst_w as u32,
             height: dst_h as u32,
         };
         Ok(yuv::rgb_to_yuv400(
             &mut dst,
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             src_rs as u32,
             yuv::YuvRange::Full,
             yuv::YuvStandardMatrix::Bt601,
@@ -1105,10 +1109,10 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        let src = src.map()?;
+        let src = src.map_read()?;
         let src = src.as_slice();
 
-        let mut dst = dst.map()?;
+        let mut dst = dst.map_mut()?;
         let dst = dst.as_mut_slice();
 
         // RGB→YUV coefficients resolved from the destination colorimetry.
@@ -1153,7 +1157,7 @@ impl CPUProcessor {
         };
         let src_rs = super::tensor_row_stride(src);
         let dst_stride = super::tensor_row_stride(dst);
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
 
         // Split at the stride-aligned luma plane boundary, not the tight one,
         // validating the destination holds the full combined plane first.
@@ -1174,7 +1178,7 @@ impl CPUProcessor {
 
         Ok(yuv::rgb_to_yuv_nv16(
             &mut bi_planar_image,
-            src.map()?.as_slice(),
+            src.map_read()?.as_slice(),
             src_rs as u32,
             cp.range,
             cp.matrix,
@@ -1183,8 +1187,8 @@ impl CPUProcessor {
     }
 
     pub(super) fn copy_image(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
-        let src_map = src.map()?;
-        let mut dst_map = dst.map()?;
+        let src_map = src.map_read()?;
+        let mut dst_map = dst.map_mut()?;
         let (s, d) = (src_map.as_slice(), dst_map.as_mut_slice());
         // Guard the length before `copy_from_slice` (which panics on mismatch),
         // for parity with `prepare_dst_base_cpu`.
@@ -1201,7 +1205,7 @@ impl CPUProcessor {
 
     /// Swap R and B channels in-place for an interleaved 4-channel image.
     pub(super) fn swizzle_rb_4chan(dst: &mut Tensor<u8>) -> Result<()> {
-        let mut map = dst.map()?;
+        let mut map = dst.map_mut()?;
         let buf = map.as_mut_slice();
         for chunk in buf.chunks_exact_mut(4) {
             chunk.swap(0, 2);
@@ -1228,8 +1232,8 @@ impl CPUProcessor {
             .effective_row_stride()
             .unwrap_or(src_w.next_multiple_of(2));
         if src.is_multiplane() {
-            let y_map = src.map()?;
-            let uv_map = src.chroma().unwrap().map()?;
+            let y_map = src.map_read()?;
+            let uv_map = src.chroma().unwrap().map_read()?;
             Self::semi_planar_decode(
                 y_map.as_slice(),
                 uv_map.as_slice(),
@@ -1241,7 +1245,7 @@ impl CPUProcessor {
                 decode,
             )
         } else {
-            let map = src.map()?;
+            let map = src.map_read()?;
             let (y_plane, uv_plane) = super::split_semi_planar(
                 map.as_slice(),
                 stride,
@@ -1307,8 +1311,8 @@ impl CPUProcessor {
             .unwrap_or(src_w.next_multiple_of(2));
         let uv_stride = stride * 2;
         if src.is_multiplane() {
-            let y_map = src.map()?;
-            let uv_map = src.chroma().unwrap().map()?;
+            let y_map = src.map_read()?;
+            let uv_map = src.chroma().unwrap().map_read()?;
             Self::semi_planar_decode(
                 y_map.as_slice(),
                 uv_map.as_slice(),
@@ -1320,7 +1324,7 @@ impl CPUProcessor {
                 decode,
             )
         } else {
-            let map = src.map()?;
+            let map = src.map_read()?;
             let (y_plane, uv_plane) = super::split_semi_planar(
                 map.as_slice(),
                 stride,
@@ -1390,9 +1394,9 @@ impl CPUProcessor {
         // Full-range luma is copied directly; limited-range luma is expanded.
         let luma = luma_mapper(cp.src_full_range);
 
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         super::guard_plane(src_bytes.len(), src_stride, src_h, src_w, "nv24→grey src")?;
         super::guard_plane(dst_bytes.len(), dst_stride, src_h, src_w, "nv24→grey dst")?;
@@ -1460,9 +1464,9 @@ impl CPUProcessor {
             other => return Err(Error::NotSupported(format!("fused {other} → planar"))),
         };
 
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let chroma_map = if src.is_multiplane() {
-            Some(src.chroma().unwrap().map()?)
+            Some(src.chroma().unwrap().map_read()?)
         } else {
             None
         };
@@ -1475,7 +1479,7 @@ impl CPUProcessor {
         // ---- destination plane geometry + validation ----
         let dst_stride = super::tensor_row_stride(dst);
         let n_planes = if has_alpha { 4 } else { 3 };
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
         let plane = dst_stride.checked_mul(h).ok_or_else(|| {
             Error::InvalidShape(format!(
@@ -1608,9 +1612,9 @@ impl CPUProcessor {
         // destination has one and the source supplies it.
         let planes_read = if has_alpha_plane { 4 } else { 3 };
 
-        let src_map = src.map()?;
+        let src_map = src.map_read()?;
         let src_bytes = src_map.as_slice();
-        let mut dst_map = dst.map()?;
+        let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
 
         // Validate the buffers against the derived geometry before indexing.
