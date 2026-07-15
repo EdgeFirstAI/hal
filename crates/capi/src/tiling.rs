@@ -9,11 +9,12 @@
 //!
 //! ## POD configuration structs
 //!
-//! [`HalTilingConfig`] and [`HalMergeConfig`] are passed by value. Their
-//! defaults select non-zero discriminants (Stretch fit, IOS metric,
-//! `max_det == 300`), so a zero-initialized struct would mean something
-//! different. Always seed them with [`hal_tiling_config_default`] /
-//! [`hal_merge_config_default`] before overriding fields.
+//! [`HalTilingConfig`] and [`HalMergeConfig`] are passed by value. Zero-init
+//! (`memset(0)`) does **not** match the library defaults — e.g. overlap would
+//! be `0` instead of `0.2`, and the merge metric/`max_det` would not match
+//! IOS / 300 — even though `HAL_FIT_STRETCH` happens to be `0`. Always seed
+//! them with [`hal_tiling_config_default`] / [`hal_merge_config_default`]
+//! before overriding fields.
 //!
 //! ## Box list I/O
 //!
@@ -81,8 +82,8 @@ impl From<MatchMetric> for HalMatchMetric {
 /// Static tiling configuration (independent of frame size). Passed by value.
 ///
 /// Seed with `hal_tiling_config_default()` then override fields; do **not**
-/// `memset(0)` — a zero `fit` happens to be `HAL_FIT_STRETCH` but a zero
-/// `overlap_ratio` differs from the default 0.2.
+/// `memset(0)` — that zeroes `overlap_ratio` (default is 0.2) even though
+/// `fit == 0` happens to equal `HAL_FIT_STRETCH`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HalTilingConfig {

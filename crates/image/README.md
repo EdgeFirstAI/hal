@@ -231,7 +231,8 @@ let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
 // plan_tiles is pure geometry (no GPU): use its length to size the batch.
 let placements = processor.plan_tiles(src_w, src_h, &cfg)?;
 
-// One tall [N*tile_h, tile_w, C] destination — allocate once, reuse per frame.
+// One tall [tile_w, N*tile_h] destination (width × stacked height) —
+// allocate once, reuse per frame.
 let mut batch = processor.alloc_tile_batch(
     placements.len(), &cfg,
     PixelFormat::Rgb, DType::U8, None, CpuAccess::None,

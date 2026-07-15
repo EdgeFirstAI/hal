@@ -71,9 +71,12 @@ impl TilingConfig {
         self
     }
 
-    /// Set the fit mode (builder). For `Fit::Letterbox` the configured `pad` is
-    /// used.
+    /// Set the fit mode (builder). When switching to [`Fit::Letterbox`], also
+    /// copies that variant's pad into [`Self::pad`] so the two stay in sync.
     pub fn with_fit(mut self, fit: Fit) -> Self {
+        if let Fit::Letterbox { pad } = fit {
+            self.pad = pad;
+        }
         self.fit = fit;
         self
     }
@@ -102,17 +105,21 @@ impl TilingConfig {
 }
 
 /// EvenDist 1-D tile origins along one axis. Mirrors adis-uav-model `sahi()`:
-/// `overlap` is the minimum; origins are redistributed evenly so the first is
-/// `0`, the last is `frame - tile`, and the realized step is `>= (1-overlap)`.
+/// `overlap` is the *minimum*; origins are redistributed evenly so the first
+/// is `0`, the last is `frame - tile`, and the realized step is
+/// `<= floor(tile * (1 - overlap))` (realized overlap `>=` requested).
 /// Returns `[0]` when the frame is no larger than the tile.
 fn axis_origins(frame: usize, tile: usize, overlap: f64) -> Vec<usize> {
     if frame <= tile {
         return vec![0];
     }
     let last = frame - tile;
-    // saturating_sub + max(1): never underflow or div_ceil(0), even for a
-    // pathological overlap (config validation rejects >= 1.0 up front).
-    let max_step = tile.saturating_sub((overlap * tile as f64) as usize).max(1);
+    // Use floor(tile*(1-overlap)), not tile-floor(overlap*tile): the latter can
+    // be 1px larger than tile*(1-overlap) for non-integer ratios (e.g. 0.333),
+    // which would under-count tiles and realize less than the requested overlap.
+    // Clamp to >= 1 so a pathological overlap never div_ceil(0) (config
+    // validation already rejects overlap >= 1.0 up front).
+    let max_step = ((1.0 - overlap) * tile as f64).floor().max(1.0) as usize;
     let total = last.div_ceil(max_step);
     (0..=total)
         .map(|i| (i as f32 * last as f32 / total as f32).round() as usize)
@@ -275,10 +282,10 @@ impl ImageProcessor {
         let count = placements.len();
 
         let dst_h = dst_batched.height().ok_or(Error::NotAnImage)?;
-        if dst_h < count.saturating_mul(cfg.tile_h) {
+        let required_h = count.saturating_mul(cfg.tile_h);
+        if dst_h < required_h {
             return Err(Error::InvalidShape(format!(
-                "tile_into dst height {dst_h} < count*tile_h {}",
-                count * cfg.tile_h
+                "tile_into dst height {dst_h} < count*tile_h {required_h}"
             )));
         }
 
@@ -320,16 +327,16 @@ impl ImageProcessor {
         placement: &TilePlacement,
         cfg: &TilingConfig,
     ) -> Result<()> {
-        let (ox, oy) = placement.origin;
-        let (cw, ch) = placement.crop_size;
-        let source = Region::new(ox as usize, oy as usize, cw as usize, ch as usize);
+        let source = placement_to_source_region(placement)?;
         let crop = Crop::default().with_source(Some(source)).with_fit(cfg.fit);
 
         // Destination is a row-band of the tall parent (packed) or the slot
-        // itself. For a tall batched parent, address this tile's band.
+        // itself. Decide batched vs slot from capacity vs. `placement.count`,
+        // not merely `dst_h > tile_h` — a padded `tile_one` slot can be taller
+        // than `tile_h` without being a tall parent.
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        if dst_h > cfg.tile_h {
-            // Tall parent: this tile's vertical band.
+        let batched = dst_h >= placement.count.saturating_mul(cfg.tile_h);
+        if batched {
             let mut band = dst.view(Region::new(
                 0,
                 placement.index * cfg.tile_h,
@@ -342,6 +349,43 @@ impl ImageProcessor {
         }
         Ok(())
     }
+}
+
+/// Validate a [`TilePlacement`]'s origin/crop and convert to a pixel [`Region`].
+///
+/// Rejects negative, non-finite, or non-integral (after truncation) geometry
+/// that Python/C callers could otherwise smuggle in via the public placement
+/// constructors.
+fn placement_to_source_region(placement: &TilePlacement) -> Result<Region> {
+    let (ox, oy) = placement.origin;
+    let (cw, ch) = placement.crop_size;
+    for (name, v) in [("origin.x", ox), ("origin.y", oy), ("crop.w", cw), ("crop.h", ch)] {
+        if !v.is_finite() || v < 0.0 {
+            return Err(Error::CropInvalid(format!(
+                "tile placement {name} must be finite and non-negative, got {v}"
+            )));
+        }
+    }
+    let (ox_i, oy_i, cw_i, ch_i) = (ox as usize, oy as usize, cw as usize, ch as usize);
+    // Reject fractional values that would silently truncate (e.g. origin.x=1.5).
+    for (name, f, i) in [
+        ("origin.x", ox, ox_i),
+        ("origin.y", oy, oy_i),
+        ("crop.w", cw, cw_i),
+        ("crop.h", ch, ch_i),
+    ] {
+        if (f - i as f32).abs() > f32::EPSILON {
+            return Err(Error::CropInvalid(format!(
+                "tile placement {name} must be an integral pixel value, got {f}"
+            )));
+        }
+    }
+    if cw_i == 0 || ch_i == 0 {
+        return Err(Error::CropInvalid(
+            "tile placement crop size must be non-zero".into(),
+        ));
+    }
+    Ok(Region::new(ox_i, oy_i, cw_i, ch_i))
 }
 
 #[cfg(test)]
@@ -443,11 +487,53 @@ mod tests {
 
     #[test]
     fn rounding_uses_f32_path() {
-        // overlap 0.333 on a large frame: exercise the f32 round() path.
+        // overlap 0.333 on a large frame: exercise the f32 round() path AND
+        // the floor(tile*(1-overlap)) minimum-overlap contract (max_step must
+        // be 426, not 427 — tile - floor(overlap*tile) would under-count).
         let xs = axis_origins(4000, 640, 0.333);
         assert_eq!(xs[0], 0);
         assert_eq!(*xs.last().unwrap(), 4000 - 640);
         assert!(xs.windows(2).all(|w| w[0] <= w[1]));
+        let max_step = xs.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        let realized = 1.0 - (max_step as f64 / 640.0);
+        assert!(
+            realized >= 0.333 - 1e-9,
+            "realized overlap {realized} < 0.333 (max_step={max_step})"
+        );
+    }
+
+    #[test]
+    fn with_fit_letterbox_syncs_pad() {
+        let pad = [1, 2, 3, 4];
+        let cfg = TilingConfig::new(640, 640).with_fit(Fit::Letterbox { pad });
+        assert_eq!(cfg.fit, Fit::Letterbox { pad });
+        assert_eq!(cfg.pad, pad);
+    }
+
+    #[test]
+    fn placement_to_source_region_rejects_invalid() {
+        let good = TilePlacement {
+            index: 0,
+            count: 1,
+            origin: (10.0, 20.0),
+            crop_size: (640.0, 640.0),
+            letterbox: None,
+            frame_dims: (3840.0, 2160.0),
+        };
+        assert!(placement_to_source_region(&good).is_ok());
+
+        let mut bad = good;
+        bad.origin.0 = -1.0;
+        assert!(placement_to_source_region(&bad).is_err());
+        bad = good;
+        bad.origin.0 = f32::NAN;
+        assert!(placement_to_source_region(&bad).is_err());
+        bad = good;
+        bad.origin.0 = 1.5;
+        assert!(placement_to_source_region(&bad).is_err());
+        bad = good;
+        bad.crop_size.0 = 0.0;
+        assert!(placement_to_source_region(&bad).is_err());
     }
 
     #[test]

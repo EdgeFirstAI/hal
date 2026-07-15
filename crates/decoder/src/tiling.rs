@@ -396,9 +396,15 @@ impl TiledFrameAccumulator {
 
     /// Merge then renormalize to `[0,1]` by `frame_dims` (for the tracker,
     /// matching the non-tiled normalized-detection contract).
+    ///
+    /// Returns an empty list when `frame_dims` are non-finite or non-positive
+    /// rather than emitting Inf/NaN coordinates.
     #[must_use]
     pub fn finalize_normalized(self) -> Vec<DetectBox> {
         let (fw, fh) = self.frame_dims;
+        if !(fw.is_finite() && fh.is_finite() && fw > 0.0 && fh > 0.0) {
+            return Vec::new();
+        }
         let inv_w = 1.0 / fw;
         let inv_h = 1.0 / fh;
         let mut merged = merge_tiled_detections(self.dets, &self.cfg);
@@ -856,6 +862,29 @@ mod tests {
             assert!((n.bbox.ymin - p.bbox.ymin / fh).abs() < 1e-4);
             assert!((n.bbox.xmax - p.bbox.xmax / fw).abs() < 1e-4);
             assert!((n.bbox.ymax - p.bbox.ymax / fh).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn finalize_normalized_rejects_invalid_frame_dims() {
+        let cfg = MergeConfig::default();
+        let boxes = vec![det([10.0, 10.0, 40.0, 40.0], 0.9, 0)];
+        for frame in [(0.0, 640.0), (1280.0, 0.0), (f32::NAN, 640.0), (1280.0, f32::INFINITY)]
+        {
+            let p = TilePlacement {
+                index: 0,
+                count: 1,
+                origin: (0.0, 0.0),
+                crop_size: (640.0, 640.0),
+                letterbox: None,
+                frame_dims: frame,
+            };
+            let mut acc = TiledFrameAccumulator::new(frame, 1, cfg, 8);
+            acc.push_tile(boxes.clone(), &p);
+            assert!(
+                acc.finalize_normalized().is_empty(),
+                "expected empty for frame_dims={frame:?}"
+            );
         }
     }
 
