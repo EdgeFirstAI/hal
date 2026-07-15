@@ -437,8 +437,14 @@ mod tests {
     #[test]
     fn mem_tensor_falls_through_untouched() {
         let mut probe = NvJpegProbe::default();
-        let mut dst =
-            Tensor::<u8>::image(64, 64, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // The `cuda()` gate fires before the headers are consulted, but parse the
         // fixture unconditionally so a broken `MINIMAL_JPEG` fails the test loudly
         // instead of silently skipping the `try_decode` call.
@@ -477,8 +483,14 @@ mod tests {
     #[test]
     fn unavailable_probe_returns_none_without_touching_tensor() {
         let mut probe = NvJpegProbe::Unavailable;
-        let mut dst =
-            Tensor::<u8>::image(64, 64, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
         let r = probe.try_decode::<u8>(
@@ -530,8 +542,14 @@ mod tests {
             matches!(probe, NvJpegProbe::Unprobed),
             "default must be Unprobed"
         );
-        let mut dst =
-            Tensor::<u8>::image(64, 64, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = Tensor::<u8>::image(
+            64,
+            64,
+            PixelFormat::Nv12,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let headers =
             crate::jpeg::markers::parse_markers(MINIMAL_JPEG).expect("MINIMAL_JPEG must parse");
         // First call probes; without CUDA the library is absent → Unavailable.

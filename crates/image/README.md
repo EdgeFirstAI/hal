@@ -34,7 +34,7 @@ neighbours:
 ```rust
 use edgefirst_image::{save_jpeg, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
-use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorDyn, TensorMemory};
+use edgefirst_tensor::{CpuAccess, PixelFormat, DType, Tensor, TensorDyn, TensorMemory};
 
 // Decode an image into its native format. The codec reports the source's
 // native pixel format (JPEG -> NV12/GREY, PNG -> RGB/RGBA/GREY) and sizes,
@@ -42,7 +42,8 @@ use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorDyn, TensorMemory};
 let bytes = std::fs::read("input.jpg")?;
 let info = peek_info(&bytes)?;
 let mut decoder = ImageDecoder::new();
-let mut src = Tensor::<u8>::image(info.width, info.height, info.format, Some(TensorMemory::Mem))?;
+let mut src = Tensor::<u8>::image(info.width, info.height, info.format, Some(TensorMemory::Mem),
+    CpuAccess::ReadWrite)?;
 src.load_image(&mut decoder, &bytes)?;
 let src = TensorDyn::from(src);
 
@@ -51,7 +52,8 @@ let mut processor = ImageProcessor::new()?;
 
 // Create destination with desired size and format (the convert below
 // handles NV12 -> RGBA color conversion, resize, and letterboxing)
-let mut dst = processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None)?;
+let mut dst =
+    processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None, CpuAccess::ReadWrite)?;
 
 // Convert with resize, rotation, letterboxing
 processor.convert(
@@ -195,7 +197,8 @@ optimal memory backend (DMA-buf, PBO, or system memory). This enables
 zero-copy GPU paths that direct `Tensor::new()` allocation cannot achieve:
 
 ```rust,ignore
-let mut dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
 ```
 
@@ -219,6 +222,7 @@ N tiles cost roughly one GPU sync rather than N.
 
 ```rust,ignore
 use edgefirst_image::TilingConfig;
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 // 640x640 tiles, >=20% overlap (the minimum; actual overlap is redistributed
 // evenly so every tile is full-size and the last tile lands flush at frame-tile).
@@ -230,7 +234,7 @@ let placements = processor.plan_tiles(src_w, src_h, &cfg)?;
 // One tall [N*tile_h, tile_w, C] destination — allocate once, reuse per frame.
 let mut batch = processor.alloc_tile_batch(
     placements.len(), &cfg,
-    PixelFormat::Rgb, DType::U8, None,
+    PixelFormat::Rgb, DType::U8, None, CpuAccess::None,
 )?;
 
 // Render all tiles (deferred convert per tile + single flush). Returns the same
@@ -284,7 +288,8 @@ processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())
 For the reverse direction (HAL allocates, consumer imports):
 
 ```rust,ignore
-let hal_dst = processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None)?;
+let hal_dst =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 let fd = hal_dst.dmabuf_clone()?;  // Error if not DMA-backed
 vxdelegate.register_buffer(fd)?;
 ```

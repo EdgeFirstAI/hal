@@ -52,7 +52,7 @@ struct Cell {
     use_dma: bool,
 }
 
-const CELLS: [Cell; 4] = [
+const CELLS: [Cell; 6] = [
     Cell {
         tag: "gpu_bound",
         src_fmt: PixelFormat::Nv12,
@@ -100,6 +100,33 @@ const CELLS: [Cell; 4] = [
         letterbox: true,
         use_dma: true,
     },
+    // The RGBA→PlanarF16 DIRECT path (not the fused NV two-pass): the only
+    // cells that exercise per-frame float SOURCE feeding — zero-copy source
+    // import vs CPU map+upload (`feed_float_src`). Two sizes because the
+    // upload cost scales with source bytes (~2.5 GB/s): 720p ≈ 3.7 MB,
+    // 1080p ≈ 8.3 MB per frame on the upload path.
+    Cell {
+        tag: "f16_rgba_src",
+        src_fmt: PixelFormat::Rgba,
+        src_w: 1280,
+        src_h: 720,
+        dst_fmt: PixelFormat::PlanarRgb,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
+    Cell {
+        tag: "f16_rgba_src_1080p",
+        src_fmt: PixelFormat::Rgba,
+        src_w: 1920,
+        src_h: 1080,
+        dst_fmt: PixelFormat::PlanarRgb,
+        dst_w: 640,
+        dst_h: 640,
+        letterbox: true,
+        use_dma: true,
+    },
 ];
 
 /// Run one (cell, n_procs) configuration; returns per-thread convert counts.
@@ -108,6 +135,17 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
     // is false there and would silently measure CPU-heap converts.
     let mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
         Some(TensorMemory::Dma)
+    } else {
+        Some(TensorMemory::Mem)
+    };
+    // The DESTINATION auto-selects: explicit Some(Dma) now errors loudly
+    // for (format, dtype) combos with no zero-copy mapping (the
+    // explicit-Dma contract) — e.g. the gpu_bound cell's packed-RGB dst on
+    // macOS, which historically byte-bagged and silently measured the CPU
+    // fallback. Auto-select keeps every platform on its honest best path
+    // (Linux: Dma; macOS packed-RGB: Mem + CPU convert).
+    let dst_mem = if cell.use_dma && edgefirst_tensor::is_gpu_buffer_available() {
+        None
     } else {
         Some(TensorMemory::Mem)
     };
@@ -120,7 +158,14 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 let mut proc = ImageProcessor::new()
                     .map_err(|e| format!("processor {i} creation failed: {e}"))?;
                 let src = proc
-                    .create_image(cell.src_w, cell.src_h, cell.src_fmt, DType::U8, mem)
+                    .create_image(
+                        cell.src_w,
+                        cell.src_h,
+                        cell.src_fmt,
+                        DType::U8,
+                        mem,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
                     .map_err(|e| format!("src alloc failed: {e}"))?;
                 {
                     use edgefirst_tensor::TensorMapTrait;
@@ -138,13 +183,20 @@ fn run_config(cell: Cell, n_procs: usize) -> Result<Vec<usize>, String> {
                 // Pre-allocate and REUSE the destination: real pipelines pool
                 // buffers, and per-iteration allocation would measure the
                 // allocator (PBO/DMA churn) instead of convert dispatch.
-                let dst_dtype = if cell.tag == "f16_zero_copy" {
+                let dst_dtype = if cell.tag.starts_with("f16_") {
                     DType::F16
                 } else {
                     DType::U8
                 };
                 let mut dst = proc
-                    .create_image(cell.dst_w, cell.dst_h, cell.dst_fmt, dst_dtype, mem)
+                    .create_image(
+                        cell.dst_w,
+                        cell.dst_h,
+                        cell.dst_fmt,
+                        dst_dtype,
+                        dst_mem,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
                     .map_err(|e| format!("dst alloc failed: {e}"))?;
                 let convert_once = |proc: &mut ImageProcessor, dst: &mut _| -> Result<(), String> {
                     proc.convert(&src, dst, Rotation::None, Flip::None, crop)

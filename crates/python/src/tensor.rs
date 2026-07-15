@@ -173,6 +173,36 @@ pub(crate) fn parse_dtype(dtype: &str) -> Result<DType> {
     }
 }
 
+/// Parse a Python CPU-access string into a `CpuAccess` declaration.
+pub(crate) fn parse_cpu_access(access: &str) -> Result<tensor::CpuAccess> {
+    match access {
+        "none" => Ok(tensor::CpuAccess::None),
+        "read" => Ok(tensor::CpuAccess::Read),
+        "write" => Ok(tensor::CpuAccess::Write),
+        "readwrite" => Ok(tensor::CpuAccess::ReadWrite),
+        _ => Err(Error::Format(format!(
+            "access must be one of none|read|write|readwrite, got {access:?}"
+        ))),
+    }
+}
+
+/// Parse a Python compression-request string into a [`Compression`]
+/// request (`None` input = no request).
+pub(crate) fn parse_compression(compression: Option<&str>) -> Result<Option<tensor::Compression>> {
+    use tensor::{Compression, CompressionScheme};
+    match compression {
+        None => Ok(None),
+        Some("any") => Ok(Some(Compression::Any)),
+        Some("ubwc") => Ok(Some(Compression::Scheme(CompressionScheme::Ubwc))),
+        Some("afbc") => Ok(Some(Compression::Scheme(CompressionScheme::Afbc))),
+        Some("pvric") => Ok(Some(Compression::Scheme(CompressionScheme::Pvric))),
+        Some("dcc") => Ok(Some(Compression::Scheme(CompressionScheme::Dcc))),
+        Some(other) => Err(Error::Format(format!(
+            "compression must be one of any|ubwc|afbc|pvric|dcc, got {other:?}"
+        ))),
+    }
+}
+
 /// Convert a `DType` to a Python dtype string.
 fn dtype_to_str(dtype: DType) -> &'static str {
     match dtype {
@@ -772,6 +802,22 @@ impl PyTensor {
         self.0.memory().into()
     }
 
+    /// The vendor tile-compression scheme recorded at allocation
+    /// (``"ubwc"``/``"afbc"``/``"pvric"``/``"dcc"``), or ``None`` for a
+    /// linear layout. A compressed tensor has no meaningful linear row
+    /// stride and CPU maps are best-effort.
+    #[getter]
+    fn compression(&self) -> Option<&'static str> {
+        use edgefirst_hal::tensor::CompressionScheme;
+        match self.0.compression()? {
+            CompressionScheme::Ubwc => Some("ubwc"),
+            CompressionScheme::Afbc => Some("afbc"),
+            CompressionScheme::Pvric => Some("pvric"),
+            CompressionScheme::Dcc => Some("dcc"),
+            _ => None,
+        }
+    }
+
     #[getter]
     fn name(&self) -> String {
         self.0.name()
@@ -922,18 +968,30 @@ impl PyTensor {
     // ── Image-specific methods ──────────────────────────────────────────
 
     /// Create an image tensor with the given dimensions and pixel format.
+    ///
+    /// `access` declares CPU access (`"none"`, `"read"`, `"write"`,
+    /// `"readwrite"`); hardware access is always implied. Scripts that
+    /// `map()` or `numpy()` the tensor should pass `access="readwrite"`.
     #[staticmethod]
-    #[pyo3(signature = (width, height, format, mem = None))]
+    #[pyo3(signature = (width, height, format, mem = None, access = "none"))]
     fn image(
         width: usize,
         height: usize,
         format: crate::image::PyPixelFormat,
         mem: Option<PyTensorMemory>,
+        access: &str,
     ) -> Result<Self> {
         use edgefirst_hal::tensor::PixelFormat;
         let fmt: PixelFormat = format.into();
         let memory = mem.map(|x| x.into());
-        let tensor = TensorDyn::image(width, height, fmt, DType::U8, memory)?;
+        let tensor = TensorDyn::image(
+            width,
+            height,
+            fmt,
+            DType::U8,
+            memory,
+            parse_cpu_access(access)?,
+        )?;
         Ok(PyTensor(tensor))
     }
 

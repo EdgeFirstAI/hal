@@ -43,7 +43,14 @@ const TILE_H: usize = 640;
 /// Synthesize an NV12 source: Y plane = luma gradient, chroma = neutral 128.
 fn make_nv12_src(proc: &ImageProcessor) -> Option<TensorDyn> {
     let src = proc
-        .create_image(IN_W, IN_H, PixelFormat::Nv12, DType::U8, None)
+        .create_image(
+            IN_W,
+            IN_H,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
         .ok()?;
     {
         let t = src.as_u8().expect("u8 source");
@@ -110,9 +117,18 @@ fn main() {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
-        .or_else(|_| TensorDyn::image(TILE_W, n * TILE_H, PixelFormat::Rgba, DType::U8, None))
-        {
+        .or_else(|_| {
+            TensorDyn::image(
+                TILE_W,
+                n * TILE_H,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+        }) {
             Ok(p) => p,
             Err(e) => {
                 println!("  n={n}: [skipped: batched destination alloc failed: {e}]");
@@ -161,7 +177,14 @@ fn main() {
             let mut dsts: Vec<TensorDyn> = Vec::with_capacity(n);
             let mut alloc_failed = false;
             for _ in 0..n {
-                match proc.create_image(TILE_W, TILE_H, PixelFormat::Rgba, DType::U8, None) {
+                match proc.create_image(
+                    TILE_W,
+                    TILE_H,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                ) {
                     Ok(d) => dsts.push(d),
                     Err(e) => {
                         println!("  n={n}: [skipped: eager destination alloc failed: {e}]");

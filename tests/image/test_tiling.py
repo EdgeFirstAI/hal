@@ -138,10 +138,10 @@ def test_tile_into_round_trip():
 
     # 128x64 frame, 64x64 tile, no overlap => 2 tiles side by side.
     try:
-        src = proc.create_image(128, 64, PixelFormat.Rgba)
+        src = proc.create_image(128, 64, PixelFormat.Rgba, access="readwrite")
         placements = proc.plan_tiles(128, 64, cfg)
         n = len(placements)
-        dst = proc.alloc_tile_batch(n, cfg, PixelFormat.Rgba)
+        dst = proc.alloc_tile_batch(n, cfg, PixelFormat.Rgba, access="readwrite")
     except (RuntimeError, AttributeError) as e:
         pytest.skip(f"GPU/image backend unavailable: {e}")
 

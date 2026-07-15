@@ -97,6 +97,13 @@ must `cargo build` first.
   `NEUTRON_ENABLE_ZERO_COPY=1`.
 - **No special features required** for the Rust-side tests; default
   features build the full FFI surface.
+- **The C suite is gcc-built and invisible to cargo.** The `test_*.c`
+  programs compile against the committed header via the Makefile, so
+  cargo-driven sweeps and `cargo check` diagnostics never see these call
+  sites. ABI-breaking changes (e.g. the required `HalCpuAccess`
+  parameter on the image constructors — every C call site passes
+  `HAL_CPU_ACCESS_READ_WRITE`) must be applied here separately; the CI
+  lanes that run `make test` are the backstop.
 
 ## Coverage Notes
 

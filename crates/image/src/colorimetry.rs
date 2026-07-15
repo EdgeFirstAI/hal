@@ -130,11 +130,27 @@ mod tests {
 
     #[test]
     fn heuristic_hd_is_709_limited_sd_is_601_limited() {
-        let hd = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let hd = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let r = effective_colorimetry(&hd);
         assert_eq!(r.encoding, Some(ColorEncoding::Bt709));
         assert_eq!(r.range, Some(ColorRange::Limited));
-        let sd = TensorDyn::image(640, 480, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let sd = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let r = effective_colorimetry(&sd);
         assert_eq!(r.encoding, Some(ColorEncoding::Bt601));
         assert_eq!(r.range, Some(ColorRange::Limited));
@@ -142,7 +158,15 @@ mod tests {
 
     #[test]
     fn specified_axes_win_only_missing_filled() {
-        let mut t = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let mut t = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         t.set_colorimetry(Some(Colorimetry::default().with_range(ColorRange::Full)));
         let r = effective_colorimetry(&t);
         assert_eq!(r.range, Some(ColorRange::Full)); // kept
@@ -151,7 +175,15 @@ mod tests {
 
     #[test]
     fn resolver_does_not_mutate_tensor() {
-        let t = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let t = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let _ = effective_colorimetry(&t);
         assert_eq!(t.colorimetry(), None); // unchanged
     }

@@ -77,16 +77,155 @@ pub enum HalTensorMemory {
     Pbo = 3,
 }
 
+/// Declared CPU involvement for an image tensor, chosen at allocation.
+///
+/// Hardware (GPU/NPU/ISP/codec) access is always implied; CPU access is
+/// the opt-in. HAL_CPU_ACCESS_NONE (the default for hardware pipelines)
+/// makes the buffer eligible for vendor tile compression on Android and
+/// skips CPU cache maintenance; mapping such a tensor is best-effort and
+/// counted (see hal_unplanned_cpu_access_count). Write selects a
+/// write-combined mapping where supported; Read a cached mapping.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalCpuAccess {
+    /// Hardware-only buffer: no CPU mapping declared.
+    None = 0,
+    /// CPU reads (verification, CPU consumers).
+    Read = 1,
+    /// CPU writes (decode targets).
+    Write = 2,
+    /// CPU reads and writes (the pre-CpuAccess implicit behavior).
+    ReadWrite = 3,
+}
+
+impl From<HalCpuAccess> for edgefirst_tensor::CpuAccess {
+    fn from(a: HalCpuAccess) -> Self {
+        match a {
+            HalCpuAccess::None => edgefirst_tensor::CpuAccess::None,
+            HalCpuAccess::Read => edgefirst_tensor::CpuAccess::Read,
+            HalCpuAccess::Write => edgefirst_tensor::CpuAccess::Write,
+            HalCpuAccess::ReadWrite => edgefirst_tensor::CpuAccess::ReadWrite,
+        }
+    }
+}
+
+/// Number of tensor maps that exceeded the buffer's declared CPU access
+/// since process start (including any map of a HAL_CPU_ACCESS_NONE
+/// buffer). A pipeline that declares its CPU access correctly holds this
+/// flat; each offending buffer also logs one warning.
+///
+/// @return Monotonic process-wide counter
+#[no_mangle]
+pub extern "C" fn hal_unplanned_cpu_access_count() -> u64 {
+    edgefirst_tensor::unplanned_cpu_access_count()
+}
+
+/// Tile-compression request/recording for image tensors.
+///
+/// As a request (hal_image_desc_set_compression): HAL_COMPRESSION_ANY
+/// asks for the device's native scheme with a counted linear fallback;
+/// a specific scheme value requires exactly that scheme (allocation
+/// fails otherwise); HAL_COMPRESSION_NONE clears the request.
+///
+/// As a recording (hal_tensor_compression): the scheme the allocation
+/// actually holds — HAL_COMPRESSION_NONE means linear. A compressed
+/// tensor has no meaningful linear row stride and CPU maps are
+/// best-effort.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HalCompression {
+    /// Linear layout (recording) / no compression request (request).
+    None = 0,
+    /// Request only: the device's native scheme, linear fallback counted.
+    Any = 1,
+    /// Qualcomm Adreno Universal Bandwidth Compression.
+    Ubwc = 2,
+    /// Arm Mali/Immortalis Framebuffer Compression.
+    Afbc = 3,
+    /// Imagination PowerVR Image Compression.
+    Pvric = 4,
+    /// Samsung Xclipse Delta Color Compression.
+    Dcc = 5,
+}
+
+impl From<HalCompression> for Option<edgefirst_tensor::Compression> {
+    fn from(c: HalCompression) -> Self {
+        use edgefirst_tensor::{Compression, CompressionScheme};
+        match c {
+            HalCompression::None => None,
+            HalCompression::Any => Some(Compression::Any),
+            HalCompression::Ubwc => Some(Compression::Scheme(CompressionScheme::Ubwc)),
+            HalCompression::Afbc => Some(Compression::Scheme(CompressionScheme::Afbc)),
+            HalCompression::Pvric => Some(Compression::Scheme(CompressionScheme::Pvric)),
+            HalCompression::Dcc => Some(Compression::Scheme(CompressionScheme::Dcc)),
+        }
+    }
+}
+
+impl From<Option<edgefirst_tensor::CompressionScheme>> for HalCompression {
+    fn from(s: Option<edgefirst_tensor::CompressionScheme>) -> Self {
+        use edgefirst_tensor::CompressionScheme;
+        match s {
+            None => HalCompression::None,
+            Some(CompressionScheme::Ubwc) => HalCompression::Ubwc,
+            Some(CompressionScheme::Afbc) => HalCompression::Afbc,
+            Some(CompressionScheme::Pvric) => HalCompression::Pvric,
+            Some(CompressionScheme::Dcc) => HalCompression::Dcc,
+            // CompressionScheme is #[non_exhaustive]: record unknown
+            // future schemes as linear at this ABI level rather than
+            // inventing a value the header doesn't name.
+            #[allow(unreachable_patterns)]
+            Some(_) => HalCompression::None,
+        }
+    }
+}
+
+/// The vendor tile-compression scheme recorded on a tensor at
+/// allocation, or HAL_COMPRESSION_NONE for a linear layout (also
+/// returned for NULL).
+///
+/// @param tensor Tensor handle
+/// @return Recorded scheme (never HAL_COMPRESSION_ANY)
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_compression(tensor: *const HalTensor) -> HalCompression {
+    let Some(tensor) = (unsafe { tensor.as_ref() }) else {
+        return HalCompression::None;
+    };
+    tensor.inner.compression().into()
+}
+
+/// Number of HAL_COMPRESSION_ANY requests since process start that
+/// resolved to a linear layout instead of a vendor tile scheme. A
+/// pipeline that expects compressed destinations asserts this stays
+/// flat after warmup.
+///
+/// @return Monotonic process-wide counter
+#[no_mangle]
+pub extern "C" fn hal_compression_fallback_count() -> u64 {
+    edgefirst_tensor::compression_fallback_count()
+}
+
 impl From<HalTensorMemory> for Option<TensorMemory> {
     fn from(mem: HalTensorMemory) -> Self {
         match mem {
             HalTensorMemory::Mem => Some(TensorMemory::Mem),
-            // Dma covers DMA-BUF on Linux and IOSurface on macOS.
-            // On platforms without a GPU-buffer backend, fall back to Mem
-            // so callers don't get a misleading ENOMEM.
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            // Dma covers DMA-BUF on Linux, IOSurface on macOS/iOS, and
+            // AHardwareBuffer on Android. On platforms without a
+            // GPU-buffer backend, fall back to Mem so callers don't get a
+            // misleading ENOMEM.
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ))]
             HalTensorMemory::Dma => Some(TensorMemory::Dma),
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            )))]
             HalTensorMemory::Dma => Some(TensorMemory::Mem),
             #[cfg(unix)]
             HalTensorMemory::Shm => Some(TensorMemory::Shm),
@@ -415,9 +554,9 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
 /// - EINVAL: NULL shape, NULL surface_ref, ndim outside [1, 8], or
 ///   shape footprint exceeds the IOSurface allocation
 /// - EIO: Failed to import IOSurface (e.g. dead pointer)
-/// - ENOTSUP: Not supported on this platform (non-macOS)
+/// - ENOTSUP: Not supported on this platform (non-Apple)
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_from_iosurface(
     dtype: HalDtype,
     surface_ref: *mut std::ffi::c_void,
@@ -443,7 +582,7 @@ pub unsafe extern "C" fn hal_tensor_from_iosurface(
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_from_iosurface(
     _dtype: HalDtype,
     _surface_ref: *mut std::ffi::c_void,
@@ -452,6 +591,260 @@ pub unsafe extern "C" fn hal_tensor_from_iosurface(
     _name: *const c_char,
 ) -> *mut HalTensor {
     set_error_null(libc::ENOTSUP)
+}
+
+/// Wrap an existing AHardwareBuffer as a tensor (Android only).
+///
+/// The buffer is acquired (refcounted) for the tensor's lifetime; the
+/// caller keeps its own reference and releases it independently
+/// (AHardwareBuffer_release). The Android analog of
+/// hal_tensor_from_iosurface().
+///
+/// Use this to import buffers from CameraX/ImageReader (via
+/// AHardwareBuffer from the Java HardwareBuffer's JNI handle), NNAPI, or
+/// cross-process binder transfers. A wrapped buffer carries a shape but
+/// no image metadata — call hal_tensor_set_format() (and, when the
+/// producer pads rows, hal_tensor_set_row_stride()) before convert().
+///
+/// **GL backend interaction**: the resulting tensor reports
+/// HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by the
+/// GL backend as an EGLImage with no extra copy.
+///
+/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
+/// @param buffer Pointer to a valid AHardwareBuffer (typed as void*)
+/// @param shape Array of dimension sizes (ndim elements). The footprint
+///              must fit the buffer's allocation; HAL rejects mismatched
+///              shapes with EINVAL rather than risking out-of-bounds maps.
+/// @param ndim Number of dimensions (1-8)
+/// @param name Optional tensor name for debugging (can be NULL)
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL shape, NULL buffer, ndim outside [1, 8], or shape
+///   footprint exceeds the buffer allocation
+/// - EIO: Failed to acquire/describe the AHardwareBuffer
+/// - ENOTSUP: Not supported on this platform (non-Android)
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_from_hardware_buffer(
+    dtype: HalDtype,
+    buffer: *mut std::ffi::c_void,
+    shape: *const size_t,
+    ndim: size_t,
+    name: *const c_char,
+) -> *mut HalTensor {
+    check_null_ret_null!(shape, buffer);
+    if ndim == 0 || ndim > 8 {
+        return set_error_null(libc::EINVAL);
+    }
+
+    let shape_slice = unsafe { std::slice::from_raw_parts(shape, ndim) };
+    let name_opt = unsafe { c_str_to_option(name) };
+    let dt: DType = dtype.into();
+
+    let tensor = try_or_null!(
+        unsafe { TensorDyn::from_hardware_buffer(buffer, shape_slice, dt, name_opt) },
+        libc::EIO
+    );
+    Box::into_raw(Box::new(HalTensor { inner: tensor }))
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_from_hardware_buffer(
+    _dtype: HalDtype,
+    _buffer: *mut std::ffi::c_void,
+    _shape: *const size_t,
+    _ndim: size_t,
+    _name: *const c_char,
+) -> *mut HalTensor {
+    set_error_null(libc::ENOTSUP)
+}
+
+/// Borrow the raw AHardwareBuffer backing a tensor (Android only).
+///
+/// The NPU-direct handle: pass it to
+/// ANeuralNetworksMemory_createFromAHardwareBuffer (NNAPI) or a LiteRT
+/// delegate so the accelerator consumes the convert output with no CPU
+/// readback. When hal_image_processor_convert() returns, the GPU has
+/// finished writing and the handle is safe to hand off (see
+/// hal_image_processor_convert_fence() for the non-blocking variant).
+/// Check hal_tensor_recorded_row_stride() first: a nonzero value means
+/// the rows are padded and a flat-layout consumer needs
+/// hal_tensor_copy_to_flat() instead.
+///
+/// The returned pointer is borrowed; its lifetime is tied to the tensor
+/// handle. If it must outlive the tensor, call AHardwareBuffer_acquire()
+/// and pair it with AHardwareBuffer_release().
+///
+/// @param tensor Tensor handle
+/// @return Borrowed AHardwareBuffer pointer (typed as void*) on success,
+///         NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+/// - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_ptr(
+    tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    match unsafe { &*tensor }.inner.hardware_buffer_ptr() {
+        Some(ptr) => ptr,
+        None => {
+            set_error(libc::ENOTSUP);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_ptr(
+    _tensor: *const HalTensor,
+) -> *mut std::ffi::c_void {
+    set_error(libc::ENOTSUP);
+    std::ptr::null_mut()
+}
+
+/// Physical AHardwareBuffer dimensions in texels (Android only).
+///
+/// Independent of the logical tensor shape: packed representations (the
+/// planar-F16 RGBA16F surface, the RGB-in-RGBA8888 surface) allocate at
+/// packed dims, and gralloc chooses its own pitch. NPU consumers that
+/// describe the buffer to NNAPI need these, not the logical shape.
+///
+/// @param tensor Tensor handle
+/// @param width Out: physical width in texels (must not be NULL)
+/// @param height Out: physical height in texels (must not be NULL)
+/// @return 0 on success, -1 on error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor or NULL out-pointer
+/// - ENOTSUP: Tensor is not AHardwareBuffer-backed, or non-Android
+#[no_mangle]
+#[cfg(target_os = "android")]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_physical_dims(
+    tensor: *const HalTensor,
+    width: *mut size_t,
+    height: *mut size_t,
+) -> c_int {
+    check_null!(tensor, width, height);
+    match unsafe { &*tensor }.inner.hardware_buffer_physical_dims() {
+        Some((w, h)) => {
+            unsafe {
+                *width = w;
+                *height = h;
+            }
+            0
+        }
+        None => set_error(libc::ENOTSUP),
+    }
+}
+
+/// cbindgen:ignore
+#[no_mangle]
+#[cfg(not(target_os = "android"))]
+pub unsafe extern "C" fn hal_tensor_hardware_buffer_physical_dims(
+    _tensor: *const HalTensor,
+    _width: *mut size_t,
+    _height: *mut size_t,
+) -> c_int {
+    set_error(libc::ENOTSUP)
+}
+
+/// Recorded row stride in bytes, or 0 when the tensor is tightly packed.
+///
+/// The flatness check: a nonzero value means the allocator padded the
+/// row pitch (gralloc on Android, IOSurface 64-byte alignment on macOS,
+/// GPU pitch alignment on Linux) and the buffer is NOT flat — CPU
+/// consumers must iterate rows at this stride (or use
+/// hal_tensor_copy_to_flat()), and NPU consumers must either describe
+/// the pitch to the runtime or repack. Unlike hal_tensor_row_stride()
+/// (which reports the effective walk pitch and is nonzero for every
+/// image), 0 here positively means "no padding — the buffer is flat".
+///
+/// @param tensor Tensor handle
+/// @return Recorded stride in bytes; 0 when tightly packed or on error
+///         (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_recorded_row_stride(tensor: *const HalTensor) -> size_t {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return 0;
+    }
+    unsafe { &*tensor }.inner.row_stride().unwrap_or(0)
+}
+
+/// Effective row stride in bytes: the recorded stride if set, otherwise
+/// the tight pitch computed from the image format and width.
+///
+/// This is the pitch to walk rows with regardless of padding — the
+/// clearly-named twin of hal_tensor_row_stride() (which has returned the
+/// effective stride since EDGEAI-1176 and is kept for ABI stability).
+/// Returns 0 when the tensor has no image format and no recorded stride
+/// (a plain non-image tensor).
+///
+/// @param tensor Tensor handle
+/// @return Effective stride in bytes; 0 for non-image tensors or on
+///         error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_effective_row_stride(tensor: *const HalTensor) -> size_t {
+    if tensor.is_null() {
+        set_error(libc::EINVAL);
+        return 0;
+    }
+    unsafe { &*tensor }
+        .inner
+        .effective_row_stride()
+        .unwrap_or(0)
+}
+
+/// Copy the tensor's logical bytes into `dst`, compacting away any
+/// recorded row-stride padding.
+///
+/// The flatness helper for NPU handoff: when hal_tensor_row_stride() is
+/// nonzero and the runtime needs a flat layout (e.g. `[1, C, H, W]` for
+/// NNAPI/LiteRT without pitch support), this walks the rows and packs
+/// them tightly into `dst`. On a tight tensor it degenerates to one
+/// memcpy. Zero-copy consumers should prefer
+/// hal_tensor_hardware_buffer_ptr() + the stride and skip this copy.
+///
+/// @param tensor Tensor handle
+/// @param dst Destination buffer (must not be NULL)
+/// @param dst_len Length of `dst` in bytes; must equal the tight
+///                footprint (shape product × element size)
+/// @return 0 on success, -1 on error (check errno)
+/// @par Errors (errno):
+/// - EINVAL: NULL tensor/dst, or dst_len does not match the tight
+///   footprint
+/// - EIO: Mapping the tensor for reading failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_copy_to_flat(
+    tensor: *const HalTensor,
+    dst: *mut u8,
+    dst_len: size_t,
+) -> c_int {
+    check_null!(tensor, dst);
+    let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, dst_len) };
+    match unsafe { &*tensor }.inner.copy_to_flat(dst_slice) {
+        Ok(()) => 0,
+        Err(edgefirst_tensor::Error::InvalidArgument(msg)) => {
+            log::debug!("hal_tensor_copy_to_flat: {msg}");
+            set_error(libc::EINVAL)
+        }
+        Err(e) => {
+            log::debug!("hal_tensor_copy_to_flat: {e:?}");
+            set_error(libc::EIO)
+        }
+    }
 }
 
 /// Free a tensor and release its resources.
@@ -651,9 +1044,9 @@ pub unsafe extern "C" fn hal_tensor_dmabuf_clone(_tensor: *const HalTensor) -> c
 /// @return IOSurfaceID on success, 0 on error (check errno)
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor
-/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_iosurface_id(tensor: *const HalTensor) -> u32 {
     if tensor.is_null() {
         set_error(libc::EINVAL);
@@ -670,13 +1063,13 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(tensor: *const HalTensor) -> u3
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u32 {
     set_error(libc::ENOTSUP);
     0
 }
 
-/// Borrow the raw IOSurfaceRef backing a tensor (macOS only).
+/// Borrow the raw IOSurfaceRef backing a tensor (macOS/iOS only).
 ///
 /// The returned pointer is borrowed; its lifetime is tied to the tensor
 /// handle. The caller does NOT hold a retain count on the returned
@@ -686,7 +1079,7 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u
 /// pointer without a matching CFRetain() first; that would drop the
 /// HalTensor's own retain and produce a use-after-free.
 ///
-/// Use this when you need to pass the IOSurface to a native macOS API
+/// Use this when you need to pass the IOSurface to a native Apple API
 /// (e.g. CIImage, AVSampleBufferDisplayLayer,
 /// CVPixelBufferCreateWithIOSurface) that takes an IOSurfaceRef directly,
 /// without going through the IOSurfaceID indirection.
@@ -698,9 +1091,9 @@ pub unsafe extern "C" fn hal_tensor_iosurface_id(_tensor: *const HalTensor) -> u
 ///         error. Borrowed — do NOT CFRelease without first CFRetaining.
 /// @par Errors (errno):
 /// - EINVAL: NULL tensor
-/// - ENOTSUP: Tensor is not IOSurface-backed, or non-macOS platform
+/// - ENOTSUP: Tensor is not IOSurface-backed, or non-Apple platform
 #[no_mangle]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub unsafe extern "C" fn hal_tensor_iosurface_ref(
     tensor: *const HalTensor,
 ) -> *mut std::ffi::c_void {
@@ -719,7 +1112,7 @@ pub unsafe extern "C" fn hal_tensor_iosurface_ref(
 
 /// cbindgen:ignore
 #[no_mangle]
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub unsafe extern "C" fn hal_tensor_iosurface_ref(
     _tensor: *const HalTensor,
 ) -> *mut std::ffi::c_void {

@@ -213,8 +213,12 @@ where
     /// `byte_size <= capacity_bytes()` first; `map_inner` re-checks against the
     /// backing allocation. `Mem` is always HAL-owned, so the backing covers the
     /// full requested range.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
-        self.map_inner(Some(byte_size))
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size), access)
     }
 
     /// Shared map constructor. When `byte_size_override` is `Some(bytes)`,
@@ -223,7 +227,11 @@ where
     /// that the exposed window `[offset, offset + exposed)` fits the backing
     /// allocation and that `offset` is aligned to `align_of::<T>()` (mirrors
     /// `DmaMap`'s bounds + alignment checks).
-    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+    fn map_inner(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let elem = std::mem::size_of::<T>();
         let exposed = match byte_size_override {
             Some(bytes) => bytes,
@@ -255,6 +263,7 @@ where
             offset: self.offset,
             shape: self.shape.clone(),
             byte_size_override,
+            writable: access.writes(),
             _marker: std::marker::PhantomData,
         }))
     }
@@ -368,8 +377,8 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        self.map_inner(None)
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        self.map_inner(None, access)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -475,6 +484,9 @@ where
     /// `DmaMap`'s override for self-allocated strided tensors whose rows are
     /// padded; callers iterate via `row_stride`.
     byte_size_override: Option<usize>,
+    /// Whether mutable access is permitted (`map_read()` maps are not) —
+    /// enforced uniformly across backends by `assert_map_writable`.
+    writable: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -526,6 +538,7 @@ where
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "Mem");
         // SAFETY: as `as_slice`, plus: the backing elements are `UnsafeCell`, so
         // `base_ptr()` carries write provenance and interior mutation through
         // the shared `Arc` is sound. Distinct sub-region views address

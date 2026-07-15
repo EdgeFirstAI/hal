@@ -159,8 +159,14 @@ fn main() {
 
     for src_fmt in [PixelFormat::Nv12, PixelFormat::Rgba] {
         for src_req in mem_reqs {
-            let src = match proc.create_image(IN_W, IN_H, src_fmt, DType::U8, src_req.to_request())
-            {
+            let src = match proc.create_image(
+                IN_W,
+                IN_H,
+                src_fmt,
+                DType::U8,
+                src_req.to_request(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ) {
                 Ok(s) => s,
                 Err(_) => continue, // backing not available on this target
             };
@@ -172,9 +178,14 @@ fn main() {
                     for dtype in dtypes {
                         // Probe the destination allocation first: its resolved
                         // memory is part of the cell key.
-                        let Ok(mut dst) =
-                            proc.create_image(OUT_W, OUT_H, dst_fmt, dtype, dst_req.to_request())
-                        else {
+                        let Ok(mut dst) = proc.create_image(
+                            OUT_W,
+                            OUT_H,
+                            dst_fmt,
+                            dtype,
+                            dst_req.to_request(),
+                            edgefirst_tensor::CpuAccess::ReadWrite,
+                        ) else {
                             continue;
                         };
                         let name = format!(

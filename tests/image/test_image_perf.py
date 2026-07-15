@@ -44,11 +44,11 @@ def _tensor_from_bytes(data, fmt):
     the same pattern explicitly.
     """
     info = Tensor.peek_image_info(data)
-    native = Tensor.image(info.width, info.height, info.format)
+    native = Tensor.image(info.width, info.height, info.format, access="readwrite")
     native.decode_image(data)
     if native.format == fmt:
         return native
-    out = Tensor.image(info.width, info.height, fmt)
+    out = Tensor.image(info.width, info.height, fmt, access="readwrite")
     ImageProcessor().convert(native, out)
     return out
 
@@ -115,7 +115,7 @@ def test_resize_cpu_rgba_to_rgba(benchmark):
     """Benchmark CPU RGBA to RGBA resize."""
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
 
@@ -133,8 +133,8 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
     cv2 = pytest.importorskip("cv2")
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     def resize(arr, size, dst):
         cv2.resize(arr, size, dst=dst)
@@ -165,7 +165,7 @@ def test_resize_cv2_rgba_to_rgba(benchmark):
 def test_resize_gl_rgba_to_rgba(benchmark):
     """Benchmark GL RGBA to RGBA resize."""
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -187,7 +187,7 @@ def test_resize_g2d_rgba_to_rgba(benchmark):
     """Benchmark G2D RGBA to RGBA resize."""
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -209,7 +209,7 @@ def test_resize_cpu_rgba_to_rgb(benchmark):
     """Benchmark CPU RGBA to RGB resize."""
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -226,8 +226,8 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
     cv2 = pytest.importorskip("cv2")
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     tmp = np.zeros((src.height, src.width, 3), dtype=np.uint8)
 
@@ -261,7 +261,7 @@ def test_resize_cv2_rgba_to_rgb(benchmark):
 def test_resize_g2d_rgba_to_rgb(benchmark):
     """Benchmark G2D RGBA to RGB resize."""
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -286,12 +286,12 @@ def test_resize_cpu_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -310,13 +310,13 @@ def test_resize_cv2_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.yuyv", "rb") as f:
         data = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     tmp = np.zeros((src.height, src.width, 4), dtype=np.uint8)
 
@@ -355,12 +355,12 @@ def test_resize_gl_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -385,12 +385,12 @@ def test_resize_g2d_yuyv_to_rgba(benchmark):
     with open("testdata/camera720p.rgba", "rb") as f:
         expected_bytes = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst = Tensor.image(*dst_size, PixelFormat.Rgba)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgba, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -415,12 +415,12 @@ def test_resize_cpu_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.rgb", "rb") as f:
         expected_bytes = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate0, Flip.NoFlip)
     with dst.map() as d:
@@ -439,13 +439,13 @@ def test_resize_cv2_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.yuyv", "rb") as f:
         data = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb)
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst_cv2 = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     tmp = np.zeros((src.height, src.width, 3), dtype=np.uint8)
 
@@ -484,12 +484,12 @@ def test_resize_g2d_yuyv_to_rgb(benchmark):
     with open("testdata/camera720p.rgb", "rb") as f:
         expected_bytes = f.read()
 
-    src = Tensor.image(1280, 720, PixelFormat("YUYV"))
+    src = Tensor.image(1280, 720, PixelFormat("YUYV"), access="readwrite")
     src_array = np.frombuffer(data, dtype=np.uint8)
     with src.map() as m:
         np.frombuffer(m.numpy(), dtype=np.uint8)[:] = src_array
 
-    dst = Tensor.image(*dst_size, PixelFormat.Rgb)
+    dst = Tensor.image(*dst_size, PixelFormat.Rgb, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -531,7 +531,7 @@ def test_cpu_rotate_90(benchmark):
         data = f.read()
 
     src = _tensor_from_bytes(data, PixelFormat.Rgba)
-    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
+    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Clockwise90, Flip.NoFlip)
     expected = load_image(
@@ -553,7 +553,7 @@ def test_cv2_rotate_90(benchmark):
     cv2 = pytest.importorskip("cv2")
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
+    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba, access="readwrite")
 
     with src.map() as m, dst.map() as d:
         arr_src = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
@@ -588,7 +588,7 @@ def test_gl_rotate_90(benchmark):
         data = f.read()
 
     src = _tensor_from_bytes(data, PixelFormat.Rgba)
-    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
+    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba, access="readwrite")
 
     try:
         gl_processor.convert(src, dst, Rotation.Clockwise90, Flip.NoFlip)
@@ -616,7 +616,7 @@ def test_g2d_rotate_90(benchmark):
         data = f.read()
 
     src = _tensor_from_bytes(data, PixelFormat.Rgba)
-    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba)
+    dst = Tensor.image(src.height, src.width, PixelFormat.Rgba, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Clockwise90, Flip.NoFlip)
@@ -644,7 +644,7 @@ def test_cpu_rotate_180(benchmark):
         data = f.read()
 
     src = _tensor_from_bytes(data, PixelFormat.Rgba)
-    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
+    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba, access="readwrite")
 
     benchmark(cpu_processor.convert, src, dst, Rotation.Rotate180, Flip.NoFlip)
 
@@ -667,7 +667,7 @@ def test_cv2_rotate_180(benchmark):
     cv2 = pytest.importorskip("cv2")
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
+    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba, access="readwrite")
 
     with src.map() as m, dst.map() as d:
         arr_src = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(
@@ -702,7 +702,7 @@ def test_gl_rotate_180(benchmark):
         data = f.read()
 
     src = _tensor_from_bytes(data, PixelFormat.Rgba)
-    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
+    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba, access="readwrite")
 
     try:
         gl_processor.convert(src, dst, Rotation.Rotate180, Flip.NoFlip)
@@ -728,7 +728,7 @@ def test_g2d_rotate_180(benchmark):
     """Benchmark G2D 180 degree rotation."""
 
     src = _tensor_from_file("testdata/zidane.jpg", PixelFormat.Rgba)
-    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba)
+    dst = Tensor.image(src.width, src.height, PixelFormat.Rgba, access="readwrite")
 
     try:
         g2d_processor.convert(src, dst, Rotation.Rotate180, Flip.NoFlip)

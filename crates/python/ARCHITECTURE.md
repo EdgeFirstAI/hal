@@ -42,6 +42,21 @@ build matrix lives in
 | `Region` | `edgefirst_tensor::Region` (a **struct**, not an enum) | `{x, y, width, height}` in pixels; the single rectangle type, re-exported from tensor; argument to `view`/`Crop.source` |
 | `Tracing` (context manager) | umbrella `trace::start_tracing` / `stop_tracing` | `with hal.Tracing("/tmp/trace.json"): ...` |
 
+### CPU access declaration and compression metadata
+
+`Tensor.image(...)` and `ImageProcessor.create_image(...)` take an
+`access` keyword with a STRICT default of `"none"` (hardware-only,
+mirroring the Rust `CpuAccess` breaking change): scripts that `map()` a
+tensor or read it into numpy must pass `access="readwrite"` (or the
+precise `"read"`/`"write"`). Hardware (GPU/NPU) access is always
+implied; `"none"` keeps Android allocations eligible for vendor tile
+compression, and mapping beyond the declaration is best-effort
+(warn-once + counted), never silent. `create_image(...,
+compression="any")` requests a compressed layout through the ImageDesc
+path; the recorded scheme is readable as the `Tensor.compression`
+property (`None` or `"ubwc"`/`"afbc"`/`"pvric"`/`"dcc"`). Both kwargs
+are declared in `edgefirst_hal.pyi`.
+
 ## Internal Architecture
 
 ### Binding shape

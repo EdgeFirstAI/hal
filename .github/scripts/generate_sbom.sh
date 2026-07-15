@@ -12,9 +12,39 @@ echo "Generating Complete SBOM for EdgeFirst HAL"
 echo "=================================================="
 echo
 
-# Step 1: Generate dependency SBOM with cargo-cyclonedx (~1 second)
-echo "[1/5] Generating dependency SBOM with cargo-cyclonedx..."
-cargo cyclonedx --format json --all
+# Step 1: Generate dependency SBOM with cargo-cyclonedx (~1 second per target)
+#
+# Without an explicit --target, cargo-cyclonedx resolves only the
+# dependency graph for the HOST target (`rustc -vV`), silently dropping
+# every platform-gated dependency that isn't reachable from the machine
+# generating the SBOM (e.g. running this on macOS drops the Linux-only
+# g2d-sys/linux-raw-sys/safe_arch attributions NOTICE needs). NOTICE must
+# cover every platform this HAL ships to regardless of which host runs
+# this script.
+#
+# `--target all` would cover every platform Cargo.lock could resolve for
+# ANY Rust target (wasm32, UEFI, ...), pulling in attributions for code
+# this HAL never ships (e.g. getrandom's UEFI backend drags in r-efi)
+# and drowning the license-policy report in irrelevant unknown-license
+# warnings. Instead, enumerate exactly the targets this HAL ships/tests
+# for (kept in sync with the CI build matrix in .github/workflows/) and
+# merge their per-target SBOMs — a precise union, not an ecosystem-wide
+# one. Target resolution only needs rustc's built-in target spec, not an
+# installed toolchain (`rustup target add` not required).
+HAL_TARGETS=(
+    x86_64-unknown-linux-gnu    # Desktop Linux; also stands in for aarch64-unknown-linux-gnu (embedded i.MX/RPi5), which resolves the same target_os="linux" dependency graph
+    aarch64-apple-darwin        # macOS
+    aarch64-apple-ios           # iOS device
+    aarch64-apple-ios-sim       # iOS simulator
+    aarch64-linux-android       # Android device
+    x86_64-linux-android        # Android emulator
+    x86_64-pc-windows-msvc      # Windows
+)
+echo "[1/5] Generating dependency SBOM with cargo-cyclonedx (${#HAL_TARGETS[@]} targets)..."
+for t in "${HAL_TARGETS[@]}"; do
+    echo "  target: ${t}"
+    cargo cyclonedx --format json --all --target "${t}" --target-in-filename
+done
 
 # Merge all crate SBOMs into a single dependency SBOM
 if ! command -v cyclonedx &> /dev/null; then

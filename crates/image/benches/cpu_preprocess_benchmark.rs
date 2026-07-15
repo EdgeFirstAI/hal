@@ -105,7 +105,14 @@ fn main() {
     let lb_crop = Crop::letterbox([114, 114, 114, 255]);
 
     for fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
-        let src = match proc.create_image(IN_W, IN_H, fmt, DType::U8, None) {
+        let src = match proc.create_image(
+            IN_W,
+            IN_H,
+            fmt,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 println!("  {fmt:?}: [skipped: source alloc failed: {e}]");
@@ -172,7 +179,14 @@ fn main() {
             if !only.is_empty() && !name.contains(&only) {
                 continue;
             }
-            let mut dst = match proc.create_image(ow, oh, ofmt, odt, None) {
+            let mut dst = match proc.create_image(
+                ow,
+                oh,
+                ofmt,
+                odt,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            ) {
                 Ok(d) => d,
                 Err(e) => {
                     println!("  {name:50} [dst alloc failed: {e}]");

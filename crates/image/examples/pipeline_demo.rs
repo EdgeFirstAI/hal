@@ -227,7 +227,16 @@ fn main() {
     // the tensor's dims+format during the decode and the convert step below
     // handles the NV12 → RGB colour conversion.
     let mut input = proc
-        .create_image(max_w, max_h, PixelFormat::Nv12, DType::U8, mem_type)
+        .create_image(
+            max_w,
+            max_h,
+            PixelFormat::Nv12,
+            DType::U8,
+            mem_type,
+            // The codec CPU-writes the decode; nothing reads it back on the
+            // CPU (convert consumes it on the GPU).
+            edgefirst_tensor::CpuAccess::Write,
+        )
         .expect("Failed to create input tensor");
     let input_stride = input.effective_row_stride().unwrap_or(0);
     let input_memory = input.memory();
@@ -243,7 +252,17 @@ fn main() {
 
     // Allocate output tensors — 640×640 in both packed and planar layouts
     let mut output_packed = proc
-        .create_image(MODEL_W, MODEL_H, PixelFormat::Rgb, DType::U8, mem_type)
+        .create_image(
+            MODEL_W,
+            MODEL_H,
+            PixelFormat::Rgb,
+            DType::U8,
+            mem_type,
+            // Convert destinations feed hardware consumers; no CPU access —
+            // the None declaration keeps them eligible for vendor tile
+            // compression on platforms that support it.
+            edgefirst_tensor::CpuAccess::None,
+        )
         .expect("Failed to create packed output tensor");
     let packed_stride = output_packed.effective_row_stride().unwrap_or(0);
     eprintln!(
@@ -263,6 +282,7 @@ fn main() {
             PixelFormat::PlanarRgb,
             DType::U8,
             mem_type,
+            edgefirst_tensor::CpuAccess::None,
         )
         .expect("Failed to create planar output tensor");
     eprintln!(

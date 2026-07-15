@@ -6,7 +6,7 @@ use crate::{
     TensorMap, TensorMapTrait, TensorMemory, TensorTrait,
 };
 use log::{debug, trace, warn};
-use nix::{fcntl::OFlag, sys::stat::fstat, unistd::ftruncate};
+use nix::{sys::stat::fstat, unistd::ftruncate};
 use num_traits::Num;
 use std::{
     ffi::c_void,
@@ -48,6 +48,41 @@ impl<T> ShmTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
 {
+    /// Allocate the anonymous POSIX shared-memory segment backing a new
+    /// tensor: `shm_open` with a random name, then immediately `shm_unlink`
+    /// so nothing outlives the process — the library's sharing model is
+    /// file descriptors (`clone_fd`), never names.
+    ///
+    /// Android's bionic libc has no POSIX shared memory (`shm_open` /
+    /// `shm_unlink` do not exist), so allocation reports `NotImplemented`
+    /// there. Receiving a segment created elsewhere still works on Android:
+    /// [`from_fd`](TensorTrait::from_fd) needs only `mmap`/`fstat`, which
+    /// bionic provides. (A `memfd_create`-backed allocator is the planned
+    /// replacement: the syscall exists on all Android kernels, but the
+    /// bionic wrapper appears at API 30 and the HAL floor is 26.)
+    #[cfg(not(target_os = "android"))]
+    fn alloc_anon_fd(name: &str) -> Result<OwnedFd> {
+        use nix::fcntl::OFlag;
+        let shm_fd = nix::sys::mman::shm_open(
+            name,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        if let Err(e) = nix::sys::mman::shm_unlink(name) {
+            warn!("Failed to unlink shared memory: {e}");
+        }
+        Ok(shm_fd)
+    }
+
+    #[cfg(target_os = "android")]
+    fn alloc_anon_fd(_name: &str) -> Result<OwnedFd> {
+        Err(Error::NotImplemented(
+            "TensorMemory::Shm allocation is not available on Android (bionic has no \
+             POSIX shm_open); import an existing segment via from_fd instead"
+                .to_owned(),
+        ))
+    }
+
     /// Create a shared-memory tensor with a logical `shape` but a physical
     /// allocation of `byte_size` bytes (which must be `>= shape.product() *
     /// sizeof(T)`).  Used for image tensors with a 64-byte-aligned row stride
@@ -72,15 +107,7 @@ where
                 format!("/{}", &uuid[..16])
             }
         };
-        let shm_fd = nix::sys::mman::shm_open(
-            name.as_str(),
-            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
-        let err = nix::sys::mman::shm_unlink(name.as_str());
-        if let Err(e) = err {
-            log::warn!("Failed to unlink shared memory: {e}");
-        }
+        let shm_fd = Self::alloc_anon_fd(name.as_str())?;
         ftruncate(&shm_fd, byte_size as i64)?;
         Ok(ShmTensor::<T> {
             name,
@@ -96,11 +123,19 @@ where
     /// Map exposing `byte_size` bytes via `as_slice()` for self-allocated
     /// strided tensors whose rows are padded. The caller (`Tensor::map`)
     /// validates `byte_size <= capacity_bytes()` first.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<TensorMap<T>> {
-        self.map_inner(Some(byte_size))
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
+        self.map_inner(Some(byte_size), access)
     }
 
-    fn map_inner(&self, byte_size_override: Option<usize>) -> Result<TensorMap<T>> {
+    fn map_inner(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<TensorMap<T>> {
         let exposed = byte_size_override.unwrap_or_else(|| self.size());
         // Map the whole segment from fd offset 0 and apply `self.offset` in
         // `ShmMap::as_slice` — mmap cannot take a non-page-aligned fd offset,
@@ -143,6 +178,7 @@ where
             offset: self.offset,
             mmap_size,
             byte_size_override,
+            writable: access.writes(),
             _marker: std::marker::PhantomData,
         }))
     }
@@ -162,21 +198,9 @@ where
             }
         };
 
-        let shm_fd = nix::sys::mman::shm_open(
-            name.as_str(),
-            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
+        let shm_fd = Self::alloc_anon_fd(name.as_str())?;
 
         trace!("Creating shared memory: {name}");
-
-        // We drop the shared memory object name after creating it to avoid
-        // leaving it in the system after the program exits.  The sharing model
-        // for the library is through file descriptors, not names.
-        let err = nix::sys::mman::shm_unlink(name.as_str());
-        if let Err(e) = err {
-            warn!("Failed to unlink shared memory: {e}");
-        }
 
         ftruncate(&shm_fd, size as i64)?;
         let stat = fstat(&shm_fd)?;
@@ -252,8 +276,8 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
-        self.map_inner(None)
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+        self.map_inner(None, access)
     }
 
     fn buffer_identity(&self) -> &crate::BufferIdentity {
@@ -355,6 +379,10 @@ where
     /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)` elements
     /// (the full padded window) instead of `shape.product()`.
     byte_size_override: Option<usize>,
+    /// Whether mutable access is permitted (`map_read()` maps are not).
+    /// The mmap itself stays PROT_READ|PROT_WRITE (protection narrowing is
+    /// a follow-up); this enforces the API contract uniformly.
+    writable: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -422,6 +450,7 @@ where
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.writable, "Shm");
         let ptr = self.ptr.lock().expect("Failed to lock ShmMap pointer");
         let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.len()) }

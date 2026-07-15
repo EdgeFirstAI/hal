@@ -198,6 +198,10 @@ performance requires tensors allocated by `ImageProcessor::create_image()`:
   zero-copy decode path
 - **PBO backing**: when GL is the active transfer path
 - **GPU pitch alignment**: row stride padded for Mali DMA-BUF import
+- **CPU access declaration**: decode targets are CPU-written — allocate
+  them with `CpuAccess::Write` (the decode loop maps via `map_write()`,
+  which selects a write-oriented mapping / dma-buf sync direction);
+  `ReadWrite` also works but declares reads the decoder never performs
 
 Free-standing `Tensor::new()` or `Tensor::image()` works but:
 - Cannot produce PBO tensors (requires GL context)

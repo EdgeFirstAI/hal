@@ -1,25 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(any(target_os = "linux", target_os = "macos"))]
+#![cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android"
+))]
 #![cfg(feature = "opengl")]
 // Several types defined at the `gl` module root (EglDisplayKind,
 // TransferBackend, RegionOfInterest, etc.) are consumed only by the
 // Linux-only inner modules (`context`, `processor`, ...). The macOS
 // path uses its own `MacosGlProcessor` + `iosurface_import` modules and
-// does not touch every shared type, so some appear unused on macOS.
+// does not touch every shared type, so some appear unused on macOS/iOS.
 // Rather than fragmenting the type definitions per platform, suppress
-// the dead-code lint on non-Linux targets.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// the dead-code/unused-import lints on non-Linux targets.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 // Module layout:
-//   - `platform/` — cross-platform display/EGL-loader seam (both OSes)
-//   - Linux-only:  `context`, `processor`, `threaded`, `dma_import`,
-//                  `cache`, `resources`, `shaders`, `tests`
-//   - macOS-only:  `iosurface_import`, `macos_processor`
-// The macOS processor is parallel to (not a refactor of) the Linux
-// threaded processor — see `crates/image/ARCHITECTURE.md` for the
-// rationale and the planned convergence story.
+//   - `platform/` — cross-platform display/EGL-loader seam (all OSes)
+//   - Linux-only:   `context`, `dma_import`, `fourcc`
+//   - macOS/iOS:    `iosurface_import`
+//   - Android-only: `ahardwarebuffer_import`
+// The engine (`processor`, `threaded`, `cache`, `resources`, `shaders`)
+// is portable and reaches platform buffers only through the `GlPlatform`
+// trait — see `crates/image/ARCHITECTURE.md`.
 
 macro_rules! function {
     () => {{
@@ -62,10 +67,14 @@ mod render;
 // `gbm`). DRM FourCC is a Linux/DMA-BUF concept, so this lives with the other
 // Linux graphics modules; the point is that it carries no `gbm` coupling, so
 // `shaders.rs` and the format code no longer pull in `gbm`.
+#[cfg(target_os = "android")]
+mod ahardwarebuffer_import;
 #[cfg(target_os = "linux")]
 mod fourcc;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod iosurface_import;
+#[cfg(target_os = "android")]
+mod native_fence;
 mod platform;
 mod processor;
 mod resources;
@@ -84,7 +93,7 @@ mod threaded;
 pub use context::probe_egl_displays;
 // These are accessed by sibling sub-modules via `super::context::` directly.
 // No re-export needed at the mod.rs level.
-pub use cache::{CacheStats, GlCacheStats};
+pub use cache::{CacheStats, ConvertStats, GlCacheStats};
 pub use threaded::GLProcessorThreaded;
 
 /// Dynamically-loaded EGL 1.4 instance. The lifetime parameter is
@@ -169,12 +178,21 @@ pub(crate) enum TransferBackend {
     /// the GPU can actually render through DMA-buf-backed textures.
     DmaBuf,
 
-    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS).
+    /// Zero-copy via `EGL_ANGLE_iosurface_client_buffer` (macOS/iOS).
     /// Available when ANGLE's Metal backend is loaded and the EGL
     /// extension is advertised. The IOSurface is wrapped as an EGL
     /// pbuffer and bound to a 2D texture via `eglBindTexImage`.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     IOSurface,
+
+    /// Zero-copy via `EGL_ANDROID_image_native_buffer` (Android). The
+    /// AHardwareBuffer is wrapped as an EGLImage via
+    /// `eglGetNativeClientBufferANDROID` → `eglCreateImageKHR` and bound
+    /// to a 2D texture via `glEGLImageTargetTexture2DOES` — persistent
+    /// bindings, like Linux DMA-BUF (unlike the per-pass IOSurface
+    /// pbuffer binds).
+    #[cfg(target_os = "android")]
+    AHardwareBuffer,
 
     /// GPU buffer via Pixel Buffer Object. Used when DMA-buf is unavailable
     /// but OpenGL is present. Data stays in GPU-accessible memory.
@@ -199,8 +217,12 @@ impl TransferBackend {
     /// specifically about DMA-BUF semantics (e.g. the render-roundtrip
     /// verification) keep `is_dma`.
     pub(crate) fn is_zero_copy(self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self == TransferBackend::IOSurface {
+            return true;
+        }
+        #[cfg(target_os = "android")]
+        if self == TransferBackend::AHardwareBuffer {
             return true;
         }
         self == TransferBackend::DmaBuf

@@ -202,12 +202,13 @@ where
         Ok(())
     }
 
-    fn map(&self) -> Result<TensorMap<T>> {
+    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
         Ok(TensorMap::Dma(DmaMap::new(
             self.fd.try_clone()?,
             &self.shape,
             self.buf_size,
             self.mmap_offset,
+            access,
         )?))
     }
 
@@ -405,13 +406,18 @@ where
     /// `as_slice()`/`as_mut_slice()`, not just the shape-derived logical
     /// count. Callers are expected to iterate rows with
     /// `Tensor::effective_row_stride()` so they don't read past the end.
-    pub(crate) fn map_with_byte_size(&self, byte_size: usize) -> Result<DmaMap<T>> {
+    pub(crate) fn map_with_byte_size(
+        &self,
+        byte_size: usize,
+        access: crate::CpuAccess,
+    ) -> Result<DmaMap<T>> {
         DmaMap::new_with_byte_size(
             self.fd.try_clone()?,
             &self.shape,
             self.buf_size,
             self.mmap_offset,
             byte_size,
+            access,
         )
     }
 
@@ -461,6 +467,10 @@ where
     /// row-padding between logical rows and callers need to iterate via
     /// `row_stride` rather than a packed `width * bpp` layout.
     byte_size_override: Option<usize>,
+    /// Access direction this map was taken with: selects the dma-buf sync
+    /// direction (replayed symmetrically at unmap) and gates mutable
+    /// access (`map_read()` maps reject `as_mut_slice`).
+    access: crate::CpuAccess,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -468,8 +478,14 @@ impl<T> DmaMap<T>
 where
     T: Num + Clone + fmt::Debug,
 {
-    pub fn new(fd: OwnedFd, shape: &[usize], buf_size: usize, offset: usize) -> Result<Self> {
-        Self::new_internal(fd, shape, buf_size, offset, None)
+    pub fn new(
+        fd: OwnedFd,
+        shape: &[usize],
+        buf_size: usize,
+        offset: usize,
+        access: crate::CpuAccess,
+    ) -> Result<Self> {
+        Self::new_internal(fd, shape, buf_size, offset, None, access)
     }
 
     /// Construct a DmaMap whose `as_slice()` exposes the full padded
@@ -488,8 +504,9 @@ where
         buf_size: usize,
         offset: usize,
         byte_size: usize,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
-        Self::new_internal(fd, shape, buf_size, offset, Some(byte_size))
+        Self::new_internal(fd, shape, buf_size, offset, Some(byte_size), access)
     }
 
     fn new_internal(
@@ -498,6 +515,7 @@ where
         buf_size: usize,
         offset: usize,
         byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
     ) -> Result<Self> {
         if shape.is_empty() {
             return Err(Error::InvalidSize(0));
@@ -559,8 +577,20 @@ where
 
         #[cfg(target_os = "linux")]
         {
-            trace!("DmaMap: sync start fd={} size={mmap_size}", fd.as_raw_fd());
-            if let Err(e) = crate::dmabuf::start_readwrite(&fd) {
+            // The sync direction tells the kernel exactly which cache
+            // maintenance this CPU access needs: a read-only map skips the
+            // writeback at END, a write-only map skips the invalidate at
+            // START. The direction MUST match at end (stored below).
+            trace!(
+                "DmaMap: sync start fd={} size={mmap_size} access={access:?}",
+                fd.as_raw_fd()
+            );
+            let sync = match (access.reads(), access.writes()) {
+                (true, false) => crate::dmabuf::start_read(&fd),
+                (false, true) => crate::dmabuf::start_write(&fd),
+                _ => crate::dmabuf::start_readwrite(&fd),
+            };
+            if let Err(e) = sync {
                 warn!(
                     "DmaMap: DMA_BUF_IOCTL_SYNC(START) failed fd={}: {e}",
                     fd.as_raw_fd()
@@ -589,6 +619,7 @@ where
             mmap_size,
             offset,
             byte_size_override,
+            access,
             _marker: std::marker::PhantomData,
         })
     }
@@ -642,8 +673,16 @@ where
         }
 
         #[cfg(target_os = "linux")]
-        if let Err(e) = crate::dmabuf::end_readwrite(&self.fd) {
-            warn!("Failed to end read/write on DMA memory: {e}");
+        {
+            // Same direction as the START sync (see `new_internal`).
+            let sync = match (self.access.reads(), self.access.writes()) {
+                (true, false) => crate::dmabuf::end_read(&self.fd),
+                (false, true) => crate::dmabuf::end_write(&self.fd),
+                _ => crate::dmabuf::end_readwrite(&self.fd),
+            };
+            if let Err(e) = sync {
+                warn!("Failed to end CPU access on DMA memory: {e}");
+            }
         }
     }
 
@@ -654,6 +693,7 @@ where
     }
 
     fn as_mut_slice(&mut self) -> &mut [T] {
+        crate::assert_map_writable(self.access.writes(), "Dma");
         let ptr = self.ptr.lock().expect("Failed to lock DmaMap pointer");
         let base = unsafe { (ptr.as_ptr() as *mut u8).add(self.offset) as *mut T };
         unsafe { std::slice::from_raw_parts_mut(base, self.slice_len_elems()) }
@@ -708,7 +748,7 @@ mod tests {
         let fd = dummy_fd();
         // shape=[4096] u8 → logical_size=4096; offset=4096 → total_needed=8192
         // buf_size=4096 < 8192 → error
-        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096);
+        let result = DmaMap::<u8>::new(fd, &[4096], 4096, 4096, crate::CpuAccess::ReadWrite);
         match result {
             Err(Error::InvalidSize(n)) => assert_eq!(n, 8192),
             other => panic!("expected InvalidSize(8192), got {:?}", other),
@@ -722,7 +762,7 @@ mod tests {
         let fd = dummy_fd();
         // shape=[1024] u32 → logical_size=4096; offset=3 (not aligned to 4)
         // buf_size=8192 so total_needed check passes; alignment check fires
-        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3);
+        let result = DmaMap::<u32>::new(fd, &[1024], 8192, 3, crate::CpuAccess::ReadWrite);
         assert!(
             matches!(result, Err(Error::InvalidOperation(_))),
             "expected InvalidOperation for misaligned offset, got {:?}",
@@ -736,7 +776,13 @@ mod tests {
     fn test_dma_map_offset_overflow() {
         let fd = dummy_fd();
         // offset=usize::MAX, shape=[1] u8 → checked_add overflows
-        let result = DmaMap::<u8>::new(fd, &[1], usize::MAX, usize::MAX);
+        let result = DmaMap::<u8>::new(
+            fd,
+            &[1],
+            usize::MAX,
+            usize::MAX,
+            crate::CpuAccess::ReadWrite,
+        );
         assert!(
             matches!(result, Err(Error::InvalidSize(0))),
             "expected InvalidSize(0) on overflow, got {:?}",

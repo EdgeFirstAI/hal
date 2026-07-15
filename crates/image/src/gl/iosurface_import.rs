@@ -1,27 +1,27 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! IOSurface allocation and EGL pbuffer import for the macOS GL backend.
+//! IOSurface allocation and EGL pbuffer import for the macOS/iOS GL backend.
 //!
 //! Mirrors the role of `dma_import.rs` on Linux: takes a tensor that
-//! carries platform-native zero-copy GPU buffer (IOSurface on macOS,
+//! carries platform-native zero-copy GPU buffer (IOSurface on macOS/iOS,
 //! DMA-BUF on Linux) and produces the EGL handle the GL backend can
 //! sample from or render to.
 //!
 //! The EGL flow is structurally different from Linux. Linux uses
 //! `eglCreateImageKHR` with `EGL_LINUX_DMA_BUF_EXT` to produce an
 //! `EGLImage` that is bound to a texture via
-//! `glEGLImageTargetTexture2DOES`. macOS uses
+//! `glEGLImageTargetTexture2DOES`. macOS/iOS uses
 //! `eglCreatePbufferFromClientBuffer` with `EGL_IOSURFACE_ANGLE` to
 //! produce an `EGLSurface` (pbuffer) that is bound to a texture via
-//! `eglBindTexImage`. The macOS path is invoked from
+//! `eglBindTexImage`. The macOS/iOS path is invoked from
 //! the engine's zero-copy source attach (`draw_src_texture`);
 //! Linux callers do not go through this module.
 //!
 //! See `spikes/angle_iosurface/` (local, gitignored) for the proof-of-
 //! concept that validates each constant + attribute combination.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use crate::Error;
 use edgefirst_egl as egl;

@@ -318,6 +318,20 @@ jobs:
       contents: read
       checks: write
       pull-requests: write
+    env:
+      # scripts/fetch-angle.sh downloads the signed xcframeworks from the
+      # public EdgeFirstAI/angle-package release. The release is public, so no
+      # credentials are required; GH_TOKEN is passed only to raise GitHub's API
+      # rate limit (honored if present, not required). This means the ANGLE
+      # fetch — and the GL render path it enables — works on pushes, same-repo
+      # PRs, and fork PRs alike.
+      GH_TOKEN: ${{ github.token }}
+      # Point the HAL's macOS ANGLE loader at the flat-lib staging dir that
+      # scripts/fetch-angle.sh produces from the release xcframeworks. ANGLE's
+      # libEGL dlopens libGLESv2.dylib from its own directory, so the two must
+      # be flat siblings (the framework bundle layout does not work for the
+      # macOS runtime dlopen path) — see crates/image/src/gl/platform/macos.rs.
+      EDGEFIRST_ANGLE_PATH: ${{ github.workspace }}/target/angle/macos-flat-lib
 
     steps:
       - name: Checkout code
@@ -351,27 +365,15 @@ jobs:
         with:
           tool: cargo-nextest,cargo-llvm-cov@0.6.16
 
-      - name: Install ANGLE (Homebrew tap) and re-sign dylibs
-        # ANGLE provides the libEGL.dylib + libGLESv2.dylib that
-        # translate OpenGL ES 3.0 to Metal. Homebrews install_name_tool
-        # post-install pass invalidates the upstream signatures
-        # (Homebrew/brew#19144), so re-sign ad-hoc before any HAL
-        # binary tries to dlopen them. Without this step the
-        # test_yuyv_to_rgba_opengl_macos integration test silently
-        # skips and the entire GL backend ships untested in CI.
-        run: |
-          set -euxo pipefail
-          # Homebrew now requires explicit trust for third-party taps; these are
-          # taps we deliberately rely on for ANGLE, so disable the trust gate
-          # for this step rather than fail the install (Homebrew/brew Tap-Trust).
-          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
-          brew tap startergo/gn
-          brew tap startergo/angle
-          brew install startergo/angle/angle
-          ANGLE_DIR="$(brew --prefix angle)/lib"
-          codesign --force --sign - "$ANGLE_DIR/libEGL.dylib"
-          codesign --force --sign - "$ANGLE_DIR/libGLESv2.dylib"
-          echo "ANGLE installed at $ANGLE_DIR"
+      - name: Fetch ANGLE xcframeworks (release v2.1.28252)
+        # Download + sha256-verify + extract the signed, notarized ANGLE
+        # xcframeworks from the EdgeFirstAI/angle-package release. Replaces
+        # the old Homebrew tap (`brew install startergo/angle/angle`) + the
+        # re-sign dance (the release is already Developer-ID-signed +
+        # notarized, so it dlopens cleanly without re-signing — unlike
+        # Homebrew's install_name_tool-mangled dylibs). EDGEFIRST_ANGLE_PATH
+        # (set on the job) points the HAL loader at the macOS slice.
+        run: bash scripts/fetch-angle.sh
 
       - name: Run Clippy
         # Use default features only (no OpenCV, no Linux-specific hardware features)
@@ -380,10 +382,10 @@ jobs:
 
       - name: Run Rust tests with coverage
         # scripts/test-macos.sh builds with --tests, signs every binary
-        # with entitlements.plist (disables library validation so dlopen
-        # of ad-hoc-signed ANGLE works on Tahoe), then forwards to
-        # nextest. The script already injects
-        # `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
+        # with entitlements.plist (disables library validation so an
+        # ad-hoc-signed test binary can dlopen the Developer-ID-signed
+        # ANGLE framework), then forwards to nextest. The script already
+        # injects `--workspace --exclude gpu-probe --exclude edgefirst-bench`,
         # so we only add the runner-specific `-j 1` here. Without the
         # sign step the GL tests SIGKILL and silently skip.
         #
@@ -466,6 +468,157 @@ jobs:
           check_name: Test Results (macOS)
           comment_mode: always
           ignore_runs: true
+
+  # ===========================================================================
+  # Build + link-validate on iOS (aarch64 device + simulator)
+  #
+  # Verifies the HAL Rust library closure (default features incl. `opengl`)
+  # compiles for the iOS targets, and that the native symbol closure links
+  # cleanly against the ANGLE xcframeworks + Apple system frameworks. There
+  # is no runtime test (no device/simulator in CI) — runtime EGL bring-up on
+  # device is a future Swift-bindings effort. See README.md § iOS.
+  #
+  # gpu-probe (Linux-only binary), edgefirst_hal (python), and
+  # edgefirst-bench are excluded from the workspace build. The C API is
+  # INCLUDED — its staticlib is the iOS embedding artifact and the
+  # link-closure anchor.
+  # ===========================================================================
+  build-ios:
+    name: Build & Link (iOS)
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      # scripts/fetch-angle.sh downloads the ANGLE xcframeworks from the public
+      # EdgeFirstAI/angle-package release. No token is required (the release is
+      # public); GH_TOKEN is passed only so `gh release download` uses it when
+      # present and gets a higher API rate limit.
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-ios
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Run Clippy (iOS device)
+        # Lint the cfg-gated iOS code paths (the GL platform seam + IOSurface
+        # backend) that no other lane compiles. Excludes Linux-only / python /
+        # bench crates; the C API is included. -D warnings keeps the lane a
+        # hard gate.
+        run: |
+          cargo clippy --target aarch64-apple-ios \
+            --workspace \
+            --exclude gpu-probe \
+            --exclude edgefirst_hal --exclude edgefirst-bench \
+            -- -D warnings
+
+      - name: Build HAL for iOS (device + simulator)
+        run: |
+          cargo build --target aarch64-apple-ios      --release -p edgefirst-hal -p edgefirst-hal-capi
+          cargo build --target aarch64-apple-ios-sim  --release -p edgefirst-hal -p edgefirst-hal-capi
+
+      - name: Validate iOS link closure (device + simulator)
+        # scripts/validate-ios-link.sh fetches the signed ANGLE xcframeworks
+        # from the EdgeFirstAI/angle-package release via scripts/fetch-angle.sh,
+        # then links the production C API staticlib (libedgefirst_hal.a,
+        # built by the step above) against the xcframeworks + Apple system
+        # frameworks.
+        run: |
+          bash scripts/validate-ios-link.sh device
+          bash scripts/validate-ios-link.sh sim
+
+  # ===========================================================================
+  # Build & Link Check for Android (arm64 device + x86_64 emulator ABIs)
+  #
+  # Mirrors the iOS lane's decision: compile + clippy + link-closure
+  # validation only, no emulator runtime — GitHub runners have no GPU, so
+  # the Android emulator would exercise SwiftShader software GL rather
+  # than a real Adreno/Mali driver and add flakiness without signal.
+  # On-device GL correctness and the performance gates run via the
+  # internal hal-mobile AWS Device Farm harness (Galaxy S26 Ultra pool);
+  # see TESTING.md § Android On-Device Validation.
+  # ===========================================================================
+  build-android:
+    name: Build & Link (Android)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+          targets: aarch64-linux-android,x86_64-linux-android
+          components: clippy
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        # Pin our own NDK rather than using the runner image's preinstalled
+        # copies, whose versions drift with image updates. r27c is the LTS
+        # release; the HAL's API floor (26) is set per-invocation via
+        # cargo-ndk's -P flag and scripts/validate-android-link.sh.
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779  # v1.6.0
+        with:
+          ndk-version: r27c
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-android
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Run Clippy (Android arm64)
+        # Lint the cfg-gated Android code paths (the GL platform seam +
+        # AHardwareBuffer backend) that no other lane compiles. Excludes
+        # Linux-only gpu-probe, the python crate, and the bench harness;
+        # the C API is INCLUDED — its cdylib is the future JNI library.
+        # -D warnings keeps the lane a hard gate.
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -P 26 clippy \
+            --workspace \
+            --exclude gpu-probe --exclude edgefirst_hal --exclude edgefirst-bench \
+            -- -D warnings
+
+      - name: Build HAL for Android (arm64 device + x86_64 emulator)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 -P 26 build --release \
+            -p edgefirst-hal -p edgefirst-hal-capi
+
+      - name: Validate Android link closure (arm64 + x86_64)
+        # Links the production C API staticlib (libedgefirst_hal.a, built
+        # by the step above) against the NDK system libraries, after
+        # verifying the AHardwareBuffer references and the NDK API-26 stub
+        # exports with llvm-nm.
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          bash scripts/validate-android-link.sh arm64
+          bash scripts/validate-android-link.sh x86_64
 
   # ===========================================================================
   # Build Check on Windows (verify Windows compilation before release)
@@ -1312,7 +1465,10 @@ jobs:
     name: SonarCloud Analysis
     needs: [doc-tests, build-and-test-x86, build-and-test-macos, software-gl-coverage, test-arm, process-hardware-coverage]
     runs-on: ubuntu-22.04
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # !cancelled() keeps analysis running even when a needed lane fails or
+    # skips — otherwise a single macOS/ANGLE failure silently skips SonarCloud
+    # for the whole PR. Coverage aggregation globs whatever artifacts exist.
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
       pull-requests: read
@@ -1382,6 +1538,7 @@ jobs:
             echo "| Ubuntu 22.04 | x86_64 | Rust, Python, C API |"
             echo "| Ubuntu 22.04 | aarch64 | Rust, Python, C API |"
             echo "| macOS | Apple Silicon | Rust, C API |"
+            echo "| iOS | arm64 (device + simulator) | Rust build + link validation |"
             echo "| NXP i.MX8M Plus | aarch64 | Rust, Python, C API (DMA, G2D) |"
             echo ""
             python3 .github/scripts/coverage_summary.py --github-actions

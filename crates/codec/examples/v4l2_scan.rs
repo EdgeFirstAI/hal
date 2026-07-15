@@ -54,6 +54,8 @@ fn main() {
             info.height,
             PixelFormat::Nv24,
             Some(TensorMemory::Mem),
+            // Decode target: written during copy-out, never read back.
+            edgefirst_tensor::CpuAccess::Write,
         )
         .expect("tensor alloc");
         let t0 = Instant::now();

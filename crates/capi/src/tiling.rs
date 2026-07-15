@@ -390,6 +390,7 @@ pub extern "C" fn hal_tile_grid(
 /// @param format Pixel format (HAL_PIXEL_FORMAT_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+/// @param access Declared CPU access (see HalCpuAccess)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
 /// - EINVAL: NULL argument or invalid config (zero tile size, bad overlap)
@@ -404,6 +405,7 @@ pub unsafe extern "C" fn hal_image_processor_alloc_tile_batch(
     format: HalPixelFormat,
     dtype: HalDtype,
     memory: HalTensorMemory,
+    access: crate::tensor::HalCpuAccess,
 ) -> *mut HalTensor {
     check_null_ret_null!(processor, config);
     let cfg: TilingConfig = (*config).into();
@@ -415,6 +417,7 @@ pub unsafe extern "C" fn hal_image_processor_alloc_tile_batch(
         format.to_pixel_format(),
         dtype.into(),
         mem_opt,
+        access.into(),
     ) {
         Ok(t) => Box::into_raw(Box::new(HalTensor { inner: t })),
         Err(e) => set_error_null(image_err_to_errno(&e)),

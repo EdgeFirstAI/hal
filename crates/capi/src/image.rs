@@ -395,6 +395,7 @@ pub unsafe extern "C" fn hal_tensor_new_image(
     format: HalPixelFormat,
     dtype: HalDtype,
     memory: HalTensorMemory,
+    access: crate::tensor::HalCpuAccess,
 ) -> *mut HalTensor {
     if width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
@@ -408,10 +409,142 @@ pub unsafe extern "C" fn hal_tensor_new_image(
             format.to_pixel_format(),
             dtype.into(),
             mem_opt,
+            access.into(),
         ),
         libc::ENOMEM
     );
 
+    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
+}
+
+/// Opaque declarative image-allocation request.
+///
+/// Create with hal_image_desc_new(), refine with the hal_image_desc_set_*
+/// functions, allocate via hal_tensor_new_image_desc() or
+/// hal_image_processor_create_image_desc(), and release with
+/// hal_image_desc_free(). The desc is the full-featured front door — the
+/// classic constructors cover the common cases; the desc adds optional
+/// requests (tile compression) without new positional parameters.
+pub struct HalImageDesc {
+    pub(crate) inner: edgefirst_tensor::ImageDesc,
+}
+
+/// Create an image-allocation request. Defaults: auto-selected memory,
+/// HAL_CPU_ACCESS_NONE (hardware-only), no compression request.
+///
+/// @param width Image width in pixels
+/// @param height Image height in pixels
+/// @param format Pixel format (HAL_PIXEL_FORMAT_*)
+/// @param dtype Data type of tensor elements (HAL_DTYPE_*)
+/// @return New desc handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: zero dimensions
+#[no_mangle]
+pub extern "C" fn hal_image_desc_new(
+    width: size_t,
+    height: size_t,
+    format: HalPixelFormat,
+    dtype: HalDtype,
+) -> *mut HalImageDesc {
+    if width == 0 || height == 0 {
+        return set_error_null(libc::EINVAL);
+    }
+    Box::into_raw(Box::new(HalImageDesc {
+        inner: edgefirst_tensor::ImageDesc::new(
+            width,
+            height,
+            format.to_pixel_format(),
+            dtype.into(),
+        ),
+    }))
+}
+
+/// Request a specific memory backing (the default is auto-select).
+///
+/// @param desc Desc handle (NULL is ignored)
+/// @param memory Memory allocation type
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_desc_set_memory(
+    desc: *mut HalImageDesc,
+    memory: HalTensorMemory,
+) {
+    if let Some(desc) = unsafe { desc.as_mut() } {
+        let mem: Option<TensorMemory> = memory.into();
+        desc.inner = desc.inner.clone().with_memory(mem);
+    }
+}
+
+/// Declare the CPU access (see HalCpuAccess). Any declaration other than
+/// HAL_CPU_ACCESS_NONE makes a compression request invalid.
+///
+/// @param desc Desc handle (NULL is ignored)
+/// @param access Declared CPU access
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_desc_set_access(
+    desc: *mut HalImageDesc,
+    access: crate::tensor::HalCpuAccess,
+) {
+    if let Some(desc) = unsafe { desc.as_mut() } {
+        desc.inner = desc.inner.clone().with_access(access.into());
+    }
+}
+
+/// Request a tile-compressed layout (see HalCompression).
+/// HAL_COMPRESSION_NONE clears the request.
+///
+/// @param desc Desc handle (NULL is ignored)
+/// @param compression Compression request
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_desc_set_compression(
+    desc: *mut HalImageDesc,
+    compression: crate::tensor::HalCompression,
+) {
+    if let Some(desc) = unsafe { desc.as_mut() } {
+        let request: Option<edgefirst_tensor::Compression> = compression.into();
+        let base = edgefirst_tensor::ImageDesc::new(
+            desc.inner.width(),
+            desc.inner.height(),
+            desc.inner.format(),
+            desc.inner.dtype(),
+        )
+        .with_memory(desc.inner.memory())
+        .with_access(desc.inner.access());
+        desc.inner = match request {
+            Some(c) => base.with_compression(c),
+            None => base,
+        };
+    }
+}
+
+/// Free an image-allocation request handle. NULL is a no-op. Descs are
+/// independent of the tensors they created — freeing a desc never
+/// affects a tensor.
+///
+/// @param desc Desc handle
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_desc_free(desc: *mut HalImageDesc) {
+    if !desc.is_null() {
+        drop(unsafe { Box::from_raw(desc) });
+    }
+}
+
+/// Allocate an image tensor from a declarative request — the
+/// full-featured variant of hal_tensor_new_image(). See HalCompression
+/// for the request semantics; read the outcome back with
+/// hal_tensor_compression().
+///
+/// @param desc Desc handle
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL desc, or an invalid compression request (declared CPU
+///   access, ineligible format, or scheme mismatch)
+/// - ENOMEM: allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_tensor_new_image_desc(desc: *const HalImageDesc) -> *mut HalTensor {
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return set_error_null(libc::EINVAL);
+    };
+    let dyn_tensor = try_or_null!(TensorDyn::image_desc(&desc.inner), libc::ENOMEM);
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
 }
 
@@ -854,6 +987,72 @@ pub unsafe extern "C" fn hal_image_processor_convert(
         ),
         libc::EIO
     );
+    0
+}
+
+/// Convert and export a native sync-fence fd instead of blocking on the
+/// GPU — the GL→NPU handoff (`EGL_ANDROID_native_fence_sync`, Android).
+///
+/// Identical semantics to [`hal_image_processor_convert`] (including the
+/// GL→CPU fallback chain), except that when the platform supports native
+/// fences the call returns as soon as the GPU commands are submitted and
+/// writes the fence fd to `*fence_fd`. The destination buffer must not
+/// be read until the fence signals — hand the fd to the NPU runtime
+/// (`ANeuralNetworksExecution_startComputeWithDependencies`) or `poll()`
+/// it. When no fence is available (`*fence_fd == -1`) the convert
+/// completed with the blocking contract and the destination is already
+/// safe to read.
+///
+/// The returned fd is owned by the caller: `close()` it when done (the
+/// NPU runtime duplicates what it needs).
+///
+/// @param processor Image processor handle
+/// @param src Source image tensor
+/// @param dst Destination image tensor (pre-allocated; reuse across frames)
+/// @param rotation Rotation to apply
+/// @param flip Flip to apply
+/// @param crop Crop configuration (can be NULL for no crop)
+/// @param fence_fd Out: the sync-fence fd, or -1 when the convert
+///                 completed synchronously (must not be NULL)
+/// @return 0 on success, -1 on error
+/// @par Errors (errno):
+/// - EINVAL: Invalid argument (NULL processor/src/dst/fence_fd)
+/// - EIO: Conversion failed
+#[no_mangle]
+#[cfg(unix)]
+pub unsafe extern "C" fn hal_image_processor_convert_fence(
+    processor: *mut HalImageProcessor,
+    src: *const HalTensor,
+    dst: *mut HalTensor,
+    rotation: HalRotation,
+    flip: HalFlip,
+    crop: *const HalCrop,
+    fence_fd: *mut c_int,
+) -> c_int {
+    check_null!(processor, src, dst, fence_fd);
+
+    let crop_config = if crop.is_null() {
+        Crop::default()
+    } else {
+        unsafe { *crop }.into()
+    };
+
+    let fd = try_or_errno!(
+        unsafe { &mut (*processor) }.inner.convert_with_fence(
+            &unsafe { &(*src) }.inner,
+            &mut unsafe { &mut (*dst) }.inner,
+            rotation.into(),
+            flip.into(),
+            crop_config,
+        ),
+        libc::EIO
+    );
+    unsafe {
+        *fence_fd = fd.map_or(-1, |owned| {
+            use std::os::fd::IntoRawFd;
+            owned.into_raw_fd()
+        });
+    }
     0
 }
 
@@ -1423,6 +1622,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
     height: size_t,
     format: HalPixelFormat,
     dtype: HalDtype,
+    access: crate::tensor::HalCpuAccess,
 ) -> *mut HalTensor {
     if processor.is_null() || width == 0 || height == 0 {
         return set_error_null(libc::EINVAL);
@@ -1434,6 +1634,7 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
         format.to_pixel_format(),
         dtype.into(),
         None,
+        access.into(),
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1458,6 +1659,78 @@ pub unsafe extern "C" fn hal_image_processor_create_image(
         }
     };
     Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
+}
+
+/// Allocate an image tensor from a declarative request — the
+/// full-featured variant of hal_image_processor_create_image().
+///
+/// Without a compression request the processor's memory negotiation
+/// applies (identical to hal_image_processor_create_image with
+/// auto-selected memory); with one, the allocation goes straight to the
+/// platform allocator and the request's guards apply (see
+/// HalCompression). Read the outcome back with hal_tensor_compression().
+///
+/// @param processor Image processor handle
+/// @param desc Desc handle
+/// @return New tensor handle on success, NULL on error
+/// @par Errors (errno):
+/// - EINVAL: NULL argument or invalid compression request
+/// - ENOTSUP: a specific scheme was requested on a platform without it
+/// - ENOMEM: allocation failed
+#[no_mangle]
+pub unsafe extern "C" fn hal_image_processor_create_image_desc(
+    processor: *mut HalImageProcessor,
+    desc: *const HalImageDesc,
+) -> *mut HalTensor {
+    if processor.is_null() || desc.is_null() {
+        return set_error_null(libc::EINVAL);
+    }
+    let desc = unsafe { &(*desc) };
+    let dyn_tensor = match unsafe { &(*processor) }
+        .inner
+        .create_image_desc(&desc.inner)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return set_error_null(match &e {
+                edgefirst_image::Error::Tensor(te) => match te {
+                    edgefirst_tensor::Error::InvalidArgument(_)
+                    | edgefirst_tensor::Error::InvalidShape(_)
+                    | edgefirst_tensor::Error::InvalidOperation(_)
+                    | edgefirst_tensor::Error::ShapeMismatch(_) => libc::EINVAL,
+                    edgefirst_tensor::Error::IoError(io) => io.raw_os_error().unwrap_or(libc::EIO),
+                    edgefirst_tensor::Error::NotImplemented(_) => libc::ENOTSUP,
+                    _ => libc::ENOMEM,
+                },
+                edgefirst_image::Error::InvalidShape(_) | edgefirst_image::Error::NotAnImage => {
+                    libc::EINVAL
+                }
+                edgefirst_image::Error::UnsupportedFormat(_)
+                | edgefirst_image::Error::NotSupported(_)
+                | edgefirst_image::Error::NotImplemented(_) => libc::ENOTSUP,
+                edgefirst_image::Error::Io(io) => io.raw_os_error().unwrap_or(libc::EIO),
+                _ => libc::ENOMEM,
+            });
+        }
+    };
+    Box::into_raw(Box::new(HalTensor { inner: dyn_tensor }))
+}
+
+/// Whether this platform can allocate (format, dtype) images in a vendor
+/// tile-compressed layout. True requires an Android build, an eligible
+/// format (RGBA8888 u8/i8 initially), and a positively identified GPU
+/// vendor; everywhere else HAL_COMPRESSION_ANY requests fall back to
+/// linear (counted by hal_compression_fallback_count()).
+///
+/// @param format Pixel format
+/// @param dtype Data type
+/// @return true when a compression request can be honored
+#[no_mangle]
+pub extern "C" fn hal_platform_compression_support(
+    format: HalPixelFormat,
+    dtype: HalDtype,
+) -> bool {
+    edgefirst_tensor::compression_support(format.to_pixel_format(), dtype.into())
 }
 
 // ============================================================================
@@ -1866,6 +2139,69 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
+    fn test_image_desc_lifecycle_and_create() {
+        unsafe {
+            // NULL desc is rejected, not dereferenced.
+            assert!(hal_tensor_new_image_desc(std::ptr::null()).is_null());
+            hal_image_desc_free(std::ptr::null_mut()); // NULL free is a no-op
+
+            let desc = hal_image_desc_new(64, 32, HalPixelFormat::Rgba, HalDtype::U8);
+            assert!(!desc.is_null());
+            hal_image_desc_set_memory(desc, HalTensorMemory::Mem);
+            hal_image_desc_set_access(desc, crate::tensor::HalCpuAccess::ReadWrite);
+
+            let image = hal_tensor_new_image_desc(desc);
+            assert!(!image.is_null());
+            assert_eq!(hal_tensor_width(image), 64);
+            assert_eq!(hal_tensor_height(image), 32);
+            assert_eq!(
+                crate::tensor::hal_tensor_compression(image),
+                crate::tensor::HalCompression::None
+            );
+            hal_tensor_free(image);
+
+            // A compression request combined with CPU access is EINVAL.
+            hal_image_desc_set_compression(desc, crate::tensor::HalCompression::Any);
+            assert!(hal_tensor_new_image_desc(desc).is_null());
+
+            // Hardware-only + Any allocates everywhere (linear fallback
+            // off-Android, counted by the process-wide counter).
+            let before = crate::tensor::hal_compression_fallback_count();
+            hal_image_desc_set_access(desc, crate::tensor::HalCpuAccess::None);
+            let image = hal_tensor_new_image_desc(desc);
+            assert!(!image.is_null());
+            #[cfg(not(target_os = "android"))]
+            {
+                assert_eq!(
+                    crate::tensor::hal_tensor_compression(image),
+                    crate::tensor::HalCompression::None
+                );
+                assert!(crate::tensor::hal_compression_fallback_count() > before);
+            }
+            #[cfg(target_os = "android")]
+            let _ = before;
+            hal_tensor_free(image);
+            hal_image_desc_free(desc);
+        }
+    }
+
+    #[test]
+    fn test_platform_compression_support_is_conservative() {
+        // Off-Android this is always false; the assert also pins the
+        // symbol into the link closure for the header contract.
+        #[cfg(not(target_os = "android"))]
+        assert!(!hal_platform_compression_support(
+            HalPixelFormat::Rgba,
+            HalDtype::U8
+        ));
+        // Never true for an ineligible format on any platform.
+        assert!(!hal_platform_compression_support(
+            HalPixelFormat::Nv12,
+            HalDtype::U8
+        ));
+    }
+
+    #[test]
     fn test_image_create_and_free() {
         unsafe {
             let image = hal_tensor_new_image(
@@ -1874,6 +2210,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -1904,7 +2241,14 @@ mod tests {
 
             for fmt in formats {
                 // Use dimensions that work for all formats (divisible by 2 for YUV)
-                let image = hal_tensor_new_image(320, 240, fmt, HalDtype::U8, HalTensorMemory::Mem);
+                let image = hal_tensor_new_image(
+                    320,
+                    240,
+                    fmt,
+                    HalDtype::U8,
+                    HalTensorMemory::Mem,
+                    crate::tensor::HalCpuAccess::ReadWrite,
+                );
                 assert!(
                     !image.is_null(),
                     "Failed to create image with format {:?}",
@@ -2067,6 +2411,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             let dst = hal_tensor_new_image(
                 100,
@@ -2074,6 +2419,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!src.is_null());
             assert!(!dst.is_null());
@@ -2132,6 +2478,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2168,6 +2515,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert!(!hal_tensor_is_planar(rgb));
@@ -2179,6 +2527,7 @@ mod tests {
                 HalPixelFormat::Nv12,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!nv12.is_null());
             assert!(hal_tensor_is_planar(nv12));
@@ -2190,6 +2539,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!planar.is_null());
             assert!(hal_tensor_is_planar(planar));
@@ -2209,6 +2559,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_channels(rgb), 3);
@@ -2220,6 +2571,7 @@ mod tests {
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgba.is_null());
             assert_eq!(hal_tensor_channels(rgba), 4);
@@ -2231,6 +2583,7 @@ mod tests {
                 HalPixelFormat::Grey,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!grey.is_null());
             assert_eq!(hal_tensor_channels(grey), 1);
@@ -2250,6 +2603,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!rgb.is_null());
             assert_eq!(hal_tensor_row_stride(rgb), 300); // 100 * 3
@@ -2261,6 +2615,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!planar.is_null());
             assert_eq!(hal_tensor_row_stride(planar), 100); // planar: width
@@ -2284,6 +2639,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!dst.is_null());
 
@@ -2376,6 +2732,7 @@ mod tests {
                 HalPixelFormat::Rgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2407,6 +2764,7 @@ mod tests {
                 HalPixelFormat::PlanarRgb,
                 HalDtype::U8,
                 HalTensorMemory::Mem,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!image.is_null());
 
@@ -2482,6 +2840,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2496,6 +2855,7 @@ mod tests {
                 480,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2506,6 +2866,7 @@ mod tests {
                 0,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(img.is_null());
 
@@ -2534,7 +2895,14 @@ mod tests {
             ];
 
             for (fmt, channels) in formats {
-                let img = hal_image_processor_create_image(processor, 320, 240, fmt, HalDtype::U8);
+                let img = hal_image_processor_create_image(
+                    processor,
+                    320,
+                    240,
+                    fmt,
+                    HalDtype::U8,
+                    crate::tensor::HalCpuAccess::ReadWrite,
+                );
                 assert!(!img.is_null(), "create_image failed for {:?}", fmt);
 
                 assert_eq!(hal_tensor_width(img), 320);
@@ -2571,6 +2939,7 @@ mod tests {
                 240,
                 HalPixelFormat::Rgb,
                 HalDtype::I8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!img.is_null(), "create_image with I8 dtype failed");
             assert_eq!(hal_tensor_dtype(img), HalDtype::I8);
@@ -2600,6 +2969,7 @@ mod tests {
                 240,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!src.is_null());
 
@@ -2610,6 +2980,7 @@ mod tests {
                 120,
                 HalPixelFormat::Rgba,
                 HalDtype::U8,
+                crate::tensor::HalCpuAccess::ReadWrite,
             );
             assert!(!dst.is_null());
 
@@ -2927,6 +3298,7 @@ mod tests {
                 edgefirst_tensor::PixelFormat::Rgba,
                 edgefirst_tensor::DType::U8,
                 None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             t.set_row_stride(512).unwrap();

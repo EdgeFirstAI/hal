@@ -28,6 +28,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ios_value`.
   - Fully wired into the Python and C APIs.
 
+## [0.26.0] - 2026-07-11
+
+### Changed
+
+- **BREAKING: image constructors require a `CpuAccess` declaration.**
+  `Tensor::image`/`image_with_stride`/`image_with_capacity`,
+  `TensorDyn::image`/`image_with_stride`, `ImageProcessor::create_image`,
+  capi `hal_tensor_new_image` + `hal_image_processor_create_image` (new
+  `HalCpuAccess` enum), and Python `create_image`/`Tensor.image`
+  (keyword `access`, strict `"none"` default) all take the declared CPU
+  involvement. Hardware (GPU/NPU/ISP/codec) access is always implied;
+  CPU access is the opt-in that selects the mapping mode (write-combined
+  for `Write`, cached/read-only locks and dma-buf sync direction for
+  `Read`) and, on Android, the gralloc CPU usage bits — a hardware-only
+  (`None`) buffer is eligible for vendor tile compression. Mapping
+  beyond the declaration stays best-effort but warns once per buffer and
+  counts in the new `unplanned_cpu_access_count()`
+  (`hal_unplanned_cpu_access_count`); Android hardware-only buffers
+  refuse CPU maps deterministically.
+
+  Migration: append the access argument to every image-constructor call —
+  `CpuAccess::ReadWrite` reproduces the previous implicit behavior
+  byte-for-byte; declare precisely (`Write` for decode targets, `Read`
+  for verification readers, `None` for hardware-only destinations) to
+  pick up the cheaper mappings. `map()` itself is unchanged (ReadWrite
+  semantics); the new `map_with`/`map_read`/`map_write`/`map_mut` are
+  opt-in. Python scripts that call `map()`/`numpy()` must pass
+  `access="readwrite"` (the default is strict `"none"`).
+
+### Added
+
+- **Tile-compression image metadata and the `ImageDesc` creation path.**
+  `Compression::{Any, Scheme(..)}` requests and the recorded
+  `CompressionScheme::{Ubwc, Afbc, Pvric, Dcc}` become optional image
+  metadata (sibling to colorimetry; preserved by `configure_image`,
+  inherited by views). `ImageDesc` + `Tensor::image_desc` /
+  `TensorDyn::image_desc` / `ImageProcessor::create_image_desc` carry
+  the request (capi: opaque `hal_image_desc_*` handle,
+  `hal_tensor_new_image_desc`, `hal_image_processor_create_image_desc`,
+  `hal_tensor_compression`, `hal_platform_compression_support`; Python:
+  `compression=` keyword + `Tensor.compression`). `Any` resolves linear
+  with a counted fallback (`compression_fallback_count()`); `Scheme`
+  errors on mismatch. The device scheme is classified from
+  `ro.hardware.egl` (host-tested table).
+- **Android `BufferIdentity` interning on `AHardwareBuffer_getId`**
+  (API 31+, dlsym-resolved): every re-wrap of the same buffer shares one
+  identity, so CameraX/ImageReader re-wrap pipelines hit the EGLImage
+  import cache in steady state; API 26–30 keeps fresh-per-wrap
+  identities (correct, uncached, visible in miss counters).
+- **Device Farm validation cells** for the access/compression/identity
+  surface: CPU-usage sweep, write-combined mapping bench, hardware-only
+  map contract, getId-interning window, and compressed-render
+  round-trip (internal hal-mobile Device Farm harness).
+- **Android support: AHardwareBuffer zero-copy tensor storage and a native
+  OpenGL ES backend** (min API 26, `aarch64-linux-android` +
+  `x86_64-linux-android`). Android becomes the third `GlPlatform`
+  implementation, following the architecture validated on-device by the
+  Phase-1 `hal-mobile` probe (Galaxy S26 Ultra):
+  - **`AHardwareBufferTensor`** fills the `TensorMemory::Dma` slot (the role
+    DMA-BUF plays on Linux and IOSurface on macOS/iOS): raw
+    `libnativewindow` FFI (stable NDK ABI since API 26), lock/unlock CPU
+    maps carrying the GPU↔CPU coherency contract, gralloc-stride-aware
+    geometry, BLOB byte-bags for generic tensors, and RGBA8/RGBA16F image
+    buffers sharing the planar-F16 RGBA16F packing with the macOS path. New
+    public API: `Tensor::from_hardware_buffer`, `hardware_buffer_ptr`,
+    `hardware_buffer_physical_dims` (+ `TensorDyn` equivalents),
+    `image_ahardwarebuffer_layout`, `is_ahardwarebuffer_available`.
+  - **`AndroidEgl` GL backend**: native default-display EGL (no ANGLE, no
+    GBM) with per-processor contexts; zero-copy import via
+    `EGL_ANDROID_image_native_buffer` with **persistent** texture bindings
+    (like Linux DMA-BUF, so the binding-skip cache applies). New
+    `TransferBackend::AHardwareBuffer`.
+  - **Android build & link validation**: new `scripts/build-android.sh`
+    and `scripts/validate-android-link.sh` (links the production C API
+    staticlib against the NDK system libraries and checks the API-26
+    EGL/GLES stub exports with `llvm-nm`), and a `build-android` CI lane
+    (clippy + build + link validation for both ABIs, pinned NDK r27c).
+    On-device validation (GL-vs-CPU oracles, convert benchmarks with
+    import-cache miss gates) runs via the internal hal-mobile AWS Device
+    Farm harness.
+  - Deferred follow-ups (fall back to CPU today): YUV camera buffers
+    (external-OES sampling), Grey/NV single-plane zero-copy (`R8_UNORM`
+    needs API 29), and shared-memory *allocation* (bionic has no
+    `shm_open`; importing an existing segment via `from_fd` works).
+- **True end-to-end zero-copy on the float convert paths + NPU-direct
+  output surface** (all platforms; measured on macOS/ANGLE and on-device):
+  - **Float-path zero-copy source import**: the F16/F32 render family
+    previously CPU-uploaded its RGBA source every frame on every platform
+    (the largest silent zero-copy degrade found by a full engine audit —
+    ~3.2 ms/frame at 1080p on-device). `feed_float_src` now imports
+    Dma-backed sources as EGLImages with a per-driver fallback chain
+    (escape hatch: `EDGEFIRST_GL_NO_FLOAT_SRC_IMPORT=1`). macOS medians:
+    720p RGBA→PlanarF16 762→363 µs (2.1×), 1080p 1422→351 µs (4.1×).
+  - **`ConvertStats` telemetry**: per-feed counters (`src_imports`,
+    `src_pbo_uploads`, `src_uploads`, `zero_copy_declines`) via
+    `GLProcessorThreaded::convert_stats()`, a `src_feed` field on the
+    `image.convert.gl` span, `ImageProcessor::convert_fallback_count()`,
+    and warn-once (per buffer) NV import failures — every silent fallback
+    is now loud and countable.
+  - **Explicit-Dma contract**: `Some(TensorMemory::Dma)` image requests
+    with no zero-copy mapping now return `InvalidArgument` on
+    macOS/Android instead of silently allocating a byte-bag no GL import
+    can bind (semi-planar u8 on macOS keeps its designed `'L008'` R8
+    mapping).
+  - **Packed RGB u8/i8 zero-copy on Android AND macOS** (the INT8 NPU
+    input layout): new `packed_rgb888_layout` shared by allocation and
+    render ((W·3/4, H) RGBA8888 texels), wired into both the
+    AHardwareBuffer format table and the IOSurface FourCC table (on
+    macOS this replaces the accidental `'L008'` byte-bag the two-pass
+    shader used to bind); I8 rides the same layout on both platforms.
+    The packed-RGB GL correctness tests now run on macOS too.
+  - **NPU-direct C API**: `hal_tensor_from_hardware_buffer`,
+    `hal_tensor_hardware_buffer_ptr`/`_physical_dims`,
+    `hal_tensor_recorded_row_stride`, `hal_tensor_effective_row_stride`,
+    and `hal_tensor_copy_to_flat` (+ `Tensor/TensorDyn::copy_to_flat`) —
+    consume the convert output with zero CPU readback, with the padded-
+    pitch flatness contract documented (README § NPU-direct output).
+  - **GL→NPU fence export**: `convert_with_fence` /
+    `hal_image_processor_convert_fence` return an
+    `EGL_ANDROID_native_fence_sync` fd instead of blocking in `glFinish`,
+    so the NPU waits on the GPU directly
+    (`ANeuralNetworksExecution_startComputeWithDependencies`); platforms
+    without native fences keep the blocking contract and return no fd.
+  - Float-draw micro-optimizations: uniform locations cached per program
+    and the constant full-screen quad moved to static VBOs.
+
 ## [0.25.3] - 2026-06-24
 
 ### Changed

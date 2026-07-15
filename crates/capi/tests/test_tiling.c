@@ -205,7 +205,8 @@ static void test_gpu_paths_null_guards(void) {
     // alloc_tile_batch: NULL processor / config -> NULL + EINVAL.
     errno = 0;
     ASSERT_NULL(hal_image_processor_alloc_tile_batch(
-        NULL, 4, &cfg, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM));
+        NULL, 4, &cfg, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8, HAL_TENSOR_MEMORY_MEM,
+        HAL_CPU_ACCESS_NONE));
     ASSERT_ERRNO(EINVAL);
 
     // tile_into / tile_one: NULL args -> NULL/-1 + EINVAL.

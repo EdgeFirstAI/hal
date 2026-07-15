@@ -24,8 +24,15 @@ fn main() {
     let jpeg = std::fs::read(testdata.join("zidane.jpg")).expect("testdata/zidane.jpg");
 
     // Colour JPEGs decode to NV12; allocate at the max expected image size.
-    let mut tensor =
-        Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12, Some(TensorMemory::Mem)).unwrap();
+    let mut tensor = Tensor::<u8>::image(
+        1920,
+        1080,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        // Decode target: the codec CPU-writes it; nothing reads it back.
+        edgefirst_tensor::CpuAccess::Write,
+    )
+    .unwrap();
     let mut decoder = ImageDecoder::new();
 
     // Warmup: scratch buffer grows to required size

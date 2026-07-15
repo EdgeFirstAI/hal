@@ -27,19 +27,24 @@ the appropriate conversion method based on the available hardware.
 ```rust
 # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait};
 # use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
-# use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorMemory};
+# use edgefirst_tensor::{CpuAccess, PixelFormat, DType, Tensor, TensorMemory};
 # fn main() -> Result<(), edgefirst_image::Error> {
 let image = edgefirst_bench::testdata::read("zidane.jpg");
 // The codec emits the source's native format (a colour JPEG decodes to NV12)
 // and configures the destination tensor's dims+format during the decode.
 let info = peek_info(&image).expect("peek");
+// Heap tensors are CPU-touched on both sides (codec decode writes, the
+// engine's upload/CPU-fallback paths read), so declare ReadWrite. Pure
+// hardware pipelines allocate their convert destinations with
+// `CpuAccess::None` instead.
 let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
-                                   Some(TensorMemory::Mem))?;
+                                   Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
 let mut decoder = ImageDecoder::new();
 src.load_image(&mut decoder, &image).expect("decode");
 // Convert the native NV12 frame to packed RGB for downstream processing.
 let mut converter = ImageProcessor::new()?;
-let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+let mut dst =
+    converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
 converter.convert(&src.into(), &mut dst, Rotation::None, Flip::None, Crop::default())?;
 # Ok(())
 # }
@@ -318,11 +323,35 @@ use enum_dispatch::enum_dispatch;
 pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 pub use g2d::G2DProcessor;
-#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
+    feature = "opengl"
+))]
 pub use opengl_headless::EglDisplayKind;
-#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
+    feature = "opengl"
+))]
 pub use opengl_headless::GLProcessorThreaded;
-#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
+    feature = "opengl"
+))]
 pub use opengl_headless::Int8InterpolationMode;
 #[cfg(target_os = "linux")]
 #[cfg(feature = "opengl")]
@@ -330,8 +359,16 @@ pub use opengl_headless::{probe_egl_displays, EglDisplayInfo};
 // EGLImage cache counter snapshots (diagnostics): see
 // `GLProcessorThreaded::egl_cache_stats` and the steady-state import gate in
 // `crates/image/ARCHITECTURE.md § image.convert.gl.egl_import`.
-#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
-pub use opengl_headless::{CacheStats, GlCacheStats};
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android"
+    ),
+    feature = "opengl"
+))]
+pub use opengl_headless::{CacheStats, ConvertStats, GlCacheStats};
 use std::{fmt::Display, time::Instant};
 
 mod colorimetry;
@@ -960,7 +997,15 @@ pub struct ImageProcessorConfig {
     /// Ignored when `EDGEFIRST_DISABLE_GL=1` is set, and on macOS
     /// (ANGLE/Metal is the only display there; a `Some` value logs a
     /// debug note and is otherwise ignored).
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
+        feature = "opengl"
+    ))]
     pub egl_display: Option<EglDisplayKind>,
 
     /// Preferred compute backend.
@@ -1116,17 +1161,25 @@ pub struct ImageProcessor {
     /// if the EDGEFIRST_DISABLE_GL environment variable is not set and OpenGL
     /// ES is available.
     pub opengl: Option<GLProcessorThreaded>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
     #[cfg(feature = "opengl")]
-    /// OpenGL-based image converter for macOS via ANGLE + IOSurface —
-    /// the same unified `GLProcessorThreaded` engine as Linux (its
-    /// worker owns a per-processor ANGLE context). Available when
-    /// ANGLE's libEGL.dylib can be loaded (see README.md § macOS GPU
-    /// Acceleration).
+    /// OpenGL-based image converter — the same unified
+    /// `GLProcessorThreaded` engine as Linux (its worker owns a
+    /// per-processor context). macOS/iOS run it via ANGLE + IOSurface
+    /// (available when ANGLE's libEGL.dylib can be loaded — see
+    /// README.md § macOS GPU Acceleration); Android runs it via the
+    /// native EGL driver + AHardwareBuffer.
     pub opengl: Option<GLProcessorThreaded>,
 
     /// When set, only the specified backend is used — no fallback chain.
     pub(crate) forced_backend: Option<ForcedBackend>,
+
+    /// Converts where the GL backend declined and the auto chain fell
+    /// through toward G2D/CPU. Owned by the dispatcher (the GL worker never
+    /// sees these frames), unlike the per-feed counters in
+    /// `GLProcessorThreaded::convert_stats`. Read via
+    /// [`convert_fallback_count`](Self::convert_fallback_count).
+    pub(crate) convert_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 unsafe impl Send for ImageProcessor {}
@@ -1141,24 +1194,105 @@ impl ImageProcessor {
     /// ```rust,no_run
     /// # use edgefirst_image::{ImageProcessor, Rotation, Flip, Crop, ImageProcessorTrait};
     /// # use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
-    /// # use edgefirst_tensor::{PixelFormat, DType, Tensor, TensorMemory};
+    /// # use edgefirst_tensor::{CpuAccess, PixelFormat, DType, Tensor, TensorMemory};
     /// # fn main() -> Result<(), edgefirst_image::Error> {
     /// let image = std::fs::read("zidane.jpg")?;
     /// // The codec emits the source's native format (a colour JPEG decodes to
     /// // NV12) and configures the destination tensor during the decode.
     /// let info = peek_info(&image).expect("peek");
     /// let mut src = Tensor::<u8>::image(info.width, info.height, info.format,
-    ///                                    Some(TensorMemory::Mem))?;
+    ///                                    Some(TensorMemory::Mem), CpuAccess::ReadWrite)?;
     /// let mut decoder = ImageDecoder::new();
     /// src.load_image(&mut decoder, &image).expect("decode");
     /// let mut converter = ImageProcessor::new()?;
-    /// let mut dst = converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None)?;
+    /// let mut dst =
+    ///     converter.create_image(640, 480, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
     /// converter.convert(&src.into(), &mut dst, Rotation::None, Flip::None, Crop::default())?;
     /// # Ok(())
     /// # }
     /// ```
     pub fn new() -> Result<Self> {
         Self::with_config(ImageProcessorConfig::default())
+    }
+
+    /// Number of converts where the auto chain's GL backend declined and the
+    /// frame fell through toward G2D/CPU — each one silently lost any
+    /// zero-copy guarantee. A pipeline that expects to stay on the GPU
+    /// asserts this stays flat across its steady-state loop; pair with
+    /// `GLProcessorThreaded::convert_stats` to see how the frames that DID
+    /// reach GL were fed. Always 0 under a forced backend (no chain).
+    pub fn convert_fallback_count(&self) -> u64 {
+        self.convert_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of [`Compression::Any`](edgefirst_tensor::Compression)
+    /// requests since process start that resolved to a linear layout
+    /// (process-wide mirror of
+    /// [`edgefirst_tensor::compression_fallback_count`], surfaced here
+    /// beside [`convert_fallback_count`](Self::convert_fallback_count)
+    /// so pipeline telemetry reads from one place). A pipeline that
+    /// expects compressed convert destinations asserts this stays flat
+    /// after warmup.
+    pub fn compression_fallback_count(&self) -> u64 {
+        edgefirst_tensor::compression_fallback_count()
+    }
+
+    /// Convert and return a native sync-fence fd that signals when the
+    /// GPU work completes, instead of blocking the CPU — the GL→NPU
+    /// handoff (`EGL_ANDROID_native_fence_sync` on Android).
+    ///
+    /// `Ok(Some(fd))`: the destination buffer is still in flight; hand
+    /// the fd to the consumer (e.g.
+    /// `ANeuralNetworksExecution_startComputeWithDependencies`) or
+    /// `poll()` it before reading. `Ok(None)`: the convert completed with
+    /// the normal blocking contract (no native fence on this platform, or
+    /// a non-GL backend handled the frame) — the destination is already
+    /// safe. Semantics are otherwise identical to
+    /// [`convert`](ImageProcessorTrait::convert), including the
+    /// GL→G2D→CPU fallback chain.
+    #[cfg(unix)]
+    pub fn convert_with_fence(
+        &mut self,
+        src: &TensorDyn,
+        dst: &mut TensorDyn,
+        rotation: Rotation,
+        flip: Flip,
+        crop: Crop,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
+        #[cfg(feature = "opengl")]
+        {
+            let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
+            if self.forced_backend.is_none() || gl_forced {
+                if let Some(opengl) = self.opengl.as_mut() {
+                    match opengl.convert_with_fence(src, dst, rotation, flip, crop) {
+                        Ok(fd) => return Ok(fd),
+                        Err(e) if gl_forced => return Err(e),
+                        Err(e) => {
+                            // Not counted here: the blocking chain below
+                            // re-runs the dispatcher, whose decline arm
+                            // counts the fallback exactly once.
+                            log::debug!(
+                                "convert_with_fence: opengl declined, \
+                                 falling back to the blocking chain: {e}"
+                            );
+                        }
+                    }
+                } else if gl_forced {
+                    return Err(Error::ForcedBackendUnavailable("opengl".into()));
+                }
+            }
+        }
+        // Blocking chain (G2D/CPU, forced non-GL, or non-GL builds):
+        // completion == return, so no fence is needed.
+        self.convert(src, dst, rotation, flip, crop)?;
+        Ok(None)
     }
 
     /// Report which float dtypes the GPU can render to.
@@ -1174,7 +1308,10 @@ impl ImageProcessor {
     ///
     /// [`create_image`]: Self::create_image
     pub fn supported_render_dtypes(&self) -> RenderDtypeSupport {
-        #[cfg(all(target_os = "macos", feature = "opengl"))]
+        #[cfg(all(
+            any(target_os = "macos", target_os = "ios", target_os = "android"),
+            feature = "opengl"
+        ))]
         if let Some(gl) = self.opengl.as_ref() {
             return gl.supported_render_dtypes();
         }
@@ -1211,9 +1348,10 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
+                    convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                     forced_backend: None,
                 });
             }
@@ -1233,6 +1371,7 @@ impl ImageProcessor {
                         g2d,
                         #[cfg(feature = "opengl")]
                         opengl: None,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1241,9 +1380,10 @@ impl ImageProcessor {
                     log::warn!("G2D requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                         #[cfg(feature = "opengl")]
                         opengl: None,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1265,11 +1405,12 @@ impl ImageProcessor {
                         g2d: None,
                         #[cfg(feature = "opengl")]
                         opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 {
                     #[cfg(feature = "opengl")]
                     let opengl = match GLProcessorThreaded::new(config.egl_display) {
@@ -1288,15 +1429,44 @@ impl ImageProcessor {
                         cpu: Some(CPUProcessor::new()),
                         #[cfg(feature = "opengl")]
                         opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     }
                     .apply_colorimetry_mode(config.colorimetry));
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                #[cfg(target_os = "android")]
+                {
+                    #[cfg(feature = "opengl")]
+                    let opengl = match GLProcessorThreaded::new(config.egl_display) {
+                        Ok(gl) => Some(gl),
+                        Err(e) => {
+                            log::warn!(
+                                "OpenGL requested but native EGL init failed: {e:?}. \
+                                 Falling back to CPU."
+                            );
+                            None
+                        }
+                    };
+                    return Ok(Self {
+                        cpu: Some(CPUProcessor::new()),
+                        #[cfg(feature = "opengl")]
+                        opengl,
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                        forced_backend: None,
+                    }
+                    .apply_colorimetry_mode(config.colorimetry));
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "android"
+                )))]
                 {
                     log::warn!("OpenGL requested but not available on this platform, using CPU");
                     return Ok(Self {
                         cpu: Some(CPUProcessor::new()),
+                        convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                         forced_backend: None,
                     });
                 }
@@ -1331,9 +1501,10 @@ impl ImageProcessor {
                     #[cfg(target_os = "linux")]
                     #[cfg(feature = "opengl")]
                     opengl: None,
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                     #[cfg(feature = "opengl")]
                     opengl: None,
+                    convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                     forced_backend: Some(ForcedBackend::Cpu),
                 }),
                 ForcedBackend::G2d => {
@@ -1349,6 +1520,7 @@ impl ImageProcessor {
                             g2d: Some(g2d),
                             #[cfg(feature = "opengl")]
                             opengl: None,
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::G2d),
                         })
                     }
@@ -1372,11 +1544,12 @@ impl ImageProcessor {
                             cpu: None,
                             g2d: None,
                             opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
                     #[cfg(feature = "opengl")]
                     {
                         let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
@@ -1387,12 +1560,34 @@ impl ImageProcessor {
                         Ok(Self {
                             cpu: None,
                             opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
+                            forced_backend: Some(ForcedBackend::OpenGl),
+                        }
+                        .apply_colorimetry_mode(config.colorimetry))
+                    }
+                    #[cfg(target_os = "android")]
+                    #[cfg(feature = "opengl")]
+                    {
+                        let opengl = GLProcessorThreaded::new(config.egl_display).map_err(|e| {
+                            Error::ForcedBackendUnavailable(format!(
+                                "opengl forced but native EGL init failed: {e:?}"
+                            ))
+                        })?;
+                        Ok(Self {
+                            cpu: None,
+                            opengl: Some(opengl),
+                            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
                             forced_backend: Some(ForcedBackend::OpenGl),
                         }
                         .apply_colorimetry_mode(config.colorimetry))
                     }
                     #[cfg(not(all(
-                        any(target_os = "linux", target_os = "macos"),
+                        any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "android"
+                        ),
                         feature = "opengl"
                     )))]
                     {
@@ -1442,7 +1637,7 @@ impl ImageProcessor {
             }
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         let opengl = if std::env::var("EDGEFIRST_DISABLE_GL")
             .map(|x| x != "0" && x.to_lowercase() != "false")
@@ -1455,7 +1650,7 @@ impl ImageProcessor {
                 Ok(gl_converter) => Some(gl_converter),
                 Err(err) => {
                     log::debug!(
-                        "macOS GL backend unavailable: {err:?} \
+                        "GL backend unavailable: {err:?} \
                          (CPU fallback will be used)"
                     );
                     None
@@ -1479,9 +1674,10 @@ impl ImageProcessor {
             #[cfg(target_os = "linux")]
             #[cfg(feature = "opengl")]
             opengl,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
             #[cfg(feature = "opengl")]
             opengl,
+            convert_fallbacks: std::sync::atomic::AtomicU64::new(0),
             forced_backend: None,
         }
         .apply_colorimetry_mode(config.colorimetry))
@@ -1491,7 +1687,15 @@ impl ImageProcessor {
     /// it (currently the Linux GL backend); no-op elsewhere. Constructor
     /// plumbing for [`ImageProcessorConfig::colorimetry`].
     fn apply_colorimetry_mode(self, _mode: ColorimetryMode) -> Self {
-        #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+        #[cfg(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ),
+            feature = "opengl"
+        ))]
         {
             let mut me = self;
             if let Err(e) = me.set_colorimetry_mode(_mode) {
@@ -1499,7 +1703,15 @@ impl ImageProcessor {
             }
             me
         }
-        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "opengl")))]
+        #[cfg(not(all(
+            any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "android"
+            ),
+            feature = "opengl"
+        )))]
         {
             let _ = _mode;
             self
@@ -1510,7 +1722,15 @@ impl ImageProcessor {
     /// on the OpenGL backend. No-op if OpenGL is not available. The
     /// `EDGEFIRST_COLORIMETRY` environment variable takes precedence — when
     /// it is set, this call logs and keeps the env-selected mode.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
+        feature = "opengl"
+    ))]
     pub fn set_colorimetry_mode(&mut self, mode: ColorimetryMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_colorimetry_mode(mode)?;
@@ -1520,7 +1740,15 @@ impl ImageProcessor {
 
     /// Sets the interpolation mode for int8 proto textures on the OpenGL
     /// backend. No-op if OpenGL is not available.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "opengl"))]
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ),
+        feature = "opengl"
+    ))]
     pub fn set_int8_interpolation_mode(&mut self, mode: Int8InterpolationMode) -> Result<()> {
         if let Some(ref mut gl) = self.opengl {
             gl.set_int8_interpolation_mode(mode)?;
@@ -1595,6 +1823,30 @@ impl ImageProcessor {
     /// # Errors
     ///
     /// Returns an error if all allocation strategies fail.
+    /// Allocate an image tensor from a declarative
+    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
+    /// full-featured variant of [`create_image`](Self::create_image).
+    ///
+    /// Without a compression request this is exactly `create_image` (the
+    /// processor's memory negotiation applies). With one, the allocation
+    /// rides the tensor desc path un-negotiated: the layout decision
+    /// belongs to the platform allocator, and the request's guards and
+    /// fallback counting live there (see
+    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)).
+    pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
+        if desc.compression().is_none() {
+            return self.create_image(
+                desc.width(),
+                desc.height(),
+                desc.format(),
+                desc.dtype(),
+                desc.memory(),
+                desc.access(),
+            );
+        }
+        Ok(TensorDyn::image_desc(desc)?)
+    }
+
     pub fn create_image(
         &self,
         width: usize,
@@ -1602,6 +1854,7 @@ impl ImageProcessor {
         format: PixelFormat,
         dtype: DType,
         memory: Option<TensorMemory>,
+        access: edgefirst_tensor::CpuAccess,
     ) -> Result<TensorDyn> {
         // Compute the GPU-aligned row stride in bytes for this image.
         // `None` means either the format has no defined primary-plane bpp
@@ -1649,6 +1902,7 @@ impl ImageProcessor {
                         dtype,
                         stride,
                         Some(edgefirst_tensor::TensorMemory::Dma),
+                        access,
                     )?)
                 }
                 _ => Ok(TensorDyn::image(
@@ -1657,6 +1911,7 @@ impl ImageProcessor {
                     format,
                     dtype,
                     Some(edgefirst_tensor::TensorMemory::Dma),
+                    access,
                 )?),
             }
         };
@@ -1681,27 +1936,46 @@ impl ImageProcessor {
                 return try_dma();
             }
             Some(mem) => {
-                return Ok(TensorDyn::image(width, height, format, dtype, Some(mem))?);
+                return Ok(TensorDyn::image(
+                    width,
+                    height,
+                    format,
+                    dtype,
+                    Some(mem),
+                    access,
+                )?);
             }
             None => {}
         }
 
         // macOS: when the GL backend is active with the IOSurface
-        // transfer path, prefer Dma (IOSurface) for zero-copy import.
-        // The Tensor allocator falls through to SHM/Mem automatically
-        // for formats without an IOSurface mapping (NV12, planar, etc.).
-        #[cfg(target_os = "macos")]
+        // transfer path, prefer Dma (IOSurface on Apple, AHardwareBuffer
+        // on Android) for zero-copy import. Formats without a zero-copy
+        // mapping now ERROR under explicit Dma (the explicit-Dma
+        // contract), so auto-select catches that error here and falls
+        // back to host storage — loudly, via the debug log below.
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
         #[cfg(feature = "opengl")]
         if let Some(gl) = self.opengl.as_ref() {
             let _ = gl; // probe_transfer_backend lives behind the platform trait
-            if let Ok(img) = TensorDyn::image(
+            match TensorDyn::image(
                 width,
                 height,
                 format,
                 dtype,
                 Some(edgefirst_tensor::TensorMemory::Dma),
+                access,
             ) {
-                return Ok(img);
+                Ok(img) => return Ok(img),
+                Err(e) => {
+                    // Falling back to a non-zero-copy destination is a real
+                    // perf cliff — never do it silently (on-device triage
+                    // starts from this line).
+                    log::debug!(
+                        "create_image: zero-copy Dma allocation declined \
+                         ({format:?}/{dtype:?} {width}x{height}): {e:?}; using fallback storage"
+                    );
+                }
             }
         }
 
@@ -1780,6 +2054,7 @@ impl ImageProcessor {
             format,
             dtype,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            access,
         )?)
     }
 
@@ -2177,7 +2452,12 @@ impl ImageProcessorTrait for ImageProcessor {
                     Err(Error::ForcedBackendUnavailable("g2d".into()))
                 }
                 ForcedBackend::OpenGl => {
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    #[cfg(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "android"
+                    ))]
                     #[cfg(feature = "opengl")]
                     if let Some(opengl) = self.opengl.as_mut() {
                         let r = opengl.convert(src, dst, rotation, flip, crop);
@@ -2194,7 +2474,12 @@ impl ImageProcessorTrait for ImageProcessor {
         }
 
         // ── Auto fallback chain: OpenGL → G2D → CPU ──────────────────
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             match opengl.convert(src, dst, rotation, flip, crop) {
@@ -2206,7 +2491,14 @@ impl ImageProcessorTrait for ImageProcessor {
                     return Ok(());
                 }
                 Err(e) => {
-                    log::trace!("convert: auto opengl declined {src_fmt:?}→{dst_fmt:?}: {e}");
+                    self.convert_fallbacks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::debug!(
+                        "convert: auto opengl declined {src_fmt:?}@{:?}→{dst_fmt:?}@{:?}, \
+                         falling back toward G2D/CPU: {e}",
+                        src.memory(),
+                        dst.memory(),
+                    );
                 }
             }
         }
@@ -2283,7 +2575,12 @@ impl ImageProcessorTrait for ImageProcessor {
         // is forced or auto-selectable; on a GL decline fall back to an eager
         // convert (the auto chain), which is correct everywhere — it completes
         // synchronously and `flush` stays a no-op for non-GL backends.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         {
             let gl_forced = matches!(self.forced_backend, Some(ForcedBackend::OpenGl));
@@ -2310,7 +2607,12 @@ impl ImageProcessorTrait for ImageProcessor {
         let _span = tracing::trace_span!("image.flush").entered();
         // Only the OpenGL backend defers; flushing it issues the single GPU
         // sync. CPU/G2D converts already completed, so there is nothing to flush.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android"
+        ))]
         #[cfg(feature = "opengl")]
         if let Some(opengl) = self.opengl.as_mut() {
             return opengl.flush();
@@ -2685,18 +2987,31 @@ pub(crate) fn load_image_test_helper(
                 native_fmt,
                 aligned_pitch,
                 Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )?;
             dma.load_image(&mut decoder, image)?;
             TensorDyn::from(dma)
         } else {
-            let mut img = Tensor::<u8>::image(w, h, native_fmt, memory)?;
+            let mut img = Tensor::<u8>::image(
+                w,
+                h,
+                native_fmt,
+                memory,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )?;
             img.load_image(&mut decoder, image)?;
             TensorDyn::from(img)
         }
     };
     #[cfg(not(target_os = "linux"))]
     let native_src = {
-        let mut img = Tensor::<u8>::image(w, h, native_fmt, memory)?;
+        let mut img = Tensor::<u8>::image(
+            w,
+            h,
+            native_fmt,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         img.load_image(&mut decoder, image)?;
         TensorDyn::from(img)
     };
@@ -2706,7 +3021,14 @@ pub(crate) fn load_image_test_helper(
     // without GPU/G2D hardware.
     match format {
         Some(f) if f != native_fmt => {
-            let mut dst = TensorDyn::image(w, h, f, DType::U8, memory)?;
+            let mut dst = TensorDyn::image(
+                w,
+                h,
+                f,
+                DType::U8,
+                memory,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )?;
             // `ImageProcessorConfig` has platform-specific fields: on Linux it
             // carries extra GL/G2D options so `..Default::default()` is needed,
             // but on macOS `backend` is the only field, making the update
@@ -2758,7 +3080,7 @@ pub fn save_jpeg(tensor: &TensorDyn, path: impl AsRef<std::path::Path>, quality:
     let w = t.width().ok_or(Error::NotAnImage)?;
     let h = t.height().ok_or(Error::NotAnImage)?;
     let encoder = jpeg_encoder::Encoder::new_file(path, quality)?;
-    let tensor_map = t.map()?;
+    let tensor_map = t.map_read()?;
 
     encoder.encode(&tensor_map, w as u16, h as u16, colour)?;
 
@@ -3057,6 +3379,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -3084,9 +3407,15 @@ mod image_tests {
 
         for (i, &c) in colors.iter().enumerate().take(n) {
             // Standalone full-buffer convert of the same source = the oracle.
-            let mut solo =
-                TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                    .unwrap();
+            let mut solo = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             proc.convert(
                 &make_src(c),
                 &mut solo,
@@ -3156,6 +3485,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
         let placements = proc.tile_into(&src, &mut parent, &cfg).unwrap();
@@ -3174,6 +3504,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             proc.convert(
@@ -3223,6 +3554,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
         proc.tile_into(&src, &mut parent, &cfg).unwrap();
@@ -3235,6 +3567,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             proc.tile_one(&src, &mut slot, p, &cfg).unwrap();
@@ -3279,6 +3612,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(p) => p,
             Err(e) => {
@@ -3304,6 +3638,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             proc.convert(
@@ -3354,6 +3689,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let r = proc.tile_into(&src, &mut small, &cfg);
@@ -3384,7 +3720,8 @@ mod image_tests {
                 &bad,
                 PixelFormat::Rgba,
                 DType::U8,
-                Some(TensorMemory::Mem)
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .is_err());
     }
@@ -3413,8 +3750,24 @@ mod image_tests {
 
     #[test]
     fn test_invalid_crop() {
-        let src = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
-        let dst = TensorDyn::image(100, 100, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let dst = TensorDyn::image(
+            100,
+            100,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         // A source crop exceeding the source bounds is rejected.
         let crop = Crop::new().with_source(Some(Region::new(50, 50, 60, 60)));
@@ -3477,7 +3830,15 @@ mod image_tests {
         assert_eq!(img.width(), Some(1280));
         assert_eq!(img.height(), Some(720));
 
-        let dst = TensorDyn::image(640, 360, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut converter = CPUProcessor::new();
         let (result, _img, dst) = convert_img(
             &mut converter,
@@ -3637,8 +3998,22 @@ mod image_tests {
         unsafe { std::env::set_var("EDGEFIRST_DISABLE_G2D", "1") };
         let mut converter = ImageProcessor::new()?;
 
-        let src = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None)?;
-        let dst = TensorDyn::image(640, 360, PixelFormat::Rgba, DType::U8, None)?;
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
+        let dst = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         let (result, _src, _dst) = convert_img(
             &mut converter,
             src,
@@ -3654,8 +4029,24 @@ mod image_tests {
 
     #[test]
     fn test_unsupported_conversion() {
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
-        let dst = TensorDyn::image(640, 360, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let dst = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut converter = ImageProcessor::new().unwrap();
         let (result, _src, _dst) = convert_img(
             &mut converter,
@@ -3703,7 +4094,15 @@ mod image_tests {
 
     #[test]
     fn test_new_nv12() {
-        let nv12 = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let nv12 = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(nv12.height(), Some(720));
         assert_eq!(nv12.width(), Some(1280));
         assert_eq!(nv12.format().unwrap(), PixelFormat::Nv12);
@@ -3724,7 +4123,14 @@ mod image_tests {
 
         let mut converter = ImageProcessor::new().unwrap();
         let converter_dst = converter
-            .create_image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None)
+            .create_image(
+                dst_width,
+                dst_height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         let (result, src, converter_dst) = convert_img(
             &mut converter,
@@ -3736,8 +4142,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -3759,7 +4172,14 @@ mod image_tests {
 
         // I8 image should allocate successfully via create_image
         let dst = converter
-            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .create_image(
+                320,
+                240,
+                PixelFormat::Rgb,
+                DType::I8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         assert_eq!(dst.dtype(), DType::I8);
         assert!(dst.width() == Some(320));
@@ -3768,7 +4188,14 @@ mod image_tests {
 
         // U8 for comparison
         let dst_u8 = converter
-            .create_image(320, 240, PixelFormat::Rgb, DType::U8, None)
+            .create_image(
+                320,
+                240,
+                PixelFormat::Rgb,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         assert_eq!(dst_u8.dtype(), DType::U8);
 
@@ -3776,7 +4203,14 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let mut dst_i8 = converter
-            .create_image(320, 240, PixelFormat::Rgb, DType::I8, None)
+            .create_image(
+                320,
+                240,
+                PixelFormat::Rgb,
+                DType::I8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         converter
             .convert(
@@ -3806,6 +4240,7 @@ mod image_tests {
             PixelFormat::Nv12,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         );
 
         match result {
@@ -3837,7 +4272,14 @@ mod image_tests {
 
         let mut converter = ImageProcessor::new().unwrap();
         let converter_dst = converter
-            .create_image(1280, 720, PixelFormat::Rgba, DType::U8, None)
+            .create_image(
+                1280,
+                720,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         let crop = Crop::new().with_source(Some(Region::new(0, 0, 640, 640)));
         let (result, src, converter_dst) = convert_img(
@@ -3850,7 +4292,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -3963,14 +4413,28 @@ mod image_tests {
         let rotation = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
         let (dst_width, dst_height) = (cpu_src.height().unwrap(), cpu_src.width().unwrap());
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         // Rotate the native-orientation `loaded` frame and the native `zidane`
         // frame by the same reported rotation; the results must agree.
-        let loaded_rotated =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let loaded_rotated = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let (r0, _loaded, loaded_rotated) = convert_img(
             &mut cpu_converter,
             loaded,
@@ -4018,7 +4482,15 @@ mod image_tests {
         let cpu_src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
         let rotation = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _cpu_src, cpu_dst) = convert_img(
@@ -4033,8 +4505,15 @@ mod image_tests {
 
         // Rotate the decoded PNG by the same reported angle so both frames are
         // in the same (180°-rotated) orientation before comparing.
-        let loaded_rotated =
-            TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let loaded_rotated = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let (r0, _loaded, loaded_rotated) = convert_img(
             &mut cpu_converter,
             loaded,
@@ -4112,7 +4591,14 @@ mod image_tests {
         // GL-backed convert into a pitch-aligned 640×640 Rgba dest.
         let mut gl_proc = ImageProcessor::new().unwrap();
         let gl_dst = gl_proc
-            .create_image(640, 640, PixelFormat::Rgba, DType::U8, None)
+            .create_image(
+                640,
+                640,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         let (r_gl, _src_gl, gl_dst) = convert_img(
             &mut gl_proc,
@@ -4142,6 +4628,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let (r_cpu, _src_cpu, cpu_dst) = convert_img(
@@ -4396,6 +4883,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -4409,8 +4897,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -4444,8 +4939,15 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -4461,9 +4963,15 @@ mod image_tests {
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
 
         for _ in 0..5 {
-            let gl_dst =
-                TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None)
-                    .unwrap();
+            let gl_dst = TensorDyn::image(
+                dst_width,
+                dst_height,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             let (result, src_back, gl_dst) = convert_img(
                 &mut gl_converter,
                 src,
@@ -4519,8 +5027,24 @@ mod image_tests {
         )
         .unwrap();
 
-        let gl_dst = TensorDyn::image(640, 640, PixelFormat::Grey, DType::U8, None).unwrap();
-        let cpu_dst = TensorDyn::image(640, 640, PixelFormat::Grey, DType::U8, None).unwrap();
+        let gl_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Grey,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let cpu_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Grey,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         let mut converter = CPUProcessor::new();
 
@@ -4567,8 +5091,15 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let crop = Crop::new().with_source(Some(Region::new(0, 0, 640, 360)));
         let (result, src, cpu_dst) = convert_img(
@@ -4581,8 +5112,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let g2d_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
         let (result, _src, g2d_dst) = convert_img(
             &mut g2d_converter,
@@ -4621,8 +5159,15 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let crop = Crop::new();
         let (result, src, cpu_dst) = convert_img(
@@ -4635,8 +5180,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let g2d_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
         let (result, _src, g2d_dst) = convert_img(
             &mut g2d_converter,
@@ -4676,11 +5228,25 @@ mod image_tests {
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let src_dyn = src;
 
-        let mut cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
-        let mut g2d_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let mut g2d_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
 
         let crop = Crop::new().with_source(Some(Region::new(50, 120, 1024, 576)));
@@ -4751,8 +5317,15 @@ mod image_tests {
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
         let crop = Crop::new().with_source(Some(Region::new(320, 180, 1280 - 320, 720 - 180)));
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, src, cpu_dst) = convert_img(
             &mut cpu_converter,
@@ -4764,8 +5337,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let gl_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let gl_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
         let (result, _src, gl_dst) = convert_img(
             &mut gl_converter,
@@ -4794,8 +5374,15 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let crop = Crop::new();
         let (result, src, cpu_dst) = convert_img(
@@ -4808,8 +5395,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let gl_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let gl_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
         let (result, _src, gl_dst) = convert_img(
             &mut gl_converter,
@@ -4857,12 +5451,24 @@ mod image_tests {
                 Rotation::CounterClockwise90,
             ] {
                 for flip in [Flip::None, Flip::Horizontal, Flip::Vertical] {
-                    let cpu_dst =
-                        TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, m)
-                            .unwrap();
-                    let gl_dst =
-                        TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, m)
-                            .unwrap();
+                    let cpu_dst = TensorDyn::image(
+                        dst_width,
+                        dst_height,
+                        PixelFormat::Rgba,
+                        DType::U8,
+                        m,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
+                    let gl_dst = TensorDyn::image(
+                        dst_width,
+                        dst_height,
+                        PixelFormat::Rgba,
+                        DType::U8,
+                        m,
+                        edgefirst_tensor::CpuAccess::ReadWrite,
+                    )
+                    .unwrap();
                     cpu_dst
                         .as_u8()
                         .unwrap()
@@ -4943,8 +5549,15 @@ mod image_tests {
             }
         };
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         // After rotating 4 times, the image should be the same as the original
@@ -5034,8 +5647,15 @@ mod image_tests {
         let src =
             crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), tensor_memory).unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, mut src, cpu_dst) = convert_img(
@@ -5057,6 +5677,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 tensor_memory,
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             let (result, src_back, gl_dst) = convert_img(
@@ -5109,8 +5730,15 @@ mod image_tests {
             crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), Some(TensorMemory::Dma))
                 .unwrap();
 
-        let cpu_dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, src, cpu_dst) = convert_img(
@@ -5129,6 +5757,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -5164,13 +5793,34 @@ mod image_tests {
 
         let (dst_width, dst_height) = (640, 360);
 
-        let dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Yuyv, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
-        let dst_through_yuyv =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
-        let dst_direct =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst_through_yuyv = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let dst_direct = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         let mut cpu_converter = CPUProcessor::new();
 
@@ -5242,6 +5892,7 @@ mod image_tests {
             PixelFormat::Yuyv,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -5268,6 +5919,7 @@ mod image_tests {
             PixelFormat::Yuyv,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let (result, _src, cpu_dst) = convert_img(
@@ -5316,6 +5968,7 @@ mod image_tests {
             PixelFormat::Yuyv,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -5325,6 +5978,7 @@ mod image_tests {
             PixelFormat::Yuyv,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -5372,7 +6026,15 @@ mod image_tests {
     #[test]
     fn test_yuyv_to_rgba_cpu() {
         let file = edgefirst_bench::testdata::read("camera720p.yuyv").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8()
             .unwrap()
             .map()
@@ -5380,7 +6042,15 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -5393,7 +6063,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -5410,7 +6088,15 @@ mod image_tests {
     #[test]
     fn test_yuyv_to_rgb_cpu() {
         let file = edgefirst_bench::testdata::read("camera720p.yuyv").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8()
             .unwrap()
             .map()
@@ -5418,7 +6104,15 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -5431,7 +6125,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -5482,6 +6184,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -5496,7 +6199,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -5542,6 +6253,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
@@ -5556,7 +6268,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -5593,8 +6313,15 @@ mod image_tests {
         };
 
         let (w, h) = (16usize, 16usize);
-        let src = TensorDyn::image(w, h, PixelFormat::Grey, DType::U8, Some(TensorMemory::Dma))
-            .expect("GREY IOSurface (R8/L008) should allocate — proves the FourCC mapping");
+        let src = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Grey,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .expect("GREY IOSurface (R8/L008) should allocate — proves the FourCC mapping");
         // Known luma ramp: value = (x * 13 + y * 7) & 0xff.
         {
             let su8 = src.as_u8().unwrap();
@@ -5608,8 +6335,15 @@ mod image_tests {
             }
         }
 
-        let dst =
-            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let (result, src_back, dst) = convert_img(
             &mut proc,
             src,
@@ -5658,14 +6392,20 @@ mod image_tests {
             }
         };
         let (w, h) = (64usize, 64usize);
-        let src =
-            match TensorDyn::image(w, h, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Dma)) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
-                    return;
-                }
-            };
+        let src = match TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — NV12 IOSurface alloc: {e:?}", function!());
+                return;
+            }
+        };
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128); // Y=U=V=128
 
         let dst = match TensorDyn::image(
@@ -5674,6 +6414,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -5749,6 +6490,7 @@ mod image_tests {
             PixelFormat::Grey,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -5767,6 +6509,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -5829,6 +6572,7 @@ mod image_tests {
             PixelFormat::Grey,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -5844,6 +6588,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -5906,6 +6651,7 @@ mod image_tests {
                     PixelFormat::Grey,
                     DType::U8,
                     Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
@@ -5921,6 +6667,7 @@ mod image_tests {
                     PixelFormat::PlanarRgb,
                     DType::F16,
                     Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
@@ -6026,7 +6773,15 @@ mod image_tests {
                 (15, 16),           // odd-W
                 (16, 15),           // odd-H
             ] {
-                let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+                let mem = TensorDyn::image(
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
                 fill(
                     mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
@@ -6035,7 +6790,15 @@ mod image_tests {
                     w,
                     h,
                 );
-                let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let cpu_dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let (r, _s, cpu_dst) = convert_img(
                     &mut cpu,
                     mem,
@@ -6046,8 +6809,15 @@ mod image_tests {
                 );
                 r.unwrap_or_else(|e| panic!("CPU {fmt:?}->{w}x{h}->RGBA: {e}"));
 
-                let ios = TensorDyn::image(w, h, fmt, DType::U8, Some(TensorMemory::Dma))
-                    .unwrap_or_else(|e| panic!("{fmt:?} {w}x{h} IOSurface alloc: {e}"));
+                let ios = TensorDyn::image(
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap_or_else(|e| panic!("{fmt:?} {w}x{h} IOSurface alloc: {e}"));
                 let ios_stride = ios.as_u8().unwrap().effective_row_stride().unwrap();
                 fill(
                     ios.as_u8().unwrap().map().unwrap().as_mut_slice(),
@@ -6056,9 +6826,15 @@ mod image_tests {
                     w,
                     h,
                 );
-                let gpu_dst =
-                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                        .unwrap();
+                let gpu_dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let (r, _s, gpu_dst) = convert_img(
                     &mut gpu,
                     ios,
@@ -6151,7 +6927,15 @@ mod image_tests {
                 let ew = w.next_multiple_of(2);
 
                 // CPU reference from a tightly-packed Mem tensor at the frame size.
-                let mem = TensorDyn::image(w, h, fmt, DType::U8, None).unwrap();
+                let mem = TensorDyn::image(
+                    w,
+                    h,
+                    fmt,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let mem_stride = mem.as_u8().unwrap().effective_row_stride().unwrap();
                 fill(
                     mem.as_u8().unwrap().map().unwrap().as_mut_slice(),
@@ -6160,7 +6944,15 @@ mod image_tests {
                     w,
                     h,
                 );
-                let cpu_dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, None).unwrap();
+                let cpu_dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let (r, _s, cpu_dst) = convert_img(
                     &mut cpu,
                     mem,
@@ -6180,6 +6972,7 @@ mod image_tests {
                     PixelFormat::Grey,
                     DType::U8,
                     Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
                 ) {
                     Ok(t) => t,
                     Err(e) => {
@@ -6203,9 +6996,15 @@ mod image_tests {
                     h,
                 );
 
-                let gpu_dst =
-                    TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                        .unwrap();
+                let gpu_dst = TensorDyn::image(
+                    w,
+                    h,
+                    PixelFormat::Rgba,
+                    DType::U8,
+                    Some(TensorMemory::Dma),
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
+                .unwrap();
                 let (r, _s, gpu_dst) = convert_img(
                     &mut gpu,
                     ios,
@@ -6275,6 +7074,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -6288,7 +7088,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -6349,8 +7157,15 @@ mod image_tests {
             let src = load_bytes_to_tensor(w, h, PixelFormat::Yuyv, Some(TensorMemory::Dma), &yuyv)
                 .unwrap();
 
-            let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma))
-                .unwrap();
+            let dst = TensorDyn::image(
+                w,
+                h,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
 
             let (result, _src, dst) = convert_img(
                 &mut proc,
@@ -6420,6 +7235,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -6478,8 +7294,15 @@ mod image_tests {
                     .unwrap()
             })
             .collect();
-        let mut dst =
-            TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Dma)).unwrap();
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         // Warmup: two passes over the pool import every surface once.
         for src in pool.iter().cycle().take(POOL * 2) {
@@ -6542,6 +7365,7 @@ mod image_tests {
             PixelFormat::Nv12,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         {
@@ -6557,6 +7381,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -6622,7 +7447,15 @@ mod image_tests {
             return;
         };
 
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, Some(mem)).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             // Smooth gradients, NOT noise: the GL and CPU paths upsample
             // chroma with different kernels (nearest vs bilinear), which
@@ -6647,8 +7480,15 @@ mod image_tests {
             }
         }
         let crop = Crop::letterbox([114, 114, 114, 255]);
-        let mut gl_dst =
-            TensorDyn::image(640, 640, PixelFormat::PlanarRgb, DType::F16, Some(mem)).unwrap();
+        let mut gl_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::PlanarRgb,
+            DType::F16,
+            Some(mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // Drive the GL backend DIRECTLY: a convert through `ImageProcessor`
         // silently falls back to CPU on a GL error, turning this oracle into
         // a CPU-vs-CPU tautology. A direct call surfaces the engine error.
@@ -6669,6 +7509,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         cpu.convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
@@ -6733,6 +7574,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         {
@@ -6748,6 +7590,7 @@ mod image_tests {
             PixelFormat::Bgra,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         proc.opengl
@@ -6773,6 +7616,7 @@ mod image_tests {
             PixelFormat::Bgra,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         cpu.convert(
@@ -6830,6 +7674,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -6844,7 +7689,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(
@@ -6896,6 +7749,7 @@ mod image_tests {
             PixelFormat::Yuyv,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -6910,7 +7764,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let cpu_dst = TensorDyn::image(600, 400, PixelFormat::Yuyv, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            600,
+            400,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(
@@ -6949,8 +7811,15 @@ mod image_tests {
 
         let (dst_width, dst_height) = (960, 540);
 
-        let dst =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -6963,8 +7832,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let dst_target =
-            TensorDyn::image(dst_width, dst_height, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst_target = TensorDyn::image(
+            dst_width,
+            dst_height,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let src_target = load_bytes_to_tensor(
             1280,
             720,
@@ -7021,6 +7897,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -7042,6 +7919,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut cpu_converter = CPUProcessor::new();
@@ -7097,6 +7975,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
@@ -7118,6 +7997,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut cpu_converter = CPUProcessor::new();
@@ -7141,7 +8021,15 @@ mod image_tests {
     #[test]
     fn test_vyuy_to_rgba_cpu() {
         let file = edgefirst_bench::testdata::read("camera720p.vyuy").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Vyuy,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8()
             .unwrap()
             .map()
@@ -7149,7 +8037,15 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7162,7 +8058,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -7179,7 +8083,15 @@ mod image_tests {
     #[test]
     fn test_vyuy_to_rgb_cpu() {
         let file = edgefirst_bench::testdata::read("camera720p.vyuy").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Vyuy, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Vyuy,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8()
             .unwrap()
             .map()
@@ -7187,7 +8099,15 @@ mod image_tests {
             .as_mut_slice()
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7200,7 +8120,15 @@ mod image_tests {
         );
         result.unwrap();
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -7252,6 +8180,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -7272,7 +8201,15 @@ mod image_tests {
             r => r.unwrap(),
         }
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -7317,6 +8254,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut g2d_converter = G2DProcessor::new().unwrap();
@@ -7339,7 +8277,15 @@ mod image_tests {
             r => r.unwrap(),
         }
 
-        let cpu_dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let cpu_dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter: CPUProcessor = CPUProcessor::new();
 
         let (result, _src, cpu_dst) = convert_img(
@@ -7391,6 +8337,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut gl_converter = GLProcessorThreaded::new(None).unwrap();
@@ -7414,7 +8361,15 @@ mod image_tests {
             r => r.unwrap(),
         }
 
-        let target_image = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let target_image = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         target_image
             .as_u8()
             .unwrap()
@@ -7432,11 +8387,27 @@ mod image_tests {
     #[test]
     fn test_nv12_to_rgba_cpu() {
         let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgba, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgba,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7475,8 +8446,15 @@ mod image_tests {
         // CPU-only test: pin to tight host memory (None auto-selects pitch-padded
         // DMA on i.MX, which would leave the dst's row padding unconverted and
         // break the flat byte scan below).
-        let mut src =
-            TensorDyn::image(8, 5, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut src = TensorDyn::image(
+            8,
+            5,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(src.shape(), &[8, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(5)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
@@ -7489,8 +8467,15 @@ mod image_tests {
                 .with_range(edgefirst_tensor::ColorRange::Full),
         ));
 
-        let dst =
-            TensorDyn::image(8, 5, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let dst = TensorDyn::image(
+            8,
+            5,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, dst) = convert_img(
             &mut cpu_converter,
@@ -7519,8 +8504,15 @@ mod image_tests {
         // chroma row). Neutral-grey fill (Y=U=V=128) must convert to uniform
         // grey RGB, exercising the 2× UV stride and shape[0]/3 height recovery.
         // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
-        let mut src =
-            TensorDyn::image(8, 4, PixelFormat::Nv24, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let mut src = TensorDyn::image(
+            8,
+            4,
+            PixelFormat::Nv24,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(src.shape(), &[12, 8]);
         assert_eq!((src.width(), src.height()), (Some(8), Some(4)));
         src.as_u8().unwrap().map().unwrap().as_mut_slice().fill(128);
@@ -7532,8 +8524,15 @@ mod image_tests {
                 .with_range(edgefirst_tensor::ColorRange::Full),
         ));
 
-        let dst =
-            TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let dst = TensorDyn::image(
+            8,
+            4,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let (result, _src, dst) = convert_img(
             &mut cpu_converter,
@@ -7565,9 +8564,15 @@ mod image_tests {
         // falls through to this CPU path; QA F9.)
         // CPU-only test: pin to tight host memory (see test_nv12_odd_height_to_rgb_cpu).
         fn decode_tagged(enc: edgefirst_tensor::ColorEncoding) -> [u8; 3] {
-            let mut src =
-                TensorDyn::image(8, 4, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem))
-                    .unwrap();
+            let mut src = TensorDyn::image(
+                8,
+                4,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             // NV12 8×4: 32-byte Y plane + 16-byte interleaved UV plane (4:2:0).
             assert_eq!(src.shape(), &[6, 8]);
             {
@@ -7586,8 +8591,15 @@ mod image_tests {
                     .with_encoding(enc)
                     .with_range(edgefirst_tensor::ColorRange::Limited),
             ));
-            let dst = TensorDyn::image(8, 4, PixelFormat::Rgb, DType::U8, Some(TensorMemory::Mem))
-                .unwrap();
+            let dst = TensorDyn::image(
+                8,
+                4,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
             let mut cpu = CPUProcessor::new();
             let (result, _src, dst) = convert_img(
                 &mut cpu,
@@ -7624,11 +8636,27 @@ mod image_tests {
     #[test]
     fn test_nv12_to_rgb_cpu() {
         let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7658,11 +8686,27 @@ mod image_tests {
     #[test]
     fn test_nv12_to_grey_cpu() {
         let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Grey, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Grey,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7692,11 +8736,27 @@ mod image_tests {
     #[test]
     fn test_nv12_to_yuyv_cpu() {
         let file = edgefirst_bench::testdata::read("zidane.nv12").to_vec();
-        let src = TensorDyn::image(1280, 720, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let src = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         src.as_u8().unwrap().map().unwrap().as_mut_slice()[0..(1280 * 720 * 3 / 2)]
             .copy_from_slice(&file);
 
-        let dst = TensorDyn::image(1280, 720, PixelFormat::Yuyv, DType::U8, None).unwrap();
+        let dst = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::Yuyv,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
 
         let (result, _src, dst) = convert_img(
@@ -7728,8 +8788,24 @@ mod image_tests {
         let file = edgefirst_bench::testdata::read("zidane.jpg").to_vec();
         let src = crate::load_image_test_helper(&file, Some(PixelFormat::Rgba), None).unwrap();
 
-        let cpu_nv16_dst = TensorDyn::image(640, 640, PixelFormat::Nv16, DType::U8, None).unwrap();
-        let cpu_rgb_dst = TensorDyn::image(640, 640, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let cpu_nv16_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Nv16,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let cpu_rgb_dst = TensorDyn::image(
+            640,
+            640,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         let mut cpu_converter = CPUProcessor::new();
         let crop = Crop::letterbox([255, 128, 0, 255]);
 
@@ -7762,7 +8838,14 @@ mod image_tests {
         memory: Option<TensorMemory>,
         bytes: &[u8],
     ) -> Result<TensorDyn, Error> {
-        let src = TensorDyn::image(width, height, format, DType::U8, memory)?;
+        let src = TensorDyn::image(
+            width,
+            height,
+            format,
+            DType::U8,
+            memory,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )?;
         src.as_u8()
             .unwrap()
             .map()?
@@ -7892,6 +8975,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut img_rgb2 = TensorDyn::image(
@@ -7900,6 +8984,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut __cv = CPUProcessor::default();
@@ -7984,7 +9069,15 @@ mod image_tests {
     fn test_nv12_image_creation() {
         let width = 640;
         let height = 480;
-        let img = TensorDyn::image(width, height, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let img = TensorDyn::image(
+            width,
+            height,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         assert_eq!(img.width(), Some(width));
         assert_eq!(img.height(), Some(height));
@@ -7995,7 +9088,15 @@ mod image_tests {
 
     #[test]
     fn test_nv12_channels() {
-        let img = TensorDyn::image(640, 480, PixelFormat::Nv12, DType::U8, None).unwrap();
+        let img = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Nv12,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         // PixelFormat::Nv12.channels() returns 1 (luma plane)
         assert_eq!(img.format().unwrap().channels(), 1);
     }
@@ -8024,7 +9125,15 @@ mod image_tests {
 
     #[test]
     fn test_tensordyn_image_rgb() {
-        let img = TensorDyn::image(640, 480, PixelFormat::Rgb, DType::U8, None).unwrap();
+        let img = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(img.width(), Some(640));
         assert_eq!(img.height(), Some(480));
         assert_eq!(img.format(), Some(PixelFormat::Rgb));
@@ -8032,7 +9141,15 @@ mod image_tests {
 
     #[test]
     fn test_tensordyn_image_planar_rgb() {
-        let img = TensorDyn::image(640, 480, PixelFormat::PlanarRgb, DType::U8, None).unwrap();
+        let img = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(img.width(), Some(640));
         assert_eq!(img.height(), Some(480));
         assert_eq!(img.format(), Some(PixelFormat::PlanarRgb));
@@ -8047,6 +9164,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::I8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         assert_eq!(img.width(), Some(1280));
@@ -8063,6 +9181,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::I8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         assert_eq!(img.width(), Some(1280));
@@ -8094,8 +9213,24 @@ mod image_tests {
     #[test]
     fn test_dtype_determines_int8() {
         // DType::I8 indicates int8 data
-        let u8_img = TensorDyn::image(64, 64, PixelFormat::Rgb, DType::U8, None).unwrap();
-        let i8_img = TensorDyn::image(64, 64, PixelFormat::Rgb, DType::I8, None).unwrap();
+        let u8_img = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let i8_img = TensorDyn::image(
+            64,
+            64,
+            PixelFormat::Rgb,
+            DType::I8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         assert_eq!(u8_img.dtype(), DType::U8);
         assert_eq!(i8_img.dtype(), DType::I8);
     }
@@ -8136,7 +9271,14 @@ mod image_tests {
 
         // Create PBO-backed source image
         let pbo_src = converter
-            .create_image(src_w, src_h, PixelFormat::Rgba, DType::U8, None)
+            .create_image(
+                src_w,
+                src_h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         assert_eq!(
             pbo_src.as_u8().unwrap().memory(),
@@ -8155,6 +9297,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let (result, _jpeg_src, mem_src) = convert_img(
@@ -8176,7 +9319,14 @@ mod image_tests {
 
         // Create PBO-backed destination image
         let pbo_dst = converter
-            .create_image(dst_w, dst_h, PixelFormat::Rgba, DType::U8, None)
+            .create_image(
+                dst_w,
+                dst_h,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
             .unwrap();
         assert_eq!(pbo_dst.as_u8().unwrap().memory(), TensorMemory::Pbo);
 
@@ -8198,6 +9348,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let (result, _mem_src, cpu_dst) = convert_img(
@@ -8227,6 +9378,7 @@ mod image_tests {
             PixelFormat::Bgra,
             DType::U8,
             Some(edgefirst_tensor::TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         assert_eq!(img.width(), Some(640));
@@ -8299,6 +9451,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut dst_dyn = dst;
@@ -8347,6 +9500,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let mut dst_dyn = dst;
@@ -8462,7 +9616,15 @@ mod image_tests {
     /// "dst is already cleared" assumption will see this pattern leak
     /// through to the output and fail.
     fn make_dirty_dst(w: usize, h: usize, mem: Option<TensorMemory>) -> TensorDyn {
-        let dst = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, mem).unwrap();
+        let dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            mem,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             use edgefirst_tensor::TensorMapTrait;
             let u8t = dst.as_u8().unwrap();
@@ -8476,7 +9638,15 @@ mod image_tests {
 
     /// Allocate an RGBA background filled with a constant colour.
     fn make_bg(w: usize, h: usize, mem: Option<TensorMemory>, rgba: [u8; 4]) -> TensorDyn {
-        let bg = TensorDyn::image(w, h, PixelFormat::Rgba, DType::U8, mem).unwrap();
+        let bg = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Rgba,
+            DType::U8,
+            mem,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             use edgefirst_tensor::TensorMapTrait;
             let u8t = bg.as_u8().unwrap();
@@ -8731,6 +9901,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         {
@@ -8753,6 +9924,7 @@ mod image_tests {
                 PixelFormat::Rgba,
                 DType::U8,
                 Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             {
@@ -8771,6 +9943,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         {
@@ -8796,6 +9969,7 @@ mod image_tests {
             PixelFormat::Rgba,
             DType::U8,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
         let err = processor
@@ -8852,10 +10026,24 @@ mod image_tests {
 
         for proc in &mut processors {
             let src = proc
-                .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                .create_image(
+                    128,
+                    128,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
                 .expect("create src failed");
             let mut dst = proc
-                .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                .create_image(
+                    64,
+                    64,
+                    PixelFormat::Rgb,
+                    DType::U8,
+                    None,
+                    edgefirst_tensor::CpuAccess::ReadWrite,
+                )
                 .expect("create dst failed");
             proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
                 .expect("convert failed");
@@ -8909,10 +10097,24 @@ mod image_tests {
                             panic!("ImageProcessor::new() failed on thread {i}: {e}")
                         });
                         let src = proc
-                            .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                            .create_image(
+                                128,
+                                128,
+                                PixelFormat::Rgb,
+                                DType::U8,
+                                None,
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
                             .unwrap_or_else(|e| panic!("create src failed on thread {i}: {e}"));
                         let mut dst = proc
-                            .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                            .create_image(
+                                64,
+                                64,
+                                PixelFormat::Rgb,
+                                DType::U8,
+                                None,
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
                             .unwrap_or_else(|e| panic!("create dst failed on thread {i}: {e}"));
                         proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
                             .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
@@ -8973,12 +10175,26 @@ mod image_tests {
                         // Now all 4 hammer the GPU concurrently.
                         for round in 0..ROUNDS {
                             let src = proc
-                                .create_image(128, 128, PixelFormat::Rgb, DType::U8, None)
+                                .create_image(
+                                    128,
+                                    128,
+                                    PixelFormat::Rgb,
+                                    DType::U8,
+                                    None,
+                                    edgefirst_tensor::CpuAccess::ReadWrite,
+                                )
                                 .unwrap_or_else(|e| {
                                     panic!("create src failed on thread {i} round {round}: {e}")
                                 });
                             let mut dst = proc
-                                .create_image(64, 64, PixelFormat::Rgb, DType::U8, None)
+                                .create_image(
+                                    64,
+                                    64,
+                                    PixelFormat::Rgb,
+                                    DType::U8,
+                                    None,
+                                    edgefirst_tensor::CpuAccess::ReadWrite,
+                                )
                                 .unwrap_or_else(|e| {
                                     panic!("create dst failed on thread {i} round {round}: {e}")
                                 });
@@ -9067,7 +10283,14 @@ mod image_tests {
                             Some(TensorMemory::Mem)
                         };
                         let src = proc
-                            .create_image(w, h, PixelFormat::Nv12, DType::U8, mem)
+                            .create_image(
+                                w,
+                                h,
+                                PixelFormat::Nv12,
+                                DType::U8,
+                                mem,
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
                             .unwrap();
                         {
                             let t = src.as_u8().unwrap();
@@ -9083,7 +10306,14 @@ mod image_tests {
                         let lb = Crop::letterbox([114, 114, 114, 255]);
                         let convert_once = |proc: &mut ImageProcessor| -> Vec<u8> {
                             let mut dst = proc
-                                .create_image(320, 320, PixelFormat::Rgba, DType::U8, mem)
+                                .create_image(
+                                    320,
+                                    320,
+                                    PixelFormat::Rgba,
+                                    DType::U8,
+                                    mem,
+                                    edgefirst_tensor::CpuAccess::ReadWrite,
+                                )
                                 .unwrap();
                             proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
                                 .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
@@ -9161,7 +10391,14 @@ mod image_tests {
                         // Per-thread-distinct synthetic NV12 so cross-wired
                         // GL state between processors shows up as a byte diff.
                         let src = proc
-                            .create_image(w, h, PixelFormat::Nv12, DType::U8, mem)
+                            .create_image(
+                                w,
+                                h,
+                                PixelFormat::Nv12,
+                                DType::U8,
+                                mem,
+                                edgefirst_tensor::CpuAccess::ReadWrite,
+                            )
                             .unwrap();
                         {
                             let t = src.as_u8().unwrap();
@@ -9178,7 +10415,14 @@ mod image_tests {
 
                         let convert_once = |proc: &mut ImageProcessor| -> Vec<u8> {
                             let mut dst = proc
-                                .create_image(640, 640, PixelFormat::Rgb, DType::U8, mem)
+                                .create_image(
+                                    640,
+                                    640,
+                                    PixelFormat::Rgb,
+                                    DType::U8,
+                                    mem,
+                                    edgefirst_tensor::CpuAccess::ReadWrite,
+                                )
                                 .unwrap();
                             proc.convert(&src, &mut dst, Rotation::None, Flip::None, lb)
                                 .unwrap_or_else(|e| panic!("convert failed on thread {i}: {e}"));
@@ -9234,8 +10478,15 @@ mod image_tests {
 
         // Build a small synthetic YUYV source (Y=128, U=128, V=128 → near-grey).
         // YUYV packs two pixels into 4 bytes: [Y0, U, Y1, V] per macropixel.
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Yuyv, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Yuyv,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -9247,8 +10498,15 @@ mod image_tests {
             }
         }
 
-        let mut dst =
-            TensorDyn::image(W, H, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgb,
+            DType::F32,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         let mut proc = ImageProcessor::new().unwrap();
         let result = proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default());
@@ -9304,8 +10562,15 @@ mod image_tests {
         const TOL: f32 = 1.0 / 512.0; // 2^-9
 
         // pixel (y,x): R = 50+x, G = 100+y*8, B = 200
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -9326,6 +10591,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -9390,8 +10656,15 @@ mod image_tests {
         const H: usize = 16;
 
         // RGBA8 source with a known gradient (distinct per-channel values).
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -9413,6 +10686,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::F32,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -9460,8 +10734,15 @@ mod image_tests {
         const TOL: f32 = 1.0 / 256.0; // 2^-8
 
         // pixel (y,x): R = 40+x, G = 80+y*10, B = 180
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -9502,6 +10783,7 @@ mod image_tests {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             match gl_proc.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default()) {
@@ -9528,6 +10810,7 @@ mod image_tests {
                 PixelFormat::PlanarRgb,
                 DType::F16,
                 Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
             )
             .unwrap();
             cpu_proc
@@ -9606,8 +10889,15 @@ mod image_tests {
         const H: usize = 16;
 
         // RGBA8 source filled with a flat mid-grey.
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             let data = map.as_mut_slice();
@@ -9627,6 +10917,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -9671,15 +10962,29 @@ mod image_tests {
         const H: usize = 16; // must be even for NV12
 
         // Build a valid NV12 tensor: shape [H*3/2, W], luma=128, chroma=128.
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             map.as_mut_slice().fill(128); // Y=128, U=V=128 → neutral grey
         }
 
-        let mut dst =
-            TensorDyn::image(W, H, PixelFormat::Rgb, DType::F32, Some(TensorMemory::Mem)).unwrap();
+        let mut dst = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Rgb,
+            DType::F32,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
 
         let mut proc = ImageProcessor::with_config(ImageProcessorConfig {
             backend: ComputeBackend::Cpu,
@@ -9719,8 +11024,15 @@ mod image_tests {
         const W: usize = 16;
         const H: usize = 16;
 
-        let src =
-            TensorDyn::image(W, H, PixelFormat::Nv12, DType::U8, Some(TensorMemory::Mem)).unwrap();
+        let src = TensorDyn::image(
+            W,
+            H,
+            PixelFormat::Nv12,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
         {
             let mut map = src.as_u8().unwrap().map().unwrap();
             map.as_mut_slice().fill(128);
@@ -9732,6 +11044,7 @@ mod image_tests {
             PixelFormat::PlanarRgb,
             DType::F16,
             Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .unwrap();
 
@@ -9766,6 +11079,45 @@ mod image_tests {
     // GAP-5: create_image F32 + DMA must return NotSupported
     // =========================================================================
 
+    /// `create_image_desc` without a compression request is exactly
+    /// `create_image` (the processor's memory negotiation applies); with
+    /// `Compression::Any` off-Android it resolves linear and counts the
+    /// fallback in the processor-visible mirror.
+    #[test]
+    fn create_image_desc_negotiates_and_counts_fallbacks() {
+        use edgefirst_tensor::{Compression, CpuAccess, ImageDesc};
+        let proc = ImageProcessor::new().unwrap();
+
+        let desc =
+            ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8).with_access(CpuAccess::ReadWrite);
+        let plain = proc.create_image_desc(&desc).unwrap();
+        let classic = proc
+            .create_image(
+                64,
+                64,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        assert_eq!(plain.memory(), classic.memory(), "same negotiation path");
+        assert_eq!(plain.compression(), None);
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let before = proc.compression_fallback_count();
+            let desc = ImageDesc::new(64, 64, PixelFormat::Rgba, DType::U8)
+                .with_compression(Compression::Any);
+            let t = proc.create_image_desc(&desc).unwrap();
+            assert_eq!(t.compression(), None, "no vendor tile scheme off-Android");
+            assert!(
+                proc.compression_fallback_count() > before,
+                "Any resolving linear must count"
+            );
+        }
+    }
+
     /// There is no DRM FourCC for F32 images, so `create_image` with
     /// `TensorMemory::Dma` and `DType::F32` must return `Err(NotSupported)`.
     #[test]
@@ -9778,6 +11130,7 @@ mod image_tests {
             PixelFormat::Rgb,
             DType::F32,
             Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
         );
         assert!(
             result.is_err(),
@@ -9805,9 +11158,15 @@ mod image_tests {
         if !is_dma_available() {
             // DMA unavailable on this host: exercise the storage path via
             // TensorDyn directly (mirrors what import_image does internally).
-            let mut t =
-                TensorDyn::image(8, 8, PixelFormat::Rgba, DType::U8, Some(TensorMemory::Mem))
-                    .expect("alloc");
+            let mut t = TensorDyn::image(
+                8,
+                8,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("alloc");
             assert_eq!(t.colorimetry(), None, "colorimetry must start as None");
             t.set_colorimetry(Some(expected));
             assert_eq!(

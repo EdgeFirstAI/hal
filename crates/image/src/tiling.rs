@@ -16,7 +16,7 @@
 
 use crate::{Crop, Fit, ImageProcessor, ImageProcessorTrait, Result};
 use crate::{Error, Flip, Rotation};
-use edgefirst_tensor::{DType, PixelFormat, Region, TensorDyn, TensorMemory};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
 pub use edgefirst_decoder::tiling::TilePlacement;
 
@@ -181,6 +181,10 @@ impl ImageProcessor {
     /// [`ImageProcessor::create_image`] so DMA pitch alignment and
     /// `Dma>Pbo>Mem` selection apply. Caller-owned for pool reuse.
     ///
+    /// `access` declares planned CPU involvement (see
+    /// [`edgefirst_tensor::CpuAccess`]); use `None` for NPU-bound tile
+    /// batches and `ReadWrite` when the batch will be CPU-mapped.
+    ///
     /// # Errors
     /// Returns an error if `cfg` is invalid (overlap not in `[0,1)`, or zero
     /// tile size) or if the underlying allocation fails.
@@ -191,6 +195,7 @@ impl ImageProcessor {
         format: PixelFormat,
         dtype: DType,
         memory: Option<TensorMemory>,
+        access: CpuAccess,
     ) -> Result<TensorDyn> {
         cfg.validate()?;
         self.create_image(
@@ -199,6 +204,7 @@ impl ImageProcessor {
             format,
             dtype,
             memory,
+            access,
         )
     }
 

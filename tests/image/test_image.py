@@ -65,10 +65,10 @@ def test_flip(monkeypatch):
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     # JPEG decodes to its native NV12; convert downstream produces RGBA.
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
     converter = ImageProcessor()
-    dst = converter.create_image(1280, 720, PixelFormat.Rgba)
+    dst = converter.create_image(1280, 720, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst, flip=Flip.Horizontal)
 
     n = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -88,19 +88,19 @@ def test_grey_load():
     converter = ImageProcessor()
 
     # A greyscale JPEG decodes to its native Grey format.
-    grey_ = Tensor.image(w, h, format=PixelFormat.Grey)
+    grey_ = Tensor.image(w, h, format=PixelFormat.Grey, access="readwrite")
     info = grey_.decode_image_file("testdata/grey.jpg")
     assert info.format == PixelFormat.Grey
     grey = np.zeros((h, w, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
 
     # RGBA / RGB variants are obtained by converting the native Grey image.
-    rgba_ = converter.create_image(w, h, PixelFormat.Rgba)
+    rgba_ = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(grey_, rgba_)
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba_.normalize_to_numpy(rgba)
 
-    default_ = converter.create_image(w, h, PixelFormat.Rgb)
+    default_ = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     converter.convert(grey_, default_)
     default = np.zeros((h, w, 3), dtype=np.uint8)
     default_.normalize_to_numpy(default)
@@ -112,10 +112,10 @@ def test_grey_load():
 
 def test_normalize():
     w, h = _image_size("testdata/zidane.jpg")
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
     converter = ImageProcessor()
-    dst = converter.create_image(640, 640, PixelFormat.Rgba)
+    dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     n = np.zeros((640, 640, 3), dtype=np.int8)
     dst.normalize_to_numpy(n, normalization=Normalization.SIGNED)
@@ -131,15 +131,15 @@ def test_render():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     # Decode the JPEG to its native NV12, then convert to an RGBA background.
-    bg_native = Tensor.image(w, h, format=PixelFormat.Nv12)
+    bg_native = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     bg_native.decode_image_file("testdata/giraffe.jpg")
-    bg = Tensor.image(w, h, format=PixelFormat.Rgba)
+    bg = Tensor.image(w, h, format=PixelFormat.Rgba, access="readwrite")
     converter.convert(bg_native, bg)
     seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
         (76, 55, 1)
     )
     converter.set_class_colors([[255, 255, 0, 233], [128, 128, 255, 100]])
-    dst = converter.create_image(w, h, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.draw_decoded_masks(
         dst,
         bbox=np.array([[0.59375, 0.25, 0.9375, 0.725]], dtype=np.float32),
@@ -166,10 +166,10 @@ def test_rgb_resize(monkeypatch):
     # PIL-exact oracle → opt into colorimetry-exact (see test_flip).
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
     converter = ImageProcessor()
-    dst = converter.create_image(640, 640, PixelFormat.Rgba)
+    dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     with dst.map() as m:
         n = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
@@ -183,10 +183,10 @@ def test_rgba_to_rgb(monkeypatch):
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     # Decode the JPEG to native NV12, then convert to RGB (3-channel) output.
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
     converter = ImageProcessor()
-    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     # Whole-image convert (the former Rect(0,0,w,h) was a no-op crop; the
     # destination shape is the placement and `source=None` samples the whole src).
     converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
@@ -213,7 +213,7 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     if not os.path.exists(fixture):
         pytest.skip(f"{fixture} fixture missing")
     w, h = _image_size(fixture)
-    src = Tensor.image(w, h, format=fmt)
+    src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
     info = src.decode_image_file(fixture)
     # The decoder reports (and configures) the native semi-planar format.
@@ -221,7 +221,7 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     assert (info.width, info.height) == (w, h)
 
     converter = ImageProcessor()
-    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     converter.convert(src, dst)
     n = np.zeros((h, w, 3), dtype=np.uint8)
     dst.normalize_to_numpy(n)
@@ -260,7 +260,7 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     w, h = _image_size(fixture)
     assert (w % 2 == 1) or (h % 2 == 1), f"{fixture}: expected an odd dimension"
 
-    src = Tensor.image(w, h, format=fmt)
+    src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
     info = src.decode_image_file(fixture)
     # The decoder selects + configures the native format and keeps the true
@@ -269,7 +269,7 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     assert (info.width, info.height) == (w, h)
 
     converter = ImageProcessor()
-    dst = converter.create_image(w, h, PixelFormat.Rgb)
+    dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     converter.convert(src, dst)
     # normalize_to_numpy honours the destination's (possibly padded) row stride,
     # which a flat reshape would not for odd widths.
@@ -302,7 +302,7 @@ def test_decode_native_odd_dimensions(fixture, fmt):
 def _dma_image_or_skip(w, h, fmt):
     """Allocate a DMA-backed image tensor, or skip when DMA is unavailable."""
     try:
-        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMA)
+        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMA, access="readwrite")
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
     if t.memory != TensorMemory.DMA:
@@ -392,7 +392,9 @@ def test_mem_tight_buffer_protocol_contiguous():
     """A tight (non-padded) image tensor still exposes a plain C-contiguous
     buffer — the strided exposure must only engage for padded backings."""
     w, h, c = 600, 400, 3
-    t = Tensor.image(w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM)
+    t = Tensor.image(
+        w, h, format=PixelFormat.Rgb, mem=TensorMemory.MEM, access="readwrite"
+    )
     assert t.row_stride == w * c, "Mem image must be tightly packed"
     ref = (np.arange(h * w * c, dtype=np.uint8) % 251).reshape(h, w, c)
     t.from_numpy(ref)
@@ -404,7 +406,7 @@ def test_mem_tight_buffer_protocol_contiguous():
 
 
 def test_enum_cmp():
-    dst = Tensor.image(640, 640, format=PixelFormat.Rgba)
+    dst = Tensor.image(640, 640, format=PixelFormat.Rgba, access="readwrite")
     assert dst.format == PixelFormat.Rgba
 
 
@@ -457,7 +459,7 @@ def test_from_fd_shm():
 def test_create_image():
     """Test ImageProcessor.create_image() returns a valid, mappable image."""
     converter = ImageProcessor()
-    img = converter.create_image(320, 240, PixelFormat.Rgba)
+    img = converter.create_image(320, 240, PixelFormat.Rgba, access="readwrite")
     assert img.width == 320
     assert img.height == 240
     assert img.format == PixelFormat.Rgba
@@ -476,7 +478,7 @@ def test_create_image_formats():
         (PixelFormat.Rgba, 4),
         (PixelFormat.Grey, 1),
     ]:
-        img = converter.create_image(160, 120, fmt)
+        img = converter.create_image(160, 120, fmt, access="readwrite")
         assert img.width == 160
         assert img.height == 120
         assert img.format == fmt
@@ -488,7 +490,9 @@ def test_create_image_formats():
 def test_create_image_dtype_i8():
     """Test create_image with dtype='int8'."""
     converter = ImageProcessor()
-    img = converter.create_image(320, 240, PixelFormat.Rgb, dtype="int8")
+    img = converter.create_image(
+        320, 240, PixelFormat.Rgb, dtype="int8", access="readwrite"
+    )
     assert img.width == 320
     assert img.height == 240
     assert img.format == PixelFormat.Rgb
@@ -496,9 +500,11 @@ def test_create_image_dtype_i8():
 
     # Convert into i8 destination should succeed
     w, h = _image_size("testdata/zidane.jpg")
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
-    dst = converter.create_image(640, 640, PixelFormat.Rgb, dtype="int8")
+    dst = converter.create_image(
+        640, 640, PixelFormat.Rgb, dtype="int8", access="readwrite"
+    )
     converter.convert(src, dst)
 
 
@@ -508,11 +514,11 @@ def test_create_image_convert():
 
     # Load a source image normally (native NV12 from the JPEG)
     w, h = _image_size("testdata/zidane.jpg")
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
 
     # Create destination via create_image (may use PBO, DMA, or Mem)
-    dst = converter.create_image(640, 640, PixelFormat.Rgba)
+    dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
 
     # Convert should succeed regardless of backing type
     converter.convert(src, dst)
@@ -523,7 +529,7 @@ def test_create_image_convert():
     assert n.any(), "Destination image is all zeros after convert"
 
     # Compare with standard Tensor destination
-    dst_mem = Tensor.image(640, 640, PixelFormat.Rgba)
+    dst_mem = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst_mem)
     n_mem = np.zeros((640, 640, 3), dtype=np.uint8)
     dst_mem.normalize_to_numpy(n_mem)
@@ -536,7 +542,7 @@ def test_create_image_roundtrip():
     converter = ImageProcessor()
 
     # Create source via create_image and fill it
-    src = converter.create_image(640, 480, PixelFormat.Rgba)
+    src = converter.create_image(640, 480, PixelFormat.Rgba, access="readwrite")
     with src.map() as m:
         data = np.frombuffer(m.numpy(), dtype=np.uint8).copy()
         # Fill with a gradient pattern
@@ -546,7 +552,7 @@ def test_create_image_roundtrip():
         m.numpy()[:] = data
 
     # Create destination via create_image
-    dst = converter.create_image(320, 240, PixelFormat.Rgba)
+    dst = converter.create_image(320, 240, PixelFormat.Rgba, access="readwrite")
 
     # Convert using both create_image tensors
     converter.convert(src, dst)
@@ -618,11 +624,11 @@ def test_draw_decoded_masks_empty():
     """draw_decoded_masks with zero detections should produce background only."""
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    bg_native = Tensor.image(w, h, format=PixelFormat.Nv12)
+    bg_native = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     bg_native.decode_image_file("testdata/giraffe.jpg")
-    bg = Tensor.image(w, h, format=PixelFormat.Rgba)
+    bg = Tensor.image(w, h, format=PixelFormat.Rgba, access="readwrite")
     converter.convert(bg_native, bg)
-    dst = converter.create_image(w, h, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.draw_decoded_masks(
         dst,
         bbox=np.zeros((0, 4), dtype=np.float32),
@@ -644,9 +650,9 @@ def test_draw_decoded_masks_multiple_boxes():
     """draw_decoded_masks with multiple detections (boxes only, no seg)."""
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/giraffe.jpg")
-    dst = converter.create_image(w, h, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     converter.draw_decoded_masks(
         dst,
@@ -674,9 +680,9 @@ def test_draw_decoded_masks_instance_color_mode():
     """draw_decoded_masks with ColorMode.Instance assigns per-detection colors."""
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/giraffe.jpg")
-    dst = converter.create_image(w, h, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     # Two detections with same class but Instance coloring
     converter.draw_decoded_masks(
@@ -700,11 +706,11 @@ def test_draw_decoded_masks_with_opacity():
     """draw_decoded_masks with reduced opacity makes overlays more transparent."""
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/giraffe.jpg")
-    dst_full = converter.create_image(w, h, PixelFormat.Rgba)
+    dst_full = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst_full)
-    dst_half = converter.create_image(w, h, PixelFormat.Rgba)
+    dst_half = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst_half)
     bbox = np.array([[0.1, 0.1, 0.9, 0.9]], dtype=np.float32)
     scores = np.array([0.9], dtype=np.float32)
@@ -753,9 +759,9 @@ outputs:
 
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
-    src = Tensor.image(w, h, format=PixelFormat.Nv12)
+    src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/giraffe.jpg")
-    dst = converter.create_image(w, h, PixelFormat.Rgba)
+    dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     result = converter.draw_masks(decoder, [model_output_tensor], dst)
 
@@ -771,7 +777,9 @@ def test_decode_image_from_bytes():
     """Test decode_image with raw bytes into oversized tensor (strided)."""
     data = open("testdata/zidane.jpg", "rb").read()
     # Color JPEG decodes to its native NV12; the tensor is reconfigured to match.
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12)
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info: ImageInfo = tensor.decode_image(data)
     assert info.width == 1280
     assert info.height == 720
@@ -794,7 +802,9 @@ def test_decode_image_reuse():
     The decoder configures the tensor's format per image, so the same buffer
     is reused across a color JPEG (NV12) and a greyscale JPEG (Grey).
     """
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12)
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
 
     # First decode: zidane.jpg (1280x720) — native NV12, strided into 1920x1080
     info1 = tensor.decode_image_file("testdata/zidane.jpg")
@@ -811,7 +821,9 @@ def test_decode_image_reuse():
 
 def test_decode_image_native_format():
     """Test decode_image emits the source's native format (NV12 for color JPEG)."""
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12)
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info = tensor.decode_image_file("testdata/zidane.jpg")
     assert info.width == 1280
     assert info.height == 720
@@ -820,7 +832,9 @@ def test_decode_image_native_format():
 
 def test_decode_image_grey():
     """Test decoding into Grey format with oversized tensor."""
-    tensor = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey)
+    tensor = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey, access="readwrite"
+    )
     info = tensor.decode_image_file("testdata/grey.jpg")
     assert info.width == 1024
     assert info.height == 681
@@ -834,10 +848,10 @@ def test_decode_image_pipeline():
     # Allocate via ImageProcessor for the optimal memory backend, sized to the
     # image. Decode emits native NV12; convert produces the RGBA result.
     w, h = _image_size("testdata/zidane.jpg")
-    src = converter.create_image(w, h, PixelFormat.Nv12)
+    src = converter.create_image(w, h, PixelFormat.Nv12, access="readwrite")
     src.decode_image_file("testdata/zidane.jpg")
 
-    dst = converter.create_image(640, 640, PixelFormat.Rgba)
+    dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
 
     # Verify result has pixel data
@@ -855,7 +869,7 @@ def test_decode_image_exact_size():
     # Allocate tensor at exact dimensions. Color JPEG decodes to native NV12;
     # the NV12 luma plane is one byte per pixel, so an exact-size tensor has
     # row_stride == width (no padding).
-    tensor = Tensor.image(w, h, format=PixelFormat.Nv12)
+    tensor = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     info = tensor.decode_image_file("testdata/zidane.jpg")
     assert info.width == w
     assert info.height == h
@@ -869,7 +883,7 @@ def test_decode_image_exact_size_png():
         w, h = im.size
 
     # zidane.png is a 3-channel RGB PNG; decode emits its native RGB format.
-    tensor = Tensor.image(w, h, format=PixelFormat.Rgb)
+    tensor = Tensor.image(w, h, format=PixelFormat.Rgb, access="readwrite")
     info = tensor.decode_image_file("testdata/zidane.png")
     assert info.width == w
     assert info.height == h
@@ -879,21 +893,21 @@ def test_decode_image_exact_size_png():
 
 def test_decode_image_tensor_too_small_width():
     """Decoding into a tensor narrower than the image should raise an error."""
-    tensor = Tensor.image(320, 720, format=PixelFormat.Nv12)
+    tensor = Tensor.image(320, 720, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Ww]idth|[Ss]tride"):
         tensor.decode_image_file("testdata/zidane.jpg")
 
 
 def test_decode_image_tensor_too_small_height():
     """Decoding into a tensor shorter than the image should raise an error."""
-    tensor = Tensor.image(1280, 360, format=PixelFormat.Nv12)
+    tensor = Tensor.image(1280, 360, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Hh]eight|[Rr]ow"):
         tensor.decode_image_file("testdata/zidane.jpg")
 
 
 def test_decode_image_tensor_too_small_both():
     """Decoding into a tensor smaller in both dimensions should raise an error."""
-    tensor = Tensor.image(100, 100, format=PixelFormat.Nv12)
+    tensor = Tensor.image(100, 100, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError):
         tensor.decode_image_file("testdata/zidane.jpg")
 
@@ -907,13 +921,15 @@ def test_decode_image_strided_pixel_correctness():
     """
     # Exact-size decode (no stride padding) — luma stride == width.
     w, h = _image_size("testdata/zidane.jpg")
-    exact = Tensor.image(w, h, format=PixelFormat.Nv12)
+    exact = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
     exact.decode_image_file("testdata/zidane.jpg")
     with exact.map() as m:
         exact_y = np.frombuffer(m.numpy(), dtype=np.uint8)[: w * h].reshape(h, w).copy()
 
     # Oversized decode (strided — the common real-world path).
-    big = Tensor.image(MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12)
+    big = Tensor.image(
+        MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
+    )
     info = big.decode_image_file("testdata/zidane.jpg")
 
     # Extract the decoded luma sub-region via map() and the reported row stride.
@@ -964,7 +980,7 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     the panic.
     """
     converter = ImageProcessor()
-    img = converter.create_image(width, height, PixelFormat.Grey)
+    img = converter.create_image(width, height, PixelFormat.Grey, access="readwrite")
 
     assert img.size == width * height, (
         f"Image.size ({img.size}) must remain logical (w*h={width * height})"
@@ -1010,10 +1026,10 @@ def test_convert_honors_tagged_colorimetry(monkeypatch):
     converter = ImageProcessor()
 
     def convert_as(encoding, color_range):
-        src = Tensor.image(w, h, format=PixelFormat.Nv12)
+        src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
         src.from_numpy(nv12)
         src.colorimetry = Colorimetry(encoding=encoding, range=color_range)
-        dst = converter.create_image(w, h, PixelFormat.Rgb)
+        dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
         converter.convert(src, dst)
         out = np.zeros((h, w, 3), dtype=np.uint8)
         dst.normalize_to_numpy(out)

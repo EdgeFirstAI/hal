@@ -108,7 +108,7 @@ static int test_convert(int neutron_fd, size_t offset,
 
     // Source: HAL-allocated
     struct hal_tensor *src = hal_image_processor_create_image(proc,
-        src_w, src_h, src_fmt, HAL_DTYPE_U8);
+        src_w, src_h, src_fmt, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
     if (!src) {
         fprintf(stderr, "SKIP (src alloc failed)\n");
         hal_image_processor_free(proc);
@@ -310,8 +310,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "\n  %-50s  ", sec4[i].label);
         struct hal_image_processor *p = hal_image_processor_new_with_backend(sec4[i].be);
         if (!p) { fprintf(stderr, "SKIP (no %s)\n", backend_name(sec4[i].be)); skip++; continue; }
-        struct hal_tensor *s = hal_image_processor_create_image(p, 1920, 1080, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
-        struct hal_tensor *d = hal_image_processor_create_image(p, 640, 640, sec4[i].dfmt, sec4[i].ddt);
+        struct hal_tensor *s = hal_image_processor_create_image(p, 1920, 1080, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
+        struct hal_tensor *d = hal_image_processor_create_image(p, 640, 640, sec4[i].dfmt, sec4[i].ddt, HAL_CPU_ACCESS_READ_WRITE);
         if (!s || !d) { fprintf(stderr, "SKIP (alloc)\n"); skip++; }
         else {
             struct hal_crop c = hal_crop_new();
