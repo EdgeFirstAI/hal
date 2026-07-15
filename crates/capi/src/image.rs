@@ -120,7 +120,7 @@ pub enum HalPixelFormat {
 }
 
 impl HalPixelFormat {
-    fn to_pixel_format(self) -> PixelFormat {
+    pub(crate) fn to_pixel_format(self) -> PixelFormat {
         match self {
             HalPixelFormat::Yuyv => PixelFormat::Yuyv,
             HalPixelFormat::Nv12 => PixelFormat::Nv12,

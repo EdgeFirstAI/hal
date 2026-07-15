@@ -391,8 +391,53 @@ pub fn nms_extra_class_aware_float<E: Send + Sync>(
         .collect()
 }
 
+/// Area of the axis-aligned intersection of two boxes, clamped to `>= 0` per
+/// side. Mirrors the `inter` term in ModelPack `metrics/tiled.py::_match`.
+#[must_use]
+#[inline]
+pub fn intersection_area(a: &BoundingBox, b: &BoundingBox) -> f32 {
+    let left = a.xmin.max(b.xmin);
+    let top = a.ymin.max(b.ymin);
+    let right = a.xmax.min(b.xmax);
+    let bottom = a.ymax.min(b.ymax);
+    (right - left).max(0.0) * (bottom - top).max(0.0)
+}
+
+/// Area of a box, clamped to `>= 0` per side. Mirrors ModelPack `_areas`.
+#[must_use]
+#[inline]
+pub fn box_area(b: &BoundingBox) -> f32 {
+    (b.xmax - b.xmin).max(0.0) * (b.ymax - b.ymin).max(0.0)
+}
+
+/// Intersection-over-Union value in `[0, 1]`. Mirrors ModelPack
+/// `_match(metric='iou')`: `inter / max(area_a + area_b - inter, 1e-9)`.
+#[must_use]
+#[inline]
+pub fn iou_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
+    let inter = intersection_area(a, b);
+    let union = (box_area(a) + box_area(b) - inter).max(1e-9);
+    inter / union
+}
+
+/// Intersection-over-Smaller value in `[0, 1]`. Mirrors ModelPack
+/// `_match(metric='ios')`: `inter / max(min(area_a, area_b), 1e-9)`. Used by the
+/// tiled-detection merge: a seam-split object has low IoU but high IoS.
+#[must_use]
+#[inline]
+pub fn ios_value(a: &BoundingBox, b: &BoundingBox) -> f32 {
+    let inter = intersection_area(a, b);
+    let denom = box_area(a).min(box_area(b)).max(1e-9);
+    inter / denom
+}
+
 /// Returns true if the IOU of the given bounding boxes is greater than the iou
 /// threshold
+///
+/// Kept as a standalone inline (NOT routed through [`iou_value`]) so this hot
+/// NMS primitive stays byte-identical to its NEON sibling
+/// [`jaccard_batch4`]; the value helpers above are additive and used by the
+/// tiled-detection merge.
 ///
 /// # Example
 /// ```
@@ -578,6 +623,48 @@ mod tests {
         let full = nms_float(0.5, None, boxes.clone());
         let capped = nms_float(0.5, Some(100), boxes);
         assert_eq!(full.len(), capped.len());
+    }
+
+    // Parity literals from ModelPack metrics/tiled.py::_match for
+    // A=[100,100,400,300], B=[350,100,400,300] (B fully inside A):
+    // inter=10000, area_a=60000, area_b=10000 => IoS=1.0, IoU=0.16667.
+    #[test]
+    fn metric_values_match_modelpack_match() {
+        let a = BoundingBox::new(100.0, 100.0, 400.0, 300.0);
+        let b = BoundingBox::new(350.0, 100.0, 400.0, 300.0);
+        assert!((intersection_area(&a, &b) - 10000.0).abs() < 1e-3);
+        assert!((box_area(&a) - 60000.0).abs() < 1e-3);
+        assert!((box_area(&b) - 10000.0).abs() < 1e-3);
+        assert!((ios_value(&a, &b) - 1.0).abs() < 1e-6);
+        assert!((iou_value(&a, &b) - (1.0 / 6.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn metric_values_disjoint_are_zero() {
+        let a = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        let b = BoundingBox::new(20.0, 20.0, 30.0, 30.0);
+        assert_eq!(intersection_area(&a, &b), 0.0);
+        assert_eq!(ios_value(&a, &b), 0.0);
+        assert_eq!(iou_value(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn metric_values_zero_area_box_no_panic() {
+        // Degenerate (zero-area) box: denom floored to 1e-9, result finite.
+        let degenerate = BoundingBox::new(10.0, 10.0, 10.0, 20.0);
+        let other = BoundingBox::new(0.0, 0.0, 30.0, 30.0);
+        assert_eq!(box_area(&degenerate), 0.0);
+        assert!(ios_value(&degenerate, &other).is_finite());
+        assert!(iou_value(&degenerate, &other).is_finite());
+    }
+
+    #[test]
+    fn ios_high_where_iou_low_for_contained_box() {
+        // The SAHI seam case: a small box fully inside a large one.
+        let big = BoundingBox::new(0.0, 0.0, 100.0, 100.0);
+        let small = BoundingBox::new(10.0, 10.0, 20.0, 20.0);
+        assert!((ios_value(&big, &small) - 1.0).abs() < 1e-6); // fully contained
+        assert!(iou_value(&big, &small) < 0.05); // but IoU tiny
     }
 
     #[test]

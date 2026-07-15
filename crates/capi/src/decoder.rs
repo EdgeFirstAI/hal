@@ -1565,6 +1565,49 @@ fn is_empty_sentinel(t: &edgefirst_tensor::TensorDyn) -> bool {
 // Detection Box List Functions
 // ============================================================================
 
+/// Create a detection box list from a caller-supplied array.
+///
+/// Copies `count` boxes from `boxes` into a new owned list. Pass `count == 0`
+/// (with any `boxes`, including NULL) to build an empty list. This is the
+/// counterpart to the decoder/tiling functions that *return* box lists: use it
+/// to feed externally-produced detections into `hal_lift_tile_boxes()`,
+/// `hal_merge_tiled_detections()`, or `hal_tiled_frame_accumulator_push_tile()`.
+///
+/// @param boxes Pointer to an array of `count` detection boxes (may be NULL
+///        only when `count == 0`)
+/// @param count Number of boxes to copy
+/// @return New detection box list (free with `hal_detect_box_list_free()`),
+///         or NULL on error
+/// @par Errors (errno):
+/// - EINVAL: `boxes` is NULL while `count > 0`
+#[no_mangle]
+pub unsafe extern "C" fn hal_detect_box_list_new(
+    boxes: *const HalDetectBox,
+    count: size_t,
+) -> *mut HalDetectBoxList {
+    if count == 0 {
+        return Box::into_raw(Box::new(HalDetectBoxList { boxes: Vec::new() }));
+    }
+    if boxes.is_null() {
+        return set_error_null(libc::EINVAL);
+    }
+    let slice = std::slice::from_raw_parts(boxes, count);
+    let vec: Vec<DetectBox> = slice
+        .iter()
+        .map(|b| DetectBox {
+            bbox: edgefirst_decoder::BoundingBox {
+                xmin: b.xmin,
+                ymin: b.ymin,
+                xmax: b.xmax,
+                ymax: b.ymax,
+            },
+            score: b.score,
+            label: b.label,
+        })
+        .collect();
+    Box::into_raw(Box::new(HalDetectBoxList { boxes: vec }))
+}
+
 /// Get the number of detections in a list.
 ///
 /// @param list Detection box list handle

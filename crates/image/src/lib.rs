@@ -377,6 +377,8 @@ mod error;
 mod g2d;
 #[path = "gl/mod.rs"]
 mod opengl_headless;
+mod tiling;
+pub use tiling::{tile_grid, TilePlacement, TileSpec, TilingConfig};
 
 // Use `edgefirst_tensor::PixelFormat` variants (Rgb, Rgba, Grey, etc.) and
 // `TensorDyn` / `Tensor<u8>` with `.format()` metadata instead.
@@ -599,19 +601,14 @@ impl<'a> MaskOverlay<'a> {
 ///
 /// Converts model-input-normalized coords to output-image-normalized coords,
 /// clamped to `[0.0, 1.0]`. Also canonicalises the bbox (ensures xmin ≤ xmax).
+///
+/// Thin wrapper over [`edgefirst_decoder::tiling::unletter_norm`] — the single
+/// home for the inverse-letterbox math lives in the lower `decoder` crate so the
+/// tiled-detection lift and this mask path share one implementation.
 #[inline]
 fn unletter_bbox(bbox: DetectBox, lb: [f32; 4]) -> DetectBox {
-    let b = bbox.bbox.to_canonical();
-    let [lx0, ly0, lx1, ly1] = lb;
-    let inv_w = if lx1 > lx0 { 1.0 / (lx1 - lx0) } else { 1.0 };
-    let inv_h = if ly1 > ly0 { 1.0 / (ly1 - ly0) } else { 1.0 };
     DetectBox {
-        bbox: edgefirst_decoder::BoundingBox {
-            xmin: ((b.xmin - lx0) * inv_w).clamp(0.0, 1.0),
-            ymin: ((b.ymin - ly0) * inv_h).clamp(0.0, 1.0),
-            xmax: ((b.xmax - lx0) * inv_w).clamp(0.0, 1.0),
-            ymax: ((b.ymax - ly0) * inv_h).clamp(0.0, 1.0),
-        },
+        bbox: edgefirst_decoder::tiling::unletter_norm(bbox.bbox, lb),
         ..bbox
     }
 }
@@ -3440,6 +3437,315 @@ mod image_tests {
                 "tile {i}: band is not the expected solid color {c:?} (sibling wipe?)"
             );
         }
+    }
+
+    /// Build a `w`×`h` RGBA frame whose pixels encode their position, so a crop
+    /// at any origin has distinct content (catches crop-origin / band-placement
+    /// bugs a solid color cannot).
+    #[cfg(test)]
+    fn gradient_frame(w: usize, h: usize) -> TensorDyn {
+        let mut bytes = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                bytes[i] = x as u8;
+                bytes[i + 1] = y as u8;
+                bytes[i + 2] = (x ^ y) as u8;
+                bytes[i + 3] = 255;
+            }
+        }
+        load_bytes_to_tensor(w, h, PixelFormat::Rgba, Some(TensorMemory::Mem), &bytes).unwrap()
+    }
+
+    /// `tile_into` band == standalone crop-convert of the same source region,
+    /// on the CPU backend (runs on CI without a GPU). Distinct gradient content
+    /// makes a wrong crop origin or a sibling-band wipe a hard failure.
+    #[test]
+    fn tile_into_cpu_distinct_content_parity() {
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let src = gradient_frame(fw, fh);
+        let cfg = TilingConfig::new(32, 32).with_overlap(0.0); // exact 3×2 tiling
+        let n = tile_grid(fh, fw, 32, 32, 0.0).len();
+        assert_eq!(n, 6);
+
+        let mut parent = proc
+            .alloc_tile_batch(
+                n,
+                &cfg,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        let placements = proc.tile_into(&src, &mut parent, &cfg).unwrap();
+        assert_eq!(placements.len(), n);
+
+        for p in &placements {
+            let source = Region::new(
+                p.origin.0 as usize,
+                p.origin.1 as usize,
+                p.crop_size.0 as usize,
+                p.crop_size.1 as usize,
+            );
+            let mut solo = TensorDyn::image(
+                32,
+                32,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            proc.convert(
+                &src,
+                &mut solo,
+                Rotation::None,
+                Flip::None,
+                Crop::default()
+                    .with_source(Some(source))
+                    .with_fit(Fit::Stretch),
+            )
+            .unwrap();
+            let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
+            let band_bytes = band.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            let solo_bytes = solo.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            assert_eq!(
+                band_bytes, solo_bytes,
+                "tile {} band differs from standalone crop-convert",
+                p.index
+            );
+        }
+    }
+
+    /// Streaming `tile_one` into a single slot == the corresponding batched
+    /// `tile_into` band (proves the two paths agree).
+    #[test]
+    fn tile_one_matches_tile_into_band() {
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let src = gradient_frame(fw, fh);
+        let cfg = TilingConfig::new(32, 32).with_overlap(0.0);
+        let n = tile_grid(fh, fw, 32, 32, 0.0).len();
+
+        let mut parent = proc
+            .alloc_tile_batch(
+                n,
+                &cfg,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+        proc.tile_into(&src, &mut parent, &cfg).unwrap();
+
+        let plan = proc.plan_tiles(fw, fh, &cfg).unwrap();
+        for p in &plan {
+            let mut slot = TensorDyn::image(
+                32,
+                32,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            proc.tile_one(&src, &mut slot, p, &cfg).unwrap();
+            proc.flush().unwrap();
+            let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
+            let slot_bytes = slot.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            let band_bytes = band.as_u8().unwrap().map().unwrap().as_slice().to_vec();
+            assert_eq!(
+                slot_bytes, band_bytes,
+                "tile {} stream != batch band",
+                p.index
+            );
+        }
+    }
+
+    /// `plan_tiles` returns correct per-tile metadata for a 4K frame (pure, no
+    /// GPU render).
+    /// `tile_into` through the auto backend with a DMA parent — exercises the
+    /// GL single-import band path on a GPU machine (skips when DMA/GL is
+    /// unavailable). The source is sampled via `Crop::with_source`, never
+    /// `src.view()`, so all tiles share one source import.
+    #[test]
+    fn tile_into_auto_dma_parity() {
+        let mut proc = match ImageProcessor::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — ImageProcessor init failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let src = gradient_frame(fw, fh);
+        let cfg = TilingConfig::new(32, 32).with_overlap(0.0);
+        let n = tile_grid(fh, fw, 32, 32, 0.0).len();
+
+        let mut parent = match proc.alloc_tile_batch(
+            n,
+            &cfg,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Dma),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: {} — tall DMA parent alloc failed ({e:?})",
+                    function!()
+                );
+                return;
+            }
+        };
+        let placements = proc.tile_into(&src, &mut parent, &cfg).unwrap();
+
+        for p in &placements {
+            let source = Region::new(
+                p.origin.0 as usize,
+                p.origin.1 as usize,
+                p.crop_size.0 as usize,
+                p.crop_size.1 as usize,
+            );
+            let mut solo = TensorDyn::image(
+                32,
+                32,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Dma),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            proc.convert(
+                &src,
+                &mut solo,
+                Rotation::None,
+                Flip::None,
+                Crop::default()
+                    .with_source(Some(source))
+                    .with_fit(Fit::Stretch),
+            )
+            .unwrap();
+            let band = parent.view(Region::new(0, p.index * 32, 32, 32)).unwrap();
+            // Structural-similarity tolerance (the house GPU-parity bar) rather
+            // than exact bytes: rendering a tile into a viewport band at a
+            // non-zero offset vs. a standalone origin render diverges by sampling
+            // rounding on virtualized GPUs (paravirtual Metal/ANGLE on macOS CI),
+            // the same tolerance class as the other cross-backend parity tests.
+            compare_images(
+                &band,
+                &solo,
+                0.98,
+                &format!("{}_tile{}", function!(), p.index),
+            );
+        }
+    }
+
+    /// `tile_into` rejects a destination too small to hold all tile bands.
+    #[test]
+    fn tile_into_undersized_dst_errors() {
+        let mut proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let (fw, fh) = (96usize, 64usize);
+        let src = gradient_frame(fw, fh);
+        let cfg = TilingConfig::new(32, 32).with_overlap(0.0); // 6 tiles
+                                                               // Allocate a parent for only 2 bands, far short of 6.
+        let mut small = TensorDyn::image(
+            32,
+            2 * 32,
+            PixelFormat::Rgba,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let r = proc.tile_into(&src, &mut small, &cfg);
+        assert!(
+            matches!(r, Err(Error::InvalidShape(_))),
+            "expected InvalidShape, got {r:?}"
+        );
+    }
+
+    /// `alloc_tile_batch` / `plan_tiles` reject an invalid config (zero tile).
+    #[test]
+    fn tiling_alloc_rejects_invalid_config() {
+        let proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let bad = TilingConfig::new(0, 640);
+        assert!(proc.plan_tiles(1920, 1080, &bad).is_err());
+        assert!(proc
+            .alloc_tile_batch(
+                4,
+                &bad,
+                PixelFormat::Rgba,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn plan_tiles_metadata_4k() {
+        let proc = match ImageProcessor::with_config(ImageProcessorConfig {
+            backend: ComputeBackend::Cpu,
+            ..Default::default()
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("SKIPPED: {} — CPU init failed ({e:?})", function!());
+                return;
+            }
+        };
+        let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
+        let plan = proc.plan_tiles(3840, 2160, &cfg).unwrap();
+        assert_eq!(plan.len(), 32);
+        assert!(plan.iter().all(|p| p.count == 32));
+        assert!(plan.iter().all(|p| p.crop_size == (640.0, 640.0)));
+        assert!(plan.iter().all(|p| p.letterbox.is_none())); // stretch fit
+        assert!(plan.iter().all(|p| p.frame_dims == (3840.0, 2160.0)));
+        assert_eq!(plan[0].origin, (0.0, 0.0));
     }
 
     #[test]

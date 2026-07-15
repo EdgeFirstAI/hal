@@ -75,7 +75,7 @@ no_includes = false
 # only defines the type; implementations live in edgefirst-tflite), so
 # cbindgen would otherwise skip it. This list is additive — all other
 # types/functions are still emitted normally.
-include = ["HalDmabufTensorInfo", "HalCameraAdaptorFormatInfo"]
+include = ["HalDmabufTensorInfo", "HalCameraAdaptorFormatInfo", "HalMatchMetric"]
 exclude = []
 item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "constants"]
 
@@ -108,6 +108,14 @@ item_types = ["enums", "structs", "unions", "typedefs", "opaque", "functions", "
 "HalProtoData" = "hal_proto_data"
 "HalLogLevel" = "hal_log_level"
 "HalLogCallback" = "hal_log_callback"
+"HalMatchMetric" = "hal_match_metric"
+"HalTilingConfig" = "hal_tiling_config"
+"HalTileSpec" = "hal_tile_spec"
+"HalTilePlacement" = "hal_tile_placement"
+"HalMergeConfig" = "hal_merge_config"
+"HalTileSpecList" = "hal_tile_spec_list"
+"HalTilePlacementList" = "hal_tile_placement_list"
+"HalTiledFrameAccumulator" = "hal_tiled_frame_accumulator"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"
