@@ -869,8 +869,12 @@ mod tests {
     fn finalize_normalized_rejects_invalid_frame_dims() {
         let cfg = MergeConfig::default();
         let boxes = vec![det([10.0, 10.0, 40.0, 40.0], 0.9, 0)];
-        for frame in [(0.0, 640.0), (1280.0, 0.0), (f32::NAN, 640.0), (1280.0, f32::INFINITY)]
-        {
+        for frame in [
+            (0.0, 640.0),
+            (1280.0, 0.0),
+            (f32::NAN, 640.0),
+            (1280.0, f32::INFINITY),
+        ] {
             let p = TilePlacement {
                 index: 0,
                 count: 1,

@@ -926,8 +926,8 @@ typedef void (*hal_log_callback)(enum hal_log_level level,
  * Static tiling configuration (independent of frame size). Passed by value.
  *
  * Seed with `hal_tiling_config_default()` then override fields; do **not**
- * `memset(0)` — a zero `fit` happens to be `HAL_FIT_STRETCH` but a zero
- * `overlap_ratio` differs from the default 0.2.
+ * `memset(0)` — that zeroes `overlap_ratio` (default is 0.2) even though
+ * `fit == 0` happens to equal `HAL_FIT_STRETCH`.
  */
 typedef struct hal_tiling_config {
   /**

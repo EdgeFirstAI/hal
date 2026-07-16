@@ -41,6 +41,13 @@ HAL_TARGETS=(
     x86_64-pc-windows-msvc      # Windows
 )
 echo "[1/5] Generating dependency SBOM with cargo-cyclonedx (${#HAL_TARGETS[@]} targets)..."
+# Drop any leftover *.cdx.json before regenerating. Older cargo-cyclonedx
+# invocations wrote host-only files without --target-in-filename
+# (e.g. crates/decoder/edgefirst-decoder.cdx.json); those keep the
+# workspace version from the run that produced them and would otherwise
+# pollute the merge with stale internal-crate versions (breaking
+# verify_version.py / NOTICE). Always start from a clean slate.
+find crates -name '*.cdx.json' -delete
 for t in "${HAL_TARGETS[@]}"; do
     echo "  target: ${t}"
     cargo cyclonedx --format json --all --target "${t}" --target-in-filename
