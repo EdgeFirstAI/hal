@@ -359,7 +359,12 @@ impl ImageProcessor {
 fn placement_to_source_region(placement: &TilePlacement) -> Result<Region> {
     let (ox, oy) = placement.origin;
     let (cw, ch) = placement.crop_size;
-    for (name, v) in [("origin.x", ox), ("origin.y", oy), ("crop.w", cw), ("crop.h", ch)] {
+    for (name, v) in [
+        ("origin.x", ox),
+        ("origin.y", oy),
+        ("crop.w", cw),
+        ("crop.h", ch),
+    ] {
         if !v.is_finite() || v < 0.0 {
             return Err(Error::CropInvalid(format!(
                 "tile placement {name} must be finite and non-negative, got {v}"
