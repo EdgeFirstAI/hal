@@ -143,6 +143,7 @@ fn init_shared_display() -> Result<SharedAngleDisplay> {
         >::load_required_from(egl_lib)
     }
     .map_err(|e| Error::Io(std::io::Error::other(format!("EGL load: {e:?}"))))?;
+    debug!("EGL dynamic instance loaded, version = {:?}", egl.version());
 
     // 2. Metal-backed display from ApplePlatform.
     let display = ApplePlatform::create_display(&egl)?;
