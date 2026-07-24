@@ -2179,8 +2179,16 @@ macro_rules! api {
 					// surfaces as a "successful" NULL symbol.
 					#[cfg(unix)]
 					let addr = symbol.into_raw().into_raw();
+					// On Windows `into_raw()` yields `FARPROC`
+					// (`Option<unsafe extern "system" fn() -> isize>`), not a
+					// data pointer, so it cannot be `as`-cast to `*mut c_void`.
+					// Map `None`/`Some` to a raw address so the null check and
+					// transmute below are shared with the unix path.
 					#[cfg(windows)]
-					let addr = symbol.into_raw().into_raw() as *mut std::os::raw::c_void;
+					let addr = symbol
+						.into_raw()
+						.into_raw()
+						.map_or(std::ptr::null_mut(), |f| f as *mut std::os::raw::c_void);
 					if addr.is_null() {
 						return Err(libloading::Error::DlSymUnknown);
 					}
