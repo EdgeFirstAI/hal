@@ -2166,12 +2166,40 @@ macro_rules! api {
 				$(
 					let name = stringify!($name).as_bytes();
 					let symbol = lib.get::<unsafe extern "system" fn($($atype ),*) -> $rtype>(name)?;
+					// Take the raw symbol ADDRESS and transmute it into the fn
+					// pointer directly. The previous formulation took a
+					// reference to the `into_raw()` TEMPORARY, let it die at
+					// the end of its statement, then read through the dangling
+					// pointer — UB that iOS Release codegen turned into a NULL
+					// dispatch-table entry (call to 0x0 on first EGL use,
+					// found on a physical iPhone 17 Pro); its `assert!` only
+					// checked a stack address, never the symbol. Guard the
+					// real address instead: dlsym can return NULL without
+					// setting dlerror on some handles, which libloading
+					// surfaces as a "successful" NULL symbol.
 					#[cfg(unix)]
-					let ptr = (&symbol.into_raw().into_raw()) as *const *mut _ as *const unsafe extern "system" fn($($atype ),*) -> $rtype;
+					let addr = symbol.into_raw().into_raw();
+					// On Windows `into_raw()` yields `FARPROC`
+					// (`Option<unsafe extern "system" fn() -> isize>`), not a
+					// data pointer, so it cannot be `as`-cast to `*mut c_void`.
+					// Map `None`/`Some` to a raw address so the null check and
+					// transmute below are shared with the unix path.
 					#[cfg(windows)]
-					let ptr = (&symbol.into_raw().into_raw()) as *const _ as *const unsafe extern "system" fn($($atype ),*) -> $rtype;
-					assert!(!ptr.is_null());
-					raw.$name = std::mem::MaybeUninit::new(*ptr);
+					let addr = symbol
+						.into_raw()
+						.into_raw()
+						.map_or(std::ptr::null_mut(), |f| f as *mut std::os::raw::c_void);
+					if addr.is_null() {
+						return Err(libloading::Error::DlSymUnknown);
+					}
+					// SAFETY: `addr` is the non-null address dlsym resolved for
+					// `$name`; the declared signature is the EGL-spec signature
+					// for that entry point.
+					let fnptr = std::mem::transmute::<
+						*mut std::os::raw::c_void,
+						unsafe extern "system" fn($($atype ),*) -> $rtype,
+					>(addr);
+					raw.$name = std::mem::MaybeUninit::new(fnptr);
 				)*
 
 				Ok(())
@@ -2185,6 +2213,15 @@ macro_rules! api {
 				$(
 					#[inline(always)]
 					unsafe fn $p_name(&self, $($p_arg : $p_atype),*) -> $p_rtype {
+						// Defensive slot guard: a NULL dispatch entry would
+						// otherwise be a jump to address 0 with no symbolized
+						// context. dlsym can return Ok(NULL) without dlerror
+						// on some handles, so a named panic is the honest
+						// failure mode.
+						let slot = self.raw.$p_name.as_ptr() as *const usize;
+						if *slot == 0 {
+							panic!("EGL dispatch slot {} is NULL", stringify!($p_name));
+						}
 						(self.raw.$p_name.assume_init())($($p_arg),*)
 					}
 				)*
@@ -2197,6 +2234,11 @@ macro_rules! api {
 			$(
 				#[inline(always)]
 				unsafe fn $name(&self, $($arg : $atype),*) -> $rtype {
+					// Defensive slot guard — see the $p_name accessors above.
+					let slot = self.raw.$name.as_ptr() as *const usize;
+					if *slot == 0 {
+						panic!("EGL dispatch slot {} is NULL", stringify!($name));
+					}
 					(self.raw.$name.assume_init())($($arg),*)
 				}
 			)*

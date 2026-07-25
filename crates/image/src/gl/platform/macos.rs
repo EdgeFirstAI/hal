@@ -44,11 +44,12 @@
 use super::super::Egl;
 use crate::Error;
 use edgefirst_egl as egl;
-// `debug!`/`warn!` are only used inside the macOS `load_egl_lib_inner`
-// branch (the iOS path resolves symbols via `Library::this()` with no
-// logging). Gate the import so iOS builds don't warn about unused items.
+// `debug!` is used by both Apple `load_egl_lib_inner` branches; `warn!`
+// only by the macOS one. Gate the `warn` import so iOS builds don't warn
+// about unused items.
+use log::debug;
 #[cfg(target_os = "macos")]
-use log::{debug, warn};
+use log::warn;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
@@ -98,10 +99,11 @@ impl ApplePlatform {
     /// same pattern as Linux's `EGL_LIB` in `context.rs`).
     ///
     /// The actual acquisition is OS-specific ([`Self::load_egl_lib_inner`]):
-    /// macOS `dlopen`s a `libEGL.dylib` from the search paths; iOS resolves
-    /// from the main image via `Library::this()` (the ANGLE xcframeworks are
-    /// dynamic frameworks the app links against and embeds, so they load into
-    /// the process image at launch).
+    /// macOS `dlopen`s a `libEGL.dylib` from the search paths; iOS locates
+    /// the already-loaded `libEGL` image in dyld's image list and `dlopen`s
+    /// it by exact path (the ANGLE xcframeworks are dynamic frameworks the
+    /// app or test bundle links against and embeds, so dyld loads them
+    /// before any Rust code runs).
     pub(in super::super) fn load_egl_lib() -> Result<&'static libloading::Library, Error> {
         if let Some(lib) = EGL_LIB.get() {
             return Ok(lib);
@@ -112,22 +114,64 @@ impl ApplePlatform {
     }
 
     /// iOS: ANGLE EGL/GLES symbols come from the `EGL.xcframework` +
-    /// `GLESv2.xcframework` dynamic frameworks that the app links against and
-    /// embeds (see `.cargo/config.toml` and README.md § iOS). Because they are
-    /// linked (not merely bundled), they load into the process image at launch,
-    /// so resolving from the main image via `Library::this()` — equivalent to
-    /// `dlopen(NULL)`, a handle for the whole process image — lets `dlsym` find
-    /// the ANGLE entry points the `edgefirst-egl` `Dynamic` loader requests.
-    /// (The app shell that performs that link/embed is future Swift-bindings
-    /// work; see README.md § iOS.)
+    /// `GLESv2.xcframework` dynamic frameworks that the consuming app (or
+    /// test bundle) links against and embeds. Because they are linked (not
+    /// merely bundled), dyld loads them into the process before any Rust code
+    /// runs — so locate the already-loaded `libEGL` image in dyld's image
+    /// list and `dlopen` it by its exact path.
+    ///
+    /// Deliberately NOT `Library::this()` (`dlopen(NULL)`): that handle only
+    /// searches the main executable and its launch-time dependents. When
+    /// ANGLE is linked by a *plugin* image instead (an XCTest bundle inside a
+    /// test runner — the Device Farm / device-test topology), `dlsym` on the
+    /// main-executable handle returns NULL for every EGL symbol WITHOUT
+    /// setting `dlerror`, which libloading reports as success — the
+    /// `edgefirst-egl` strict loader then builds a dispatch table of NULLs
+    /// and the first EGL call crashes at address 0 (found on a physical
+    /// iPhone 17 Pro; the same lookup succeeds in a plain app because there
+    /// ANGLE *is* a launch dependent of the main executable). Resolving the
+    /// image path first gives a real dlopen handle with honest dlerror
+    /// semantics in both topologies, and a clean `Err` (→ CPU-preprocess
+    /// fallback) when ANGLE is not linked at all.
     #[cfg(target_os = "ios")]
     fn load_egl_lib_inner() -> Result<libloading::Library, Error> {
-        let this = libloading::os::unix::Library::this();
-        // `os::unix::Library` converts into `libloading::Library` via the
-        // crate's `From<os::platform::Library>` impl (libloading 0.9),
-        // avoiding an unannotated `transmute`. The EGL `Dynamic` loader
-        // then accepts the resulting handle.
-        Ok(this.into())
+        unsafe extern "C" {
+            fn _dyld_image_count() -> u32;
+            fn _dyld_get_image_name(image_index: u32) -> *const std::os::raw::c_char;
+        }
+        // SAFETY: `_dyld_image_count` / `_dyld_get_image_name` take no
+        // pointers in and return either an index bound or a NUL-terminated
+        // string owned by dyld that lives for the image's lifetime (the
+        // image cannot unload between the calls and the copy below because
+        // we never dlclose ANGLE and the process is single-shot).
+        let count = unsafe { _dyld_image_count() };
+        for index in 0..count {
+            // SAFETY: index < count per the bound above; a NULL return (image
+            // unloaded concurrently) is skipped.
+            let name = unsafe { _dyld_get_image_name(index) };
+            if name.is_null() {
+                continue;
+            }
+            // SAFETY: dyld guarantees a valid NUL-terminated C string.
+            let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+            if path.ends_with("/libEGL.framework/libEGL") || path.ends_with("/libEGL.dylib") {
+                debug!("ApplePlatform: dlopen already-loaded ANGLE libEGL at {path}");
+                // SAFETY: dlopen is unsafe because the loaded library can run
+                // initializers; this image is already loaded (dyld list), so
+                // this only bumps its reference count.
+                return unsafe { libloading::Library::new(path.as_ref()) }.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!(
+                        "dlopen of loaded ANGLE libEGL image {path} failed: {e}"
+                    )))
+                });
+            }
+        }
+        Err(Error::Io(std::io::Error::other(
+            "ANGLE libEGL is not loaded in this process: link AND embed \
+             EGL.xcframework + GLESv2.xcframework into the app or test bundle \
+             (an embed-only copy, or an unused-framework strip at link time, \
+             leaves the image list without libEGL)",
+        )))
     }
 
     /// macOS: locate and `dlopen` ANGLE's libEGL. Search order:
