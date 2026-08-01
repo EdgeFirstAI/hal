@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-08-01
+
+### Fixed
+
+- **EGL dynamic loader undefined behavior and iOS `libEGL` resolution**
+  (EDGEAI-1353). The dynamic EGL dispatch-table loader read each resolved
+  symbol through a reference to a dead stack temporary — on iOS Release
+  codegen this materialized NULL dispatch entries, jumping to address 0 on
+  first EGL call on-device. Symbol addresses are now stored via a direct
+  transmute with a real null check (`DlSymUnknown`), with permanent
+  named-panic slot guards on the generated accessors so any future NULL
+  entry fails symbolized instead of jumping to 0. iOS `libEGL` resolution
+  now scans the dyld image list and `dlopen`s by exact path instead of
+  `Library::this()` (`dlopen(NULL)`), which cannot see plugin-linked ANGLE
+  in XCTest runner / Device Farm topologies and silently returns NULL from
+  `dlsym`. Also fixes the Windows build, where `libloading`'s
+  `os::windows::Symbol::into_raw()` returns `FARPROC` rather than a data
+  pointer and doesn't cast the same way as the Unix path.
+- Stale `hal_import_image()` doc-comment `@code` examples in the C API
+  (and the generated `hal.h`) that predated the `colorimetry` parameter —
+  copy-pasting them produced a compile error from the missing 8th
+  argument.
+
 ## [0.27.0] - 2026-07-15
 
 ### Added

@@ -1853,7 +1853,8 @@ pub extern "C" fn hal_align_width_for_pixel_format(
 /// hal_plane_descriptor_set_stride(pd, bytesperline);  // optional
 /// struct hal_tensor *src = hal_import_image(proc, pd, NULL,
 ///                                            1920, 1080,
-///                                            HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+///                                            HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8,
+///                                            NULL);  // no colorimetry override
 /// // pd is consumed — do NOT free it
 ///
 /// // Multi-plane NV12
@@ -1861,7 +1862,8 @@ pub extern "C" fn hal_align_width_for_pixel_format(
 /// struct hal_plane_descriptor *uv_pd = hal_plane_descriptor_new(uv_fd);
 /// struct hal_tensor *src = hal_import_image(proc, y_pd, uv_pd,
 ///                                            1920, 1080,
-///                                            HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+///                                            HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8,
+///                                            NULL);
 /// @endcode
 ///
 /// @see hal_plane_descriptor_new, hal_import_image
