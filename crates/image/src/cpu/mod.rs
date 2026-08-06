@@ -84,6 +84,30 @@ pub struct CPUProcessor {
     /// per-frame allocation and lets each strip stay hot in L2 between the YUV
     /// decode and the deinterleave. Grown on demand; never shrunk.
     nv_strip_scratch: Vec<u8>,
+    /// Reusable cache-resident scratch for the fused NV→planar path's
+    /// **region** case: a tight (stride == width) copy of the current
+    /// strip's luma rows, starting at column 0. The `yuv` crate's row
+    /// iteration processes fixed-`stride`-sized chunks internally, using
+    /// only the first `width` bytes of each — feeding it a slice that starts
+    /// at a mid-row column offset (a source-crop `region` with a nonzero
+    /// `left`) reads past the *source* buffer's true end for the region's
+    /// last row when that row is also the source's last row (the unused
+    /// chunk tail has no next row to alias into there). Packing each row
+    /// into a `stride == width` buffer first sidesteps that read
+    /// unconditionally. Unused (and zero-cost) for the whole-frame
+    /// (`region: None`) case, which stays fully zero-copy. Grown on demand;
+    /// never shrunk.
+    nv_strip_y_pack: Vec<u8>,
+    /// Same as [`Self::nv_strip_y_pack`], for the chroma (UV) rows.
+    nv_strip_uv_pack: Vec<u8>,
+    /// Test-only counter of `convert` calls that took the fused NV→planar
+    /// strip path (`convert_nv_to_planar_fused`), incremented at the gate in
+    /// `convert_u8`. Exists only under `#[cfg(test)]` — a field that's
+    /// written but (outside tests) never read trips clippy's dead-code lint
+    /// on both OS lanes. Read via [`Self::fused_hits`] so path-selection
+    /// tests assert on the actual gate decision rather than on timing.
+    #[cfg(test)]
+    fused_hits: u64,
     /// Reusable intermediate buffers for the multi-step convert pipeline
     /// (pre-resize format-convert and the resized-RGB scratch). Reused across
     /// frames when the dimensions/format match so the steady-state
@@ -109,6 +133,10 @@ impl Clone for CPUProcessor {
             resize_destride_scratch: Vec::new(),
             resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
+            nv_strip_y_pack: Vec::new(),
+            nv_strip_uv_pack: Vec::new(),
+            #[cfg(test)]
+            fused_hits: 0,
             convert_tmp: None,
             convert_tmp2: None,
         }
@@ -167,6 +195,22 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
         }
     }
     Ok(())
+}
+
+/// Whether a source-crop origin is safe for the fused NV→planar strip path
+/// (`convert_nv_to_planar_fused`'s `region` parameter). NV12 (4:2:0)
+/// subsamples chroma both directions, so an odd `top` would desync the
+/// luma/chroma row pairing; NV16 (4:2:2) subsamples only horizontally, so
+/// only `left` must be even; NV24 (4:4:4) carries full-resolution chroma and
+/// has no alignment constraint. Misaligned origins fall through to the
+/// general path rather than snapping or shifting.
+fn chroma_alignment_ok(fmt: PixelFormat, r: Rect) -> bool {
+    match fmt {
+        PixelFormat::Nv12 => r.left.is_multiple_of(2) && r.top.is_multiple_of(2),
+        PixelFormat::Nv16 => r.left.is_multiple_of(2),
+        PixelFormat::Nv24 => true,
+        _ => false,
+    }
 }
 
 /// Compute row stride for a packed-format Tensor<u8> image given its format.
@@ -321,6 +365,10 @@ impl CPUProcessor {
             resize_destride_scratch: Vec::new(),
             resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
+            nv_strip_y_pack: Vec::new(),
+            nv_strip_uv_pack: Vec::new(),
+            #[cfg(test)]
+            fused_hits: 0,
             convert_tmp: None,
             convert_tmp2: None,
         }
@@ -341,9 +389,19 @@ impl CPUProcessor {
             resize_destride_scratch: Vec::new(),
             resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
+            nv_strip_y_pack: Vec::new(),
+            nv_strip_uv_pack: Vec::new(),
+            #[cfg(test)]
+            fused_hits: 0,
             convert_tmp: None,
             convert_tmp2: None,
         }
+    }
+
+    /// Test-only accessor for the `fused_hits` counter (see the field doc).
+    #[cfg(test)]
+    pub(super) fn fused_hits(&self) -> u64 {
+        self.fused_hits
     }
 
     pub(crate) fn support_conversion_pf(src: PixelFormat, dst: PixelFormat) -> bool {
@@ -925,17 +983,60 @@ impl CPUProcessor {
             dst_params
         };
 
-        // Fused NV→planar (no resize/flip/rotation/crop): decode the YUV source
-        // into packed RGB one cache-resident row strip at a time and
-        // NEON-deinterleave each strip straight into the destination planes, so
-        // the full-size packed-RGB intermediate never round-trips through DRAM
-        // and is not reallocated per frame. JPEG decodes to the NV family and the
-        // model wants planar RGB, so this is the hot Orin CPU-preprocess path.
-        if !need_resize_flip_rotation
-            && matches!(src_fmt, Nv12 | Nv16 | Nv24)
-            && matches!(dst_fmt, PlanarRgb | PlanarRgba)
-        {
-            return self.convert_nv_to_planar_fused(src, dst, src_fmt, dst_fmt, direct_params);
+        // Fused NV→planar: decode the YUV source into packed RGB one
+        // cache-resident row strip at a time and NEON-deinterleave each strip
+        // straight into the destination planes, so the full-size packed-RGB
+        // intermediate never round-trips through DRAM and is not reallocated
+        // per frame. JPEG decodes to the NV family and the model wants planar
+        // RGB, so this is the hot Orin CPU-preprocess path.
+        //
+        // Two shapes take this path: the whole-frame case (no crop, dst ==
+        // src size — the original hot path, unchanged) and a **scale-
+        // identity** source crop (crop size == destination size, no rotate/
+        // flip, full destination placement, chroma-aligned origin) — the
+        // primary CPU-fallback path for uniform tiling (e.g. SAHI tiles cut
+        // from one frame). Any other shape (an actual resize, a partial
+        // destination placement, or a chroma-misaligned origin) falls
+        // through to the general pipeline below — never snapped or shifted
+        // into alignment.
+        let full_dst_rect = Rect {
+            left: 0,
+            top: 0,
+            width: dst_w,
+            height: dst_h,
+        };
+        let fused_region = if rotation != Rotation::None || flip != Flip::None {
+            None
+        } else {
+            match crop.src_rect {
+                None if src_w == dst_w && src_h == dst_h => Some(None),
+                None => None,
+                Some(r)
+                    if r.width == dst_w
+                        && r.height == dst_h
+                        && crop.dst_rect.is_none_or(|d| d == full_dst_rect)
+                        && chroma_alignment_ok(src_fmt, r) =>
+                {
+                    Some(Some(r))
+                }
+                Some(_) => None,
+            }
+        };
+        if let Some(region) = fused_region {
+            if matches!(src_fmt, Nv12 | Nv16 | Nv24) && matches!(dst_fmt, PlanarRgb | PlanarRgba) {
+                #[cfg(test)]
+                {
+                    self.fused_hits += 1;
+                }
+                return self.convert_nv_to_planar_fused(
+                    src,
+                    dst,
+                    src_fmt,
+                    dst_fmt,
+                    direct_params,
+                    region,
+                );
+            }
         }
 
         // check if a direct conversion can be done

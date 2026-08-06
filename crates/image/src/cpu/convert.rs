@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Error, Result};
+use crate::{Error, Rect, Result};
 use edgefirst_tensor::{Tensor, TensorMapTrait, TensorTrait};
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -1418,10 +1418,18 @@ impl CPUProcessor {
     /// is not reallocated per frame. The strip height keeps a `width × 3`
     /// strip resident in L2 between the YUV decode and the deinterleave.
     ///
+    /// `region` (source pixels) selects a sub-rectangle to decode: `None`
+    /// decodes the whole source (the original whole-frame hot path). `Some(r)`
+    /// decodes only `r`, writing the dense `r.width × r.height` result — the
+    /// caller (the gate in `cpu/mod.rs`) guarantees `r` is scale-identity with
+    /// the destination and chroma-aligned for `src_fmt`; this function itself
+    /// only validates `r` against the source bounds.
+    ///
     /// Geometry mirrors `convert_nv12`/`convert_nv16`/`convert_nv24` (contiguous
     /// and multiplane sources). NV12 (4:2:0) advances the chroma plane by half
     /// the luma rows; the strip height is even so each strip starts on an even
-    /// luma row. The destination is validated against the derived plane sizes
+    /// luma row (relative to `region.top`, which the gate guarantees is even
+    /// for NV12). The destination is validated against the derived plane sizes
     /// (untrusted dims → `InvalidShape`, not a panic), like the other helpers.
     pub(super) fn convert_nv_to_planar_fused(
         &mut self,
@@ -1430,6 +1438,7 @@ impl CPUProcessor {
         src_fmt: edgefirst_tensor::PixelFormat,
         dst_fmt: edgefirst_tensor::PixelFormat,
         cp: ColorParams,
+        region: Option<Rect>,
     ) -> Result<()> {
         use edgefirst_tensor::PixelFormat::{Nv12, Nv16, Nv24, PlanarRgb, PlanarRgba};
 
@@ -1438,29 +1447,50 @@ impl CPUProcessor {
         /// (32 × 1920 × 3 ≈ 180 KiB).
         const STRIP_ROWS: usize = 32;
 
-        let w = src.width().unwrap();
-        let h = src.height().unwrap();
+        let src_w = src.width().unwrap();
+        let src_h = src.height().unwrap();
         let has_alpha = dst_fmt == PlanarRgba;
         debug_assert!(matches!(dst_fmt, PlanarRgb | PlanarRgba));
 
+        // `region` in source pixels; `None` is the whole-frame case (left=0,
+        // top=0, out dims == source dims), preserving the original behaviour
+        // exactly.
+        let (region_left, region_top, out_w, out_h) = match region {
+            Some(r) => (r.left, r.top, r.width, r.height),
+            None => (0, 0, src_w, src_h),
+        };
+        if region_left.checked_add(out_w).is_none_or(|e| e > src_w)
+            || region_top.checked_add(out_h).is_none_or(|e| e > src_h)
+        {
+            return Err(Error::InvalidShape(format!(
+                "fused nv→planar region out of bounds: {region:?} (source {src_w}x{src_h})"
+            )));
+        }
+
         // ---- source plane geometry (mirrors convert_nv12/nv16/nv24) ----
-        let y_stride = src.effective_row_stride().unwrap_or(w.next_multiple_of(2));
+        let y_stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
         // `chroma_div` maps a luma row index to its chroma row index: NV12
         // (4:2:0) subsamples chroma vertically by two; NV16/NV24 do not.
-        let (uv_stride, chroma_div) = match src_fmt {
+        // `chroma_x` converts a luma-column offset to the matching chroma
+        // byte offset: NV12/NV16 pack one U+V byte pair per two luma columns
+        // (1 byte/column); NV24 carries a full-resolution U+V pair per luma
+        // column (2 bytes/column).
+        let (uv_stride, chroma_div, chroma_x) = match src_fmt {
             Nv12 => {
                 let uv = if src.is_multiplane() {
                     src.chroma()
                         .unwrap()
                         .effective_row_stride()
-                        .unwrap_or(w.next_multiple_of(2))
+                        .unwrap_or(src_w.next_multiple_of(2))
                 } else {
                     y_stride
                 };
-                (uv, 2usize)
+                (uv, 2usize, region_left)
             }
-            Nv16 => (y_stride, 1usize),
-            Nv24 => (y_stride * 2, 1usize),
+            Nv16 => (y_stride, 1usize, region_left),
+            Nv24 => (y_stride * 2, 1usize, region_left * 2),
             other => return Err(Error::NotSupported(format!("fused {other} → planar"))),
         };
 
@@ -1473,7 +1503,7 @@ impl CPUProcessor {
         let (y_plane, uv_plane): (&[u8], &[u8]) = if let Some(cm) = &chroma_map {
             (src_map.as_slice(), cm.as_slice())
         } else {
-            super::split_semi_planar(src_map.as_slice(), y_stride, h, src_fmt)?
+            super::split_semi_planar(src_map.as_slice(), y_stride, src_h, src_fmt)?
         };
 
         // ---- destination plane geometry + validation ----
@@ -1481,9 +1511,9 @@ impl CPUProcessor {
         let n_planes = if has_alpha { 4 } else { 3 };
         let mut dst_map = dst.map_mut()?;
         let dst_bytes = dst_map.as_mut_slice();
-        let plane = dst_stride.checked_mul(h).ok_or_else(|| {
+        let plane = dst_stride.checked_mul(out_h).ok_or_else(|| {
             Error::InvalidShape(format!(
-                "fused nv→planar plane overflow (stride={dst_stride}, h={h})"
+                "fused nv→planar plane overflow (stride={dst_stride}, h={out_h})"
             ))
         })?;
         let dst_need = plane.checked_mul(n_planes).ok_or_else(|| {
@@ -1491,13 +1521,13 @@ impl CPUProcessor {
                 "fused nv→planar dst overflow (plane={plane}, planes={n_planes})"
             ))
         })?;
-        if dst_stride < w || dst_bytes.len() < dst_need {
+        if dst_stride < out_w || dst_bytes.len() < dst_need {
             return Err(Error::InvalidShape(format!(
-                "fused nv→planar dst too small: {} bytes, need {dst_need} (stride={dst_stride} >= w={w}, planes={n_planes})",
+                "fused nv→planar dst too small: {} bytes, need {dst_need} (stride={dst_stride} >= w={out_w}, planes={n_planes})",
                 dst_bytes.len()
             )));
         }
-        if w == 0 || h == 0 {
+        if out_w == 0 || out_h == 0 {
             return Ok(());
         }
 
@@ -1512,28 +1542,90 @@ impl CPUProcessor {
 
         // ---- strip loop: decode into the cached scratch, deinterleave out ----
         let mut scratch = std::mem::take(&mut self.nv_strip_scratch);
-        let need = STRIP_ROWS.saturating_mul(w).saturating_mul(3);
+        let need = STRIP_ROWS.saturating_mul(out_w).saturating_mul(3);
         if scratch.len() < need {
             scratch.resize(need, 0);
         }
 
+        // Chroma bytes per row for `out_w` luma columns: NV12/NV16 pack one
+        // U+V byte pair per two luma columns (1 byte/column); NV24 carries a
+        // full-resolution U+V pair per luma column (2 bytes/column). Mirrors
+        // `chroma_x`'s scaling above.
+        let chroma_row_bytes = if src_fmt == Nv24 { out_w * 2 } else { out_w };
+
+        // See the `nv_strip_y_pack`/`nv_strip_uv_pack` field docs: only the
+        // region case (a nonzero column offset) needs packing; the
+        // whole-frame case (`region: None`, `region_left == 0`) always reads
+        // whole, buffer-aligned rows and stays zero-copy below.
+        let mut y_pack = std::mem::take(&mut self.nv_strip_y_pack);
+        let mut uv_pack = std::mem::take(&mut self.nv_strip_uv_pack);
+        if region.is_some() {
+            let y_need = STRIP_ROWS.saturating_mul(out_w);
+            if y_pack.len() < y_need {
+                y_pack.resize(y_need, 0);
+            }
+            let uv_need = STRIP_ROWS
+                .div_ceil(chroma_div)
+                .saturating_mul(chroma_row_bytes);
+            if uv_pack.len() < uv_need {
+                uv_pack.resize(uv_need, 0);
+            }
+        }
+
         let mut r0 = 0usize;
         let mut result = Ok(());
-        while r0 < h {
-            let sh = STRIP_ROWS.min(h - r0);
-            let yoff = r0 * y_stride;
-            let uvoff = (r0 / chroma_div) * uv_stride;
+        while r0 < out_h {
+            let sh = STRIP_ROWS.min(out_h - r0);
+            let src_row = region_top + r0;
+
+            // `img_y`/`img_uv` always start at column 0 of their first row
+            // with `stride == width`, so the crate's internal `stride`-sized
+            // chunking never reads past a row it doesn't own — see the
+            // `nv_strip_y_pack` field doc for why the region case can't just
+            // slice `y_plane`/`uv_plane` directly at a column offset.
+            let (img_y, img_y_stride, img_uv, img_uv_stride): (&[u8], u32, &[u8], u32) =
+                if region.is_some() {
+                    let chroma_rows = sh.div_ceil(chroma_div);
+                    for i in 0..sh {
+                        let s_off = (src_row + i) * y_stride + region_left;
+                        y_pack[i * out_w..i * out_w + out_w]
+                            .copy_from_slice(&y_plane[s_off..s_off + out_w]);
+                    }
+                    for j in 0..chroma_rows {
+                        let chroma_row = src_row / chroma_div + j;
+                        let s_off = chroma_row * uv_stride + chroma_x;
+                        uv_pack[j * chroma_row_bytes..j * chroma_row_bytes + chroma_row_bytes]
+                            .copy_from_slice(&uv_plane[s_off..s_off + chroma_row_bytes]);
+                    }
+                    (
+                        &y_pack[..sh * out_w],
+                        out_w as u32,
+                        &uv_pack[..chroma_rows * chroma_row_bytes],
+                        chroma_row_bytes as u32,
+                    )
+                } else {
+                    // `region_left`/`chroma_x` are always 0 here (whole-frame
+                    // case), so this is exactly the original zero-copy read.
+                    let yoff = src_row * y_stride + region_left;
+                    let uvoff = (src_row / chroma_div) * uv_stride + chroma_x;
+                    (
+                        &y_plane[yoff..],
+                        y_stride as u32,
+                        &uv_plane[uvoff..],
+                        uv_stride as u32,
+                    )
+                };
             let img = yuv::YuvBiPlanarImage {
-                y_plane: &y_plane[yoff..],
-                y_stride: y_stride as u32,
-                uv_plane: &uv_plane[uvoff..],
-                uv_stride: uv_stride as u32,
-                width: w as u32,
+                y_plane: img_y,
+                y_stride: img_y_stride,
+                uv_plane: img_uv,
+                uv_stride: img_uv_stride,
+                width: out_w as u32,
                 height: sh as u32,
             };
-            let rgb_stride = (w * 3) as u32;
+            let rgb_stride = (out_w * 3) as u32;
             {
-                let rgb = &mut scratch[..sh * w * 3];
+                let rgb = &mut scratch[..sh * out_w * 3];
                 let decode = match src_fmt {
                     Nv12 => yuv::yuv_nv12_to_rgb(
                         &img,
@@ -1569,21 +1661,23 @@ impl CPUProcessor {
             // The strip's packed RGB is now hot in the scratch; scatter each row
             // into the destination planes at its frame-row offset.
             for i in 0..sh {
-                let s = &scratch[i * w * 3..i * w * 3 + w * 3];
+                let s = &scratch[i * out_w * 3..i * out_w * 3 + out_w * 3];
                 let roff = (r0 + i) * dst_stride;
                 super::simd::deinterleave_row(
                     s,
-                    &mut rp[roff..roff + w],
-                    &mut gp[roff..roff + w],
-                    &mut bp[roff..roff + w],
+                    &mut rp[roff..roff + out_w],
+                    &mut gp[roff..roff + out_w],
+                    &mut bp[roff..roff + out_w],
                     None,
-                    w,
+                    out_w,
                     3,
                 );
             }
             r0 += sh;
         }
         self.nv_strip_scratch = scratch;
+        self.nv_strip_y_pack = y_pack;
+        self.nv_strip_uv_pack = uv_pack;
         result
     }
 

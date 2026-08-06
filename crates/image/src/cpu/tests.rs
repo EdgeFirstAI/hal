@@ -4432,4 +4432,167 @@ mod cpu_tests {
             );
         }
     }
+
+    // ---- Task 3: fused NV→planar source region + scale-identity gate ----
+
+    /// Decode `full` (a whole-frame NV12→PlanarRgb convert, no crop) once and
+    /// slice each colour plane down to `region` by hand. This is the ground
+    /// truth both the new fused-with-region path and the existing general
+    /// crop pipeline must reproduce: the general pipeline also decodes the
+    /// full source into an RGB intermediate before cropping, so both paths
+    /// ultimately sample the same per-pixel decode.
+    fn manual_planar_rgb_crop(full: &TensorDyn, region: Region) -> Vec<u8> {
+        let full_w = full.width().unwrap();
+        let full_h = full.height().unwrap();
+        let full_bytes = full.as_u8().unwrap().map().unwrap().to_vec();
+        let plane_full = full_w * full_h;
+        let plane_dst = region.width * region.height;
+        let mut out = vec![0u8; plane_dst * 3];
+        for p in 0..3 {
+            let src_plane = &full_bytes[p * plane_full..(p + 1) * plane_full];
+            let dst_plane = &mut out[p * plane_dst..(p + 1) * plane_dst];
+            for row in 0..region.height {
+                let s_off = (region.y + row) * full_w + region.x;
+                let d_off = row * region.width;
+                dst_plane[d_off..d_off + region.width]
+                    .copy_from_slice(&src_plane[s_off..s_off + region.width]);
+            }
+        }
+        out
+    }
+
+    /// Full-frame (no-crop) NV12→PlanarRgb convert of `camera720p.nv12` —
+    /// the source both new tests below slice down to a sub-region by hand.
+    fn nv12_720p_to_planar_rgb_full(converter: &mut CPUProcessor) -> (TensorDyn, TensorDyn) {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+        let mut full = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        converter
+            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        (src, full)
+    }
+
+    /// A source crop whose size equals the destination (scale identity) with
+    /// an even (chroma-aligned) origin must take the fused NV→planar strip
+    /// path and produce output identical to decoding the whole frame once
+    /// and manually slicing the same sub-rectangle out of each plane.
+    #[test]
+    fn fused_region_matches_general_path() {
+        let mut converter = CPUProcessor::default();
+        let (src, full) = nv12_720p_to_planar_rgb_full(&mut converter);
+        let region = Region::new(256, 128, 640, 360); // scale identity, even origin
+        let reference = manual_planar_rgb_crop(&full, region);
+
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(region));
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            actual, reference,
+            "fused NV12->PlanarRgb region convert must match the full-decode \
+             + manual plane crop reference byte-for-byte"
+        );
+    }
+
+    /// The same scale-identity, chroma-aligned crop as above must actually
+    /// take the fused path — asserted via the test-only `fused_hits` counter
+    /// rather than by timing, so the path selection itself is under test.
+    #[test]
+    fn scale_identity_crop_takes_fused_path() {
+        let mut converter = CPUProcessor::default();
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(Region::new(256, 128, 640, 360)));
+
+        let before = converter.fused_hits();
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            converter.fused_hits(),
+            before + 1,
+            "scale-identity, chroma-aligned crop must take the fused NV->planar path"
+        );
+    }
+
+    /// An odd-origin NV12 crop (odd left AND top) fails the NV12 chroma-
+    /// alignment gate and must fall through to the general path — never
+    /// snapped to the nearest even origin, never shifted. The output must
+    /// still be correct.
+    #[test]
+    fn odd_origin_nv12_crop_falls_through() {
+        let mut converter = CPUProcessor::default();
+        let (src, full) = nv12_720p_to_planar_rgb_full(&mut converter);
+        let region = Region::new(257, 129, 640, 360); // odd left AND top
+        let reference = manual_planar_rgb_crop(&full, region);
+
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(region));
+
+        let before = converter.fused_hits();
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            converter.fused_hits(),
+            before,
+            "odd-origin NV12 crop must never take the fused path (chroma \
+             alignment requires even left/top) — never snap, never shift"
+        );
+
+        let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            actual, reference,
+            "general-path output for the odd-origin crop must still be correct"
+        );
+    }
 }
