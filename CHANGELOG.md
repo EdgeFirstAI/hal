@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Byte-identical to the prior full-frame behaviour on all existing NV-family
   golden outputs; see `tiled_convert_benchmark` above for the resulting
   proportionality.
+- **`Tensor::from_fd()` now identifies both buffer types positively**
+  (TOP2-833). An fd that is neither a DMA-BUF nor tmpfs/shm is rejected with
+  the new `Error::UnknownBufferType(magic)` instead of being assumed to be
+  shared memory. Previously any unrecognized fd fell through to the SHM
+  branch, which could succeed nonsensically — a pipe fd imported as a
+  zero-length tensor rather than erroring. Callers importing fds backed by
+  other filesystems (e.g. a regular file, or a `MFD_HUGETLB` memfd) will now
+  see an error where they previously got a tensor.
 
 ### Fixed
 
@@ -47,6 +55,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stride) instead of writing as if the view were the whole buffer, so
   resizing into a sub-rectangle of a larger padded tensor no longer
   corrupts neighboring rows.
+- **DMA-BUF fds imported as shared memory, silently forfeiting zero-copy**
+  (TOP2-833). `Tensor::from_fd()` classified an incoming fd by the *minor*
+  number of its `st_dev`, treating a hardcoded `9 | 10` as "this is a
+  DMA-BUF". Those minors come from `get_anon_bdev()`, an IDA shared by every
+  anonymous pseudo-filesystem (pipefs, sockfs, nsfs, bdev, tracefs, ...),
+  first-come-first-served during boot — so the value a DMA-BUF lands on
+  depends on kernel config, driver load order, initramfs use, and kernel
+  version. It is not part of any ABI. A genuine DMA-BUF is minor 12 on x86
+  desktop and minor 8 on the ADIS Verdin; both missed `9 | 10` and were
+  imported as `ShmTensor`. Because a DMA-BUF is mmap-able, the wrong branch
+  produced a working-but-not-DMA tensor, which surfaced downstream as
+  `ImageProcessor::import_image` rejecting the buffer with "requires
+  DMA-backed fd, got Shm". Classification is now by filesystem magic
+  (`DMA_BUF_MAGIC` / `TMPFS_MAGIC` from `include/uapi/linux/magic.h`), which
+  is stable UAPI.
 
 ## [0.27.1] - 2026-08-01
 

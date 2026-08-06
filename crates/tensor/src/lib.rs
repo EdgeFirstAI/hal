@@ -1265,6 +1265,20 @@ impl Default for BufferIdentity {
 #[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
 
+/// Filesystem magic of the internal `dma_buf` mount, from
+/// `include/uapi/linux/magic.h` (`DMA_BUF_MAGIC`, "DMAB").
+///
+/// This is stable UAPI and is the only reliable way to recognize a DMA-BUF
+/// fd — see [`TensorStorage::from_fd`] for why `st_dev` cannot be used.
+#[cfg(target_os = "linux")]
+const DMA_BUF_MAGIC: i64 = 0x444d_4142;
+
+/// Filesystem magic of tmpfs, from `include/uapi/linux/magic.h`
+/// (`TMPFS_MAGIC`). Covers both POSIX `shm_open` segments under `/dev/shm`
+/// and anonymous `memfd_create` files.
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+
 pub trait TensorTrait<T>: Send + Sync
 where
     T: Num + Clone + fmt::Debug,
@@ -1276,11 +1290,80 @@ where
         Self: Sized;
 
     #[cfg(unix)]
-    /// Create a new tensor using the given file descriptor, shape, and optional
-    /// name. If no name is given, a random name will be generated.
+    /// Import an existing buffer as a tensor, taking ownership of its file
+    /// descriptor. The buffer is adopted in place — no bytes are copied.
     ///
-    /// On Linux: Inspects the fd to determine DMA vs SHM based on device major/minor.
-    /// On other Unix (macOS): Always creates SHM tensor.
+    /// The backend is **detected**, not chosen: the fd already belongs to a
+    /// buffer type, and this call's job is to recognize which. On Linux that
+    /// is decided by the fd's filesystem magic, which is stable UAPI
+    /// (`include/uapi/linux/magic.h`):
+    ///
+    /// | Filesystem | Magic | Resulting [`TensorMemory`] |
+    /// |------------|-------|----------------------------|
+    /// | `dma_buf` | `DMA_BUF_MAGIC` (`0x444d4142`) | [`TensorMemory::Dma`] |
+    /// | `tmpfs` (`/dev/shm` **and** `memfd`) | `TMPFS_MAGIC` (`0x01021994`) | [`TensorMemory::Shm`] |
+    /// | anything else | — | *rejected* — see Errors |
+    ///
+    /// Both supported types are identified **positively**. An unrecognized
+    /// filesystem is an error, never a fallback to shared memory: the wrong
+    /// branch does not fail loudly (a DMA-BUF is mmap-able, so it would
+    /// import as a perfectly functional tensor that merely isn't DMA, and a
+    /// pipe would import as a zero-length one), so guessing would trade a
+    /// clear error here for silent loss of zero-copy far downstream.
+    ///
+    /// The device number is deliberately **not** consulted. `dma_buf` files
+    /// live on an internal kernel mount whose `st_dev` comes from
+    /// `get_anon_bdev()` — an IDA shared with every other anonymous
+    /// pseudo-filesystem and allocated in boot order — so the minor a
+    /// DMA-BUF lands on varies by kernel build and is not part of any ABI.
+    ///
+    /// On non-Linux Unix (macOS/iOS/Android) there is no fd-based DMA import;
+    /// the fd is always adopted as [`TensorMemory::Shm`].
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Owned descriptor for the buffer to import. Ownership
+    ///   transfers to the returned tensor and the fd is closed on drop; pass
+    ///   [`clone_fd`](TensorTrait::clone_fd) output to keep your own handle.
+    /// * `shape` - Logical shape to interpret the buffer with. Must describe
+    ///   no more elements than the buffer holds.
+    /// * `name` - Optional name; a random one is generated when `None`.
+    ///
+    /// # Returns
+    ///
+    /// A tensor sharing the imported buffer's memory, whose
+    /// [`memory()`](TensorTrait::memory) reports the detected backend.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::UnknownBufferType`] - the fd is on a filesystem that is
+    ///   neither `dma_buf` nor `tmpfs`, so its buffer type cannot be
+    ///   determined. Carries the observed `fstatfs` magic for diagnosis.
+    ///   Typical causes: a regular file, a pipe or socket, or a
+    ///   `MFD_HUGETLB` memfd (hugetlbfs, not tmpfs). Linux only.
+    /// * [`Error::UnknownDeviceType`] - the fd's `st_dev` major is non-zero,
+    ///   i.e. it lives on a real block device rather than an anonymous or
+    ///   in-memory filesystem. Linux only.
+    /// * [`Error::InvalidSize`] - `shape` is empty or describes zero
+    ///   elements.
+    /// * [`Error::NixError`] - `fstat`, `fstatfs`, or `mmap` failed on the
+    ///   descriptor.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait};
+    ///
+    /// # fn main() -> edgefirst_tensor::Result<()> {
+    /// let src = Tensor::<u8>::new(&[480, 640, 3], Some(TensorMemory::Dma), None)?;
+    ///
+    /// // Round-tripping a DMA-BUF fd preserves the backend — the import is
+    /// // still zero-copy, and still eligible for GPU/NPU paths.
+    /// let imported = Tensor::<u8>::from_fd(src.clone_fd()?, src.shape(), None)?;
+    /// assert_eq!(imported.memory(), TensorMemory::Dma);
+    /// # Ok(())
+    /// # }
+    /// ```
     fn from_fd(fd: std::os::fd::OwnedFd, shape: &[usize], name: Option<&str>) -> Result<Self>
     where
         Self: Sized;
@@ -1757,27 +1840,50 @@ where
         #[cfg(target_os = "linux")]
         {
             use nix::sys::stat::fstat;
+            use nix::sys::statfs::fstatfs;
 
             let stat = fstat(&fd)?;
             let major = major(stat.st_dev);
             let minor = minor(stat.st_dev);
-
-            log::debug!("Creating tensor from fd: major={major}, minor={minor}");
 
             if major != 0 {
                 // Dma and Shm tensors are expected to have major number 0
                 return Err(Error::UnknownDeviceType(major, minor));
             }
 
-            match minor {
-                9 | 10 => {
-                    // minor number 9 & 10 indicates DMA memory
-                    DmaTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Dma)
-                }
-                _ => {
-                    // other minor numbers are assumed to be shared memory
-                    ShmTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Shm)
-                }
+            // Classify by filesystem magic, never by the st_dev minor.
+            //
+            // dma_buf files live on an internal kernel mount (`dma_buf_mnt`,
+            // created with `kern_mount`) whose superblock draws its device
+            // number from `get_anon_bdev()` — an IDA allocated first-come,
+            // first-served during boot, shared with every other anonymous
+            // pseudo-filesystem (pipefs, sockfs, anon_inodefs, nsfs, bdev,
+            // tracefs, ...). The minor a DMA-BUF lands on is therefore a
+            // function of which pseudo-filesystems registered first on that
+            // kernel build: it moves with kernel config, driver load order,
+            // initramfs use, and kernel version. It is not part of any ABI.
+            //
+            // Observed values for a genuine DMA-BUF: 12 on x86 desktop, 8 on
+            // the ADIS Verdin. An earlier revision hardcoded `9 | 10` here,
+            // which silently imported real DMA-BUFs as shared memory
+            // everywhere else.
+            //
+            // The filesystem magic, by contrast, is stable UAPI
+            // (include/uapi/linux/magic.h). Both branches are identified
+            // positively; anything else is genuinely unknown and is rejected
+            // rather than guessed at. Falling back to SHM would "work" — a
+            // DMA-BUF is mmap-able, and even a pipe imports as a zero-length
+            // tensor — which is exactly why it must not be the default.
+            let magic = fstatfs(&fd)?.filesystem_type().0 as i64;
+
+            log::debug!(
+                "Creating tensor from fd: major={major}, minor={minor}, magic={magic:#010x}"
+            );
+
+            match magic {
+                DMA_BUF_MAGIC => DmaTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Dma),
+                TMPFS_MAGIC => ShmTensor::<T>::from_fd(fd, shape, name).map(TensorStorage::Shm),
+                other => Err(Error::UnknownBufferType(other)),
             }
         }
         #[cfg(all(unix, not(target_os = "linux")))]
@@ -5985,6 +6091,11 @@ mod tests {
         for _ in 0..100 {
             let tensor =
                 Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
+            assert_eq!(
+                tensor.memory(),
+                TensorMemory::Dma,
+                "DMA-BUF fd must import as Dma, not be silently downgraded"
+            );
             let mut map = tensor.map().unwrap();
             map.as_mut_slice().fill(233);
         }
@@ -5997,6 +6108,87 @@ mod tests {
             "File descriptor leak detected: {} -> {}",
             start_open_fds, end_open_fds
         );
+    }
+
+    /// A DMA-BUF fd must import as [`TensorMemory::Dma`].
+    ///
+    /// Regression test for the `st_dev` minor-number classifier, which
+    /// hardcoded `9 | 10` as "this is DMA". Those minors come from
+    /// `get_anon_bdev()` and are assigned first-come-first-served at boot,
+    /// so they vary by kernel build and boot order — a real DMA-BUF is
+    /// minor 12 on x86 desktop and minor 8 on the ADIS Verdin. Both fell
+    /// into the `_` arm and imported as SHM, which "works" (a DMA-BUF is
+    /// mmap-able) but silently forfeits zero-copy.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_fd_dma_imports_as_dma() {
+        let _lock = FD_LOCK.read().unwrap();
+        if !is_dma_available() {
+            log::warn!("SKIPPED: {} - DMA memory not available", function!());
+            return;
+        }
+
+        let orig = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::Dma), None).unwrap();
+        assert_eq!(orig.memory(), TensorMemory::Dma);
+
+        let imported = Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
+
+        assert_eq!(
+            imported.memory(),
+            TensorMemory::Dma,
+            "a DMA-BUF fd must import as Dma"
+        );
+    }
+
+    /// A tmpfs/SHM fd must import as [`TensorMemory::Shm`].
+    ///
+    /// The companion to `test_from_fd_dma_imports_as_dma`: confirms the
+    /// magic-based classifier identifies SHM positively rather than by
+    /// falling through.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_fd_shm_imports_as_shm() {
+        let _lock = FD_LOCK.read().unwrap();
+        if !is_shm_available() {
+            log::warn!("SKIPPED: {} - SHM memory not available", function!());
+            return;
+        }
+
+        let orig = Tensor::<u8>::new(&[64, 64], Some(TensorMemory::Shm), None).unwrap();
+        assert_eq!(orig.memory(), TensorMemory::Shm);
+
+        let imported = Tensor::<u8>::from_fd(orig.clone_fd().unwrap(), orig.shape(), None).unwrap();
+
+        assert_eq!(
+            imported.memory(),
+            TensorMemory::Shm,
+            "a tmpfs fd must import as Shm"
+        );
+    }
+
+    /// An fd that is neither a DMA-BUF nor tmpfs must be rejected.
+    ///
+    /// A pipe is the convenient probe: it lives on `pipefs`, another
+    /// `get_anon_bdev()` pseudo-filesystem, so it shares major 0 with the
+    /// buffer types we do support and is only distinguishable by magic.
+    /// Importing one as SHM is meaningless — `mmap` on a pipe fails — so
+    /// the classifier must say "unknown" rather than guess.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_from_fd_rejects_unknown_filesystem() {
+        let _lock = FD_LOCK.read().unwrap();
+
+        let (read_end, _write_end) = nix::unistd::pipe().unwrap();
+
+        let result = Tensor::<u8>::from_fd(read_end, &[64], None);
+
+        match result {
+            Err(Error::UnknownBufferType(magic)) => {
+                // PIPEFS_MAGIC, from include/uapi/linux/magic.h
+                assert_eq!(magic, 0x5049_5045, "expected PIPEFS_MAGIC");
+            }
+            other => panic!("expected UnknownBufferType for a pipe fd, got {other:?}"),
+        }
     }
 
     #[test]

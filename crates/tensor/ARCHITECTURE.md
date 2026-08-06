@@ -158,6 +158,45 @@ The fallback chain is **DMA → SHM → Heap**. `EDGEFIRST_TENSOR_FORCE_MEM=1`
 short-circuits the chain to `MemTensor`, primarily for unit tests on hosts
 without DMA-heap permissions.
 
+### Import classification (`from_fd`, Linux)
+
+`Tensor::from_fd()` is the mirror of the selection logic above: rather than
+choosing a backend, it must *recognize* which backend a foreign fd already
+belongs to. On Linux this is decided by **filesystem magic**, never by the
+device number.
+
+| `fstatfs` `f_type` | Constant | Backend |
+|--------------------|----------|---------|
+| `0x444d4142` | `DMA_BUF_MAGIC` | `DmaTensor` |
+| `0x01021994` | `TMPFS_MAGIC` | `ShmTensor` (both `/dev/shm` and `memfd`) |
+| anything else | — | `Error::UnknownBufferType(magic)` |
+
+**Do not classify on `st_dev`.** `dma_buf` files do not live on a real
+filesystem; they live on an internal kernel mount (`dma_buf_mnt`, created
+with `kern_mount`) whose superblock takes its device number from
+`get_anon_bdev()`. That allocator is an IDA shared by *every* anonymous
+pseudo-filesystem — pipefs, sockfs, anon_inodefs, nsfs, bdev, tracefs —
+handed out first-come-first-served during boot. The minor a DMA-BUF ends up
+with is therefore an artifact of which pseudo-filesystems registered first
+on that kernel build, and moves with kernel config, driver load order,
+initramfs use, and kernel version. Nothing in the kernel documents it and it
+is not part of any ABI. Measured values for a genuine DMA-BUF: **12** on x86
+desktop, **8** on the ADIS Verdin. The kernel exports `DMA_BUF_MAGIC` for
+exactly this purpose and exports nothing at all for the minor.
+
+Both branches are identified **positively**, and an unrecognized filesystem
+is an error rather than an assumption. This matters because the wrong branch
+does not fail loudly: a DMA-BUF is mmap-able, so importing one as SHM yields
+a perfectly functional tensor that merely isn't DMA — the loss only surfaces
+much later, as `ImageProcessor::import_image` refusing a non-DMA plane. A
+pipe fd is worse still, importing as a zero-length tensor. Guessing is the
+failure mode; `UnknownBufferType` is the fix.
+
+The portable alternative probe would be `dmabuf::phys()`
+(`DMA_BUF_IOCTL_PHYS`), but that is an NXP vendor ioctl and fails on
+mainline kernels. `fstatfs` is the portable answer and costs one syscall
+with no side effects.
+
 ### CPU access declaration (CpuAccess)
 
 There is no usage/role enum. The allocation model assumes what is true for

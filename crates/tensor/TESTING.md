@@ -50,6 +50,29 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
   DMA tests are skipped at runtime and the suite falls back to heap-only
   coverage; nothing fails outright. Set `EDGEFIRST_TENSOR_FORCE_MEM=1` to
   skip even the probe.
+
+  **A green run therefore says nothing about the DMA paths.** This is how the
+  `from_fd` minor-number misclassification reached a release: the only test
+  covering the import path skipped on every unprivileged host, and asserted
+  fd counts rather than the backend it got back. When touching DMA import or
+  allocation, confirm the tests actually ran — build unprivileged and run the
+  binary under `sudo` if the heap device is root-only:
+
+  ```bash
+  cargo test -p edgefirst-tensor --lib --no-run     # build as your user
+  sudo ./target/debug/deps/edgefirst_tensor-<hash> --test-threads=1
+  ```
+- **Import classification tests** (`test_from_fd_dma_imports_as_dma`,
+  `test_from_fd_shm_imports_as_shm`,
+  `test_from_fd_rejects_unknown_filesystem`) pin the `from_fd` contract:
+  a DMA-BUF fd must come back as `TensorMemory::Dma`, a tmpfs fd as
+  `Shm`, and anything else must be rejected with `UnknownBufferType`
+  rather than assumed to be shared memory. The unknown case uses a pipe —
+  `pipefs` is another `get_anon_bdev()` pseudo-filesystem, so it shares
+  major 0 with the buffer types we do support and is distinguishable only
+  by magic. Assert on `memory()`, never merely on "the import succeeded":
+  the wrong branch mmaps fine and looks healthy (a pipe even imports as a
+  zero-length tensor). See ARCHITECTURE.md § Import classification.
 - **PBO tests** live in
   [`crates/tensor/src/pbo.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/pbo.rs)
   and exercise `PboTensor` against a mock `PboOps` implementation. They

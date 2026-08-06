@@ -508,7 +508,32 @@ impl TensorDyn {
         }
     }
 
-    /// Create a type-erased tensor from a file descriptor.
+    /// Import an existing buffer as a type-erased tensor, taking ownership
+    /// of its file descriptor. No bytes are copied.
+    ///
+    /// Dispatches to [`Tensor::from_fd`](crate::TensorTrait::from_fd) for
+    /// `dtype` and inherits its contract in full: on Linux the backend is
+    /// detected from the fd's filesystem magic — `DMA_BUF_MAGIC` imports as
+    /// [`TensorMemory::Dma`](crate::TensorMemory::Dma), `TMPFS_MAGIC` (both
+    /// `/dev/shm` and `memfd`) as [`TensorMemory::Shm`](crate::TensorMemory::Shm)
+    /// — and any other filesystem is rejected rather than assumed to be
+    /// shared memory. On non-Linux Unix the fd is always adopted as SHM.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::UnknownBufferType`](crate::Error::UnknownBufferType) - the
+    ///   fd is neither a DMA-BUF nor tmpfs-backed; carries the observed
+    ///   `fstatfs` magic. Linux only.
+    /// * [`Error::UnknownDeviceType`](crate::Error::UnknownDeviceType) - the
+    ///   fd lives on a real block device. Linux only.
+    /// * [`Error::InvalidSize`](crate::Error::InvalidSize) - `shape` is empty
+    ///   or describes zero elements.
+    /// * [`Error::NixError`](crate::Error::NixError) - a syscall on the
+    ///   descriptor failed.
+    ///
+    /// Callers that require zero-copy must check
+    /// [`memory()`](crate::TensorDyn::memory) on the result rather than
+    /// treating a successful import as proof of DMA backing.
     #[cfg(unix)]
     pub fn from_fd(
         fd: std::os::fd::OwnedFd,
