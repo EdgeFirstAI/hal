@@ -4720,6 +4720,10 @@ mod cpu_tests {
     /// differ. This lives here rather than in `tests/crop_golden.rs` because it
     /// also asserts the shrink actually happened, via the crate-private
     /// `last_tmp_dims`, which an integration test cannot reach.
+    ///
+    /// Run for both resize algorithms: the golden matrix only ever builds a
+    /// `default()` (bilinear) processor, so `new_nearest()` — the one algorithm
+    /// with a genuinely zero filter reach — has no other coverage here.
     #[test]
     fn crop_edge_matches_full_frame_intermediate() {
         const SRC_W: usize = 640;
@@ -4727,61 +4731,156 @@ mod cpu_tests {
         const CW: usize = 128;
         const CH: usize = 96;
 
-        for src_fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
-            let mut converter = CPUProcessor::default();
-            let src = gradient_image(SRC_W, SRC_H, src_fmt);
+        for alg in ["bilinear", "nearest"] {
+            for src_fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+                let mut converter = match alg {
+                    "nearest" => CPUProcessor::new_nearest(),
+                    _ => CPUProcessor::default(),
+                };
+                let src = gradient_image(SRC_W, SRC_H, src_fmt);
 
-            // The pre-Task-4 intermediate: the whole frame, converted once.
-            let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
-            converter
-                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
-                .unwrap();
+                // The pre-Task-4 intermediate: the whole frame, converted once.
+                let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
+                converter
+                    .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                    .unwrap();
 
-            let origins = [
-                (0, 0),                   // top-left corner
-                (SRC_W - CW, 0),          // top-right, flush right
-                (0, SRC_H - CH),          // bottom-left, flush bottom
-                (SRC_W - CW, SRC_H - CH), // bottom-right, flush both
-                (101, 53),                // interior, odd on both axes
-            ];
-            for (left, top) in origins {
-                for (dst_w, dst_h) in [(CW, CH), (CW / 2, CH / 2)] {
-                    let crop = Crop::new()
-                        .with_source(Some(Region::new(left, top, CW, CH)))
-                        .with_fit(crate::Fit::Stretch);
+                let origins = [
+                    (0, 0),                   // top-left corner
+                    (SRC_W - CW, 0),          // top-right, flush right
+                    (0, SRC_H - CH),          // bottom-left, flush bottom
+                    (SRC_W - CW, SRC_H - CH), // bottom-right, flush both
+                    (101, 53),                // interior, odd on both axes
+                ];
+                for (left, top) in origins {
+                    for (dst_w, dst_h) in [(CW, CH), (CW / 2, CH / 2)] {
+                        let crop = Crop::new()
+                            .with_source(Some(Region::new(left, top, CW, CH)))
+                            .with_fit(crate::Fit::Stretch);
 
-                    let mut actual = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
-                    converter
-                        .convert(&src, &mut actual, Rotation::None, Flip::None, crop)
-                        .unwrap();
-                    let dims = converter.last_tmp_dims();
+                        let mut actual = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                        converter
+                            .convert(&src, &mut actual, Rotation::None, Flip::None, crop)
+                            .unwrap();
+                        let dims = converter.last_tmp_dims();
 
-                    let mut expect = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
-                    converter
-                        .convert(&full, &mut expect, Rotation::None, Flip::None, crop)
-                        .unwrap();
+                        let mut expect = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                        converter
+                            .convert(&full, &mut expect, Rotation::None, Flip::None, crop)
+                            .unwrap();
 
-                    let case =
-                        format!("{src_fmt:?} crop=({left},{top},{CW},{CH}) dst={dst_w}x{dst_h}");
-                    assert_eq!(
-                        actual.as_u8().unwrap().map().unwrap().to_vec(),
-                        expect.as_u8().unwrap().map().unwrap().to_vec(),
-                        "crop-sized intermediate changed output bytes for {case}"
-                    );
+                        let case = format!(
+                            "{alg} {src_fmt:?} crop=({left},{top},{CW},{CH}) dst={dst_w}x{dst_h}"
+                        );
+                        assert_eq!(
+                            actual.as_u8().unwrap().map().unwrap().to_vec(),
+                            expect.as_u8().unwrap().map().unwrap().to_vec(),
+                            "crop-sized intermediate changed output bytes for {case}"
+                        );
 
-                    // ...and the intermediate really did shrink to the crop.
-                    let (tw, th) = dims
-                        .unwrap_or_else(|| panic!("{case}: expected a pre-resize intermediate"));
-                    assert!(
-                        tw < SRC_W && th < SRC_H,
-                        "{case}: intermediate {tw}x{th} did not shrink below the frame"
-                    );
-                    assert!(
-                        tw >= CW && th >= CH,
-                        "{case}: intermediate {tw}x{th} is smaller than the crop"
-                    );
+                        // ...and the intermediate really did shrink to the crop.
+                        let (tw, th) = dims.unwrap_or_else(|| {
+                            panic!("{case}: expected a pre-resize intermediate")
+                        });
+                        assert!(
+                            tw < SRC_W && th < SRC_H,
+                            "{case}: intermediate {tw}x{th} did not shrink below the frame"
+                        );
+                        assert!(
+                            tw >= CW && th >= CH,
+                            "{case}: intermediate {tw}x{th} is smaller than the crop"
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// `Nearest` is the one algorithm whose filter reach is genuinely zero, so
+    /// without a halo *floor* an already-chroma-aligned crop grows by nothing:
+    /// the rebased source rect becomes the whole intermediate, `needs_resize`
+    /// in `resize_flip_rotate_pf` flips to false for the first time on this
+    /// shape, and control reaches `flip_rotate_ndarray_pf`, which assumes
+    /// tightly-packed destination rows and so bypasses the padded-destination
+    /// destride entirely.
+    ///
+    /// Scale-identity crop into a 320x240 view of a parent with a padded row
+    /// stride, checked against both a standalone tight convert and the
+    /// pre-change full-frame-intermediate oracle.
+    #[test]
+    fn nearest_scale_identity_crop_into_padded_view() {
+        const SRC_W: usize = 640;
+        const SRC_H: usize = 480;
+        let tile_w = 320usize;
+        let tile_h = 240usize;
+        let channels = 3usize; // PixelFormat::Rgb
+
+        let src = gradient_image(SRC_W, SRC_H, PixelFormat::Nv12);
+        // Even origin on both axes: already chroma-aligned, so the even-snap
+        // grows nothing and only the halo floor can separate the rebased rect
+        // from the full intermediate.
+        let crop = Crop::new()
+            .with_source(Some(Region::new(100, 52, tile_w, tile_h)))
+            .with_fit(crate::Fit::Stretch);
+
+        let mut converter = CPUProcessor::new_nearest();
+
+        // Reference A: standalone, tightly-packed destination.
+        let mut reference = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
+        converter
+            .convert(&src, &mut reference, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Reference B: the pre-Task-4 algorithm — whole frame converted once
+        // into the packed-RGB intermediate, then the same crop applied to it.
+        let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
+        converter
+            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        let mut oracle = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
+        converter
+            .convert(&full, &mut oracle, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            reference_bytes,
+            oracle.as_u8().unwrap().map().unwrap().to_vec(),
+            "Nearest crop-sized intermediate diverged from the full-frame oracle"
+        );
+
+        // Padded parent: allocate wider, narrow the logical width back, then
+        // record a row stride padded past the tight pitch — the shape a DMA
+        // pitch-aligned destination presents.
+        let mut parent = TensorDyn::image(
+            tile_w + 64,
+            2 * tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        parent
+            .configure_image(tile_w, 2 * tile_h, PixelFormat::Rgb)
+            .unwrap();
+        let padded_stride = tile_w * channels + 16;
+        parent.set_row_stride(padded_stride).unwrap();
+
+        let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
+        converter
+            .convert(&src, &mut view, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let band_offset = tile_h * padded_stride;
+        let tight_row = tile_w * channels;
+        for row in 0..tile_h {
+            let start = band_offset + row * padded_stride;
+            assert_eq!(
+                &parent_bytes[start..start + tight_row],
+                &reference_bytes[row * tight_row..(row + 1) * tight_row],
+                "row {row} of the padded destination view must match the standalone convert"
+            );
         }
     }
 

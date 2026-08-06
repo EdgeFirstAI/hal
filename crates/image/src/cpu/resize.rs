@@ -81,11 +81,38 @@ impl CPUProcessor {
     /// 2, `Gaussian`/`Lanczos3` 3) — read from `self.options.algorithm`, never
     /// assumed by the caller.
     ///
+    /// The result is never zero — see `HALO_SLACK` below, which is load-bearing
+    /// and not just slack.
+    ///
     /// Returns `None` when the reach is not modelled (`SuperSampling`, or a
     /// filter/algorithm added by a future upstream release), so the caller
     /// keeps the full-frame intermediate and its unchanged output.
     pub(super) fn filter_halo(&self, src_extent: usize, dst_extent: usize) -> Option<usize> {
         use fast_image_resize::{FilterType, ResizeAlg};
+
+        /// One spare pixel added to *every* modelled reach, so the halo is
+        /// never zero. It earns its place twice over.
+        ///
+        /// 1. Slack. Growing the extracted rect *beyond* the filter's true
+        ///    reach cannot change any output pixel — the extra columns/rows are
+        ///    simply never sampled — so a spare pixel costs a few bytes and
+        ///    buys immunity to f64 rounding and to small kernel changes in an
+        ///    upstream release.
+        /// 2. **It keeps `needs_resize` true.** With a zero halo an already
+        ///    chroma-aligned crop grows by nothing, so the rebased source rect
+        ///    becomes the *whole* intermediate and `needs_resize` in
+        ///    [`Self::resize_flip_rotate_pf`] flips to false — handing control
+        ///    to `flip_rotate_ndarray_pf`, which assumes tightly-packed
+        ///    destination rows and so bypasses the padded-destination destride.
+        ///    A crop that is not the whole frame must stay on the resize path
+        ///    it took before this optimisation existed. A nonzero halo
+        ///    guarantees that: the grown rect can only equal the crop when the
+        ///    crop is clamped on all four sides, i.e. when it *is* the whole
+        ///    frame — which the caller has already rejected.
+        ///
+        /// Only `Nearest` has a genuinely zero filter reach, so before this was
+        /// applied uniformly it was the only algorithm that could reach 0.
+        const HALO_SLACK: usize = 1;
 
         fn support(filter: FilterType) -> Option<f64> {
             Some(match filter {
@@ -99,14 +126,15 @@ impl CPUProcessor {
         }
 
         let (support, adaptive_kernel) = match self.options.algorithm {
-            // Nearest picks one source pixel inside the crop — no halo at all.
-            ResizeAlg::Nearest => return Some(0),
+            // Nearest samples exactly one source pixel per output pixel, always
+            // inside the crop: zero reach, plus HALO_SLACK below.
+            ResizeAlg::Nearest => (0.0, false),
             ResizeAlg::Convolution(f) => (support(f)?, true),
             ResizeAlg::Interpolation(f) => (support(f)?, false),
             _ => return None,
         };
         if src_extent == 0 || dst_extent == 0 {
-            return Some(0);
+            return Some(HALO_SLACK);
         }
 
         let scale = src_extent as f64 / dst_extent as f64;
@@ -115,12 +143,7 @@ impl CPUProcessor {
         if !reach.is_finite() {
             return None;
         }
-        // One pixel of slack on top of the modelled reach. Growing the
-        // extracted rect *beyond* the filter's true reach cannot change any
-        // output pixel — the extra columns/rows are simply never sampled — so
-        // the slack costs a few bytes and buys immunity to f64 rounding and to
-        // small kernel changes in an upstream release.
-        Some(reach.max(0.0) as usize + 1)
+        Some(reach.max(0.0) as usize + HALO_SLACK)
     }
 
     /// Resize/flip/rotate with explicit PixelFormat (used by convert_u8).
