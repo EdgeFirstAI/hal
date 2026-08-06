@@ -4683,6 +4683,100 @@ mod cpu_tests {
         }
     }
 
+    /// `region.left == 0` crops exercise the fused path's zero-copy arm (no
+    /// y/uv row packing — the read slices the parent planes at a row
+    /// boundary) and its one mandatory exception. Cases:
+    ///
+    /// - NV12 flush-bottom, even height: zero-copy; the region's last
+    ///   luma/chroma rows are the planes' last rows, so any stride-chunking
+    ///   past a row's true end (the bug the packing arm exists to avoid for
+    ///   column-shifted crops) would read out of bounds or drop rows here.
+    /// - NV12 odd width AND odd height, not flush-bottom: MUST fall back to
+    ///   the packing arm — the `yuv` crate's 4:2:0 odd-last-row handling
+    ///   (`chunks_exact(..).remainder()` / `.last()`) is only correct on a
+    ///   slice of exactly `height` rows, which a row-aligned slice running
+    ///   to the plane end is not. Without the fallback this case panics
+    ///   inside the crate ("range end index 641 out of range").
+    /// - NV16 odd width/height: zero-copy is safe at any height (4:2:2 has
+    ///   no vertical subsampling and no remainder path).
+    ///
+    /// All must stay fused and byte-exact against the full-decode + manual
+    /// plane crop oracle.
+    #[test]
+    fn left_edge_crop_zero_copy_arm_is_fused_and_correct() {
+        for (src_fmt, asset, region, label) in [
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
+                Region::new(0, 80, 640, 640),
+                "nv12 flush-bottom",
+            ),
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
+                Region::new(0, 0, 641, 361),
+                "nv12 odd-width odd-height",
+            ),
+            (
+                PixelFormat::Nv16,
+                "camera720p.nv16",
+                Region::new(0, 0, 641, 361),
+                "nv16 odd-width odd-height",
+            ),
+        ] {
+            let mut converter = CPUProcessor::default();
+            let src = load_bytes_to_tensor(
+                1280,
+                720,
+                src_fmt,
+                None,
+                &edgefirst_bench::testdata::read(asset),
+            )
+            .unwrap();
+            let mut full = TensorDyn::image(
+                1280,
+                720,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            converter
+                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            let reference = manual_planar_rgb_crop(&full, region);
+
+            let mut cropped = TensorDyn::image(
+                region.width,
+                region.height,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let crop = Crop::new().with_source(Some(region));
+
+            let before = converter.fused_hits();
+            converter
+                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| panic!("left-edge {label} crop must not error: {e}"));
+            assert_eq!(
+                converter.fused_hits(),
+                before + 1,
+                "left-edge {label} crop must take the fused path"
+            );
+
+            let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+            assert_eq!(
+                actual, reference,
+                "left-edge {label} zero-copy region output must match the \
+                 full-decode + manual plane crop reference"
+            );
+        }
+    }
+
     /// Build a `w`x`h` tensor in `fmt` whose every mapped byte follows a
     /// deterministic gradient, so neighbouring pixels differ and any misplaced
     /// filter tap shows up as a byte difference.

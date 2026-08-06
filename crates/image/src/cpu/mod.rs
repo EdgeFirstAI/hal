@@ -93,10 +93,12 @@ pub struct CPUProcessor {
     /// `left`) reads past the *source* buffer's true end for the region's
     /// last row when that row is also the source's last row (the unused
     /// chunk tail has no next row to alias into there). Packing each row
-    /// into a `stride == width` buffer first sidesteps that read
-    /// unconditionally. Unused (and zero-cost) for the whole-frame
-    /// (`region: None`) case, which stays fully zero-copy. Grown on demand;
-    /// never shrunk.
+    /// into a `stride == width` buffer first sidesteps that read. Unused
+    /// (and zero-cost) for any row-aligned read (`region.left == 0`,
+    /// including the whole-frame `region: None` case): with no column
+    /// shift, every row chunk the crate sees is a real, fully-owned source
+    /// row, so those reads stay fully zero-copy. Grown on demand; never
+    /// shrunk.
     nv_strip_y_pack: Vec<u8>,
     /// Same as [`Self::nv_strip_y_pack`], for the chroma (UV) rows.
     nv_strip_uv_pack: Vec<u8>,

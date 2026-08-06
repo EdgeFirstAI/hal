@@ -1709,13 +1709,29 @@ impl CPUProcessor {
             out_w.div_ceil(2) * 2
         };
 
-        // See the `nv_strip_y_pack`/`nv_strip_uv_pack` field docs: only the
-        // region case (a nonzero column offset) needs packing; the
-        // whole-frame case (`region: None`, `region_left == 0`) always reads
-        // whole, buffer-aligned rows and stays zero-copy below.
+        // See the `nv_strip_y_pack`/`nv_strip_uv_pack` field docs: a nonzero
+        // column offset always needs packing. Row-aligned reads
+        // (`region_left == 0` — left-edge crops and the whole frame) slice
+        // at row boundaries with the parent stride, so every stride-sized
+        // chunk the `yuv` crate walks is a real, fully-owned source row and
+        // the read can stay zero-copy — EXCEPT the NV12 odd-height,
+        // non-flush-bottom case: the crate's 4:2:0 odd-last-row handling
+        // takes `chunks_exact(2*stride).remainder()` / `uv.chunks_exact(
+        // stride).last()`, which are only the region's own last rows when
+        // the slice holds EXACTLY `height` rows. A row-aligned slice runs to
+        // the plane's end, which is exact only when the region is flush with
+        // the source's bottom edge; otherwise the remainder is empty or the
+        // wrong row entirely (caught by
+        // `left_edge_crop_zero_copy_arm_is_fused_and_correct`). Even heights
+        // never reach that handling (the paired loop is bounded by the
+        // destination zip), and NV16/NV24 have no vertical subsampling and
+        // therefore no remainder path.
+        let flush_bottom = region_top + out_h == src_h;
+        let needs_pack =
+            region_left != 0 || (src_fmt == Nv12 && !out_h.is_multiple_of(2) && !flush_bottom);
         let mut y_pack = std::mem::take(&mut self.nv_strip_y_pack);
         let mut uv_pack = std::mem::take(&mut self.nv_strip_uv_pack);
-        if region.is_some() {
+        if needs_pack {
             let y_need = STRIP_ROWS.saturating_mul(out_w);
             if y_pack.len() < y_need {
                 y_pack.resize(y_need, 0);
@@ -1734,13 +1750,14 @@ impl CPUProcessor {
             let sh = STRIP_ROWS.min(out_h - r0);
             let src_row = region_top + r0;
 
-            // `img_y`/`img_uv` always start at column 0 of their first row
-            // with `stride == width`, so the crate's internal `stride`-sized
-            // chunking never reads past a row it doesn't own — see the
-            // `nv_strip_y_pack` field doc for why the region case can't just
-            // slice `y_plane`/`uv_plane` directly at a column offset.
+            // `img_y`/`img_uv` always start at column 0 of a real source row,
+            // so the crate's internal `stride`-sized chunking never reads
+            // past a row it doesn't own: a column-shifted region is packed to
+            // `stride == width` first (see the `nv_strip_y_pack` field doc),
+            // while a row-aligned region (`region_left == 0`) slices the
+            // parent planes directly at its first row and stays zero-copy.
             let (img_y, img_y_stride, img_uv, img_uv_stride): (&[u8], u32, &[u8], u32) =
-                if region.is_some() {
+                if needs_pack {
                     let chroma_rows = sh.div_ceil(chroma_div);
                     for i in 0..sh {
                         let s_off = (src_row + i) * y_stride + region_left;
@@ -1760,8 +1777,9 @@ impl CPUProcessor {
                         chroma_row_bytes as u32,
                     )
                 } else {
-                    // `region_left`/`chroma_x` are always 0 here (whole-frame
-                    // case), so this is exactly the original zero-copy read.
+                    // `region_left`/`chroma_x` are always 0 here (row-aligned
+                    // region or whole frame), so this is exactly the original
+                    // zero-copy read, offset to the region's first row.
                     let yoff = src_row * y_stride + region_left;
                     let uvoff = (src_row / chroma_div) * uv_stride + chroma_x;
                     (
