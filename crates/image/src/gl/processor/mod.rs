@@ -2160,9 +2160,18 @@ impl GLProcessorST {
                     | PixelFormat::Rgb
             )
         } else {
+            // PlanarRgb into heap (`Mem`) or `Pbo` memory renders through the
+            // same SinglePass `convert_to_planar` shader as the DMA/Rgb arm
+            // above; `readback_rendered` recovers the packed R8 target into
+            // the destination's CHW layout. PlanarRgba stays unsupported
+            // here — no readback geometry has been proven for a 4th plane.
             matches!(
                 fmt,
-                PixelFormat::Rgb | PixelFormat::Rgba | PixelFormat::Bgra | PixelFormat::Grey
+                PixelFormat::Rgb
+                    | PixelFormat::Rgba
+                    | PixelFormat::Bgra
+                    | PixelFormat::Grey
+                    | PixelFormat::PlanarRgb
             )
         }
     }
@@ -2554,11 +2563,23 @@ impl GLProcessorST {
             PixelFormat::Rgb => edgefirst_gl::gl::RGB,
             PixelFormat::Rgba | PixelFormat::Bgra => edgefirst_gl::gl::RGBA,
             PixelFormat::Grey => edgefirst_gl::gl::RED,
+            // Same packed R8 target as `setup_renderbuffer_non_dma` /
+            // `setup_renderbuffer_from_pbo`: full dst_w, dst_h stacked
+            // `channels` times — CHW planes are contiguous in row-major
+            // order, so a single-channel readback at that geometry lands
+            // directly in the destination's CHW byte layout. PlanarRgba is
+            // NOT covered — no 4th-plane readback geometry proven yet.
+            PixelFormat::PlanarRgb => edgefirst_gl::gl::RED,
             _ => {
                 return Err(crate::Error::NotSupported(format!(
                     "GL readback not supported for {dst_fmt}"
                 )))
             }
+        };
+        let read_h = if dst_fmt == PixelFormat::PlanarRgb {
+            dst_h * 3
+        } else {
+            dst_h
         };
         let len = dst.len();
         match pbo_id {
@@ -2567,7 +2588,7 @@ impl GLProcessorST {
                 edgefirst_gl::gl::ReadBuffer(edgefirst_gl::gl::COLOR_ATTACHMENT0);
                 read_pixels_into(
                     dst_w,
-                    dst_h,
+                    read_h,
                     dest_format,
                     &mut self.readback_scratch,
                     dst_map.as_mut_slice(),
@@ -2586,7 +2607,7 @@ impl GLProcessorST {
                         0,
                         0,
                         dst_w as i32,
-                        dst_h as i32,
+                        read_h as i32,
                         dest_format,
                         edgefirst_gl::gl::UNSIGNED_BYTE,
                         std::ptr::null_mut(),
@@ -2639,14 +2660,19 @@ impl GLProcessorST {
         let is_planar = dst_fmt.layout() == PixelLayout::Planar;
 
         let (width, height) = if is_planar {
-            let width = dst_w / 4;
+            // Full dst_w, NOT dst_w/4: `convert_to_planar` draws each plane as
+            // one full-width quad (see `draw_camera_texture_to_rgb_planar`'s
+            // texture-swizzle-per-plane loop) into a single-channel R8
+            // target, byte-for-byte identical to the proven DMA target
+            // geometry in `setup_renderbuffer_dma` — there is no 4-texels-
+            // per-column packing in this shader to justify a narrower width.
             let height = match dst_fmt.channels() {
                 4 => dst_h * 4,
                 3 => dst_h * 3,
                 1 => dst_h,
                 _ => unreachable!(),
             };
-            (width as i32, height as i32)
+            (dst_w as i32, height as i32)
         } else {
             (dst_w as i32, dst_h as i32)
         };
@@ -2885,14 +2911,15 @@ impl GLProcessorST {
         let is_planar = dst_fmt.layout() == PixelLayout::Planar;
 
         let (width, height) = if is_planar {
-            let width = dst_w / 4;
+            // Same full-width geometry as `setup_renderbuffer_non_dma` — see
+            // its comment; both feed the identical `convert_to_planar` draw.
             let height = match dst_fmt.channels() {
                 4 => dst_h * 4,
                 3 => dst_h * 3,
                 1 => dst_h,
                 _ => unreachable!(),
             };
-            (width as i32, height as i32)
+            (dst_w as i32, height as i32)
         } else {
             (dst_w as i32, dst_h as i32)
         };
@@ -3991,17 +4018,19 @@ impl GLProcessorST {
         pass1?;
         drop(_pass1);
 
-        // --- Pass 2: RGBA→PlanarRgb to DMA destination ---
-        // bind_dst rebinds convert_fbo with the DMA destination EGLImage,
-        // replacing packed_rgb_fbo that was active during pass 1. It also sets the viewport
-        // to (dst_w, dst_h * 3) for the tall R8 planar renderbuffer.
+        // --- Pass 2: RGBA→PlanarRgb into the classified destination ---
+        // bind_dst rebinds convert_fbo with the destination target (DMA
+        // EGLImage — zero-copy, no readback needed — or a texture backed by
+        // the Mem/Pbo readback below), replacing packed_rgb_fbo that was
+        // active during pass 1. It also sets the viewport to
+        // (dst_w, dst_h * 3) for the tall R8 planar target.
         let _pass2 = tracing::trace_span!(
             "image.convert.gl.nv_to_planar.pass2_deinterleave",
             dst_w,
             dst_h
         )
         .entered();
-        self.bind_dst(dst, dst_fmt, crop)?;
+        let target = self.bind_dst(dst, dst_fmt, crop)?;
 
         // Pass 2 is a fullscreen blit from the intermediate to the planar
         // destination. Pass 1 (convert_to above) already placed the image
@@ -4027,6 +4056,13 @@ impl GLProcessorST {
 
         unsafe { edgefirst_gl::gl::Finish() };
         check_gl_error(function!(), line!())?;
+
+        // A texture-lowered destination (Mem/Pbo) rendered into an offscreen
+        // target above — mirror the SinglePass engine's post-render readback.
+        // Zero-copy wrote the destination's own EGLImage directly.
+        if let DstTarget::Texture { readback } = target {
+            self.readback_rendered(dst, dst_fmt, readback.pbo_id())?;
+        }
         Ok(())
     }
 

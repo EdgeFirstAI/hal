@@ -64,23 +64,28 @@ pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLow
 /// How a convert renders — the pure plan half of the engine
 /// (`convert_via_engine` in `processor/mod.rs` executes it). Exactly one
 /// plan per (source format, destination format, destination lowering)
-/// triple; the two-pass plans exist only for zero-copy destinations, whose
-/// buffers GL cannot write in the requested layout in one pass.
+/// triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConvertPlan {
     /// One render pass into the bound destination target (packed via the
     /// texture shaders, planar via the planar shader), then the lowering's
     /// readback (none for zero-copy).
     SinglePass,
-    /// Zero-copy packed-RGB: pass 1 renders RGBA into an intermediate
+    /// Zero-copy packed-RGB only: pass 1 renders RGBA into an intermediate
     /// texture, pass 2 packs it into the destination reinterpreted as
-    /// RGBA8 at `W*3/4 × H` (GL has no 3-byte render format).
+    /// RGBA8 at `W*3/4 × H` (GL has no 3-byte render format). Texture
+    /// lowerings render genuine RGB in one pass instead — see
+    /// `setup_renderbuffer_non_dma`/`setup_renderbuffer_from_pbo`.
     TwoPassPackedRgb,
-    /// Zero-copy NV*→planar: pass 1 converts NV*→RGBA through the full
-    /// `select_nv_path` machinery (colorimetry-exact ShaderR8 + Vivante
-    /// carve-out), pass 2 deinterleaves RGBA into the planar destination.
-    /// Also the Vivante GC7000UL single-pass GPU-hang workaround
-    /// (EDGEAI-1180).
+    /// NV*→planar on ANY lowering: pass 1 converts NV*→RGBA through the
+    /// full `select_nv_path` machinery (colorimetry-exact ShaderR8 +
+    /// Vivante carve-out), pass 2 deinterleaves RGBA into the planar
+    /// destination (`bind_dst` classifies pass 2's target the same way
+    /// `SinglePass` does, so a texture lowering reads back same as
+    /// `SinglePass` would). Also the Vivante GC7000UL single-pass GPU-hang
+    /// workaround (EDGEAI-1180). The single-pass planar shader has no route
+    /// for a semi-planar NV source: no multi-plane EGLImage/IOSurface
+    /// binding on ANGLE, and no upload path at all for a heap/Mem source.
     TwoPassNvPlanar,
 }
 
@@ -92,15 +97,20 @@ pub(super) fn plan_convert(
     dst_fmt: PixelFormat,
     lowering: DstLowering,
 ) -> ConvertPlan {
-    if lowering != DstLowering::ZeroCopy {
-        // Texture destinations always render once and read back; packed RGB
-        // and planar layouts are handled by the readback format / planar
-        // shader, not by reinterpreting the destination buffer.
-        return ConvertPlan::SinglePass;
-    }
-    if dst_fmt == PixelFormat::Rgb {
+    // Packed RGB only needs the two-pass W*3/4 reinterpretation on a
+    // zero-copy destination (no native 3-byte GL render format); texture
+    // destinations already render genuine RGB via `setup_renderbuffer_non_dma`
+    // / `setup_renderbuffer_from_pbo`, so they stay single-pass.
+    if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
     }
+    // NV*→planar needs the two-pass ShaderR8 route on EVERY lowering, not
+    // just zero-copy: the single-pass planar shader
+    // (`draw_camera_texture_to_rgb_planar`) samples the source through a
+    // generic EGLImage/IOSurface import, which has no multi-plane binding
+    // for semi-planar NV on ANGLE and no import path at all for a heap/Mem
+    // source on any platform. `select_nv_path`'s ShaderR8 upload (driven by
+    // pass 1's `convert_to`) is the only route that handles both.
     if dst_fmt.layout() == PixelLayout::Planar
         && matches!(
             src_fmt,
@@ -415,13 +425,32 @@ mod tests {
             );
             assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
         }
-        // Texture lowerings: ALWAYS single-pass, for every format pair — the
-        // two-pass plans only exist to write zero-copy buffers in-place.
+        // Texture lowerings: packed-RGB and non-NV→planar single-pass (the
+        // texture destination renders genuine RGB / the planar shader
+        // samples the source directly); NV*→planar still needs the two-pass
+        // ShaderR8 route — the single-pass planar shader has no source
+        // import for semi-planar NV on a texture-lowered destination either.
         for lowering in [TextureMem, TexturePbo] {
-            for src in nv.iter().chain(&non_nv) {
+            for src in nv {
+                for dst in [PlanarRgb, PlanarRgba] {
+                    assert_eq!(
+                        plan_convert(src, dst, lowering),
+                        ConvertPlan::TwoPassNvPlanar,
+                        "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+                for dst in [Rgba, Bgra, Rgb, Grey] {
+                    assert_eq!(
+                        plan_convert(src, dst, lowering),
+                        ConvertPlan::SinglePass,
+                        "{src:?}->{dst:?} via {lowering:?}"
+                    );
+                }
+            }
+            for src in non_nv {
                 for dst in [Rgba, Bgra, Rgb, PlanarRgb, Grey] {
                     assert_eq!(
-                        plan_convert(*src, dst, lowering),
+                        plan_convert(src, dst, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->{dst:?} via {lowering:?}"
                     );
