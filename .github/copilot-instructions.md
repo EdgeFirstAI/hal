@@ -2,8 +2,8 @@
 
 **Purpose:** Instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on this project.
 
-**Version:** 1.5
-**Last Updated:** July 2026
+**Version:** 1.6
+**Last Updated:** August 2026
 
 ---
 
@@ -68,7 +68,7 @@ Update dependencies
 
 ### Overview
 
-This project uses semantic versioning (MAJOR.MINOR.PATCH) with automated publishing to crates.io and PyPI via GitHub Actions when version tags are pushed.
+This project uses semantic versioning (MAJOR.MINOR.PATCH). Releases are PR-first: release preparation lands on a `release/X.Y.Z` branch that is merged to `main` through a reviewed pull request. Tagging is automated — merging the release PR triggers `.github/workflows/tag-release.yml`, which creates the `vX.Y.Z` tag, and that tag triggers `release.yml` to publish to crates.io and PyPI. **Never create release tags manually.**
 
 ### Pre-Release Checklist
 
@@ -152,40 +152,46 @@ Or run the full pre-release target:
 make pre-release
 ```
 
-#### 6. Commit the Release
+#### 6. Commit and Push the Release Branch
+
+All release preparation happens on a `release/X.Y.Z` branch cut from `main`
+(the branch name must be exactly `release/` plus three numeric fields — the
+tagging workflow derives the tag from it):
 
 ```bash
+git checkout -b release/0.6.0
 git add -A
 git commit -s -m "Release v0.6.0"
+git push -u origin release/0.6.0
 ```
 
 The `-s` flag adds a signed-off-by line.
 
-#### 7. Create and Push Tag
+#### 7. Open the Release PR
 
-```bash
-git tag -a -s v0.6.0 -m "Version 0.6.0
+Open a pull request from `release/0.6.0` into `main`, wait for CI to pass,
+and collect the required approvals. **Do not create any tag.**
 
-Highlights:
-- Feature X
-- Improvement Y
-- Bug fix Z
+#### 8. Merge — Tagging Is Automatic
 
-See CHANGELOG.md for full details."
-```
+Merging the release PR triggers `.github/workflows/tag-release.yml`, which:
 
-The `-a` flag creates an annotated tag, `-s` signs it with GPG.
+- runs only for merged PRs whose head branch matches `release/X.Y.Z`
+  (strict three-field numeric version, no suffixes)
+- derives the tag name `vX.Y.Z` from the branch name
+- creates the tag at the PR's merge commit through the GitHub API,
+  authenticated with the `RELEASE_TAG_TOKEN` secret (a PAT, so the new tag
+  still triggers `release.yml`; the workflow fails with a clear error if
+  the secret is missing)
 
-#### 8. Push Changes
-
-```bash
-git push origin main
-git push origin v0.6.0
-```
+**Never run `git tag` for a release** — manual tagging has been removed
+from the process. If the tag does not appear after the merge, inspect the
+Tag Release workflow run instead of tagging by hand.
 
 ### Post-Release
 
-The `release.yml` workflow automatically:
+Once `tag-release.yml` has created the tag, the `release.yml` workflow
+automatically:
 - Builds Python wheels for Linux, Windows, and macOS
 - Publishes to PyPI (stable releases only)
 - Publishes Rust crates to crates.io
@@ -193,19 +199,22 @@ The `release.yml` workflow automatically:
 
 ### Release Candidates
 
-For pre-release versions, use the `rcN` suffix:
-
-```bash
-git tag -a -s v0.6.0rc1 -m "Version 0.6.0 Release Candidate 1"
-```
-
-Release candidates are published to PyPI but marked as pre-release.
+The tagging automation only recognizes plain `release/X.Y.Z` branches — its
+version check rejects suffixes, so an `rcN` pre-release is **not** covered by
+`tag-release.yml`, and the old manual `vX.Y.ZrcN` tagging process has been
+removed. If a release candidate is needed, agree on the mechanism with the
+maintainers first; do not tag by hand.
 
 ### Maintenance / Back-Port Patch Release
 
 Use this when patching an **older, superseded release line** — e.g. shipping
 `0.22.2` while `main` has already advanced to `0.24.x`. The patch is **not**
 merged into `main`; it is released by tagging a maintenance branch directly.
+
+> **Note:** `tag-release.yml` fires only for PRs merged into `main`, so it
+> does not cover maintenance lines — the tag in step 4 below is the one
+> remaining hand-created release tag. Confirm with the maintainers before
+> using it.
 
 1. **Branch from the previous release tag**, not from `main`:
 
