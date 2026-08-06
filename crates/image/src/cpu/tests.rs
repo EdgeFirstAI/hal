@@ -4436,11 +4436,10 @@ mod cpu_tests {
     // ---- Task 3: fused NV→planar source region + scale-identity gate ----
 
     /// Decode `full` (a whole-frame NV12→PlanarRgb convert, no crop) once and
-    /// slice each colour plane down to `region` by hand. This is the ground
-    /// truth both the new fused-with-region path and the existing general
-    /// crop pipeline must reproduce: the general pipeline also decodes the
-    /// full source into an RGB intermediate before cropping, so both paths
-    /// ultimately sample the same per-pixel decode.
+    /// slice each colour plane down to `region` by hand, entirely without
+    /// invoking any cropped-convert code path. This is the ground-truth
+    /// oracle both `fused_region_matches_general_path` and
+    /// `odd_origin_nv12_crop_falls_through` compare against.
     fn manual_planar_rgb_crop(full: &TensorDyn, region: Region) -> Vec<u8> {
         let full_w = full.width().unwrap();
         let full_h = full.height().unwrap();
@@ -4463,6 +4462,19 @@ mod cpu_tests {
 
     /// Full-frame (no-crop) NV12→PlanarRgb convert of `camera720p.nv12` —
     /// the source both new tests below slice down to a sub-region by hand.
+    ///
+    /// Note this itself already routes through `convert_nv_to_planar_fused`
+    /// (with `region: None` — the pre-existing whole-frame gate, unchanged
+    /// by this task), not some independently-implemented "general path"
+    /// decode. It's still a valid oracle for `fused_region_matches_general_path`
+    /// because that test's *only* claim is that the fused function's
+    /// `region: Some(r)` strip arithmetic reproduces exactly what its own
+    /// `region: None` whole-frame arithmetic computes for the same pixels —
+    /// i.e. that the region offsets are correct, not that the fused decode
+    /// numerically matches the separate `convert_format_pf` pipeline (which
+    /// `odd_origin_nv12_crop_falls_through` exercises independently against
+    /// this same oracle, and which the frozen `crop_golden` fixtures pin
+    /// byte-for-byte as the ultimate independent check).
     fn nv12_720p_to_planar_rgb_full(converter: &mut CPUProcessor) -> (TensorDyn, TensorDyn) {
         let src = load_bytes_to_tensor(
             1280,
@@ -4490,7 +4502,9 @@ mod cpu_tests {
     /// A source crop whose size equals the destination (scale identity) with
     /// an even (chroma-aligned) origin must take the fused NV→planar strip
     /// path and produce output identical to decoding the whole frame once
-    /// and manually slicing the same sub-rectangle out of each plane.
+    /// and manually slicing the same sub-rectangle out of each plane (see
+    /// `nv12_720p_to_planar_rgb_full`'s doc for exactly what this oracle
+    /// does and doesn't independently prove).
     #[test]
     fn fused_region_matches_general_path() {
         let mut converter = CPUProcessor::default();
@@ -4594,5 +4608,78 @@ mod cpu_tests {
             actual, reference,
             "general-path output for the odd-origin crop must still be correct"
         );
+    }
+
+    /// Regression: a scale-identity, chroma-aligned (even left/top) crop
+    /// whose *width* is odd used to error out of the fused NV12/NV16 region
+    /// path (`YuvError::ChromaPlaneMinimumSizeMismatch`). The `yuv` crate
+    /// needs `width.div_ceil(2) * 2` chroma bytes per row — a full trailing
+    /// U+V pair for the odd column's fractional pair, not `width` bytes —
+    /// but the packed UV scratch was sized to exactly `out_w`, one byte
+    /// short. Covers both NV12 (4:2:0) and NV16 (4:2:2): both pack one U+V
+    /// byte pair per two luma columns and so share the same rounding need.
+    #[test]
+    fn odd_width_scale_identity_crop_takes_fused_path_and_is_correct() {
+        for (src_fmt, asset) in [
+            (PixelFormat::Nv12, "camera720p.nv12"),
+            (PixelFormat::Nv16, "camera720p.nv16"),
+        ] {
+            let mut converter = CPUProcessor::default();
+            let src = load_bytes_to_tensor(
+                1280,
+                720,
+                src_fmt,
+                None,
+                &edgefirst_bench::testdata::read(asset),
+            )
+            .unwrap();
+            let mut full = TensorDyn::image(
+                1280,
+                720,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            converter
+                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+
+            // Even left/top (chroma-aligned) but an ODD width — the shape
+            // that used to crash.
+            let region = Region::new(256, 128, 641, 360);
+            let reference = manual_planar_rgb_crop(&full, region);
+
+            let mut cropped = TensorDyn::image(
+                region.width,
+                region.height,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let crop = Crop::new().with_source(Some(region));
+
+            let before = converter.fused_hits();
+            converter
+                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| {
+                    panic!("{src_fmt:?} odd-width scale-identity crop must not error: {e}")
+                });
+            assert_eq!(
+                converter.fused_hits(),
+                before + 1,
+                "{src_fmt:?} odd-width, chroma-aligned crop must still take the fused path"
+            );
+
+            let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+            assert_eq!(
+                actual, reference,
+                "{src_fmt:?} odd-width fused region output must match the \
+                 full-decode + manual plane crop reference"
+            );
+        }
     }
 }

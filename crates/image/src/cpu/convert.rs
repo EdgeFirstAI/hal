@@ -1548,10 +1548,23 @@ impl CPUProcessor {
         }
 
         // Chroma bytes per row for `out_w` luma columns: NV12/NV16 pack one
-        // U+V byte pair per two luma columns (1 byte/column); NV24 carries a
-        // full-resolution U+V pair per luma column (2 bytes/column). Mirrors
-        // `chroma_x`'s scaling above.
-        let chroma_row_bytes = if src_fmt == Nv24 { out_w * 2 } else { out_w };
+        // U+V byte pair per two luma columns (1 byte/column on average), so
+        // an odd `out_w` still needs the *whole* trailing byte pair for the
+        // column pair it's the first half of — round up to the next even
+        // count, not down. NV24 carries a full-resolution U+V pair per luma
+        // column (2 bytes/column, always exact). The gate requires an even
+        // `region_left`, so this rounding never reads past the row's own
+        // stride: the source region is always validated to fit within
+        // `src_w <= uv_stride` (both `uv_stride` and `region_left` are even
+        // for a chroma-subsampled format, so an odd `out_w` — the only case
+        // that adds the extra byte — keeps `region_left + out_w` odd and
+        // therefore strictly less than the even `uv_stride`, leaving room
+        // for the pad byte).
+        let chroma_row_bytes = if src_fmt == Nv24 {
+            out_w * 2
+        } else {
+            out_w.div_ceil(2) * 2
+        };
 
         // See the `nv_strip_y_pack`/`nv_strip_uv_pack` field docs: only the
         // region case (a nonzero column offset) needs packing; the
