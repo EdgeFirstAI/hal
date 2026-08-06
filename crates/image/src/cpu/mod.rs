@@ -1221,7 +1221,15 @@ impl CPUProcessor {
                         g.height,
                         src_fmt,
                     )?;
-                    Self::extract_nv_region(src, &mut sub, src_fmt, g)?;
+                    {
+                        let _s = tracing::trace_span!(
+                            "image.convert.cpu.extract_region",
+                            region_w = g.width,
+                            region_h = g.height,
+                        )
+                        .entered();
+                        Self::extract_nv_region(src, &mut sub, src_fmt, g)?;
+                    }
                     Self::convert_format_pf(&sub, &mut t, src_fmt, intermediate, src_params)?;
                     self.convert_src_sub = Some(sub);
                 }

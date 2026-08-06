@@ -366,6 +366,15 @@ decoder.nms_get_boxes                                   [post-NMS candidate sele
 ├── decoder.nms_get_boxes.suppress                      ← class-agnostic / class-aware IoU NMS
 └── decoder.nms_get_boxes.dequant_boxes                 ← int8 → f32 on survivors only (quant path)
     field: n
+
+# Tiled-inference postprocessing (crates/decoder/src/tiling.rs; grid geometry
+# lives in edgefirst-image, see ../image/ARCHITECTURE.md)
+
+decoder.tiled.lift                                       [lift_tile_boxes — tile-local norm → full-frame pixel xyxy]
+fields: boxes
+
+decoder.tiled.merge                                      [the merge_tiled_detections call inside TiledFrameAccumulator::finalize / finalize_normalized]
+fields: tiles, boxes_in, boxes_out
 ```
 
 ### What each span measures (mapped to reference YOLO post-processing)
@@ -392,6 +401,8 @@ decoder.nms_get_boxes                                   [post-NMS candidate sele
 | `decoder.nms_get_boxes.top_k`                   | `x[x[:, 4].argsort(descending=True)[:max_nms]]`         | Partial sort to `pre_nms_top_k` candidates (default 300; raise to anchor count for COCO mAP at `conf=0.001`). |
 | `decoder.nms_get_boxes.suppress`                | `torchvision.ops.nms` or `batched_nms`                  | IoU-based suppression. Class-agnostic or class-aware per the decoder's `Nms` setting. |
 | `decoder.nms_get_boxes.dequant_boxes`           | (quant path only)                                       | Int8 → f32 dequant applied only to survivors of NMS — avoids dequantising filtered candidates. |
+| `decoder.tiled.lift`                            | `metrics/tiled.py::lift_tile_boxes` (partial)            | Per-tile-decoded normalized boxes → full-frame pixel xyxy (optional letterbox inversion). Called once per tile, either directly or via `TiledFrameAccumulator::push_tile`. The `boxes` field is the per-call detection count — sum across tiles to get total lift cost for a frame. |
+| `decoder.tiled.merge`                           | `metrics/tiled.py::merge_tiled_detections`                | GREEDYNMM/IOS merge of one frame's accumulated lifted detections, called from `TiledFrameAccumulator::finalize`/`finalize_normalized`. `tiles` is the frame's total tile count (the fan-in fence), `boxes_in` the pre-merge detection count, `boxes_out` the post-merge count — the ratio is the seam-duplicate collapse rate. |
 
 [`tracing::trace_span!`]: https://docs.rs/tracing/latest/tracing/macro.trace_span.html
 

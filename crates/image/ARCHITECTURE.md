@@ -1167,7 +1167,9 @@ image.convert                                           [user-facing fn, orchest
 │
 └── image.convert.cpu                                   [universal fallback, parent implicit]
     ├── image.convert.cpu.format_convert                ← per-pixel format conversion
-    │   fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
+    │   │ fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
+    │   └── image.convert.cpu.extract_region             ← NV12/NV16/NV24 sub-rect copy feeding a "pre_resize" convert
+    │       fields: region_w, region_h
     └── image.convert.cpu.resize_flip_rotate            ← fast_image_resize + rayon
 
 image.flush                                             [user-facing fn — batch sync]
@@ -1184,12 +1186,30 @@ image.materialize_masks                                 [user-facing fn]
 ├── image.materialize_masks.kernel_i8_scaled            ← i8 coeff × i8 proto, scaled to dst W×H
 └── image.materialize_masks.kernel_i16xi8_scaled        ← i16 coeff × i8 proto, scaled to dst W×H
     fields: n, proto_h, proto_w, num_protos, layout, (width, height for *_scaled)
+
+image.plan_tiles                                        [user-facing fn — SAHI tile grid + placement geometry, no GPU]
+fields: tiles, overlap
+
+image.tile_into                                         [user-facing fn — renders every tile into a shared tall-parent batch]
+│ fields: tiles
+├── image.plan_tiles                                    ← grid + placement geometry for this frame
+└── (per tile) render_tile → convert_deferred            ← enters the image.convert.* tree above (dst_tile = row-band index)
+
+image.tile_one                                          [user-facing fn — renders exactly one tile into a caller-owned slot]
+│ fields: index, count
+└── render_tile → convert_deferred                       ← enters the image.convert.* tree above
 ```
 
 > The CPU backend has no top-level `image.convert.cpu` span of its own; the
 > CPU dispatch enters via `image.convert.cpu.format_convert` and/or
 > `image.convert.cpu.resize_flip_rotate` directly. Parent in the trace is
 > `image.convert`.
+>
+> `image.tile_into` and `image.tile_one` do not themselves open `image.convert`:
+> each per-tile render goes through `convert_deferred`, which on the GL path
+> enters `image.convert.gl` directly (the outer `image.convert` span is
+> skipped on the deferred fast path) and on the CPU/G2D fallback goes through
+> `image.convert` as usual.
 
 ### What each span measures (mapped to the `convert()` inner workings)
 
@@ -1206,7 +1226,11 @@ image.materialize_masks                                 [user-facing fn]
 | `image.convert.gl.nv_to_planar_float`                  | Fused NV12/NV16/NV24 → PlanarRgb F16 with a GPU-resident intermediate: pass 1 renders NV→RGBA with the caller's full geometry into the shared intermediate texture (`packed_rgb_intermediate_tex`), pass 2 packs it 1:1 through the RGBA16F float shader into the zero-copy destination. The pixels never visit the host between the zero-copy source and the zero-copy destination. Portable (macOS IOSurface + Linux DMA-BUF f16 targets). | Emitted by `convert_nv_to_planar_float_two_pass`. |
 | `image.convert.g2d`                                    | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
 | `image.convert.cpu.format_convert`                     | Per-pixel format conversion (e.g. NV12 → RGB, RGBA → BGRA). The `pass` field tells you whether this ran before, after, or instead of resize. | `pre_resize` indicates the source needed conversion to RGB/RGBA/GREY before `fast_image_resize` could run; `direct` indicates no resize was needed; `post_resize` indicates the destination format differed from the intermediate. |
+| `image.convert.cpu.extract_region`                     | `extract_nv_region`: copies the halo-grown crop rectangle out of an NV12/NV16/NV24 source into a small same-format tensor, so the unmodified format converters can decode just the crop instead of the whole frame. | Nested inside a `pass = "pre_resize"` `format_convert` span. Isolates the per-tile extraction cost (the SAHI tiling hot path) from the decode cost that follows it in the same `format_convert` span; see `pre_resize_region`. |
 | `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
+| `image.plan_tiles`                                     | `tile_grid` (EvenDist SAHI grid) + per-tile `TilePlacement` construction for a `src_w`×`src_h` frame. Pure host computation, no GPU/CPU pixel work. | The `tiles` field is the realized tile count for this frame/config pair (can exceed the naive `ceil(frame/tile)` estimate under heavy overlap); `overlap` is the requested minimum. Called once per frame by `tile_into`, or directly by a pipelined caller sizing its own tile stream. |
+| `image.tile_into`                                      | Renders every tile of one frame into a shared tall packed-parent batch, one deferred `render_tile` per tile, then a single `flush`. | `tiles` mirrors `plan_tiles`' count for the same call. Per-tile cost is attributed via the nested `image.convert.*` (or `image.convert.gl.*`) spans that `render_tile` opens; use `dst_tile` on those to identify which row-band. |
+| `image.tile_one`                                       | Renders exactly one tile of a frame into a caller-owned slot (e.g. a ring buffer entry), deferred — the caller controls the flush cadence. | `index`/`count` identify which tile of the frame this is, letting a pipelined runtime attribute cost per tile without a `tile_into` batch. Holds no frame-wide state — all geometry rides in the `TilePlacement` argument. |
 | `image.draw_decoded_masks`                             | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
 | `image.draw.gl.proto`                                  | The fused GL proto-segmentation render: proto texture upload + per-detection quad draws. The `upload` / `program` fields record the `ProtoPlan` chosen by the pure `proto_dispatch::plan_proto` table (e.g. `I8CpuRepack`/`Int8Bilinear`, `F32R32f`/`F32`, `F16Rgba16f`/`F16`), alongside `dtype`, `num_protos`, and `detections`. | Filter by `upload` to isolate one upload strategy's latency. Steady-state at fixed proto dims re-uploads via `TexSubImage3D` into the immutable `TexStorage3D` allocation (the `ensure_proto_texture` gate); re-allocation happens only on dims/format churn. |
 | `image.materialize_masks`                              | Wrapper around the four `kernel_*` spans, paired with letterbox inversion and bbox-clipped row iteration. `mode = "proto"` returns proto-resolution masks; `mode = "scaled"` resamples to `(width, height)`. | Use the proto-resolution mode when you only need IoU computation against ground truth at the proto grid (the default Ultralytics evaluation mode). |
