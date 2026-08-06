@@ -60,6 +60,69 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// How many extra source pixels the **configured** resize filter can read
+    /// beyond each edge of the crop rect along one axis, when `src_extent`
+    /// cropped source pixels are resampled to `dst_extent` destination pixels.
+    ///
+    /// `fast_image_resize` clamps its filter window to the *image* bounds, not
+    /// to the crop rect (the FIXME in [`Self::resize_flip_rotate_pf`]), so a
+    /// cropped convert legitimately samples a margin of real neighbouring
+    /// pixels around the crop. Reproducing that margin — the *halo* — is what
+    /// lets the pre-resize intermediate shrink to the crop without changing a
+    /// single output byte.
+    ///
+    /// The arithmetic mirrors `fast_image_resize`'s `precompute_coefficients`:
+    /// with `scale = src_extent / dst_extent` the kernel radius is
+    /// `support * max(scale, 1)` for `Convolution` (adaptive kernel size) and
+    /// `support` for `Interpolation` (fixed kernel), and the window for the
+    /// first/last output pixel reaches `ceil(radius - scale / 2)` pixels
+    /// outside an integer-aligned crop edge. The filter supports are the
+    /// crate's own (`Box` 0.5, `Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell`
+    /// 2, `Gaussian`/`Lanczos3` 3) — read from `self.options.algorithm`, never
+    /// assumed by the caller.
+    ///
+    /// Returns `None` when the reach is not modelled (`SuperSampling`, or a
+    /// filter/algorithm added by a future upstream release), so the caller
+    /// keeps the full-frame intermediate and its unchanged output.
+    pub(super) fn filter_halo(&self, src_extent: usize, dst_extent: usize) -> Option<usize> {
+        use fast_image_resize::{FilterType, ResizeAlg};
+
+        fn support(filter: FilterType) -> Option<f64> {
+            Some(match filter {
+                FilterType::Box => 0.5,
+                FilterType::Bilinear | FilterType::Hamming => 1.0,
+                FilterType::CatmullRom | FilterType::Mitchell => 2.0,
+                FilterType::Gaussian | FilterType::Lanczos3 => 3.0,
+                FilterType::Custom(f) => f.support(),
+                _ => return None,
+            })
+        }
+
+        let (support, adaptive_kernel) = match self.options.algorithm {
+            // Nearest picks one source pixel inside the crop — no halo at all.
+            ResizeAlg::Nearest => return Some(0),
+            ResizeAlg::Convolution(f) => (support(f)?, true),
+            ResizeAlg::Interpolation(f) => (support(f)?, false),
+            _ => return None,
+        };
+        if src_extent == 0 || dst_extent == 0 {
+            return Some(0);
+        }
+
+        let scale = src_extent as f64 / dst_extent as f64;
+        let radius = support * if adaptive_kernel { scale.max(1.0) } else { 1.0 };
+        let reach = (radius - scale / 2.0).ceil();
+        if !reach.is_finite() {
+            return None;
+        }
+        // One pixel of slack on top of the modelled reach. Growing the
+        // extracted rect *beyond* the filter's true reach cannot change any
+        // output pixel — the extra columns/rows are simply never sampled — so
+        // the slack costs a few bytes and buys immunity to f64 rounding and to
+        // small kernel changes in an upstream release.
+        Some(reach.max(0.0) as usize + 1)
+    }
+
     /// Resize/flip/rotate with explicit PixelFormat (used by convert_u8).
     pub(super) fn resize_flip_rotate_pf(
         &mut self,

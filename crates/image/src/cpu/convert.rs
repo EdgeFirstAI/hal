@@ -1410,6 +1410,149 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Copy the sub-rectangle `region` out of a semi-planar (NV12/NV16/NV24)
+    /// source into `dst`, a `region.width × region.height` tensor of the *same*
+    /// pixel format.
+    ///
+    /// This is the extraction step of the crop-sized pre-resize intermediate:
+    /// `Tensor::view` only supports packed layouts, so a sub-rectangle of an
+    /// NV source cannot be expressed as a strided view — its two planes sit at
+    /// different offsets and subsample independently. Copying `region`'s luma
+    /// and chroma rows into a small NV tensor lets the *unmodified* format
+    /// converters decode just the crop.
+    ///
+    /// The copy is byte-exact by construction as long as `region`'s origin sits
+    /// on a chroma sample boundary — even `left` for NV12/NV16, even `top` for
+    /// NV12 — because a luma pixel's chroma sample is then found at the same
+    /// relative index in the extracted plane as in the frame. The caller
+    /// (`pre_resize_region`) guarantees that alignment; this function
+    /// re-validates it rather than trusting it, and validates `region` against
+    /// both buffers so a malformed tensor yields `InvalidShape`, not a panic.
+    pub(super) fn extract_nv_region(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        fmt: edgefirst_tensor::PixelFormat,
+        region: Rect,
+    ) -> Result<()> {
+        use edgefirst_tensor::PixelFormat::{Nv12, Nv16, Nv24};
+
+        let src_w = src.width().unwrap_or(0);
+        let src_h = src.height().unwrap_or(0);
+        let (w, h) = (region.width, region.height);
+        if region.left + w > src_w || region.top + h > src_h {
+            return Err(Error::InvalidShape(format!(
+                "nv region extract out of bounds: {region:?} (source {src_w}x{src_h})"
+            )));
+        }
+
+        // Plane geometry, mirroring `convert_nv12`/`convert_nv16`/`convert_nv24`.
+        // `chroma_div` maps a luma row to its chroma row; `chroma_x` converts a
+        // luma-column offset into a chroma byte offset.
+        let y_stride = src
+            .effective_row_stride()
+            .unwrap_or(src_w.next_multiple_of(2));
+        let (uv_stride, chroma_div, chroma_x, chroma_row_bytes) = match fmt {
+            Nv12 => {
+                let uv = if src.is_multiplane() {
+                    src.chroma()
+                        .unwrap()
+                        .effective_row_stride()
+                        .unwrap_or(src_w.next_multiple_of(2))
+                } else {
+                    y_stride
+                };
+                (uv, 2usize, region.left, w.div_ceil(2) * 2)
+            }
+            Nv16 => (y_stride, 1usize, region.left, w.div_ceil(2) * 2),
+            Nv24 => (y_stride * 2, 1usize, region.left * 2, w * 2),
+            other => {
+                return Err(Error::NotSupported(format!(
+                    "nv region extract from {other}"
+                )));
+            }
+        };
+        // Chroma-boundary alignment (see the doc comment): without it the
+        // extracted chroma plane would be offset by half a sample against the
+        // luma and the decode would not match the frame's.
+        let misaligned = match fmt {
+            Nv12 => !region.left.is_multiple_of(2) || !region.top.is_multiple_of(2),
+            Nv16 => !region.left.is_multiple_of(2),
+            _ => false,
+        };
+        if misaligned {
+            return Err(Error::InvalidShape(format!(
+                "nv region extract needs a chroma-aligned origin for {fmt}: {region:?}"
+            )));
+        }
+
+        let src_map = src.map_read()?;
+        let chroma_map = if src.is_multiplane() {
+            Some(src.chroma().unwrap().map_read()?)
+        } else {
+            None
+        };
+        let (src_y, src_uv): (&[u8], &[u8]) = if let Some(cm) = &chroma_map {
+            (src_map.as_slice(), cm.as_slice())
+        } else {
+            super::split_semi_planar(src_map.as_slice(), y_stride, src_h, fmt)?
+        };
+
+        if dst.is_multiplane() {
+            return Err(Error::InvalidShape(
+                "nv region extract destination must be a contiguous single-plane tensor".into(),
+            ));
+        }
+        let dst_stride = super::tensor_row_stride(dst);
+        let dst_uv_stride = if fmt == Nv24 {
+            dst_stride * 2
+        } else {
+            dst_stride
+        };
+        if dst_stride < w || dst_uv_stride < chroma_row_bytes {
+            return Err(Error::InvalidShape(format!(
+                "nv region extract destination stride {dst_stride} too small for width {w}"
+            )));
+        }
+        let mut dst_map = dst.map_mut()?;
+        let (dst_y, dst_uv) =
+            super::split_semi_planar_mut(dst_map.as_mut_slice(), dst_stride, h, fmt)?;
+
+        let chroma_rows = h.div_ceil(chroma_div);
+        super::guard_plane(
+            src_y.len(),
+            y_stride,
+            region.top + h,
+            region.left + w,
+            "nv extract src luma",
+        )?;
+        super::guard_plane(
+            src_uv.len(),
+            uv_stride,
+            region.top / chroma_div + chroma_rows,
+            chroma_x + chroma_row_bytes,
+            "nv extract src chroma",
+        )?;
+        super::guard_plane(dst_y.len(), dst_stride, h, w, "nv extract dst luma")?;
+        super::guard_plane(
+            dst_uv.len(),
+            dst_uv_stride,
+            chroma_rows,
+            chroma_row_bytes,
+            "nv extract dst chroma",
+        )?;
+
+        for i in 0..h {
+            let s = (region.top + i) * y_stride + region.left;
+            dst_y[i * dst_stride..i * dst_stride + w].copy_from_slice(&src_y[s..s + w]);
+        }
+        for j in 0..chroma_rows {
+            let s = (region.top / chroma_div + j) * uv_stride + chroma_x;
+            dst_uv[j * dst_uv_stride..j * dst_uv_stride + chroma_row_bytes]
+                .copy_from_slice(&src_uv[s..s + chroma_row_bytes]);
+        }
+        Ok(())
+    }
+
     /// Strip-fused NV12/NV16/NV24 → PlanarRgb/PlanarRgba for the no-resize
     /// case. Decodes the YUV source into packed RGB one cache-resident row
     /// strip at a time (into the reused [`Self::nv_strip_scratch`]) and

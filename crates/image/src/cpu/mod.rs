@@ -108,6 +108,14 @@ pub struct CPUProcessor {
     /// tests assert on the actual gate decision rather than on timing.
     #[cfg(test)]
     fused_hits: u64,
+    /// Test-only record of the dimensions of the pre-resize intermediate the
+    /// most recent `convert_u8` call allocated, or `None` when that call did
+    /// not need one. Lets the allocation-proportionality tests assert that a
+    /// cropped convert sizes its intermediate to the crop rather than to the
+    /// whole frame, without reaching into the allocator. Reset at the top of
+    /// every `convert_u8`.
+    #[cfg(test)]
+    last_tmp_dims: Option<(usize, usize)>,
     /// Reusable intermediate buffers for the multi-step convert pipeline
     /// (pre-resize format-convert and the resized-RGB scratch). Reused across
     /// frames when the dimensions/format match so the steady-state
@@ -116,6 +124,11 @@ pub struct CPUProcessor {
     /// fully overwritten first, so reused (non-zeroed) contents are never read.
     convert_tmp: Option<Tensor<u8>>,
     convert_tmp2: Option<Tensor<u8>>,
+    /// Reusable crop-sized copy of the source's own pixel format, holding the
+    /// halo-grown crop rectangle extracted by [`Self::extract_nv_region`] for
+    /// the crop-sized pre-resize intermediate. Only allocated for a cropped
+    /// convert that takes that path; the whole-frame path never touches it.
+    convert_src_sub: Option<Tensor<u8>>,
 }
 
 // `CPUProcessor` was `#[derive(Clone)]` before the `widen_scratch` field was
@@ -137,8 +150,11 @@ impl Clone for CPUProcessor {
             nv_strip_uv_pack: Vec::new(),
             #[cfg(test)]
             fused_hits: 0,
+            #[cfg(test)]
+            last_tmp_dims: None,
             convert_tmp: None,
             convert_tmp2: None,
+            convert_src_sub: None,
         }
     }
 }
@@ -369,8 +385,11 @@ impl CPUProcessor {
             nv_strip_uv_pack: Vec::new(),
             #[cfg(test)]
             fused_hits: 0,
+            #[cfg(test)]
+            last_tmp_dims: None,
             convert_tmp: None,
             convert_tmp2: None,
+            convert_src_sub: None,
         }
     }
 
@@ -393,8 +412,11 @@ impl CPUProcessor {
             nv_strip_uv_pack: Vec::new(),
             #[cfg(test)]
             fused_hits: 0,
+            #[cfg(test)]
+            last_tmp_dims: None,
             convert_tmp: None,
             convert_tmp2: None,
+            convert_src_sub: None,
         }
     }
 
@@ -402,6 +424,13 @@ impl CPUProcessor {
     #[cfg(test)]
     pub(super) fn fused_hits(&self) -> u64 {
         self.fused_hits
+    }
+
+    /// Test-only accessor for the dimensions of the pre-resize intermediate the
+    /// last `convert_u8` allocated (see the `last_tmp_dims` field doc).
+    #[cfg(test)]
+    pub(super) fn last_tmp_dims(&self) -> Option<(usize, usize)> {
+        self.last_tmp_dims
     }
 
     pub(crate) fn support_conversion_pf(src: PixelFormat, dst: PixelFormat) -> bool {
@@ -857,6 +886,98 @@ impl CPUProcessor {
         )?)
     }
 
+    /// The source sub-rectangle to convert into the pre-resize intermediate for
+    /// a cropped convert, or `None` to keep converting the whole frame.
+    ///
+    /// A cropped convert only ever reads the crop rect plus the resize filter's
+    /// halo (see [`Self::filter_halo`]), so converting the whole frame into the
+    /// intermediate wastes work proportional to the frame — for a 4K frame
+    /// tiled into 640x640 crops, ~22x the pixels actually needed. Returning the
+    /// halo-grown crop lets the pre-resize convert produce a crop-sized
+    /// intermediate instead.
+    ///
+    /// The returned rect only ever *grows* the crop, and is clamped to the
+    /// frame, so the resize reads exactly the same real source pixels — and
+    /// clamps at exactly the same frame edges — as it did with a full-frame
+    /// intermediate. Output is byte-identical; only the buffer size changes.
+    ///
+    /// `None` (unchanged full-frame behaviour) for: an uncropped convert, a
+    /// crop covering the whole frame, a source format that cannot be extracted
+    /// (only the semi-planar NV family can — `Tensor::view` rejects non-packed
+    /// layouts, and NV is what the 4K tiling path feeds in), and a resize
+    /// algorithm whose filter reach is not modelled.
+    fn pre_resize_region(
+        &self,
+        src_fmt: PixelFormat,
+        (src_w, src_h): (usize, usize),
+        (dst_w, dst_h): (usize, usize),
+        rotation: Rotation,
+        crop: ResolvedCrop,
+    ) -> Option<Rect> {
+        use PixelFormat::{Nv12, Nv16, Nv24};
+
+        if !matches!(src_fmt, Nv12 | Nv16 | Nv24) {
+            return None;
+        }
+        let r = crop.src_rect?;
+        let full_src = Rect {
+            left: 0,
+            top: 0,
+            width: src_w,
+            height: src_h,
+        };
+        if r == full_src {
+            return None;
+        }
+
+        // The resize maps the source rect onto the destination rect; a quarter
+        // turn swaps which destination extent each source axis is scaled onto
+        // (see `adjust_dest_rect_for_rotate_flip_dims`), and the filter halo
+        // depends on that scale factor.
+        let d = crop.dst_rect.unwrap_or(Rect {
+            left: 0,
+            top: 0,
+            width: dst_w,
+            height: dst_h,
+        });
+        let (dst_x, dst_y) = match rotation {
+            Rotation::None | Rotation::Rotate180 => (d.width, d.height),
+            Rotation::Clockwise90 | Rotation::CounterClockwise90 => (d.height, d.width),
+        };
+        let halo_x = self.filter_halo(r.width, dst_x)?;
+        let halo_y = self.filter_halo(r.height, dst_y)?;
+
+        let mut left = r.left.saturating_sub(halo_x);
+        let mut top = r.top.saturating_sub(halo_y);
+        let mut right = (r.left + r.width + halo_x).min(src_w);
+        let mut bottom = (r.top + r.height + halo_y).min(src_h);
+
+        // NV12 subsamples chroma on both axes, NV16 on the horizontal one, so
+        // the extracted origin must land on a chroma sample boundary for the
+        // sub-image's chroma to line up with the frame's. Snap the origin DOWN
+        // and the far edge UP — growing only, so every pixel inside `r` keeps
+        // exactly the neighbours it had, whatever the crop's own parity.
+        let (align_x, align_y) = match src_fmt {
+            Nv12 => (2, 2),
+            Nv16 => (2, 1),
+            _ => (1, 1),
+        };
+        left -= left % align_x;
+        top -= top % align_y;
+        right = right.next_multiple_of(align_x).min(src_w);
+        bottom = bottom.next_multiple_of(align_y).min(src_h);
+
+        let grown = Rect {
+            left,
+            top,
+            width: right - left,
+            height: bottom - top,
+        };
+        // The halo already reaches the whole frame — extracting would be a pure
+        // copy with no saving.
+        (grown != full_src).then_some(grown)
+    }
+
     /// U8-to-U8 conversion: the full format conversion + resize pipeline.
     #[allow(clippy::too_many_arguments)]
     fn convert_u8(
@@ -872,6 +993,11 @@ impl CPUProcessor {
         dst_params: ColorParams,
     ) -> Result<()> {
         use PixelFormat::*;
+
+        #[cfg(test)]
+        {
+            self.last_tmp_dims = None;
+        }
 
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
@@ -1062,6 +1188,16 @@ impl CPUProcessor {
         let mut cached_tmp = self.convert_tmp.take();
         let mut cached_tmp2 = self.convert_tmp2.take();
 
+        // For a cropped convert, size the pre-resize intermediate to the crop
+        // (grown by the resize filter's halo) instead of the whole frame — see
+        // `pre_resize_region`. `None` keeps the previous full-frame behaviour,
+        // which is also the uncropped hot path.
+        let pre_region = if intermediate != src_fmt {
+            self.pre_resize_region(src_fmt, (src_w, src_h), (dst_w, dst_h), rotation, crop)
+        } else {
+            None
+        };
+
         // create tmp buffer (reusing the cached one when its geometry matches)
         let tmp_holder: Option<Tensor<u8>> = if intermediate != src_fmt {
             let _s = tracing::trace_span!(
@@ -1071,11 +1207,45 @@ impl CPUProcessor {
                 pass = "pre_resize",
             )
             .entered();
-            let mut t = Self::reuse_or_alloc_image(cached_tmp.take(), src_w, src_h, intermediate)?;
-            Self::convert_format_pf(src, &mut t, src_fmt, intermediate, src_params)?;
+            let (tmp_w, tmp_h) = pre_region.map_or((src_w, src_h), |g| (g.width, g.height));
+            let mut t = Self::reuse_or_alloc_image(cached_tmp.take(), tmp_w, tmp_h, intermediate)?;
+            #[cfg(test)]
+            {
+                self.last_tmp_dims = Some((tmp_w, tmp_h));
+            }
+            match pre_region {
+                Some(g) => {
+                    let mut sub = Self::reuse_or_alloc_image(
+                        self.convert_src_sub.take(),
+                        g.width,
+                        g.height,
+                        src_fmt,
+                    )?;
+                    Self::extract_nv_region(src, &mut sub, src_fmt, g)?;
+                    Self::convert_format_pf(&sub, &mut t, src_fmt, intermediate, src_params)?;
+                    self.convert_src_sub = Some(sub);
+                }
+                None => Self::convert_format_pf(src, &mut t, src_fmt, intermediate, src_params)?,
+            }
             Some(t)
         } else {
             None
+        };
+
+        // The intermediate now starts at `grown`'s origin rather than the
+        // frame's, so rebase the source crop into its coordinates for the
+        // resize step. The crop's size — and therefore the resize scale, the
+        // filter coefficients, and every output pixel — is unchanged.
+        let crop = match (pre_region, crop.src_rect) {
+            (Some(g), Some(r)) => ResolvedCrop {
+                src_rect: Some(Rect {
+                    left: r.left - g.left,
+                    top: r.top - g.top,
+                    ..r
+                }),
+                ..crop
+            },
+            _ => crop,
         };
         let (tmp, tmp_fmt): (&Tensor<u8>, PixelFormat) = match &tmp_holder {
             Some(t) => (t, intermediate),

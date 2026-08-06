@@ -4682,4 +4682,241 @@ mod cpu_tests {
             );
         }
     }
+
+    /// Build a `w`x`h` tensor in `fmt` whose every mapped byte follows a
+    /// deterministic gradient, so neighbouring pixels differ and any misplaced
+    /// filter tap shows up as a byte difference.
+    fn gradient_image(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
+        let t = TensorDyn::image(
+            w,
+            h,
+            fmt,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let u8t = t.as_u8().unwrap();
+            let mut map = u8t.map_mut().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 7 + i / w * 13) & 0xFF) as u8;
+            }
+        }
+        t
+    }
+
+    /// The crop-sized pre-resize intermediate must be byte-identical to the
+    /// pre-Task-4 full-frame intermediate for crops flush against every frame
+    /// edge — the cases where the halo clamps against the frame bounds instead
+    /// of finding real neighbouring pixels.
+    ///
+    /// The reference is the old algorithm rebuilt from the public API: convert
+    /// the whole frame once into the packed-RGB intermediate, then apply the
+    /// same crop+resize to *that* tensor. `Rgb -> Rgb` needs no intermediate,
+    /// so the reference convert runs the identical resize against a full-frame
+    /// source — exactly what the NV source used to do internally. Any halo
+    /// arithmetic error (too small, mis-snapped, or mis-rebased) makes the two
+    /// differ. This lives here rather than in `tests/crop_golden.rs` because it
+    /// also asserts the shrink actually happened, via the crate-private
+    /// `last_tmp_dims`, which an integration test cannot reach.
+    #[test]
+    fn crop_edge_matches_full_frame_intermediate() {
+        const SRC_W: usize = 640;
+        const SRC_H: usize = 480;
+        const CW: usize = 128;
+        const CH: usize = 96;
+
+        for src_fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+            let mut converter = CPUProcessor::default();
+            let src = gradient_image(SRC_W, SRC_H, src_fmt);
+
+            // The pre-Task-4 intermediate: the whole frame, converted once.
+            let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
+            converter
+                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+
+            let origins = [
+                (0, 0),                   // top-left corner
+                (SRC_W - CW, 0),          // top-right, flush right
+                (0, SRC_H - CH),          // bottom-left, flush bottom
+                (SRC_W - CW, SRC_H - CH), // bottom-right, flush both
+                (101, 53),                // interior, odd on both axes
+            ];
+            for (left, top) in origins {
+                for (dst_w, dst_h) in [(CW, CH), (CW / 2, CH / 2)] {
+                    let crop = Crop::new()
+                        .with_source(Some(Region::new(left, top, CW, CH)))
+                        .with_fit(crate::Fit::Stretch);
+
+                    let mut actual = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                    converter
+                        .convert(&src, &mut actual, Rotation::None, Flip::None, crop)
+                        .unwrap();
+                    let dims = converter.last_tmp_dims();
+
+                    let mut expect = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                    converter
+                        .convert(&full, &mut expect, Rotation::None, Flip::None, crop)
+                        .unwrap();
+
+                    let case =
+                        format!("{src_fmt:?} crop=({left},{top},{CW},{CH}) dst={dst_w}x{dst_h}");
+                    assert_eq!(
+                        actual.as_u8().unwrap().map().unwrap().to_vec(),
+                        expect.as_u8().unwrap().map().unwrap().to_vec(),
+                        "crop-sized intermediate changed output bytes for {case}"
+                    );
+
+                    // ...and the intermediate really did shrink to the crop.
+                    let (tw, th) = dims
+                        .unwrap_or_else(|| panic!("{case}: expected a pre-resize intermediate"));
+                    assert!(
+                        tw < SRC_W && th < SRC_H,
+                        "{case}: intermediate {tw}x{th} did not shrink below the frame"
+                    );
+                    assert!(
+                        tw >= CW && th >= CH,
+                        "{case}: intermediate {tw}x{th} is smaller than the crop"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A multiplane (separate luma/chroma tensors) NV12 source must extract the
+    /// same crop as the contiguous layout — the two take different branches in
+    /// `extract_nv_region` (own chroma stride vs. `split_semi_planar`), and only
+    /// the contiguous one is exercised by the golden matrix.
+    #[test]
+    fn crop_multiplane_nv12_matches_contiguous() {
+        const W: usize = 640;
+        const H: usize = 480;
+
+        let contiguous = gradient_image(W, H, PixelFormat::Nv12);
+        let (luma_bytes, chroma_bytes) = {
+            let u8t = contiguous.as_u8().unwrap();
+            let stride = u8t.effective_row_stride().unwrap_or(W);
+            let map = u8t.map().unwrap();
+            let s = map.as_slice();
+            (s[..stride * H].to_vec(), s[stride * H..].to_vec())
+        };
+
+        let multiplane = {
+            let luma = Tensor::<u8>::new(&[H, W], mem(), None).unwrap();
+            let chroma = Tensor::<u8>::new(&[H / 2, W], mem(), None).unwrap();
+            luma.map_mut().unwrap().as_mut_slice()[..luma_bytes.len()].copy_from_slice(&luma_bytes);
+            let n = chroma_bytes
+                .len()
+                .min(chroma.map().unwrap().as_slice().len());
+            chroma.map_mut().unwrap().as_mut_slice()[..n].copy_from_slice(&chroma_bytes[..n]);
+            TensorDyn::from(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap())
+        };
+
+        let mut converter = CPUProcessor::default();
+        // Cropped AND scaled, with an odd origin so the even-snap runs too.
+        let crop = Crop::new()
+            .with_source(Some(Region::new(101, 53, 320, 240)))
+            .with_fit(crate::Fit::Stretch);
+
+        let mut from_multi = gradient_image(160, 120, PixelFormat::Rgb);
+        converter
+            .convert(
+                &multiplane,
+                &mut from_multi,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .unwrap();
+        let mut from_contig = gradient_image(160, 120, PixelFormat::Rgb);
+        converter
+            .convert(
+                &contiguous,
+                &mut from_contig,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .unwrap();
+
+        assert_eq!(
+            from_multi.as_u8().unwrap().map().unwrap().to_vec(),
+            from_contig.as_u8().unwrap().map().unwrap().to_vec(),
+            "multiplane NV12 crop extraction diverged from the contiguous layout"
+        );
+    }
+
+    /// A cropped **and scaled** convert must size its pre-resize intermediate
+    /// to the crop (plus the resize filter's halo), not to the whole frame.
+    ///
+    /// 4032x2268 NV12 -> crop (512, 512, 640, 640) -> 320x320 Rgb: the crop is
+    /// scaled 2:1, so Task 3's scale-identity fused path does not swallow it
+    /// and the general pipeline's pre-resize intermediate is exercised. The
+    /// full frame is 9.1 MPix against the crop's 0.41 MPix — a ~22x
+    /// difference, so the assertion is about proportionality, not an exact
+    /// halo width (which is an implementation detail of the configured
+    /// filter).
+    #[test]
+    fn pre_resize_intermediate_is_crop_sized() {
+        const SRC_W: usize = 4032;
+        const SRC_H: usize = 2268;
+        const CROP: (usize, usize, usize, usize) = (512, 512, 640, 640);
+
+        let mut converter = CPUProcessor::default();
+        let src = TensorDyn::image(
+            SRC_W,
+            SRC_H,
+            PixelFormat::Nv12,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let u8t = src.as_u8().unwrap();
+            let mut map = u8t.map_mut().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 7 + i / SRC_W * 13) & 0xFF) as u8;
+            }
+        }
+
+        let mut dst = TensorDyn::image(
+            320,
+            320,
+            PixelFormat::Rgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new()
+            .with_source(Some(Region::new(CROP.0, CROP.1, CROP.2, CROP.3)))
+            .with_fit(crate::Fit::Stretch);
+
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let dims = converter
+            .last_tmp_dims()
+            .expect("a cropped NV12->Rgb scaled convert needs a pre-resize intermediate");
+        assert_ne!(
+            dims,
+            (SRC_W, SRC_H),
+            "the pre-resize intermediate is still frame-sized"
+        );
+        // Crop-sized: at least the crop, and at most the crop plus a small
+        // filter halo on each side. 16px of slack per side is far more than
+        // any supported filter needs at this 2:1 scale, and far less than the
+        // frame.
+        assert!(
+            (CROP.2..=CROP.2 + 32).contains(&dims.0) && (CROP.3..=CROP.3 + 32).contains(&dims.1),
+            "pre-resize intermediate {dims:?} is not crop-sized \
+             (expected ~{}x{} + filter halo)",
+            CROP.2,
+            CROP.3
+        );
+    }
 }
