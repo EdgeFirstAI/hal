@@ -67,6 +67,17 @@ pub struct CPUProcessor {
     /// reuses the allocation instead of a fresh `Vec` per call (the stride
     /// alignment in this release makes that de-stride copy fire far more often).
     resize_destride_scratch: Vec<u8>,
+    /// Reusable scratch for de-striding a padded resize *destination* before
+    /// resize.
+    ///
+    /// `fast_image_resize` needs a tightly-packed output buffer; a padded
+    /// destination (a DMA pitch-aligned tensor, or a `view()` narrower than
+    /// its parent's row stride) is resized into this tight scratch first,
+    /// then copied back into the real destination row-by-row at its true
+    /// stride. Kept on the processor so the steady-state resize loop reuses
+    /// the allocation instead of a fresh `Vec` per call — mirrors
+    /// `resize_destride_scratch` on the source side.
+    resize_dst_destride_scratch: Vec<u8>,
     /// Reusable cache-resident scratch for the strip-fused NV→planar path
     /// (`convert_nv_to_planar_fused`): holds a single row strip of packed RGB
     /// (`STRIP_ROWS * width * 3` bytes). Keeping it on the processor avoids a
@@ -96,6 +107,7 @@ impl Clone for CPUProcessor {
             colors: self.colors,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
             convert_tmp: None,
             convert_tmp2: None,
@@ -307,6 +319,7 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
             convert_tmp: None,
             convert_tmp2: None,
@@ -326,6 +339,7 @@ impl CPUProcessor {
             colors: crate::DEFAULT_COLORS_U8,
             widen_scratch: None,
             resize_destride_scratch: Vec::new(),
+            resize_dst_destride_scratch: Vec::new(),
             nv_strip_scratch: Vec::new(),
             convert_tmp: None,
             convert_tmp2: None,

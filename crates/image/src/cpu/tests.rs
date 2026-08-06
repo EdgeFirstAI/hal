@@ -4339,4 +4339,97 @@ mod cpu_tests {
             "view 1 window must match a standalone convert of src1"
         );
     }
+
+    /// A *real* resize (not a same-size format conversion) into a padded
+    /// destination view must land each row at the view's stride, not a
+    /// tight `dst_w * channels` pitch. Regression coverage for the
+    /// `(Rotation::None, Flip::None)` resize branch, which used to build its
+    /// `fast_image_resize::images::Image` straight from the padded map
+    /// (implicitly tight), smearing later rows across the padding.
+    #[test]
+    fn resize_into_padded_view_matches_standalone() {
+        let tile_w = 320usize;
+        let tile_h = 240usize;
+        let channels = 3usize; // PixelFormat::Rgb
+
+        // 640x480 Rgb source with non-uniform, deterministic content so a
+        // row-stride mismatch shows up as a byte mismatch rather than
+        // silently comparing padding zeros to padding zeros.
+        let mut src = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let mut m = src.as_u8_mut().unwrap().map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+
+        let mut converter = CPUProcessor::default();
+        let mut do_convert = |dst: &mut TensorDyn| {
+            converter
+                .convert(&src, dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+        };
+
+        // Reference: standalone tight 320x240 destination.
+        let mut reference = TensorDyn::image(
+            tile_w,
+            tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        do_convert(&mut reference);
+        let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Parent: allocate wider than the tile (real spare capacity), narrow
+        // the logical width back to `tile_w` via `configure_image` (which
+        // keeps the wider physical allocation), then record a row stride
+        // padded +16 bytes past the tight `tile_w * channels` pitch — the
+        // shape a DMA pitch-aligned destination would present.
+        let alloc_w = tile_w + 64;
+        let mut parent = TensorDyn::image(
+            alloc_w,
+            2 * tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        parent
+            .configure_image(tile_w, 2 * tile_h, PixelFormat::Rgb)
+            .unwrap();
+        let padded_stride = tile_w * channels + 16;
+        parent.set_row_stride(padded_stride).unwrap();
+
+        // Second band: rows [tile_h, 2*tile_h) of the padded parent.
+        let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
+        do_convert(&mut view);
+
+        // Walk the view's window at the parent's real stride, comparing
+        // each row's tight `width * channels` bytes (skipping the padding)
+        // against the standalone reference.
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let band_offset = tile_h * padded_stride;
+        let tight_row = tile_w * channels;
+        for row in 0..tile_h {
+            let parent_row_start = band_offset + row * padded_stride;
+            let parent_row = &parent_bytes[parent_row_start..parent_row_start + tight_row];
+            let ref_row = &reference_bytes[row * tight_row..(row + 1) * tight_row];
+            assert_eq!(
+                parent_row, ref_row,
+                "row {row} of the padded destination view must match the standalone convert"
+            );
+        }
+    }
 }

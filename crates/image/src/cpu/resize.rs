@@ -181,22 +181,72 @@ impl CPUProcessor {
 
             match (rotation, flip) {
                 (Rotation::None, Flip::None) => {
-                    let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
-                        dst_w as u32,
-                        dst_h as u32,
-                        &mut dst_map,
-                        src_type,
-                    )?;
+                    let tight_dst_stride = dst_w * channels;
+                    // `fast_image_resize` requires a tightly-packed output
+                    // buffer — it addresses rows by `row * width * bpp`, not
+                    // by the tensor's real row stride. Passing a padded
+                    // `dst_map` straight through (as the zero-copy path
+                    // below does) silently smears every row after the first
+                    // at the wrong offset. When the destination is padded
+                    // (a DMA pitch-aligned tensor, or a `view()` narrower
+                    // than its parent's stride), resize into a tight
+                    // scratch — seeded with the existing dst content so
+                    // pixels outside `dst_rect` (e.g. letterbox borders)
+                    // survive unchanged — then copy back row-by-row at the
+                    // real stride. Tight destinations keep the existing
+                    // zero-copy path unchanged.
+                    if dst_rs != tight_dst_stride {
+                        let need = dst_h * tight_dst_stride;
+                        self.resize_dst_destride_scratch.clear();
+                        self.resize_dst_destride_scratch.resize(need, 0u8);
+                        for row in 0..dst_h {
+                            let dst_row = &dst_map[row * dst_rs..row * dst_rs + tight_dst_stride];
+                            self.resize_dst_destride_scratch
+                                [row * tight_dst_stride..(row + 1) * tight_dst_stride]
+                                .copy_from_slice(dst_row);
+                        }
 
-                    let mut dst_view = fast_image_resize::images::CroppedImageMut::new(
-                        &mut dst_view,
-                        dst_rect.left as u32,
-                        dst_rect.top as u32,
-                        dst_rect.width as u32,
-                        dst_rect.height as u32,
-                    )?;
+                        let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
+                            dst_w as u32,
+                            dst_h as u32,
+                            &mut self.resize_dst_destride_scratch,
+                            src_type,
+                        )?;
 
-                    self.resizer.resize(&src_view, &mut dst_view, &options)?;
+                        let mut dst_view = fast_image_resize::images::CroppedImageMut::new(
+                            &mut dst_view,
+                            dst_rect.left as u32,
+                            dst_rect.top as u32,
+                            dst_rect.width as u32,
+                            dst_rect.height as u32,
+                        )?;
+
+                        self.resizer.resize(&src_view, &mut dst_view, &options)?;
+
+                        for row in 0..dst_h {
+                            let scratch_row = &self.resize_dst_destride_scratch
+                                [row * tight_dst_stride..(row + 1) * tight_dst_stride];
+                            dst_map[row * dst_rs..row * dst_rs + tight_dst_stride]
+                                .copy_from_slice(scratch_row);
+                        }
+                    } else {
+                        let mut dst_view = fast_image_resize::images::Image::from_slice_u8(
+                            dst_w as u32,
+                            dst_h as u32,
+                            &mut dst_map,
+                            src_type,
+                        )?;
+
+                        let mut dst_view = fast_image_resize::images::CroppedImageMut::new(
+                            &mut dst_view,
+                            dst_rect.left as u32,
+                            dst_rect.top as u32,
+                            dst_rect.width as u32,
+                            dst_rect.height as u32,
+                        )?;
+
+                        self.resizer.resize(&src_view, &mut dst_view, &options)?;
+                    }
                 }
                 (Rotation::Clockwise90, _) | (Rotation::CounterClockwise90, _) => {
                     let mut tmp = vec![0; dst_rs * dst_h];
