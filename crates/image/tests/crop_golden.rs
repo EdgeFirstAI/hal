@@ -11,15 +11,24 @@
 //! keep green — any behavioural change to cropped-convert byte output shows
 //! up here first.
 //!
-//! The fixtures are **per-architecture**: the `yuv` crate's NEON (aarch64)
-//! and AVX2/SSE (x86_64) kernels round YUV→RGB differently, so every
-//! NV-source case's bytes differ between the two (48 of 80 cases; the 32
-//! RGB-source resize-only cases are identical — `fast_image_resize` is
-//! arch-consistent). Both fixture files were generated from the PRE-change
-//! implementation at the Task 1 freeze commit: aarch64 on an Apple M2 Max
-//! (validated against Linux aarch64 NEON by CI), x86_64 in an AVX2 x86
-//! container from the same tree. Within one architecture the frozen bytes
-//! are the byte-exactness arbiter; neither file is ever regenerated.
+//! The fixtures are **per-architecture and per-kernel-path**: the `yuv`
+//! crate rounds YUV→RGB differently between its NEON+RDM (aarch64), plain
+//! NEON, and AVX2 (x86_64) kernels, selected at runtime by CPU feature
+//! detection — so every NV-source case's bytes differ between kernel paths
+//! (48 of 80 cases; the 32 RGB-source resize-only cases are identical —
+//! `fast_image_resize` is arch-consistent). Both fixture files were
+//! generated from the PRE-change implementation at the Task 1 freeze
+//! commit: aarch64 on an Apple M2 Max (RDM kernels — byte-identical on
+//! Linux aarch64 CI, i.MX 95 Cortex-A55, and RPi5 Cortex-A76, which all
+//! have `asimdrdm`), x86_64 in an AVX2 container from the same tree. On a
+//! CPU without the fixture's feature (e.g. i.MX 8M Plus Cortex-A53, no
+//! RDM) the matrix test SKIPS: the same code picks a different, equally
+//! correct kernel whose bytes cannot match a frozen file. Cropped-convert
+//! correctness there is proven by the oracle-based tests in the lib suite
+//! (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`,
+//! `crop_edge_matches_full_frame_intermediate`, …), which compare against
+//! references computed in the same run. Within one kernel path the frozen
+//! bytes are the byte-exactness arbiter; neither file is ever regenerated.
 
 use edgefirst_image::{CPUProcessor, Crop, Fit, Flip, ImageProcessorTrait, Region, Rotation};
 use edgefirst_tensor::{
@@ -188,6 +197,20 @@ const GOLDEN_JSON: &str = include_str!("data/crop_golden.aarch64.json");
 #[cfg(target_arch = "x86_64")]
 const GOLDEN_JSON: &str = include_str!("data/crop_golden.x86_64.json");
 
+/// Whether this CPU selects the same `yuv`-crate kernel path the fixture was
+/// generated under (see the module doc). When it doesn't, the frozen bytes
+/// are unmatchable by construction and the matrix test skips.
+fn cpu_matches_fixture_kernel_path() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("rdm")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+}
+
 #[test]
 #[ignore = "generator: writes tests/data/crop_golden.<arch>.json from the CURRENT implementation"]
 fn generate_golden() {
@@ -210,6 +233,16 @@ fn generate_golden() {
 
 #[test]
 fn cropped_convert_matches_golden() {
+    if !cpu_matches_fixture_kernel_path() {
+        eprintln!(
+            "crop_golden: SKIP — this CPU selects a different (equally correct) \
+             yuv-crate kernel path than the one the frozen fixtures were \
+             generated under; byte comparison is unmatchable by construction. \
+             Cropped-convert correctness here is covered by the oracle-based \
+             tests in the edgefirst-image lib suite."
+        );
+        return;
+    }
     let fixtures: Vec<Case> = serde_json::from_str(GOLDEN_JSON).unwrap();
     assert!(!fixtures.is_empty(), "golden fixture file is empty");
 
