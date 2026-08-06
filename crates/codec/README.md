@@ -110,10 +110,11 @@ let mut decoder = ImageDecoder::new();
 loop {
     let bytes = capture_frame();
     let info = src.load_image(&mut decoder, &bytes)?;
-    // convert() performs colour conversion (NV12 → RGB), resize, and any EXIF
-    // rotation/flip the decode reported.
-    processor.convert(&src, &mut dst, Rotation::None, Flip::None,
-        Crop::new(0, 0, info.width, info.height))?;
+    // convert() performs colour conversion (NV12 → RGB) and resize; the codec
+    // reports EXIF orientation in `info` but does not apply it, so pass it on.
+    let rot = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
+    let flip = if info.flip_horizontal { Flip::Horizontal } else { Flip::None };
+    processor.convert(&src, &mut dst, rot, flip, Crop::new())?;
 }
 ```
 

@@ -49,11 +49,13 @@ let mut dst =
 
 let mut decoder = ImageDecoder::new();
 
-// Hot loop: decode, then convert (colour + resize + any EXIF orientation).
+// Hot loop: decode, then convert (colour + resize). The codec reports EXIF
+// orientation in `info` but does not apply it — pass it to convert().
 let bytes = std::fs::read("image.jpg")?;
 let info = src.load_image(&mut decoder, &bytes)?;
-processor.convert(&src, &mut dst, Rotation::None, Flip::None,
-                  Crop::new(0, 0, info.width, info.height))?;
+let rotation = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
+let flip = if info.flip_horizontal { Flip::Horizontal } else { Flip::None };
+processor.convert(&src, &mut dst, rotation, flip, Crop::new())?;
 ```
 
 > **Why `create_image()`?** Creating tensors directly with `Tensor::new()` or
