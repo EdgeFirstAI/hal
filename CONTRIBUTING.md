@@ -179,7 +179,7 @@ test(image): per-architecture golden fixtures for cropped-convert
 docs: reconcile the three batch memory representations
 ```
 
-Release commits are their own shape: `Release v0.27.1`.
+Release commits are their own shape: `Release v0.28.0`.
 
 ### 6. Submit Pull Request
 

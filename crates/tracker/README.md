@@ -144,14 +144,14 @@ When used via `edgefirst-hal` or `edgefirst-decoder`, the `tracker` feature flag
 
 ```toml
 [dependencies]
-edgefirst-hal = { version = "0.27", features = ["tracker"] }
+edgefirst-hal = { version = "0.28", features = ["tracker"] }
 ```
 
 Or when depending on the decoder directly:
 
 ```toml
 [dependencies]
-edgefirst-decoder = { version = "0.27", features = ["tracker"] }
+edgefirst-decoder = { version = "0.28", features = ["tracker"] }
 ```
 
 The decoder exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation:

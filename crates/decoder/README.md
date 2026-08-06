@@ -284,7 +284,7 @@ The `tracker` feature adds `decode_tracked` to integrate object tracking directl
 Enable the feature in `Cargo.toml`:
 
 ```toml
-edgefirst-decoder = { version = "0.27", features = ["tracker"] }
+edgefirst-decoder = { version = "0.28", features = ["tracker"] }
 ```
 
 ### Usage

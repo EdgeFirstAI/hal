@@ -24,7 +24,7 @@ the crate exposes the types but no way to load a driver, so enable it unless you
 are supplying your own loader. The HAL's workspace dependency turns it on:
 
 ```toml
-edgefirst-egl = { version = "0.27", features = ["dynamic"] }
+edgefirst-egl = { version = "0.28", features = ["dynamic"] }
 ```
 
 The `1_0` through `1_5` features gate the EGL API version, cumulatively, and

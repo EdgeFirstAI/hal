@@ -18,7 +18,7 @@ matrix has not been re-collected since (Known Gap #17). YUYV→RGBA same-size co
 the Apple Silicon CPU path: **1.32×** at 1080p, **4.76×** at 4K.
 
 > **These results are two minor releases behind the workspace.** They were
-> collected on 0.25.0; the workspace is now on 0.27.1. Treat them as the last
+> collected on 0.25.0; the workspace is now on 0.28.0. Treat them as the last
 > known-good baseline rather than a description of current performance, and
 > re-collect before using them to argue a regression either way.
 
