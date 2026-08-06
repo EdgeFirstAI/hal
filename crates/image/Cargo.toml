@@ -114,6 +114,10 @@ name = "batch_convert_benchmark"
 harness = false
 
 [[bench]]
+name = "tiled_convert_benchmark"
+harness = false
+
+[[bench]]
 name = "opencv_benchmark"
 harness = false
 required-features = ["opencv"]

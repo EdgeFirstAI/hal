@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tracing spans on the tiling path** (`edgefirst-image`, `edgefirst-decoder`):
+  `image.plan_tiles`, `image.tile_one`, `image.tile_into`,
+  `decoder.tiled.lift`, and `decoder.tiled.merge` are now first-class spans,
+  and `image.convert.cpu.extract_region` covers the CPU crop-extraction
+  step introduced below. Matches the crate's existing convention that every
+  HAL code path is traced.
+- **`tiled_convert_benchmark`** (`edgefirst-image`): a self-contained
+  on-target benchmark demonstrating that CPU convert cost scales with the
+  requested crop/tile area rather than the source frame area — full-frame
+  4032×2268 NV12 → 640×640 versus an equivalent 640×640 crop taken from the
+  same frame (scale-identity fused path and a 2× downscale halo path). An
+  informational fourth group repeats the same cells on the OpenGL backend.
+
+### Changed
+
+- **GL renders `PlanarRgb` into heap (`Mem`) destinations** (`edgefirst-image`):
+  previously any planar destination outside DMA-BUF memory made the GL
+  backend decline the whole convert to CPU. GL now renders `PlanarRgb` into
+  heap destinations too, via a generalized two-pass plan shared across all
+  source formats, closing a latent geometry bug where the non-DMA planar
+  target was sized to a quarter of the destination width.
+- **CPU converts are proportional to the requested crop, not the source
+  frame** (`edgefirst-image`): the CPU pre-resize intermediate is now sized
+  to the crop plus an adaptive filter halo instead of the full frame, and
+  the fused NV→planar path accepts a source region directly (gated on scale
+  identity with chroma-aligned origins), so a small crop out of a large
+  frame no longer pays for decoding/resizing pixels outside the crop.
+  Byte-identical to the prior full-frame behaviour on all existing NV-family
+  golden outputs; see `tiled_convert_benchmark` above for the resulting
+  proportionality.
+
+### Fixed
+
+- **CPU resize into a padded destination view** (`edgefirst-image`): the
+  CPU resize path now honours the destination's view geometry (offset and
+  stride) instead of writing as if the view were the whole buffer, so
+  resizing into a sub-rectangle of a larger padded tensor no longer
+  corrupts neighboring rows.
+
 ## [0.27.1] - 2026-08-01
 
 ### Fixed
