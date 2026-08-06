@@ -77,15 +77,23 @@ pub(super) enum ConvertPlan {
     /// lowerings render genuine RGB in one pass instead — see
     /// `setup_renderbuffer_non_dma`/`setup_renderbuffer_from_pbo`.
     TwoPassPackedRgb,
-    /// NV*→planar on ANY lowering: pass 1 converts NV*→RGBA through the
-    /// full `select_nv_path` machinery (colorimetry-exact ShaderR8 +
-    /// Vivante carve-out), pass 2 deinterleaves RGBA into the planar
-    /// destination (`bind_dst` classifies pass 2's target the same way
-    /// `SinglePass` does, so a texture lowering reads back same as
-    /// `SinglePass` would). Also the Vivante GC7000UL single-pass GPU-hang
-    /// workaround (EDGEAI-1180). The single-pass planar shader has no route
-    /// for a semi-planar NV source: no multi-plane EGLImage/IOSurface
-    /// binding on ANGLE, and no upload path at all for a heap/Mem source.
+    /// Planar destination, driven by an ordinary packed convert: pass 1
+    /// renders the source into an intermediate RGBA texture via the full
+    /// `convert_to` machinery (any source format — `select_nv_path`'s
+    /// colorimetry-exact ShaderR8 + Vivante carve-out for NV*, the plain
+    /// upload/import path for everything else), pass 2 deinterleaves RGBA
+    /// into the planar destination (`bind_dst` classifies pass 2's target
+    /// the same way `SinglePass` does, so a texture lowering reads back
+    /// same as `SinglePass` would). Selected on EVERY lowering for NV*
+    /// sources, and additionally on texture lowerings for every source:
+    /// the single-pass planar shader (`draw_camera_texture_to_rgb_planar`)
+    /// exists only where `Platform::EXTERNAL_OES` is true (false on
+    /// ANGLE/Android — `texture_program_planar` is `None` there,
+    /// regardless of source format), and even where it exists its source
+    /// import is DMA-only, with no upload path for a heap/Mem source.
+    /// Zero-copy keeps the non-NV single-pass route (proven, EXTERNAL_OES
+    /// path with a DMA source). Also the Vivante GC7000UL single-pass
+    /// GPU-hang workaround for NV* (EDGEAI-1180).
     TwoPassNvPlanar,
 }
 
@@ -104,13 +112,24 @@ pub(super) fn plan_convert(
     if lowering == DstLowering::ZeroCopy && dst_fmt == PixelFormat::Rgb {
         return ConvertPlan::TwoPassPackedRgb;
     }
-    // NV*→planar needs the two-pass ShaderR8 route on EVERY lowering, not
-    // just zero-copy: the single-pass planar shader
-    // (`draw_camera_texture_to_rgb_planar`) samples the source through a
-    // generic EGLImage/IOSurface import, which has no multi-plane binding
-    // for semi-planar NV on ANGLE and no import path at all for a heap/Mem
-    // source on any platform. `select_nv_path`'s ShaderR8 upload (driven by
-    // pass 1's `convert_to`) is the only route that handles both.
+    // A texture-lowered (Mem/Pbo) planar destination has NO single-pass
+    // route for any source format: `texture_program_planar` (the
+    // EXTERNAL_OES planar shader `draw_camera_texture_to_rgb_planar`
+    // needs) is built only where `Platform::EXTERNAL_OES` is true — never
+    // on ANGLE or Android — and even on Linux (where it IS built) the
+    // source import (`get_or_create_egl_image`) is unconditionally
+    // DMA-only, so a heap/Mem source fails there too. The two-pass plan's
+    // pass 1 is the ordinary `convert_to` packed path, which already
+    // handles every source format (including a Mem source) on every
+    // platform.
+    if dst_fmt.layout() == PixelLayout::Planar && lowering != DstLowering::ZeroCopy {
+        return ConvertPlan::TwoPassNvPlanar;
+    }
+    // Zero-copy NV*→planar still needs the two-pass ShaderR8 route: the
+    // single-pass planar shader has no multi-plane EGLImage/IOSurface
+    // binding for semi-planar NV even when EXTERNAL_OES is available.
+    // Zero-copy non-NV→planar stays single-pass (proven EXTERNAL_OES +
+    // DMA-source route).
     if dst_fmt.layout() == PixelLayout::Planar
         && matches!(
             src_fmt,
@@ -425,32 +444,26 @@ mod tests {
             );
             assert_eq!(plan_convert(src, Rgba, ZeroCopy), ConvertPlan::SinglePass);
         }
-        // Texture lowerings: packed-RGB and non-NV→planar single-pass (the
-        // texture destination renders genuine RGB / the planar shader
-        // samples the source directly); NV*→planar still needs the two-pass
-        // ShaderR8 route — the single-pass planar shader has no source
-        // import for semi-planar NV on a texture-lowered destination either.
+        // Texture lowerings: packed-RGB single-pass (the texture destination
+        // renders genuine RGB); EVERY source→planar is two-pass regardless
+        // of format — the single-pass planar shader
+        // (`draw_camera_texture_to_rgb_planar`) needs
+        // `Platform::EXTERNAL_OES` (false on ANGLE/Android) AND a DMA
+        // source, neither of which a texture-lowered destination can rely
+        // on, so non-NV sources route through the same two-pass plan as NV*
+        // instead of single-pass.
         for lowering in [TextureMem, TexturePbo] {
-            for src in nv {
+            for src in nv.iter().chain(&non_nv) {
                 for dst in [PlanarRgb, PlanarRgba] {
                     assert_eq!(
-                        plan_convert(src, dst, lowering),
+                        plan_convert(*src, dst, lowering),
                         ConvertPlan::TwoPassNvPlanar,
                         "{src:?}->{dst:?} via {lowering:?}"
                     );
                 }
                 for dst in [Rgba, Bgra, Rgb, Grey] {
                     assert_eq!(
-                        plan_convert(src, dst, lowering),
-                        ConvertPlan::SinglePass,
-                        "{src:?}->{dst:?} via {lowering:?}"
-                    );
-                }
-            }
-            for src in non_nv {
-                for dst in [Rgba, Bgra, Rgb, PlanarRgb, Grey] {
-                    assert_eq!(
-                        plan_convert(src, dst, lowering),
+                        plan_convert(*src, dst, lowering),
                         ConvertPlan::SinglePass,
                         "{src:?}->{dst:?} via {lowering:?}"
                     );

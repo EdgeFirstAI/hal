@@ -3613,6 +3613,117 @@ mod gl_tests {
         );
     }
 
+    /// Non-NV companion to [`gl_planar_heap_matches_cpu`]: a packed Rgba
+    /// source into a heap PlanarRgb destination. Before the `plan_convert`
+    /// generalization (Task 5 fix round 1) this combination hit the
+    /// single-pass planar shader, which is unavailable on ANGLE/Android
+    /// (`Platform::EXTERNAL_OES == false` — see `ConvertPlan::TwoPassNvPlanar`'s
+    /// doc) and DMA-source-only on Linux — a heap Rgba source could reach
+    /// neither. Now routed through the same two-pass plan as the NV pair.
+    #[test]
+    fn gl_planar_heap_rgba_src_matches_cpu() {
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let src = crate::load_image_test_helper(
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
+            Some(PixelFormat::Rgba),
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+
+        let crop = Crop::letterbox([114, 114, 114, 255]);
+        let (dw, dh) = (640usize, 640usize);
+
+        let mut gl = match GLProcessorThreaded::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!("SKIPPED: {} - GL not available: {e}", function!());
+                return;
+            }
+        };
+        let mut gl_dst = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        gl.convert(&src, &mut gl_dst, Rotation::None, Flip::None, crop)
+            .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: GL convert failed: {e}"));
+
+        let mut cpu_dst = TensorDyn::image(
+            dw,
+            dh,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            None,
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        crate::cpu::CPUProcessor::new()
+            .convert(&src, &mut cpu_dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        compare_images(&gl_dst, &cpu_dst, 0.95, function!());
+    }
+
+    /// Steady-state companion to [`gl_planar_heap_rgba_src_matches_cpu`],
+    /// mirroring [`gl_planar_heap_does_not_fall_back`] for the non-NV source.
+    #[test]
+    fn gl_planar_heap_rgba_src_does_not_fall_back() {
+        use crate::ImageProcessor;
+
+        if !is_opengl_available() {
+            eprintln!("SKIPPED: {} - OpenGL not available", function!());
+            return;
+        }
+        let mut proc = ImageProcessor::new().unwrap();
+        if proc.opengl.is_none() {
+            eprintln!(
+                "SKIPPED: {} - ImageProcessor resolved no GL backend",
+                function!()
+            );
+            return;
+        }
+
+        let src = crate::load_image_test_helper(
+            &edgefirst_bench::testdata::read("giraffe.jpg"),
+            Some(PixelFormat::Rgba),
+            Some(TensorMemory::Mem),
+        )
+        .unwrap();
+        let crop = Crop::letterbox([114, 114, 114, 255]);
+        let (dw, dh) = (640usize, 640usize);
+        let mut dst = proc
+            .create_image(
+                dw,
+                dh,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+
+        let before = proc.convert_fallback_count();
+        for i in 0..10 {
+            proc.convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| panic!("rgba->PlanarRgb@Mem: convert failed on iter {i}: {e}"));
+        }
+        let after = proc.convert_fallback_count();
+        assert_eq!(
+            after - before,
+            0,
+            "GL planar heap (Rgba src) convert fell back {} time(s) over 10 iterations \
+             (before={before}, after={after})",
+            after - before
+        );
+    }
+
     /// Compare fused GL proto rendering against hybrid (CPU materialize + GL overlay).
     ///
     /// Both paths should produce visually similar output. Differences arise from
