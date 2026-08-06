@@ -5,10 +5,21 @@
 //! **before** any crop-contract implementation work starts.
 //!
 //! `generate_golden` (marked `#[ignore]`) regenerates
-//! `tests/data/crop_golden.json` from whatever the CPU backend currently
-//! produces. `cropped_convert_matches_golden` replays the same matrix against
-//! the fixture and is the guard later crop-contract tasks must keep green —
-//! any behavioural change to cropped-convert byte output shows up here first.
+//! `tests/data/crop_golden.<arch>.json` from whatever the CPU backend
+//! currently produces. `cropped_convert_matches_golden` replays the same
+//! matrix against the fixture and is the guard later crop-contract tasks must
+//! keep green — any behavioural change to cropped-convert byte output shows
+//! up here first.
+//!
+//! The fixtures are **per-architecture**: the `yuv` crate's NEON (aarch64)
+//! and AVX2/SSE (x86_64) kernels round YUV→RGB differently, so every
+//! NV-source case's bytes differ between the two (48 of 80 cases; the 32
+//! RGB-source resize-only cases are identical — `fast_image_resize` is
+//! arch-consistent). Both fixture files were generated from the PRE-change
+//! implementation at the Task 1 freeze commit: aarch64 on an Apple M2 Max
+//! (validated against Linux aarch64 NEON by CI), x86_64 in an AVX2 x86
+//! container from the same tree. Within one architecture the frozen bytes
+//! are the byte-exactness arbiter; neither file is ever regenerated.
 
 use edgefirst_image::{CPUProcessor, Crop, Fit, Flip, ImageProcessorTrait, Region, Rotation};
 use edgefirst_tensor::{
@@ -168,13 +179,25 @@ fn generate_cases() -> Vec<Case> {
     cases
 }
 
+/// The architecture-specific fixture, as a compiled-in string. Architectures
+/// without a frozen fixture fail to compile here deliberately: freeze one
+/// from the pre-change implementation before enabling the guard on a new
+/// architecture, never from a tree with crop-contract work already applied.
+#[cfg(target_arch = "aarch64")]
+const GOLDEN_JSON: &str = include_str!("data/crop_golden.aarch64.json");
+#[cfg(target_arch = "x86_64")]
+const GOLDEN_JSON: &str = include_str!("data/crop_golden.x86_64.json");
+
 #[test]
-#[ignore = "generator: writes tests/data/crop_golden.json from the CURRENT implementation"]
+#[ignore = "generator: writes tests/data/crop_golden.<arch>.json from the CURRENT implementation"]
 fn generate_golden() {
     let cases = generate_cases();
     assert!(!cases.is_empty(), "no golden cases were generated");
 
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/crop_golden.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "tests/data/crop_golden.{}.json",
+        std::env::consts::ARCH
+    ));
     let file = std::fs::File::create(&path)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", path.display()));
     serde_json::to_writer_pretty(file, &cases).unwrap();
@@ -187,7 +210,7 @@ fn generate_golden() {
 
 #[test]
 fn cropped_convert_matches_golden() {
-    let fixtures: Vec<Case> = serde_json::from_str(include_str!("data/crop_golden.json")).unwrap();
+    let fixtures: Vec<Case> = serde_json::from_str(GOLDEN_JSON).unwrap();
     assert!(!fixtures.is_empty(), "golden fixture file is empty");
 
     // Sanity: fixtures must have distinct checksums (cases actually differ),
