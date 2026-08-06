@@ -32,7 +32,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Tensor(e) => write!(f, "Tensor error: {e:?}"),
+            // Display, not Debug: variants with a hand-written Display arm
+            // (UnknownBufferType's hex magic, InsufficientCapacity,
+            // RegionOutOfBounds, BatchIndexOutOfBounds) render legibly, and
+            // the rest fall back to Debug inside tensor::Error's own Display.
+            Error::Tensor(e) => write!(f, "Tensor error: {e}"),
             Error::UnsupportedMemoryType(msg) => write!(f, "Invalid memory type: {msg}"),
             Error::UnsupportedDataType(msg) => write!(f, "Invalid data type: {msg}"),
             Error::TensorMap(msg) => write!(f, "Tensor map error: {msg}"),
@@ -737,6 +741,19 @@ impl PyTensor {
         Ok(PyTensor(tensor))
     }
 
+    /// Import an existing buffer as a tensor, without copying.
+    ///
+    /// The buffer type is detected, not chosen. On Linux a `dma_buf` fd
+    /// imports as `TensorMemory.DMA` and a tmpfs fd (`/dev/shm` or `memfd`)
+    /// as `TensorMemory.SHM`, decided by filesystem magic; any other
+    /// filesystem raises `RuntimeError` rather than silently falling back to
+    /// shared memory. On macOS the fd is always imported as SHM.
+    ///
+    /// The fd is `dup()`'d immediately — the caller retains ownership of the
+    /// original and must close it.
+    ///
+    /// Check `tensor.memory` if you require zero-copy; a successful import
+    /// is not by itself proof of DMA backing.
     #[cfg(unix)]
     #[staticmethod]
     #[pyo3(signature = (fd, shape, dtype = "float32", name = None))]

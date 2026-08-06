@@ -789,14 +789,45 @@ class Tensor:
             name: None | str = None,
         ) -> Tensor: ...
         """
-        Create a new tensor using the given file descriptor, shape, and optional
-        name. If no name is given, a random name will be generated.
+        Import an existing buffer as a tensor, without copying. If no name is
+        given, a random name will be generated.
 
-        Inspects the file descriptor to determine the appropriate tensor type
-        (DMA or SHM) based on the device major and minor numbers.
+        The buffer type is **detected, not chosen**. On Linux it is determined
+        by the file descriptor's filesystem magic:
+
+        =========================================  ===================
+        File descriptor                            ``Tensor.memory``
+        =========================================  ===================
+        ``dma_buf`` (``DMA_BUF_MAGIC``)            ``TensorMemory.DMA``
+        ``tmpfs`` — ``/dev/shm`` and ``memfd``     ``TensorMemory.SHM``
+        anything else                              raises (see below)
+        =========================================  ===================
+
+        On macOS the fd is always imported as ``TensorMemory.SHM``.
+
+        Both supported types are identified positively; an unrecognized
+        filesystem raises rather than silently falling back to shared memory.
+        That fallback would not fail loudly — a DMA-BUF is mmap-able, so it
+        would import as a working tensor that merely isn't DMA, and the lost
+        zero-copy would only surface later as ``ImageProcessor.import_image``
+        refusing the buffer.
 
         The fd is ``dup()``'d immediately — the caller retains ownership
         of the original fd and must close it when done.
+
+        Raises:
+            RuntimeError: The fd could not be imported. Most commonly its
+                buffer type could not be determined because it is neither a
+                DMA-BUF nor tmpfs-backed (a regular file, a pipe or socket, or
+                a ``MFD_HUGETLB`` memfd) — the message reports the observed
+                filesystem magic, e.g. ``Tensor error: UnknownBufferType: fd
+                is on an unrecognized filesystem (magic 0x50495045)``. Also
+                raised for a negative ``fd``, an unsupported ``dtype``, a
+                shape larger than the buffer, or a failed syscall.
+
+        Note:
+            Check ``tensor.memory`` if you require zero-copy — a successful
+            import is not by itself proof of DMA backing.
         """
 
         @property

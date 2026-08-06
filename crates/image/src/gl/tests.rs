@@ -5,8 +5,6 @@
 #[cfg(feature = "opengl")]
 #[allow(deprecated)]
 mod gl_tests {
-    #[cfg(all(target_os = "linux", feature = "dma_test_formats"))]
-    use crate::opengl_headless::processor::GLProcessorST;
     #[cfg(target_os = "linux")]
     use crate::{probe_egl_displays, EglDisplayKind};
     use crate::{Crop, Flip, GLProcessorThreaded, ImageProcessorTrait, Rotation};

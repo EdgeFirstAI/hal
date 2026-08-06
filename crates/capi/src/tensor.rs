@@ -15,6 +15,34 @@ use libc::{c_char, c_int, size_t};
 #[cfg(unix)]
 use std::os::fd::IntoRawFd;
 
+/// Map an `edgefirst_tensor::Error` to a POSIX errno, consistent with
+/// `image_err_to_errno` in `tiling.rs`: caller-fault argument/shape/fd-type
+/// -> EINVAL, unsupported -> ENOTSUP, I/O -> the underlying errno,
+/// otherwise EIO.
+///
+/// Buffer-type misidentification is a caller fault, not an I/O failure —
+/// handing `hal_tensor_from_fd()` a pipe, a socket, a regular file, or a
+/// `MFD_HUGETLB` memfd means the fd is the wrong *kind* of thing, which is
+/// what EINVAL is for.
+#[cfg(unix)]
+fn tensor_err_to_errno(e: &edgefirst_tensor::Error) -> c_int {
+    use edgefirst_tensor::Error as E;
+    match e {
+        E::InvalidArgument(_)
+        | E::InvalidShape(_)
+        | E::ShapeMismatch(_)
+        | E::InvalidSize(_)
+        | E::InvalidMemoryType(_) => libc::EINVAL,
+        #[cfg(target_os = "linux")]
+        E::UnknownBufferType(_) | E::UnknownDeviceType(_, _) => libc::EINVAL,
+        E::NotImplemented(_) => libc::ENOTSUP,
+        E::InsufficientCapacity { .. } => libc::ENOSPC,
+        E::IoError(io) => io.raw_os_error().unwrap_or(libc::EIO),
+        E::NixError(errno) => *errno as c_int,
+        _ => libc::EIO,
+    }
+}
+
 /// Data type of tensor elements.
 ///
 /// Used to query the type of elements stored in a tensor and interpret
@@ -455,11 +483,23 @@ pub unsafe extern "C" fn hal_tensor_new(
     Box::into_raw(Box::new(HalTensor { inner: tensor }))
 }
 
-/// Create a new tensor from an existing file descriptor (Linux only).
+/// Create a new tensor from an existing file descriptor (Unix only).
 ///
 /// The fd is duplicated internally — the caller retains ownership of the
 /// original fd and must close it when done. This is consistent with all
 /// other fd-accepting APIs in this library.
+///
+/// **Buffer type is detected, not specified.** On Linux the backend is
+/// determined by the fd's filesystem magic: a `dma_buf` fd
+/// (`DMA_BUF_MAGIC`) becomes a DMA tensor, a tmpfs fd (`TMPFS_MAGIC` —
+/// both `/dev/shm` and `memfd`) becomes an SHM tensor, and any other
+/// filesystem is **rejected** rather than assumed to be shared memory.
+/// On macOS/iOS/Android the fd is always adopted as SHM.
+///
+/// Call `hal_tensor_memory()` on the result if the buffer type matters —
+/// for example before handing the tensor to `hal_import_image()`, which
+/// requires DMA-backed planes. A successful return is not by itself proof
+/// of DMA backing.
 ///
 /// **EGL image cache interaction**: Each call to this function allocates a
 /// new `BufferIdentity` with a globally unique ID. The OpenGL backend uses
@@ -476,14 +516,22 @@ pub unsafe extern "C" fn hal_tensor_new(
 /// `convert()` is in progress.
 ///
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param fd File descriptor for DMA/SHM buffer (caller retains ownership)
+/// @param fd File descriptor for a DMA-BUF or tmpfs/shm buffer (caller
+///           retains ownership)
 /// @param shape Array of dimension sizes (ndim elements)
 /// @param ndim Number of dimensions (1-8)
 /// @param name Optional tensor name for debugging (can be NULL)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
-/// - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
-/// - EIO: Failed to duplicate fd or create tensor
+/// - EINVAL: Invalid argument — NULL shape, ndim is 0 or > 8, negative fd,
+///   a shape that does not fit the buffer, or an fd whose buffer type could
+///   not be determined because it is neither a DMA-BUF nor tmpfs-backed
+///   (e.g. a regular file, a pipe or socket, or a `MFD_HUGETLB` memfd).
+///   The last case means the fd is the wrong *kind* of object; enable debug
+///   logging to see the observed filesystem magic.
+/// - ENOSPC: The buffer is smaller than the requested shape requires
+/// - EIO: Failed to duplicate the fd, or the import failed for another
+///   reason
 /// - ENOTSUP: Not supported on this platform (non-Unix)
 #[no_mangle]
 pub unsafe extern "C" fn hal_tensor_from_fd(
@@ -510,10 +558,10 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
         };
         let dt: DType = dtype.into();
 
-        let tensor = try_or_null!(
-            TensorDyn::from_fd(owned_fd, shape_slice, dt, name_opt),
-            libc::EIO
-        );
+        let tensor = match TensorDyn::from_fd(owned_fd, shape_slice, dt, name_opt) {
+            Ok(t) => t,
+            Err(e) => return set_error_null(tensor_err_to_errno(&e)),
+        };
         Box::into_raw(Box::new(HalTensor { inner: tensor }))
     }
     #[cfg(not(unix))]

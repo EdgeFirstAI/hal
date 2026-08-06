@@ -95,6 +95,26 @@ must `cargo build` first.
 - **Hardware gates** — `test_neutron_dmabuf*` requires a live TFLite
   delegate, model, and the i.MX 95 NPU device tree. Run on target with
   `NEUTRON_ENABLE_ZERO_COPY=1`.
+- **`hal_tensor_from_fd` import tests skip without DMA-heap access.**
+  `tensor_from_fd_dma_roundtrip` asserts that a DMA-BUF fd imports as
+  `HAL_TENSOR_MEMORY_DMA` through the ABI — the C-side guard against the
+  buffer-type misclassification fixed in TOP2-833. It self-skips where
+  `hal_tensor_new(..., HAL_TENSOR_MEMORY_DMA, ...)` returns NULL, which on
+  a typical workstation means the DMA-heap node is root-only, so an
+  unprivileged run reports `[SKIP]` and proves nothing. Run the binary
+  under `sudo` to get real coverage:
+
+  ```bash
+  cargo build -p edgefirst-hal-capi
+  # cargo emits libedgefirst_hal.so but the cdylib's SONAME is
+  # libedgefirst_hal.so.0 — link the two before running:
+  ln -sf libedgefirst_hal.so target/debug/libedgefirst_hal.so.0
+  make -C crates/capi/tests test_tensor      # unprivileged: DMA cases skip
+  sudo ./crates/capi/build/test_tensor       # privileged: DMA cases run
+  ```
+
+  `tensor_from_fd_unknown_type_einval` needs no privileges — it feeds a
+  pipe fd and asserts `NULL` + `EINVAL`.
 - **No special features required** for the Rust-side tests; default
   features build the full FFI surface.
 - **The C suite is gcc-built and invisible to cargo.** The `test_*.c`

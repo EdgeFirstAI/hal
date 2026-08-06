@@ -13,6 +13,15 @@ pub enum Error {
     ShapeMismatch(String),
     #[cfg(target_os = "linux")]
     UnknownDeviceType(u64, u64),
+    /// An imported fd sits on a filesystem we cannot classify as either a
+    /// DMA-BUF (`DMA_BUF_MAGIC`) or shared memory (`TMPFS_MAGIC`).
+    ///
+    /// Carries the `f_type` magic reported by `fstatfs`, normalized to the
+    /// 32-bit unsigned value used by `include/uapi/linux/magic.h`, so it can
+    /// be cross-referenced against that header directly on both 32- and
+    /// 64-bit targets.
+    #[cfg(target_os = "linux")]
+    UnknownBufferType(u32),
     InvalidMemoryType(String),
     /// The GL context backing a PBO tensor has been destroyed.
     PboDisconnected,
@@ -95,6 +104,12 @@ impl std::fmt::Display for Error {
             Error::BatchIndexOutOfBounds { index, batch } => write!(
                 f,
                 "batch index {index} out of bounds for batch size {batch}"
+            ),
+            #[cfg(target_os = "linux")]
+            Error::UnknownBufferType(magic) => write!(
+                f,
+                "UnknownBufferType: fd is on an unrecognized filesystem \
+                 (magic {magic:#010x}); expected a DMA-BUF or tmpfs/shm fd"
             ),
             _ => write!(f, "{self:?}"),
         }
