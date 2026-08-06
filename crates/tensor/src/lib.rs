@@ -1271,13 +1271,32 @@ use nix::sys::stat::{major, minor};
 /// This is stable UAPI and is the only reliable way to recognize a DMA-BUF
 /// fd — see [`TensorStorage::from_fd`] for why `st_dev` cannot be used.
 #[cfg(target_os = "linux")]
-const DMA_BUF_MAGIC: i64 = 0x444d_4142;
+const DMA_BUF_MAGIC: u32 = 0x444d_4142;
 
 /// Filesystem magic of tmpfs, from `include/uapi/linux/magic.h`
 /// (`TMPFS_MAGIC`). Covers both POSIX `shm_open` segments under `/dev/shm`
 /// and anonymous `memfd_create` files.
 #[cfg(target_os = "linux")]
-const TMPFS_MAGIC: i64 = 0x0102_1994;
+const TMPFS_MAGIC: u32 = 0x0102_1994;
+
+/// Normalize a raw `fstatfs` `f_type` to the 32-bit unsigned magic that
+/// `include/uapi/linux/magic.h` documents.
+///
+/// The width and signedness of `f_type` are target-dependent: `__fsword_t`
+/// on Linux/gnu (`i64` on 64-bit, `i32` on 32-bit targets such as armv7,
+/// i686 and aarch64-ilp32), `c_int` on uclibc, `c_ulong` on musl, and
+/// `c_uint` on s390x. Where it is signed and 32 bits wide, widening it
+/// sign-extends every magic with bit 31 set — hugetlbfs (`0x958458f6`),
+/// btrfs (`0x9123683e`), f2fs (`0xf2f52010`) — which would make the value
+/// reported by [`Error::UnknownBufferType`] impossible to find in the
+/// header the docs point callers at.
+///
+/// Every magic is a 32-bit quantity, so truncating back to `u32` recovers
+/// the true value from all four representations and loses nothing.
+#[cfg(target_os = "linux")]
+const fn fs_magic(raw: i64) -> u32 {
+    raw as u32
+}
 
 pub trait TensorTrait<T>: Send + Sync
 where
@@ -1338,9 +1357,10 @@ where
     ///
     /// * [`Error::UnknownBufferType`] - the fd is on a filesystem that is
     ///   neither `dma_buf` nor `tmpfs`, so its buffer type cannot be
-    ///   determined. Carries the observed `fstatfs` magic for diagnosis.
-    ///   Typical causes: a regular file, a pipe or socket, or a
-    ///   `MFD_HUGETLB` memfd (hugetlbfs, not tmpfs). Linux only.
+    ///   determined. Carries the observed `fstatfs` magic as a `u32`,
+    ///   normalized so it can be looked up in `magic.h` directly on both
+    ///   32- and 64-bit targets. Typical causes: a regular file, a pipe or
+    ///   socket, or a `MFD_HUGETLB` memfd (hugetlbfs, not tmpfs). Linux only.
     /// * [`Error::UnknownDeviceType`] - the fd's `st_dev` major is non-zero,
     ///   i.e. it lives on a real block device rather than an anonymous or
     ///   in-memory filesystem. Linux only.
@@ -1874,7 +1894,7 @@ where
             // rather than guessed at. Falling back to SHM would "work" — a
             // DMA-BUF is mmap-able, and even a pipe imports as a zero-length
             // tensor — which is exactly why it must not be the default.
-            let magic = fstatfs(&fd)?.filesystem_type().0 as i64;
+            let magic = fs_magic(fstatfs(&fd)?.filesystem_type().0 as i64);
 
             log::debug!(
                 "Creating tensor from fd: major={major}, minor={minor}, magic={magic:#010x}"
@@ -6108,6 +6128,55 @@ mod tests {
             "File descriptor leak detected: {} -> {}",
             start_open_fds, end_open_fds
         );
+    }
+
+    /// A filesystem magic must report its true 32-bit value regardless of
+    /// how wide, and how signed, `fstatfs`'s `f_type` is on the target.
+    ///
+    /// `fs_type_t` is `__fsword_t` on Linux/gnu — `i64` on 64-bit but `i32`
+    /// on 32-bit (armv7, i686, aarch64-ilp32) — `c_int` on uclibc, and
+    /// unsigned on musl and s390x. Widening a *signed* 32-bit `f_type`
+    /// sign-extends every magic with bit 31 set, so a naive widening cast
+    /// reports e.g. `0xffffffff958458f6` for hugetlbfs. The docs tell
+    /// callers to look the reported value up in `include/uapi/linux/magic.h`,
+    /// so a sign-extended value is actively misleading.
+    ///
+    /// This cannot be reproduced on a 64-bit host — the defect only exists
+    /// where `f_type` is a signed 32-bit type — so the test drives the
+    /// conversion directly with the value such a target would produce.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_fs_magic_normalizes_sign_extended_values() {
+        // Magics whose bit 31 is set. HUGETLBFS is the one that matters
+        // most in practice: a MFD_HUGETLB memfd is the likeliest fd to land
+        // in the UnknownBufferType arm.
+        const HUGETLBFS_MAGIC: u32 = 0x9584_58f6;
+        const F2FS_MAGIC: u32 = 0xf2f5_2010;
+        const BTRFS_MAGIC: u32 = 0x9123_683e;
+
+        for magic in [HUGETLBFS_MAGIC, F2FS_MAGIC, BTRFS_MAGIC] {
+            // 64-bit gnu: f_type is i64 and already holds the true value.
+            assert_eq!(fs_magic(i64::from(magic)), magic);
+
+            // 32-bit gnu / uclibc: f_type is i32, so the value arrives
+            // sign-extended once widened. It must still report its true
+            // 32 bits.
+            let sign_extended = i64::from(magic as i32);
+            assert!(sign_extended < 0, "{magic:#x} should have bit 31 set");
+            assert_eq!(
+                fs_magic(sign_extended),
+                magic,
+                "{magic:#x} must survive a signed 32-bit f_type"
+            );
+        }
+
+        // The two magics we actually classify on are below 2^31, so they are
+        // unaffected by signedness either way — this is why the DMA-vs-SHM
+        // decision is correct on 32-bit even without this normalization.
+        for magic in [DMA_BUF_MAGIC, TMPFS_MAGIC] {
+            assert!(magic < 0x8000_0000);
+            assert_eq!(fs_magic(i64::from(magic as i32)), magic);
+        }
     }
 
     /// A DMA-BUF fd must import as [`TensorMemory::Dma`].

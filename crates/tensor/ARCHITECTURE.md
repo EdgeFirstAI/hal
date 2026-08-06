@@ -171,6 +171,18 @@ device number.
 | `0x01021994` | `TMPFS_MAGIC` | `ShmTensor` (both `/dev/shm` and `memfd`) |
 | anything else | — | `Error::UnknownBufferType(magic)` |
 
+**Normalize `f_type` before comparing or reporting it.** Its width and
+signedness vary by target — `__fsword_t` on Linux/gnu (`i64` on 64-bit,
+`i32` on 32-bit), `c_int` on uclibc, `c_ulong` on musl, `c_uint` on s390x.
+Where it is signed and 32 bits wide, widening it sign-extends any magic with
+bit 31 set (hugetlbfs `0x958458f6`, btrfs `0x9123683e`, f2fs `0xf2f52010`),
+which would make the value carried by `UnknownBufferType` impossible to look
+up in `magic.h`. `fs_magic()` truncates back to `u32`, which is lossless for
+every magic and is why the variant's payload is `u32` rather than a wider
+signed type. The two magics we classify on are both below 2³¹, so the
+DMA-vs-SHM decision itself is unaffected by signedness — only the reported
+value was.
+
 **Do not classify on `st_dev`.** `dma_buf` files do not live on a real
 filesystem; they live on an internal kernel mount (`dma_buf_mnt`, created
 with `kern_mount`) whose superblock takes its device number from

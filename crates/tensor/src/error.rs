@@ -16,10 +16,12 @@ pub enum Error {
     /// An imported fd sits on a filesystem we cannot classify as either a
     /// DMA-BUF (`DMA_BUF_MAGIC`) or shared memory (`TMPFS_MAGIC`).
     ///
-    /// Carries the `f_type` magic reported by `fstatfs`; cross-reference it
-    /// against `include/uapi/linux/magic.h` to identify the filesystem.
+    /// Carries the `f_type` magic reported by `fstatfs`, normalized to the
+    /// 32-bit unsigned value used by `include/uapi/linux/magic.h`, so it can
+    /// be cross-referenced against that header directly on both 32- and
+    /// 64-bit targets.
     #[cfg(target_os = "linux")]
-    UnknownBufferType(i64),
+    UnknownBufferType(u32),
     InvalidMemoryType(String),
     /// The GL context backing a PBO tensor has been destroyed.
     PboDisconnected,
