@@ -4691,6 +4691,8 @@ mod cpu_tests {
     ///   luma/chroma rows are the planes' last rows, so any stride-chunking
     ///   past a row's true end (the bug the packing arm exists to avoid for
     ///   column-shifted crops) would read out of bounds or drop rows here.
+    /// - NV12 odd width, even height: zero-copy; the chroma read covers the
+    ///   trailing half-pair byte from the parent stride.
     /// - NV12 odd width AND odd height, not flush-bottom: MUST fall back to
     ///   the packing arm — the `yuv` crate's 4:2:0 odd-last-row handling
     ///   (`chunks_exact(..).remainder()` / `.last()`) is only correct on a
@@ -4700,27 +4702,45 @@ mod cpu_tests {
     /// - NV16 odd width/height: zero-copy is safe at any height (4:2:2 has
     ///   no vertical subsampling and no remainder path).
     ///
-    /// All must stay fused and byte-exact against the full-decode + manual
-    /// plane crop oracle.
+    /// All must stay fused. Even-height NV12 cases and NV16 are byte-exact
+    /// against the full-decode + manual plane crop oracle on every CPU. The
+    /// odd-height NV12 case compares its LAST row with a small tolerance
+    /// instead: an odd-height region decodes its final row through the
+    /// crate's halved-chroma-row kernel, while the even-height full-frame
+    /// oracle rendered that same source row through the paired kernel — and
+    /// on the plain-NEON (non-RDM) path those two kernels round ±1
+    /// differently (observed on i.MX 8M Plus Cortex-A53), so bit-equality
+    /// with this oracle is unattainable there by construction. All rows
+    /// before the last stay byte-exact, which still pins the addressing.
     #[test]
     fn left_edge_crop_zero_copy_arm_is_fused_and_correct() {
-        for (src_fmt, asset, region, label) in [
+        for (src_fmt, asset, region, last_row_tol, label) in [
             (
                 PixelFormat::Nv12,
                 "camera720p.nv12",
                 Region::new(0, 80, 640, 640),
+                0u8,
                 "nv12 flush-bottom",
             ),
             (
                 PixelFormat::Nv12,
                 "camera720p.nv12",
+                Region::new(0, 0, 641, 360),
+                0u8,
+                "nv12 odd-width even-height",
+            ),
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
                 Region::new(0, 0, 641, 361),
+                2u8,
                 "nv12 odd-width odd-height",
             ),
             (
                 PixelFormat::Nv16,
                 "camera720p.nv16",
                 Region::new(0, 0, 641, 361),
+                0u8,
                 "nv16 odd-width odd-height",
             ),
         ] {
@@ -4769,11 +4789,38 @@ mod cpu_tests {
             );
 
             let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
-            assert_eq!(
-                actual, reference,
-                "left-edge {label} zero-copy region output must match the \
-                 full-decode + manual plane crop reference"
-            );
+            if last_row_tol == 0 {
+                assert_eq!(
+                    actual, reference,
+                    "left-edge {label} region output must match the \
+                     full-decode + manual plane crop reference"
+                );
+            } else {
+                // Odd-height NV12: all rows but the last are byte-exact; the
+                // last row tolerates the paired-vs-halved chroma kernel
+                // rounding delta (see the test doc).
+                let (w, h) = (region.width, region.height);
+                let plane = w * h;
+                for p in 0..3 {
+                    for row in 0..h {
+                        let off = p * plane + row * w;
+                        let (a, r) = (&actual[off..off + w], &reference[off..off + w]);
+                        if row + 1 < h {
+                            assert_eq!(
+                                a, r,
+                                "left-edge {label}: plane {p} row {row} must be byte-exact"
+                            );
+                        } else {
+                            for (i, (x, y)) in a.iter().zip(r).enumerate() {
+                                assert!(
+                                    (i16::from(*x) - i16::from(*y)).abs() <= i16::from(last_row_tol),
+                                    "left-edge {label}: plane {p} last row byte {i}: {x} vs {y} exceeds tolerance {last_row_tol}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
