@@ -1,6 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! Kalman filtering for tracklet motion.
+//!
+//! Each tracklet owns one [`ConstantVelocityXYAHModel2`], a constant-velocity
+//! filter over the state `[x, y, a, h, ẋ, ẏ, ȧ, ḣ]` — box centre, aspect
+//! ratio, height, and their velocities. Tracking in XYAH rather than XYXY
+//! means an object's aspect ratio is modelled as one slowly-varying quantity
+//! instead of being smeared across four correlated corner coordinates.
+//!
+//! The filter supplies the predicted box that
+//! [`crate::bytetrack::ByteTrack`] matches detections against, and the
+//! smoothed box reported as [`crate::TrackInfo::tracked_location`]. Nothing
+//! here is public API beyond the model type itself; the tracker drives it.
+
 use nalgebra::{
     allocator::Allocator, convert, dimension::U4, DVector, DefaultAllocator, Dyn, OMatrix,
     RealField, SVector, U1, U8,

@@ -6,16 +6,27 @@
 crates/image/
 ├── src/
 │   ├── lib.rs              # Doc-tests on the public API surface
+│   ├── tiling.rs           # SAHI grid geometry unit tests + span assertions (no GPU)
 │   ├── cpu/
 │   │   ├── tests.rs        # CPU backend conversion + mask tests
 │   │   ├── convert.rs      # fast_image_resize-based format conversion
-│   │   ├── resize.rs       # Resize kernels
+│   │   ├── resize.rs       # Resize kernels + filter-halo unit tests
 │   │   └── masks.rs        # CPU mask materialization (f16 hot path)
 │   ├── g2d.rs              # G2D backend tests (gated on /dev/galcore)
 │   └── gl/
+│       ├── render.rs       # plan_convert / lower_dst / plan_batch tables (host, no GL)
 │       └── tests.rs        # OpenGL backend tests (gated via OnceLock probe)
+├── tests/
+│   ├── crop_golden.rs      # Frozen per-architecture cropped-convert fixtures
+│   ├── odd_dim_cpu.rs      # End-to-end odd-dimension CPU conversion
+│   └── data/               # crop_golden.{aarch64,x86_64}.json
 └── benches/
     ├── image_benchmark.rs       # Convert/resize/rotate throughput
+    ├── convert_matrix_benchmark.rs   # Full (src fmt × dst fmt × memory) convert matrix
+    ├── batch_convert_benchmark.rs    # convert_deferred batch-tile assembly vs per-call
+    ├── tiled_convert_benchmark.rs    # SAHI tile-crop converts; proportionality to crop size
+    ├── cpu_preprocess_benchmark.rs   # CPU NV→planar preprocess breakdown
+    ├── parallel_processors_benchmark.rs  # Multi-processor GL scaling S(n)
     ├── mask_benchmark.rs        # Mask decode + draw paths
     ├── mask_decode_benchmark.rs # Mask materialization vs proto-only
     ├── pipeline_benchmark.rs    # End-to-end pipeline measurements
@@ -56,7 +67,7 @@ hardware and risk CMA pool exhaustion on memory-constrained targets.
 The
 [`Makefile`](https://github.com/EdgeFirstAI/hal/blob/main/Makefile)
 enforces `-j 1` automatically. See
-[`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)
+[`ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)
 for the `GL_MUTEX` implementation that makes this rule load-bearing.
 
 ### GL hardware-gated tests
@@ -149,6 +160,37 @@ EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
   cargo test -p edgefirst-image -- --test-threads=1
 ```
 
+### Golden fixtures for cropped convert
+
+[`tests/crop_golden.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/tests/crop_golden.rs)
+holds an 80-case matrix of CPU cropped-convert outputs, stored as CRC32s in
+`tests/data/crop_golden.<arch>.json`. It is the byte-exactness arbiter for the
+crop path: `cropped_convert_matches_golden` replays the matrix and fails on any
+change to a single output byte.
+
+**Never regenerate the fixtures.** `generate_golden` exists and is
+`#[ignore]`d, but both files were frozen from the pre-change implementation
+before any crop-contract work began — that is the whole point of them.
+Regenerating turns the guard into a rubber stamp for whatever the code
+currently does.
+
+The fixtures are **per architecture and per kernel path**. The `yuv` crate
+picks its NEON+RDM, plain-NEON, or AVX2 kernel by runtime CPU feature
+detection, and the three round YUV→RGB differently, so the 48 NV-source cases
+differ between them (the 32 RGB-source resize-only cases are identical —
+`fast_image_resize` is arch-consistent). Two files are checked in: aarch64,
+generated on an Apple M2 Max and byte-identical on Linux aarch64 CI, i.MX 95
+(Cortex-A55), and RPi 5 (Cortex-A76); and x86_64, generated in an AVX2
+container from the same tree.
+
+On a CPU without the fixture's feature — i.MX 8M Plus (Cortex-A53) has no
+`asimdrdm` — the matrix test **skips**. The same code picks a different,
+equally correct kernel whose bytes cannot match a file frozen on RDM hardware.
+Cropped-convert correctness there is covered instead by the oracle-based lib
+tests (`fused_region_matches_general_path`, `left_edge_crop_zero_copy_*`,
+`crop_edge_matches_full_frame_intermediate`), which compare against references
+computed in the same run rather than against frozen bytes.
+
 ### LFS testdata
 
 JPEG/PNG fixtures and proto-mask test vectors live under `testdata/` and
@@ -167,6 +209,11 @@ on i.MX 8/i.MX 95 targets.
 | Benchmark | Source | What it measures |
 |-----------|--------|------------------|
 | `image_benchmark` | [`benches/image_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/image_benchmark.rs) | Format conversion + resize + rotation throughput per backend |
+| `convert_matrix_benchmark` | [`benches/convert_matrix_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/convert_matrix_benchmark.rs) | The full (source format × destination format × memory class) convert matrix |
+| `batch_convert_benchmark` | [`benches/batch_convert_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/batch_convert_benchmark.rs) | `convert_deferred` batch-tile assembly against one eager convert per tile |
+| `tiled_convert_benchmark` | [`benches/tiled_convert_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/tiled_convert_benchmark.rs) | SAHI-shaped tile-crop converts; the proportionality cell checks that a crop costs in proportion to its own size, not the frame's |
+| `cpu_preprocess_benchmark` | [`benches/cpu_preprocess_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/cpu_preprocess_benchmark.rs) | CPU NV→planar preprocess breakdown (colour convert vs. deinterleave) |
+| `parallel_processors_benchmark` | [`benches/parallel_processors_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/parallel_processors_benchmark.rs) | Aggregate throughput with `n` concurrent `ImageProcessor`s — the `S(n)` table in ARCHITECTURE.md |
 | `mask_benchmark` | [`benches/mask_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/mask_benchmark.rs) | `decode_masks/{proto,materialize}`, `draw_masks/{cpu,opengl}`, `draw_proto_masks/{cpu,opengl}` |
 | `mask_decode_benchmark` | [`benches/mask_decode_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/mask_decode_benchmark.rs) | NMS + mask coefficient extraction (proto-only path) vs. full materialization |
 | `pipeline_benchmark` | [`benches/pipeline_benchmark.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/benches/pipeline_benchmark.rs) | End-to-end inference + decode + draw pipeline |
@@ -328,6 +375,6 @@ is covered in CI.
 
 - Project testing patterns: [../../TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md)
 - Validating optimizations: [TESTING.md#validating-optimizations](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#validating-optimizations)
-- GL_MUTEX rationale and resource-cleanup layers: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)
+- GL_MUTEX rationale and resource-cleanup layers: [ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)
 - Decoder testing (proto API consumer): [../decoder/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/TESTING.md)
 - Tensor backend tests: [../tensor/TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/TESTING.md)

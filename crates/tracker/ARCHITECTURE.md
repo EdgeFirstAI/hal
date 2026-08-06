@@ -55,7 +55,7 @@ flowchart TD
     NewFrame[New frame detections]
     Predict[Predict tracklet positions<br/>Kalman forward step]
     Cost[Compute cost matrix<br/>IoU between predictions and detections]
-    Hungarian[Hungarian assignment LAPJV<br/>optimal global match]
+    Hungarian[LAPJV linear assignment<br/>optimal global match]
 
     Matched[Matched: update tracklet]
     UnmatchedDet[Unmatched detection: create new tracklet]
@@ -88,7 +88,7 @@ high-confidence pool.
 
 ### Kalman filter state
 
-Each tracklet owns a constant-velocity Kalman filter modeling box state as
+Each tracklet owns a constant-velocity Kalman filter modelling box state as
 `[x_center, y_center, aspect, height, ẋ, ẏ, ȧ, ḣ]`. The `track_update`
 parameter on the builder controls the gain — lower values trust the predicted
 trajectory more, higher values trust the new measurement more. See
@@ -111,9 +111,9 @@ for the matrix definitions.
   [Performance Tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)
   section of the project README for capture and viewing instructions.
 
-## Tracing Span Catalog
+## Tracing Span Catalogue
 
-All spans emitted by this crate. The catalog exactly matches the `tracing::trace_span!`
+All spans emitted by this crate. The catalogue exactly matches the `tracing::trace_span!`
 call sites in `crates/tracker/src/bytetrack.rs` (no spans are emitted in `kalman.rs`).
 
 | Span name | Source line | When it fires | Fields |
@@ -123,7 +123,7 @@ call sites in `crates/tracker/src/bytetrack.rs` (no spans are emitted in `kalman
 | `tracker.update.match_high_conf` | [`bytetrack.rs:470`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L470) | First-pass LAPJV assignment (high-confidence detections vs all tracklets) — fires only when tracklets exist | (none) |
 | `tracker.update.match_low_conf` | [`bytetrack.rs:494`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/src/bytetrack.rs#L494) | Second-pass LAPJV assignment (remaining unmatched detections vs remaining unmatched tracklets) — fires only when tracklets exist | (none) |
 
-The four child spans are sequential and non-overlapping within `tracker.update`.
+The three child spans are sequential and non-overlapping within `tracker.update`.
 In the Perfetto timeline they appear as adjacent slices inside the parent span.
 Tracklet expiry and new-tracklet spawning happen after the spans close and do
 not have their own instrumentation.
@@ -134,7 +134,7 @@ The tracker crate has no compile-time dependency on any other `edgefirst-*`
 crate. It is consumed as an optional feature by:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) — exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` is the planned per-UUID palette mode, but currently aliases `ColorMode::Instance` (detection-order coloring) until the per-track palette lands.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) — adds `draw_masks_tracked()` for rendering masks for tracked detections and returning track info. `ColorMode::Track` is the planned per-UUID palette mode, but currently aliases `ColorMode::Instance` (detection-order colouring) until the per-track palette lands.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) — re-exports as `edgefirst_hal::tracker`.
 
 The boundary type is the [`DetectionBox`](https://docs.rs/edgefirst-tracker/latest/edgefirst_tracker/trait.DetectionBox.html)

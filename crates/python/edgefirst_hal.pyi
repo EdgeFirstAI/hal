@@ -35,7 +35,7 @@ def is_gpu_buffer_available() -> bool:
     """
 
 def is_shm_available() -> bool:
-    """True when POSIX shared memory allocation is available (Unix only)."""
+    """True when POSIX shared memory allocation is available (Linux and macOS)."""
 
 def is_cuda_available() -> bool:
     """True when libcudart is loaded and all CUDA interop symbols resolved.
@@ -687,19 +687,45 @@ class Decoder:
     @property
     def normalized_boxes(self) -> Optional[bool]:
         """
-        Whether decoded bounding boxes are normalized to [0, 1] range.
-        Returns True if normalized, False if pixel coordinates, or None if unknown.
+        Whether decoded bounding boxes are normalized to the [0, 1] range.
+        Returns True if normalized, False if pixel coordinates, or None if
+        unknown.
+
+        Segmentation decoders (combined, split, and two-way) and the
+        per-scale path divide by :attr:`input_dims` before returning, so
+        they report ``True`` once ``input_dims`` is known. Detection-only,
+        end-to-end YOLO, and ModelPack decoders report the raw schema
+        annotation; if one of those returns ``False`` and you need
+        ``[0, 1]`` boxes, divide by :attr:`input_dims` yourself. Never
+        re-normalize when this returns ``True`` — dividing already-normalized
+        coordinates collapses every detection to roughly zero.
+        """
+        ...
+
+    @property
+    def input_dims(self) -> Optional[Tuple[int, int]]:
+        """
+        Model input dimensions ``(width, height)``, or ``None`` when unknown.
+
+        Set through the ``input_dims`` constructor argument, or taken from a
+        v2 schema's ``input.shape`` / ``input.dshape``. The decode paths
+        listed under :attr:`normalized_boxes` use it to convert pixel-space
+        boxes to ``[0, 1]`` before mask cropping. When it is ``None`` those
+        paths skip the division, and pixel-space boxes will trip the
+        prototype-mask safety guard.
         """
         ...
 
 class TensorMemory(enum.Enum):
-    if sys.platform == "linux":
-        DMA: TensorMemory
-        """
-        Direct Memory Access (DMA) allocation. Incurs additional overhead for memory reading/writing with the CPU. 
-        Allows for hardware acceleration when supported
-        """
+    DMA: TensorMemory
+    """
+    Platform-native zero-copy GPU buffer: DMA-BUF on Linux, IOSurface on
+    macOS. The name is the same on both. CPU reads and writes cost more
+    than system memory, but the GPU and other hardware blocks can use the
+    buffer without a copy.
+    """
 
+    if sys.platform != "win32":
         SHM: TensorMemory
         """
         POSIX Shared Memory allocation. Suitable for inter-process
@@ -735,159 +761,114 @@ class ImageInfo:
     flip_horizontal: bool
     """Horizontal flip from EXIF orientation. The decode never flips."""
 
-class Tensor:
-    if sys.platform == "linux":
-        def __init__(
-            self,
-            shape: list[int],
-            dtype: Literal[
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-                "int64",
-                "uint64",
-                "float32",
-                "float64",
-            ] = "float32",
-            mem: None | TensorMemory = None,
-            name: None | str = None,
-        ) -> None: ...
-        """
-        Create a new tensor with the given shape, memory type, and optional
-        name. If no name is given, a random name will be generated. If no
-        memory type is given, the best available memory type will be chosen
-        based on the platform and environment variables.
-            
-        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
-        On non-Linux platforms, only MEM is available.
-        
-        # Environment Variables
-        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
-        value, forces the use of regular system memory allocation
-        (`TensorMemory.MEM`) regardless of platform capabilities.
-        """
+DType = Literal[
+    "int8",
+    "uint8",
+    "int16",
+    "uint16",
+    "int32",
+    "uint32",
+    "int64",
+    "uint64",
+    "float16",
+    "float32",
+    "float64",
+]
+"""Element type names accepted wherever the API takes a ``dtype`` string."""
 
+class Tensor:
+    def __init__(
+        self,
+        shape: list[int],
+        dtype: DType = "float32",
+        mem: None | TensorMemory = None,
+        name: None | str = None,
+    ) -> None:
+        """Create a new tensor with the given shape, memory type, and optional
+        name. If no name is given, a random name is generated. If no memory
+        type is given, the best available one is chosen for the platform.
+
+        The order of preference is DMA -> SHM -> MEM on Linux and
+        DMA (IOSurface) -> SHM -> MEM on macOS; Windows falls back to MEM.
+        ``Tensor(...)`` does not probe the GPU backend — use
+        :meth:`ImageProcessor.create_image` for anything you intend to pass
+        to :meth:`ImageProcessor.convert`.
+
+        Environment variables:
+            ``EDGEFIRST_TENSOR_FORCE_MEM``: when set to a non-zero,
+            non-false value, forces ``TensorMemory.MEM`` regardless of
+            platform capabilities.
+        """
+        ...
+
+    if sys.platform != "win32":
         @staticmethod
         def from_fd(
             fd: int,
             shape: list[int],
-            dtype: Literal[
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-                "int64",
-                "uint64",
-                "float32",
-                "float64",
-            ] = "float32",
+            dtype: DType = "float32",
             name: None | str = None,
-        ) -> Tensor: ...
-        """
-        Import an existing buffer as a tensor, without copying. If no name is
-        given, a random name will be generated.
+        ) -> Tensor:
+            """Import an existing buffer as a tensor, without copying. If no
+            name is given, a random name will be generated.
 
-        The buffer type is **detected, not chosen**. On Linux it is determined
-        by the file descriptor's filesystem magic:
+            The buffer type is **detected, not chosen**. On Linux it is
+            determined by the file descriptor's filesystem magic:
 
-        =========================================  ===================
-        File descriptor                            ``Tensor.memory``
-        =========================================  ===================
-        ``dma_buf`` (``DMA_BUF_MAGIC``)            ``TensorMemory.DMA``
-        ``tmpfs`` — ``/dev/shm`` and ``memfd``     ``TensorMemory.SHM``
-        anything else                              raises (see below)
-        =========================================  ===================
+            =========================================  ===================
+            File descriptor                            ``Tensor.memory``
+            =========================================  ===================
+            ``dma_buf`` (``DMA_BUF_MAGIC``)            ``TensorMemory.DMA``
+            ``tmpfs`` — ``/dev/shm`` and ``memfd``     ``TensorMemory.SHM``
+            anything else                              raises (see below)
+            =========================================  ===================
 
-        On macOS the fd is always imported as ``TensorMemory.SHM``.
+            On macOS the fd is always imported as ``TensorMemory.SHM``.
 
-        Both supported types are identified positively; an unrecognized
-        filesystem raises rather than silently falling back to shared memory.
-        That fallback would not fail loudly — a DMA-BUF is mmap-able, so it
-        would import as a working tensor that merely isn't DMA, and the lost
-        zero-copy would only surface later as ``ImageProcessor.import_image``
-        refusing the buffer.
+            Both supported types are identified positively; an unrecognized
+            filesystem raises rather than silently falling back to shared
+            memory. That fallback would not fail loudly — a DMA-BUF is
+            mmap-able, so it would import as a working tensor that merely
+            isn't DMA, and the lost zero-copy would only surface later as
+            ``ImageProcessor.import_image`` refusing the buffer.
 
-        The fd is ``dup()``'d immediately — the caller retains ownership
-        of the original fd and must close it when done.
+            The fd is ``dup()``'d immediately — the caller retains ownership
+            of the original fd and must close it when done.
 
-        Raises:
-            RuntimeError: The fd could not be imported. Most commonly its
-                buffer type could not be determined because it is neither a
-                DMA-BUF nor tmpfs-backed (a regular file, a pipe or socket, or
-                a ``MFD_HUGETLB`` memfd) — the message reports the observed
-                filesystem magic, e.g. ``Tensor error: UnknownBufferType: fd
-                is on an unrecognized filesystem (magic 0x50495045)``. Also
-                raised for a negative ``fd``, an unsupported ``dtype``, a
-                shape larger than the buffer, or a failed syscall.
+            Raises:
+                RuntimeError: The fd could not be imported. Most commonly its
+                    buffer type could not be determined because it is neither
+                    a DMA-BUF nor tmpfs-backed (a regular file, a pipe or
+                    socket, or a ``MFD_HUGETLB`` memfd) — the message reports
+                    the observed filesystem magic, e.g. ``Tensor error:
+                    UnknownBufferType: fd is on an unrecognized filesystem
+                    (magic 0x50495045)``. Also raised for a negative ``fd``,
+                    an unsupported ``dtype``, a shape larger than the buffer,
+                    or a failed syscall.
 
-        Note:
-            Check ``tensor.memory`` if you require zero-copy — a successful
-            import is not by itself proof of DMA backing.
-        """
+            Note:
+                Check ``tensor.memory`` if you require zero-copy — a
+                successful import is not by itself proof of DMA backing.
+            """
+            ...
 
         @property
-        def fd(self) -> int: ...
-        """Gets a duplicate of the file descriptor associated with the tensor's memory. The caller will be responsible for closing the file descriptor."""
+        def fd(self) -> int:
+            """A duplicate of the file descriptor backing the tensor's memory.
 
-    else:
-        def __init__(
-            self,
-            shape: list[int],
-            dtype: Literal[
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-                "int64",
-                "uint64",
-                "float32",
-                "float64",
-            ] = "float32",
-            mem: None | TensorMemory = None,
-            name: None | str = None,
-        ) -> None: ...
-        """
-        Create a new tensor with the given shape, memory type, and optional
-        name. If no name is given, a random name will be generated. If no
-        memory type is given, the best available memory type will be chosen
-        based on the platform and environment variables.
-
-        On Linux platforms, the order of preference is: DMA -> SHM -> MEM.
-        On non-Linux platforms, only MEM is available.
-
-        # Environment Variables
-        - `EDGEFIRST_TENSOR_FORCE_MEM`: If set to a non-zero and non-false
-        value, forces the use of regular system memory allocation
-        (`TensorMemory.MEM`) regardless of platform capabilities.
-        """
+            The caller owns the returned descriptor and must close it.
+            """
+            ...
 
     @property
-    def dtype(
-        self,
-    ) -> Literal[
-        "int8",
-        "uint8",
-        "int16",
-        "uint16",
-        "int32",
-        "uint32",
-        "int64",
-        "uint64",
-        "float32",
-        "float64",
-    ]: ...
-    """The data type of the tensor."""
+    def dtype(self) -> DType:
+        """The data type of the tensor."""
+        ...
 
     @property
-    def size(self) -> int: ...
-    """The size of the tensor in bytes."""
+    def size(self) -> int:
+        """The size of the tensor in bytes."""
+        ...
 
     @property
     def compression(self) -> str | None:
@@ -900,19 +881,23 @@ class Tensor:
         ...
 
     @property
-    def memory(self) -> TensorMemory: ...
-    """The memory type of the tensor."""
+    def memory(self) -> TensorMemory:
+        """The memory type of the tensor."""
+        ...
 
     @property
-    def name(self) -> str: ...
-    """The name of the tensor."""
+    def name(self) -> str:
+        """The name of the tensor."""
+        ...
 
     @property
-    def shape(self) -> list[int]: ...
-    """The shape of the tensor."""
+    def shape(self) -> list[int]:
+        """The shape of the tensor. A property, not a method."""
+        ...
 
-    def reshape(self, shape: list[int]) -> None: ...
-    """Reshape the tensor to the given shape. The total number of elements must remain the same."""
+    def reshape(self, shape: list[int]) -> None:
+        """Reshape the tensor. The total element count must stay the same."""
+        ...
 
     def view(self, region: Region) -> Tensor:
         """Zero-copy rectangular sub-region view — the source/destination crop.
@@ -981,18 +966,7 @@ class Tensor:
         def from_iosurface(
             surface_ref: int,
             shape: list[int],
-            dtype: Literal[
-                "int8",
-                "uint8",
-                "int16",
-                "uint16",
-                "int32",
-                "uint32",
-                "int64",
-                "uint64",
-                "float32",
-                "float64",
-            ] = "uint8",
+            dtype: DType = "uint8",
             name: None | str = None,
         ) -> Tensor:
             """Wrap an externally-allocated IOSurface as a Tensor (macOS only).
@@ -1057,10 +1031,12 @@ class Tensor:
             Example — hand the surface to ``CIImage``::
 
                 import ctypes
-                from edgefirst_hal import Tensor, TensorMemory
+                from edgefirst_hal import PixelFormat, Tensor, TensorMemory
 
                 # Create the tensor (or import an existing IOSurface).
-                t = Tensor.image(1280, 720, "rgba", mem=TensorMemory.DMA)
+                t = Tensor.image(
+                    1280, 720, PixelFormat.Rgba, mem=TensorMemory.DMA
+                )
 
                 # Wrap the raw IOSurfaceRef for ctypes handoff.
                 surf_ptr = ctypes.c_void_p(t.iosurface_ref)
@@ -1388,6 +1364,11 @@ class Tensor:
         ...
 
 class TensorMap:
+    """Mapped-memory guard returned by :meth:`Tensor.map`.
+
+    Not constructible from Python — obtain instances from ``Tensor.map()``.
+    """
+
     def unmap(self) -> None: ...
     def numpy(self) -> memoryview: ...
     def __repr__(self) -> str: ...
@@ -1681,16 +1662,13 @@ class Region:
     source crop of ``convert``."""
 
     def __init__(self, x: int, y: int, width: int, height: int): ...
-    @property
-    def x(self) -> int: ...
-    @property
-    def y(self) -> int: ...
-    @property
-    def width(self) -> int: ...
-    @property
-    def height(self) -> int: ...
 
-class EglDisplayKind:
+    x: int
+    y: int
+    width: int
+    height: int
+
+class EglDisplayKind(enum.Enum):
     """Identifies the type of EGL display used for headless OpenGL ES rendering.
 
     The HAL creates a surfaceless GLES 3.0 context and renders exclusively
@@ -1711,31 +1689,33 @@ class EglDisplayKind:
     PlatformDevice: EglDisplayKind
     Default: EglDisplayKind
 
-class EglDisplayInfo:
-    """A validated, available EGL display discovered by probe_egl_displays()."""
+if sys.platform == "linux":
+    class EglDisplayInfo:
+        """A validated, available EGL display discovered by probe_egl_displays()."""
 
-    @property
-    def kind(self) -> EglDisplayKind:
-        """The type of EGL display."""
+        @property
+        def kind(self) -> EglDisplayKind:
+            """The type of EGL display."""
+            ...
+
+        @property
+        def description(self) -> str:
+            """Human-readable description for logging/diagnostics."""
+            ...
+
+    def probe_egl_displays() -> list[EglDisplayInfo]:
+        """Probe for available EGL displays supporting headless OpenGL ES 3.0.
+
+        Linux only. Returns displays in priority order (PlatformDevice, GBM,
+        Default). Each display is validated with eglInitialize and checked
+        for the required extensions (EGL_KHR_surfaceless_context,
+        EGL_KHR_no_config_context). An empty list means OpenGL is not
+        available on this system.
+
+        Raises:
+            RuntimeError: If libEGL.so.1 cannot be loaded.
+        """
         ...
-
-    @property
-    def description(self) -> str:
-        """Human-readable description for logging/diagnostics."""
-        ...
-
-def probe_egl_displays() -> list[EglDisplayInfo]:
-    """Probe for available EGL displays supporting headless OpenGL ES 3.0.
-
-    Returns displays in priority order (PlatformDevice, GBM, Default).
-    Each display is validated with eglInitialize and checked for required
-    extensions (EGL_KHR_surfaceless_context, EGL_KHR_no_config_context).
-    An empty list means OpenGL is not available on this system.
-
-    Raises:
-        RuntimeError: If libEGL.so.1 cannot be loaded.
-    """
-    ...
 
 def align_width_for_gpu_pitch(width: int, bpp: int) -> int:
     """Round ``width`` up so that ``width * bpp`` satisfies the GPU DMA-BUF
@@ -1763,7 +1743,7 @@ def align_width_for_gpu_pitch(width: int, bpp: int) -> int:
 def align_width_for_pixel_format(
     width: int,
     format: PixelFormat,
-    dtype: str = "uint8",
+    dtype: DType = "uint8",
 ) -> int:
     """Convenience wrapper that derives bytes-per-pixel from a pixel format
     and dtype, then calls :func:`align_width_for_gpu_pitch`.
@@ -2071,7 +2051,7 @@ class ImageProcessor:
         width: int,
         height: int,
         format: PixelFormat = PixelFormat.Rgba,
-        dtype: str = "uint8",
+        dtype: DType = "uint8",
         access: str = "none",
         compression: str | None = None,
     ) -> Tensor:
@@ -2120,7 +2100,7 @@ class ImageProcessor:
         n: int,
         cfg: "TilingConfig",
         format: PixelFormat = PixelFormat.Rgba,
-        dtype: str = "uint8",
+        dtype: DType = "uint8",
         memory: TensorMemory | None = None,
         access: str = "none",
     ) -> Tensor:
@@ -2216,7 +2196,7 @@ class ImageProcessor:
             width: int,
             height: int,
             format: PixelFormat,
-            dtype: str = "uint8",
+            dtype: DType = "uint8",
             stride: int | None = None,
             offset: int | None = None,
             chroma_fd: int | None = None,
@@ -2713,6 +2693,12 @@ def tile_grid(
 
     Row-major. Every tile is full-size unless the frame is smaller than the
     tile on an axis, in which case that axis yields a single whole-frame crop.
+
+    Note:
+        Argument order here is width-first, following Python imaging
+        conventions. The Rust (``edgefirst_image::tile_grid``) and C
+        (``hal_tile_grid``) APIs are height-first:
+        ``(frame_h, frame_w, tile_h, tile_w)``. Mind the swap when porting.
 
     Args:
         frame_w: Full-frame width in pixels.

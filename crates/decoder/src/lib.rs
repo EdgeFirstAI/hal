@@ -457,7 +457,7 @@ impl DetectBox {
 /// describes the spatial extent of `segmentation`.
 ///
 /// The `xmin`/`ymin`/`xmax`/`ymax` fields describe the **mask region** —
-/// the proto-grid-aligned crop the [`segmentation`] tensor was sliced
+/// the proto-grid-aligned crop the `segmentation` tensor was sliced
 /// from. They are quantized to the proto grid step (`1/proto_height` and
 /// `1/proto_width`, typically `1/160`), so the region's origin floors and
 /// its extent ceils relative to the companion [`DetectBox`]'s `bbox`. The
@@ -514,16 +514,16 @@ pub enum ProtoLayout {
 /// renderer to compute `mask_coeff @ protos` directly (e.g. in a GPU fragment
 /// shader) without materializing intermediate `Array3<u8>` masks.
 ///
-/// Both fields are carried as [`TensorDyn`] so downstream consumers (Rust, C
+/// Both fields are carried as [`TensorDyn`](edgefirst_tensor::TensorDyn) so downstream consumers (Rust, C
 /// API, Python) get zero-copy typed access through the HAL's shared tensor
 /// infrastructure. Dtype policy:
 ///
 /// | Source model | protos dtype | mask_coefficients dtype | protos.quantization |
 /// |---|---|---|---|
-/// | int8 quantized | [`TensorDyn::I8`] | [`TensorDyn::I8`] (raw + quantization) | `Some(q)` |
-/// | f32 | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
-/// | f16 (TensorRT fp16) | [`TensorDyn::F16`] | [`TensorDyn::F16`] | `None` |
-/// | f64 (narrowed) | [`TensorDyn::F32`] | [`TensorDyn::F32`] | `None` |
+/// | int8 quantized | [`TensorDyn::I8`](edgefirst_tensor::TensorDyn::I8) | [`TensorDyn::I8`](edgefirst_tensor::TensorDyn::I8) (raw + quantization) | `Some(q)` |
+/// | f32 | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | `None` |
+/// | f16 (TensorRT fp16) | [`TensorDyn::F16`](edgefirst_tensor::TensorDyn::F16) | [`TensorDyn::F16`](edgefirst_tensor::TensorDyn::F16) | `None` |
+/// | f64 (narrowed) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | [`TensorDyn::F32`](edgefirst_tensor::TensorDyn::F32) | `None` |
 ///
 /// Quantization metadata lives on the proto tensor itself via
 /// [`edgefirst_tensor::Tensor::quantization`] — float tensors cannot carry

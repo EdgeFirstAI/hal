@@ -20,6 +20,7 @@ Inline `#[cfg(test)]` modules in each source file:
 | `jpeg/idct/{neon,sse2,sse41}.rs` | Scalar↔SIMD parity per kernel            |
 | `jpeg/v4l2/format.rs` | `classify()` CAPTURE FourCC → `CapKind`             |
 | `jpeg/v4l2/mod.rs`    | Backend helpers (geometry/format negotiation logic) |
+| `jpeg/nvjpeg/mod.rs`  | Graceful degradation without a GPU: a non-CUDA destination falls through untouched, an unavailable or unprobed probe returns `None` without writing the tensor, circuit-breaker threshold sanity |
 
 ### Integration Tests
 
@@ -27,7 +28,7 @@ Located in `crates/codec/tests/`:
 
 | File                    | What It Tests                                      |
 |-------------------------|----------------------------------------------------|
-| `decode_jpeg.rs`        | JPEG → native `Nv12`/`Grey`, pixel accuracy vs the `image` crate, strided decode, capacity/error handling, reuse patterns, non-`u8` rejection |
+| `decode_jpeg.rs`        | JPEG → native `Nv12`/`Nv16`/`Nv24`/`Grey`, pixel accuracy vs the `image` crate, strided decode, capacity/error handling, reuse patterns, non-`u8` rejection |
 | `decode_png.rs`         | PNG → Tensor<u8/u16/i8/i16/f32>, native colorspace |
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 | `exif_orientations.rs`  | End-to-end EXIF orientation reporting (JPEG + PNG): native dims preserved, `(rotation_degrees, flip_horizontal)` per tag |
@@ -75,7 +76,9 @@ target that has one (e.g. imx95-frdm `/dev/video11`).
 ### Native Format
 
 The decoder emits the source's native format; tests assert the tensor is
-configured accordingly (colour JPEG → `Nv12`, greyscale JPEG → `Grey`):
+configured accordingly. A colour JPEG maps to the NV format matching its own
+chroma sampling (the 4:2:0 test images below give `Nv12`), a greyscale JPEG to
+`Grey`:
 
 ```rust
 let info = tensor.load_image(&mut decoder, &jpeg)?;
@@ -98,7 +101,7 @@ assert!(matches!(result, Err(CodecError::InsufficientCapacity { .. })));
 JPEG decodes to `u8`-only native formats; a non-`u8` destination is rejected:
 
 ```rust
-let mut tensor = Tensor::<f32>::image(w, h, PixelFormat::Nv12, Some(Mem))?;
+let mut tensor = Tensor::<f32>::image(w, h, PixelFormat::Nv12, Some(Mem), CpuAccess::Write)?;
 let result = tensor.load_image(&mut decoder, &jpeg);
 assert!(matches!(result, Err(CodecError::UnsupportedDtype(_))));
 ```
@@ -106,7 +109,7 @@ assert!(matches!(result, Err(CodecError::UnsupportedDtype(_))));
 The same holds for an unsupported `TensorDyn` dtype:
 
 ```rust
-let mut tensor = TensorDyn::image(w, h, fmt, DType::I32, Some(Mem)).unwrap();
+let mut tensor = TensorDyn::image(w, h, fmt, DType::I32, Some(Mem), CpuAccess::Write).unwrap();
 let result = tensor.load_image(&mut decoder, &data);
 assert!(result.is_err());
 ```
@@ -130,7 +133,7 @@ Tests decode multiple different images into the same pre-allocated tensor,
 verifying each decode succeeds and reconfigures the tensor:
 
 ```rust
-let mut tensor = Tensor::<u8>::image(4256, 2532, PixelFormat::Nv12, Some(Mem)).unwrap();
+let mut tensor = Tensor::<u8>::image(4256, 2532, PixelFormat::Nv12, Some(Mem), CpuAccess::Write).unwrap();
 for name in &["zidane.jpg", "giraffe.jpg", "jaguar.jpg"] {
     let info = tensor.load_image(&mut decoder, &testdata(name)).unwrap();
     assert!(info.width > 0);
@@ -189,7 +192,7 @@ allocation-free in the hot loop.
 | JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
 | JPEG IDCT workspace      | No allocations   | Stack-allocated `[i32; 64]`  |
 | JPEG native row write    | No allocations   | Strided into pre-allocated tensor |
-| V4L2 streaming session   | No allocations   | Buffers set up once per geometry |
+| V4L2 streaming session   | No allocations   | OUTPUT buffer + DMA scratch persist; geometry changes are ioctl-only |
 | EXIF reader              | 1 `Vec` / call   | Only when APP1/`eXIf` present |
 | zune-png `decode()`      | 1 `Vec` / call   | Returns owned `Vec<u16/u8>`  |
 | zune-png `decode_into()` | ~3 `brk` / call  | Internal filter state        |

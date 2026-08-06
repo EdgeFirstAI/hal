@@ -11,16 +11,28 @@ different formats and sizes.  The crate is designed to work with hardware
 acceleration when available, but also provides a CPU-based fallback for
 environments where hardware acceleration is not present or not suitable.
 
-The main features of the `edgefirst_image` crate include:
-- Support for various image formats, including YUYV, RGB, RGBA, and GREY.
-- Support for source crop, destination crop, rotation, and flipping.
-- Image conversion using hardware acceleration (G2D, OpenGL) when available.
-- CPU-based image conversion as a fallback option.
+What the crate covers:
+- Packed and planar RGB families (`Rgb`, `Rgba`, `Bgra`, `Grey`,
+  `PlanarRgb`, `PlanarRgba`), semi-planar YUV sources (`Nv12`, `Nv16`,
+  `Nv24`), and packed YUV (`Yuyv`, `Vyuy`).
+- Source crop, resize, letterbox, 90° rotation, and flipping in one call.
+- Segmentation-mask rendering, including a fused GPU proto path.
+- SAHI-style input tiling for small-object detection in large frames
+  ([`TilingConfig`], [`ImageProcessor::tile_into`]).
+- Hardware acceleration (OpenGL, NXP G2D) with a CPU fallback that is
+  always available.
 
 The crate uses [`TensorDyn`] from `edgefirst_tensor` to represent images,
 with [`PixelFormat`] metadata describing the pixel layout. The
 [`ImageProcessor`] struct manages the conversion process, selecting
 the appropriate conversion method based on the available hardware.
+
+Geometry is **source-side**: [`Crop`] says which sub-rectangle of the source
+to sample and how to fit it into the destination's shape. Where the output
+lands is the destination itself — pass a
+[`view`](edgefirst_tensor::TensorDyn::view) or
+[`batch`](edgefirst_tensor::TensorDyn::batch) of a larger tensor to render
+into one tile of a batch.
 
 ## Examples
 
@@ -824,21 +836,42 @@ impl Rect {
 
 #[enum_dispatch(ImageProcessor)]
 pub trait ImageProcessorTrait {
-    /// Converts the source image to the destination image format and size. The
-    /// image is cropped first, then flipped, then rotated
+    /// Convert `src` into `dst`'s format and size, applying the crop first,
+    /// then the flip, then the rotation.
+    ///
+    /// The destination is normally an RGB-family colour — `Grey`, `Rgb`,
+    /// `Rgba`/`Bgra`, packed `HWC` or planar `CHW`. That is what the
+    /// accelerated paths target and what models expect. The CPU backend also
+    /// accepts a handful of YUV destinations (`Yuyv`→`Yuyv`, `Yuyv`→`Nv16`,
+    /// and the `Vyuy` equivalents); no GPU or G2D path does, so those pairs
+    /// always land on the CPU.
     ///
     /// # Arguments
     ///
-    /// * `dst` - The destination image to be converted to.
     /// * `src` - The source image to convert from.
-    /// * `rotation` - The rotation to apply to the destination image.
-    /// * `flip` - Flips the image
-    /// * `crop` - An optional rectangle specifying the area to crop from the
-    ///   source image
+    /// * `dst` - The destination image. Its shape and [`PixelFormat`] define
+    ///   the output; pass a [`view`](edgefirst_tensor::TensorDyn::view) or
+    ///   [`batch`](edgefirst_tensor::TensorDyn::batch) of a larger tensor to
+    ///   render into one tile of a batch.
+    /// * `rotation` - Rotation applied to the output, in 90° steps.
+    /// * `flip` - Horizontal, vertical, or both.
+    /// * `crop` - Source-side geometry: which sub-rectangle of `src` to sample
+    ///   ([`Crop::source`]) and how to fit it into `dst`'s shape
+    ///   ([`Crop::fit`] — stretch, or letterbox with a pad colour). Destination
+    ///   placement lives on `dst`, not here.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A `Result` indicating success or failure of the conversion.
+    /// - [`Error::CropInvalid`] if `crop.source` falls outside `src`.
+    /// - [`Error::NotAnImage`] if either tensor carries no `PixelFormat`.
+    /// - [`Error::NoConverter`] if no backend accepts the format pair — the
+    ///   dispatch tries OpenGL, then G2D, then CPU, so this means all three
+    ///   declined.
+    ///
+    /// Backend-specific failures (EGL import, G2D blit, allocation) surface as
+    /// their own variants. A backend *declining* a pair is not an error while
+    /// another remains in the chain; it silently costs the zero-copy path, and
+    /// [`ImageProcessor::convert_fallback_count`] counts those.
     fn convert(
         &mut self,
         src: &TensorDyn,
@@ -1756,6 +1789,30 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// Allocate an image tensor from a declarative
+    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
+    /// full-featured variant of [`create_image`](Self::create_image).
+    ///
+    /// Without a compression request this is exactly `create_image` (the
+    /// processor's memory negotiation applies). With one, the allocation
+    /// rides the tensor desc path un-negotiated: the layout decision
+    /// belongs to the platform allocator, and the request's guards and
+    /// fallback counting live there (see
+    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)).
+    pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
+        if desc.compression().is_none() {
+            return self.create_image(
+                desc.width(),
+                desc.height(),
+                desc.format(),
+                desc.dtype(),
+                desc.memory(),
+                desc.access(),
+            );
+        }
+        Ok(TensorDyn::image_desc(desc)?)
+    }
+
     /// Create a [`TensorDyn`] image with the best available memory backend.
     ///
     /// Priority: DMA-buf → float PBO (F16/F32) → u8/i8 PBO → system memory.
@@ -1790,11 +1847,34 @@ impl ImageProcessor {
     /// * `dtype` - Element data type (e.g. `DType::U8`, `DType::F16`, `DType::F32`)
     /// * `memory` - Optional memory type override; when `None`, the best
     ///   available backend is selected automatically.
+    /// * `access` - Declares the CPU involvement you plan on. Use
+    ///   [`CpuAccess::None`](edgefirst_tensor::CpuAccess) for a destination
+    ///   that only hardware reads (an NPU input), and `ReadWrite` when you
+    ///   will map it. Hardware access is always implied. Mapping a tensor
+    ///   beyond its declaration is counted by
+    ///   [`unplanned_cpu_access_count`](edgefirst_tensor::unplanned_cpu_access_count).
     ///
     /// # Returns
     ///
     /// A [`TensorDyn`] backed by the highest-performance memory type
     /// available on this system.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use edgefirst_image::ImageProcessor;
+    /// # use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
+    /// # fn main() -> Result<(), edgefirst_image::Error> {
+    /// let processor = ImageProcessor::new()?;
+    ///
+    /// // Model input the NPU reads directly — no CPU mapping planned.
+    /// let input = processor.create_image(
+    ///     640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::None,
+    /// )?;
+    /// # let _ = input;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Pitch alignment for DMA-backed allocations
     ///
@@ -1823,30 +1903,6 @@ impl ImageProcessor {
     /// # Errors
     ///
     /// Returns an error if all allocation strategies fail.
-    /// Allocate an image tensor from a declarative
-    /// [`ImageDesc`](edgefirst_tensor::ImageDesc) request — the
-    /// full-featured variant of [`create_image`](Self::create_image).
-    ///
-    /// Without a compression request this is exactly `create_image` (the
-    /// processor's memory negotiation applies). With one, the allocation
-    /// rides the tensor desc path un-negotiated: the layout decision
-    /// belongs to the platform allocator, and the request's guards and
-    /// fallback counting live there (see
-    /// [`Tensor::image_desc`](edgefirst_tensor::Tensor::image_desc)).
-    pub fn create_image_desc(&self, desc: &edgefirst_tensor::ImageDesc) -> Result<TensorDyn> {
-        if desc.compression().is_none() {
-            return self.create_image(
-                desc.width(),
-                desc.height(),
-                desc.format(),
-                desc.dtype(),
-                desc.memory(),
-                desc.access(),
-            );
-        }
-        Ok(TensorDyn::image_desc(desc)?)
-    }
-
     pub fn create_image(
         &self,
         width: usize,
@@ -2263,7 +2319,7 @@ impl ImageProcessor {
     /// Decode model outputs and draw segmentation masks onto `dst`.
     ///
     /// This is the primary mask rendering API. The processor decodes via the
-    /// provided [`Decoder`], selects the optimal rendering path (hybrid
+    /// provided [`Decoder`](edgefirst_decoder::Decoder), selects the optimal rendering path (hybrid
     /// CPU+GL or fused GPU), and composites masks onto `dst`.
     ///
     /// Returns the detected bounding boxes.

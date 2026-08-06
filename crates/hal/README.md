@@ -8,40 +8,52 @@
 
 This is the umbrella crate that re-exports the core EdgeFirst HAL components:
 
-- [`edgefirst-tensor`](https://crates.io/crates/edgefirst-tensor) — Zero-copy tensor memory management (DMA, SHM, PBO, system memory)
+- [`edgefirst-tensor`](https://crates.io/crates/edgefirst-tensor) — Zero-copy tensor memory management (platform GPU buffer, SHM, PBO, system memory)
+- [`edgefirst-codec`](https://crates.io/crates/edgefirst-codec) — JPEG/PNG decode into pre-allocated tensors
 - [`edgefirst-image`](https://crates.io/crates/edgefirst-image) — Hardware-accelerated image processing and format conversion
 - [`edgefirst-decoder`](https://crates.io/crates/edgefirst-decoder) — ML model output decoding (YOLOv5/v8/v11/v26, ModelPack)
 - [`edgefirst-tracker`](https://crates.io/crates/edgefirst-tracker) — Multi-object tracking (ByteTrack)
 
+`codec` and `decoder` sit at opposite ends of the pipeline: `codec` turns image
+bytes into tensors, `decoder` turns model output tensors into detections.
+
 ## Features
 
-- **Zero-copy memory management** with DMA-BUF, POSIX shared memory, and PBO support
+- **Zero-copy memory management** with DMA-BUF, IOSurface, AHardwareBuffer, POSIX shared memory, and PBO support
 - **Hardware-accelerated image processing** via OpenGL, G2D (NXP i.MX), and optimized CPU
+- **Hardware JPEG decode** via V4L2 mem2mem on Linux SoCs and nvJPEG on CUDA GPUs, each falling back to the built-in CPU decoder
 - **Efficient ML post-processing** for object detection and segmentation models
 - **Int8 GPU shaders** for direct signed int8 output without CPU post-processing
-- **Cross-platform** — Linux (with hardware acceleration), macOS, and other Unix systems
+- **Cross-platform** — Linux, macOS/iOS, and Android with hardware acceleration; other Unix on CPU
 
 ## Quick Start
 
+Decode a JPEG into a tensor, then letterbox it into the shape a model wants.
+Both buffers are allocated once, outside the loop.
+
 ```rust,ignore
-use edgefirst_image::{load_image, ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-use edgefirst_tensor::{CpuAccess, PixelFormat, DType};
+use edgefirst_hal::codec::{ImageDecoder, ImageLoad};
+use edgefirst_hal::image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_hal::tensor::{CpuAccess, DType, PixelFormat};
 
-// Load a source image
-let bytes = std::fs::read("image.jpg")?;
-let input = load_image(&bytes, Some(PixelFormat::Rgb), None)?;
-
-// Create an image processor (auto-selects best backend)
+// Create an image processor (auto-selects the best backend).
 let mut processor = ImageProcessor::new()?;
 
-// Allocate a GPU-optimal output buffer — always use create_image() for
-// destinations passed to convert(). This selects the best memory type
-// (DMA-buf, PBO, or system memory) for zero-copy GPU paths.
-let mut output =
-    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
+// Allocate both buffers with create_image() — see the note below. The source
+// holds the codec's native NV12 and is CPU-written by the decoder; the
+// destination is the RGB the model consumes.
+let mut src =
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::Write)?;
+let mut dst =
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::None)?;
 
-// Convert with letterbox resize
-processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default())?;
+let mut decoder = ImageDecoder::new();
+
+// Hot loop: decode, then convert (colour + resize + any EXIF orientation).
+let bytes = std::fs::read("image.jpg")?;
+let info = src.load_image(&mut decoder, &bytes)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None,
+                  Crop::new(0, 0, info.width, info.height))?;
 ```
 
 > **Why `create_image()`?** Creating tensors directly with `Tensor::new()` or
@@ -53,17 +65,25 @@ processor.convert(&input, &mut output, Rotation::None, Flip::None, Crop::default
 
 | Platform | Memory Types | Image Acceleration |
 |----------|--------------|-------------------|
-| Linux (NXP i.MX8/i.MX95) | DMA, SHM, PBO, Mem | OpenGL, G2D, CPU |
-| Linux (other) | SHM, PBO, Mem | OpenGL, CPU |
-| macOS | Mem | CPU |
+| Linux (NXP i.MX8/i.MX95) | DMA-BUF, SHM, PBO, Mem | OpenGL, G2D, CPU |
+| Linux (other) | DMA-BUF, SHM, PBO, Mem | OpenGL, CPU |
+| macOS / iOS | IOSurface, SHM, Mem | OpenGL (ANGLE), CPU |
+| Android | AHardwareBuffer, SHM, Mem | OpenGL, CPU |
 | Other Unix | SHM, Mem | CPU |
+| Windows | Mem | CPU |
+
+DMA-BUF on Linux needs a mountable dma-heap and permission to use it; without
+that the allocator falls back and everything still works, just with a copy.
+`TensorMemory::Dma` names the platform's native GPU buffer on all three of
+Linux, Apple, and Android, so portable code never branches on the mechanism.
 
 ## Feature Flags
 
 The following Cargo feature flags are available for `edgefirst-hal`:
 
 - `ndarray` (default) — Enable ndarray integration in the tensor crate. Allows converting tensors to/from `ndarray::Array`.
-- `opengl` (default) — Enable the OpenGL backend for hardware-accelerated image processing on Linux.
+- `opengl` (default) — Enable the OpenGL backend for hardware-accelerated image processing. Compiled on Linux, macOS, iOS, and Android.
+- `tracing` (default) — Enable the `edgefirst_hal::trace` module, which installs the process-wide subscriber that turns the sub-crates' spans into a Chrome/Perfetto trace file. Pulls in `tracing-subscriber` and `tracing-chrome`.
 - `tracker` (optional, not default) — Enable multi-object tracking support via ByteTrack. Enables `draw_masks_tracked()` in the image crate and `decode_tracked()` in the decoder crate. Requires explicit opt-in:
 
   ```toml

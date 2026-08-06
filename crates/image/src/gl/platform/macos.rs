@@ -29,17 +29,16 @@
 //!    display via `eglGetPlatformDisplayEXT`.
 //!
 //! Everything downstream (pbuffer import, texture binding, FBO setup,
-//! shader compilation, lifetime management) lives in
-//! [`super::super::macos_processor`] and [`super::super::iosurface_import`].
-//! Those modules call these two functions directly — no trait, no enum
-//! dispatch. The trait-based `GlPlatform` seam that existed earlier in
-//! this branch was unused scaffolding and has been removed.
+//! shader compilation, lifetime management) lives in the shared GL engine
+//! (`processor`, `threaded`, `resources`, `shaders`) and in
+//! [`super::super::iosurface_import`]. The engine reaches IOSurface-backed
+//! buffers through the `GlPlatform` trait, implemented for macOS/iOS by
+//! `AngleClientBuffer` in the sibling `angle` module.
 //!
-//! A future `WindowsPlatform` (ANGLE + D3D11 shared textures) will most
-//! likely follow the same two-function seam shape, with its own
-//! `windows_processor.rs` and `d3d11_import.rs` companions. The seam
-//! does not need to be a trait until and unless two platforms end up
-//! sharing a processor implementation.
+//! A future `WindowsPlatform` (ANGLE + D3D11 shared textures) would slot
+//! in the same way: implement these two bring-up functions plus a
+//! `GlPlatform` import type (a `d3d11_import.rs` companion), and the
+//! shared engine runs unchanged.
 
 use super::super::Egl;
 use crate::Error;

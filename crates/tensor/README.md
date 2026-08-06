@@ -28,47 +28,109 @@ This crate has **no internal `edgefirst-*` dependencies**.
 
 | Type | Description | Use Case |
 |------|-------------|----------|
-| **DMA** | Linux DMA-BUF allocation | Hardware accelerators (GPU, NPU, video codecs) |
+| **DMA** | The platform's native zero-copy GPU buffer: DMA-BUF on Linux, IOSurface on macOS/iOS, AHardwareBuffer on Android | Hardware accelerators (GPU, NPU, video codecs) |
 | **SHM** | POSIX shared memory | Inter-process communication, zero-copy IPC |
 | **Mem** | Standard heap allocation | General purpose, maximum compatibility |
-| **PBO** | OpenGL Pixel Buffer Object | GPU-accelerated image processing (created by ImageProcessor) |
+| **PBO** | OpenGL Pixel Buffer Object | GPU-accelerated image processing (created by `ImageProcessor`, never allocated by this crate) |
+
+`TensorMemory::Dma` is one variant on every platform. Ask for it and you get
+whichever of the three backings the OS provides, so portable code does not
+branch on the mechanism.
 
 ## Features
 
-- **Automatic memory selection** - Tries DMA → SHM → Mem based on availability
-- **Zero-copy sharing** - Share tensors between processes via file descriptors
-- **Memory mapping** - Efficient CPU access to tensor data
-- **ndarray integration** - Optional conversion to/from `ndarray::Array` (feature: `ndarray`)
+- **Automatic memory selection** — `new()` tries DMA → SHM → Mem; the image
+  constructors try DMA → Mem (SHM buys an image nothing)
+- **Zero-copy sharing** — share tensors between processes via file descriptors
+- **Memory mapping** — CPU access with the direction declared up front
+- **ndarray integration** — optional conversion to/from `ndarray::Array`
+  (feature: `ndarray`)
 
 ## Quick Start
 
-```rust
-use edgefirst_tensor::{Tensor, TensorMemory, TensorTrait, TensorMapTrait};
+```rust,no_run
+use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMapTrait, TensorMemory, TensorTrait};
 
-// Create a tensor with automatic memory selection
+# fn main() -> Result<(), edgefirst_tensor::Error> {
+// Plain tensor, automatic memory selection (DMA → SHM → Mem).
 let tensor = Tensor::<f32>::new(&[1, 3, 224, 224], None, None)?;
 println!("Memory type: {:?}", tensor.memory());
 
-// Create with explicit memory type
-let dma_tensor = Tensor::<u8>::new(&[1920, 1080, 4], Some(TensorMemory::Dma), None)?;
-
-// Map tensor for CPU access
+// Map for CPU access. `map()` is ReadWrite; map_read() / map_write() are
+// cheaper when you only need one direction.
 let mut map = tensor.map()?;
 map.as_mut_slice().fill(0.0);
 
-// Share via file descriptor (Unix only)
-#[cfg(unix)]
-let fd = tensor.clone_fd()?;
+// Image tensors take a required CpuAccess declaration — see below.
+let frame = Tensor::<u8>::image(1920, 1080, PixelFormat::Rgba,
+                                Some(TensorMemory::Dma), CpuAccess::None)?;
+
+// Share via file descriptor (Linux DMA-BUF / POSIX shm).
+#[cfg(target_os = "linux")]
+let fd = frame.clone_fd()?;
+# Ok(())
+# }
 ```
+
+## CPU Access Is Declared, Hardware Access Is Assumed
+
+Every image constructor — `Tensor::image`, `TensorDyn::image`,
+`ImageProcessor::create_image`, and the C and Python equivalents — takes a
+required `CpuAccess` argument. There is no usage or role enum beyond it.
+
+The crate assumes image buffers are produced and consumed by hardware (ISP,
+codec, GPU, NPU), so every image tensor allocates GPU-readable and
+GPU-writable and no declaration is needed for that. What the CPU intends to do
+is the one thing the allocator cannot guess:
+
+| Declaration | Meaning |
+|---|---|
+| `CpuAccess::None` | Hardware-only. On Android this keeps the allocation eligible for vendor tile compression (UBWC/AFBC/PVRIC/DCC) |
+| `CpuAccess::Read` | Cached mapping. macOS takes the read-only IOSurface lock and skips the unlock flush; Linux syncs the read direction only |
+| `CpuAccess::Write` | Decode targets. Write-combined where the platform offers it, no cache clean on unlock |
+| `CpuAccess::ReadWrite` | Both directions |
+
+Over-declaring is not free: any access other than `None` pins the layout
+linear and forfeits tile compression. Under-declaring is not silent: mapping
+beyond the declaration is best-effort, and either the platform refuses
+(Android refuses deterministically — locking an AHardwareBuffer with usage
+bits it was not allocated with is undefined behaviour per the NDK contract) or
+it succeeds on a slow path. Either way it logs once per buffer and increments
+the process-wide `unplanned_cpu_access_count()`, so undeclared CPU access
+shows up in telemetry instead of quietly costing you throughput.
+
+For anything past the four common parameters — notably a compression request —
+use the `ImageDesc` builder and `Tensor::image_desc`.
+
+## DMA Images Carry a 64-Byte-Aligned Row Stride
+
+Every DMA-backed image tensor has a 64-byte-aligned row stride, in packed,
+planar, and semi-planar layouts alike. This is not a tuning choice: Mali
+rejects an `eglCreateImage` DMA-BUF import at an unaligned pitch with
+`EGL_BAD_ALLOC`, and Vivante with `EGL_BAD_ACCESS`. Neither error mentions the
+stride, which is what makes the bug expensive to find.
+
+The alignment holds in both `image()` (allocation) and `configure_image()`
+(reconfiguring a pooled tensor for a new geometry). If you touch either path,
+keep it. Widths that are merely not a multiple of 16 are enough to trip it —
+321 pixels of RGBA is 1284 bytes, 322 is 1288, and neither divides by 64 — and
+the resulting convert succeeds on V3D and Tegra while failing on imx95 and
+imx8mp.
 
 ## Platform Support
 
 | Platform | DMA | SHM | Mem | PBO |
 |----------|-----|-----|-----|-----|
-| Linux | Yes | Yes | Yes | Yes (with OpenGL) |
-| macOS | No | Yes | Yes | No |
+| Linux | Yes (DMA-BUF) | Yes | Yes | Yes (with OpenGL) |
+| macOS / iOS | Yes (IOSurface) | Yes | Yes | No |
+| Android | Yes (AHardwareBuffer) | Yes | Yes | No |
 | Other Unix | No | Yes | Yes | No |
 | Windows | No | No | Yes | No |
+
+On macOS and Android the GL backend renders into the platform GPU buffer
+directly, so it has no need of PBOs. Probe with `is_gpu_buffer_available()`
+rather than the per-platform probes when all you need to know is whether
+`TensorMemory::Dma` will work.
 
 ## Feature Flags
 
@@ -182,7 +244,7 @@ if is_cuda_available() {
 
 ### Usage — try CUDA map, fall back to host
 
-```rust
+```rust,ignore
 use edgefirst_tensor::{TensorTrait, TensorMapTrait};
 
 // Per-frame: prefer zero-copy CUDA, fall back to host map

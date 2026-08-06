@@ -176,7 +176,13 @@ ONNX/TFLite flat-detection.
 - `dshape.len()` must equal `shape.len()` when `dshape` is present.
 - Each `dshape[i].size` must equal `shape[i]` — catches the common mistake
   of declaring `dshape` in a different order than `shape`.
-- No axis name may appear twice within a single output's `dshape`.
+- No axis name may appear twice within a single output's `dshape`. Duplicates
+  map to the same canonical slot and would make the axis permutation
+  non-invertible.
+- A `padding` axis must have size 1, and a `box_coords` axis size 4.
+
+An empty `dshape` skips all of it: the caller is asserting `shape` is already
+canonical for the role.
 
 Mis-declaring physical order causes every element access to index the wrong
 byte. This was the root cause of two production bugs: a vertical-stripe mask
@@ -236,8 +242,10 @@ module is the high-performance hot path used for split-tensor models
 per-scale tensors (e.g. 80×80, 40×40, 20×20). The pipeline:
 
 1. **Plan** ([`per_scale/plan.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/plan.rs)) — walks the schema once, validating shapes and producing a stride-typed `Plan` that captures every per-scale tensor's role.
-2. **Pipeline** ([`per_scale/pipeline.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/pipeline.rs)) — drives the per-frame decode using the `Plan`. Hot inner loops are NEON-vectorized on aarch64 (see `kernels/`).
-3. **Helper** ([`per_scale/helper.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/helper.rs)) — small math primitives (sigmoid, dequant) shared between the planner and the pipeline.
+2. **Pipeline** ([`per_scale/pipeline.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/pipeline.rs)) — drives the per-frame decode using the `Plan`.
+3. **Kernels** ([`per_scale/kernels/`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/kernels/)) — the compute primitives the pipeline dispatches into: dequant, sigmoid, softmax, transpose, and the per-level box / score / mask-coefficient orchestrators. `cpu_features.rs` probes NEON tiers at runtime (`neon_baseline`, `neon_fp16`, `neon_dotprod`, `neon_i8mm`) and `dispatch.rs` picks the kernel, so an aarch64 host without FP16 falls back rather than failing.
+4. **Outputs** ([`per_scale/outputs.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/outputs.rs)) — the owned box / score / mask-coef / proto buffers, allocated on the first frame and overwritten in place afterwards. Callers get borrowed `DecodedOutputsRef<'_>` views, which is what keeps the steady-state decode allocation-free.
+5. **Helper** ([`per_scale/helper.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/src/per_scale/helper.rs)) — small math primitives (sigmoid, dequant) shared between the planner and the pipeline.
 
 The per-scale path achieved 17–45× mask-materialize speedup on i.MX 8M Plus
 in the v0.18 → v0.20 cycle through batched GEMM, NEON FP16 fused-multiply,
@@ -257,7 +265,7 @@ linear combination weights):
 mask_raw[i] = coefficients[i] @ protos       # (proto_h, proto_w)
 ```
 
-The decoder exposes three mask APIs that pair with image-side rendering:
+The decoder exposes four mask APIs that pair with image-side rendering:
 
 | Workflow | Decoder API (public) | Image-side render | Use case |
 |----------|----------------------|-------------------|----------|
@@ -438,7 +446,7 @@ quality issue. The decoder math is correct in both cases.
 ## Cross-References
 
 - Project architecture: [../../ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md)
-- Batched output consumption (`N > 1`): the decoder maps the whole output tensor once and indexes each batch element via an ndarray slice — no tensor sub-view. The batched output must be tight (or honor its declared strides) so element *n* is a plain stride offset. See [project `ARCHITECTURE.md` § Batched Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#batched-preprocessing).
+- Batched output consumption (`N > 1`): the decoder maps the whole output tensor once and indexes each batch element via an ndarray slice — no tensor sub-view. The batched output must be tight (or honour its declared strides) so element *n* is a plain stride offset. See [project `ARCHITECTURE.md` § Batched Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#batched-preprocessing).
 - Image-side mask rendering: [../image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
 - Tracker integration: [../tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md)
 - Performance tracing usage: [README.md#performance-tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)

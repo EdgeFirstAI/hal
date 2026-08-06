@@ -1994,7 +1994,7 @@ void hal_crop_set_letterbox(struct hal_crop *crop, uint8_t r, uint8_t g, uint8_t
  * @param height Image height in pixels
  * @param format Pixel format (HAL_PIXEL_FORMAT_*)
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
- * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+ * @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
  * - EINVAL: Invalid argument (zero dimensions, unsupported format)
@@ -2988,10 +2988,10 @@ bool hal_is_iosurface_available(void);
  *
  * Portable probe that dispatches to hal_is_dma_available() on Linux and
  * hal_is_iosurface_available() on macOS. Use this when writing
- * cross-platform code that wants to know whether HAL_TENSOR_DMA will
+ * cross-platform code that wants to know whether HAL_TENSOR_MEMORY_DMA will
  * succeed without caring which primitive backs it.
  *
- * @return true if HAL_TENSOR_DMA allocation will succeed, false otherwise
+ * @return true if HAL_TENSOR_MEMORY_DMA allocation will succeed, false otherwise
  */
 bool hal_is_gpu_buffer_available(void);
 
@@ -3022,7 +3022,7 @@ bool hal_is_cuda_available(void);
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
  * @param shape Array of dimension sizes (ndim elements)
  * @param ndim Number of dimensions (1-8)
- * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+ * @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
  * @param name Optional tensor name for debugging (can be NULL)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
@@ -3107,7 +3107,7 @@ struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,
  * obtain the IOSurfaceRef, then pass it here.
  *
  * **GL backend interaction**: the resulting tensor reports
- * HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by
+ * HAL_TENSOR_MEMORY_DMA from hal_tensor_memory_type() and is importable by
  * the GL backend via EGL_ANGLE_iosurface_client_buffer with no extra
  * copy.
  *
@@ -3149,7 +3149,7 @@ struct hal_tensor *hal_tensor_from_iosurface(enum hal_dtype dtype,
  * producer pads rows, hal_tensor_set_row_stride()) before convert().
  *
  * **GL backend interaction**: the resulting tensor reports
- * HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by the
+ * HAL_TENSOR_MEMORY_DMA from hal_tensor_memory_type() and is importable by the
  * GL backend as an EGLImage with no extra copy.
  *
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
@@ -3771,7 +3771,7 @@ struct hal_tile_spec_list *hal_tile_grid(size_t frame_h,
  * @param config Tiling configuration (must be non-NULL)
  * @param format Pixel format (HAL_PIXEL_FORMAT_*)
  * @param dtype Data type of tensor elements (HAL_DTYPE_*)
- * @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+ * @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
  * @param access Declared CPU access (see HalCpuAccess)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):

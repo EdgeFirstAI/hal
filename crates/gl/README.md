@@ -22,6 +22,14 @@ The library is imported as `edgefirst_gl`:
 use edgefirst_gl as gls; // optional alias
 ```
 
+## Loading the function pointers
+
+`gl_generator`'s `GlobalGenerator` emits a process-global `static mut` function
+table, so `gl::load_with` must run exactly once per process — not once per
+context or per object. Calling it again from a second thread while GL calls are
+in flight is a data race. The HAL wraps this in a `load_gl_once` step on its
+platform seam; anything else embedding this crate needs the same discipline.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

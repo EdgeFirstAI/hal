@@ -4,12 +4,14 @@
 
 We actively support the following versions of EdgeFirst HAL with security updates:
 
-| Version | Support Status          |
-|---------|------------------------|
-| 0.x     | ✅ Full support         |
-| < 0.1   | ❌ Not yet released     |
+| Version | Support Status |
+|---------|----------------|
+| 0.x (latest release) | Full support |
+| 0.x (older releases) | Fix ships in the next release; no backports |
 
-*Note: Version support policy will be updated once we reach stable 1.0 release.*
+The project is pre-1.0, so security fixes land on the current release line rather
+than being backported. Upgrade to the latest 0.x to pick them up. This policy will
+be revisited at 1.0.
 
 ## Reporting a Vulnerability
 
@@ -38,7 +40,7 @@ Please include:
    - **Critical**: 7 days
    - **High**: 30 days
    - **Medium**: Next minor release
-   - **Low**: Next major release
+   - **Low**: Scheduled into a future release; we'll tell you which one
 
 ### Response Process
 
@@ -161,7 +163,7 @@ For production deployments requiring enhanced security:
 
 Au-Zone Technologies provides:
 
-- **Security Audits** - Comprehensive code and architecture reviews
+- **Security Audits** - Full code and architecture reviews
 - **Penetration Testing** - Third-party security assessments
 - **Compliance Certification** - Help meeting regulatory requirements
 - **Priority Security Patches** - Expedited fixes for enterprise customers

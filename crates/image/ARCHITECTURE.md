@@ -26,7 +26,9 @@ shutdown quirks of each driver stack.
 | [`cpu/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/cpu) | local | `CPUProcessor` — fast_image_resize + rayon, plus the f16 mask kernels |
 | [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/tiling.rs) | local | SAHI input side: EvenDist `tile_grid` geometry, `TilingConfig`/`TileSpec`, and the `ImageProcessor` tiling methods (`alloc_tile_batch`, `plan_tiles`, `tile_into`, `tile_one`) that render zero-copy tile batches |
 | [`g2d.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/g2d.rs) | local | `G2DProcessor` — NXP i.MX G2D 2D-engine bindings |
+| [`colorimetry.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/colorimetry.rs) | local | `yuv_to_rgb_coeffs` (the six shader uniforms) and `effective_colorimetry` — the use-time resolver every backend shares |
 | [`gl/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/image/src/gl) | local | OpenGL backend: threaded wrapper, context, EGL+PBO caches, shaders, DMA-BUF import |
+| [`gl/render.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/render.rs) | local | **Portable** pure decision tables and geometry — `lower_dst`, `plan_convert`, `region_to_viewport_top_down`, plus `region_to_viewport`, `source_uv`, and `plan_batch` reserved for the bottom-up-surface and `GL_MAX_*` chunking follow-ups. Host-tested with no GL dependency. |
 | [`gl/shaders_common.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/shaders_common.rs) | local | **Portable** GLSL shared by both backends (compiled on every OS): the shared fullscreen `VERTEX_SHADER`, the PlanarRgb F16 packer, and the NV→RGBA shader (`NV_RGBA_FRAGMENT`, one divide-free body shared by both backends). Its bytes are byte-frozen by golden-file tests that run on every platform. |
 | [`gl/core.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/core.rs) | local | **Portable** renderer helpers shared by both backends (no gbm/IOSurface types): `float_crop_uniforms` and its unit tests. |
 | [`gl/fourcc.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/src/gl/fourcc.rs) | local | `PixelFormat`→`DrmFourcc` mapping via the portable `drm_fourcc` crate (NOT `gbm`), so shader/format code carries no `gbm` coupling. |
@@ -43,7 +45,7 @@ shutdown quirks of each driver stack.
 
 - [`ImageProcessor`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.ImageProcessor.html) — the orchestrator. Owns CPU + G2D + GL backends and dispatches per call.
 - [`ImageProcessorTrait`](https://docs.rs/edgefirst-image/latest/edgefirst_image/trait.ImageProcessorTrait.html) — the convert/draw API common to every backend.
-- [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — **source-side** geometry: `Crop { source: Option<Region>, fit: Fit }` selects the sampled source sub-rectangle and the fit mode. `Fit = Stretch | Letterbox`; **letterbox** preserves the *source* aspect ratio while filling the requested *destination* shape (padding the remainder). Destination placement is the destination itself (a tensor or a `view`/`batch` of one), never a `Crop` field.
+- [`Rotation`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Rotation.html), [`Flip`](https://docs.rs/edgefirst-image/latest/edgefirst_image/enum.Flip.html), [`Crop`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.Crop.html) — **source-side** geometry: `Crop { source: Option<Region>, fit: Fit }` selects the sampled source sub-rectangle and the fit mode. `Fit = Stretch | Letterbox { pad: [u8; 4] }`; **letterbox** preserves the *source* aspect ratio while filling the requested *destination* shape, padding the remainder with `pad` (`Crop::letterbox([114, 114, 114, 255])` is the YOLO-style shorthand). When a source crop is set, the preserved aspect ratio is the *crop's*, not the full frame's. Destination placement is the destination itself (a tensor or a `view`/`batch` of one), never a `Crop` field.
 - **Destination / source regions** (`dst.view(rect)` / `dst.batch(n)`, `src.view(rect)`) — a sub-region of a tensor used to target a batch tile or select a sampling window in `convert()`. The `view`/`batch` primitive is a **raw tensor** concept (it shares the parent's `BufferIdentity` and carries the sub-region — defined in [`crates/tensor/ARCHITECTURE.md` § Views and sub-regions](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#views-and-sub-regions)); the *mechanics* of consuming one live here. A region lowers to `glViewport`/`glScissor` (GL dst), the destination crop (G2D dst), an offset+stride (CPU dst), or `Crop.source` sampling (src). It is render state, not a buffer attribute, so it never re-keys the EGLImage. See [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert).
 - [`MaskOverlay`](https://docs.rs/edgefirst-image/latest/edgefirst_image/struct.MaskOverlay.html) — composite control for mask-rendering APIs (`background`, `opacity`).
 - [`codec::ImageLoad`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/trait.ImageLoad.html) + [`codec::ImageDecoder`](https://docs.rs/edgefirst-codec/latest/edgefirst_codec/struct.ImageDecoder.html) — decode JPEG/PNG into a pre-allocated tensor at its native format (JPEG → `Nv12`/`Nv16`/`Nv24` by subsampling, or `Grey`; PNG → `Rgb`/`Rgba`/`Grey`); EXIF orientation is reported in `ImageInfo`, never applied (apply it via `convert()`). [`save_jpeg`](https://docs.rs/edgefirst-image/latest/edgefirst_image/fn.save_jpeg.html) — encode a `u8` tensor to JPEG.
@@ -57,6 +59,8 @@ classDiagram
     class ImageProcessorTrait {
         <<trait>>
         +convert(src, dst, rotation, flip, crop)
+        +convert_deferred(src, dst, rotation, flip, crop)
+        +flush()
         +draw_decoded_masks(dst, detections, segmentations)
         +draw_proto_masks(dst, detections, proto_data)
         +set_class_colors(colors)
@@ -65,9 +69,10 @@ classDiagram
     class ImageProcessor {
         cpu: Option~CPUProcessor~
         g2d: Option~G2DProcessor~
-        opengl: Option~GLProcessorThreaded~ (Linux + macOS)
+        opengl: Option~GLProcessorThreaded~ (every OS)
         +new() orchestrator with fallback chain
-        +create_image(w, h, PixelFormat, DType, mem) GPU-optimal alloc
+        +create_image(w, h, PixelFormat, DType, mem, access) GPU-optimal alloc
+        +plan_tiles / alloc_tile_batch / tile_into / tile_one  SAHI input tiling
     }
 
     class G2DProcessor { NXP i.MX G2D hardware (Linux) }
@@ -144,7 +149,7 @@ at `ImageProcessor::new()` time:
 
 ```mermaid
 flowchart TD
-    Create["create_image(w, h, PixelFormat, DType, mem)"]
+    Create["create_image(w, h, PixelFormat, DType, mem, access)"]
     ExplicitDma{explicit Dma?}
     F32Dma{dtype == F32?}
     DMA{DMA-buf roundtrip<br/>verified at init?}
@@ -252,7 +257,7 @@ path, no type parameters leaking into the engine):
 | `load_gl_once` | once-per-process via this display's `eglGetProcAddress` | no-op (loaded at shared-display init) | no-op (loaded at shared-display init) |
 
 `PlatformCaps` (transfer backend, float render support, `serialize_gl`,
-`external_oes`) is captured ONCE per processor at worker startup and
+`external_oes`, `native_fence_sync`) is captured ONCE per processor at worker startup and
 feeds the pure decision tables — platform differences never appear as
 new `cfg` branches inside the engine.
 
@@ -471,17 +476,39 @@ that tells the engine what completes the convert.
 | `TextureMem` | Mem/Shm (or DMA without import) | offscreen texture seeded from the mapped tensor | `glReadPixels` into the mapped tensor |
 
 One `convert_via_engine` executes every u8/i8 convert: the pure plan table
-`render::plan_convert(src_fmt, dst_fmt, lowering)` picks `SinglePass`,
-`TwoPassPackedRgb` (zero-copy packed RGB needs an RGBA-reinterpret second
-pass), or `TwoPassNvPlanar` (NV→planar through the full `select_nv_path`
-machinery; also the Vivante single-pass GPU-hang workaround). Single-pass
-converts share the same `bind_dst → render → readback` body for every
-src/dst memory combination — the source side independently picks the PBO
-UNPACK upload or the CPU texture upload. The two-pass functions survive as
-render strategies, not duplicated dispatch. Both decision tables
+`render::plan_convert(src_fmt, dst_fmt, lowering)` picks one of three plans.
+
+| Plan | Selected when | Why |
+|------|---------------|-----|
+| `TwoPassPackedRgb` | `dst_fmt == Rgb` on a `ZeroCopy` lowering | GL has no 3-byte render format, so pass 2 packs into the destination reinterpreted as RGBA8 at `W*3/4 × H`. Texture lowerings render genuine RGB in one pass and stay `SinglePass`. |
+| `TwoPassNvPlanar` | any planar `dst_fmt` on a texture lowering (`TextureMem`/`TexturePbo`), **or** an NV12/NV16/NV24 source into a planar destination on any lowering | Pass 1 is the ordinary `convert_to` packed path (which handles every source format, including a heap source, on every platform); pass 2 deinterleaves RGBA into the planes and reads back through the same `DstTarget` `SinglePass` uses. |
+| `SinglePass` | everything else | One render pass into the bound target, then the lowering's readback. |
+
+The `TwoPassNvPlanar` gate is a *capability* fact, not a Vivante carve-out:
+the single-pass planar shader (`draw_camera_texture_to_rgb_planar`) is built
+only where `Platform::EXTERNAL_OES` is true — never on ANGLE or Android — and
+even on Linux, where it is built, its source import is unconditionally
+DMA-only. A texture-lowered planar destination therefore has no single-pass
+route for *any* source format, and semi-planar NV has none even zero-copy
+(no multi-plane EGLImage/IOSurface binding for the planar shader). Only
+non-NV → planar on a zero-copy destination keeps the proven single-pass
+EXTERNAL_OES route. The Vivante GC7000UL single-pass GPU hang (EDGEAI-1180)
+is subsumed by the same plan rather than gated separately.
+
+Single-pass converts share the same `bind_dst → render → readback` body for
+every src/dst memory combination — the source side independently picks the
+PBO UNPACK upload or the CPU texture upload. The two-pass functions survive
+as render strategies, not duplicated dispatch. Both decision tables
 (`lower_dst`, `plan_convert`) are host-tested in `render.rs` with no GL
 dependency, so a new platform changes capability *inputs*, never the
 tables.
+
+**Planar render-target geometry.** A planar destination's render target is
+full `dst_w × (dst_h · channels)` single-channel R8 — the planar shader draws
+each plane as one full-width quad, so there is no `/4` texel packing to
+compensate for. Sizing the target at `dst_w/4` (as the non-DMA setup once
+did) has no shader that packs four plane bytes per texel and silently
+truncates. The `W*3/4` reinterpretation belongs to `TwoPassPackedRgb` alone.
 
 **Why the PBO lowering never maps:** the GL thread must not call
 `tensor.map()` on a PBO image — that sends a `PboMap` message back to the
@@ -635,10 +662,12 @@ EGLImage cache key. Per backend:
 | G2D     | the tile is the destination crop rectangle of the blit | the tile's byte offset/stride must meet G2D's dst alignment, else this tile falls back to CPU |
 | CPU     | a base `offset` + the **parent's** `row_stride` into the parent buffer | the writer strides by the parent pitch, not a tile-local tight stride |
 
-**`convert()` always outputs an RGB-family color (`Grey` / `Rgb` / `Rgba`),
-packed `HWC` or planar `CHW`** — never a YUV/semi-planar layout (chroma is a
-*source* concern only; a YUV destination returns `Error::InvalidFormat`). NPUs
-require packed/aligned inputs and models are trained to match. The `Rgb` output
+**Every accelerated `convert()` outputs an RGB-family colour (`Grey` / `Rgb` /
+`Rgba` / `Bgra`), packed `HWC` or planar `CHW`** — chroma is a *source* concern
+on the GL and G2D paths, which decline a YUV destination outright. NPUs require
+packed/aligned inputs and models are trained to match. (The CPU backend does
+accept four YUV pairs — `Yuyv`→`Yuyv`, `Yuyv`→`Nv16`, and the two `Vyuy`
+equivalents — so such a convert is correct but always lands on the CPU.) The `Rgb` output
 uses the "4-into-3" packing trick (four RGB pixels written as three RGBA texels);
 `Grey` renders to `GL_RED` or, for throughput, packs into RGBA like `Rgb`.
 
@@ -669,9 +698,13 @@ OpenGL destination-tile obligations:
 - **Sync once per batch.** A plain `convert()` ends with `glFinish()`, so a loop
   of N converts incurs N pipeline syncs. `convert_deferred` defers that finish and
   `flush()` issues a single `finish_via_fence` for the whole batch; the CUDA map
-  path auto-flushes a pending batch before handing the device the buffer. First
-  engine: single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA only — two-pass packed-RGB,
-  planar, and macOS GL fall back to an eager per-tile convert.
+  path auto-flushes a pending batch before handing the device the buffer.
+  **Current limit:** the band lowering handles the single-pass geometry only. A
+  `view`/`batch` destination on a zero-copy lowering whose format is packed
+  `Rgb` or any planar layout reinterprets the render-target geometry
+  (`W*3/4 × H`, `H*3` bands), which the band path does not yet compute, so the
+  GL backend declines it and the tile falls through to CPU. Band tiling for
+  those geometries is a follow-up.
 
 **Source import churn.** Each distinct source re-imports (~100–300 µs); across a
 run that is O(images) unless bounded. Reuse a fixed-capacity ring of source
@@ -680,8 +713,7 @@ the live source EGLImages stay warm and bounded. Reconfiguring a reused buffer
 must re-import at the new geometry: because the cache key includes the import
 geometry (`width`/`height`/`row_stride`/`format`) alongside `BufferIdentity.id`
 and `chroma_id`, a buffer reused at a new size **re-keys to a fresh import**
-rather than returning a *stale* image. (A `last_import_reason` field recording
-`Reconfigure`/`NewIdentity`/`Hit` is a planned observability addition.)
+rather than returning a *stale* image.
 
 Edge contracts (testable invariants):
 
@@ -695,11 +727,121 @@ Edge contracts (testable invariants):
 - Master oracle for every tile: a tile equals a standalone full-buffer
   `convert()` of the same source into a fresh single-image destination.
 
+### SAHI input tiling (`tiling.rs`)
+
+Small-object detection in a 4K frame runs the model at its native input
+resolution over an overlapping grid of native-resolution crops — SAHI
+(Slicing Aided Hyper Inference). `tiling.rs` is the input half of that; the
+detection-merge half lives in `edgefirst_decoder::tiling`, and the two share
+one `TilePlacement` type (re-exported here) so the lift back to full-frame
+coordinates cannot drift from the crop that produced it.
+
+**Grid.** `tile_grid` lays a uniform row-major grid using **EvenDist**
+spacing, ported from the adis-uav-model `sahi()` reference. `overlap_ratio`
+is a *minimum*: the step is `floor(tile · (1 − overlap))` and the origins are
+then redistributed evenly, so the first tile starts at 0, the last lands
+exactly on `frame − tile`, and every tile is full-size. Realized overlap is
+always at least the requested ratio. There is no flush-to-edge or clip
+alternative — one spacing method, no configurability. An axis whose frame
+extent is no larger than the tile yields a single whole-frame crop.
+
+**Three entry points, one geometry.**
+
+| Method | GPU work | Destination | Use |
+|---|---|---|---|
+| `plan_tiles(src_w, src_h, &cfg)` | none — pure geometry | — | Size pools up front; drive a pipelined tile stream |
+| `alloc_tile_batch(n, &cfg, …)` | allocation only | one tall `tile_w × (n · tile_h)` parent via `create_image` | Reused per frame |
+| `tile_into(&src, &mut batch, &cfg)` | one deferred convert per tile, then a single `flush` | row-band `view` of the tall parent | Whole frame in one batch |
+| `tile_one(&src, &mut slot, &placement, &cfg)` | one deferred convert, caller flushes | a caller-owned model-input slot | Overlap preprocessing with inference |
+
+**The zero-copy property rests on how the source crop is selected.** Each
+tile passes its crop as `Crop::with_source(region)` — sampling the whole-frame
+tensor through texture coordinates — and **never** as `src.view(region)`. A
+viewed source would mint one EGLImage import per tile and turn `N` tiles into
+`N` imports. The destination side is the mirror image: sibling row-bands of
+one parent buffer, selected by `glViewport`/`glScissor`, sharing the parent's
+single import (see [Batched preprocessing](#batched-preprocessing-building-a-batch-via-convert)).
+`tile_into` therefore costs roughly one GPU sync for the whole frame rather
+than one per tile.
+
+`render_tile` decides batched-band versus whole-slot from the destination's
+capacity against `placement.count · tile_h`, not from `dst_h > tile_h` — a
+padded `tile_one` slot can be taller than one tile without being a tall
+parent. `TilePlacement` geometry arriving from the C and Python bindings is
+validated in `placement_to_source_region`: negative, non-finite, fractional,
+or zero-extent values are rejected rather than truncated.
+
+### CPU cropped convert (the tiling fallback)
+
+When no GPU accepts the pair, tiles land on the CPU backend, and a crop that
+costs a whole-frame decode per tile is `N`× the work it should be. Two
+mechanisms keep the cost proportional to the crop.
+
+**Fused NV → planar strip path.** `convert_nv_to_planar_fused` decodes YUV
+into packed RGB one cache-resident 32-row strip at a time and NEON-
+deinterleaves each strip straight into the destination planes, so the
+full-size packed intermediate never round-trips through DRAM. It now takes an
+optional source `region`. Exactly two shapes reach it: the whole-frame case
+(no crop, destination the same size as the source) and a **scale-identity**
+crop — crop extent equal to the destination extent, no rotation or flip, full
+destination placement, and a chroma-aligned origin. Any other shape (a real
+resize, a partial destination placement, a misaligned origin) falls through
+to the general pipeline. Nothing is ever snapped or shifted into alignment.
+
+Alignment follows the subsampling: NV12 (4:2:0) needs an even `left` *and*
+`top`, NV16 (4:2:2) only an even `left`, NV24 (4:4:4) neither. A crop whose
+`left` is 0 — the whole frame and every left-edge tile — slices the parent
+planes directly and stays zero-copy, because each stride-sized chunk the
+`yuv` crate walks is a real, fully-owned source row. The one exception is
+NV12 at odd height that is not flush with the source's bottom edge: the
+crate's 4:2:0 odd-last-row handling reads `chunks_exact(2·stride)
+.remainder()`, which is the region's own last row only when the slice holds
+exactly `height` rows, so that case packs. Every non-zero `left` packs.
+Chroma scratch rows round up to an even byte count
+(`out_w.div_ceil(2) * 2`) for NV12/NV16, leaving room for the trailing U+V
+pair an odd-width crop still needs.
+
+**Adaptive resize halo.** For everything that does resize, the pre-resize
+intermediate is sized to the crop rather than the frame
+(`pre_resize_region` → `extract_nv_region`, the
+`image.convert.cpu.extract_region` span). `fast_image_resize` clamps its filter window to the
+*image* bounds, not the crop rect, so a cropped convert legitimately samples
+a margin of real neighbouring pixels; reproducing that margin — the halo — is
+what lets the intermediate shrink without changing a single output byte.
+
+The halo is computed, not assumed. A fixed radius is wrong in both
+directions: `Convolution` uses an adaptive kernel whose radius is
+`support · max(scale, 1)`, so a large downscale reaches much further than any
+constant, while `Interpolation` holds a fixed `support` regardless of scale.
+`filter_halo` reads the support from the configured `ResizeAlg` (`Box` 0.5,
+`Bilinear`/`Hamming` 1, `CatmullRom`/`Mitchell` 2, `Gaussian`/`Lanczos3` 3,
+`Custom` from the filter itself) and derives the reach as
+`ceil(radius − scale/2)`. An algorithm it cannot model (`SuperSampling`, or
+anything a future upstream release adds) returns `None` and the caller keeps
+the full-frame intermediate and its unchanged output.
+
+`HALO_SLACK = 1` is added to every modelled reach and is load-bearing, not
+padding. Growing the extracted rect beyond the filter's true reach cannot
+change an output pixel — the extra columns are never sampled — but a *zero*
+halo can: an already-chroma-aligned crop would grow by nothing, the rebased
+source rect would become the whole intermediate, `needs_resize` would flip to
+false, and control would pass to `flip_rotate_ndarray_pf`, which assumes
+tightly-packed destination rows and so bypasses the padded-destination
+destride. Only `Nearest` has a genuinely zero reach, which is why it was the
+one algorithm that could hit that case before the floor applied uniformly.
+
+Byte-exactness across this whole path is frozen by the per-architecture
+golden fixtures in `tests/crop_golden.rs` — see
+[`TESTING.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md#golden-fixtures-for-cropped-convert).
+
 ### EGL image cache
 
-The OpenGL backend maintains two independent LRU caches of EGLImages —
-`src_egl_cache` for source tensors and `dst_egl_cache` for destination
-tensors. The full key (`EglCacheKey`) is the tensor's **`BufferIdentity.id`**
+The OpenGL backend maintains three independent LRU caches of EGLImages —
+`src_egl_cache` for source tensors, `dst_egl_cache` for destination tensors,
+and `nv_r8_egl_cache` for the Path-B single-plane R8 source imports (keyed
+identically to `src_egl_cache` but holding R8 imports, so the two never
+collide on the same buffer). `egl_cache_stats()` reports all three
+separately. The full key (`EglCacheKey`) is the tensor's **`BufferIdentity.id`**
 (plus `chroma_id` for multi-plane sources) **and the imported geometry**
 (`width`, `height`, `row_stride`, `format`) — the geometry distinguishes a
 pooled buffer reused at a new size via `configure_image`. A `view()`/`batch()`
@@ -726,7 +868,7 @@ When a tensor is freed, its `Arc<()>` guard drops. The cache holds only a
 `Weak<()>` reference, so `sweep()` detects dead entries without an explicit
 removal call.
 
-| Pattern | Cache behavior | Performance |
+| Pattern | Cache behaviour | Performance |
 |---------|----------------|-------------|
 | Same tensor object reused across frames | Hit on every frame | Fast — no EGLImage re-import |
 | New tensor wrapping the same fd each frame | Miss on every frame | Slow — re-imports each call |
@@ -752,10 +894,12 @@ See [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFir
 in the project ARCHITECTURE.md for the cross-crate cache story (V4L2
 fd recycling, inode-keyed cache, GStreamer adaptor integration).
 
-### Vivante NV12/NV16/NV24 → PlanarRgb two-pass workaround
+### NV12/NV16/NV24 → PlanarRgb two-pass render
 
 A single-pass semi-planar-YUV → PlanarRgb shader causes a GPU hang on the
-Vivante GC7000UL (NXP i.MX 8M Plus). The workaround splits the conversion:
+Vivante GC7000UL (NXP i.MX 8M Plus), which is where this split originated.
+It is now the plan for every NV\* → planar convert on every GPU, for the
+capability reasons in [Destination lowering](#destination-lowering-bind_dst):
 
 ```text
 Pass 1:  NV12/NV16/NV24 → RGBA (intermediate)
@@ -766,9 +910,10 @@ Pass 2:  RGBA → PlanarRgb (at destination resolution)
 
 Pass 1 reuses the existing `packed_rgb_intermediate_tex` texture — no new
 GPU resources allocated. Pass 2 uses the same shader infrastructure as
-direct RGBA → PlanarRgb. The two-pass path is selected automatically when
-`is_vivante && matches!(src_fmt, Nv12 | Nv16 | Nv24) && dst_fmt.layout() ==
-Planar`; the function is `convert_nv_to_planar_two_pass`. No API changes
+direct RGBA → PlanarRgb, and classifies its target through the same
+`bind_dst` seam `SinglePass` uses, so a heap or PBO destination reads back
+identically. The function is `convert_nv_to_planar_two_pass`; selection is
+`render::plan_convert`'s, not an `is_vivante` branch. No API changes
 required from callers.
 
 **Multi-pass invariant.** Every multi-pass GL flow keeps its intermediate
@@ -906,17 +1051,18 @@ deployment that may run on it) is to **materialise masks once on the
 CPU** via `materialize_masks` immediately after decode, free the proto
 data, and then render with the cheap `draw_decoded_masks` blit:
 
-```rust
+```rust,ignore
 // On the decode thread:
 let masks = processor.materialize_masks(
-    &boxes, &scores, &classes, &proto_data,
-    letterbox_norm,
+    &detections,
+    &proto_data,
+    letterbox_norm, // Option<[f32; 4]>
     MaskResolution::Scaled { width: dst_w, height: dst_h },
 )?;
 drop(proto_data); // free the proto tensor immediately
 
 // On the render thread (or the same thread, just later):
-processor.draw_decoded_masks(&mut frame, &boxes, &masks, overlay)?;
+processor.draw_decoded_masks(&mut frame, &detections, &masks, overlay)?;
 ```
 
 `materialize_masks` runs the same batched-GEMM kernel exercised by
@@ -1053,7 +1199,7 @@ when the worker starts:
 
 | Driver | Policy | Effect |
 |---|---|---|
-| Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behavior on every platform). |
+| Vivante `galcore` (i.MX 8M Plus) | `Full` | Every message acquires the global `GL_MUTEX` — all instances serialize (the pre-2026-06 behaviour on every platform). |
 | Virtualized GPUs (`Paravirtual`/`virtio` in `GL_RENDERER`) | `Full` | Concurrent GL across contexts mis-renders on paravirtual Metal (observed on GitHub macOS runners: ~60–86% of output bytes diverge under parallel converts). Messages serialize on a process-global mutex (macOS has no lifecycle lock — ANGLE serializes display entry points internally). |
 | Mali/Panfrost, V3D, Tegra, llvmpipe, macOS (real Apple GPU) | `LifecycleOnly` | Messages run unlocked; instances execute GL concurrently on the same GPU. |
 | Android (Adreno/Mali system drivers) | `LifecycleOnly` | Messages run unlocked. Android's system EGL is specification-conformant thread-safe, so there is also no Linux-style lifecycle lock around context bring-up (same reasoning as ANGLE's internal serialization); this claim is device-validated by the Device Farm harness. |
@@ -1137,7 +1283,8 @@ Span names follow `<crate>.<function>[.<operation>[.<sub-operation>]]`:
   invoked (`image.convert`, `image.materialize_masks`, `image.draw_decoded_masks`).
 - **`<crate>.<function>.<operation>`** — meaningful internal work; backend
   dispatch within `convert()` lives at this level
-  (`image.convert.gl`, `image.convert.g2d`, `image.convert.cpu`).
+  (`image.convert.gl`, `image.convert.g2d`; the CPU backend emits no
+  span at this level — see the note under the tree).
 - **`<crate>.<function>.<operation>.<sub-operation>`** — further
   decomposition where it aids optimisation (`image.convert.gl.pack_rgb.pass1_rgba`,
   `image.convert.cpu.format_convert`).
@@ -1149,23 +1296,26 @@ optimisation and has enough complexity to justify the overhead — roughly
 ### Span tree
 
 ```text
+image.gl_init                                           [once per shared display — macOS/ANGLE and Android bring-up]
+fields: platform, backend
+
 image.convert                                           [user-facing fn, orchestrator]
-│ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip, dst_tile?
+│ fields: src_fmt, dst_fmt, src_memory, dst_memory, rotation, flip
 │
 ├── image.convert.gl                                    [OpenGL backend, picked first]
-│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, dst_tile?, last_import_reason?
+│   │ fields: src_fmt, dst_fmt, is_int8, src_memory, dst_memory, src_feed (import | pbo | upload)
 │   ├── image.convert.gl.engine                         ← plan + destination lowering for the convert ({plan, lowering, src_pbo})
 │   ├── image.convert.gl.egl_import                     ← one actual eglCreateImageKHR (cache MISS only; zero in steady state)
 │   ├── image.convert.gl.pack_rgb.pass1_rgba            ← NV* → intermediate RGBA (resize + crop + flip)
 │   ├── image.convert.gl.pack_rgb.pass2_pack            ← intermediate RGBA → packed RGB (3:4 width ratio)
-│   ├── image.convert.gl.nv_to_planar.pass1_rgba        ← Vivante 2-pass: NV12/NV16/NV24 → intermediate RGBA
-│   ├── image.convert.gl.nv_to_planar.pass2_deinterleave ← Vivante 2-pass: RGBA → PlanarRgb planes
-│   └── image.convert.gl.macos.nv_to_planar             ← macOS two-pass: NV12/NV16/NV24 → PlanarRgb F16 (single GL session)
+│   ├── image.convert.gl.nv_to_planar.pass1_rgba        ← 2-pass: NV12/NV16/NV24 → intermediate RGBA
+│   ├── image.convert.gl.nv_to_planar.pass2_deinterleave ← 2-pass: RGBA → PlanarRgb planes
+│   └── image.convert.gl.nv_to_planar_float             ← fused two-pass: NV12/NV16/NV24 → PlanarRgb F16 (macOS IOSurface + Linux DMA-BUF f16)
 │
 ├── image.convert.g2d                                   [NXP i.MX G2D backend, picked second]
 │   fields: src_fmt, dst_fmt
 │
-└── image.convert.cpu                                   [universal fallback, parent implicit]
+└── (image.convert.cpu)                                 [universal fallback — GROUPING ONLY, no span of this name is emitted]
     ├── image.convert.cpu.format_convert                ← per-pixel format conversion
     │   │ fields: from, to, pass = "pre_resize" | "direct" | "post_resize"
     │   └── image.convert.cpu.extract_region             ← NV12/NV16/NV24 sub-rect copy feeding a "pre_resize" convert
@@ -1178,6 +1328,9 @@ image.flush                                             [user-facing fn — batc
 
 image.draw_decoded_masks                                [user-facing fn]
 fields: n_detections, n_segmentations
+
+image.draw.gl.proto                                     [fused GL proto-segmentation render]
+fields: dtype, upload, program, num_protos, detections
 
 image.materialize_masks                                 [user-facing fn]
 │ fields: n_detections, mode = "proto" | "scaled", width?, height?
@@ -1215,13 +1368,14 @@ image.tile_one                                          [user-facing fn — rend
 
 | Span                                                   | What is happening inside | Key observations |
 |--------------------------------------------------------|--------------------------|------------------|
-| `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. `dst_tile` (the batch-tile rect / index) is present when the call renders into a destination region rather than the whole tensor. |
-| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. `dst_tile` and `last_import_reason` reveal the tile rect/index and whether the source re-imported. |
+| `image.gl_init`                                        | One-time shared-display bring-up: ANGLE dylib discovery + Metal display on macOS/iOS, system EGL default display on Android. An `info_span`, not a trace span. | Fires once per process, not per processor. A second occurrence means the `OnceLock` was re-entered — worth investigating. Linux brings its display up through `context.rs` and emits no span here. |
+| `image.convert`                                        | Orchestration: probe backends, pick OpenGL → G2D → CPU, dispatch. | The `src_memory` and `dst_memory` fields reveal whether you're on a zero-copy DMA-buf path, the PBO path, or the heap fallback. Cache-miss EGLImage imports show up as outliers here when callers reuse fds without reusing tensors. |
+| `image.convert.gl`                                     | The chosen GL backend's full shader pipeline: bind/import source, set up FBO/renderbuffer, run conversion shader, `glFinish`. | First call at a new (src_fmt, dst_fmt, dims) tuple includes shader compile/link cost. Steady-state cost is dominated by the GPU draw and the `glFinish` at the end. `src_feed` is recorded at the source-feed site (`import` / `pbo` / `upload`) and is the per-call zero-copy observable — anything but `import` on a DMA source means the frame paid a copy. |
 | `image.convert.gl.engine`                              | The convert engine's decision record: which `ConvertPlan` (`SinglePass` / `TwoPassPackedRgb` / `TwoPassNvPlanar`) and which destination lowering (`ZeroCopy` / `TextureMem` / `TexturePbo`) this convert took, plus whether the source is PBO-backed. | The plan/lowering pair maps 1:1 onto the GL work performed — filter traces by these fields to isolate one lowering's latency. Both decisions are pure host-tested tables in `render.rs` (`plan_convert`, `lower_dst`). |
-| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behavior observable: a steady-state frame loop over a fixed buffer pool must emit ZERO of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
+| `image.convert.gl.egl_import`                          | One actual `eglCreateImageKHR` — every EGLImage creation (DMA-BUF, NV R8, RGB renderbuffer paths) funnels through this single choke point. | The cache-behaviour observable: a steady-state frame loop over a fixed buffer pool must emit ZERO of these after warmup. Any per-frame occurrence means the EGLImage cache stopped hitting (key drift, geometry churn, or pool misuse). The `GLProcessorThreaded::egl_cache_stats()` counters (`src`/`dst`/`nv_r8` hits/misses) are the assertable form, pinned by the `dma_pool_steady_state_zero_imports` test. |
 | `image.convert.gl.pack_rgb.pass1_rgba`                 | NV12 → intermediate RGBA texture (full geometry: resize, crop, rotation, flip, letterbox). | Reused for the "packed RGB" output path (DMA destination with 3-byte-per-pixel width × 3 / 4 render geometry). |
 | `image.convert.gl.pack_rgb.pass2_pack`                 | Intermediate RGBA → RGB DMA destination via the packed shader. | Only the second pass touches the DMA buffer; the first pass renders into the cached intermediate texture. |
-| `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA (the Vivante GC7000UL workaround for the GPU hang on single-pass NV* → PlanarRgb). | Selected automatically when `is_vivante && matches!(src_fmt, Nv12 \| Nv16 \| Nv24) && dst.layout == Planar`. |
+| `image.convert.gl.nv_to_planar.pass1_rgba`             | NV12/NV16/NV24 → intermediate RGBA — pass 1 of the `TwoPassNvPlanar` plan. | Selected by `render::plan_convert` for every NV\* → planar convert on every GPU, and for any source → planar on a texture lowering. Originally the Vivante GC7000UL single-pass GPU-hang workaround, now the general route. |
 | `image.convert.gl.nv_to_planar.pass2_deinterleave`     | RGBA → PlanarRgb / PlanarRgba via `sampler2D` deinterleave shader. | Includes the optional `XOR 0x80` int8-bias step when the destination is `DType::I8`. |
 | `image.convert.gl.nv_to_planar_float`                  | Fused NV12/NV16/NV24 → PlanarRgb F16 with a GPU-resident intermediate: pass 1 renders NV→RGBA with the caller's full geometry into the shared intermediate texture (`packed_rgb_intermediate_tex`), pass 2 packs it 1:1 through the RGBA16F float shader into the zero-copy destination. The pixels never visit the host between the zero-copy source and the zero-copy destination. Portable (macOS IOSurface + Linux DMA-BUF f16 targets). | Emitted by `convert_nv_to_planar_float_two_pass`. |
 | `image.convert.g2d`                                    | NXP 2D hardware engine doing format conversion + resize + rotation + flip + letterbox in one DMA-DMA blit. | Only available on i.MX 8M Plus / 8M Mini. Synchronous on the G2D driver; the span includes the driver's blocking wait. |
@@ -1229,7 +1383,7 @@ image.tile_one                                          [user-facing fn — rend
 | `image.convert.cpu.extract_region`                     | `extract_nv_region`: copies the halo-grown crop rectangle out of an NV12/NV16/NV24 source into a small same-format tensor, so the unmodified format converters can decode just the crop instead of the whole frame. | Nested inside a `pass = "pre_resize"` `format_convert` span. Isolates the per-tile extraction cost (the SAHI tiling hot path) from the decode cost that follows it in the same `format_convert` span; see `pre_resize_region`. |
 | `image.convert.cpu.resize_flip_rotate`                 | `fast_image_resize::Resizer` + rayon parallel slice, with composed flip/rotate/letterbox geometry. | The bulk of CPU `convert()` cost. The CPU backend is selected only when neither GL nor G2D accepts the (src, dst) format pair. |
 | `image.plan_tiles`                                     | `tile_grid` (EvenDist SAHI grid) + per-tile `TilePlacement` construction for a `src_w`×`src_h` frame. Pure host computation, no GPU/CPU pixel work. | The `tiles` field is the realized tile count for this frame/config pair (can exceed the naive `ceil(frame/tile)` estimate under heavy overlap); `overlap` is the requested minimum. Called once per frame by `tile_into`, or directly by a pipelined caller sizing its own tile stream. |
-| `image.tile_into`                                      | Renders every tile of one frame into a shared tall packed-parent batch, one deferred `render_tile` per tile, then a single `flush`. | `tiles` mirrors `plan_tiles`' count for the same call. Per-tile cost is attributed via the nested `image.convert.*` (or `image.convert.gl.*`) spans that `render_tile` opens; use `dst_tile` on those to identify which row-band. |
+| `image.tile_into`                                      | Renders every tile of one frame into a shared tall packed-parent batch, one deferred `render_tile` per tile, then a single `flush`. | `tiles` mirrors `plan_tiles`' count for the same call. Per-tile cost is attributed via the nested `image.convert.*` (or `image.convert.gl.*`) spans that `render_tile` opens, in tile-index order. |
 | `image.tile_one`                                       | Renders exactly one tile of a frame into a caller-owned slot (e.g. a ring buffer entry), deferred — the caller controls the flush cadence. | `index`/`count` identify which tile of the frame this is, letting a pipelined runtime attribute cost per tile without a `tile_into` batch. Holds no frame-wide state — all geometry rides in the `TilePlacement` argument. |
 | `image.draw_decoded_masks`                             | Per-detection alpha-blend of `Segmentation` mask onto the destination image (CPU or GL depending on backend). | When backend == GL, this dispatches to the shader-based mask blit. |
 | `image.draw.gl.proto`                                  | The fused GL proto-segmentation render: proto texture upload + per-detection quad draws. The `upload` / `program` fields record the `ProtoPlan` chosen by the pure `proto_dispatch::plan_proto` table (e.g. `I8CpuRepack`/`Int8Bilinear`, `F32R32f`/`F32`, `F16Rgba16f`/`F16`), alongside `dtype`, `num_protos`, and `detections`. | Filter by `upload` to isolate one upload strategy's latency. Steady-state at fixed proto dims re-uploads via `TexSubImage3D` into the immutable `TexStorage3D` allocation (the `ensure_proto_texture` gate); re-allocation happens only on dims/format churn. |

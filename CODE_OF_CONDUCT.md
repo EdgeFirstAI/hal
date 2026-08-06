@@ -70,8 +70,8 @@ avoid conflicts and minimize harm.
 When an incident does occur, it is important to report it promptly. To report a
 possible violation, please use one of the following methods:
 
-- **Open a confidential issue**: Use the [GitHub repository's private reporting feature](https://github.com/EdgeFirstAI/client/security)
-- **Email the maintainers**: Contact the project maintainers directly through GitHub
+- **Open a confidential issue**: Use the [GitHub repository's private reporting feature](https://github.com/EdgeFirstAI/hal/security)
+- **Email the maintainers**: support@au-zone.com
 
 Community Moderators take reports of violations seriously and will make every
 effort to respond in a timely manner. They will investigate all reports of code of

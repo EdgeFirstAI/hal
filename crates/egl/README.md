@@ -17,6 +17,21 @@ dynamic-loading API is otherwise unchanged. The library is imported as
 use edgefirst_egl as egl;
 ```
 
+## Features
+
+`dynamic` pulls in `libloading` and enables the `Dynamic` instance — without it
+the crate exposes the types but no way to load a driver, so enable it unless you
+are supplying your own loader. The HAL's workspace dependency turns it on:
+
+```toml
+edgefirst-egl = { version = "0.27", features = ["dynamic"] }
+```
+
+The `1_0` through `1_5` features gate the EGL API version, cumulatively, and
+default to `1_5`. Both this crate and its consumer must resolve to the same
+`libloading` version — the `Borrow<Library>` bound on `Dynamic` will not hold
+across a version mismatch.
+
 ## License
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

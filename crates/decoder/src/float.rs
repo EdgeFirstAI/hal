@@ -1,6 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! Float-domain NMS and box geometry.
+//!
+//! Two groups of primitives, both reusable outside the decoder:
+//!
+//! - **Suppression** — [`nms_float`], [`nms_class_aware_float`], and the
+//!   `_extra` variants that carry a per-box payload (mask coefficients, say)
+//!   through suppression so the survivors stay paired with their data.
+//! - **Geometry** — [`intersection_area`], [`box_area`], [`iou_value`], and
+//!   [`ios_value`]. The tiled-inference merge in [`crate::tiling`] shares
+//!   these, which is what keeps its IoS metric numerically identical to the
+//!   IoU used by ordinary NMS.
+//!
+//! [`jaccard`] and [`jaccard_batch4`] are the threshold-test forms used on the
+//! suppression hot path; they answer "do these overlap past `iou`?" without
+//! materializing the ratio.
+
 use crate::{arg_max, BBoxTypeTrait, BoundingBox, DetectBox};
 use ndarray::{
     parallel::prelude::{IntoParallelIterator, ParallelIterator as _},

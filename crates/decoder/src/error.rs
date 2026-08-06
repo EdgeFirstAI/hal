@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! [`DecoderError`] and the [`DecoderResult`] alias returned across the crate.
+
 use core::fmt;
 
+/// `Result` alias defaulting the error type to [`DecoderError`].
 pub type DecoderResult<T, E = DecoderError> = std::result::Result<T, E>;
 
 #[derive(Debug)]

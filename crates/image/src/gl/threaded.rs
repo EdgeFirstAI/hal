@@ -1122,7 +1122,7 @@ impl GLProcessorThreaded {
         })?
     }
 
-    /// Create a PBO-backed [`Tensor<u8>`] image on the GL thread.
+    /// Create a PBO-backed [`Tensor<u8>`](edgefirst_tensor::Tensor) image on the GL thread.
     pub fn create_pbo_image(
         &self,
         width: usize,

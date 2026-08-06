@@ -11,8 +11,9 @@ The core principle: **allocate once at init, decode in the hot loop**.
 
 A second principle drives the data path: the decoder emits each image in its
 **native pixel format** and does nothing else — no colour conversion, no
-resize, no rotation. JPEG decodes to `Nv12` (subsampled colour), `Nv24`
-(4:4:4 colour), or `Grey` (greyscale); PNG decodes to `Rgb` / `Rgba` / `Grey`. Everything beyond raw decode —
+resize, no rotation. JPEG decodes to the NV format matching its own chroma
+sampling — `Nv12` (4:2:0), `Nv16` (4:2:2), `Nv24` (4:4:4) — or `Grey`
+(greyscale); PNG decodes to `Rgb` / `Rgba` / `Grey`. Everything beyond raw decode —
 colour-space conversion, EXIF orientation, resize, crop — belongs to
 [`ImageProcessor::convert()`](../image), which runs on the GPU where available.
 This keeps the decode path branch-free and lets a single `convert()` fold all
@@ -29,9 +30,12 @@ edgefirst-tensor ← edgefirst-codec ← edgefirst-image (re-export)
 `edgefirst-codec` depends only on `edgefirst-tensor` plus `zune-png`
 (for PNG decoding) and `kamadak-exif` (for reading EXIF orientation). JPEG
 decoding uses a custom from-scratch decoder with no external dependencies.
-On Linux, the default-on `v4l2` feature adds `nix` and `libc` (Linux-target
-only) for the hardware backend. The crate has no dependency on
-`edgefirst-image` or any GPU libraries, keeping the dependency graph clean.
+The two default-on hardware features add a little on Linux — `v4l2` pulls
+`nix` and `libc` (Linux-target only), `nvjpeg` pulls `libloading` — and both
+compile to nothing elsewhere. Neither adds a link-time GPU dependency:
+`nvjpeg` resolves `libnvjpeg.so.12` through `dlopen` at runtime. The crate has
+no dependency on `edgefirst-image` or any GPU libraries, keeping the
+dependency graph clean.
 
 ## Module Map
 
@@ -61,7 +65,7 @@ only) for the hardware backend. The crate has no dependency on
 | `idct/neon.rs`   | NEON 8×8 IDCT: 4-wide Loeffler butterfly, 4×4 transpose, DC-only fill |
 | `idct/sse2.rs`   | SSE2 8×8 IDCT: 4-wide Loeffler butterfly, emulated mullo_epi32 |
 | `idct/sse41.rs`  | SSE4.1 8×8 IDCT: native mullo_epi32, min/max clamping |
-| `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12` row writes, 4:2:0 chroma downsample (`avg_block`) |
+| `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, chroma downsample for the non-matching subsamplings (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
@@ -91,16 +95,17 @@ The decoder writes the image's native pixel format and configures the
 destination tensor to match (`Tensor::configure_image(w, h, format)`), within
 the tensor's existing allocation:
 
-- **JPEG**, 3-component subsampled colour → `Nv12` (Y plane + interleaved
-  Cb/Cr at 4:2:0).
-- **JPEG**, 3-component 4:4:4 colour → `Nv24` (Y plane + interleaved Cb/Cr at
-  full chroma resolution).
+- **JPEG**, 3-component colour → the NV format matching the source's chroma
+  sampling, so nothing is resampled: 4:2:0 → `Nv12`, 4:2:2 → `Nv16`, 4:4:4 →
+  `Nv24` (Y plane + interleaved Cb/Cr in each case). Exotic subsamplings
+  (4:1:1, 4:1:0, or Cb and Cr sampled differently from each other) are the only
+  cases that resample, block-averaging down to `Nv12`.
 - **JPEG**, 1-component → `Grey`.
 - **PNG** → `Rgb` / `Rgba` / `Grey` per the source colorspace.
 
-JPEG output is `u8` only — `Nv12`/`Grey` are byte layouts — so a non-`u8`
-destination is rejected with `CodecError::UnsupportedDtype`. The PNG path
-supports the full set of tensor element types (see below).
+JPEG output is `u8` only — the NV formats and `Grey` are byte layouts — so a
+non-`u8` destination is rejected with `CodecError::UnsupportedDtype`. The PNG
+path supports the full set of tensor element types (see below).
 
 No colour conversion, resize, or rotation happens here. Callers that need
 `Rgb`/`Rgba`/`Bgra`, a resize, or EXIF orientation applied run
@@ -243,9 +248,10 @@ The custom baseline JPEG decoder processes images through these stages:
    segments. Build Huffman tables, quantisation tables, and read the EXIF
    orientation tag (reported only).
 2. **Native format + capacity** (`mod.rs`): derive the native format
-   (`native_format()`: 3 components → `Nv12`, 1 → `Grey`) and reconfigure the
-   destination tensor via `configure_image()`, which errors with
-   `InsufficientCapacity` if the image exceeds the tensor's allocation.
+   (`native_format()`: 1 component → `Grey`; 3 components → `Nv24`/`Nv16`/`Nv12`
+   from the chroma-to-luma sampling ratio) and reconfigure the destination
+   tensor via `configure_image()`, which errors with `InsufficientCapacity` if
+   the image exceeds the tensor's allocation.
 3. **Hardware attempt** (Linux + `v4l2`): try `V4l2Probe::try_decode()`. On
    success it returns the `ImageInfo`; on `Fallback` (no device / unsupported
    capture format / transient hardware failure) the CPU path below runs.
@@ -273,18 +279,19 @@ The custom baseline JPEG decoder processes images through these stages:
 - Function pointer dispatch for the IDCT: selected once at init based on CPU
   feature detection (NEON on AArch64, SSE4.1 > SSE2 on x86-64, scalar fallback).
 
-### NV12 Output Path
+### NV Output Path
 
-For a colour JPEG the decoder produces `Nv12` directly, skipping any
-YCbCr→RGB conversion:
+For a colour JPEG the decoder produces a semi-planar NV format directly,
+skipping any YCbCr→RGB conversion:
 
 - The Y plane is copied from the IDCT luma output at the tensor's row stride.
-- The Cb/Cr components are downsampled to 4:2:0 (`avg_block`) and interleaved
-  pair-wise into the UV plane that follows the Y plane.
+- The Cb/Cr components are interleaved pair-wise into the UV plane that follows
+  the Y plane, at the source's own chroma resolution. `avg_block` downsamples
+  first only for the exotic subsamplings that have no matching NV format.
 
-This is the codec's only colour output. The chroma carries the source's JFIF
-(BT.601 full-range) colorimetry; mapping that to RGB is the downstream
-`convert()` step's responsibility, not the codec's.
+These NV formats are the codec's only colour output. The chroma carries the
+source's JFIF (BT.601 full-range) colorimetry; mapping that to RGB is the
+downstream `convert()` step's responsibility, not the codec's.
 
 ### Chroma Subsampling Support
 
@@ -293,11 +300,16 @@ The Cb/Cr components are decoded at their native sampling and downsampled to
 
 | Source sampling | Description              | Native output            |
 |-----------------|--------------------------|--------------------------|
-| 4:2:0           | Horizontal + vertical 2× | `Nv12` passthrough (`avg_block` 1×1) |
-| 4:2:2           | Horizontal 2×            | `Nv12` via vertical 2× block-average |
-| 4:4:0           | Vertical 2×              | `Nv12` via horizontal 2× block-average |
-| 4:4:4           | No subsampling           | `Nv24` (full chroma preserved, no downsample) |
+| 4:2:0           | Horizontal + vertical 2× | `Nv12` (passthrough, no resample) |
+| 4:2:2           | Horizontal 2×            | `Nv16` (passthrough, no resample) |
+| 4:4:4           | No subsampling           | `Nv24` (passthrough, no resample) |
+| 4:4:0, 4:1:1, 4:1:0, mismatched Cb/Cr | Everything else | `Nv12` via `avg_block` block-average |
 | Greyscale       | Single component         | No chroma (`Grey` output) |
+
+The passthrough rows are the point: `native_format()` reads the chroma-to-luma
+sampling ratio and picks the NV format that already matches, so the common
+cases never touch `avg_block` at all. It runs only for the last row, where no
+NV format fits the source.
 
 ### IDCT SIMD Kernels
 
@@ -606,12 +618,12 @@ frame or error recovery. For nvJPEG, `nvjpeg_sync` is the GPU decode time and
 
 | Span                              | What is happening inside | Reference equivalent |
 |-----------------------------------|--------------------------|----------------------|
-| `codec.decode_jpeg`               | Full JPEG decode: marker parsing then either the V4L2 hardware decode or the CPU MCU loop, writing native `Nv12`/`Grey`. | Baseline JPEG decode per ITU T.81. |
+| `codec.decode_jpeg`               | Full JPEG decode: marker parsing then either the V4L2 hardware decode or the CPU MCU loop, writing the native NV format or `Grey`. | Baseline JPEG decode per ITU T.81. |
 | `codec.decode_jpeg.parse_markers` | Walk the JPEG byte stream once: parse SOF0, DQT, DHT, DRI, SOS, and APP1 (EXIF) segments; build Huffman LUTs and quant tables; read the EXIF orientation tag. | Equivalent to libjpeg's `jpeg_read_header` + DHT/DQT table builds. |
 | `codec.decode_jpeg.nvjpeg`        | The nvJPEG GPU decode: map the PBO, `nvjpegGetImageInfo`, decode interleaved `Rgb` into the device pointer, synchronise, unmap. `target = "rgbi"`. Absent when V4L2/CPU decodes. | nvJPEG single-image GPU decode (`nvjpegDecode`). |
 | `codec.decode_jpeg.nvjpeg_map` / `nvjpeg_unmap` | The `cuda_map()` / drop round-trips to the PBO's owning GL worker thread (`cudaGraphicsMapResources` / `Unmap`). Isolates the per-frame GL-thread interop cost. | CUDA-GL interop buffer map/unmap. |
 | `codec.decode_jpeg.nvjpeg_submit` / `nvjpeg_sync` | `nvjpegDecode` enqueue on the per-decoder CUDA stream, then `cudaStreamSynchronize`. `nvjpeg_sync`'s duration is the GPU decode time (resolution/entropy dependent). | Async CUDA decode + stream sync. |
-| `codec.decode_jpeg.mcu_loop`      | The CPU core loop: per MCU row, Huffman-decode + dequant-fuse → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2) → native `Grey`/`Nv12`/`Nv24` write, strided into the tensor. Allocation-free after warmup. Absent when hardware decodes. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, IDCT handwritten and SIMD-dispatched. |
+| `codec.decode_jpeg.mcu_loop`      | The CPU core loop: per MCU row, Huffman-decode + dequant-fuse → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2) → native `Grey`/`Nv12`/`Nv16`/`Nv24` write, strided into the tensor. Allocation-free after warmup. Absent when hardware decodes. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, IDCT handwritten and SIMD-dispatched. |
 | `codec.decode_jpeg.v4l2_rebuild`  | Full V4L2 stream setup: OUTPUT buffer allocation + mmap + `STREAMON`, JPEG staging, `SOURCE_CHANGE` wait, CAPTURE format negotiation, `REQBUFS(DMABUF)`, `STREAMON`. Runs on the first frame, OUTPUT overflow, or error recovery. | A stateful V4L2 decoder session open + format negotiation. |
 | `codec.decode_jpeg.v4l2_reconfigure` | The geometry-change hot path: `STREAMOFF`/`REQBUFS(0)` on CAPTURE only, JPEG staging + `QBUF` while OUTPUT keeps streaming, `SOURCE_CHANGE` wait, `G_FMT` stale-geometry guard, renegotiation, `REQBUFS(1, DMABUF)`, `STREAMON`. ~1 ms — DMABUF makes `REQBUFS` allocation-free, vs ~110 ms for an MMAP buffer reallocation. | The V4L2 stateful-decoder dynamic-resolution-change sequence. |
 | `codec.decode_jpeg.v4l2_collect`  | The per-frame hardware decode: queue the CAPTURE dmabuf (`target` names where the hardware writes — the destination tensor for zero-copy, or the persistent scratch), poll for completion, dequeue both buffers. Dominated by the hardware decode itself. | A V4L2 M2M `QBUF` → `poll` → `DQBUF` cycle. |
@@ -625,8 +637,9 @@ frame or error recovery. For nvJPEG, `nvjpeg_sync` is the GPU decode time and
 
 | Output Format | JPEG | PNG  | Notes                              |
 |---------------|------|------|------------------------------------|
-| Nv12          | ✓    | —    | Subsampled colour JPEG: Y + interleaved UV (4:2:0) |
-| Nv24          | ✓    | —    | 4:4:4 colour JPEG: Y + interleaved UV (full resolution) |
+| Nv12          | ✓    | —    | 4:2:0 colour JPEG (and the fallback for exotic subsamplings): Y + interleaved UV |
+| Nv16          | ✓    | —    | 4:2:2 colour JPEG: Y + interleaved UV at half horizontal chroma |
+| Nv24          | ✓    | —    | 4:4:4 colour JPEG: Y + interleaved UV at full resolution |
 | Grey          | ✓    | ✓    | Single luma component              |
 | Rgb           | —    | ✓    | Native PNG RGB                     |
 | Rgba          | —    | ✓    | Native PNG RGBA                    |
@@ -652,7 +665,8 @@ precise typed error."
 
 ## Data Type Support
 
-JPEG decodes to `u8` only (native `Nv12`/`Grey`); a non-`u8` destination is
+JPEG decodes to `u8` only (the native NV formats and `Grey` are byte
+layouts); a non-`u8` destination is
 rejected with `CodecError::UnsupportedDtype`. PNG supports the full set:
 
 | Type  | PNG (8-bit source)   | PNG (16-bit source) |

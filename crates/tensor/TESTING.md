@@ -13,8 +13,11 @@ crates/tensor/
 │   ├── iosurface.rs     # IOSurface backend (macOS/iOS) — runs on macOS hosts
 │   ├── ahardwarebuffer.rs        # AHardwareBuffer backend (Android) — FFI, on-device only
 │   ├── ahardwarebuffer_layout.rs # Pure Android layout/policy logic — host-tested everywhere
+│   ├── cuda.rs          # Mock CudaGlOps map/unmap guards, degradation without libcudart, ABI asserts
+│   ├── colorimetry.rs   # V4L2 → Colorimetry axis mapping, JFIF = BT.601 full, BT luma constants
 │   ├── tensor_dyn.rs    # TensorDyn metadata, multi-plane, format/stride checks
-│   └── format.rs        # PixelFormat + DType compatibility
+│   ├── format.rs        # PixelFormat + DType compatibility
+│   └── error.rs         # Error Display strings (incl. InsufficientCapacity message)
 └── benches/
     └── tensor_benchmark.rs   # Allocation + map/unmap throughput
 ```
@@ -99,8 +102,12 @@ cargo test -p edgefirst-tensor --features ndarray -- --test-threads=1
 - **No LFS testdata.** All shapes and inputs are synthesized in-test.
   `tensor_benchmark` does not use `edgefirst_bench::testdata`; it
   generates its inputs in memory.
-- **No feature flags required by default**; `ndarray` is on by default
-  and is required for `view()` / `view_mut()` doc-tests.
+- **No feature flags required by default**; `ndarray` is on by default and
+  gates `TensorMapTrait::view()` / `view_mut()`, which return ndarray
+  `ArrayView` / `ArrayViewMut` over a mapped tensor. Building with
+  `--no-default-features` compiles those methods out, so any test that touches
+  them goes with it. Note these are unrelated to `Tensor::view(region)`, the
+  zero-copy sub-region primitive, which is always available.
 
 ## Benchmarks
 

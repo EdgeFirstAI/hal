@@ -763,8 +763,8 @@ impl SchemaV2 {
     /// sub-splits such as ARA-2 `boxes_xy` / `boxes_wh`). The returned
     /// legacy config captures the logical-level metadata, while the
     /// physical-to-logical merge is handled separately by the
-    /// [`DecodeProgram`](crate::decoder::merge::DecodeProgram) that
-    /// [`DecoderBuilder::build`](crate::decoder::builder::DecoderBuilder::build)
+    /// `DecodeProgram` that
+    /// [`DecoderBuilder::build`](crate::DecoderBuilder::build)
     /// compiles alongside this legacy config.
     ///
     /// Returns [`DecoderError::NotSupported`] when the schema uses
@@ -772,7 +772,7 @@ impl SchemaV2 {
     /// - Per-channel quantization arrays on a logical output.
     /// - `encoding: dfl` on a **flat** logical output (no physical
     ///   children). DFL combined with per-scale children is handled by
-    ///   the merge path (see [`crate::decoder::merge::DecodeProgram`])
+    ///   the merge path (see `DecodeProgram`)
     ///   which decodes the distribution before producing the merged
     ///   post-decode `(1, 4, total_anchors)` tensor the legacy decoder
     ///   consumes.

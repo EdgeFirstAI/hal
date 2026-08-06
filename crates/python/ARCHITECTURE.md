@@ -24,22 +24,26 @@ build matrix lives in
 
 | Module | Source | Responsibility |
 |--------|--------|----------------|
-| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/lib.rs) | local | `#[pymodule]` registration; module-level docstring |
-| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs) | local | `Tensor`, `Region`, `PixelFormat`, `DType`; `view`/`batch` sub-regions; numpy buffer protocol; `from_fd` / `dmabuf_clone` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/image.rs) | local | `ImageProcessor`, `Rotation`, `Flip` (`Region` re-exported from tensor); `convert`, `draw_masks`, `draw_decoded_masks`, `import_image` |
-| [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/decoder.rs) | local | `Decoder`; `decode`, `decode_tracked`, proto-mask APIs |
-| [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tracker.rs) | local | `ByteTrack`; `update`, `get_active_tracks` |
+| [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/lib.rs) | local | `#[pymodule]` registration; `version`, `build_info`, the `is_*_available` probes, and the `Tracing` context manager |
+| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tensor.rs) | local | `Tensor`, `TensorMemory`, `TensorMap`, `CudaMap`, `Quantization`, `ImageInfo`; `view`/`batch` sub-regions; numpy copy dispatch; `from_fd` / `from_iosurface` / `dmabuf_clone` |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/image.rs) | local | `ImageProcessor`, `PixelFormat`, `Region`, `Rotation`, `Flip`, `ColorMode`, `MaskResolution`, `Normalization`, `EglDisplayKind`; `convert`, `draw_masks`, `draw_decoded_masks`, `import_image`, the `plan_tiles` / `tile_into` / `tile_one` render half of tiling |
+| [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/decoder.rs) | local | `Decoder`, `Output`, `ProtoData`, `Nms`, `DecoderType`, `DecoderVersion`, `DimName`; `decode`, `decode_tracked`, `decode_proto` |
+| [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tracker.rs) | local | `ByteTrack`, `TrackInfo`, `ActiveTrackInfo`; `update`, `get_active_tracks` |
+| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/tiling.rs) | local | `TilingConfig`, `TileSpec`, `TilePlacement`, `MergeConfig`, `MatchMetric`, `Fit`, `TiledFrameAccumulator`; `tile_grid`, `lift_tile_boxes`, `merge_tiled_detections` |
+| [`colorimetry.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/src/colorimetry.rs) | local | `Colorimetry`, `ColorSpace`, `ColorTransfer`, `ColorEncoding`, `ColorRange` |
 
 ## Key Types
 
 | Python class | Wraps | Notes |
 |--------------|-------|-------|
-| `Tensor` | `edgefirst_tensor::TensorDyn` | Buffer protocol is exposed by `TensorMap` (returned by `Tensor.map()`), not by `Tensor` itself. The portable zero-copy pattern is `with t.map() as m: np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())`. The shorter `np.frombuffer(t.map(), ...)` works only on the abi3-py311 wheel (see § Stable ABI). `Tensor.view(region)` / `Tensor.batch(n)` return zero-copy sub-region tensors sharing the parent's identity (e.g. `proc.convert(src, dst.batch(n), ...)`). |
+| `Tensor` | `edgefirst_tensor::TensorDyn` | Buffer protocol is exposed by `TensorMap` (returned by `Tensor.map()`), not by `Tensor` itself. The portable zero-copy pattern is `with t.map() as m: np.frombuffer(m.numpy(), dtype=...).reshape(t.shape)` — note `shape` is a property, not a method. The shorter `np.frombuffer(t.map(), ...)` works only on the abi3-py311 wheel (see § Stable ABI). `Tensor.view(region)` / `Tensor.batch(n)` return zero-copy sub-region tensors sharing the parent's identity (e.g. `proc.convert(src, dst.batch(n), ...)`). |
+| `TensorMap`, `CudaMap` | `edgefirst_tensor` map guards | Context managers returned by `Tensor.map()` / `Tensor.cuda_map()`. Both are registered on the module (usable in `isinstance` checks and annotations); neither is constructible from Python — instances come only from the `map()` / `cuda_map()` calls. |
 | `ImageProcessor` | `edgefirst_image::ImageProcessor` | One-per-pipeline; owns the GL thread |
-| `Decoder` | `edgefirst_decoder::Decoder` | Built once from a metadata dict or YAML/JSON string |
+| `Decoder` | `edgefirst_decoder::Decoder` | Built once from a metadata dict, a YAML/JSON string, or a list of `Output` descriptors |
 | `ByteTrack` | `edgefirst_tracker::ByteTrack<DetectBox>` | Stable per-track UUIDs |
-| `PixelFormat`, `DType`, `Rotation`, `Flip` | corresponding Rust enums | `repr()` matches Rust naming |
-| `Region` | `edgefirst_tensor::Region` (a **struct**, not an enum) | `{x, y, width, height}` in pixels; the single rectangle type, re-exported from tensor; argument to `view`/`Crop.source` |
+| `PixelFormat`, `Rotation`, `Flip`, `ColorMode`, `TensorMemory` | corresponding Rust enums | `repr()` matches Rust naming. Element types are plain strings (`"uint8"`, `"float16"`, …), not an enum; there is no `DType` class. |
+| `Region` | `edgefirst_tensor::Region` (a **struct**, not an enum) | `{x, y, width, height}` in pixels, all readable and writable; the single rectangle type, bound in `image.rs`; argument to `Tensor.view` and to `convert(..., source=)` |
+| `TilingConfig`, `TilePlacement`, `MergeConfig`, `TiledFrameAccumulator` | `edgefirst_hal::image` grid + `edgefirst_hal::decoder::tiling` | The SAHI path. Detections cross the FFI boundary as the numpy triple `(bbox (N,4) f32, scores (N,) f32, classes (N,) uintp)`, never as a box class. |
 | `Tracing` (context manager) | umbrella `trace::start_tracing` / `stop_tracing` | `with hal.Tracing("/tmp/trace.json"): ...` |
 
 ### CPU access declaration and compression metadata
@@ -107,7 +111,16 @@ allocation overhead:
 |------|---------------|----------|------|
 | 1 | Fully contiguous | `copy_from_slice` (memcpy), rayon-parallel ≥ 256 KiB | Lower bound — no allocation |
 | 2 | Strided with contiguous inner rows (column slice, sub-volume, negative stride) | Per-row memcpy, iterate outer dimensions | Within ≈ 5 % of Path 1 for typical row sizes |
-| 3 | Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` (numpy's vectorised C strided→contig pass), then Path 1 memcpy | ≈ 4× Path 1 — but ≈ 4× faster than the legacy element-wise iteration the binding used to do here |
+| 3 | Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` (numpy's vectorised C strided→contig pass), then Path 1 memcpy | ≈ 4× Path 1, and ≈ 4× faster than the legacy element-wise iteration the binding used to do here |
+
+A stride-padded **destination** is handled ahead of all three: when
+`create_image()` allocates a DMA-BUF or PBO with GPU pitch alignment,
+`map()` exposes the full `stride × height` buffer while the logical
+element count from `shape` is smaller. A flat `copy_from_slice` would
+panic on the length mismatch, so `copy_numpy_to_tensor_dyn` detects the
+padding and copies row by row, placing `row_elems` logical pixels per row
+and stepping over the padding. Callers see nothing, but it explains why a
+mapped `memoryview` can be larger than `shape` implies.
 
 Path 3 is the case that bit early users: a HailoRT output naturally arrives
 as `arr.transpose(0, 2, 1)` over a `(1, anchors, channels)` buffer, which
@@ -133,7 +146,7 @@ and dtype so the typical pattern is:
 
 ```python
 with t.map() as m:
-    arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())
+    arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape)
 ```
 
 The context manager is required because `Pbo` and `Dma` mappings
@@ -167,7 +180,7 @@ relies on the Rust-side `Drop` chain.
 
   ```python
   with t.map() as m:
-      arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape())
+      arr = np.frombuffer(m.numpy(), dtype=...).reshape(t.shape)
   ```
 
   rather than copying with `np.array(t.map(), copy=True)`. The
@@ -180,8 +193,8 @@ relies on the Rust-side `Drop` chain.
 - **Hold tensors alive across frames.** Each new tensor allocates a fresh
   `BufferIdentity`; the EGL image cache keys on it, so re-creating tensors
   defeats the cache. Same rule as the Rust and C APIs.
-- **Use `processor.create_image()` for `convert()` destinations.** Direct
-  `Tensor.new()` allocations bypass the GPU memory-backend probe.
+- **Use `processor.create_image()` for `convert()` destinations.** A direct
+  `Tensor(shape, ...)` allocation bypasses the GPU memory-backend probe.
 - **Tracing has near-zero cost when no subscriber is active.** Wrap the
   hot loop in `with hal.Tracing(...)` only when collecting a profile.
 

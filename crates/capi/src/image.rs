@@ -383,7 +383,7 @@ pub unsafe extern "C" fn hal_crop_set_letterbox(crop: *mut HalCrop, r: u8, g: u8
 /// @param height Image height in pixels
 /// @param format Pixel format (HAL_PIXEL_FORMAT_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+/// @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
 /// - EINVAL: Invalid argument (zero dimensions, unsupported format)

@@ -730,10 +730,16 @@ impl PyDecoder {
     ///
     /// Returns:
     ///     Tuple ``(boxes, scores, classes, masks)`` where ``boxes`` is a
-    ///     ``(N, 4)`` ``numpy.ndarray`` of normalized ``[xmin, ymin, xmax,
-    ///     ymax]`` coords, ``scores`` is ``(N,)`` ``float32``, ``classes``
-    ///     is ``(N,)`` ``int64``, and ``masks`` is a list of N
-    ///     :class:`Segmentation` instances.
+    ///     ``(N, 4)`` ``float32`` array of ``[xmin, ymin, xmax, ymax]``
+    ///     coords, ``scores`` is ``(N,)`` ``float32``, and ``classes`` is
+    ///     ``(N,)`` ``uintp``. Consult :attr:`normalized_boxes` for the
+    ///     coordinate space of ``boxes``.
+    ///
+    ///     ``masks`` is a list of N ``(H, W, C)`` ``uint8`` arrays at
+    ///     prototype resolution, empty for detection-only models. Instance
+    ///     segmentation gives ``C == 1`` (binary, threshold at 128);
+    ///     semantic segmentation gives ``C == num_classes`` (per-pixel
+    ///     scores, take ``argmax`` over the last axis).
     #[pyo3(signature = (model_output, max_boxes=100))]
     pub fn decode<'py>(
         self_: PyRef<'py, Self>,
@@ -949,26 +955,22 @@ impl PyDecoder {
     ///
     /// - **Per-scale decoders**: the bridge always divides by ``(W, H)``
     ///   before returning.
-    /// - **:attr:`ModelType.YoloSegDet`**: combined-output segmentation
-    ///   models; helper fires across all entry points and element-type
-    ///   variants.
-    /// - **:attr:`ModelType.YoloSplitSegDet`**: split-output segmentation
-    ///   models; aligned across all four entry points for both quantized
-    ///   and float variants.
-    /// - **:attr:`ModelType.YoloSegDet2Way`**: two-way segmentation
-    ///   models; same four entry points and both element-type variants.
+    /// - **Combined-output segmentation** models: the helper fires across
+    ///   all entry points and element-type variants.
+    /// - **Split-output segmentation** models: aligned across all four
+    ///   entry points for both quantized and float variants.
+    /// - **Two-way segmentation** models: same four entry points and both
+    ///   element-type variants.
     ///
     /// For all four paths, when the schema declares ``normalized: false``
     /// and :attr:`input_dims` is a valid ``(W, H)`` tuple, the decoder
     /// has already divided and returns ``True``. When :attr:`input_dims`
     /// is ``None`` or zero, pixel-space leaks out and returns ``False``.
     ///
-    /// **All other decoders** — detection-only (``YoloDet``,
-    /// ``YoloSplitDet``), end-to-end YOLO (``YoloEndToEnd*``), and
-    /// ``ModelPack*`` — return the raw schema annotation. Callers that
-    /// receive ``False`` from these model types must consult
-    /// :attr:`input_dims` and divide themselves if ``[0, 1]`` output is
-    /// required.
+    /// **All other decoders** — detection-only, end-to-end YOLO, and
+    /// ModelPack — return the raw schema annotation. Callers that receive
+    /// ``False`` from these model types must consult :attr:`input_dims`
+    /// and divide themselves if ``[0, 1]`` output is required.
     ///
     /// Callers must not re-normalize when this returns ``True``; dividing
     /// already-normalized coordinates by ``(W, H)`` collapses detections
@@ -984,11 +986,11 @@ impl PyDecoder {
     /// Set to a non-``None`` value via the ``input_dims`` constructor
     /// kwarg, or sourced from the schema's ``input.shape`` /
     /// ``input.dshape`` when building from a v2 schema. On the per-scale
-    /// path and for ``ModelType.YoloSegDet``, ``ModelType.YoloSplitSegDet``,
-    /// and ``ModelType.YoloSegDet2Way``, when the schema declares
-    /// pixel-space outputs and ``input_dims`` is a valid tuple, the
-    /// decoder divides post-NMS box coordinates by ``(W, H)`` so they
-    /// enter the canonical ``[0, 1]`` range before mask cropping;
+    /// path and on the combined, split, and two-way segmentation paths,
+    /// when the schema declares pixel-space outputs and ``input_dims`` is
+    /// a valid tuple, the decoder divides post-NMS box coordinates by
+    /// ``(W, H)`` so they enter the canonical ``[0, 1]`` range before
+    /// mask cropping;
     /// :attr:`normalized_boxes` then reports ``True`` to match. All other
     /// decode paths (detection-only, end-to-end YOLO, ModelPack) do not
     /// apply this division — see :attr:`normalized_boxes` for the

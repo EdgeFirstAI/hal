@@ -219,6 +219,14 @@ impl ImageProcessor {
     /// `src_w`×`src_h` frame **without touching the GPU**. A pipelined runtime
     /// calls this once per frame to size pools and drive its tile stream.
     ///
+    /// The realized tile count can exceed the naive `ceil(frame / tile)`: the
+    /// grid treats `cfg.overlap_ratio` as a *minimum* and redistributes the
+    /// surplus evenly, so allocate from `len()` rather than estimating.
+    ///
+    /// The returned placements are consumed by
+    /// [`edgefirst_decoder::tiling`] to lift per-tile detections back to
+    /// full-frame coordinates.
+    ///
     /// # Errors
     /// Returns an error if `cfg` is invalid (overlap not in `[0,1)`, or zero
     /// tile size).
@@ -269,6 +277,36 @@ impl ImageProcessor {
     /// sub-rect of the whole-frame `src`) — **not** `src.view()` — so all tiles
     /// share one source import. Each destination tile is a `view` row-band of
     /// the shared parent.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use edgefirst_image::{ImageProcessor, TilingConfig};
+    /// # use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn};
+    /// # fn run(src: &TensorDyn) -> Result<(), edgefirst_image::Error> {
+    /// let mut processor = ImageProcessor::new()?;
+    /// let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
+    ///
+    /// // Pure geometry — size the batch before touching the GPU.
+    /// let planned = processor.plan_tiles(3840, 2160, &cfg)?;
+    /// let mut batch = processor.alloc_tile_batch(
+    ///     planned.len(), &cfg, PixelFormat::Rgba, DType::U8, None, CpuAccess::None,
+    /// )?;
+    ///
+    /// // One import, one flush, N tiles.
+    /// let placements = processor.tile_into(src, &mut batch, &cfg)?;
+    /// assert_eq!(placements.len(), planned.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Backend note
+    ///
+    /// The GL band lowering covers single-pass geometry only. A zero-copy
+    /// (DMA) `dst_batched` in packed `Rgb` or a planar layout reinterprets the
+    /// render-target shape, which the band path does not yet compute, so GL
+    /// declines and each tile falls back to CPU. `Rgba`, `Bgra`, and `Grey`
+    /// batches stay on the batched GPU path.
     ///
     /// # Errors
     /// Returns an error if `cfg` is invalid, if `src`/`dst_batched` are not

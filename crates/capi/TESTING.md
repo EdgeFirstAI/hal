@@ -5,11 +5,14 @@
 ```
 crates/capi/
 ├── src/
-│   ├── tensor.rs       # Doc-tests on hal_tensor_* functions
-│   ├── image.rs        # Doc-tests on hal_image_processor_* functions
-│   ├── decoder.rs      # Doc-tests on hal_decoder_* functions
-│   ├── tracker.rs      # Doc-tests on hal_bytetrack_* functions
-│   ├── delegate.rs     # Doc-tests on delegate ABI types
+│   ├── tensor.rs       # #[test] module — hal_tensor_* functions
+│   ├── image.rs        # #[test] module — hal_image_processor_* functions
+│   ├── decoder.rs      # #[test] module — hal_decoder_* functions
+│   ├── tracker.rs      # #[test] module — hal_bytetrack_* functions
+│   ├── colorimetry.rs  # #[test] module — V4L2 colorimetry conversion
+│   ├── error.rs        # #[test] module — errno mapping
+│   ├── tiling.rs       # no Rust tests; covered entirely by test_tiling.c
+│   ├── delegate.rs     # no Rust tests; type layout is asserted at compile time
 │   └── ...
 ├── tests/              # C-side integration suite (built via Makefile)
 │   ├── test_all.c
@@ -17,6 +20,7 @@ crates/capi/
 │   ├── test_image.c
 │   ├── test_decoder.c
 │   ├── test_tracker.c
+│   ├── test_tiling.c
 │   ├── test_neutron_dmabuf.c
 │   ├── test_neutron_dmabuf_infer.c
 │   ├── bench_preproc.c
@@ -26,9 +30,14 @@ crates/capi/
     └── hal.h           # cbindgen-generated; committed in-tree (review is the parity gate)
 ```
 
-The Rust side has thin per-function `#[test]` modules and doc-tests on the
-public FFI surface. The bulk of the coverage lives in the C-side test
-suite under [`crates/capi/tests/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/capi/tests).
+The Rust side has thin per-function `#[test]` modules that call the `extern "C"`
+functions directly. There are **no doc-tests**: the C examples in the module and
+function docs are ` ```c ` fences, which rustdoc renders but never compiles, so
+they carry no automated guarantee that they still match the ABI. Reviewing them
+against the header is a manual step. The bulk of the real coverage lives in the
+C-side test suite under
+[`crates/capi/tests/`](https://github.com/EdgeFirstAI/hal/tree/main/crates/capi/tests),
+which does compile against the generated header.
 
 ## Running Tests
 
@@ -39,7 +48,7 @@ single-threaded rule
 ([root TESTING.md § Single-threaded execution](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)).
 
 ```bash
-# Rust unit + doc-tests
+# Rust unit tests
 cargo test -p edgefirst-hal-capi -- --test-threads=1
 ```
 
@@ -58,14 +67,16 @@ make test_tensor
 make test_image
 make test_decoder
 make test_tracker
+make test_tiling
 
 # 4. Memory check (valgrind on Linux)
 make valgrind
 ```
 
-The C suite links against `target/release/libedgefirst_hal.{so,a}`; the
-Makefile resolves include paths relative to the workspace root, so you
-must `cargo build` first.
+The Makefile prefers `target/release/libedgefirst_hal.{so,dylib,a}` and falls
+back to `target/debug/` when no release build is present. Either way it resolves
+include and library paths relative to the workspace root, so `cargo build` has
+to run first — `make info` reports which directory it picked.
 
 | Source file | Coverage |
 |-------------|----------|
@@ -73,6 +84,7 @@ must `cargo build` first.
 | [`test_image.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_image.c) | Image loading, pre-allocated decode, format conversion, draw masks |
 | [`test_decoder.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_decoder.c) | YOLO/ModelPack decoder, post-processing parity |
 | [`test_tracker.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_tracker.c) | ByteTrack create/update/get_active_tracks |
+| [`test_tiling.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_tiling.c) | Grid geometry, plan metadata, box lift, IOS-vs-IOU merge, accumulator fan-in. The GPU paths (`alloc_tile_batch` / `tile_into` / `tile_one`) are covered for null-argument and validation behaviour only, since CI has no GPU |
 | [`test_neutron_dmabuf.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_neutron_dmabuf.c) | On-target Neutron NPU DMA-BUF regression |
 | [`test_neutron_dmabuf_infer.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/test_neutron_dmabuf_infer.c) | End-to-end zero-copy inference path |
 | [`bench_preproc.c`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/tests/bench_preproc.c) | Reference C preprocessing benchmark — also serves as the canonical example for the [Performance Recommendations](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#performance-recommendations-dma-buf--egl-path) in `ARCHITECTURE.md` |

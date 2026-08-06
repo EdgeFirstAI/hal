@@ -5,23 +5,24 @@
 [![Crates.io](https://img.shields.io/crates/v/edgefirst-hal.svg)](https://crates.io/crates/edgefirst-hal)
 [![PyPI](https://img.shields.io/pypi/v/edgefirst-hal.svg)](https://pypi.org/project/edgefirst-hal/)
 
-The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust workspace that
-provides hardware-accelerated tensor management, image processing, ML model
-output decoding, and multi-object tracking for edge AI inference pipelines.
-It ships as a Rust crate, a Python package, and a C library — same code,
-three language surfaces — with Linux DMA-BUF, OpenGL ES, and NXP G2D
-acceleration where the platform supports them, and a portable CPU fallback
+The EdgeFirst Hardware Abstraction Layer (HAL) is a Rust workspace providing
+hardware-accelerated tensor management, image processing, ML model output
+decoding, and multi-object tracking for edge AI inference pipelines. It ships
+as a Rust crate, a Python package, and a C library, all built from the same
+code. A single OpenGL ES engine runs on Linux (native EGL + DMA-BUF), macOS
+and iOS (ANGLE over Metal + IOSurface), and Android (native EGL +
+AHardwareBuffer), alongside NXP G2D on i.MX and a portable CPU fallback
 everywhere else.
 
 ## Features
 
-- **Zero-copy memory management** — DMA-BUF, POSIX shared memory, OpenGL PBO, and heap with automatic backend selection
+- **Zero-copy memory management** — DMA-BUF, IOSurface, AHardwareBuffer, POSIX shared memory, OpenGL PBO, and heap, with automatic backend selection
 - **Zero-copy CUDA tensor mapping** — `convert()` PBO output mapped directly to a CUDA device pointer for TensorRT and other CUDA consumers; no host round-trip on Jetson (Orin-series). See [Zero-copy CUDA (TensorRT) input](#zero-copy-cuda-tensorrt-input).
 - **Hardware-accelerated image processing** — OpenGL → G2D → CPU dispatch with shared cache infrastructure
+- **Tiled inference (SAHI)** — overlapping tile grid rendered in one GPU pass, with IoS-based merge of per-tile detections back to full-frame coordinates. See [Tiled inference (SAHI)](#tiled-inference-sahi).
 - **YOLO + ModelPack decoding** — YOLOv5 / v8 / v11 / v26 (incl. end-to-end) and ModelPack post-processing
 - **Multi-object tracking** — ByteTrack with Kalman filtering and stable per-track UUIDs
-- **Cross-platform** — Linux (i.MX 8M Plus / i.MX 95 / desktop), macOS, with three CPU/GPU/DMA tiers
-- **Production-ready** — used in the Au-Zone EdgeFirst suite for edge AI deployments
+- **Cross-platform** — Linux (i.MX 8M Plus / i.MX 95 / RPi 5 / Jetson / desktop), macOS, iOS, and Android, over CPU / GPU / zero-copy-buffer tiers
 
 ## Quick Start
 
@@ -37,7 +38,7 @@ Rust:
 
 ```toml
 [dependencies]
-edgefirst-hal = "0.25"
+edgefirst-hal = "0.27"
 ```
 
 C: download a release archive from
@@ -53,43 +54,55 @@ for full instructions.
 ```python
 import edgefirst_hal as ef
 
-img = ef.Tensor.load("image.jpg", ef.PixelFormat.Rgb)
+# Decode into a tensor you own. A real pipeline allocates once and reuses
+# the tensor every frame; JPEG decodes to its native Nv12, PNG to Rgb/Rgba/Grey.
+info = ef.Tensor.peek_image_info_file("image.jpg")
+src = ef.Tensor.image(info.width, info.height, info.format)
+src.decode_image_file("image.jpg")
+
 processor = ef.ImageProcessor()
-output = processor.create_image(640, 640, ef.PixelFormat.Rgb)
-processor.convert(img, output)
+model_input = processor.create_image(640, 640, ef.PixelFormat.Rgb)
 
-decoder = ef.Decoder(config, 0.5, 0.45)
-boxes, scores, classes, masks = decoder.decode([output0, output1])
+# convert() handles the colour conversion and the resize in one call.
+# Omit letterbox= to stretch to fill instead of preserving aspect ratio.
+processor.convert(src, model_input, letterbox=[114, 114, 114, 255])
 
-# Fused decode + draw — masks never leave Rust
-processor.draw_masks(decoder, [output0, output1], output)
+# outputs is the list of Tensors your inference engine produced from model_input.
+decoder = ef.Decoder(model_config, score_threshold=0.5, iou_threshold=0.45)
+boxes, scores, classes, masks = decoder.decode(outputs)
+
+# Fused decode + draw: masks never leave Rust.
+processor.draw_masks(decoder, outputs, model_input)
 ```
 
 **Rust:**
 
 The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
-so a single `edgefirst-hal = "0.25"` dependency is enough — no need to
-list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
+so a single `edgefirst-hal = "0.27"` dependency is enough. There's no need
+to list `edgefirst-image` / `edgefirst-tensor` separately in `Cargo.toml`.
 
 ```rust
 use edgefirst_hal::image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
 use edgefirst_hal::image::codec::{ImageDecoder, ImageLoad};
-use edgefirst_hal::tensor::{PixelFormat, DType};
+use edgefirst_hal::tensor::{PixelFormat, DType, CpuAccess};
 
 let bytes = std::fs::read("image.jpg")?;
 let mut processor = ImageProcessor::new()?;
 let mut decoder = ImageDecoder::new();
 
 // JPEG decodes to its native NV12 (colour); decode into an NV12 source tensor.
+// load_image() reconfigures the tensor's shape and format to the decoded
+// content, so allocate at or above the largest frame you expect.
 let mut input =
-    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::ReadWrite)?;
-let info = input.load_image(&mut decoder, &bytes)?;
+    processor.create_image(1920, 1080, PixelFormat::Nv12, DType::U8, None, CpuAccess::Write)?;
+let _info = input.load_image(&mut decoder, &bytes)?;
 
-// convert() handles NV12 -> RGB, resize, and any EXIF rotation the decode reported.
+// convert() handles NV12 -> RGB and the letterbox resize in one call. The
+// decode never rotates; pass the EXIF rotation here if you want it applied.
 let mut output =
-    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
+    processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::Read)?;
 processor.convert(&input, &mut output, Rotation::None, Flip::None,
-    Crop::new(0, 0, info.width, info.height))?;
+    Crop::letterbox([114, 114, 114, 255]))?;
 ```
 
 If you prefer to depend on the sub-crates directly (e.g. to opt out of
@@ -104,8 +117,9 @@ unprefixed `edgefirst_image::*` / `edgefirst_tensor::*` paths above.
 #include <edgefirst/hal.h>
 
 struct hal_image_processor *proc = hal_image_processor_new();
-/* `src` is loaded from disk or imported from a DMA-BUF fd —
- * see the C API README for hal_tensor_load_file / hal_import_image. */
+/* `src` is decoded from disk with hal_tensor_decode_image_file(), or
+ * imported from a DMA-BUF fd with hal_import_image() / hal_tensor_from_fd().
+ * See the C API README for the full allocate-then-decode pattern. */
 struct hal_tensor *src = /* ... */;
 struct hal_tensor *dst = hal_image_processor_create_image(
     proc, 640, 640, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8, HAL_CPU_ACCESS_READ_WRITE);
@@ -172,6 +186,122 @@ per-language API reference, see
 [crates/tensor/README.md § CUDA tensor mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md#cuda-tensor-mapping)
 and
 [crates/tensor/ARCHITECTURE.md § Zero-copy CUDA tensor mapping](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#zero-copy-cuda-tensor-mapping).
+
+### Tiled inference (SAHI)
+
+Small objects in a high-resolution frame disappear when the whole frame is
+squeezed down to a 640×640 model input. SAHI (Slicing Aided Hyper Inference)
+runs the same model at its native resolution over an overlapping grid of
+native-resolution crops instead, then stitches the per-tile detections back
+together. HAL covers both halves: `edgefirst-image` cuts and renders the grid,
+`edgefirst-decoder` lifts and merges the results.
+
+The input side renders every tile into one tall packed batch tensor with a
+single GL import and a single flush, so N tiles cost roughly one GPU sync
+rather than N. The output side merges with **GREEDYNMM** using the **IoS**
+(intersection-over-smaller) metric, because an object split across a tile seam
+has low IoU with its own fragments but high IoS. A `TilePlacement` produced by
+`plan_tiles` / `tile_into` is the shared record of how each tile was cut, and it
+is what the merge uses to lift boxes back to full-frame coordinates.
+
+**Rust:**
+
+```rust
+use edgefirst_hal::image::{ImageProcessor, ImageProcessorTrait, TilingConfig};
+use edgefirst_hal::decoder::{DecoderBuilder, DetectBox, Nms, Segmentation};
+use edgefirst_hal::decoder::tiling::{MergeConfig, TiledFrameAccumulator};
+use edgefirst_hal::tensor::{CpuAccess, DType, PixelFormat};
+
+// 640x640 tiles with at least 20% overlap. The realized overlap is
+// redistributed evenly so every tile is full-size and the last one lands flush.
+let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
+
+// plan_tiles is pure geometry (no GPU work), so its length sizes the batch.
+let placements = processor.plan_tiles(src_w, src_h, &cfg)?;
+
+// One tall [tile_w, N * tile_h] destination. Allocate once, reuse per frame.
+let mut batch = processor.alloc_tile_batch(
+    placements.len(), &cfg, PixelFormat::Rgb, DType::U8, None, CpuAccess::None)?;
+
+// Render every tile: deferred convert per tile, one flush at the end.
+let placements = processor.tile_into(&src, &mut batch, &cfg)?;
+
+// Per-tile decoding is deliberately permissive. A fragment clipped at a seam
+// scores low, and a high per-tile threshold discards it before the merge can
+// rebuild the object. Gate the final scores in MergeConfig instead.
+let decoder = DecoderBuilder::new()
+    .with_config_yaml_str(model_config_yaml)
+    .with_score_threshold(0.05)
+    .with_nms(Some(Nms::ClassAware))
+    .build()?;
+
+let mut acc = TiledFrameAccumulator::new(
+    (src_w as f32, src_h as f32),
+    placements.len(),       // tiles_total — the fan-in fence
+    MergeConfig::default(), // Ios metric, 0.5 threshold, max_det 300
+    16,                     // estimated detections per tile (capacity hint)
+);
+
+// HAL does not run inference. `tile_results` pairs each placement with the
+// output tensors your engine produced for that tile; tiles may arrive in any
+// order, so pair them explicitly rather than relying on loop position.
+for (tile_outputs, placement) in tile_results {
+    let mut boxes: Vec<DetectBox> = Vec::new();
+    let mut masks: Vec<Segmentation> = Vec::new();
+    decoder.decode(&tile_outputs, &mut boxes, &mut masks)?;
+    acc.push_tile(boxes, &placement);
+}
+
+// Merged, deduplicated, normalized to [0, 1] for the tracker.
+let detections = acc.finalize_normalized();
+```
+
+**Python:**
+
+```python
+import edgefirst_hal as ef
+
+cfg = ef.TilingConfig(640, 640, overlap=0.2)
+placements = processor.plan_tiles(src.width, src.height, cfg)
+
+batch = processor.alloc_tile_batch(len(placements), cfg, ef.PixelFormat.Rgb)
+placements = processor.tile_into(src, batch, cfg)
+
+acc = ef.TiledFrameAccumulator(
+    (float(src.width), float(src.height)), len(placements), ef.MergeConfig())
+
+for tile_outputs, placement in tile_results:
+    boxes, scores, classes, _masks = decoder.decode(tile_outputs)
+    acc.push_tile(boxes, scores, classes, placement)
+
+boxes, scores, classes = acc.finalize_normalized()
+```
+
+`push_tile` is idempotent per `placement.index`, so tiles can arrive in any
+order and an at-least-once delivery retry stays harmless. The merge runs once
+at `finalize`, never per push, which is what a pipelined runtime needs:
+`plan_tiles` sizes the ring up front, `tile_one` streams individual tiles
+through inference into a caller-owned slot, and `is_complete()` / `remaining()`
+fence the frame.
+
+`MergeConfig` tunes the metric (`Ios` by default, or `Iou`), the match
+`threshold` (0.5), `class_agnostic` (false), `max_det` (300), and a final
+`score_threshold` (0.0). That last default is deliberate: per-tile decoding is
+the real flood control, and the merged score gate belongs after fragments have
+been joined.
+
+> [!NOTE]
+> An IoS merge reconstructs the enclosing union of fragments, so it cannot
+> recover an object larger than a single tile. For mixed-scale datasets, add a
+> full-frame downscaled pass as one more `push_tile` at `origin=(0, 0)`,
+> `crop_size=frame_dims`.
+
+The C API mirrors the same split (`hal_image_processor_plan_tiles` /
+`_tile_into` / `_tile_one` on the input side, `hal_tiled_frame_accumulator_*`
+on the output side). Full per-language detail lives in
+[image/README.md § Tiled Preprocessing](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/README.md#tiled-preprocessing-sahi)
+and
+[decoder/README.md § Tiled Inference](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/README.md#tiled-inference-sahi).
 
 Per-language quick-starts and richer examples live in each crate's README:
 [Rust (`edgefirst-hal`)](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/README.md),
@@ -261,7 +391,7 @@ for how to verify your integration follows it.
 | One `ImageProcessor` per pipeline | Each instance owns its own GL context, EGL display, and per-thread caches | On Vivante / paravirtual GPUs multiple contexts serialize on the global `GL_MUTEX`; on Mali / V3D / Tegra / Apple they run concurrently (one per thread is the portable rule) |
 | Use native fp16 / AVX build overrides only on supporting CPUs | These flags unlock native widening / vector paths for local perf testing | Unsupported targets may SIGILL or fail to build; portability loss |
 | Pass numpy arrays straight to `Tensor.from_numpy()` — do not pre-`ascontiguousarray()` | HAL detects strided sources and materializes via numpy's vectorized C strided→contig pass; a manual workaround above HAL adds a redundant copy | Redundant pre-copy on every call (≈ 1.5 ms on a `(1, 116, 8400)` f32 view, rpi5-hailo) |
-| For COCO/IoU evaluation use `MaskResolution::Scaled(orig_w, orig_h)`, not `Proto` | `Scaled` upsamples the proto plane *before* thresholding (clean sub-pixel edges); `Proto` thresholds at proto resolution and callers typically nearest-upsample (blocky) | Mask mAP regression of up to 0.04–0.05 absolute when `Proto` is nearest-upsampled |
+| For COCO/IoU evaluation use `MaskResolution::Scaled { width, height }`, not `Proto` | `Scaled` upsamples the proto plane *before* thresholding (clean sub-pixel edges); `Proto` thresholds at proto resolution and callers typically nearest-upsample (blocky) | Mask mAP regression of up to 0.04–0.05 absolute when `Proto` is nearest-upsampled |
 
 > [!IMPORTANT]
 > The single most common performance bug is calling `Tensor::from_fd()`
@@ -360,7 +490,8 @@ if (!tensor) {
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new(fd);
     if (!pd) { perror("hal_plane_descriptor_new"); continue; }
     tensor = hal_import_image(proc, pd, NULL, w, h,
-                              HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+                              HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8,
+                              NULL /* colorimetry: NULL = default */);
     // pd is consumed by hal_import_image (success or failure)
     if (!tensor) { perror("hal_import_image"); continue; }
     insert_tensor(cache, &key, tensor);
@@ -429,7 +560,7 @@ pipelines) and share it across all `convert()`, `draw_*()`, and
 threads. On serializing drivers, concurrent use of a single shared
 instance funnels through `GL_MUTEX`; per-worker ownership runs in
 parallel wherever the driver allows and gives more predictable cache
-behavior everywhere.
+behaviour everywhere.
 
 ### Rule 6 — Local fp16 / AVX build overrides
 
@@ -476,7 +607,7 @@ paths based on the source array's layout:
 |---|---|---|
 | Fully contiguous | Single `copy_from_slice` (memcpy), rayon-parallel ≥ 256 KiB | Lower bound |
 | Strided with contiguous inner rows (column slice, sub-volume, negative stride) | Per-row memcpy iterating outer dimensions | ≈ same as contiguous |
-| Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` materialisation, then Path 1 memcpy | ≈ 4× contiguous |
+| Fully strided (transposed view, every-other-element) | Internal `np.ascontiguousarray()` materialization, then Path 1 memcpy | ≈ 4× contiguous |
 
 The fully-strided case is the one that bites users in practice: HailoRT's
 natural output is `arr.transpose(0, 2, 1)` over a `(1, anchors,
@@ -505,7 +636,7 @@ parameter:
 
 | Mode | Output | Pipeline | When to use |
 |------|--------|----------|-------------|
-| `MaskResolution::Proto` (default) | `(roi_h, roi_w, 1)` u8 binary at 160×160 proto resolution | dot → sign threshold → emit | Real-time visualisation, when proto-resolution binary suffices |
+| `MaskResolution::Proto` (default) | `(roi_h, roi_w, 1)` u8 binary at 160×160 proto resolution | dot → sign threshold → emit | Real-time visualization, when proto-resolution binary suffices |
 | `MaskResolution::Scaled { width, height }` | `(roi_h, roi_w, 1)` u8 binary at requested resolution | dot → sigmoid → upsample to `(W, H)` → threshold (`>127`) | All COCO / IoU / mAP evaluation |
 
 ```python
@@ -883,7 +1014,7 @@ consume it directly — no `map()`, no CPU readback:
 ```c
 // Allocate once, reuse every frame (Rule 1). F16 NCHW model input;
 // auto-select yields an AHardwareBuffer when the GL backend is active —
-// assert hal_tensor_memory_type(dst) == HAL_TENSOR_DMA at startup.
+// assert hal_tensor_memory_type(dst) == HAL_TENSOR_MEMORY_DMA at startup.
 HalTensor* dst = hal_image_processor_create_image(
     proc, 640, 640, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_F16, HAL_CPU_ACCESS_NONE);
 
@@ -985,6 +1116,9 @@ For the C library and consumer linking, see
 | `EDGEFIRST_FORCE_BACKEND` | Force one backend: `cpu`, `g2d`, or `opengl` (disables fallback) |
 | `EDGEFIRST_FORCE_TRANSFER` | Force GL transfer: `pbo`, `dmabuf`, or `sync` |
 | `EDGEFIRST_NV_CONVERT_PATH` | NV12/16/24 GPU conversion path: `sampler`, `shader`, or `auto` (default). `auto` prefers the portable, colorimetry-exact in-shader `ShaderR8`, except BT.601-limited single-plane NV12 on Vivante (hardware sampler is ~12× faster and correct). `sampler`/`shader` force a path for benchmarking/bring-up |
+| `EDGEFIRST_COLORIMETRY` | `fast` (default) or `exact`. High-performance colour conversion is the default; `exact` opts into the colorimetry-exact path where it costs more. Takes precedence over the per-processor setting |
+| `EDGEFIRST_GL_SERIALIZE` | `full` or `lifecycle` — pin the GL command serialization policy instead of using the per-driver default (see [Rule 5](#rule-5--one-imageprocessor-per-pipeline)) |
+| `EDGEFIRST_ENABLE_NVJPEG` | `1` opts into the nvJPEG GPU JPEG decoder on CUDA hosts (off by default so it never silently contends with the inference engine) |
 | `EDGEFIRST_EGL_CACHE_CAPACITY` | Override the per-cache EGLImage capacity (default 64) for high-cardinality varied-geometry streams |
 | `EDGEFIRST_ALLOW_SOFTWARE_GL` | `1` opts in to running the GL backend on a software renderer (otherwise rejected); for CI / headless bring-up |
 | `EDGEFIRST_OPENGL_RENDERSURFACE` | `1` enables EGL renderbuffer path for non-`dma_heap` DMA-BUF (i.MX 95 Neutron NPU) |
@@ -1010,10 +1144,19 @@ testing detail lives in each crate's `TESTING.md` — links in the
 | Binary | Crate | What it measures |
 |--------|-------|------------------|
 | `tensor_benchmark` | `edgefirst-tensor` | Tensor allocation and map/unmap latency across buffer types |
+| `codec_benchmark` | `edgefirst-codec` | Strided decode into pre-allocated tensors vs. the `image` crate and raw `zune-png` |
 | `image_benchmark` | `edgefirst-image` | Crop, flip, rotate, resize, draw |
 | `pipeline_benchmark` | `edgefirst-image` | Letterbox pipeline + format conversion |
+| `convert_matrix_benchmark` | `edgefirst-image` | Full src/dst memory × format × dtype GL convert matrix |
+| `batch_convert_benchmark` | `edgefirst-image` | Batched `convert_deferred` + `flush` vs. eager per-tile convert |
+| `tiled_convert_benchmark` | `edgefirst-image` | Crop contract: per-convert CPU cost scales with tile area, not source area |
 | `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert (strided, HWC/CHW) |
+| `nv_path_benchmark` | `edgefirst-image` | NV12/16/24 `ExternalSampler` vs. `ShaderR8` conversion paths |
+| `cpu_preprocess_benchmark` | `edgefirst-image` | CPU-only JPEG decode + preprocess path (for targets that reserve the GPU for inference) |
+| `parallel_processors_benchmark` | `edgefirst-image` | Aggregate convert throughput with 1 / 2 / 4 concurrent `ImageProcessor` instances |
 | `mask_benchmark` | `edgefirst-image` | `draw_decoded_masks`, `draw_proto_masks`, hybrid path |
+| `mask_decode_benchmark` | `edgefirst-image` | `materialize_scaled_segmentations` — the COCO-eval scaled-mask path |
+| `nvjpeg_benchmark` | `edgefirst-image` | nvJPEG GPU decode into a CUDA-registered PBO (Jetson / CUDA targets) |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequant |
 | `tracker_benchmark` | `edgefirst-tracker` | ByteTrack throughput vs. simultaneous tracks |
@@ -1050,16 +1193,16 @@ python3 .github/scripts/generate_benchmark_tables.py --data-dir benchmarks/
 
 ## Performance Tracing
 
-The HAL ships with built-in tracing for capturing detailed performance
-traces across all processing stages. Traces use the Chrome JSON format
-and view in [Perfetto UI](https://ui.perfetto.dev/).
+The HAL captures performance traces across every processing stage. Traces
+are written in the Chrome JSON format and open directly in the
+[Perfetto UI](https://ui.perfetto.dev/).
 
 ### How it works
 
-Every HAL library crate emits `tracing` spans on hot paths. These spans
-have **near-zero overhead** when no subscriber is active — each site
-compiles to a single relaxed atomic load. No heap allocations, no string
-formatting, no function calls on the hot path.
+Every HAL library crate emits `tracing` spans on hot paths. Those spans cost
+close to nothing when no subscriber is active: each site compiles to a single
+relaxed atomic load, with no heap allocations, no string formatting, and no
+function calls on the hot path.
 
 When a session is started via the API, a Chrome JSON subscriber records
 all span enter/exit events with high-resolution timestamps and structured
@@ -1117,9 +1260,10 @@ The tracing infrastructure complements the rules in the
 [BENCHMARKS.md](https://github.com/EdgeFirstAI/hal/blob/main/BENCHMARKS.md):
 
 1. **Identify bottlenecks** — common findings:
-   - `extract_proto > 3 ms` → model emits NCHW protos but HAL is transposing (check the `layout` field)
-   - `cpu_format_convert` appearing twice → intermediate format conversion (consider matching src/dst formats)
-   - `tensor_alloc` per-frame → tensors not being reused (Rule 1)
+   - `decoder.decode_proto.extract_proto_data > 3 ms` → model emits NCHW protos but HAL is transposing (check the `layout` field)
+   - `image.convert.cpu.format_convert` appearing twice → intermediate format conversion (consider matching src/dst formats)
+   - `tensor.alloc` per-frame → tensors not being reused (Rule 1)
+   - `image.convert.gl.egl_import` on every frame → camera tensors re-imported instead of cached (Rule 3)
 2. **Validate rules** — re-run with tracing after applying a rule to confirm the expected spans disappear or shrink.
 3. **Cross-reference with `perf`** — for CPU-bound spans, combine trace data with `perf record` for instruction-level hotspots.
 
@@ -1200,15 +1344,15 @@ This project is part of the EdgeFirst Perception stack:
 
 ### Professional services
 
-Au-Zone Technologies offers comprehensive support for production
-deployments: training & workshops, custom development, integration
-services, enterprise SLAs, and hardware reference designs.
+Au-Zone Technologies supports production deployments with training and
+workshops, custom development, integration services, enterprise SLAs, and
+hardware reference designs.
 
 Contact: <support@au-zone.com> · [au-zone.com](https://au-zone.com?utm_source=github&utm_medium=readme&utm_campaign=hal)
 
 ## Contributing
 
-We welcome contributions! Please see
+Contributions are welcome. See
 [CONTRIBUTING.md](https://github.com/EdgeFirstAI/hal/blob/main/CONTRIBUTING.md)
 for development setup and guidelines. This project follows our
 [Code of Conduct](https://github.com/EdgeFirstAI/hal/blob/main/CODE_OF_CONDUCT.md).
