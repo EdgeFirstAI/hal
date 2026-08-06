@@ -57,10 +57,13 @@ g2d-sys = { workspace = true }
 gbm = { workspace = true, optional = true }
 
 [dev-dependencies]
+crc32fast = { workspace = true }
 edgefirst-bench = { workspace = true }
 image = { workspace = true }
 image-compare = { workspace = true }
 safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "image_benchmark"
@@ -108,6 +111,10 @@ harness = false
 
 [[bench]]
 name = "batch_convert_benchmark"
+harness = false
+
+[[bench]]
+name = "tiled_convert_benchmark"
 harness = false
 
 [[bench]]

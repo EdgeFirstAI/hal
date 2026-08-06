@@ -4339,4 +4339,824 @@ mod cpu_tests {
             "view 1 window must match a standalone convert of src1"
         );
     }
+
+    /// A *real* resize (not a same-size format conversion) into a padded
+    /// destination view must land each row at the view's stride, not a
+    /// tight `dst_w * channels` pitch. Regression coverage for the
+    /// `(Rotation::None, Flip::None)` resize branch, which used to build its
+    /// `fast_image_resize::images::Image` straight from the padded map
+    /// (implicitly tight), smearing later rows across the padding.
+    #[test]
+    fn resize_into_padded_view_matches_standalone() {
+        let tile_w = 320usize;
+        let tile_h = 240usize;
+        let channels = 3usize; // PixelFormat::Rgb
+
+        // 640x480 Rgb source with non-uniform, deterministic content so a
+        // row-stride mismatch shows up as a byte mismatch rather than
+        // silently comparing padding zeros to padding zeros.
+        let mut src = TensorDyn::image(
+            640,
+            480,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let mut m = src.as_u8_mut().unwrap().map().unwrap();
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+        }
+
+        let mut converter = CPUProcessor::default();
+        let mut do_convert = |dst: &mut TensorDyn| {
+            converter
+                .convert(&src, dst, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+        };
+
+        // Reference: standalone tight 320x240 destination.
+        let mut reference = TensorDyn::image(
+            tile_w,
+            tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        do_convert(&mut reference);
+        let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Parent: allocate wider than the tile (real spare capacity), narrow
+        // the logical width back to `tile_w` via `configure_image` (which
+        // keeps the wider physical allocation), then record a row stride
+        // padded +16 bytes past the tight `tile_w * channels` pitch — the
+        // shape a DMA pitch-aligned destination would present.
+        let alloc_w = tile_w + 64;
+        let mut parent = TensorDyn::image(
+            alloc_w,
+            2 * tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        parent
+            .configure_image(tile_w, 2 * tile_h, PixelFormat::Rgb)
+            .unwrap();
+        let padded_stride = tile_w * channels + 16;
+        parent.set_row_stride(padded_stride).unwrap();
+
+        // Second band: rows [tile_h, 2*tile_h) of the padded parent.
+        let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
+        do_convert(&mut view);
+
+        // Walk the view's window at the parent's real stride, comparing
+        // each row's tight `width * channels` bytes (skipping the padding)
+        // against the standalone reference.
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let band_offset = tile_h * padded_stride;
+        let tight_row = tile_w * channels;
+        for row in 0..tile_h {
+            let parent_row_start = band_offset + row * padded_stride;
+            let parent_row = &parent_bytes[parent_row_start..parent_row_start + tight_row];
+            let ref_row = &reference_bytes[row * tight_row..(row + 1) * tight_row];
+            assert_eq!(
+                parent_row, ref_row,
+                "row {row} of the padded destination view must match the standalone convert"
+            );
+        }
+    }
+
+    // ---- Task 3: fused NV→planar source region + scale-identity gate ----
+
+    /// Decode `full` (a whole-frame NV12→PlanarRgb convert, no crop) once and
+    /// slice each colour plane down to `region` by hand, entirely without
+    /// invoking any cropped-convert code path. This is the ground-truth
+    /// oracle both `fused_region_matches_general_path` and
+    /// `odd_origin_nv12_crop_falls_through` compare against.
+    fn manual_planar_rgb_crop(full: &TensorDyn, region: Region) -> Vec<u8> {
+        let full_w = full.width().unwrap();
+        let full_h = full.height().unwrap();
+        let full_bytes = full.as_u8().unwrap().map().unwrap().to_vec();
+        let plane_full = full_w * full_h;
+        let plane_dst = region.width * region.height;
+        let mut out = vec![0u8; plane_dst * 3];
+        for p in 0..3 {
+            let src_plane = &full_bytes[p * plane_full..(p + 1) * plane_full];
+            let dst_plane = &mut out[p * plane_dst..(p + 1) * plane_dst];
+            for row in 0..region.height {
+                let s_off = (region.y + row) * full_w + region.x;
+                let d_off = row * region.width;
+                dst_plane[d_off..d_off + region.width]
+                    .copy_from_slice(&src_plane[s_off..s_off + region.width]);
+            }
+        }
+        out
+    }
+
+    /// Full-frame (no-crop) NV12→PlanarRgb convert of `camera720p.nv12` —
+    /// the source both new tests below slice down to a sub-region by hand.
+    ///
+    /// Note this itself already routes through `convert_nv_to_planar_fused`
+    /// (with `region: None` — the pre-existing whole-frame gate, unchanged
+    /// by this task), not some independently-implemented "general path"
+    /// decode. It's still a valid oracle for `fused_region_matches_general_path`
+    /// because that test's *only* claim is that the fused function's
+    /// `region: Some(r)` strip arithmetic reproduces exactly what its own
+    /// `region: None` whole-frame arithmetic computes for the same pixels —
+    /// i.e. that the region offsets are correct, not that the fused decode
+    /// numerically matches the separate `convert_format_pf` pipeline (which
+    /// `odd_origin_nv12_crop_falls_through` exercises independently against
+    /// this same oracle, and which the frozen `crop_golden` fixtures pin
+    /// byte-for-byte as the ultimate independent check).
+    fn nv12_720p_to_planar_rgb_full(converter: &mut CPUProcessor) -> (TensorDyn, TensorDyn) {
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+        let mut full = TensorDyn::image(
+            1280,
+            720,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        converter
+            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        (src, full)
+    }
+
+    /// A source crop whose size equals the destination (scale identity) with
+    /// an even (chroma-aligned) origin must take the fused NV→planar strip
+    /// path and produce output identical to decoding the whole frame once
+    /// and manually slicing the same sub-rectangle out of each plane (see
+    /// `nv12_720p_to_planar_rgb_full`'s doc for exactly what this oracle
+    /// does and doesn't independently prove).
+    #[test]
+    fn fused_region_matches_general_path() {
+        let mut converter = CPUProcessor::default();
+        let (src, full) = nv12_720p_to_planar_rgb_full(&mut converter);
+        let region = Region::new(256, 128, 640, 360); // scale identity, even origin
+        let reference = manual_planar_rgb_crop(&full, region);
+
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(region));
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            actual, reference,
+            "fused NV12->PlanarRgb region convert must match the full-decode \
+             + manual plane crop reference byte-for-byte"
+        );
+    }
+
+    /// The same scale-identity, chroma-aligned crop as above must actually
+    /// take the fused path — asserted via the test-only `fused_hits` counter
+    /// rather than by timing, so the path selection itself is under test.
+    #[test]
+    fn scale_identity_crop_takes_fused_path() {
+        let mut converter = CPUProcessor::default();
+        let src = load_bytes_to_tensor(
+            1280,
+            720,
+            PixelFormat::Nv12,
+            None,
+            &edgefirst_bench::testdata::read("camera720p.nv12"),
+        )
+        .unwrap();
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(Region::new(256, 128, 640, 360)));
+
+        let before = converter.fused_hits();
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            converter.fused_hits(),
+            before + 1,
+            "scale-identity, chroma-aligned crop must take the fused NV->planar path"
+        );
+    }
+
+    /// An odd-origin NV12 crop (odd left AND top) fails the NV12 chroma-
+    /// alignment gate and must fall through to the general path — never
+    /// snapped to the nearest even origin, never shifted. The output must
+    /// still be correct.
+    #[test]
+    fn odd_origin_nv12_crop_falls_through() {
+        let mut converter = CPUProcessor::default();
+        let (src, full) = nv12_720p_to_planar_rgb_full(&mut converter);
+        let region = Region::new(257, 129, 640, 360); // odd left AND top
+        let reference = manual_planar_rgb_crop(&full, region);
+
+        let mut cropped = TensorDyn::image(
+            640,
+            360,
+            PixelFormat::PlanarRgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new().with_source(Some(region));
+
+        let before = converter.fused_hits();
+        converter
+            .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            converter.fused_hits(),
+            before,
+            "odd-origin NV12 crop must never take the fused path (chroma \
+             alignment requires even left/top) — never snap, never shift"
+        );
+
+        let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+        assert_eq!(
+            actual, reference,
+            "general-path output for the odd-origin crop must still be correct"
+        );
+    }
+
+    /// Regression: a scale-identity, chroma-aligned (even left/top) crop
+    /// whose *width* is odd used to error out of the fused NV12/NV16 region
+    /// path (`YuvError::ChromaPlaneMinimumSizeMismatch`). The `yuv` crate
+    /// needs `width.div_ceil(2) * 2` chroma bytes per row — a full trailing
+    /// U+V pair for the odd column's fractional pair, not `width` bytes —
+    /// but the packed UV scratch was sized to exactly `out_w`, one byte
+    /// short. Covers both NV12 (4:2:0) and NV16 (4:2:2): both pack one U+V
+    /// byte pair per two luma columns and so share the same rounding need.
+    #[test]
+    fn odd_width_scale_identity_crop_takes_fused_path_and_is_correct() {
+        for (src_fmt, asset) in [
+            (PixelFormat::Nv12, "camera720p.nv12"),
+            (PixelFormat::Nv16, "camera720p.nv16"),
+        ] {
+            let mut converter = CPUProcessor::default();
+            let src = load_bytes_to_tensor(
+                1280,
+                720,
+                src_fmt,
+                None,
+                &edgefirst_bench::testdata::read(asset),
+            )
+            .unwrap();
+            let mut full = TensorDyn::image(
+                1280,
+                720,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            converter
+                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+
+            // Even left/top (chroma-aligned) but an ODD width — the shape
+            // that used to crash.
+            let region = Region::new(256, 128, 641, 360);
+            let reference = manual_planar_rgb_crop(&full, region);
+
+            let mut cropped = TensorDyn::image(
+                region.width,
+                region.height,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let crop = Crop::new().with_source(Some(region));
+
+            let before = converter.fused_hits();
+            converter
+                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| {
+                    panic!("{src_fmt:?} odd-width scale-identity crop must not error: {e}")
+                });
+            assert_eq!(
+                converter.fused_hits(),
+                before + 1,
+                "{src_fmt:?} odd-width, chroma-aligned crop must still take the fused path"
+            );
+
+            let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+            assert_eq!(
+                actual, reference,
+                "{src_fmt:?} odd-width fused region output must match the \
+                 full-decode + manual plane crop reference"
+            );
+        }
+    }
+
+    /// `region.left == 0` crops exercise the fused path's zero-copy arm (no
+    /// y/uv row packing — the read slices the parent planes at a row
+    /// boundary) and its one mandatory exception. Cases:
+    ///
+    /// - NV12 flush-bottom, even height: zero-copy; the region's last
+    ///   luma/chroma rows are the planes' last rows, so any stride-chunking
+    ///   past a row's true end (the bug the packing arm exists to avoid for
+    ///   column-shifted crops) would read out of bounds or drop rows here.
+    /// - NV12 odd width, even height: zero-copy; the chroma read covers the
+    ///   trailing half-pair byte from the parent stride.
+    /// - NV12 odd width AND odd height, not flush-bottom: MUST fall back to
+    ///   the packing arm — the `yuv` crate's 4:2:0 odd-last-row handling
+    ///   (`chunks_exact(..).remainder()` / `.last()`) is only correct on a
+    ///   slice of exactly `height` rows, which a row-aligned slice running
+    ///   to the plane end is not. Without the fallback this case panics
+    ///   inside the crate ("range end index 641 out of range").
+    /// - NV16 odd width/height: zero-copy is safe at any height (4:2:2 has
+    ///   no vertical subsampling and no remainder path).
+    ///
+    /// All must stay fused. Even-height NV12 cases and NV16 are byte-exact
+    /// against the full-decode + manual plane crop oracle on every CPU. The
+    /// odd-height NV12 case compares its LAST row with a small tolerance
+    /// instead: an odd-height region decodes its final row through the
+    /// crate's halved-chroma-row kernel, while the even-height full-frame
+    /// oracle rendered that same source row through the paired kernel — and
+    /// on the plain-NEON (non-RDM) path those two kernels round ±1
+    /// differently (observed on i.MX 8M Plus Cortex-A53), so bit-equality
+    /// with this oracle is unattainable there by construction. All rows
+    /// before the last stay byte-exact, which still pins the addressing.
+    #[test]
+    fn left_edge_crop_zero_copy_arm_is_fused_and_correct() {
+        for (src_fmt, asset, region, last_row_tol, label) in [
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
+                Region::new(0, 80, 640, 640),
+                0u8,
+                "nv12 flush-bottom",
+            ),
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
+                Region::new(0, 0, 641, 360),
+                0u8,
+                "nv12 odd-width even-height",
+            ),
+            (
+                PixelFormat::Nv12,
+                "camera720p.nv12",
+                Region::new(0, 0, 641, 361),
+                2u8,
+                "nv12 odd-width odd-height",
+            ),
+            (
+                PixelFormat::Nv16,
+                "camera720p.nv16",
+                Region::new(0, 0, 641, 361),
+                0u8,
+                "nv16 odd-width odd-height",
+            ),
+        ] {
+            let mut converter = CPUProcessor::default();
+            let src = load_bytes_to_tensor(
+                1280,
+                720,
+                src_fmt,
+                None,
+                &edgefirst_bench::testdata::read(asset),
+            )
+            .unwrap();
+            let mut full = TensorDyn::image(
+                1280,
+                720,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            converter
+                .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                .unwrap();
+            let reference = manual_planar_rgb_crop(&full, region);
+
+            let mut cropped = TensorDyn::image(
+                region.width,
+                region.height,
+                PixelFormat::PlanarRgb,
+                DType::U8,
+                mem(),
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .unwrap();
+            let crop = Crop::new().with_source(Some(region));
+
+            let before = converter.fused_hits();
+            converter
+                .convert(&src, &mut cropped, Rotation::None, Flip::None, crop)
+                .unwrap_or_else(|e| panic!("left-edge {label} crop must not error: {e}"));
+            assert_eq!(
+                converter.fused_hits(),
+                before + 1,
+                "left-edge {label} crop must take the fused path"
+            );
+
+            let actual = cropped.as_u8().unwrap().map().unwrap().to_vec();
+            if last_row_tol == 0 {
+                assert_eq!(
+                    actual, reference,
+                    "left-edge {label} region output must match the \
+                     full-decode + manual plane crop reference"
+                );
+            } else {
+                // Odd-height NV12: all rows but the last are byte-exact; the
+                // last row tolerates the paired-vs-halved chroma kernel
+                // rounding delta (see the test doc).
+                let (w, h) = (region.width, region.height);
+                let plane = w * h;
+                for p in 0..3 {
+                    for row in 0..h {
+                        let off = p * plane + row * w;
+                        let (a, r) = (&actual[off..off + w], &reference[off..off + w]);
+                        if row + 1 < h {
+                            assert_eq!(
+                                a, r,
+                                "left-edge {label}: plane {p} row {row} must be byte-exact"
+                            );
+                        } else {
+                            for (i, (x, y)) in a.iter().zip(r).enumerate() {
+                                assert!(
+                                    (i16::from(*x) - i16::from(*y)).abs() <= i16::from(last_row_tol),
+                                    "left-edge {label}: plane {p} last row byte {i}: {x} vs {y} exceeds tolerance {last_row_tol}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build a `w`x`h` tensor in `fmt` whose every mapped byte follows a
+    /// deterministic gradient, so neighbouring pixels differ and any misplaced
+    /// filter tap shows up as a byte difference.
+    fn gradient_image(w: usize, h: usize, fmt: PixelFormat) -> TensorDyn {
+        let t = TensorDyn::image(
+            w,
+            h,
+            fmt,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let u8t = t.as_u8().unwrap();
+            let mut map = u8t.map_mut().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 7 + i / w * 13) & 0xFF) as u8;
+            }
+        }
+        t
+    }
+
+    /// The crop-sized pre-resize intermediate must be byte-identical to the
+    /// pre-Task-4 full-frame intermediate for crops flush against every frame
+    /// edge — the cases where the halo clamps against the frame bounds instead
+    /// of finding real neighbouring pixels.
+    ///
+    /// The reference is the old algorithm rebuilt from the public API: convert
+    /// the whole frame once into the packed-RGB intermediate, then apply the
+    /// same crop+resize to *that* tensor. `Rgb -> Rgb` needs no intermediate,
+    /// so the reference convert runs the identical resize against a full-frame
+    /// source — exactly what the NV source used to do internally. Any halo
+    /// arithmetic error (too small, mis-snapped, or mis-rebased) makes the two
+    /// differ. This lives here rather than in `tests/crop_golden.rs` because it
+    /// also asserts the shrink actually happened, via the crate-private
+    /// `last_tmp_dims`, which an integration test cannot reach.
+    ///
+    /// Run for both resize algorithms: the golden matrix only ever builds a
+    /// `default()` (bilinear) processor, so `new_nearest()` — the one algorithm
+    /// with a genuinely zero filter reach — has no other coverage here.
+    #[test]
+    fn crop_edge_matches_full_frame_intermediate() {
+        const SRC_W: usize = 640;
+        const SRC_H: usize = 480;
+        const CW: usize = 128;
+        const CH: usize = 96;
+
+        for alg in ["bilinear", "nearest"] {
+            for src_fmt in [PixelFormat::Nv12, PixelFormat::Nv16, PixelFormat::Nv24] {
+                let mut converter = match alg {
+                    "nearest" => CPUProcessor::new_nearest(),
+                    _ => CPUProcessor::default(),
+                };
+                let src = gradient_image(SRC_W, SRC_H, src_fmt);
+
+                // The pre-Task-4 intermediate: the whole frame, converted once.
+                let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
+                converter
+                    .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+                    .unwrap();
+
+                let origins = [
+                    (0, 0),                   // top-left corner
+                    (SRC_W - CW, 0),          // top-right, flush right
+                    (0, SRC_H - CH),          // bottom-left, flush bottom
+                    (SRC_W - CW, SRC_H - CH), // bottom-right, flush both
+                    (101, 53),                // interior, odd on both axes
+                ];
+                for (left, top) in origins {
+                    for (dst_w, dst_h) in [(CW, CH), (CW / 2, CH / 2)] {
+                        let crop = Crop::new()
+                            .with_source(Some(Region::new(left, top, CW, CH)))
+                            .with_fit(crate::Fit::Stretch);
+
+                        let mut actual = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                        converter
+                            .convert(&src, &mut actual, Rotation::None, Flip::None, crop)
+                            .unwrap();
+                        let dims = converter.last_tmp_dims();
+
+                        let mut expect = gradient_image(dst_w, dst_h, PixelFormat::Rgb);
+                        converter
+                            .convert(&full, &mut expect, Rotation::None, Flip::None, crop)
+                            .unwrap();
+
+                        let case = format!(
+                            "{alg} {src_fmt:?} crop=({left},{top},{CW},{CH}) dst={dst_w}x{dst_h}"
+                        );
+                        assert_eq!(
+                            actual.as_u8().unwrap().map().unwrap().to_vec(),
+                            expect.as_u8().unwrap().map().unwrap().to_vec(),
+                            "crop-sized intermediate changed output bytes for {case}"
+                        );
+
+                        // ...and the intermediate really did shrink to the crop.
+                        let (tw, th) = dims.unwrap_or_else(|| {
+                            panic!("{case}: expected a pre-resize intermediate")
+                        });
+                        assert!(
+                            tw < SRC_W && th < SRC_H,
+                            "{case}: intermediate {tw}x{th} did not shrink below the frame"
+                        );
+                        assert!(
+                            tw >= CW && th >= CH,
+                            "{case}: intermediate {tw}x{th} is smaller than the crop"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Nearest` is the one algorithm whose filter reach is genuinely zero, so
+    /// without a halo *floor* an already-chroma-aligned crop grows by nothing:
+    /// the rebased source rect becomes the whole intermediate, `needs_resize`
+    /// in `resize_flip_rotate_pf` flips to false for the first time on this
+    /// shape, and control reaches `flip_rotate_ndarray_pf`, which assumes
+    /// tightly-packed destination rows and so bypasses the padded-destination
+    /// destride entirely.
+    ///
+    /// Scale-identity crop into a 320x240 view of a parent with a padded row
+    /// stride, checked against both a standalone tight convert and the
+    /// pre-change full-frame-intermediate oracle.
+    #[test]
+    fn nearest_scale_identity_crop_into_padded_view() {
+        const SRC_W: usize = 640;
+        const SRC_H: usize = 480;
+        let tile_w = 320usize;
+        let tile_h = 240usize;
+        let channels = 3usize; // PixelFormat::Rgb
+
+        let src = gradient_image(SRC_W, SRC_H, PixelFormat::Nv12);
+        // Even origin on both axes: already chroma-aligned, so the even-snap
+        // grows nothing and only the halo floor can separate the rebased rect
+        // from the full intermediate.
+        let crop = Crop::new()
+            .with_source(Some(Region::new(100, 52, tile_w, tile_h)))
+            .with_fit(crate::Fit::Stretch);
+
+        let mut converter = CPUProcessor::new_nearest();
+
+        // Reference A: standalone, tightly-packed destination.
+        let mut reference = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
+        converter
+            .convert(&src, &mut reference, Rotation::None, Flip::None, crop)
+            .unwrap();
+        let reference_bytes = reference.as_u8().unwrap().map().unwrap().to_vec();
+
+        // Reference B: the pre-Task-4 algorithm — whole frame converted once
+        // into the packed-RGB intermediate, then the same crop applied to it.
+        let mut full = gradient_image(SRC_W, SRC_H, PixelFormat::Rgb);
+        converter
+            .convert(&src, &mut full, Rotation::None, Flip::None, Crop::default())
+            .unwrap();
+        let mut oracle = gradient_image(tile_w, tile_h, PixelFormat::Rgb);
+        converter
+            .convert(&full, &mut oracle, Rotation::None, Flip::None, crop)
+            .unwrap();
+        assert_eq!(
+            reference_bytes,
+            oracle.as_u8().unwrap().map().unwrap().to_vec(),
+            "Nearest crop-sized intermediate diverged from the full-frame oracle"
+        );
+
+        // Padded parent: allocate wider, narrow the logical width back, then
+        // record a row stride padded past the tight pitch — the shape a DMA
+        // pitch-aligned destination presents.
+        let mut parent = TensorDyn::image(
+            tile_w + 64,
+            2 * tile_h,
+            PixelFormat::Rgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        parent
+            .configure_image(tile_w, 2 * tile_h, PixelFormat::Rgb)
+            .unwrap();
+        let padded_stride = tile_w * channels + 16;
+        parent.set_row_stride(padded_stride).unwrap();
+
+        let mut view = parent.view(Region::new(0, tile_h, tile_w, tile_h)).unwrap();
+        converter
+            .convert(&src, &mut view, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let parent_bytes = parent.as_u8().unwrap().map().unwrap().to_vec();
+        let band_offset = tile_h * padded_stride;
+        let tight_row = tile_w * channels;
+        for row in 0..tile_h {
+            let start = band_offset + row * padded_stride;
+            assert_eq!(
+                &parent_bytes[start..start + tight_row],
+                &reference_bytes[row * tight_row..(row + 1) * tight_row],
+                "row {row} of the padded destination view must match the standalone convert"
+            );
+        }
+    }
+
+    /// A multiplane (separate luma/chroma tensors) NV12 source must extract the
+    /// same crop as the contiguous layout — the two take different branches in
+    /// `extract_nv_region` (own chroma stride vs. `split_semi_planar`), and only
+    /// the contiguous one is exercised by the golden matrix.
+    #[test]
+    fn crop_multiplane_nv12_matches_contiguous() {
+        const W: usize = 640;
+        const H: usize = 480;
+
+        let contiguous = gradient_image(W, H, PixelFormat::Nv12);
+        let (luma_bytes, chroma_bytes) = {
+            let u8t = contiguous.as_u8().unwrap();
+            let stride = u8t.effective_row_stride().unwrap_or(W);
+            let map = u8t.map().unwrap();
+            let s = map.as_slice();
+            (s[..stride * H].to_vec(), s[stride * H..].to_vec())
+        };
+
+        let multiplane = {
+            let luma = Tensor::<u8>::new(&[H, W], mem(), None).unwrap();
+            let chroma = Tensor::<u8>::new(&[H / 2, W], mem(), None).unwrap();
+            luma.map_mut().unwrap().as_mut_slice()[..luma_bytes.len()].copy_from_slice(&luma_bytes);
+            let n = chroma_bytes
+                .len()
+                .min(chroma.map().unwrap().as_slice().len());
+            chroma.map_mut().unwrap().as_mut_slice()[..n].copy_from_slice(&chroma_bytes[..n]);
+            TensorDyn::from(Tensor::<u8>::from_planes(luma, chroma, PixelFormat::Nv12).unwrap())
+        };
+
+        let mut converter = CPUProcessor::default();
+        // Cropped AND scaled, with an odd origin so the even-snap runs too.
+        let crop = Crop::new()
+            .with_source(Some(Region::new(101, 53, 320, 240)))
+            .with_fit(crate::Fit::Stretch);
+
+        let mut from_multi = gradient_image(160, 120, PixelFormat::Rgb);
+        converter
+            .convert(
+                &multiplane,
+                &mut from_multi,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .unwrap();
+        let mut from_contig = gradient_image(160, 120, PixelFormat::Rgb);
+        converter
+            .convert(
+                &contiguous,
+                &mut from_contig,
+                Rotation::None,
+                Flip::None,
+                crop,
+            )
+            .unwrap();
+
+        assert_eq!(
+            from_multi.as_u8().unwrap().map().unwrap().to_vec(),
+            from_contig.as_u8().unwrap().map().unwrap().to_vec(),
+            "multiplane NV12 crop extraction diverged from the contiguous layout"
+        );
+    }
+
+    /// A cropped **and scaled** convert must size its pre-resize intermediate
+    /// to the crop (plus the resize filter's halo), not to the whole frame.
+    ///
+    /// 4032x2268 NV12 -> crop (512, 512, 640, 640) -> 320x320 Rgb: the crop is
+    /// scaled 2:1, so Task 3's scale-identity fused path does not swallow it
+    /// and the general pipeline's pre-resize intermediate is exercised. The
+    /// full frame is 9.1 MPix against the crop's 0.41 MPix — a ~22x
+    /// difference, so the assertion is about proportionality, not an exact
+    /// halo width (which is an implementation detail of the configured
+    /// filter).
+    #[test]
+    fn pre_resize_intermediate_is_crop_sized() {
+        const SRC_W: usize = 4032;
+        const SRC_H: usize = 2268;
+        const CROP: (usize, usize, usize, usize) = (512, 512, 640, 640);
+
+        let mut converter = CPUProcessor::default();
+        let src = TensorDyn::image(
+            SRC_W,
+            SRC_H,
+            PixelFormat::Nv12,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        {
+            let u8t = src.as_u8().unwrap();
+            let mut map = u8t.map_mut().unwrap();
+            for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+                *b = ((i * 7 + i / SRC_W * 13) & 0xFF) as u8;
+            }
+        }
+
+        let mut dst = TensorDyn::image(
+            320,
+            320,
+            PixelFormat::Rgb,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let crop = Crop::new()
+            .with_source(Some(Region::new(CROP.0, CROP.1, CROP.2, CROP.3)))
+            .with_fit(crate::Fit::Stretch);
+
+        converter
+            .convert(&src, &mut dst, Rotation::None, Flip::None, crop)
+            .unwrap();
+
+        let dims = converter
+            .last_tmp_dims()
+            .expect("a cropped NV12->Rgb scaled convert needs a pre-resize intermediate");
+        assert_ne!(
+            dims,
+            (SRC_W, SRC_H),
+            "the pre-resize intermediate is still frame-sized"
+        );
+        // Crop-sized: at least the crop, and at most the crop plus a small
+        // filter halo on each side. 16px of slack per side is far more than
+        // any supported filter needs at this 2:1 scale, and far less than the
+        // frame.
+        assert!(
+            (CROP.2..=CROP.2 + 32).contains(&dims.0) && (CROP.3..=CROP.3 + 32).contains(&dims.1),
+            "pre-resize intermediate {dims:?} is not crop-sized \
+             (expected ~{}x{} + filter halo)",
+            CROP.2,
+            CROP.3
+        );
+    }
 }

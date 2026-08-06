@@ -654,6 +654,7 @@ dependencies = [
 name = "edgefirst-image"
 version = "0.27.1"
 dependencies = [
+ "crc32fast",
  "ctor",
  "dma-heap",
  "drm-fourcc",
@@ -684,6 +685,8 @@ dependencies = [
  "opencv",
  "rayon",
  "safetensors",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "yuv",

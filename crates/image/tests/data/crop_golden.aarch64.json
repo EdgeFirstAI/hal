@@ -1,0 +1,1202 @@
+[
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 771152801
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3044867001
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2963599617
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3452641335
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1630263747
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1898434685
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2093076558
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3122685702
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2966803960
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3897171493
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2500771324
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3854965564
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 963913900
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 947603598
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2430877456
+  },
+  {
+    "src_fmt": "Nv12",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2476625373
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3702593559
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2125427050
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 4045888740
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 91247923
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3541565998
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3068245325
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 314415633
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1736385706
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2128536994
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1018726911
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3373934439
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 460800850
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1873597899
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2298802216
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 4055746179
+  },
+  {
+    "src_fmt": "Nv16",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 610659227
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 536773044
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3511270431
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3371246407
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1231338552
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 4098019380
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 116112513
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3693320985
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 4255022272
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 455178887
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3441280807
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3826264711
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3657179519
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1513275325
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3112386881
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2688438449
+  },
+  {
+    "src_fmt": "Nv24",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 84018633
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3199910747
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 645105019
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 948633647
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2547560826
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1015588495
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 4211529829
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1639463059
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1135342850
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 814125726
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1884571466
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3403310818
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 979857656
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3987746000
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2358493580
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 910488753
+  },
+  {
+    "src_fmt": "Rgb",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1361655055
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 726462376
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1784130794
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1386888859
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 2563742600
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2233710312
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3071394335
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 3573136828
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "Rgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 595179494
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2618226092
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      101,
+      53,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1451229266
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1397806656
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      0,
+      0,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 3730758288
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 1616038762
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      320,
+      240,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 1323885025
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 320,
+    "dst_h": 240,
+    "crc32": 2268677792
+  },
+  {
+    "src_fmt": "Rgba",
+    "dst_fmt": "PlanarRgb",
+    "src_w": 640,
+    "src_h": 480,
+    "crop": [
+      100,
+      52,
+      320,
+      240
+    ],
+    "dst_w": 160,
+    "dst_h": 120,
+    "crc32": 4039034775
+  }
+]

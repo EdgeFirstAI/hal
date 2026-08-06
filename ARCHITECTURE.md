@@ -296,6 +296,20 @@ G2D destination crop, CPU offset+stride) and the cache-key invariant live in
 The `BufferIdentity`-sharing contract for regions lives in
 [`crates/tensor/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#bufferidentity-and-egl-image-caching).
 
+### Three batch memory representations, reconciled
+
+Three conventions for addressing a batch coexist across HAL and its consumers, and nothing previously stated how they relate.
+
+1. **Engine batch inputs — `dst.batch(n)`.** The convention above: `N` the leading dimension over a packed `[N, H, W, C]` or planar `[N, C, H, W]` tensor, addressed by batch index. For a packed destination, `Tensor::batch(n)` (`crates/tensor/src/lib.rs`) treats the underlying buffer as a tall `(W, N·H)` parent and composes a `view_origin` so the GL backend imports it once and renders tile `n` as a `glViewport` row-band at `y = n·H` — the mechanism the "Convert → tile" step above relies on. Planar/semi-planar tensors take the plain per-element subview instead, with no composed `view_origin`; batching a non-packed layout stays on the per-slot path.
+2. **Tile rendering — `dst.view(Region)`.** `ImageProcessor::tile_into`'s destination is expected to come from `alloc_tile_batch`, which builds the same tall `[tile_w, N·tile_h]` parent shape as (1) but through `create_image` — so DMA pitch alignment applies — rather than through a pre-shaped batched tensor. `render_tile` addresses tile `index` as a spatial region view, `dst.view(Region::new(0, index·tile_h, tile_w, tile_h))`, of that parent when the destination has room for the whole tile count; a single-slot `tile_one` destination without that capacity is converted into directly instead of viewed. So (1) and (2) share the same tall-packed-buffer physical layout — batch index and region view are two ways of reaching the same row-band — but (2) is reached through the general region-view API rather than `batch(n)`, and always goes through `create_image`'s pitch alignment.
+3. **Profiler device-batch mode — `plane_offset = e × input_frame_size`.** An external convention used by the EdgeFirst Studio profiler's device batch invoke path, documented in the profiler repository's `SAHI.md` §D2: the accelerator addresses element `e` of a batch by a fixed per-element frame-size offset rather than through either of the above. It is not part of this repository's tensor or tiling API and is out of scope for HAL's memory-layout guarantees — a caller building a batched invoke against it must not assume `dst.batch(n)` or `dst.view(Region)` semantics apply.
+
+Two caveats from `SAHI.md`'s audit of the tall batch apply to (1) and (2), since they share physical layout, and are carried over verbatim:
+
+> If `row_stride > tile_w · channels`, the buffer is **not** a dense `[N, tile_h, tile_w, C]` tensor and no engine can consume it directly. (§D1)
+
+> HAL's root `ARCHITECTURE.md` notes the one-import batch engine covers "the single-pass `Rgba`/`Bgra`/`Grey` u8/i8 DMA path", with two-pass packed-RGB, planar, and macOS falling back to eager per-tile converts. (§D5)
+
 ---
 
 ## Design Patterns

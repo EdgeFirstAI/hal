@@ -26,6 +26,7 @@ approx = "0.5.1"
 cbindgen = "0.29"
 errno = "0.3"
 argminmax = { version = "0.6.3", default-features = false }
+crc32fast = "1.5.0"
 ctor = "1.0.7"
 dma-heap = "0.4.1"
 # fast-math removed: upstream abandoned (last release 2019). Its single use

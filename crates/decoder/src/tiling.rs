@@ -172,6 +172,7 @@ pub fn unletter_norm(b: BoundingBox, lb: [f32; 4]) -> BoundingBox {
 /// ```
 #[must_use]
 pub fn lift_tile_boxes(mut boxes: Vec<DetectBox>, placement: &TilePlacement) -> Vec<DetectBox> {
+    let _s = tracing::trace_span!("decoder.tiled.lift", boxes = boxes.len()).entered();
     let (ox, oy) = placement.origin;
     let (cw, ch) = placement.crop_size;
     for d in &mut boxes {
@@ -391,7 +392,16 @@ impl TiledFrameAccumulator {
     /// Merge all accumulated detections into full-frame **pixel** boxes.
     #[must_use]
     pub fn finalize(self) -> Vec<DetectBox> {
-        merge_tiled_detections(self.dets, &self.cfg)
+        let span = tracing::trace_span!(
+            "decoder.tiled.merge",
+            tiles = self.tiles_total,
+            boxes_in = self.dets.len(),
+            boxes_out = tracing::field::Empty,
+        );
+        let _s = span.enter();
+        let out = merge_tiled_detections(self.dets, &self.cfg);
+        span.record("boxes_out", out.len());
+        out
     }
 
     /// Merge then renormalize to `[0,1]` by `frame_dims` (for the tracker,
@@ -407,7 +417,18 @@ impl TiledFrameAccumulator {
         }
         let inv_w = 1.0 / fw;
         let inv_h = 1.0 / fh;
-        let mut merged = merge_tiled_detections(self.dets, &self.cfg);
+        let mut merged = {
+            let span = tracing::trace_span!(
+                "decoder.tiled.merge",
+                tiles = self.tiles_total,
+                boxes_in = self.dets.len(),
+                boxes_out = tracing::field::Empty,
+            );
+            let _s = span.enter();
+            let out = merge_tiled_detections(self.dets, &self.cfg);
+            span.record("boxes_out", out.len());
+            out
+        };
         for d in &mut merged {
             d.bbox.xmin *= inv_w;
             d.bbox.xmax *= inv_w;

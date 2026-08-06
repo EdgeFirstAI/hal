@@ -228,9 +228,16 @@ impl ImageProcessor {
         src_h: usize,
         cfg: &TilingConfig,
     ) -> Result<Vec<TilePlacement>> {
+        let span = tracing::trace_span!(
+            "image.plan_tiles",
+            tiles = tracing::field::Empty,
+            overlap = cfg.overlap_ratio,
+        );
+        let _s = span.enter();
         cfg.validate()?;
         let grid = tile_grid(src_h, src_w, cfg.tile_h, cfg.tile_w, cfg.overlap_ratio);
         let count = grid.len();
+        span.record("tiles", count);
         let crop = Crop::default().with_fit(cfg.fit);
         Ok(grid
             .iter()
@@ -273,6 +280,8 @@ impl ImageProcessor {
         dst_batched: &mut TensorDyn,
         cfg: &TilingConfig,
     ) -> Result<Vec<TilePlacement>> {
+        let span = tracing::trace_span!("image.tile_into", tiles = tracing::field::Empty);
+        let _s = span.enter();
         cfg.validate()?;
         let (src_w, src_h) = (
             src.width().ok_or(Error::NotAnImage)?,
@@ -280,6 +289,7 @@ impl ImageProcessor {
         );
         let placements = self.plan_tiles(src_w, src_h, cfg)?;
         let count = placements.len();
+        span.record("tiles", count);
 
         let dst_h = dst_batched.height().ok_or(Error::NotAnImage)?;
         let required_h = count.saturating_mul(cfg.tile_h);
@@ -314,6 +324,12 @@ impl ImageProcessor {
         placement: &TilePlacement,
         cfg: &TilingConfig,
     ) -> Result<()> {
+        let _s = tracing::trace_span!(
+            "image.tile_one",
+            index = placement.index,
+            count = placement.count,
+        )
+        .entered();
         cfg.validate()?;
         self.render_tile(src, dst_slot, placement, cfg)
     }
@@ -561,5 +577,88 @@ mod tests {
     fn tiling_config_validate_rejects_zero_tile_size() {
         assert!(TilingConfig::new(0, 640).validate().is_err());
         assert!(TilingConfig::new(640, 0).validate().is_err());
+    }
+
+    // --- span instrumentation ----------------------------------------------
+
+    /// Minimal `tracing::Subscriber` that records every span's name, in
+    /// creation order, into a shared `Vec`. Enough to assert *which* spans
+    /// fired without pulling in `tracing-subscriber` (not a dependency of
+    /// this crate) or `tracing-test`.
+    struct SpanNameCapture {
+        names: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        next_id: std::sync::atomic::AtomicU64,
+    }
+
+    impl tracing::Subscriber for SpanNameCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.names
+                .lock()
+                .unwrap()
+                .push(span.metadata().name().to_string());
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, _event: &tracing::Event<'_>) {}
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn tiling_emits_spans() {
+        let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = SpanNameCapture {
+            names: names.clone(),
+            next_id: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut proc = ImageProcessor::new().expect("processor");
+            let cfg = TilingConfig::new(320, 240);
+            let placements = proc.plan_tiles(640, 480, &cfg).expect("plan_tiles");
+
+            let src = TensorDyn::image(
+                640,
+                480,
+                PixelFormat::Nv12,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .expect("src");
+            let mut dst = TensorDyn::image(
+                320,
+                240,
+                PixelFormat::Rgb,
+                DType::U8,
+                Some(TensorMemory::Mem),
+                CpuAccess::ReadWrite,
+            )
+            .expect("dst");
+
+            proc.tile_one(&src, &mut dst, &placements[0], &cfg)
+                .expect("tile_one");
+            let _ = proc.flush();
+        });
+
+        let names = names.lock().unwrap();
+        assert!(
+            names.iter().any(|n| n == "image.plan_tiles"),
+            "expected image.plan_tiles in {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "image.tile_one"),
+            "expected image.tile_one in {names:?}"
+        );
     }
 }
