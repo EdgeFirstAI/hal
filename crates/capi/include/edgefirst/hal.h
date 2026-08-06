@@ -3077,12 +3077,15 @@ struct hal_tensor *hal_tensor_new(enum hal_dtype dtype,
  * @param name Optional tensor name for debugging (can be NULL)
  * @return New tensor handle on success, NULL on error
  * @par Errors (errno):
- * - EINVAL: Invalid argument (NULL shape, ndim is 0, invalid fd)
- * - EIO: Failed to duplicate fd, or the fd could not be imported —
- *   including an fd whose buffer type could not be determined because it
- *   is neither a DMA-BUF nor tmpfs-backed (e.g. a regular file, a pipe or
- *   socket, or a `MFD_HUGETLB` memfd). Enable debug logging to see the
- *   observed filesystem magic.
+ * - EINVAL: Invalid argument — NULL shape, ndim is 0 or > 8, negative fd,
+ *   a shape that does not fit the buffer, or an fd whose buffer type could
+ *   not be determined because it is neither a DMA-BUF nor tmpfs-backed
+ *   (e.g. a regular file, a pipe or socket, or a `MFD_HUGETLB` memfd).
+ *   The last case means the fd is the wrong *kind* of object; enable debug
+ *   logging to see the observed filesystem magic.
+ * - ENOSPC: The buffer is smaller than the requested shape requires
+ * - EIO: Failed to duplicate the fd, or the import failed for another
+ *   reason
  * - ENOTSUP: Not supported on this platform (non-Unix)
  */
 struct hal_tensor *hal_tensor_from_fd(enum hal_dtype dtype,

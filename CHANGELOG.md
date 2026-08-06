@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero-length tensor rather than erroring. Callers importing fds backed by
   other filesystems (e.g. a regular file, or a `MFD_HUGETLB` memfd) will now
   see an error where they previously got a tensor.
+- **`hal_tensor_from_fd()` reports per-variant errnos** (TOP2-833). The C
+  API previously collapsed every import failure to `EIO`. It now maps
+  caller-fault conditions to `EINVAL` — including an fd whose buffer type
+  cannot be determined, which means the fd is the wrong *kind* of object
+  rather than an I/O failure — an undersized buffer to `ENOSPC`, and
+  unsupported operations to `ENOTSUP`, matching the convention already used
+  by `hal_tile_*` and the image entry points. Code branching on `EIO` from
+  this function needs updating; code that only checks for `NULL` is
+  unaffected.
 
 ### Fixed
 

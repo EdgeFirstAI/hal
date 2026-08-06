@@ -425,6 +425,58 @@ static void test_tensor_clone_fd_mem_fails(void) {
     TEST_PASS();
 }
 
+#ifdef __linux__
+// An fd whose buffer type cannot be determined is a caller error (EINVAL),
+// not an I/O failure (EIO). A pipe is the convenient probe: pipefs is another
+// get_anon_bdev() pseudo-filesystem, so it shares st_dev major 0 with the
+// buffer types we do support and is distinguishable only by filesystem magic.
+static void test_tensor_from_fd_unknown_type_einval(void) {
+    TEST("tensor_from_fd_unknown_type_einval");
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        TEST_SKIP("pipe() unavailable");
+        return;
+    }
+
+    size_t shape[] = {64};
+    errno = 0;
+    struct hal_tensor* t = hal_tensor_from_fd(HAL_DTYPE_U8, pipefd[0], shape, 1, NULL);
+    ASSERT_NULL(t);
+    ASSERT_ERRNO(EINVAL);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    TEST_PASS();
+}
+
+// A DMA-BUF fd must import as a DMA tensor, not be silently downgraded to
+// SHM. Skipped when DMA-heap permissions are unavailable.
+static void test_tensor_from_fd_dma_roundtrip(void) {
+    TEST("tensor_from_fd_dma_roundtrip");
+
+    size_t shape[] = {64, 64};
+    struct hal_tensor* src =
+        hal_tensor_new(HAL_DTYPE_U8, shape, 2, HAL_TENSOR_MEMORY_DMA, NULL);
+    if (src == NULL) {
+        TEST_SKIP("DMA memory not available");
+        return;
+    }
+
+    int fd = hal_tensor_clone_fd(src);
+    ASSERT_TRUE(fd >= 0);
+
+    struct hal_tensor* imported = hal_tensor_from_fd(HAL_DTYPE_U8, fd, shape, 2, NULL);
+    ASSERT_NOT_NULL(imported);
+    ASSERT_EQ(HAL_TENSOR_MEMORY_DMA, hal_tensor_memory_type(imported));
+
+    hal_tensor_free(imported);
+    close(fd);
+    hal_tensor_free(src);
+    TEST_PASS();
+}
+#endif // __linux__
+
 // =============================================================================
 // Quantization Metadata Tests
 // =============================================================================
@@ -575,6 +627,10 @@ void run_tensor_tests(void) {
     // DMA tests (Linux DMA-BUF + macOS IOSurface)
     test_tensor_dma_memory();
     test_tensor_clone_fd_mem_fails();
+#ifdef __linux__
+    test_tensor_from_fd_unknown_type_einval();
+    test_tensor_from_fd_dma_roundtrip();
+#endif
 #ifdef __APPLE__
     test_tensor_iosurface_roundtrip();
 #endif
