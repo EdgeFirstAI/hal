@@ -303,6 +303,11 @@ pub struct GLProcessorST {
     /// diverged output bytes); such devices get the Full serialization
     /// policy, like Vivante.
     is_virtual_gpu: bool,
+    /// Whether the GL implementation is ANGLE (GLES over Metal/D3D — the
+    /// only GL on macOS). Concurrent GL across contexts loses per-draw
+    /// state there, so ANGLE takes the Full serialization policy; see
+    /// [`requires_full_serialization`].
+    is_angle: bool,
     /// Whether to use renderbuffer-backed EGLImages for DMA destinations.
     ///
     /// Set `EDGEFIRST_OPENGL_RENDERSURFACE=1` to enable (required on i.MX 95 / Mali-G310
@@ -777,6 +782,46 @@ struct RendererTraits {
     /// mis-renders (observed: Apple Paravirtual device on macOS CI runners);
     /// gets the Full serialization policy.
     virtual_gpu: bool,
+    /// ANGLE — the GLES-over-Metal/D3D translation layer, the only GL
+    /// implementation on macOS. Concurrent GL across contexts loses
+    /// per-draw state there; gets the Full serialization policy. See
+    /// [`requires_full_serialization`].
+    angle: bool,
+}
+
+/// Whether this driver needs per-message global serialization
+/// (`SerializationPolicy::Full`) rather than the parallel `LifecycleOnly`
+/// policy. Pure so the policy is unit-testable without a GL context, like
+/// [`should_reject_software_gl`].
+///
+/// The `LifecycleOnly` default — several `ImageProcessor`s running GL work
+/// genuinely in parallel, each on its own thread and context — was validated
+/// by the P0 spike (2026-06) on **Mali G310, V3D and Tegra/Orin only**. Two
+/// driver families are known to break it:
+///
+/// * **Vivante/galcore** (i.MX 8M Plus): not thread-safe for concurrent
+///   EGL/GL at all; concurrent access corrupts driver-internal state.
+/// * **ANGLE**, including on a real (non-paravirtual) Apple GPU: a deferred
+///   draw does not reliably execute with the per-draw state its own
+///   processor programmed while another context is active. Measured on
+///   macOS 27 / ANGLE Metal / Apple M2 Max: a tiled convert's source-region
+///   transform is silently reset to identity — or the draw lands nothing at
+///   all — for ~0.3% of tiles at 8 concurrent processors, scaling with
+///   concurrency and never occurring at 1. `EDGEFIRST_GL_SERIALIZE=full`
+///   drives it to zero, which is what this default now selects.
+///
+///   ANGLE was previously in the policy's "everywhere else" bucket by
+///   omission: it was never in the P0 validation set, only assumed to
+///   behave like the drivers that were. Paravirtual Metal was already
+///   caught by `virtual_gpu`; the underlying defect is not specific to
+///   virtualization. Silently wrong pixels is the worse failure mode, so
+///   correctness is the default and `EDGEFIRST_GL_SERIALIZE=lifecycle`
+///   remains available to re-measure once ANGLE is genuinely validated.
+///
+/// Serialization costs throughput only when a process runs several
+/// `ImageProcessor`s concurrently; a single-processor pipeline is unaffected.
+fn requires_full_serialization(t: RendererTraits) -> bool {
+    t.vivante || t.virtual_gpu || t.angle
 }
 
 /// Capability probe results from a freshly-current GL context
@@ -871,6 +916,7 @@ fn classify_renderer(renderer: &str) -> RendererTraits {
             || lower.contains("swrast")
             || lower.contains("software rasterizer"),
         virtual_gpu: lower.contains("paravirtual") || lower.contains("virtio"),
+        angle: lower.contains("angle"),
     }
 }
 
@@ -911,6 +957,7 @@ impl GLProcessorST {
                     vivante: is_vivante,
                     software: is_software_renderer,
                     virtual_gpu: is_virtual_gpu,
+                    angle: is_angle,
                 },
             supports_f32_color,
             supports_f16_color,
@@ -1220,6 +1267,7 @@ impl GLProcessorST {
             readback_scratch: Vec::new(),
             is_vivante,
             is_virtual_gpu,
+            is_angle,
             use_renderbuffer: std::env::var("EDGEFIRST_OPENGL_RENDERSURFACE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
@@ -2205,6 +2253,7 @@ impl GLProcessorST {
             vivante: is_vivante,
             software: is_software_renderer,
             virtual_gpu: is_virtual_gpu,
+            angle: is_angle,
         } = traits;
         if is_vivante {
             log::warn!(
@@ -2226,6 +2275,15 @@ impl GLProcessorST {
                  runners); processors will serialize per-message (Full \
                  policy, same as Vivante). Override with \
                  EDGEFIRST_GL_SERIALIZE=lifecycle."
+            );
+        } else if is_angle {
+            log::info!(
+                "ANGLE detected — a deferred draw does not reliably execute \
+                 with the per-draw state its own processor programmed while \
+                 another context is active, so processors will serialize \
+                 per-message (Full policy). Costs throughput only when one \
+                 process runs several ImageProcessors concurrently. Override \
+                 with EDGEFIRST_GL_SERIALIZE=lifecycle."
             );
         }
 
@@ -6871,9 +6929,15 @@ impl GLProcessorST {
             transfer_backend: self.gl_context.transfer_backend,
             render_dtypes: self.supported_render_dtypes(),
             // Full per-message serialization where concurrent GL across
-            // contexts is unsafe: Vivante/galcore (driver races) and
-            // virtualized GPUs (paravirtual Metal mis-renders).
-            serialize_gl: self.is_vivante() || self.is_virtual_gpu,
+            // contexts is unsafe — see `requires_full_serialization`.
+            // `software` is always false here: software renderers are
+            // rejected in `new` before a processor exists.
+            serialize_gl: requires_full_serialization(RendererTraits {
+                vivante: self.is_vivante(),
+                software: false,
+                virtual_gpu: self.is_virtual_gpu,
+                angle: self.is_angle,
+            }),
             external_oes: Platform::EXTERNAL_OES,
             native_fence_sync: Platform::native_fence_sync(&self.gl_context),
         }
@@ -6911,7 +6975,7 @@ mod tests {
 
     // Real GL_RENDERER strings from the fleet: classification drives the
     // Vivante workarounds, the software-GL rejection, and the Full
-    // serialization policy (Vivante + virtualized GPUs).
+    // serialization policy (Vivante + virtualized GPUs + ANGLE).
     #[test]
     fn classify_renderer_fleet_strings() {
         use super::{classify_renderer, RendererTraits};
@@ -6919,16 +6983,16 @@ mod tests {
 
         // imx8mp (Vivante GC7000UL)
         let t = classify_renderer("Vivante GC7000UL");
-        assert!(t.vivante && !t.software && !t.virtual_gpu);
-        // Apple Silicon via ANGLE (developer machines)
-        assert_eq!(
-            classify_renderer(
-                "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, \
-                 Version 26.4.1 (Build 25E253))"
-            ),
-            real_gpu
+        assert!(t.vivante && !t.software && !t.virtual_gpu && !t.angle);
+        // Apple Silicon via ANGLE (developer machines) — a REAL GPU, not
+        // paravirtual, but still ANGLE and still loses per-draw state under
+        // concurrent GL.
+        let t = classify_renderer(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, \
+             Version 26.4.1 (Build 25E253))",
         );
-        // Mali / V3D / Tegra: plain hardware
+        assert!(t.angle && !t.virtual_gpu && !t.software && !t.vivante);
+        // Mali / V3D / Tegra: plain hardware, the P0-validated parallel set
         assert_eq!(classify_renderer("Mali-G310"), real_gpu);
         assert_eq!(classify_renderer("V3D 7.1"), real_gpu);
         assert_eq!(
@@ -6937,13 +7001,41 @@ mod tests {
         );
         // Mesa software rasterizer (CI coverage lane)
         let t = classify_renderer("llvmpipe (LLVM 15.0.7, 256 bits)");
-        assert!(t.software && !t.vivante && !t.virtual_gpu);
+        assert!(t.software && !t.vivante && !t.virtual_gpu && !t.angle);
         // GitHub macOS runner: virtualized Metal — concurrent GL across
         // contexts mis-renders there; must select the Full policy.
         let t = classify_renderer(
             "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, \
              Version 15.7.7 (Build 24G720))",
         );
-        assert!(t.virtual_gpu && !t.software && !t.vivante);
+        assert!(t.virtual_gpu && t.angle && !t.software && !t.vivante);
+    }
+
+    // The serialization policy each fleet renderer selects. The parallel
+    // (`LifecycleOnly`) policy is validated ONLY on Mali/V3D/Tegra; every
+    // other driver family that has been measured breaks it.
+    #[test]
+    fn serialization_policy_per_renderer() {
+        use super::{classify_renderer, requires_full_serialization};
+        let policy = |r: &str| requires_full_serialization(classify_renderer(r));
+
+        // Parallel: the P0-validated set.
+        assert!(!policy("Mali-G310"));
+        assert!(!policy("V3D 7.1"));
+        assert!(!policy("NVIDIA Tegra Orin (nvgpu)/integrated"));
+
+        // Serialized: driver is not thread-safe for concurrent GL.
+        assert!(policy("Vivante GC7000UL"));
+        // Serialized: ANGLE on a real Apple GPU loses per-draw state under
+        // concurrent GL — the regression this policy exists to prevent.
+        assert!(policy(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Max, \
+             Version 27.0 (Build 26A5388g))"
+        ));
+        // Serialized: paravirtual Metal, by both traits.
+        assert!(policy(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple Paravirtual device, \
+             Version 15.7.7 (Build 24G720))"
+        ));
     }
 }

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Silently wrong pixels under concurrent GL on macOS** (`edgefirst-image`):
+  when one process ran several `ImageProcessor`s with GL work in flight at
+  once, a convert could execute with the per-draw state it had programmed
+  lost — a tiled convert's source region reset to identity, so the
+  destination received the whole source stretched into the tile instead of
+  the requested crop, or received nothing at all. Wrong output, no error.
+  ANGLE (the only GL implementation on macOS) was taking the parallel
+  serialization policy without ever having been validated for it; the policy
+  was measured on Mali, V3D and Tegra only. ANGLE now serializes GL messages
+  process-wide, as Vivante and paravirtual GPUs already did.
+  `EDGEFIRST_GL_SERIALIZE=lifecycle` restores the old behaviour for anyone
+  re-measuring. This costs throughput only where one process drives several
+  processors concurrently — a single-processor pipeline is unaffected — and
+  no other platform's policy changes.
+
 - **CPU format converts into a destination view** (`edgefirst-image`): a
   `convert()` whose destination was a `Tensor::view()` of a **wider** parent
   wrote its rows tightly packed into the head of the parent buffer instead of

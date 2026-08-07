@@ -32,15 +32,22 @@ static EGL_LIB: OnceLock<&'static libloading::Library> = OnceLock::new();
 /// this mutex for **every** message (`SerializationPolicy::Full`) — the
 /// pre-2026-06 behavior for all platforms.
 ///
-/// Everywhere else (Mali, V3D, Tegra, llvmpipe, ANGLE) the per-message
-/// acquisition is skipped (`SerializationPolicy::LifecycleOnly`): each
+/// ANGLE (GLES over Metal/D3D — the only GL on macOS) takes the same Full
+/// policy, for a different reason: a deferred draw does not reliably execute
+/// with the per-draw state its own processor programmed while another context
+/// is active. Measured on a real Apple M2 Max, not only paravirtual Metal.
+/// See `requires_full_serialization` in `processor/mod.rs` for the evidence,
+/// and `tests/gl_concurrent_stress.rs` for the reproducer.
+///
+/// Everywhere else (Mali, V3D, Tegra, llvmpipe) the per-message acquisition
+/// is skipped (`SerializationPolicy::LifecycleOnly`): each
 /// `GLProcessorThreaded` owns a dedicated worker thread and its own EGL
 /// context held current for the thread's life, and the EGL spec requires
 /// concurrent contexts on distinct threads to work. The P0 spike (2026-06,
 /// 4 processors × barrier × 200-convert oracle stress, 5 reps per leg)
-/// validated this clean on Mali G310, V3D, and Tegra/Orin. Multiple
-/// `ImageProcessor` instances now genuinely execute GL work in parallel on
-/// those platforms.
+/// validated this clean on Mali G310, V3D, and Tegra/Orin — **those three
+/// drivers are the whole validated set**; treat any other driver's
+/// parallelism as unmeasured until it has been through the same stress.
 ///
 /// What ALWAYS stays under this mutex, on every platform:
 /// - Initialization (`GLProcessorST::new` — EGL display probe/init, context

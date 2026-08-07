@@ -269,6 +269,16 @@ path, no type parameters leaking into the engine):
 feeds the pure decision tables — platform differences never appear as
 new `cfg` branches inside the engine.
 
+`serialize_gl` selects between running several processors' GL work in
+parallel and serializing every message process-wide, and it is decided by
+`requires_full_serialization` from the GL_RENDERER string. Parallelism is
+validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races)
+and ANGLE (per-draw state lost under concurrent contexts) are serialized.
+Adding a driver to the parallel set means running it through
+`tests/gl_concurrent_stress.rs` first — ANGLE shipped wrong pixels for a
+release because it was assumed to behave like the drivers that had been
+measured.
+
 **Porting checklist (Windows/ANGLE-D3D11 lands as a leaf, not a
 fork):** implement the trait (`init_display` over a shared
 ANGLE display + per-processor context, the three import methods over
