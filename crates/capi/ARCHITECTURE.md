@@ -4,16 +4,18 @@
 
 `edgefirst-hal-capi` is the C API layer over the EdgeFirst HAL Rust
 workspace. It exposes tensor allocation, hardware-accelerated image
-processing, ML decoder post-processing, ByteTrack object tracking, and the
-delegate DMA-BUF framework as a stable C ABI suitable for consumption from
-C, C++, GStreamer plugins, OpenCV pipelines, NPU delegates, and Python
-extensions written outside PyO3. Headers are generated from Rust source
-annotations via `cbindgen`; the implementation builds as both `staticlib`
+processing, ML decoder post-processing, ByteTrack object tracking, SAHI
+tiling, and the delegate DMA-BUF framework as a stable C ABI suitable for
+consumption from C, C++, GStreamer plugins, OpenCV pipelines, NPU
+delegates, and Python extensions written outside PyO3. Headers are
+generated from Rust source annotations via `cbindgen`; the
+implementation builds as both `staticlib`
 and `cdylib`. On mobile the two artifacts have distinct roles: the
 `cdylib` (`libedgefirst_hal.so`) is the Android JNI library, and the
 `staticlib` (`libedgefirst_hal.a`) is the iOS static-embedding artifact
-and the link-closure anchor for `scripts/validate-android-link.sh` in CI
-(a Rust staticlib archives the full HAL dependency closure).
+and the link-closure anchor for both mobile CI checks —
+`scripts/validate-android-link.sh` and `scripts/validate-ios-link.sh` —
+since a Rust staticlib archives the full HAL dependency closure.
 
 This crate is the highest-stakes ABI surface in the workspace. Performance
 recommendations and lifecycle rules are not advisory — getting them wrong
@@ -28,14 +30,16 @@ that downstream integrators must follow.
 | Module | Source | Responsibility |
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/lib.rs) | local | crate-wide setup, panic-safe FFI helpers, error reporting |
-| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | ~1.2k lines — `hal_tensor_*` create/map/reshape/fd-share, `HalCpuAccess`/`HalCompression` enums, AHardwareBuffer wrap + handle surface, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | ~2.6k lines — `hal_image_processor_*`, `hal_image_desc_*` builder, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
-| [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | ~3.2k lines — `hal_decoder_*` create / decode detection / decode segmentation |
-| [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | ~300 lines — `hal_bytetrack_*` create / update / get_active_tracks |
-| [`delegate.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/delegate.rs) | local | ~200 lines — Delegate DMA-BUF ABI types and camera adaptor format info |
+| [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | `hal_tensor_*` create/map/reshape/fd-share, `HalCpuAccess`/`HalCompression` enums, AHardwareBuffer wrap + handle surface, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | `hal_image_processor_*`, `hal_image_desc_*` builder, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
+| [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | `hal_decoder_*` create / decode detection / decode segmentation |
+| [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tiling.rs) | local | SAHI tiling — `hal_tile_grid`, the `hal_image_processor_*_tile*` GPU paths, `hal_lift_tile_boxes` / `hal_merge_tiled_detections`, and the `hal_tiled_frame_accumulator_*` streaming fan-in |
+| [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | `hal_bytetrack_*` create / update / get_active_tracks |
+| [`colorimetry.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/colorimetry.rs) | local | `hal_colorimetry` four-axis struct, `hal_colorimetry_from_v4l2`, tensor get/set |
+| [`delegate.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/delegate.rs) | local | Delegate DMA-BUF ABI types and camera adaptor format info |
 | [`trace.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/trace.rs) | local | `hal_start_tracing` / `hal_stop_tracing` — surfaces the umbrella's tracing API |
-| [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/error.rs) | local | ~120 lines — error code conversion and `hal_error_message` helper |
-| [`log.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/log.rs) | local | ~50 lines — `hal_log_init_file` / `hal_log_init_callback` |
+| [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/error.rs) | local | error code conversion and `hal_error_message` helper |
+| [`log.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/log.rs) | local | `hal_log_init_file` / `hal_log_init_callback` |
 | [`include/edgefirst/hal.h`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h) | generated | cbindgen-emitted header consumed by C/C++ users |
 
 ## Key Types
@@ -58,16 +62,31 @@ struct churn — only the function signatures form the stable contract.
 | `struct hal_segmentation_list *` | `Vec<Segmentation>` | `hal_segmentation_list_free` |
 | `struct hal_bytetrack *` | `edgefirst_tracker::ByteTrack<DetectBox>` | `hal_bytetrack_free` |
 | `struct hal_track_info_list *` | `Vec<TrackInfo>` | `hal_track_info_list_free` |
+| `struct HalTensorQuant *` | `edgefirst_tensor` quantization params | `hal_quantization_free` |
+| `struct hal_tile_spec_list *` | `Vec<TileSpec>` | `hal_tile_spec_list_free` |
+| `struct hal_tile_placement_list *` | `Vec<TilePlacement>` | `hal_tile_placement_list_free` |
+| `struct hal_tiled_frame_accumulator *` | `edgefirst_decoder::tiling::TiledFrameAccumulator` | `hal_tiled_frame_accumulator_free`, but **only on the abandon path**. `_finalize` and `_finalize_normalized` consume the handle and free it internally; calling `_free` after either is a double-free. |
 | `hal_delegate_t` | opaque `void *` for delegate DMA-BUF queries | (caller-managed) |
 
 All `hal_*_free` functions accept `NULL` safely (no-op).
+
+Two functions return caller-owned C strings rather than handles:
+`hal_tensor_name()` and `hal_decoder_model_type()`. Release those with plain
+`free()` — they carry no `hal_*_free` counterpart.
+
+Most opaque handles are snake-cased by the `[export.rename]` table in
+`cbindgen.toml`, but a few reach the header in their Rust CamelCase spelling:
+`struct HalImageDesc`, `struct HalTensorQuant`, `enum HalCpuAccess`,
+`enum HalCompression`. That inconsistency is baked into the shipped ABI, so
+renaming them is a breaking change, not a cleanup.
 
 ### Tensor sub-regions (views / batch tiles)
 
 `hal_tensor_view(t, hal_region)` and `hal_tensor_batch(t, n)` return a new
 `struct hal_tensor *` that **shares the parent's `BufferIdentity`** (zero-copy,
-no new GPU import) and is freed independently with `hal_tensor_free` — freeing a
-view does not affect the parent. `hal_region` is a by-value struct
+no new GPU import) and is freed independently with `hal_tensor_free`. The two
+handles co-own the underlying buffer, so freeing either one leaves the other
+usable and release order does not matter. `hal_region` is a by-value struct
 `{ size_t x, y, width, height; }` in pixels (no free). A view is
 interchangeable with a tensor at `convert()`: pass `hal_tensor_batch(dst, n)` as
 `dst` to render into batch element *n* — the `convert()` signature is unchanged.
@@ -205,10 +224,18 @@ with their FFI change. CI does not currently run an explicit
 `git diff --exit-code` parity check on the header, so review is the
 gate against drift.
 
-The header preamble defines `HAL_DTYPE_*`, `HAL_PIXEL_FORMAT_*`,
-`HAL_TENSOR_MEMORY_*`, `HAL_ROTATION_*`, `HAL_FLIP_*`, and the
-`HAL_LOG_LEVEL_*` enums in plain C — no `enum class` or other C++-specific
-constructs — to keep the surface usable from straight C.
+The hand-written preamble in `cbindgen.toml` contributes only the include
+guard, the `extern "C"` wrapper, the file-level Doxygen block, and the
+`hal_delegate_t` typedef (which has no Rust definition to generate from).
+Everything else — `HAL_DTYPE_*`, `HAL_PIXEL_FORMAT_*`,
+`HAL_TENSOR_MEMORY_*`, `HAL_ROTATION_*`, `HAL_FLIP_*`, `HAL_LOG_LEVEL_*`,
+`HAL_CPU_ACCESS_*`, `HAL_COMPRESSION_*`, `HAL_COLOR_MODE_*`,
+`HAL_MATCH_METRIC_*` — is emitted from the Rust `#[repr(C)]` enums with
+`language = "C"`, so the surface stays plain C with no `enum class` or
+other C++-only constructs. The `[export.rename]` table maps Rust
+CamelCase type names to the snake_case C spellings; anything missing from
+that table (`HalImageDesc`, `HalTensorQuant`, `HalCpuAccess`,
+`HalCompression`) reaches the header under its Rust name.
 
 ## Performance Recommendations (DMA-BUF / EGL Path)
 
@@ -263,6 +290,35 @@ once and reuse them across frames, like the tensors and the source pool.
 `dst` of one `convert()` is undefined (the GL backend binds the whole EGLImage
 as both texture and FBO), even if the rectangles are disjoint.
 
+### SAHI tiling
+
+`tiling.rs` is the batched-preprocessing pattern above, specialized for the case
+where the N sources are N overlapping crops of one high-resolution frame.
+`hal_image_processor_alloc_tile_batch()` allocates the tall packed parent and
+`hal_image_processor_tile_into()` renders every tile into it with one import and
+one flush, returning the `hal_tile_placement` metadata each tile's detections
+need later. `hal_image_processor_tile_one()` is the deferred single-tile
+variant for callers that drive their own flush cadence, and
+`hal_image_processor_plan_tiles()` computes the same metadata without touching
+the GPU — useful for sizing the batch before any rendering happens.
+
+The output side lives in `edgefirst_decoder::tiling`:
+`hal_lift_tile_boxes()` maps a tile's normalized boxes back to full-frame
+pixels, and `hal_merge_tiled_detections()` runs GREEDYNMM over the lifted set.
+The merge defaults to the intersection-over-smaller metric rather than IoU
+because an object cut by a tile seam produces two partial boxes with low IoU and
+high IoS. `hal_tiled_frame_accumulator_*` wraps both steps as a streaming
+fan-in: push each tile as its inference lands, and finalize once the frame's
+last tile arrives. Pushes are idempotent per `placement.index`, and the merge
+tie-breaks on ascending original index (rather than NumPy's unstable `argsort`)
+so the accumulator's result does not depend on tile arrival order.
+
+`hal_tiling_config` and `hal_merge_config` cross the ABI **by value**, and a
+zeroed struct is not the library default — `memset(0)` gives `overlap_ratio 0.0`
+instead of `0.2`, and IoU with `max_det 0` instead of IoS with `max_det 300`.
+The `hal_tiling_config_default()` / `hal_merge_config_default()` constructors
+exist to close that trap and are not optional.
+
 ### Initialization
 
 Allocate all tensors before entering the processing loop. When the source
@@ -301,18 +357,26 @@ struct hal_image_processor *proc = hal_image_processor_new();
 // hal_plane_descriptor_new dups the fd — caller keeps its copy.
 struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
 struct hal_tensor *src = hal_import_image(
-    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
 // pd is consumed by hal_import_image — do NOT free
 
 // Intermediate: processor-allocated RGBA for chained conversion.
 // MUST use create_image (not hal_tensor_new) for optimal memory backend.
+// HAL_CPU_ACCESS_NONE: GPU-only, never mapped on the CPU.
 struct hal_tensor *mid = hal_image_processor_create_image(
-    proc, model_w, model_h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8);
+    proc, model_w, model_h, HAL_PIXEL_FORMAT_RGBA, HAL_DTYPE_U8,
+    HAL_CPU_ACCESS_NONE);
 
 // Destination: PlanarRgb for model input, also processor-allocated.
 struct hal_tensor *dst = hal_image_processor_create_image(
-    proc, model_w, model_h, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_U8);
+    proc, model_w, model_h, HAL_PIXEL_FORMAT_PLANAR_RGB, HAL_DTYPE_U8,
+    HAL_CPU_ACCESS_NONE);
 ```
+
+The trailing `NULL` on `hal_import_image()` is the optional
+`const struct hal_colorimetry *`. Pass a filled struct (or one built by
+`hal_colorimetry_from_v4l2()`) when the capture device reports colorimetry;
+`NULL` leaves all four axes unspecified.
 
 When the external buffer has row padding (`stride > width * bytes_per_pixel`),
 set the stride on the plane descriptor:
@@ -321,7 +385,7 @@ set the stride on the plane descriptor:
 struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
 hal_plane_descriptor_set_stride(pd, v4l2_fmt.fmt.pix.bytesperline);
 struct hal_tensor *src = hal_import_image(
-    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
 ```
 
 ### Main Processing Loop
@@ -385,7 +449,7 @@ if (pool_tensors[buf_index] == NULL) {
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
     pool_tensors[buf_index] = hal_import_image(
         proc, pd, NULL, width, height,
-        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     // pd is consumed — do NOT free
 }
 
@@ -414,6 +478,10 @@ if (pool_tensors[buf_index] == NULL) {
 }
 ```
 
+`hal_tensor_from_fd()` takes the dtype **before** the fd. Getting that pair the
+wrong way round compiles cleanly on many toolchains (both are integers after
+promotion) and then fails at runtime, so it is worth a second look.
+
 ### fd Ownership Summary
 
 | Function | fd ownership | When to `dup()` |
@@ -432,9 +500,9 @@ to `hal_image_processor_convert()` will be one of two kinds:
 | **Cached** | returned from your `(inode, offset)` cache lookup; created **once** at the first cache miss via `hal_import_image()` / `hal_tensor_from_fd()` | **No** — the cache owns it for the lifetime of the pipeline | Freeing mid-pipeline drops the EGL image cache entry, churns `BufferIdentity`, and turns every subsequent frame into an import miss |
 | **Fresh** | allocated for this call (system-memory fallback when the source has no DMA-BUF, intermediate `create_image()` for chained `convert()`) | **Yes** — exactly once, after the last `convert()` that uses it | Forgetting leaks the underlying memory backend (DMA-BUF fd, PBO, or heap) |
 
-A robust pattern tracks the distinction with a small flag alongside the
-tensor pointer, e.g. an output parameter from the helper that produces
-the source tensor:
+Track the distinction with a small flag alongside the tensor pointer,
+e.g. an output parameter from the helper that produces the source
+tensor:
 
 ```c
 struct hal_tensor *src = lookup_or_import(cache, fd, &src_owned);
@@ -460,7 +528,7 @@ rule.
 while (running) {
     struct hal_plane_descriptor *pd = hal_plane_descriptor_new(v4l2_buf.m.fd);
     struct hal_tensor *src = hal_import_image(
-        proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+        proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
     hal_image_processor_convert(proc, src, dst, ...);
     hal_tensor_free(src);
 }
@@ -479,7 +547,8 @@ doubles.
 // BAD: same cost as #1, plus heap allocation overhead
 while (running) {
     struct hal_tensor *dst = hal_image_processor_create_image(
-        proc, model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8);
+        proc, model_w, model_h, HAL_PIXEL_FORMAT_RGB, HAL_DTYPE_U8,
+        HAL_CPU_ACCESS_NONE);
     hal_image_processor_convert(proc, src, dst, ...);
     // ... use dst ...
     hal_tensor_free(dst);
@@ -528,7 +597,7 @@ forces a full CPU readback.
 // BAD: corrupted output (skewed image)
 struct hal_plane_descriptor *pd = hal_plane_descriptor_new(padded_fd);
 struct hal_tensor *src = hal_import_image(
-    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8);
+    proc, pd, NULL, width, height, HAL_PIXEL_FORMAT_NV12, HAL_DTYPE_U8, NULL);
 ```
 
 *Why it fails:* many V4L2 drivers and GStreamer allocators pad rows to
@@ -570,12 +639,12 @@ symbols via `dlsym`.
 ```text
 Camera DMA-BUF
   → hal_plane_descriptor (wraps camera_fd, stride, offset)
-  → hal_import_image(proc, camera_pd, NULL, w, h, format, dtype)
+  → hal_import_image(proc, camera_pd, NULL, w, h, format, dtype, colorimetry)
   → HAL Tensor with image attributes (camera source)
 
 NPU input DMA-BUF (fd/shape from hal_dmabuf_get_tensor_info)
   → hal_plane_descriptor (wraps npu_input_fd, stride, offset)
-  → hal_import_image(proc, npu_pd, NULL, model_w, model_h, format, dtype)
+  → hal_import_image(proc, npu_pd, NULL, model_w, model_h, format, dtype, NULL)
   → HAL Tensor with image attributes (NPU destination)
 
 ImageProcessor::convert(camera_tensor, npu_tensor)
@@ -784,16 +853,22 @@ takes effect; subsequent calls return `-1` with `errno = EALREADY`.
 
 ```c
 #include <edgefirst/hal.h>
+#include <stdio.h>
 
-// Option 1: write [LEVEL] target: message lines to a FILE*
-hal_log_init_file(stderr, HAL_LOG_LEVEL_DEBUG);
-
-// Option 2: forward each record to a custom callback
-void my_logger(hal_log_level level, const char *target,
-               const char *message, void *userdata) {
+static void my_logger(hal_log_level level, const char *target,
+                      const char *message, void *userdata) {
+    (void)userdata;
     fprintf(stderr, "[%d] %s: %s\n", level, target, message);
 }
-hal_log_init_callback(my_logger, NULL, HAL_LOG_LEVEL_INFO);
+
+void init_logging(void) {
+    // Option 1: write "[LEVEL] target: message" lines to a FILE*.
+    hal_log_init_file(stderr, HAL_LOG_LEVEL_DEBUG);
+
+    // Option 2: forward each record to your own callback. Only one of the
+    // two takes effect — the second returns -1 with errno EALREADY.
+    // hal_log_init_callback(my_logger, NULL, HAL_LOG_LEVEL_INFO);
+}
 ```
 
 Available log levels: `HAL_LOG_LEVEL_ERROR`, `HAL_LOG_LEVEL_WARN`,
@@ -804,8 +879,9 @@ Available log levels: `HAL_LOG_LEVEL_ERROR`, `HAL_LOG_LEVEL_WARN`,
 | Direction | Crate | Interface |
 |-----------|-------|-----------|
 | Wraps | [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | `Tensor`, `TensorDyn`, `PlaneDescriptor`, `from_planes` |
-| Wraps | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | `ImageProcessor`, draw / convert APIs |
-| Wraps | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `Decoder`, `DecoderBuilder`, `DetectBox`, `Segmentation` |
+| Wraps | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | `ImageProcessor`, draw / convert APIs, `tile_grid`, `TilingConfig`, `TileSpec`, `Fit` |
+| Wraps | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `Decoder`, `DecoderBuilder`, `DetectBox`, `Segmentation`, `tiling::{lift_tile_boxes, merge_tiled_detections, TilePlacement, MergeConfig, MatchMetric, TiledFrameAccumulator}` |
+| Wraps | [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) | `ImageDecoder`, `ImageLoad` — JPEG/PNG decode into pre-allocated tensors, JPEG save |
 | Wraps | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | `ByteTrack`, `TrackInfo` |
 | Wraps | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | `trace::start_tracing` / `stop_tracing` (feature `tracing`) |
 

@@ -10,9 +10,10 @@
 #![cfg(feature = "opengl")]
 // Several types defined at the `gl` module root (EglDisplayKind,
 // TransferBackend, RegionOfInterest, etc.) are consumed only by the
-// Linux-only inner modules (`context`, `processor`, ...). The macOS
-// path uses its own `MacosGlProcessor` + `iosurface_import` modules and
-// does not touch every shared type, so some appear unused on macOS/iOS.
+// Linux-only inner modules (`context`, `dma_import`, `fourcc`). The
+// macOS/iOS and Android paths import platform buffers through their own
+// modules (`iosurface_import`, `ahardwarebuffer_import`) and do not
+// touch every shared type, so some appear unused off Linux.
 // Rather than fragmenting the type definitions per platform, suppress
 // the dead-code/unused-import lints on non-Linux targets.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]

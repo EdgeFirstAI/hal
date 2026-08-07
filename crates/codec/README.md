@@ -16,8 +16,12 @@ converts, rotates, or resizes. Colour conversion and geometry are the job of
 
 | Input | Native output format(s)                        |
 |-------|------------------------------------------------|
-| JPEG  | `Nv12` (3-component colour) / `Grey` (1 component) |
+| JPEG  | `Nv12` (4:2:0) / `Nv16` (4:2:2) / `Nv24` (4:4:4) / `Grey` (1 component) |
 | PNG   | `Rgb` / `Rgba` / `Grey`                        |
+
+A colour JPEG lands on the NV format that matches its own chroma sampling, so
+nothing is resampled on the way out. Only exotic subsamplings (4:1:1, 4:1:0,
+mismatched Cb/Cr) get downsampled, and they fall back to `Nv12`.
 
 The decoder configures the destination tensor's dimensions and pixel format to
 match the decoded image (within the tensor's existing allocation), so a single
@@ -27,19 +31,34 @@ reallocating.
 JPEG decoding uses a custom from-scratch baseline decoder with reusable state,
 achieving zero heap allocations after the first decode at each resolution.
 SIMD-optimized IDCT kernels (NEON on AArch64, SSE4.1/SSE2 on x86-64) are
-selected automatically at init via dynamic dispatch. On Linux, an optional
-[V4L2 hardware backend](#hardware-acceleration-v4l2) offloads JPEG decode to a
-SoC accelerator when one is present. PNG decoding uses `zune-png`.
+selected automatically at init via dynamic dispatch. On Linux two optional
+hardware backends sit in front of it — [V4L2](#hardware-acceleration-v4l2) for
+SoC JPEG accelerators and [nvJPEG](#gpu-acceleration-nvjpeg) for CUDA GPUs —
+and either falls back to the CPU decoder transparently. PNG decoding uses
+`zune-png`.
+
+## Feature Flags
+
+| Feature | Default | Effect |
+|---|---|---|
+| `v4l2` | on | Linux V4L2 mem2mem hardware JPEG decode. Opt-out at runtime with `EDGEFIRST_DISABLE_V4L2=1` |
+| `nvjpeg` | on | Linux CUDA nvJPEG GPU decode. Opt-**in** at runtime with `EDGEFIRST_ENABLE_NVJPEG=1` |
+| `opencv` | off | OpenCV-backed decode, for comparison and parity testing |
+| `turbojpeg` | off | libjpeg-turbo, for benchmark comparison |
+
+Both default features are fully `#[cfg]`-gated to Linux, so off Linux they
+compile to nothing. `nvjpeg` is pure `dlopen` and adds no link-time CUDA
+dependency, so enabling it does not constrain where the binary runs.
 
 ## Quick Start
 
-```rust
+```rust,no_run
 use edgefirst_codec::{ImageDecoder, ImageLoad};
-use edgefirst_tensor::{CpuAccess, Tensor, PixelFormat, TensorMemory};
+use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMemory};
 
 // Allocate once at init (prefer ImageProcessor::create_image() for DMA/PBO).
-// A colour JPEG decodes to NV12, so allocate an NV12 tensor. The decoder
-// CPU-writes the pixels: declare CpuAccess::Write.
+// A 4:2:0 colour JPEG decodes to NV12, so allocate an NV12 tensor. The
+// decoder CPU-writes the pixels: declare CpuAccess::Write.
 let mut tensor = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12,
     Some(TensorMemory::Mem), CpuAccess::Write).unwrap();
 let mut decoder = ImageDecoder::new();
@@ -52,6 +71,22 @@ println!("Decoded {}x{} {:?}", info.width, info.height, info.format);
 // the caller should apply downstream (the codec never rotates — see below).
 ```
 
+Don't know the image's dimensions or chroma sampling up front? `peek_info`
+parses the headers without touching pixels, so you can size the tensor to the
+format the decode will actually produce:
+
+```rust,no_run
+use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
+use edgefirst_tensor::{CpuAccess, Tensor, TensorMemory};
+
+let data = std::fs::read("frame.jpg").unwrap();
+let peek = peek_info(&data).unwrap();
+let mut tensor = Tensor::<u8>::image(peek.width, peek.height, peek.format,
+    Some(TensorMemory::Mem), CpuAccess::Write).unwrap();
+let mut decoder = ImageDecoder::new();
+let info = tensor.load_image(&mut decoder, &data).unwrap();
+```
+
 ## Recommended Pattern
 
 For maximum performance, use tensors allocated by
@@ -59,8 +94,9 @@ For maximum performance, use tensors allocated by
 your pipeline needs:
 
 ```rust,ignore
-use edgefirst_image::{ImageProcessor, ImageProcessorTrait, Crop, Rotation, Flip};
 use edgefirst_codec::{ImageDecoder, ImageLoad};
+use edgefirst_image::{Crop, Flip, ImageProcessor, ImageProcessorTrait, Rotation};
+use edgefirst_tensor::{CpuAccess, DType, PixelFormat};
 
 let mut processor = ImageProcessor::new()?;
 // Source tensor holds the codec's native NV12; destination is the RGB the
@@ -74,10 +110,11 @@ let mut decoder = ImageDecoder::new();
 loop {
     let bytes = capture_frame();
     let info = src.load_image(&mut decoder, &bytes)?;
-    // convert() performs colour conversion (NV12 → RGB), resize, and any EXIF
-    // rotation/flip the decode reported.
-    processor.convert(&src, &mut dst, Rotation::None, Flip::None,
-        Crop::new(0, 0, info.width, info.height))?;
+    // convert() performs colour conversion (NV12 → RGB) and resize; the codec
+    // reports EXIF orientation in `info` but does not apply it, so pass it on.
+    let rot = Rotation::from_degrees_clockwise(info.rotation_degrees as usize);
+    let flip = if info.flip_horizontal { Flip::Horizontal } else { Flip::None };
+    processor.convert(&src, &mut dst, rot, flip, Crop::new())?;
 }
 ```
 
@@ -134,15 +171,53 @@ hardware decodes straight into the tensor's dmabuf — a true zero-copy path.
 Otherwise the driver buffers are mapped and the decoded planes are copied
 (cropped to the logical image) into the destination.
 
+## GPU Acceleration (nvJPEG)
+
+On Linux with CUDA, the `nvjpeg` feature (compiled in by default) adds a GPU
+JPEG-decode backend for NVIDIA platforms, with Jetson Orin as the lead target.
+It sits ahead of V4L2 and CPU in the dispatch order, but it is **off unless you
+opt in**:
+
+| Environment variable | Effect |
+|---|---|
+| `EDGEFIRST_ENABLE_NVJPEG=1` | Turn the backend on (`true` / `yes` also work). Off by default |
+
+The default is off because nvJPEG decodes on the same GPU your inference runs
+on. Sharing the device can cost a concurrent TensorRT engine more than the
+decode speedup returns, so it stays opt-in for decode-bound workloads or
+machines with no concurrent GPU compute. V4L2 is the mirror image — a separate
+hardware block that contends with nothing, so it is opt-*out* via
+`EDGEFIRST_DISABLE_V4L2`.
+
+Two things to know before enabling it:
+
+- **It emits `Rgb`, not an NV format** — a deliberate exception to the
+  native-format contract. nvJPEG does YCbCr→RGB on the GPU at near-zero
+  marginal cost and the result is GPU-resident, which removes the downstream
+  NV12→RGB step. (The L4T nvJPEG 12.3.3 build has no NV12 output mode anyway.)
+- **It only engages for a CUDA-backed destination** — in practice a
+  `TensorMemory::Pbo` tensor from `ImageProcessor::create_image()` on Jetson.
+  Anything else is left untouched and falls through to V4L2 or CPU.
+
+The backend is pure `dlopen` with no link-time CUDA dependency, so one binary
+runs on Jetson (nvJPEG), i.MX (V4L2), and a laptop (CPU). `nvjpeg_available()`
+reports whether it is live — useful for benchmarks and for consumers that
+branch on backend availability. Transient nvJPEG failures restore the native
+format and fall through to the CPU decoder, which also covers the
+progressive and non-baseline JPEGs nvJPEG rejects.
+
 ## Supported Formats
 
 | Format | Input  | Native output                              |
 |--------|--------|--------------------------------------------|
-| JPEG   | `&[u8]`| `Nv12` (colour) / `Grey` (greyscale), `u8` only |
+| JPEG   | `&[u8]`| `Nv12` / `Nv16` / `Nv24` (colour, matching the source's chroma sampling) or `Grey` (greyscale), `u8` only |
 | PNG    | `&[u8]`| `Rgb` / `Rgba` / `Grey`                    |
 
 Need `Rgb`/`Rgba`/`Bgra` from a JPEG, or a resized/rotated result? Decode to the
 native format, then call `ImageProcessor::convert()`.
+
+The one exception is the nvJPEG GPU backend, which emits packed `Rgb` — see
+below.
 
 ## Decoder Limitations
 
@@ -157,9 +232,10 @@ required).
 |--------------------------------------------------|---------------|
 | Baseline DCT (SOF0)                              | Supported     |
 | 8-bit sample precision                           | Supported     |
-| 1 component (greyscale → `Grey`) or 3 components (YCbCr → `Nv12`) | Supported |
-| Chroma subsampling 4:4:4 / 4:2:2 / 4:2:0 / 4:4:0 | Supported (downsampled to 4:2:0 for `Nv12`) |
-| Non-`u8` destination tensor                      | **Unsupported** — `UnsupportedDtype` (NV12/GREY are `u8`) |
+| 1 component (greyscale → `Grey`) or 3 components (YCbCr → an NV format) | Supported |
+| Chroma subsampling 4:4:4 → `Nv24`, 4:2:2 → `Nv16`, 4:2:0 → `Nv12` | Supported, no resampling |
+| Other subsampling (4:1:1, 4:1:0, mismatched Cb/Cr) | Supported — block-averaged down to `Nv12` |
+| Non-`u8` destination tensor                      | **Unsupported** — `UnsupportedDtype` (the NV formats and GREY are `u8`) |
 | Progressive DCT (SOF2)                           | **Unsupported** — `Unsupported(ProgressiveJpeg)` |
 | Extended sequential DCT (SOF1)                   | **Unsupported** |
 | Lossless predictive (SOF3)                       | **Unsupported** — `Unsupported(LosslessJpeg)` |
@@ -188,7 +264,8 @@ stride-aware row copies and optional bit-depth/dtype conversion.
 
 ## Data Types
 
-JPEG decodes to `u8` only (its native `Nv12`/`Grey` are byte layouts). PNG
+JPEG decodes to `u8` only (its native NV formats and `Grey` are byte
+layouts). PNG
 supports the full set of tensor element types:
 
 | Type  | PNG support | Notes                              |
@@ -228,7 +305,26 @@ Returned by all decode methods:
 - `rotation_degrees`: EXIF clockwise rotation the caller should apply (`0`/`90`/`180`/`270`)
 - `flip_horizontal`: whether the caller should also flip horizontally
 
-`peek_image_info(data)` returns the same metadata without decoding pixels.
+### `peek_info`
+
+`peek_info(data)` returns the same `ImageInfo` from the headers alone, without
+decoding pixels. Use it in one-shot flows to size a tensor to the image (see
+Quick Start). Its `row_stride` is the natural pitch for the format, since no
+destination tensor is involved yet.
+
+### Errors
+
+Every decode entry point returns `Result<ImageInfo, CodecError>`:
+
+| Variant | Cause |
+|---|---|
+| `CodecError::InsufficientCapacity` | The decoded image does not fit the tensor's allocation. Allocate for the largest expected frame |
+| `CodecError::UnsupportedDtype` | Non-`u8` destination for a JPEG (`Nv12`/`Nv16`/`Nv24`/`Grey` are byte layouts) |
+| `CodecError::UnsupportedFormat` | The destination's pixel format cannot hold this decode |
+| `CodecError::Unsupported(UnsupportedFeature)` | Input outside the supported JPEG/PNG subset — match on the inner variant rather than parsing a string. See [Decoder Limitations](#decoder-limitations) |
+| `CodecError::InvalidData` | Magic bytes match neither JPEG nor PNG, or the bitstream is malformed |
+| `CodecError::Io` | The `load_image_file` / `load_image_read` source failed |
+| `CodecError::Tensor` | The destination tensor rejected the reconfigure or map |
 
 ## License
 

@@ -63,7 +63,8 @@ to SonarCloud alongside the Rust lcov coverage.
 - **Single-threaded execution** — the Python suite inherits the
   [project-wide single-threaded rule](https://github.com/EdgeFirstAI/hal/blob/main/TESTING.md#single-threaded-execution)
   whenever GL or G2D code paths are exercised. `pytest -p no:randomly` is
-  recommended; the Makefile already disables parallelism.
+  recommended. `make test-python` invokes plain `pytest` with no xdist
+  flags, so it is already serial; don't add `-n` to it.
 - **LFS testdata** — fixtures live under `testdata/`. The Python tests
   resolve paths relative to the workspace root; no env var is needed
   locally. The aarch64 (`test-arm`) and `hardware-test` CI jobs export

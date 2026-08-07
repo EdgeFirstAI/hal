@@ -410,10 +410,10 @@ pub extern "C" fn hal_is_iosurface_available() -> bool {
 ///
 /// Portable probe that dispatches to hal_is_dma_available() on Linux and
 /// hal_is_iosurface_available() on macOS. Use this when writing
-/// cross-platform code that wants to know whether HAL_TENSOR_DMA will
+/// cross-platform code that wants to know whether HAL_TENSOR_MEMORY_DMA will
 /// succeed without caring which primitive backs it.
 ///
-/// @return true if HAL_TENSOR_DMA allocation will succeed, false otherwise
+/// @return true if HAL_TENSOR_MEMORY_DMA allocation will succeed, false otherwise
 #[no_mangle]
 pub extern "C" fn hal_is_gpu_buffer_available() -> bool {
     edgefirst_tensor::is_gpu_buffer_available()
@@ -451,7 +451,7 @@ pub extern "C" fn hal_is_cuda_available() -> bool {
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
 /// @param shape Array of dimension sizes (ndim elements)
 /// @param ndim Number of dimensions (1-8)
-/// @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+/// @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
 /// @param name Optional tensor name for debugging (can be NULL)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):
@@ -583,7 +583,7 @@ pub unsafe extern "C" fn hal_tensor_from_fd(
 /// obtain the IOSurfaceRef, then pass it here.
 ///
 /// **GL backend interaction**: the resulting tensor reports
-/// HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by
+/// HAL_TENSOR_MEMORY_DMA from hal_tensor_memory_type() and is importable by
 /// the GL backend via EGL_ANGLE_iosurface_client_buffer with no extra
 /// copy.
 ///
@@ -655,7 +655,7 @@ pub unsafe extern "C" fn hal_tensor_from_iosurface(
 /// producer pads rows, hal_tensor_set_row_stride()) before convert().
 ///
 /// **GL backend interaction**: the resulting tensor reports
-/// HAL_TENSOR_DMA from hal_tensor_memory_type() and is importable by the
+/// HAL_TENSOR_MEMORY_DMA from hal_tensor_memory_type() and is importable by the
 /// GL backend as an EGLImage with no extra copy.
 ///
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)

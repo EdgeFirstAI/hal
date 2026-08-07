@@ -1,6 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! [`ConfigOutputs`], the programmatic form of a model's output description.
+//!
+//! This is what `DecoderBuilder::with_config` takes, and what the JSON and
+//! YAML config strings deserialize into. Each [`ConfigOutput`] declares one
+//! output tensor's role, shape, and quantization; the builder reads the set of
+//! them to select a model-type variant.
+//!
+//! Declare `shape` and `dshape` in physical memory order, outermost axis
+//! first. See the output tensor physical-order contract in the crate's
+//! `ARCHITECTURE.md` — mis-declaring it makes every element access index the
+//! wrong byte, and nothing at runtime can detect it.
+
 use super::configs::{self, DimName, QuantTuple};
 use serde::{Deserialize, Serialize};
 

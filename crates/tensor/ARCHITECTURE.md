@@ -5,11 +5,18 @@
 `edgefirst-tensor` is the zero-copy tensor primitive that the rest of the
 EdgeFirst HAL is built on. Its job is to give the higher-level crates a
 uniform multi-dimensional array type that can be backed by any of four memory
-sources — DMA-BUF, POSIX shared memory, the system heap, or an OpenGL Pixel
-Buffer Object — without forcing the consumer to know which backend is in use.
-A single `Tensor<T>` value is enough to feed CPU code, hand a buffer to a GPU
-shader, share an inference output with another process, or import a frame
-straight from a V4L2 camera.
+sources — the platform-native GPU buffer, POSIX shared memory, the system
+heap, or an OpenGL Pixel Buffer Object — without forcing the consumer to know
+which backend is in use. A single `Tensor<T>` value is enough to feed CPU
+code, hand a buffer to a GPU shader, share an inference output with another
+process, or import a frame straight from a V4L2 camera.
+
+"Platform-native GPU buffer" is one enum variant, `TensorMemory::Dma`, with
+three implementations behind it: a Linux DMA-heap DMA-BUF (`DmaTensor`), a
+macOS/iOS `IOSurfaceRef` (`IoSurfaceTensor`), or an Android NDK
+`AHardwareBuffer` (`AHardwareBufferTensor`). Callers ask for `Dma` and get
+whichever of the three the platform provides; see
+[`TensorMemory::Dma` is unified across platforms](#tensormemorydma-is-unified-across-platforms).
 
 ## Module Map
 
@@ -18,12 +25,17 @@ straight from a V4L2 camera.
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/lib.rs) | local | Public surface: `Tensor<T>`, `TensorTrait`, `TensorMemory`, `BufferIdentity`, `Region` + `view`/`batch` sub-regions, multi-plane composition (`from_planes`) |
 | [`dma.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dma.rs) | local | `DmaTensor<T>` — Linux DMA-BUF allocation via `dma-heap` |
 | [`dmabuf.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/dmabuf.rs) | local | `mmap` + `DMA_BUF_IOCTL_SYNC` cache-coherency helpers used by `DmaMap` |
-| [`iosurface.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/iosurface.rs) | local | `IoSurfaceTensor<T>` — macOS IOSurface allocation via raw FFI to the IOSurface + CoreFoundation frameworks (the macOS counterpart to `DmaTensor`) |
+| [`iosurface.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/iosurface.rs) | local | `IoSurfaceTensor<T>` — macOS/iOS IOSurface allocation via raw FFI to the IOSurface + CoreFoundation frameworks (the macOS counterpart to `DmaTensor`) |
+| [`ahardwarebuffer.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/ahardwarebuffer.rs) | local | `AHardwareBufferTensor<T>` — Android NDK AHardwareBuffer allocation, mapping, and import (the FFI shell; `cfg(target_os = "android")`) |
+| [`ahardwarebuffer_layout.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/ahardwarebuffer_layout.rs) | local | Every pure Android decision the FFI shell must not drift on — lock usage, descriptor geometry, vendor classifier, identity interning. Deliberately cfg-free so it host-tests on any CI lane |
 | [`shm.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/shm.rs) | local | `ShmTensor<T>` — POSIX shared memory backend |
 | [`mem.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/mem.rs) | local | `MemTensor<T>` — heap-backed tensor with no syscalls |
 | [`pbo.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/pbo.rs) | local | `PboTensor<T>` — wrapper around an OpenGL Pixel Buffer Object plus the `PboOps` trait the GL backend implements |
+| [`cuda.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/cuda.rs) | local | `CudaHandle`, `CudaMap`, `CudaStream`, `CudaGlOps`; `dlopen`-resolved `libcudart` symbol table. See [Zero-copy CUDA tensor mapping](#zero-copy-cuda-tensor-mapping) |
 | [`tensor_dyn.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/tensor_dyn.rs) | local | `TensorDyn` — dtype-erased tensor, image metadata (`PixelFormat`, row stride, plane offset, multi-plane composition) |
-| [`format.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/format.rs) | local | `PixelFormat`, `DType`, format/shape compatibility checks |
+| [`format.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/format.rs) | local | `PixelFormat`, `PixelLayout`, `ChromaLayout`, format/shape compatibility checks (`DType` itself lives in `lib.rs`) |
+| [`colorimetry.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/colorimetry.rs) | local | `Colorimetry` and its parts (`ColorSpace`, `ColorRange`, `ColorTransfer`, `MatrixWeights`, `RangeScaling`) — the YUV↔RGB conversion contract carried as image metadata |
+| [`covguard.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/covguard.rs) | local | `SIGABRT` handler that flushes LLVM coverage before re-raising. Compiled only under `-Cinstrument-coverage` on Linux (the Vivante driver aborts at shutdown on imx8mp) |
 | [`error.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/error.rs) | local | `Error`, `Result` |
 
 ## Key Types and Traits
@@ -38,6 +50,9 @@ straight from a V4L2 camera.
 - [`BufferIdentity`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.BufferIdentity.html) — stable cache key (`id() -> u64`) plus a `Weak<()>` liveness guard for caches that need to detect stale entries.
 - [`PlaneDescriptor`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.PlaneDescriptor.html) — duplicated fd plus optional stride/offset, used for multi-plane DMA-BUF imports.
 - [`PixelFormat`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.PixelFormat.html) / [`DType`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.DType.html) — image metadata attached via `set_format` / `with_format`.
+- [`CpuAccess`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.CpuAccess.html) — **required** on every image constructor: `None` / `Read` / `Write` / `ReadWrite`. Hardware access is always implied and never declared. See [CPU access declaration](#cpu-access-declaration-cpuaccess).
+- [`ImageDesc`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.ImageDesc.html) — the full-featured image request (builder style), and the only way to ask for [`Compression`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.Compression.html). `Tensor::image` is the shorthand for the common case.
+- [`Colorimetry`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/colorimetry/struct.Colorimetry.html) — the YUV↔RGB conversion contract (space, range, transfer, matrix weights) carried alongside the pixel format.
 
 ## Internal Architecture
 
@@ -55,21 +70,30 @@ classDiagram
     }
 
     class DmaTensor~T~ { Linux DMA-Heap }
+    class IoSurfaceTensor~T~ { macOS/iOS IOSurface }
+    class AHardwareBufferTensor~T~ { Android AHardwareBuffer }
     class ShmTensor~T~ { POSIX shared memory }
     class MemTensor~T~ { System heap }
-    class PboTensor~T~ { OpenGL PBO via WeakSender }
+    class PboTensor~T~ { OpenGL PBO via PboOps }
 
     TensorTrait <|.. DmaTensor
+    TensorTrait <|.. IoSurfaceTensor
+    TensorTrait <|.. AHardwareBufferTensor
     TensorTrait <|.. ShmTensor
     TensorTrait <|.. MemTensor
     TensorTrait <|.. PboTensor
 ```
+
+The first three are the per-platform faces of `TensorMemory::Dma`; exactly one
+of them is compiled in on any given target.
 
 Each backend provides its own map type implementing `TensorMapTrait<T>`:
 
 | Tensor | Map | Mechanism |
 |--------|-----|-----------|
 | `DmaTensor<T>` | `DmaMap<T>` | `mmap` + `DMA_BUF_IOCTL_SYNC` for cache coherency |
+| `IoSurfaceTensor<T>` | `IoSurfaceMap<T>` | `IOSurfaceLock`/`Unlock`; `CpuAccess::Read` takes `kIOSurfaceLockReadOnly` and skips the unlock flush |
+| `AHardwareBufferTensor<T>` | `AHardwareBufferMap<T>` | `AHardwareBuffer_lock` replaying the allocation's CPU usage values, masked to the requested direction |
 | `ShmTensor<T>` | `ShmMap<T>` | `mmap`/`munmap` on the POSIX shared memory fd |
 | `MemTensor<T>` | `MemMap<T>` | Direct raw pointer into `Vec<T>` (no syscall) |
 | `PboTensor<T>` | `PboMap<T>` | GL thread `glMapBufferRange` / `glUnmapBuffer` via channel |
@@ -158,6 +182,13 @@ The fallback chain is **DMA → SHM → Heap**. `EDGEFIRST_TENSOR_FORCE_MEM=1`
 short-circuits the chain to `MemTensor`, primarily for unit tests on hosts
 without DMA-heap permissions.
 
+That chain describes `Tensor::new` (and `TensorDyn::new`). The **image**
+constructors — `Tensor::image`, `image_with_stride`, `image_desc`, and their
+`TensorDyn` equivalents — auto-select **DMA → Heap** and skip SHM entirely.
+SHM buys an image nothing that Mem doesn't already give (it is not
+GPU-importable, and Mem always succeeds), so it is reachable for an image only
+by asking for `TensorMemory::Shm` explicitly.
+
 ### Import classification (`from_fd`, Linux)
 
 `Tensor::from_fd()` is the mirror of the selection logic above: rather than
@@ -208,6 +239,37 @@ The portable alternative probe would be `dmabuf::phys()`
 (`DMA_BUF_IOCTL_PHYS`), but that is an NXP vendor ioctl and fails on
 mainline kernels. `fstatfs` is the portable answer and costs one syscall
 with no side effects.
+### The 64-byte row-stride invariant for DMA images
+
+**Every DMA-backed image tensor carries a 64-byte-aligned row stride, in every
+layout — packed, planar, and semi-planar.** Mali rejects an `eglCreateImage`
+DMA-BUF import whose row pitch is not 64-byte aligned with `EGL_BAD_ALLOC`;
+Vivante rejects it with `EGL_BAD_ACCESS`. Nothing about the failure points at
+the stride, which is why this rule keeps getting broken and re-fixed.
+
+The alignment has to hold at **both** of the places a stride is decided:
+
+- **Allocation** (`Tensor::image` and friends) — the natural pitch is rounded
+  up with `next_multiple_of(64)` and the allocation is sized
+  `aligned_stride × total_rows`, not the shape product. The shape product
+  reflects only the logical width and under-allocates the padding.
+- **Reconfiguration** (`configure_image`) — the easy site to miss, because it
+  is the recycle path rather than the allocate path. A pooled tensor being
+  re-pointed at a new geometry recomputes the aligned stride, reusing the prior
+  stride only when that stride is itself 64-aligned, wide enough for the new
+  layout, and still inside the allocation.
+
+Host-only backings (Mem, Shm) keep the tight natural pitch for packed and
+planar images so the many flat CPU consumers are unaffected; semi-planar takes
+the aligned pitch on every backend because its chroma-plane offset arithmetic
+assumes it. macOS is the exception that proves the rule: IOSurface picks its
+own 64-aligned `bytesPerRow` and the tensor records whatever the surface
+reports.
+
+The failure mode is worth stating plainly, because it is easy to misread as a
+refactor regression: an odd or merely non-multiple-of-16 width (321 → 1284
+bytes, 322 → 1288, neither divisible by 64) converts fine on V3D and Tegra and
+fails on imx95 and imx8mp.
 
 ### CPU access declaration (CpuAccess)
 
@@ -293,9 +355,8 @@ with `glViewport`, never a per-offset import. `plane_offset` therefore addresses
 only genuine offset-distinct *imports* (a foreign DMA-BUF starting at a non-zero
 byte offset, or a multi-plane chroma plane), **not** batch tiling. Because the
 key carries the geometry, reconfiguring a reused source buffer to a new size
-re-keys to a fresh import rather than returning the previous frame's image (a
-`last_import_reason` field recording `Reconfigure` is a planned observability
-addition). The cache does **not** rescue a pipeline that
+re-keys to a fresh import rather than returning the previous frame's image.
+The cache does **not** rescue a pipeline that
 re-imports the same DMA-BUF every frame: each `hal_import_image` /
 `hal_tensor_from_fd` call mints a new `BufferIdentity` with a fresh
 ID, so re-imports always miss. The contract is:
@@ -473,33 +534,35 @@ GPU-registered (e.g. `MemTensor`, `DmaTensor` without a CUDA import, or
 
 ### When to use each backend
 
-The choice of memory type significantly impacts performance depending on the
-workload:
+The backend choice trades allocation and mapping cost against who else can
+touch the buffer without a copy.
 
-1. **Heap memory (`MemTensor<T>`)** — fastest for pure CPU algorithms (image
-   resize, filtering, format conversion). Standard heap allocation has
-   minimal overhead and is OS-optimized. Recommended when no hardware
-   acceleration is required.
+1. **Heap (`MemTensor<T>`)** — fastest for pure CPU algorithms (resize,
+   filtering, format conversion). Allocation is a plain `Vec`, mapping is a
+   raw pointer, and neither involves a syscall. Pick this when no hardware
+   accelerator will see the buffer.
 
-2. **DMA memory (`DmaTensor<T>`)** — adds CPU-level overhead for allocation
-   and mapping but provides substantial benefits when interfacing with
-   hardware accelerators:
-   - Zero-copy access from G2D (NXP i.MX graphics processor)
-   - Zero-copy access from OpenGL/GPU
-   - Zero-copy access from V4L2 video capture and codec engines
-   - Hardware DMA operations benefit from DMA-capable memory alignment and
-     page locking
+2. **Platform GPU buffer (`TensorMemory::Dma`)** — costs more to allocate and
+   more to map (cache maintenance on Linux, a lock/unlock pair on macOS and
+   Android) and earns it back by being zero-copy for everything else in the
+   pipeline:
+   - The OpenGL backend, via `EGL_EXT_image_dma_buf_import` on Linux,
+     `EGL_ANGLE_iosurface_client_buffer` on macOS, and
+     `EGL_ANDROID_get_native_client_buffer` on Android
+   - G2D on NXP i.MX
+   - V4L2 capture and codec engines
+   - NPU delegates, which consume the shared buffer directly
 
-3. **Shared memory (`ShmTensor<T>`)** — slowest option, with CPU overhead
-   from POSIX shared memory operations. Does not support hardware DMA. Use
-   only for cross-process buffer sharing when DMA-BUF is unavailable
-   (insufficient permissions, non-Linux platforms, persistent memory
-   requirements).
+3. **Shared memory (`ShmTensor<T>`)** — the slowest of the three for CPU work
+   and no use at all to hardware. It exists for one job: handing a buffer to
+   another process when the platform GPU buffer is unavailable, whether
+   because DMA-heap permissions are missing or because the OS has no
+   equivalent.
 
-**Selection guidance:**
-- Pure CPU workloads → `MemTensor` (Heap).
-- Hardware-accelerated paths (G2D, OpenGL, V4L2, codec) → `DmaTensor`.
-- Cross-process buffer sharing when DMA cannot be used → `ShmTensor`.
+Short version: CPU-only work takes Heap, anything a GPU/NPU/codec will read
+takes `Dma`, and cross-process sharing falls back to `Shm` only when `Dma`
+cannot be had. The auto-select chains already encode this — see
+[Memory selection logic](#memory-selection-logic).
 
 ### Multi-plane DMA-BUF support
 
@@ -557,16 +620,16 @@ in the project ARCHITECTURE.md for the full two-layer story.
 | Platform | DMA | SHM | Mem | PBO |
 |----------|-----|-----|-----|-----|
 | Linux (NXP i.MX, x86_64, aarch64) | Yes (DMA-BUF) | Yes | Yes | Yes (with OpenGL feature) |
-| macOS | Yes (IOSurface) | Yes | Yes | No |
-| Android | Yes (AHardwareBuffer) | Yes | Yes | No |
+| macOS / iOS | Yes (IOSurface) | Yes | Yes | No — the GL path renders into IOSurfaces |
+| Android | Yes (AHardwareBuffer) | Yes | Yes | No — the GL path renders into AHardwareBuffers |
 | Other Unix | No | Yes | Yes | No |
 | Windows | No | No | Yes | No |
 
-### `TensorMemory::Dma` is unified across Linux and macOS
+### `TensorMemory::Dma` is unified across platforms
 
-`TensorMemory::Dma` is a single enum variant on both platforms — same
-discriminant value, same `HalTensorMemory::Dma=1` over the C ABI — but
-the underlying storage type differs:
+`TensorMemory::Dma` is a single enum variant everywhere — same discriminant
+value, same `HalTensorMemory::Dma=1` over the C ABI — but the underlying
+storage type differs:
 
 - **Linux**: `TensorStorage::Dma(DmaTensor<T>)` backed by a DMA-BUF fd
   from `/dev/dma_heap/*`.
@@ -631,8 +694,9 @@ floor). It mirrors the IOSurface story with Android-specific rules:
 | Probe | Returns true when |
 |-------|-------------------|
 | `is_dma_available()` | Linux DMA-BUF heap is mountable. False on every other OS. |
-| `is_iosurface_available()` | macOS IOSurface framework is present. False on every other OS. |
-| `is_gpu_buffer_available()` | The platform-native GPU-coherent kind is available (Linux: dma; macOS: iosurface). The portable probe — prefer this one when you only care whether `TensorMemory::Dma` will succeed. |
+| `is_iosurface_available()` | macOS/iOS IOSurface framework is present. False on every other OS. |
+| `is_ahardwarebuffer_available()` | Android AHardwareBuffer allocation succeeds. False on every other OS. |
+| `is_gpu_buffer_available()` | Whichever of the three above applies to this target. The portable probe — prefer it when you only care whether `TensorMemory::Dma` will succeed, not which mechanism backs it. |
 | `is_shm_available()` | `shm_open` works. True on Linux and macOS, false on Windows. |
 
 The Linux-specific `dma-heap` and macOS-specific `IOSurface` /

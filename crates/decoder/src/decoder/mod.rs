@@ -324,14 +324,14 @@ impl Decoder {
     /// 1. The **per-scale fast path** (DFL/LTRB → dist2bbox → sigmoid),
     ///    which emits pixel-space boxes by design and always normalizes
     ///    before returning.
-    /// 2. [`ModelType::YoloSegDet`](crate::ModelType::YoloSegDet), whose
+    /// 2. [`ModelType::YoloSegDet`](crate::configs::ModelType::YoloSegDet), whose
     ///    quantized and float, tracked and untracked, masks and proto
     ///    variants each call the helper after NMS.
-    /// 3. [`ModelType::YoloSplitSegDet`](crate::ModelType::YoloSplitSegDet),
+    /// 3. [`ModelType::YoloSplitSegDet`](crate::configs::ModelType::YoloSplitSegDet),
     ///    aligned across `decode`, `decode_proto`, `decode_tracked`,
     ///    and `decode_tracked_proto` for both quantized and float
     ///    variants.
-    /// 4. [`ModelType::YoloSegDet2Way`](crate::ModelType::YoloSegDet2Way),
+    /// 4. [`ModelType::YoloSegDet2Way`](crate::configs::ModelType::YoloSegDet2Way),
     ///    aligned across the same four entry points and both element
     ///    type variants.
     ///
@@ -342,8 +342,8 @@ impl Decoder {
     ///
     /// The remaining model types still surface the raw schema flag
     /// because their post-decode contract differs:
-    /// [`ModelType::YoloDet`](crate::ModelType::YoloDet) and
-    /// [`ModelType::YoloSplitDet`](crate::ModelType::YoloSplitDet)
+    /// [`ModelType::YoloDet`](crate::configs::ModelType::YoloDet) and
+    /// [`ModelType::YoloSplitDet`](crate::configs::ModelType::YoloSplitDet)
     /// (detection-only, no protobox crop coupling), the
     /// `YoloEndToEnd*` family (model embeds its own NMS and emits its
     /// own coordinate space), and the `ModelPack*` family (separate

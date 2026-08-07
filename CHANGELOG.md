@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-06
+
 ### Added
 
 - **Tracing spans on the tiling path** (`edgefirst-image`, `edgefirst-decoder`):
@@ -79,6 +81,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DMA-backed fd, got Shm". Classification is now by filesystem magic
   (`DMA_BUF_MAGIC` / `TMPFS_MAGIC` from `include/uapi/linux/magic.h`), which
   is stable UAPI.
+- **`edgefirst_hal.TensorMap` raised `AttributeError`** (Python): the
+  class returned by `Tensor.map()` was never registered on the module, so
+  `isinstance` checks and annotations against it were impossible. It is
+  now registered (instances still come only from `map()`).
+- **Documentation examples that no longer compiled or ran.** The complete
+  documentation review (below) found and corrected phantom APIs across
+  the language surfaces: `Tensor.load` / `ef.Rect` / `Rotation.Rotate90`
+  (Python), `hal_tensor_load_file` / `HAL_TENSOR_DMA` (C, including seven
+  stale doc-comment references shipped in the generated `hal.h` —
+  comment-only regeneration, no ABI change), crate-private
+  `decode_quantized` / `decode_yolo_det` presented as public Rust API,
+  `Crop::new(x, y, w, h)` for a zero-argument constructor, and
+  `create_image` / `hal_import_image` calls missing their trailing
+  `CpuAccess` / colorimetry arguments. All replacement examples compile
+  or run against the real API.
+
+### Documentation
+
+- **Complete documentation review across all crates and API surfaces.**
+  Every markdown document (READMEs, ARCHITECTURE, TESTING, CONTRIBUTING,
+  BENCHMARKS, workflows) plus the Rust, Python, and C API docs was
+  cross-checked against the implementation and rewritten for accuracy and
+  clarity: all tracing-span catalogs now match the emitted dotted span
+  names; `.pyi` stub parity restored (`TensorMemory.DMA` available on
+  macOS via IOSurface, `Decoder.input_dims` added, `float16` accepted,
+  docstrings repositioned for IDEs); the Python-vs-Rust/C `tile_grid`
+  argument-order difference is documented; SAHI tiled inference gained
+  root-README onboarding with verified Rust and Python examples; the
+  workflows README was rebuilt from the actual CI matrix; and known
+  limitations are stated explicitly (packed-RGB tile batches fall back to
+  per-tile CPU conversion on zero-copy lowerings).
 
 ## [0.27.1] - 2026-08-01
 

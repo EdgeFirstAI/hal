@@ -1814,17 +1814,25 @@ pub(crate) fn extract_proto_data_quant<
     }
 }
 
-/// Per-float-dtype construction of a [`TensorDyn`] from a flat slice / 3-D
-/// `ArrayView`. Replaces the old `IntoProtoTensor` trait. Each implementor
-/// either passes its element type straight to `Tensor::from_slice` /
-/// `Tensor::from_arrayview3`, or narrows `f64` to `f32` (no native f64 kernel
-/// path exists).
+/// Per-float-dtype construction of an [`edgefirst_tensor::TensorDyn`] from a
+/// flat slice or a 3-D `ArrayView`. Each implementor either passes its element
+/// type straight to `Tensor::from_slice` / `Tensor::from_arrayview3`, or
+/// narrows `f64` to `f32` — there is no native f64 kernel path, so `f64` protos
+/// lose precision here rather than at some later, less obvious point.
+///
+/// Implemented for `f32`, `f64`, and `half::f16`. It is public because it
+/// appears in the bounds of the proto-extraction paths; there is no reason to
+/// implement it outside this crate.
 pub trait FloatProtoElem: Copy + 'static {
+    /// Wrap a flat slice with the given `shape` as a tensor of this element
+    /// type.
     fn slice_into_tensor_dyn(
         values: &[Self],
         shape: &[usize],
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn>;
 
+    /// Wrap a 3-D `ArrayView` (the proto-mask layout) as a tensor of this
+    /// element type.
     fn arrayview3_into_tensor_dyn(
         view: ArrayView3<'_, Self>,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn>;

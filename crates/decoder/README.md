@@ -38,23 +38,23 @@ side of the EdgeFirst HAL workspace:
 
 ```rust,ignore
 use edgefirst_decoder::{DecoderBuilder, DetectBox, Segmentation};
+use edgefirst_tensor::TensorDyn;
 
-// Build decoder from model config
+// Build the decoder once, from the model's config document.
 let decoder = DecoderBuilder::new()
     .with_score_threshold(0.25)
     .with_iou_threshold(0.7)
-    .with_config_json_str(model_config_json)
+    .with_config_json_str(model_config_json)   // String
     .build()?;
 
-// Decode quantized model output
+// Then decode once per inference frame. `decode` dispatches to the
+// quantized or float kernel from the tensor dtype — there is no separate
+// entry point per dtype.
 let mut detections: Vec<DetectBox> = Vec::with_capacity(100);
 let mut masks: Vec<Segmentation> = Vec::with_capacity(100);
 
-decoder.decode_quantized(
-    &[model_output.view().into()],
-    &mut detections,
-    &mut masks,
-)?;
+let outputs: Vec<&TensorDyn> = model_outputs.iter().collect();
+decoder.decode(&outputs, &mut detections, &mut masks)?;
 
 // Process results
 for det in &detections {
@@ -63,23 +63,16 @@ for det in &detections {
 }
 ```
 
-## Low-Level API
+Both `Vec`s are cleared on entry, and their capacity is an allocation hint
+rather than a cap — the detection count is bounded by `max_det` (default 300),
+not by what you pre-allocated.
 
-For known model types, use the direct decoding functions:
-
-```rust,ignore
-use edgefirst_decoder::yolo::decode_yolo_det;
-use edgefirst_decoder::Quantization;
-
-let mut detections = Vec::with_capacity(100);
-decode_yolo_det(
-    (output_array.view(), Quantization::new(0.012345, 26)),
-    0.25,  // score threshold
-    0.7,   // IOU threshold
-    Some(edgefirst_decoder::configs::Nms::ClassAgnostic),
-    &mut detections,
-);
-```
+> **Note:** every model decode kernel in the `yolo` and `modelpack` modules is
+> crate-private, so `Decoder` is the entire public decoding surface — there is
+> no supported way to decode a model output without going through it. The
+> `float` and `byte` modules do export reusable primitives (`nms_float`,
+> `nms_class_aware_int`, `iou_value`, `ios_value`, `box_area`, and friends) if
+> you need NMS or box geometry on your own candidates.
 
 ## Configuration
 
@@ -184,21 +177,26 @@ Models exported with `end2end=false` require external NMS, configurable via the 
 
 ## Proto Mask API
 
-For segmentation models, the decoder provides two APIs for accessing mask prototype data:
+For segmentation models, `decode_proto()` returns the mask prototypes and
+per-detection coefficients instead of materialized pixel masks. Prefer it when
+the masks are headed for a GPU rendering pipeline (e.g.
+`ImageProcessor::draw_proto_masks()`): the GPU evaluates
+`sigmoid(coeffs @ protos)` per output pixel, so the CPU never pays for
+full-resolution masks.
 
-- `decode_quantized_proto()` — returns raw quantized proto data and mask coefficients without materializing pixel masks
-- `decode_float_proto()` — returns float proto data and mask coefficients
-
-These are preferred when passing mask data to GPU rendering pipelines (e.g., `ImageProcessor::draw_proto_masks()`), as they avoid the CPU cost of materializing full-resolution masks.
+It returns `Ok(None)` for detection-only and ModelPack models, and
+`Ok(Some(ProtoData))` for YOLO segmentation models. Like `decode`, it picks the
+quantized or float kernel from the tensor dtype.
 
 ```rust,ignore
 // GPU rendering path: decode proto data, pass to GL for fused rendering
-let (detections, proto_data) = decoder.decode_quantized_proto(
-    &[model_output.view().into()],
-)?;
+let mut detections: Vec<DetectBox> = Vec::with_capacity(100);
+let proto_data = decoder.decode_proto(&outputs, &mut detections)?;
 
-// Pass proto_data directly to GPU for fused mask overlay
-processor.draw_proto_masks(&mut frame, &detections, &proto_data)?;
+// Detection-only models return None — there is nothing to overlay.
+if let Some(proto_data) = proto_data {
+    processor.draw_proto_masks(&mut frame, &detections, &proto_data)?;
+}
 ```
 
 ## Model Type Variants
@@ -224,7 +222,17 @@ The input and output sides share one `TilePlacement` (produced by
 `ImageProcessor::plan_tiles`/`tile_into`) describing how each tile was cut.
 
 ```rust,ignore
+use edgefirst_decoder::{DecoderBuilder, DetectBox, Nms, Segmentation};
 use edgefirst_decoder::tiling::{MergeConfig, TiledFrameAccumulator};
+
+// The per-tile decoder is deliberately permissive: a fragment clipped at a
+// seam scores low, and a high per-tile threshold would discard it before the
+// merge could rebuild the object. Gate the final scores in MergeConfig instead.
+let decoder = DecoderBuilder::new()
+    .with_config_json_str(model_config_json)
+    .with_score_threshold(0.05)
+    .with_nms(Some(Nms::ClassAware))
+    .build()?;
 
 // One accumulator per in-flight frame; collect tiles in any order.
 let mut acc = TiledFrameAccumulator::new(
@@ -235,12 +243,12 @@ let mut acc = TiledFrameAccumulator::new(
 );
 
 for (tile_outputs, placement) in tiles {
-    // Decode each tile at a low per-tile score threshold with class-aware NMS,
-    // then hand the tile's boxes to the accumulator.
-    let mut boxes = Vec::new();
-    let mut masks = Vec::new();
+    let mut boxes: Vec<DetectBox> = Vec::new();
+    let mut masks: Vec<Segmentation> = Vec::new();
     decoder.decode(&tile_outputs, &mut boxes, &mut masks)?;
-    acc.push_tile(boxes, &placement); // lifts to full-frame pixels + appends
+    // Lifts to full-frame pixels and appends. Returns false for a tile this
+    // accumulator has already seen, which is how retries stay harmless.
+    acc.push_tile(boxes, &placement);
 }
 
 // Once every tile has arrived, merge and normalize to [0,1] for the tracker.
@@ -256,10 +264,13 @@ tiles through inference, and `is_complete()`/`remaining()` fence the frame.
 
 The free functions `lift_tile_boxes` and `merge_tiled_detections` expose the two
 stages directly if you need to merge without the accumulator. `MergeConfig` tunes
-the metric (`Ios`/`Iou`), threshold, `class_agnostic`, `max_det`, and a final
-`score_threshold`. The same machinery supports standard SAHI with Ultralytics YOLO
-models. Merged boxes can be fed straight to the tracker (next section), which
-expects normalized coordinates — hence `finalize_normalized`.
+the metric (`Ios`, default, or `Iou`), the match `threshold` (0.5),
+`class_agnostic` (false), `max_det` (300), and a final `score_threshold`. That
+last one defaults to `0.0` on purpose: per-tile decode is the real flood
+control, and this is where you put the score gate once fragments have been
+joined. The same machinery supports standard SAHI with Ultralytics YOLO models.
+Merged boxes can be fed straight to the tracker (next section), which expects
+normalized coordinates, hence `finalize_normalized`.
 
 > **Note:** IoS merge reconstructs the *enclosing union* of fragments and cannot
 > recover an object larger than a single tile; add an optional full-frame
@@ -273,7 +284,7 @@ The `tracker` feature adds `decode_tracked` to integrate object tracking directl
 Enable the feature in `Cargo.toml`:
 
 ```toml
-edgefirst-decoder = { version = "0.13", features = ["tracker"] }
+edgefirst-decoder = { version = "0.28", features = ["tracker"] }
 ```
 
 ### Usage
@@ -327,7 +338,23 @@ for (det, track) in detections.iter().zip(tracks.iter()) {
 | `created` | `u64` | Timestamp when the track was first created |
 | `last_updated` | `u64` | Timestamp of the most recent update |
 
-The `tracked_location` reflects the Kalman-filter prediction and may differ slightly from `det.bbox`, which is the raw decoded box before smoothing.
+### What `decode_tracked` does to `detections`
+
+`decode_tracked` does not simply append track metadata to the decoded boxes. It
+rewrites `detections` to be the set of **active tracks**, which changes two
+things worth planning around:
+
+- Every `det.bbox` is overwritten with that track's Kalman-smoothed
+  `tracked_location`. After `decode_tracked`, `det.bbox` and
+  `track.tracked_location` hold the same coordinates; the raw pre-smoothing box
+  is not returned. Use `decode` if you need the unsmoothed detections.
+- Tracks still alive but unmatched this frame are included, so `detections` can
+  contain entries that no detection in this frame produced. They carry a
+  coasting Kalman prediction, and on the segmentation path they have no mask.
+  `track.last_updated` (older than the current timestamp) identifies them.
+
+`detections[i]` and `tracks[i]` describe the same track in both cases, so the
+zip above stays valid.
 
 ## Documentation
 

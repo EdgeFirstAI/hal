@@ -336,7 +336,7 @@ impl TensorDyn {
     }
 
     /// Attach quantization metadata. Fails on float variants with
-    /// [`Error::QuantizationInvalid`]; delegates to the typed setter for
+    /// [`crate::Error::QuantizationInvalid`]; delegates to the typed setter for
     /// integer variants.
     pub fn set_quantization(&mut self, q: crate::Quantization) -> crate::Result<()> {
         match self {
@@ -428,9 +428,9 @@ impl TensorDyn {
     /// Return the [`BufferIdentity`](crate::BufferIdentity) of the underlying
     /// allocation.
     ///
-    /// Two `TensorDyn` values share a [`BufferIdentity::id`] iff they were
+    /// Two `TensorDyn` values share a [`crate::BufferIdentity::id`] iff they were
     /// produced by cloning the same allocation (e.g. through
-    /// [`DmaTensor::try_clone`](crate::dma::DmaTensor::try_clone)). Separate
+    /// `DmaTensor::try_clone`). Separate
     /// imports of the same physical buffer (e.g. two `from_fd` calls on the
     /// same dmabuf fd) have **distinct** identities — use
     /// [`aliases`](Self::aliases) if you need to detect that case.
@@ -447,7 +447,7 @@ impl TensorDyn {
     /// and write the same texture — undefined behaviour on most drivers).
     ///
     /// Matching is conservative:
-    /// 1. Matching [`BufferIdentity::id`] → same buffer (always).
+    /// 1. Matching [`crate::BufferIdentity::id`] → same buffer (always).
     /// 2. Matching backing type + matching dmabuf fd number (Linux, DMA
     ///    tensors only) → same buffer, even across separate `from_fd`
     ///    imports in the same process.
@@ -818,7 +818,7 @@ impl TensorDyn {
         }
     }
 
-    /// Allocate an image tensor from a declarative [`ImageDesc`]
+    /// Allocate an image tensor from a declarative [`crate::ImageDesc`]
     /// request — dispatching on `desc.dtype()`. See
     /// [`Tensor::image_desc`] for the compression-request semantics.
     pub fn image_desc(desc: &crate::ImageDesc) -> crate::Result<Self> {

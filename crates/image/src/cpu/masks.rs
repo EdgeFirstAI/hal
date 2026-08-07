@@ -611,7 +611,7 @@ impl CPUProcessor {
     /// pixel (for proto-plane sampling). Mask values are binary
     /// `uint8 {0, 255}` after thresholding sigmoid > 0.5.
     ///
-    /// Used by [`ImageProcessor::materialize_masks`] when the caller selects
+    /// Used by [`ImageProcessor::materialize_masks`](crate::ImageProcessor::materialize_masks) when the caller selects
     /// [`MaskResolution::Scaled`](crate::MaskResolution::Scaled).
     pub fn materialize_scaled_segmentations(
         &self,

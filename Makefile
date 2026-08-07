@@ -384,14 +384,14 @@ pre-release: format lint verify-version test sbom
 	@echo "✓ All pre-release checks passed"
 	@echo "=================================================="
 	@echo ""
-	@echo "Next steps:"
-	@echo "  1. Review changes: git status && git diff"
-	@echo "  2. Commit: git add -A && git commit -m 'Prepare release'"
-	@echo "  3. Push: git push origin main"
-	@echo "  4. Wait for CI/CD to pass"
 	@CARGO_VERSION=$$(grep -A10 '^\[workspace.package\]' Cargo.toml | grep 'version = ' | sed 's/.*version = "\(.*\)"/\1/'); \
-	echo "  5. Tag: git tag -a -m 'Version $$CARGO_VERSION' v$$CARGO_VERSION"; \
-	echo "  6. Push tag: git push origin v$$CARGO_VERSION"
+	echo "Next steps:"; \
+	echo "  1. Review changes: git status && git diff"; \
+	echo "  2. Commit on the release branch: git commit -s -m 'Release v$$CARGO_VERSION'"; \
+	echo "  3. Push: git push origin release/$$CARGO_VERSION"; \
+	echo "  4. Open a PR to main and wait for CI/CD and reviews"; \
+	echo "  5. Merge the PR — tag-release.yml creates v$$CARGO_VERSION automatically"; \
+	echo "     (never create release tags manually)"
 
 # ===========================================================================
 # CLEANUP

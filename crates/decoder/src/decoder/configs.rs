@@ -1,6 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! The vocabulary types a model config is built from.
+//!
+//! Per-role output descriptors ([`Detection`], [`Boxes`], [`Scores`],
+//! [`Classes`], [`Segmentation`], [`Protos`], [`MaskCoefficients`],
+//! [`Mask`]), the axis names used to declare physical layout ([`DimName`]),
+//! quantization pairs ([`QuantTuple`]), and the enums that steer decoding:
+//! [`DecoderType`], [`DecoderVersion`], [`Nms`], and the resolved
+//! [`ModelType`].
+//!
+//! [`Nms`] is worth a note: it has no `None` variant. Bypassing suppression is
+//! expressed as `Option<Nms>::None` on the decoder configuration, and
+//! [`Nms::Auto`] means "take the mode from the config document", falling back
+//! to [`Nms::ClassAgnostic`] when the document is silent.
+
 use std::collections::HashMap;
 use std::fmt::Display;
 
@@ -114,8 +128,8 @@ pub struct Detection {
     pub shape: Vec<usize>,
     #[serde(default, deserialize_with = "deserialize_dshape")]
     pub dshape: Vec<(DimName, usize)>,
-    /// Whether box coordinates are normalized to [0,1] range.
-    /// - `Some(true)`: Coordinates in [0,1] range relative to model input
+    /// Whether box coordinates are normalized to `[0,1]` range.
+    /// - `Some(true)`: Coordinates in `[0,1]` range relative to model input
     /// - `Some(false)`: Pixel coordinates relative to model input
     ///   (letterboxed)
     /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
@@ -146,8 +160,8 @@ pub struct Boxes {
     pub shape: Vec<usize>,
     #[serde(default, deserialize_with = "deserialize_dshape")]
     pub dshape: Vec<(DimName, usize)>,
-    /// Whether box coordinates are normalized to [0,1] range.
-    /// - `Some(true)`: Coordinates in [0,1] range relative to model input
+    /// Whether box coordinates are normalized to `[0,1]` range.
+    /// - `Some(true)`: Coordinates in `[0,1]` range relative to model input
     /// - `Some(false)`: Pixel coordinates relative to model input
     ///   (letterboxed)
     /// - `None`: Unknown, caller must infer (e.g., check if any coordinate
@@ -361,7 +375,7 @@ pub enum ModelType {
         boxes: Detection,
         protos: Protos,
     },
-    /// Split end-to-end YOLO detection (onnx2tf splits [1,N,6] into 3
+    /// Split end-to-end YOLO detection (onnx2tf splits `[1,N,6]` into 3
     /// tensors) boxes: [batch, N, 4] xyxy, scores: [batch, N, 1],
     /// classes: [batch, N, 1]
     YoloSplitEndToEndDet {

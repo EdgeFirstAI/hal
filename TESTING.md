@@ -24,12 +24,19 @@ lives in each sub-crate's `TESTING.md`:
 
 ## Quick Reference
 
+> **Every test run is single-threaded.** `--test-threads=1` with `cargo test`, `-j 1`
+> with `cargo nextest`. This is a hard invariant, not a tuning knob — GPU driver
+> concurrency bugs, G2D per-process state, and CMA pool exhaustion each require it
+> independently. The Makefile targets already do it. See
+> [Single-Threaded Execution](#single-threaded-execution).
+
 | Makefile target | What it does |
 |-----------------|--------------|
 | `make test` | Run all tests (Rust + Python + C API) with coverage |
 | `make test-rust` | Run Rust tests only with `cargo-llvm-cov nextest` |
 | `make test-python` | Run Python tests with pytest (and slipcover if available) |
 | `make test-capi` | Build the C library and run C API integration tests |
+| `make test-cuda` | CUDA device-pointer tests. Not part of `make test` — needs a CUDA GPU and `libcudart` at runtime, and skips cleanly without them |
 | `make bench` | Run the workspace Rust benchmarks (custom `harness = false` binaries backed by [`crates/bench`](https://github.com/EdgeFirstAI/hal/tree/main/crates/bench); not Criterion) |
 | `make build` | Build with coverage instrumentation (profiling profile) |
 | `make format lint check` | Pre-commit gate — required before every commit |
@@ -144,18 +151,6 @@ The helper builds with `--tests`, signs every binary in
 forwards remaining arguments to `cargo nextest run`. Re-running it is
 idempotent (signing the same binary twice is a no-op).
 
-### 3. CI guard against silent GL skips
-
-Every GL test self-skips when the backend is unavailable — correct for
-developer machines, but it means a broken CI GL stack (e.g. the ANGLE
-re-sign step regressing) would ship an untested GL backend behind a
-green lane. `gl_backend_available_canary` (crates/image lib tests)
-fails the run if `HAL_TEST_REQUIRE_GL=1` is set and
-`GLProcessorThreaded::new` errors. The macOS CI job sets it; local runs
-without the variable skip the canary trivially. On macOS the canary
-additionally requires `HAL_TEST_ALLOW_DLOPEN_ANGLE` so that coverage
-pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
-
 #### The manual way
 
 For one-off binaries (e.g. a release build of an example):
@@ -186,6 +181,17 @@ RUST_LOG=edgefirst_image=debug \
 You should see lines mentioning `ANGLE` and `Metal Renderer`. If you see
 the CPU backend selected, ANGLE didn't load — re-check the codesign
 steps above.
+
+### 4. CI guard against silent GL skips
+
+Every GL test self-skips when the backend is unavailable. That is right for
+developer machines, but it means a broken CI GL stack (the ANGLE re-sign step
+regressing, say) would ship an untested GL backend behind a green lane.
+`gl_backend_available_canary` (crates/image lib tests) fails the run if
+`HAL_TEST_REQUIRE_GL=1` is set and `GLProcessorThreaded::new` errors. The macOS
+CI job sets it; local runs without the variable skip the canary trivially. On
+macOS the canary additionally requires `HAL_TEST_ALLOW_DLOPEN_ANGLE`, so that
+coverage pass 1 (unsigned binaries) skips and pass 2 (signed) enforces.
 
 ---
 
@@ -258,11 +264,15 @@ Three independent constraints each require it:
    `0x18` in its ioctl path and futex deadlocks when context creation,
    DMA-BUF import, or draw commands overlap across threads; Broadcom
    V3D 7.1.10.2 (Raspberry Pi 5) drops affected contexts into
-   `EGL(NotInitialized)` under similar pressure. The HAL's `GL_MUTEX`
-   serializes every GL/EGL call at runtime to keep this safe;
-   `--test-threads=1` extends the same discipline to test harness
-   processes, since `cargo nextest` runs each test in its own process
-   but multiple test processes still share the GPU driver state.
+   `EGL(NotInitialized)` under similar pressure. At runtime the HAL
+   picks a serialization policy per driver: `Full` on Vivante and
+   paravirtual GPUs, where every message takes the global `GL_MUTEX`,
+   and `LifecycleOnly` on Mali, V3D, Tegra, llvmpipe, Android, and real
+   Apple GPUs, where instances run GL concurrently. `--test-threads=1`
+   extends the strict discipline to test harness processes regardless of
+   that policy, since `cargo nextest` runs each test in its own process
+   but multiple test processes still share the GPU driver state — and no
+   in-process mutex can serialize across processes.
 2. **G2D driver state** — the `galcore` kernel driver maintains
    per-process state that is unsafe to access from concurrent threads
    creating and destroying G2D contexts.
@@ -275,8 +285,8 @@ is still required to prevent DMA and GPU contention across test
 processes.
 
 This constraint applies to CI, the Makefile, and local development.
-[`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-command-serialization-gl_mutex)
-documents the GL_MUTEX implementation that makes the single-threaded rule
+[`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#gl-concurrency-model-serialization-policy)
+documents the serialization policy that makes the single-threaded rule
 load-bearing.
 
 ---
@@ -329,6 +339,10 @@ Use environment variables to isolate tests to specific backends:
 | `EDGEFIRST_DISABLE_GL=1` | Disable OpenGL even when hardware is present |
 | `EDGEFIRST_DISABLE_G2D=1` | Disable G2D even when hardware is present |
 | `EDGEFIRST_FORCE_TRANSFER=pbo` / `=dmabuf` / `=sync` | Force GL transfer backend |
+| `EDGEFIRST_ALLOW_SOFTWARE_GL=1` | Accept a software renderer (llvmpipe/swrast) instead of rejecting it. The `software-gl-coverage` CI lane sets this; on a board it means the hardware GL stack failed to come up |
+| `EDGEFIRST_GL_SERIALIZE=full` / `=lifecycle` | Pin the GL serialization policy instead of letting the driver probe choose |
+| `EDGEFIRST_NV_CONVERT_PATH=sampler` / `=shader` / `=auto` | Force the NV12/16/24 GPU conversion path |
+| `EDGEFIRST_COLORIMETRY=exact` | Opt into colorimetry-exact conversion where the default trades exactness for speed |
 
 Example — run tests without any GPU backend:
 
@@ -336,6 +350,16 @@ Example — run tests without any GPU backend:
 EDGEFIRST_DISABLE_GL=1 EDGEFIRST_DISABLE_G2D=1 \
   cargo test --workspace -- --test-threads=1
 ```
+
+### Known-bug test masks
+
+Two variables exist to skip tests a specific driver cannot pass. They mask real
+bugs, so set them only on the affected hardware:
+
+| Variable | Effect |
+|----------|--------|
+| `EDGEFIRST_SKIP_VIVANTE_KNOWN_BUGS=1` | Skips `test_multiple_image_processors_separate_threads`. Its four concurrent ImageProcessor/EGL contexts trip a `double free or corruption` in the Vivante GC7000UL driver. The abort is cumulative and uncatchable, so it takes the whole suite down with it — the test passes in isolation. **Always set this when running the suite on an i.MX 8M Plus**, or an unrelated refactor will look like it caused a regression. The imx8mp CI runner sets it; the test must still pass on every other GPU. |
+| `EDGEFIRST_ENABLE_NVJPEG=1` | Opts the nvJPEG decode cells into the codec benchmark on Jetson. Off by default because the library is not on the standard loader path (`make bench-nvjpeg` sets both this and `LD_LIBRARY_PATH`). |
 
 ---
 
@@ -846,18 +870,43 @@ Tests run across multiple runner types:
 
 | Job | Runner | Architecture | Hardware |
 |-----|--------|--------------|----------|
-| Build & Test (x86_64) | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
+| Checkout LFS Files | `ubuntu-22.04` | x86_64 | (fetches testdata once for every other job) |
 | Doc Tests | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
+| Build & Test (x86_64) | `ubuntu-22.04-xlarge` | x86_64 | No GPU |
 | Build & Test (macOS) | `macos-latest` | arm64 (Apple Silicon) | Paravirtual Metal GPU (ANGLE; Full GL serialization policy) |
+| Build & Link (iOS) | `macos-latest` | arm64 | No runtime tests — build + link closure only |
+| Build & Link (Android) | `ubuntu-22.04` | x86_64 host | No runtime tests — see Device Farm section below |
+| Build Check (Windows) | `windows-latest` | x86_64 | `cargo check` only |
+| Software-GL Coverage (llvmpipe) | `ubuntu-22.04-xlarge` | x86_64 | Mesa llvmpipe (software GL) |
 | Build (aarch64) | `ubuntu-22.04-arm-xlarge` | aarch64 | No GPU (compile only) |
 | Test (aarch64) | `ubuntu-22.04-arm` | aarch64 | No GPU |
-| Hardware Test (imx8mp) | `nxp-imx8mp-latest` | aarch64 | G2D, DMA-heap |
+| Hardware Test (imx8mp) | `nxp-imx8mp-latest` | aarch64 | G2D, DMA-heap, Vivante GL |
 | Process Hardware Coverage | `ubuntu-22.04-arm` | aarch64 | (post-processing host) |
+| SonarCloud Analysis | `ubuntu-22.04` | x86_64 | (aggregates all five coverage artifacts) |
 
 The hardware runner (`nxp-imx8mp-latest`) is the only environment where
 G2D and DMA-BUF tests are fully exercised. Hardware-gated tests that
 return early on x86 and arm runners are counted as passed (not skipped)
 because the gate is an explicit probe, not a `#[ignore]` attribute.
+
+The `software-gl-coverage` lane exists because of that gap: no hosted runner has a
+GPU, so the GL code paths would otherwise show as uncovered even though the imx8mp
+board exercises them. Mesa llvmpipe runs the same code slowly but faithfully, and it
+sets `EDGEFIRST_ALLOW_SOFTWARE_GL=1` to get past the software-renderer rejection.
+
+The x86_64, aarch64, and macOS lanes each publish a "Test Results (…)"
+check on the PR via `EnricoMi/publish-unit-test-result-action` (the
+macOS lane uses the `/macos` composite sub-action — the root action is
+docker-based and Linux-only). The macOS junit comes from coverage
+pass 2, the GL-enabled run on signed binaries.
+
+The x86_64 build steps moved to `ubuntu-22.04-xlarge` (16 vCPU) in the
+v0.22 → v0.23 cycle, cutting build time roughly 30 min → ~12 min.
+Hardware-test binaries are stripped on the build host into a
+`hardware-test-binaries-stripped/` directory and uploaded under the
+artifact name `hardware-test-binaries`; unstripped originals are
+preserved as the `coverage-binaries-aarch64` artifact so source-line
+attribution still works during the post-target coverage merge.
 
 ## Android On-Device Validation (Device Farm)
 
@@ -866,11 +915,12 @@ compile + clippy + link-validation only (`validate-android-link.sh`
 proves the native symbol closure against the NDK stubs). On-device
 correctness and performance are therefore gated by the internal
 hal-mobile Device Farm harness, which builds against the HAL and
-drives its validation cells through JNI from an instrumented test. Every pure decision the Android FFI layer relies on (lock-usage
-mapping, descriptor geometry,
-the vendor classifier, identity interning) is additionally host-tested
-in `crates/tensor/src/ahardwarebuffer_layout.rs`, so drift is caught on
-every CI run even though the FFI itself only runs on-device.
+drives its validation cells through JNI from an instrumented test.
+
+Every pure decision the Android FFI layer relies on — lock-usage mapping,
+descriptor geometry, the vendor classifier, identity interning — is additionally
+host-tested in `crates/tensor/src/ahardwarebuffer_layout.rs`, so drift is caught
+on every CI run even though the FFI itself only runs on-device.
 
 **Run-level PASSED is not the gate.** Device Farm reports the RUN as
 passed when the app harness completes; always pull the artifacts
@@ -915,20 +965,6 @@ The sweep runs identically on every pool; per-device results become the
 table in SDK release notes. The budget row is deliberately adversarial —
 it proves `compression_fallback_count` and the correctness probes catch
 devices where the optimization silently can't engage.
-
-The x86_64, aarch64, and macOS lanes each publish a "Test Results (…)"
-check on the PR via `EnricoMi/publish-unit-test-result-action` (the
-macOS lane uses the `/macos` composite sub-action — the root action is
-docker-based and Linux-only). The macOS junit comes from coverage
-pass 2, i.e. the GL-enabled run on signed binaries.
-
-The x86_64 build steps moved to `ubuntu-22.04-xlarge` (16 vCPU) in the
-v0.22 → v0.23 cycle, cutting build time roughly 30 min → ~12 min.
-Hardware-test binaries are stripped on the build host into a
-`hardware-test-binaries-stripped/` directory and uploaded under the
-artifact name `hardware-test-binaries`; unstripped originals are
-preserved as the `coverage-binaries-aarch64` artifact so source-line
-attribution still works during the post-target coverage merge.
 
 ---
 

@@ -31,8 +31,8 @@ Each sub-crate has a single responsibility in the inference pipeline:
 
 - [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::Dma` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
 - [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — Image decoding (JPEG, PNG) into pre-allocated tensor buffers with support for u8, u16, i8, i16, and f32 pixel types. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch.
-- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch. Also owns the input half of SAHI tiling (`tiling.rs`) — `TilingConfig`, `plan_tiles`, `alloc_tile_batch`, `tile_into`, `tile_one` — which rides that same batch engine to render an overlapping tile grid with one import and one flush.
+- [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, GREEDYNMM `merge_tiled_detections`, and the streaming `TiledFrameAccumulator`.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the five functional crates and owns the optional Chrome JSON tracing subscriber.
 - [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) — C ABI layer with cbindgen-generated header. Defines the [Delegate DMA-BUF framework](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#delegate-dma-buf-framework) ABI used by NXP Neutron, VxDelegate, and other TFLite delegates.
@@ -53,7 +53,7 @@ the underlying storage and the GL transfer backend differ.
 | Capability | Embedded Linux (i.MX, RPi5, Jetson) | Desktop Linux (x86_64) | macOS (Apple Silicon) | Android (API 26+) |
 |------------|--------------------------------------|------------------------|------------------------|--------------------|
 | `TensorMemory::Mem` | Heap | Heap | Heap | Heap |
-| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | `shm_open` |
+| `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works |
 | `TensorMemory::Dma` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) |
 | `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) |
 | GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) |
@@ -87,12 +87,12 @@ vendor tile compression. The `ImageDesc` builder additionally requests
 compression metadata (`Compression::Any` / a specific scheme). This is a
 cross-crate contract (tensor → image → capi → python); the normative
 description lives in
-[crates/tensor/ARCHITECTURE.md § CPU access declaration](crates/tensor/ARCHITECTURE.md).
+[crates/tensor/ARCHITECTURE.md § CPU access declaration](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md#cpu-access-declaration-cpuaccess).
 
 ### Float preprocessing capability
 
 `ImageProcessor::supported_render_dtypes()` returns a `RenderDtypeSupport
-{ f16, f32 }` struct after probing the GPU's float color-buffer extensions
+{ f32, f16 }` struct after probing the GPU's float colour-buffer extensions
 at construction time. Use it once at startup to decide which destination
 dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 
@@ -127,15 +127,17 @@ dtype to request; `convert()` always succeeds (GPU or CPU fallback).
 
 ```rust,no_run
 # use edgefirst_image::{ImageProcessor, ImageProcessorTrait, Rotation, Flip, Crop};
-# use edgefirst_tensor::{PixelFormat, DType};
+# use edgefirst_tensor::{PixelFormat, DType, CpuAccess};
 # fn main() -> Result<(), edgefirst_image::Error> {
 let proc = ImageProcessor::new()?;
 let support = proc.supported_render_dtypes();
 // Pick the best float dtype; fall back to U8 if the GPU cannot render floats.
 let dst_dtype = if support.f16 { DType::F16 } else if support.f32 { DType::F32 } else { DType::U8 };
 // memory: None → auto-selects float PBO when supported, else heap.
+// access: None → hardware-only destination, the cheapest declaration.
 // convert() always succeeds; GPU path used when available, CPU otherwise.
-let mut dst = proc.create_image(640, 640, PixelFormat::PlanarRgb, dst_dtype, None)?;
+let mut dst = proc.create_image(
+    640, 640, PixelFormat::PlanarRgb, dst_dtype, None, CpuAccess::None)?;
 # Ok(())
 # }
 ```
@@ -348,8 +350,8 @@ the mechanism differs.
 Complex multi-parameter constructors use a fluent builder:
 [`DecoderBuilder`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.DecoderBuilder.html),
 [`ByteTrackBuilder`](https://docs.rs/edgefirst-tracker/latest/edgefirst_tracker/bytetrack/struct.ByteTrackBuilder.html),
-and the in-progress `hal_decoder_params` C type. Builders enforce
-invariants in `.build()` rather than scattering checks across setters.
+and the `hal_decoder_params` C struct. Builders enforce invariants in
+`.build()` rather than scattering checks across setters.
 
 ### 4. Zero-copy operations
 
@@ -358,7 +360,7 @@ Used pervasively to avoid per-frame allocations:
 - Memory-mapped hardware buffers (DMA-BUF, SHM, IOSurface, AHardwareBuffer)
 - `&[T]` slice views into tensor maps
 - ndarray `ArrayView` for math operations
-- `WeakSender<T>` for cross-thread channels that should not extend lifetime
+- tokio's `WeakSender<T>` for cross-thread channels that should not extend lifetime
 
 ### 5. Hardware fallback chain
 
@@ -473,15 +475,30 @@ When no subscriber is installed (the default), the interest cache is
 
 ### Span naming conventions
 
-| Prefix | Meaning | Example |
-|--------|---------|---------|
-| (none) | Core algorithm phase | `decode`, `nms`, `score_filter` |
-| `cpu_` | CPU backend operation | `cpu_format_convert`, `cpu_resize` |
-| `gl_` | OpenGL backend operation | `gl_convert`, `gl_pass1_to_rgba` |
-| `g2d_` | G2D hardware backend | `g2d_convert` |
-| `py_` | Python binding entry point | `py_decode`, `py_convert` |
-| `gl_pass1_` / `gl_pass2_` | Multi-pass GL sub-operation | `gl_pass1_to_rgba`, `gl_pass2_pack_rgb` |
-| `image.gl_init`, `image.convert` (with `backend = "gl"`) | macOS GL processor entry points — same `<crate>.<function>` shape as the Linux GL spans, with a `platform` field tagging the OS and a `backend` field tagging the dispatch target. |
+Span names are dotted and hierarchical:
+`<crate>.<operation>[.<backend>][.<sub-step>]`. The leading segment is the
+emitting crate, so a trace can be filtered to one layer without knowing the
+individual operation names. The same span name is used on every OS — the
+platform and dispatch target are recorded as *fields*, not baked into the
+name, so an `image.convert.gl` slice is directly comparable across Linux,
+macOS, and Android.
+
+| Segment | Meaning | Examples |
+|---------|---------|----------|
+| `codec.` | Image decode | `codec.decode_jpeg`, `codec.decode_jpeg.mcu_loop`, `codec.decode_png.zune_decode` |
+| `tensor.` | Tensor lifecycle | `tensor.alloc`, `tensor.map` |
+| `image.` | Image processing entry points | `image.convert`, `image.flush`, `image.gl_init`, `image.materialize_masks`, `image.draw_decoded_masks` |
+| `image.convert.<backend>` | Backend that serviced the convert | `image.convert.cpu`, `image.convert.gl`, `image.convert.g2d` |
+| `image.convert.<backend>.<step>` | Sub-step within a backend | `image.convert.cpu.format_convert`, `image.convert.gl.egl_import`, `image.convert.gl.pack_rgb.pass1_rgba`, `image.convert.gl.pack_rgb.pass2_pack` |
+| `image.plan_tiles` / `image.tile_into` / `image.tile_one` | SAHI tiling input side | fields `tiles`, `overlap`, `index`, `count` |
+| `decoder.` | Model output post-processing | `decoder.decode`, `decoder.nms_get_boxes`, `decoder.decode_proto`, `decoder.per_scale_run` |
+| `decoder.<op>.<step>` | Sub-step within a decode phase | `decoder.nms_get_boxes.score_filter`, `decoder.nms_get_boxes.suppress`, `decoder.decode_proto.extract_proto_data` |
+| `decoder.tiled.` | SAHI tiling output side | `decoder.tiled.lift`, `decoder.tiled.merge` |
+| `tracker.` | ByteTrack association | `tracker.update`, `tracker.update.match_high_conf`, `tracker.update.predict` |
+| `python.` | Python binding entry point | `python.convert`, `python.decode`, `python.tile_into`, `python.materialize_masks` |
+
+Every span site uses `tracing::trace_span!`, except `image.gl_init`, which
+uses `info_span!` so GL bring-up stays visible at a coarser filter level.
 
 Field conventions:
 
@@ -491,8 +508,9 @@ Field conventions:
 - `*_memory` — tensor memory backend (`Dma` / `Shm` / `Mem`)
 - `layout` — data layout (`nhwc` / `nchw`)
 - `pass` — multi-pass identifier (`pre_resize` / `post_resize` / `direct`)
-- `platform` — `"linux"` or `"macos"` — emitted by spans that live in the GL platform layer
-- `backend` — for `image.gl.platform_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"pbo"` / `"sync"`)
+- `platform` — `"linux"` / `"macos"` / `"ios"` / `"android"` — emitted by spans in the GL platform layer
+- `backend` — on `image.gl_init`, the chosen transfer backend (`"dmabuf"` / `"iosurface"` / `"ahardwarebuffer"` / `"pbo"` / `"sync"`)
+- `tiles`, `index`, `count`, `overlap` — SAHI tiling geometry on the `image.*_tile*` and `decoder.tiled.*` spans
 
 Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
 
@@ -565,26 +583,29 @@ per-pass spans to reveal the breakdown:
 CPU 3-pass (format → resize → format):
 
 ```text
-image_convert
-└─ cpu_format_convert (pass="pre_resize", from=Nv12, to=Rgb)
-└─ cpu_resize
-└─ cpu_format_convert (pass="post_resize", from=Rgb, to=Rgba)
+image.convert
+└─ image.convert.cpu.format_convert (pass="pre_resize", from=Nv12, to=Rgb)
+└─ image.convert.cpu.resize_flip_rotate
+└─ image.convert.cpu.format_convert (pass="post_resize", from=Rgb, to=Rgba)
 ```
 
 OpenGL 2-pass packed RGB:
 
 ```text
-gl_convert
-└─ gl_pass1_to_rgba (dst_w=640, dst_h=480)
-└─ gl_pass2_pack_rgb (render_w=640, render_h=480)
+image.convert
+└─ image.convert.gl
+   └─ image.convert.gl.pack_rgb.pass1_rgba (dst_w=640, dst_h=480)
+   └─ image.convert.gl.pack_rgb.pass2_pack (render_w=640, render_h=480)
 ```
 
-OpenGL 2-pass Vivante NV12 → Planar workaround:
+OpenGL 2-pass NV → Planar (the Vivante workaround, and the general
+texture-lowered planar destination path):
 
 ```text
-gl_convert
-└─ gl_pass1_to_rgba (dst_w=640, dst_h=480)
-└─ gl_pass2_to_planar (dst_w=640, dst_h=480)
+image.convert
+└─ image.convert.gl
+   └─ image.convert.gl.nv_to_planar.pass1_rgba (dst_w=640, dst_h=480)
+   └─ image.convert.gl.nv_to_planar.pass2_deinterleave (dst_w=640, dst_h=480)
 ```
 
 Spans within a multi-pass sequence are non-overlapping — the first
@@ -625,13 +646,15 @@ hal/
 │   ├── hal/                # edgefirst-hal (umbrella)
 │   ├── capi/               # edgefirst-hal-capi (C ABI)
 │   ├── python/             # edgefirst_hal (PyO3 bindings)
+│   ├── egl/                # edgefirst-egl (trimmed khronos-egl fork, dynamic load only)
+│   ├── gl/                 # edgefirst-gl (trimmed gls fork)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)
 │   └── gpu-probe/          # internal CLI for GPU capability probing
 ├── tests/                  # Project-level Python tests (C integration tests live under crates/capi/tests/)
 ├── testdata/               # Git LFS-tracked fixtures (images, model outputs)
 ├── benchmarks/             # Per-platform benchmark JSON results
 ├── scripts/                # Build / audit / release tooling
-├── .github/workflows/      # CI: test.yml, release.yml, benchmark.yml, sbom.yml
+├── .github/workflows/      # CI: test.yml, release.yml, tag-release.yml, benchmark.yml, sbom.yml
 ├── README.md               # Cross-cutting overview + Optimization Guide
 ├── ARCHITECTURE.md         # This file
 ├── TESTING.md              # Cross-cutting testing guide

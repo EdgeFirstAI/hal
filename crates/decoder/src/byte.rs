@@ -1,6 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! Quantized-domain NMS, the int8 / uint8 mirror of [`crate::float`].
+//!
+//! These kernels suppress and post-process candidates while the scores are
+//! still in their raw integer units, which is the point: dequantizing every
+//! anchor costs more than dequantizing the handful that survive. The threshold
+//! crosses the other way instead — [`quantize_score_threshold`] maps a float
+//! score threshold into the tensor's quantized domain so the comparison stays
+//! an integer one.
+//!
+//! [`postprocess_boxes_quant`] and [`postprocess_boxes_index_quant`] handle
+//! candidate selection; [`nms_int`], [`nms_class_aware_int`], and their
+//! `_extra` payload-carrying variants handle suppression. Boxes are
+//! dequantized only after suppression.
+
 #[cfg(target_arch = "aarch64")]
 use crate::arg_max_i8;
 use crate::{

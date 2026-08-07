@@ -5,8 +5,9 @@
 EdgeFirst HAL - Tensor Module
 
 The `edgefirst_tensor` crate provides a unified interface for managing multi-dimensional arrays (tensors)
-with support for different memory types, including Direct Memory Access (DMA), POSIX Shared Memory (Shm),
-and system memory. The crate defines traits and structures for creating, reshaping, and mapping tensors into memory.
+across four memory backends: the platform's native zero-copy GPU buffer, POSIX shared memory, the system
+heap, and an OpenGL Pixel Buffer Object. The crate defines traits and structures for creating, reshaping,
+and mapping tensors into memory.
 
 ## Examples
 ```rust
@@ -20,11 +21,26 @@ assert_eq!(tensor.name(), "test_tensor");
 ```
 
 ## Overview
-The main structures and traits provided by the `edgefirst_tensor` crate are `TensorTrait` and `TensorMapTrait`,
-which define the behavior of Tensors and their memory mappings, respectively.
-The `Tensor<T>` struct wraps a backend-specific storage with optional image format metadata (`PixelFormat`),
-while the `TensorMap` enum provides access to the underlying data. The `TensorDyn` type-erased enum
-wraps `Tensor<T>` for runtime element-type dispatch.
+The main structures and traits provided by the `edgefirst_tensor` crate are [`TensorTrait`] and
+[`TensorMapTrait`], which define the behavior of Tensors and their memory mappings, respectively.
+The [`Tensor<T>`] struct wraps a backend-specific storage with optional image format metadata
+([`PixelFormat`]), while the [`TensorMap`] enum provides access to the underlying data. The
+[`TensorDyn`] type-erased enum wraps `Tensor<T>` for runtime element-type dispatch.
+
+[`TensorMemory::Dma`] is one variant with three implementations behind it — a Linux DMA-heap DMA-BUF,
+a macOS/iOS `IOSurfaceRef`, or an Android `AHardwareBuffer`. Callers ask for `Dma` and get whichever
+the platform provides, so portable code never branches on the mechanism.
+
+## Image tensors
+Images go through [`Tensor::image`] (or [`Tensor::image_desc`] for the full-featured request) rather
+than [`Tensor::new`]. Two things set them apart:
+
+- They take a required [`CpuAccess`] declaration. Hardware access — GPU, NPU, ISP, codec — is always
+  implied; what the CPU intends is the one thing the allocator cannot guess. Mapping beyond the
+  declaration is best-effort and always counted by [`unplanned_cpu_access_count`].
+- DMA-backed images carry a 64-byte-aligned row stride in every layout, because Mali and Vivante
+  reject an EGLImage import at an unaligned pitch. Read the real pitch from
+  [`Tensor::effective_row_stride`]; don't assume `width * bpp`.
  */
 #[cfg(target_os = "android")]
 mod ahardwarebuffer;
@@ -995,7 +1011,7 @@ pub(crate) fn assert_map_writable(writable: bool, backend: &str) {
 /// the layout linear (vendor tile compression requires `None`).
 ///
 /// Mapping beyond the declared access is best-effort, never silent: it
-/// may be refused (`Error::NotSupported`) or take a slow path, and it
+/// may be refused ([`Error::NotImplemented`]) or take a slow path, and it
 /// always increments [`unplanned_cpu_access_count`] with a once-per-buffer
 /// warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1050,7 +1066,7 @@ pub enum Compression {
     Any,
     /// Require one specific scheme: allocation fails with
     /// [`Error::InvalidArgument`] when the device's scheme differs and
-    /// [`Error::NotSupported`] on platforms without vendor tile
+    /// [`Error::NotImplemented`] on platforms without vendor tile
     /// compression. For consumers whose ABI names a layout (e.g. a
     /// QNN context binary declaring UBWC inputs).
     Scheme(CompressionScheme),
@@ -1298,6 +1314,21 @@ const fn fs_magic(raw: i64) -> u32 {
     raw as u32
 }
 
+/// The operations every memory backend implements.
+///
+/// This is the seam that lets [`Tensor<T>`] hide which backend is in play.
+/// The implementors are `DmaTensor` (Linux DMA-BUF), `IoSurfaceTensor`
+/// (macOS/iOS), `AHardwareBufferTensor` (Android), `ShmTensor`, `MemTensor`,
+/// and [`PboTensor`]; `TensorStorage<T>` dispatches to whichever is active.
+/// Backend types are not public — allocate a [`Tensor<T>`] or [`TensorDyn`]
+/// and call these methods through it.
+///
+/// Import the trait to get `shape`, `size`, `map`, `clone_fd`,
+/// `buffer_identity`, and the zero-copy sub-region `view` on a tensor value.
+/// `Tensor::view` and `Tensor::batch` route through [`TensorTrait::view`], so
+/// each backend's identity-sharing rule lives in exactly one place.
+///
+/// [`TensorDyn`]: crate::TensorDyn
 pub trait TensorTrait<T>: Send + Sync
 where
     T: Num + Clone + fmt::Debug,
@@ -1551,6 +1582,17 @@ where
     }
 }
 
+/// Which memory backend a tensor is (or should be) allocated from.
+///
+/// Pass `Some(..)` to a constructor to pin the backend, or `None` to
+/// auto-select. Auto-selection differs by constructor: [`Tensor::new`] tries
+/// `Dma` → `Shm` → `Mem`, while the image constructors try `Dma` → `Mem` and
+/// skip `Shm`. `EDGEFIRST_TENSOR_FORCE_MEM=1` short-circuits either chain to
+/// `Mem`, which is how tests run on hosts without DMA-heap permissions.
+///
+/// A pinned request has no fallback: if the backend cannot serve it, the
+/// constructor fails rather than quietly giving you something slower.
+/// [`TensorTrait::memory`] reports what a tensor actually ended up with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TensorMemory {
     /// Platform-native zero-copy GPU buffer.
@@ -2459,6 +2501,58 @@ where
         Ok(t)
     }
 
+    /// Allocate an image tensor of `width` × `height` in `format`.
+    ///
+    /// This is the common-case image constructor. The shape follows from the
+    /// format's layout — packed `[H, W, C]`, planar `[C, H, W]`, semi-planar
+    /// `[H + chroma_rows, W]` — and the format is recorded on the tensor, so
+    /// the image crate and the codec can work from it without out-of-band
+    /// parameters.
+    ///
+    /// `memory` requests a backend, or `None` to auto-select. Auto-select for
+    /// images is **DMA → Mem**: unlike [`Tensor::new`] it does not try SHM,
+    /// which offers an image nothing that Mem doesn't (it is not
+    /// GPU-importable, and Mem always succeeds). Ask for
+    /// [`TensorMemory::Shm`] explicitly if you need it.
+    ///
+    /// `access` declares what the **CPU** intends to do with the buffer and is
+    /// required; see [`CpuAccess`]. Hardware access — GPU, NPU, ISP, codec —
+    /// is always implied and never declared. Prefer the narrowest declaration
+    /// that fits: `None` keeps the allocation eligible for Android vendor tile
+    /// compression, and anything else pins the layout linear.
+    ///
+    /// DMA-backed images always get a **64-byte-aligned row stride**, in every
+    /// layout, because Mali and Vivante reject an EGLImage import at an
+    /// unaligned pitch. Read the real pitch back with
+    /// [`Tensor::effective_row_stride`] rather than assuming `width × bpp`.
+    ///
+    /// For a compression request or any other less common knob, build an
+    /// [`ImageDesc`] and call [`Tensor::image_desc`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidArgument`] if `width` × `height` is not a valid size
+    ///   for `format` (for example odd dimensions where the format's chroma
+    ///   subsampling forbids them), or, on macOS with an explicit
+    ///   [`TensorMemory::Dma`], if the format cannot be expressed as an
+    ///   image-formatted IOSurface at this width. The message names the
+    ///   aligned width to use.
+    /// - Whatever the chosen backend returns if the allocation itself fails —
+    ///   for an explicit `memory` request there is no fallback.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMemory};
+    ///
+    /// # fn main() -> Result<(), edgefirst_tensor::Error> {
+    /// // A camera frame the GPU converts and the CPU never touches.
+    /// let frame = Tensor::<u8>::image(1920, 1080, PixelFormat::Nv12,
+    ///                                 Some(TensorMemory::Mem), CpuAccess::None)?;
+    /// assert_eq!(frame.format(), Some(PixelFormat::Nv12));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn image(
         width: usize,
         height: usize,
@@ -3373,7 +3467,7 @@ where
     /// is `Some` — on a tight tensor it degenerates to one memcpy, so it is
     /// safe to call unconditionally. `dst.len()` must equal the tight byte
     /// footprint (`shape` product × element size). Zero-copy consumers
-    /// should prefer the buffer handle + [`effective_row_stride`]
+    /// should prefer the buffer handle + [`Tensor::effective_row_stride`]
     /// (Self::effective_row_stride) and skip this copy entirely.
     pub fn copy_to_flat(&self, dst: &mut [u8]) -> Result<()> {
         let tight_bytes = crate::ahardwarebuffer_layout::checked_shape_bytes::<T>(self.shape())?;
@@ -3461,7 +3555,7 @@ where
     /// The stride is propagated to the EGL DMA-BUF import attributes so
     /// the GPU interprets the padded buffer layout correctly. Must be
     /// called after [`set_format`](Self::set_format) and before the tensor
-    /// is first passed to [`ImageProcessor::convert`]. The stored stride
+    /// is first passed to `ImageProcessor::convert`. The stored stride
     /// is cleared automatically if the pixel format is later changed.
     ///
     /// No stride-vs-buffer-size validation is performed because the
@@ -3916,7 +4010,7 @@ where
 
     /// Fast-fail CUDA map: None (no GL routing) when no handle; else map (PBO routes to the GL worker).
     ///
-    /// Returns a scoped [`CudaMap`](crate::cuda::CudaMap) guard holding the raw CUDA device pointer
+    /// Returns a scoped [`CudaMap`] guard holding the raw CUDA device pointer
     /// for the duration of the mapping. For GL-buffer-backed tensors the unmap is deferred until the
     /// guard drops, freeing the PBO for the next `convert()` call. When no CUDA handle is attached
     /// (the common case for plain `Mem`/`DMA` tensors without CUDA registration), returns `None`

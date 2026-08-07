@@ -24,10 +24,11 @@ neighbours:
 ## Features
 
 - **Multiple backends** — Automatic selection: OpenGL (GPU) → G2D (NXP i.MX) → CPU (fallback)
-- **Format conversion** - RGBA, RGB, NV12, NV16, YUYV, GREY, planar formats
-- **Geometric transforms** - Resize, rotate (90° increments), flip, crop
-- **Zero-copy integration** - Works with `edgefirst-tensor` DMA/SHM buffers
-- **JPEG/PNG support** - Load and save with EXIF orientation handling
+- **Format conversion** — RGB/RGBA/BGRA/GREY, planar RGB(A), semi-planar NV12/NV16/NV24, packed YUYV/VYUY
+- **Geometric transforms** — Source crop, resize, letterbox, rotate (90° increments), flip
+- **Zero-copy integration** — Works with `edgefirst-tensor` DMA-BUF, IOSurface, AHardwareBuffer, PBO, and SHM buffers
+- **Tiled preprocessing** — SAHI grids for small-object detection in 4K frames
+- **JPEG/PNG support** — Load and save with EXIF orientation handling
 
 ## Quick Start
 
@@ -51,7 +52,7 @@ let src = TensorDyn::from(src);
 let mut processor = ImageProcessor::new()?;
 
 // Create destination with desired size and format (the convert below
-// handles NV12 -> RGBA color conversion, resize, and letterboxing)
+// handles NV12 -> RGBA colour conversion, resize, and letterboxing)
 let mut dst =
     processor.create_image(640, 640, PixelFormat::Rgba, DType::U8, None, CpuAccess::ReadWrite)?;
 
@@ -61,7 +62,7 @@ processor.convert(
     &mut dst,
     Rotation::None,
     Flip::None,
-    Crop::letterbox(),  // Preserve aspect ratio
+    Crop::letterbox([114, 114, 114, 255]),  // preserve aspect ratio, grey pad
 )?;
 
 // Save result
@@ -72,9 +73,9 @@ save_jpeg(&dst, "output.jpg", 90)?;
 
 | Backend | Platform | Hardware | Notes |
 |---------|----------|----------|-------|
-| G2D | Linux (i.MX8) | 2D GPU | Fastest for NXP platforms |
-| OpenGL | Linux | GPU | EGL/GBM headless rendering |
-| CPU | All | SIMD | Portable fallback |
+| G2D | Linux (NXP i.MX 8M Plus / 8M Mini) | 2D blit engine | Fastest for NXP platforms; no mask rendering |
+| OpenGL | Linux, macOS/iOS, Android | GPU | One engine everywhere behind the `GlPlatform` seam: EGL/GBM + DMA-BUF on Linux, ANGLE→Metal + IOSurface on Apple, native EGL + AHardwareBuffer on Android |
+| CPU | All | SIMD (NEON / AVX2, rayon) | Portable fallback, always available |
 
 ## Supported Formats
 
@@ -84,6 +85,7 @@ save_jpeg(&dst, "output.jpg", 90)?;
 | `PixelFormat::Rgb` | 24-bit RGB | 3 |
 | `PixelFormat::Nv12` | YUV 4:2:0 semi-planar | 1.5 |
 | `PixelFormat::Nv16` | YUV 4:2:2 semi-planar | 2 |
+| `PixelFormat::Nv24` | YUV 4:4:4 semi-planar | 3 |
 | `PixelFormat::Yuyv` | YUV 4:2:2 packed | 2 |
 | `PixelFormat::Grey` | 8-bit grayscale | 1 |
 | `PixelFormat::PlanarRgb` | Planar RGB | 3 |
@@ -95,20 +97,34 @@ Note: Int8 variants (e.g. packed RGB int8, planar RGB int8) use `DType::I8` with
 
 ## Feature Flags
 
-- `opengl` (default) - Enable OpenGL backend on Linux
-- `decoder` (default) - Enable detection box rendering
-- `tracker` (optional) - Enable multi-object tracking support in `draw_masks_tracked()`. Requires `features = ["tracker"]` in your dependency declaration.
+- `opengl` (default) — Enable the OpenGL backend.
+- `tracker` — Enable multi-object tracking in `draw_masks_tracked()`. Requires `features = ["tracker"]` in your dependency declaration.
+- `opencv` — Build the OpenCV comparison benchmark. Needs a system OpenCV install.
+- `dma_test_formats`, `g2d_test_formats` — Test-only: unlock the zero-copy and G2D fixture tiers. See [TESTING.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/TESTING.md).
+
+The decoder dependency is unconditional — there is no feature flag to opt out
+of detection-box and mask rendering.
 
 ## Environment Variables
 
-- `EDGEFIRST_DISABLE_G2D` - Disable G2D backend
-- `EDGEFIRST_DISABLE_GL` - Disable OpenGL backend
-- `EDGEFIRST_DISABLE_CPU` - Disable CPU backend
-- `EDGEFIRST_FORCE_BACKEND` — Force a single backend: `cpu`, `g2d`, or `opengl`. Disables fallback chain.
-- `EDGEFIRST_FORCE_TRANSFER` — Force GPU transfer method: `pbo` or `dmabuf`
-- `EDGEFIRST_TENSOR_FORCE_MEM` — Set to `1` to force heap memory (disables DMA/SHM)
+Backend selection:
+
+- `EDGEFIRST_FORCE_BACKEND` — Force a single backend: `cpu`, `g2d`, or `opengl`. Disables the fallback chain, and makes the `EDGEFIRST_DISABLE_*` variables inert.
+- `EDGEFIRST_DISABLE_GL` / `EDGEFIRST_DISABLE_G2D` / `EDGEFIRST_DISABLE_CPU` — Set to `1` to drop that backend from the chain.
+
+Memory and transfer:
+
+- `EDGEFIRST_TENSOR_FORCE_MEM` — Set to `1` to force heap memory (disables DMA/SHM).
+- `EDGEFIRST_FORCE_TRANSFER` — Force the GPU transfer method: `dmabuf`, `pbo`, or `sync`.
+- `EDGEFIRST_EGL_CACHE_CAPACITY` — Per-cache EGLImage capacity (default 64).
 - `EDGEFIRST_OPENGL_RENDERSURFACE` — Set to `1` to use renderbuffer-backed EGLImages for DMA destinations. Required on i.MX 95 / Mali-G310 with Neutron NPU DMA-BUF destinations. Defaults to `0` (texture path).
-- `EDGEFIRST_PROTO_COMPUTE` — Set to `1` to enable the experimental GLES 3.1 compute shader path for proto repack. Requires GLES 3.1 hardware support.
+
+Conversion behaviour:
+
+- `EDGEFIRST_COLORIMETRY` — `fast` (default) or `exact`. `fast` keeps single-plane NV12 on the driver's YUV sampler even when its colorimetry does not match; `exact` forces the in-shader matrix. See [ARCHITECTURE.md § Colorimetry](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md#colorimetry-1).
+- `EDGEFIRST_NV_CONVERT_PATH` — `auto` (default), `sampler`, or `shader`. Pins the NV12 GPU conversion path for A/B measurement.
+- `EDGEFIRST_GL_SERIALIZE` — `full` or `lifecycle`. Overrides the per-driver GL serialization policy.
+- `EDGEFIRST_PROTO_COMPUTE` — Set to `1` to enable the experimental GLES 3.1 compute shader path for proto repack. Requires GLES 3.1 hardware.
 
 ## Segmentation Mask Rendering
 
@@ -125,12 +141,18 @@ use edgefirst_image::MaskOverlay;
 let overlay = MaskOverlay::default();
 
 // With a background image and 50% transparent masks
-let overlay = MaskOverlay { background: Some(&bg_tensor), opacity: 0.5 };
+let overlay = MaskOverlay {
+    background: Some(&bg_tensor),
+    opacity: 0.5,
+    ..MaskOverlay::default()
+};
 ```
 
 Fields:
-- `background: Option<&TensorDyn>` — Optional tensor to blit into `dst` before drawing masks. Must match `dst`'s shape. `None` keeps the existing `dst` content.
+- `background: Option<&TensorDyn>` — Optional tensor to blit into `dst` before drawing masks. Must match `dst`'s shape and format, and must not alias `dst` (an aliased pair returns `Error::AliasedBuffers`). `None` clears `dst` instead.
 - `opacity: f32` — Scales mask alpha in the range `0.0` (invisible) to `1.0` (fully opaque, default).
+- `letterbox: Option<[f32; 4]>` — `[xmin, ymin, xmax, ymax]` in model-input normalized space. When set, decoder output is mapped back to the original image's coordinates. Build it from the same `Crop` you gave `convert()` with `MaskOverlay::with_letterbox_crop`.
+- `color_mode: ColorMode` — `Class` (default, colour per class label), `Instance` (colour per detection index), or `Track` (reserved for track IDs; behaves like `Instance` today).
 
 ### draw_masks()
 
@@ -163,13 +185,32 @@ Returns `(Vec<DetectBox>, Vec<TrackInfo>)`.
 Computes `sigmoid(coefficients @ protos)` per-pixel in a fragment shader — no intermediate mask materialization. Preferred for real-time overlay.
 
 ```rust,ignore
-let (detections, proto_data) = decoder.decode_quantized_proto(&outputs)?;
-processor.draw_proto_masks(&mut frame, &detections, &proto_data)?;
+let mut detections = Vec::new();
+if let Some(proto_data) = decoder.decode_proto(&outputs, &mut detections)? {
+    processor.draw_proto_masks(&mut frame, &detections, &proto_data, MaskOverlay::default())?;
+}
 ```
 
 ### Hybrid CPU+GPU Path
 
-CPU materializes binary masks (`materialize_segmentations()`), then OpenGL overlays them. Auto-selected when both CPU and GL backends are available.
+The CPU materializes binary masks with `materialize_masks()`, then OpenGL blits
+them via `draw_decoded_masks()`. This is the recommended pattern on Vivante
+GC7000UL (i.MX 8M Plus), where the fused fragment shader falls off a
+performance cliff at high detection counts:
+
+```rust,ignore
+use edgefirst_image::MaskResolution;
+
+let masks = processor.materialize_masks(
+    &detections,
+    &proto_data,
+    overlay.letterbox,
+    MaskResolution::Scaled { width: dst_w, height: dst_h },
+)?;
+drop(proto_data); // free the proto tensor immediately
+
+processor.draw_decoded_masks(&mut frame, &detections, &masks, MaskOverlay::default())?;
+```
 
 ### Shader Variants
 
@@ -199,7 +240,7 @@ zero-copy GPU paths that direct `Tensor::new()` allocation cannot achieve:
 ```rust,ignore
 let mut dst =
     processor.create_image(640, 640, PixelFormat::Rgb, DType::U8, None, CpuAccess::ReadWrite)?;
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
 ```
 
 If you need to write into a pre-allocated buffer with a specific memory type
@@ -209,7 +250,7 @@ If you need to write into a pre-allocated buffer with a specific memory type
 let mut model_input = Tensor::<u8>::new(&[640, 640, 3], None, None)?;
 model_input.set_format(PixelFormat::Rgb)?;
 let mut dst = TensorDyn::from(model_input);
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
 ```
 
 ## Tiled Preprocessing (SAHI)
@@ -231,8 +272,8 @@ let cfg = TilingConfig::new(640, 640).with_overlap(0.2);
 // plan_tiles is pure geometry (no GPU): use its length to size the batch.
 let placements = processor.plan_tiles(src_w, src_h, &cfg)?;
 
-// One tall [tile_w, N*tile_h] destination (width × stacked height) —
-// allocate once, reuse per frame.
+// One tall destination: tile_w wide, N*tile_h tall — N tiles stacked
+// vertically. Allocate once, reuse per frame.
 let mut batch = processor.alloc_tile_batch(
     placements.len(), &cfg,
     PixelFormat::Rgb, DType::U8, None, CpuAccess::None,
@@ -248,14 +289,23 @@ coordinates), never by viewing it — a viewed source would mint one EGLImage im
 per tile and defeat the zero-copy property. The destination tiles are sibling views
 of one parent buffer rendered as `glViewport`/`glScissor` bands.
 
+> **Batch-format limit.** The GL band lowering handles single-pass geometry
+> only. A zero-copy (DMA) batch destination in packed `Rgb` or any planar
+> layout reinterprets the render-target shape (`W*3/4 × H`, `H*3` bands), which
+> the band path does not yet compute, so GL declines those tiles and each one
+> falls back to CPU. Batch in `Rgba`, `Bgra`, or `Grey` to stay on the batched
+> GPU path today, or use `tile_one` — it writes whole slots rather than bands,
+> so it is not subject to this limit at any format.
+
 For pipelined I/O (overlapping preprocessing, inference, and collection), use
 `tile_one` to render into a caller-owned model-input slot (e.g. one slot of a ring)
 instead of the batched `tile_into`:
 
 ```rust,ignore
 let placements = processor.plan_tiles(src_w, src_h, &cfg)?; // pure, no GPU
-let mut slot = processor.create_image(cfg.tile_w, cfg.tile_h,
-                                      PixelFormat::Rgb, DType::U8, None)?;
+let mut slot = processor.create_image(
+    cfg.tile_w, cfg.tile_h, PixelFormat::Rgb, DType::U8, None, CpuAccess::None,
+)?;
 for p in &placements {
     processor.tile_one(&src, &mut slot, p, &cfg)?; // deferred: caller owns sync
     processor.flush()?;                            // flush per-slot or per-ring cadence
@@ -281,8 +331,15 @@ use edgefirst_tensor::PlaneDescriptor;
 
 // UC1: Render into VxDelegate's DMA-BUF — zero copies
 let pd = PlaneDescriptor::new(vx_fd.as_fd())?;  // dups fd — caller keeps ownership
-let mut dst = processor.import_image(pd, None, 640, 640, PixelFormat::Rgb, DType::U8)?;
-processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox())?;
+let mut dst = processor.import_image(
+    pd,
+    None,               // chroma plane, for multiplane NV12/NV16
+    640, 640,
+    PixelFormat::Rgb,
+    DType::U8,
+    None,               // colorimetry: supply the producer's signalling for YUV sources
+)?;
+processor.convert(&src, &mut dst, Rotation::None, Flip::None, Crop::letterbox([114, 114, 114, 255]))?;
 // dst's backing memory IS vx_fd — no memcpy needed
 ```
 

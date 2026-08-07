@@ -2,12 +2,18 @@
 
 ## Test Layout
 
-The umbrella crate has no unit tests of its own; all test coverage comes from
-the sub-crates it re-exports. The two narrow concerns the umbrella tests
-itself are:
+Almost all coverage comes from the sub-crates the umbrella re-exports;
+`lib.rs` is nothing but `pub use` lines and has nothing to test. What the
+umbrella does test itself:
 
-- **Doc-tests** for the `trace::start_tracing` / `stop_tracing` API in
+- **One unit test**, `test_trace_lifecycle` in
   [`crates/hal/src/trace.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs).
+  It has to be a single test because the global subscriber is per-process: it
+  walks start → double-start (`AlreadyActive`) → emit a span → stop → restart
+  (`SessionExhausted`) in one pass, and asserts the trace file lands on disk
+  with content.
+- **Doc-tests** for the `trace::start_tracing` / `stop_tracing` API in the same
+  file.
 - **Compile-time feature-flag conditionals** are exercised in CI by:
   - the workspace doc-test job, which runs with `--all-features`
     (`cargo test --doc --workspace --all-features`); and

@@ -390,7 +390,7 @@ pub extern "C" fn hal_tile_grid(
 /// @param config Tiling configuration (must be non-NULL)
 /// @param format Pixel format (HAL_PIXEL_FORMAT_*)
 /// @param dtype Data type of tensor elements (HAL_DTYPE_*)
-/// @param memory Memory allocation type (HAL_TENSOR_DMA recommended)
+/// @param memory Memory allocation type (HAL_TENSOR_MEMORY_DMA recommended)
 /// @param access Declared CPU access (see HalCpuAccess)
 /// @return New tensor handle on success, NULL on error
 /// @par Errors (errno):

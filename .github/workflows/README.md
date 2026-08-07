@@ -5,94 +5,147 @@ This directory contains the CI/CD workflows for EdgeFirst HAL.
 ## Workflow Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        GitHub Events                            │
-└─────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         │ Push/PR            │ Tag (X.Y.Z)        │ Release
-         ▼                    ▼                    ▼
-┌────────────────┐   ┌────────────────┐   ┌────────────────┐
-│   test.yml     │   │  release.yml   │   │   sbom.yml     │
-│  (CI/Testing)  │   │  (Publishing)  │   │  (Compliance)  │
-└────────────────┘   └────────────────┘   └────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              GitHub Events                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │                │                  │                │                │
+    │ Push/PR        │ Tag (vX.Y.Z)     │ Push/PR        │ PR merged      │ Manual
+    │                │                  │ + Release      │ to main        │
+    ▼                ▼                  ▼                ▼                ▼
+┌──────────┐   ┌──────────────┐   ┌────────────┐   ┌────────────────┐  ┌──────────────┐
+│ test.yml │   │ release.yml  │   │  sbom.yml  │   │ tag-release.yml│  │ benchmark.yml│
+│ (CI)     │   │ (Publishing) │   │(Compliance)│   │  (Tagging)     │  │ (On-demand)  │
+└──────────┘   └──────────────┘   └────────────┘   └────────────────┘  └──────────────┘
 ```
+
+`tag-release.yml` closes the loop: merging a `release/**` PR into `main` pushes the
+`vX.Y.Z` tag, which is what triggers `release.yml`.
 
 ## Workflows
 
 ### test.yml - Continuous Integration
 
-**Triggers:** Push/PR to `main` or `develop`
-
-Multi-platform testing with coverage collection:
+**Triggers:** Push/PR to `main`, `develop`, or `release/**`
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
-| `checkout-lfs` | ubuntu-22.04 | Fetch Git LFS testdata as artifact |
-| `doc-tests` | ubuntu-22.04 | Rust documentation tests |
-| `build-and-test-x86` | ubuntu-22.04 | x86_64 build, test, coverage |
-| `build-and-test-arm` | ubuntu-22.04-arm-private | aarch64 build, test, coverage |
-| `hardware-test` | nxp-imx8mp-latest | On-target testing (G2D, DMA) |
-| `process-hardware-coverage` | ubuntu-22.04-arm-private | Convert profraw to LCOV |
-| `sonarcloud` | ubuntu-22.04 | Aggregate coverage, static analysis |
+| `checkout-lfs` | ubuntu-22.04 | Fetch Git LFS testdata once, share as an artifact |
+| `doc-tests` | ubuntu-22.04-xlarge | Rust documentation tests |
+| `build-and-test-x86` | ubuntu-22.04-xlarge | x86_64 build, test, Rust + Python + C API coverage |
+| `build-and-test-macos` | macos-latest | ANGLE/IOSurface GL path, C API, coverage |
+| `build-ios` | macos-latest | Clippy + build + link validation (device and simulator) |
+| `build-android` | ubuntu-22.04 | Clippy + build + link validation (arm64 and x86_64) |
+| `build-windows` | windows-latest | `cargo check` only |
+| `software-gl-coverage` | ubuntu-22.04-xlarge | GL tests under Mesa llvmpipe, for coverage of the GL paths no hardware runner reaches |
+| `build-arm` | ubuntu-22.04-arm-xlarge | Cross-build aarch64 test binaries (also feeds the hardware runner) |
+| `test-arm` | ubuntu-22.04-arm | Run the aarch64 binaries, collect coverage |
+| `hardware-test` | nxp-imx8mp-latest | On-target testing (G2D, DMA-heap, Vivante GL) |
+| `process-hardware-coverage` | ubuntu-22.04-arm | Convert the hardware runner's profraw to LCOV |
+| `sonarcloud` | ubuntu-22.04 | Aggregate all coverage, static analysis |
 
-**Key Features:**
-- Three-phase on-target testing (build → test → process)
-- Coverage instrumentation via cargo-llvm-cov
-- Python coverage via slipcover
-- Hardware benchmarks on main branch
+Three-phase on-target testing keeps the hardware runner doing only what it must:
+`build-arm` cross-compiles, `hardware-test` runs the binaries on the board, and
+`process-hardware-coverage` converts the raw profiling data back on a host with the
+matching toolchain.
+
+The iOS and Android lanes are build-and-link only. GitHub has no runner that can
+execute either GPU stack, so on-device correctness is gated separately (Android via
+the internal hal-mobile Device Farm harness — see
+[TESTING.md](../../TESTING.md#android-on-device-validation-device-farm)).
+
+The macOS and iOS lanes fetch the signed ANGLE xcframeworks from the **public**
+`EdgeFirstAI/angle-package` release via `scripts/fetch-angle.sh`. No credentials are
+involved, so the full ANGLE-backed validation runs on pushes, same-repo PRs, and fork
+PRs alike. (Fork PRs still need a maintainer to approve the run, per GitHub's default
+first-time-contributor policy.)
 
 ### release.yml - Publishing
 
-**Triggers:** Tags matching `X.Y.Z` or `X.Y.ZrcN`
+**Triggers:** Tags matching `vX.Y.Z` or `vX.Y.ZrcN`; also `workflow_dispatch` for a
+dry run that builds artifacts without publishing.
 
 | Job | Purpose |
 |-----|---------|
 | `build-wheels` | Build Python wheels (Linux, Windows, macOS) |
-| `publish-pypi` | Publish to PyPI (stable releases only) |
-| `create-release` | Create GitHub Release with changelog |
+| `build-capi` | Build the C API shared library per target |
+| `publish-pypi` | Publish wheels to PyPI |
+| `publish-crates` | Publish the Rust crates to crates.io |
+| `create-release` | Create the GitHub Release with changelog and artifacts |
+
+The three publish/release jobs are gated on `github.event_name == 'push'` plus a
+`refs/tags/` ref, so a manual dispatch builds but never publishes.
 
 ### sbom.yml - License Compliance
 
-**Triggers:** Push/PR to `main` or `develop`, releases
+**Triggers:** Push/PR to `main`, `develop`, or `release/**`; releases
 
 | Job | Purpose |
 |-----|---------|
 | `sbom-compliance` | Generate SBOM, validate licenses |
 | `release-sbom` | Attach SBOM to GitHub releases |
 
+### tag-release.yml - Release Tagging
+
+**Triggers:** PR closed against `main`
+
+Pushes the `vX.Y.Z` tag when a `release/X.Y.Z` branch merges, which is what starts
+`release.yml`. Never tag by hand; the tag follows the merge, not the other way round.
+The job derives the version from the branch name and rejects anything that is not
+`release/` plus three dot-separated numbers.
+
+### benchmark.yml - On-Demand Benchmarks
+
+**Triggers:** `workflow_dispatch` only
+
+| Job | Runner | Purpose |
+|-----|--------|---------|
+| `build-benchmarks` | ubuntu-22.04-arm | Cross-build the aarch64 benchmark binaries |
+| `run-rust-benchmarks` | nxp-imx8mp-latest | Rust benchmarks on i.MX 8M Plus |
+| `run-python-benchmarks` | nxp-imx8mp-latest | Python benchmarks on i.MX 8M Plus |
+| `process-results` | ubuntu-22.04-arm | Generate result tables and charts |
+
+Benchmarks are not part of CI. They tie up the hardware runner for a long time and the
+numbers are only meaningful when collected deliberately — see
+[BENCHMARKS.md](../../BENCHMARKS.md).
+
 ## Action Versions
 
-All workflows use hash-pinned actions for security (per Au-Zone SPS v2.1):
+All workflows use hash-pinned actions, per Au-Zone SPS. Read the pins from the workflow
+files themselves — a copy here would go stale the first time Dependabot bumps one.
 
-```yaml
-actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5         # v4
-actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065     # v5
-actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
-actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-dtolnay/rust-toolchain@6d9817901c499d6b02debbb57edb38d33daa680b   # stable
-Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5     # v2.8.2
-taiki-e/install-action@493d7f216ecab2af0602481ce809ab2c72836fa1  # v2.62.62
-softprops/action-gh-release@5be0e66d93ac7ed76da52eca8bb058f665c3a5fe # v2.4.2
+```bash
+grep -rhoE 'uses: [^ ]+@[a-f0-9]{40}.*' .github/workflows/*.yml | sort -u
 ```
+
+Each pin carries a trailing `# vX.Y.Z` comment naming the tag it corresponds to.
 
 ## Runners
 
-| Runner | Architecture | Capabilities |
-|--------|--------------|--------------|
-| `ubuntu-22.04` | x86_64 | Full toolchain, Docker |
-| `ubuntu-22.04-arm-private` | aarch64 | Full toolchain, private |
-| `nxp-imx8mp-latest` | aarch64 | Hardware (G2D, DMA), test-only |
+| Runner | Architecture | Notes |
+|--------|--------------|-------|
+| `ubuntu-22.04` | x86_64 | Standard hosted runner |
+| `ubuntu-22.04-xlarge` | x86_64 | 16 vCPU; used for the build-heavy lanes |
+| `ubuntu-22.04-arm` | aarch64 | Test and post-processing |
+| `ubuntu-22.04-arm-xlarge` | aarch64 | Cross-compilation |
+| `macos-latest` | arm64 | Apple Silicon; ANGLE → Metal |
+| `windows-latest` | x86_64 | Compile check only |
+| `nxp-imx8mp-latest` | aarch64 | Self-hosted board: G2D, DMA-heap, Vivante GL |
 
 ## Coverage Strategy
 
-Coverage is collected from three platforms and aggregated:
+Five jobs upload coverage artifacts, and `sonarcloud` merges them:
 
-1. **x86_64**: Full Rust + Python coverage
-2. **aarch64**: Full Rust + Python coverage  
-3. **imx8mp**: Hardware-specific paths (DMA, G2D acceleration)
+| Artifact | Source | Covers |
+|----------|--------|--------|
+| `coverage-x86_64` | `build-and-test-x86` | Rust + Python + C API on x86_64 |
+| `coverage-macos` | `build-and-test-macos` | ANGLE/IOSurface GL paths |
+| `coverage-software-gl` | `software-gl-coverage` | GL paths under Mesa llvmpipe |
+| `coverage-aarch64` | `test-arm` | Rust + Python on aarch64 |
+| `coverage-imx8mp-processed` | `process-hardware-coverage` | DMA-heap, G2D, Vivante GL |
 
-The `process-hardware-coverage` job converts raw profiling data from hardware tests
-to LCOV format using the same toolchain that built the instrumented binaries.
+The imx8mp path needs the extra `process-hardware-coverage` step because the board
+writes raw `.profraw` files; converting them to LCOV requires the same toolchain that
+built the instrumented binaries, which the board does not have.
 
 ## Scripts
 
@@ -102,9 +155,20 @@ Supporting scripts in `.github/scripts/`:
 |--------|---------|
 | `generate_sbom.sh` | Generate CycloneDX SBOM |
 | `check_license_policy.py` | Validate dependency licenses |
-| `generate_notice.py` | Generate NOTICE file |
+| `generate_notice.py` | Generate the NOTICE file |
+| `verify_version.py` | Check version consistency across the workspace |
+| `setup-coverage-env.sh` | Export the coverage instrumentation environment |
+| `fix_coverage_paths.py` | Rewrite cross-compiled source paths in LCOV output |
+| `coverage_summary.py` | Print a per-crate coverage summary |
+| `generate_junit_xml.py` | Convert nextest output to JUnit XML for the PR check |
+| `extract_benchmark_results.py` | Pull benchmark JSON out of the runner artifacts |
+| `generate_benchmark_tables.py` | Render the result tables in BENCHMARKS.md |
+| `benchmark_common.py` | Shared platform configuration for the benchmark scripts |
+| `build-opencv-benchmark.sh` | Build the OpenCV baseline benchmark |
+| `deploy-bench-masks.sh` | Deploy mask benchmark fixtures to the board |
+| `audit-injection.sh` | Scan workflows for script-injection patterns |
 
 ## Local Development
 
-See [CONTRIBUTING.md](../../CONTRIBUTING.md) for local testing instructions.
-
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) for local testing instructions and
+[TESTING.md](../../TESTING.md) for the workspace testing rules.

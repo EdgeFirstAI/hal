@@ -9,9 +9,11 @@
 //!
 //! # Design
 //!
-//! The HAL library crates (`edgefirst-decoder`, `edgefirst-image`) emit
-//! [`tracing::trace_span!`] spans on hot paths. These have near-zero overhead
-//! when no subscriber is active (a single relaxed atomic load per span site).
+//! Every HAL library crate — `edgefirst-tensor`, `edgefirst-codec`,
+//! `edgefirst-image`, `edgefirst-decoder`, and `edgefirst-tracker` — emits
+//! [`tracing::trace_span!`] spans on its hot paths. These have near-zero
+//! overhead when no subscriber is active (a single relaxed atomic load per
+//! span site).
 //!
 //! This module installs a **process-wide subscriber** consisting of a Chrome
 //! trace layer writing spans to a JSON file for Perfetto. Existing `log::*`

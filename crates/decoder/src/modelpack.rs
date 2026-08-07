@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! Decode kernels for the Au-Zone ModelPack output format.
+//!
+//! ModelPack emits SSD-style detection (separate box and score tensors) and
+//! semantic segmentation, in flat and per-layer split variants. Every kernel
+//! here is crate-private and reached through [`crate::Decoder`], which picks
+//! the variant from the output shapes at builder time.
+
 use ndarray::{Array2, ArrayView2, ArrayView3};
 use num_traits::{AsPrimitive, Float, PrimInt};
 

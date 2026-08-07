@@ -15,7 +15,7 @@ It has no dependency on any other `edgefirst-*` crate; instead, it is consumed
 as a feature by the decoder and image crates:
 
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) (feature `tracker`) calls `Tracker::update` from `decode_tracked()`.
-- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Color stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order coloring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
+- [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) (feature `tracker`) calls `draw_masks_tracked()` to render masks for tracked detections and surface track info to the caller. Colour stability per track UUID is the planned use of `ColorMode::Track`, but `Track` currently aliases `Instance` (detection-order colouring) — the slot is reserved so the API surface won't change once the per-UUID palette lands.
 - [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) (feature `tracker`) re-exports the crate as `edgefirst_hal::tracker`.
 
 ## Algorithms
@@ -144,14 +144,14 @@ When used via `edgefirst-hal` or `edgefirst-decoder`, the `tracker` feature flag
 
 ```toml
 [dependencies]
-edgefirst-hal = { version = "0.13", features = ["tracker"] }
+edgefirst-hal = { version = "0.28", features = ["tracker"] }
 ```
 
 Or when depending on the decoder directly:
 
 ```toml
 [dependencies]
-edgefirst-decoder = { version = "0.13", features = ["tracker"] }
+edgefirst-decoder = { version = "0.28", features = ["tracker"] }
 ```
 
 The decoder exposes `decode_tracked()` which accepts any `Tracker<DetectBox>` implementation:
@@ -173,10 +173,21 @@ decoder.decode_tracked(
 )?;
 ```
 
-`decode_tracked()` populates:
-- `output_boxes` — decoded detection boxes
-- `output_masks` — segmentation masks (empty if the model has no mask head)
-- `output_tracks` — `Vec<TrackInfo>` with one entry per matched detection
+`decode_tracked()` populates all three buffers with one entry per **active
+track**, index-aligned across them:
+
+- `output_boxes` — one box per active track, its `bbox` set to the track's
+  Kalman-smoothed `tracked_location` rather than the raw decoded box. Call
+  `decode` instead if you need the unsmoothed detections.
+- `output_masks` — segmentation masks (empty if the model has no mask head).
+  Tracks coasting without a detection this frame have no mask.
+- `output_tracks` — `Vec<TrackInfo>`, unwrapped rather than
+  `Vec<Option<TrackInfo>>`: detections that failed to start or continue a track
+  are dropped from all three buffers, and tracks that are still alive but
+  unmatched this frame are added to them.
+
+That last point is the one that surprises people: the output is the tracker's
+view of the world, not a per-detection annotation of this frame's decode.
 
 ## Documentation
 

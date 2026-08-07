@@ -1,6 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
+//! ByteTrack: two-pass detection-to-tracklet association.
+//!
+//! [`ByteTrack`] is the crate's implementation of the [`Tracker`] trait.
+//! Each [`Tracker::update`] call predicts every tracklet forward with its
+//! Kalman filter, then matches detections in two passes — high-confidence
+//! detections (score >= `track_high_conf`) against all tracklets first, then
+//! the leftover low-confidence detections against whatever went unmatched.
+//! That second pass is what ByteTrack is named for: a briefly occluded object
+//! whose score dips still recovers its original track instead of being
+//! discarded and re-created with a new UUID.
+//!
+//! Both passes solve the assignment optimally with LAPJV over an IoU cost
+//! matrix. Unmatched detections spawn tracklets; tracklets that go
+//! `track_extra_lifespan` without a match are deleted.
+//!
+//! Build one with [`ByteTrackBuilder`]; see the crate root for a worked
+//! example.
+
 use crate::{
     kalman::ConstantVelocityXYAHModel2, ActiveTrackInfo, DetectionBox, TrackInfo, Tracker,
 };

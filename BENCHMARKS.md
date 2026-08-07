@@ -11,9 +11,16 @@ letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no regressions we
 any GPU class. The Allocation table is updated for the notable imx8mp DMA-alloc
 improvement (38 ms → 1.8 ms at 720p); other tables are unchanged within noise. Raw
 per-board JSON lives in the (git-ignored) `benchmarks/<platform>/` working tree and is
-regenerated into these tables via `.github/scripts/generate_benchmark_tables.py`. The
-macOS GPU path remains same-size-convert only (see Known Gap #17). YUYV→RGBA same-size
-convert vs the Apple Silicon CPU path: **1.32×** at 1080p, **4.76×** at 4K.
+regenerated into these tables via `.github/scripts/generate_benchmark_tables.py`.
+The macOS GL rows here are still the pre-convergence capture — 0.25.0 also moved macOS
+onto the shared GL engine, which lifted the old YUYV→RGBA-only limit, but the macOS
+matrix has not been re-collected since (Known Gap #17). YUYV→RGBA same-size convert vs
+the Apple Silicon CPU path: **1.32×** at 1080p, **4.76×** at 4K.
+
+> **These results are two minor releases behind the workspace.** They were
+> collected on 0.25.0; the workspace is now on 0.28.0. Treat them as the last
+> known-good baseline rather than a description of current performance, and
+> re-collect before using them to argue a regression either way.
 
 ---
 
@@ -234,9 +241,19 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 | `decode_pipeline_benchmark` | `edgefirst-image` | JPEG decode → letterbox convert end-to-end (strided input, HWC/CHW output) |
 | `nvjpeg_benchmark` | `edgefirst-image` | nvJPEG GPU decode into CUDA-backed PBO (`codec/jpeg/nvjpeg/rgbi/*` cells); on-target only, skips cleanly without CUDA |
 | `mask_benchmark` | `edgefirst-image` | Mask rendering: draw_decoded_masks, draw_proto_masks, hybrid path |
+| `mask_decode_benchmark` | `edgefirst-image` | Focused mask decode on the RETINA (scaled) path |
+| `convert_matrix_benchmark` | `edgefirst-image` | GL convert across the memory × format matrix |
+| `batch_convert_benchmark` | `edgefirst-image` | Deferred view-tile converts vs. eager, one tile at a time |
+| `tiled_convert_benchmark` | `edgefirst-image` | Confirms CPU convert cost scales with the requested crop area, not the source frame area |
+| `cpu_preprocess_benchmark` | `edgefirst-image` | CPU JPEG-preprocessing path, profiled against the Jetson Orin Nano |
+| `parallel_processors_benchmark` | `edgefirst-image` | Multi-processor GL throughput scaling; shows where the serialization policy binds |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
 | `codec_benchmark` | `edgefirst-codec` | JPEG/PNG decode into pre-allocated tensors vs. image crate and zune-png; NEON SIMD on AArch64, SSE4.1/SSSE3 on x86-64, vectorised type conversion |
+| `tracker_benchmark` | `edgefirst-tracker` | ByteTrack association and track lifecycle |
+
+`crates/image` also carries a `sanity_check` binary. It is an adaptive smoke check
+over letterbox format combinations, not a benchmark, and feeds no results table.
 
 JSON files are collected in `benchmarks/<platform>/` and processed by `.github/scripts/generate_benchmark_tables.py` to produce the tables in this document.
 
@@ -342,11 +359,18 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **G2D** | No (Linux-only) |
 | **DMA-buf** | No (Linux-only); HAL maps `TensorMemory::Dma` onto IOSurface for zero-copy bind |
 | **GL Transfer Backend** | IOSurface (zero-copy via `EGL_ANGLE_iosurface_client_buffer`) |
-| **Notes** | Apple Silicon developer platform. The Homebrew ANGLE tap supplies `libEGL.dylib` and `libGLESv2.dylib`; ANGLE translates GLES 3.0 → Metal so the same shader source used on Linux GPUs runs unchanged here. GPU coverage is intentionally limited at present — only YUYV→RGBA is implemented in the macOS shader pack; the rest of `ImageProcessor::convert` falls back to CPU. |
+| **Notes** | Apple Silicon developer platform. ANGLE supplies `libEGL.dylib` and `libGLESv2.dylib` — either the signed EdgeFirst release via `scripts/fetch-angle.sh` or the Homebrew tap — and translates GLES 3.0 → Metal, so the same shader source used on Linux GPUs runs unchanged. Since 0.25.0 macOS runs the shared GL engine and inherits its full conversion matrix; the GL rows in the tables below predate that and still reflect the old YUYV→RGBA-only backend (Known Gap #17). |
 
 ---
 
 ## Benchmark Results
+
+> **The result tables below are generated. Do not hand-edit them.** They are
+> rendered from the per-board JSON in `benchmarks/<platform>/` by
+> `.github/scripts/generate_benchmark_tables.py`. A number typed in by hand will
+> be silently overwritten on the next regeneration, and in the meantime it is a
+> claim with no measurement behind it. To change a number, re-collect and re-run
+> the generator. Surrounding prose is hand-written and safe to edit.
 
 **Data collected:** March 30, 2026 (v0.15.0, per-texture EGL binding
 optimization) unless a section states otherwise — the GL convert,
@@ -1219,7 +1243,7 @@ allocation.
 
 7. **BGRA framebuffer CPU byte-swap overhead** — BGRA textures as framebuffer attachments have GPU-dependent swizzle behavior (some implementations don't swizzle fragment shader output). Workaround uses RGBA format internally with CPU-side R↔B byte swaps on upload and readback. RGBA→BGRA conversion on imx95-frdm GL went from 3.4ms (v1.2 PBO, no swap needed) to 26.5ms (v1.3 DMA + CPU swap). CPU backend RGBA→BGRA is 24.5ms for reference.
 
-8. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL explicitly blocks this combination on Vivante GPUs and falls back to CPU in auto mode. See `VSI_GPU_NV12_BUG.md` for the full vendor bug report.
+8. **NV12→planar GPU hang on Vivante GC7000UL** — Rendering from an NV12 source texture (via `EGL_LINUX_DMA_BUF_EXT`) to a planar RGB framebuffer (MRT with 3× color attachments) causes an **unrecoverable GPU hang** on the Vivante GC7000UL (i.MX 8M Plus, galcore 6.4.11). The GPU command processor stalls permanently, the calling process enters kernel uninterruptible sleep (Ds state), cannot be killed even with SIGKILL, and the galcore driver state is corrupted system-wide — all subsequent GPU operations from any process hang until a full board reboot. YUYV→planar and NV12→packed work fine; the bug is specific to NV12 multi-plane texture + MRT output. The HAL never issues the single-pass shader: NV\* → planar always renders NV → RGBA intermediate → planar, which is now the plan on every GPU rather than a Vivante carve-out. See [crates/image/ARCHITECTURE.md § NV12/NV16/NV24 → PlanarRgb two-pass render](crates/image/ARCHITECTURE.md#nv12nv16nv24--planarrgb-two-pass-render) (EDGEAI-1180).
 
 9. **rpi5-hailo GL planar at 4K is slow** — YUYV→8BPS/8BPS_i8 at 4K takes ~102ms on Mesa V3D GL, while CPU handles it in ~24ms. NV12→planar at 4K is ~26ms on GL. The bottleneck appears to be in Mesa V3D's MRT path when combined with high-resolution YUYV texture sampling.
 
@@ -1243,25 +1267,29 @@ allocation.
 
 16. ~~**Orin Nano GL/PBO pipeline hangs during warmup**~~ — Resolved: PBO deadlock in `setup_renderbuffer_non_dma` fixed by routing PBO destinations through `setup_renderbuffer_from_pbo` which avoids re-entering the GL thread channel. GL/PBO results now collected.
 
-17. **mbp-m2-max GL coverage is YUYV→RGBA only** — The `MacosGlProcessor` ships
-    with a single fragment shader (BT.709 YUYV→RGBA, limited range). All other
-    convert pairs, resize, rotation, flip, crop, and mask draw operations
-    return `NotImplemented`/`NotSupported` and the harness falls back to CPU.
-    Pipeline GL benchmarks therefore only show two working rows
-    (`convert/1920x1080/YUYV->RGBA` and `convert/3840x2160/YUYV->RGBA`); the
-    rest of the pipeline table is identical to the CPU-only column. Closing
-    this gap is mostly mechanical — the same GLSL ES 3.0 shaders that run on
-    Linux GPUs work unchanged through ANGLE — but each new shader needs
-    **three** synchronized entries:
-    (1) a GLSL ES 3.0 source string in `crates/image/src/gl/macos_processor.rs`,
-    (2) a FourCC + bytes-per-element mapping in
-    `tensor::iosurface::image_fourcc_and_bpe`, and
-    (3) a matching `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` entry in
-    `image::gl::iosurface_import::ImageLayout::gl_internal_format`. The
-    third entry is the one that fails silently — ANGLE validates the
-    GL-format ↔ FourCC pairing at `eglCreatePbufferFromClientBuffer` time
-    and returns a vague `EGL_BAD_ATTRIBUTE` when they disagree. Tracked
-    separately from the v3.8 buffer-infrastructure baseline.
+17. **mbp-m2-max GL rows are a stale capture, not a code limit** — This gap used
+    to describe a real backend limitation: the standalone `MacosGlProcessor`
+    shipped one fragment shader (BT.709 YUYV→RGBA, limited range) and returned
+    `NotImplemented`/`NotSupported` for everything else. That backend is gone.
+    Since 0.25.0 macOS drives the same `GLProcessorThreaded` engine as Linux
+    through the ANGLE platform seam (`crates/image/src/gl/platform/macos.rs`)
+    and inherits the engine's full conversion matrix — every format pair,
+    resize, letterbox, rotation, flip, int8, masks.
+
+    What has *not* happened is a re-collection: the macOS GL tables below still
+    show only `convert/1920x1080/YUYV->RGBA` and `convert/3840x2160/YUYV->RGBA`,
+    with the rest of the pipeline table identical to the CPU-only column. The
+    numbers that are there are valid; the blanks now mean "not measured", not
+    "not supported". Re-running the mbp-m2-max matrix would close this.
+
+    One trap survives from the old text and is worth keeping: a new IOSurface
+    format needs a FourCC + bytes-per-element mapping in
+    `tensor::iosurface::image_fourcc_and_bpe` *and* a matching
+    `EGL_TEXTURE_INTERNAL_FORMAT_ANGLE` entry in
+    `image::gl::iosurface_import::ImageLayout::gl_internal_format`. Get those
+    out of step and ANGLE validates the pairing at
+    `eglCreatePbufferFromClientBuffer` time and returns a bare
+    `EGL_BAD_ATTRIBUTE` that says nothing about which side is wrong.
 
 ---
 
@@ -1269,6 +1297,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.9 | 2026-06-16 | 0.25.0 release refresh: full bench matrix re-collected on the converged-GL-engine code across imx8mp-frdm, imx95-frdm, rpi5-hailo, and jetson-orin-nano, plus the existing mbp-m2-max rows. Confirms the GL-convergence captures within measurement noise (imx95 GL 1080p YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no GPU regressions. Allocation table updated for the imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p). macOS GL rows remain the pre-convergence capture (Known Gap #17). |
 | 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA same-size convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Add mbp-m2-max **CPU-only** rows to letterbox / decoder / mask-decode / codec tables; add mbp-m2-max **GL** rows (YUYV→RGBA only) to the same-size format-conversion and 4K-convert tables. Letterbox GL rows pending Gap #17 closure. |
 | 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |
 | 3.6 | 2026-05-17 | Add decode→letterbox pipeline benchmark (`decode_pipeline_benchmark`, `pipeline_demo`): cross-platform results on imx8mp-frdm, imx95-frdm, rpi5-hailo, orin-nano, x86-desktop. Zero heap allocations verified on all DMA-BUF platforms via strace. Auto-detect DMA/PBO/Mem memory type. |

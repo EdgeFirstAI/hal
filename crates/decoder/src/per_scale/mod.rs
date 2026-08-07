@@ -19,8 +19,12 @@ pub use helper::apply_schema_quant;
 /// 10-bit mantissa precision — empirically safe for YOLO-family models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeDtype {
+    /// 32-bit float output (default).
     #[default]
     F32,
+    /// 16-bit float output. Halves the memory bandwidth of the decode
+    /// pipeline; on aarch64 it also keeps the NEON FP16 kernels in their
+    /// native width instead of widening.
     F16,
 }
 

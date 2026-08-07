@@ -4,7 +4,7 @@
 
 `edgefirst-hal` is the umbrella crate for the EdgeFirst Hardware Abstraction
 Layer. Its job is to give downstream applications a single dependency that
-re-exports the four core HAL crates, plus an optional process-wide tracing
+re-exports the core HAL crates, plus an optional process-wide tracing
 subscriber for end-to-end performance analysis. The umbrella owns no domain
 types of its own — every type a user interacts with is defined in one of the
 sub-crates.
@@ -13,18 +13,25 @@ sub-crates.
 
 | Module | Source | Re-exports / owns |
 |--------|--------|-------------------|
-| `edgefirst_hal::tensor` | `edgefirst-tensor` | Zero-copy tensor memory (DMA, SHM, PBO, system memory) |
+| `edgefirst_hal::tensor` | `edgefirst-tensor` | Zero-copy tensor memory (platform GPU buffer, SHM, PBO, system memory) |
+| `edgefirst_hal::codec` | `edgefirst-codec` | JPEG/PNG decode into pre-allocated tensors (`ImageDecoder`, `ImageLoad`) |
 | `edgefirst_hal::image` | `edgefirst-image` | Hardware-accelerated image processing (OpenGL, G2D, CPU) |
 | `edgefirst_hal::decoder` | `edgefirst-decoder` | ML model output decoding (YOLOv5/v8/v11/v26, ModelPack) |
 | `edgefirst_hal::tracker` | `edgefirst-tracker` (feature `tracker`) | ByteTrack multi-object tracking |
 | `edgefirst_hal::trace` | local (feature `tracing`) | Process-wide span subscriber + Chrome/Perfetto trace capture |
 
+Note the two decoders, which are unrelated: `codec` decodes *images* into
+tensors at the front of the pipeline, `decoder` decodes *model outputs* into
+detections at the back.
+
 ## Key Types
 
 The umbrella owns only the tracing API:
 
-- [`trace::start_tracing(path)`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs) — install the global subscriber and begin writing spans to `path`.
-- [`trace::stop_tracing()`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs) — flush and close the trace file.
+- [`trace::start_tracing(path)`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs) — install the global subscriber and begin writing spans to `path`. Returns `Result<(), TracingError>`.
+- [`trace::stop_tracing()`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs) — flush and close the trace file. A no-op when no session is active.
+- [`trace::is_tracing_active()`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs) — whether a session is capturing right now.
+- `trace::TracingError` — `AlreadyActive`, `SessionExhausted` (a session was already started and stopped; only one is allowed per process), or `SubscriberInstallFailed` (user code installed its own global subscriber first).
 
 All other public types live in the sub-crates. See each sub-crate's
 ARCHITECTURE.md for the type-level detail.
@@ -50,8 +57,9 @@ call to `start_tracing`. The subscriber consists of a
 [`tracing-chrome`](https://docs.rs/tracing-chrome) layer that writes spans to a
 JSON file viewable at <https://ui.perfetto.dev/>.
 
-Sub-crate hot paths emit `tracing::trace_span!` spans with near-zero overhead
-when no subscriber is active (a single relaxed atomic load per span site). The
+Every sub-crate emits `tracing::trace_span!` spans on its hot paths — tensor,
+codec, image, decoder, and tracker alike — with near-zero overhead when no
+subscriber is active (a single relaxed atomic load per span site). The
 umbrella's tracing layer is what activates them. See
 [Performance Tracing](https://github.com/EdgeFirstAI/hal/blob/main/README.md#performance-tracing)
 in the project README for the user-facing guide and span name reference.
