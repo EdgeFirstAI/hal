@@ -21,7 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to that row's pixels, so neither stride padding nor the pixels beside a view
   are touched. Previously `Rgba`→`Rgba` and `Rgb`→`Rgb` into a view failed
   outright with `InvalidShape` rather than mis-writing. Output into an
-  exact-sized destination is unchanged, byte for byte.
+  exact-sized destination is unchanged, byte for byte — except for odd-width
+  YUYV, which was already wrong and is corrected below.
+- **Odd-width YUYV destinations** (`edgefirst-image`): `Rgb`/`Rgba`/`Grey` →
+  `Yuyv` encoded each 4-byte `[Y0,U,Y1,V]` macropixel by walking the whole
+  destination buffer as one run, which paired chroma **across row boundaries**
+  at an odd width — every row after the first took its U/V from the wrong
+  pixels, and the final two bytes of the buffer were never written at all.
+  Each row is now encoded independently, and the trailing unpaired pixel an odd
+  width leaves over gets its own `[Y, U]` written (a row is `width × 2` bytes,
+  which structurally has no room for that pixel's `V`). Even widths are
+  unaffected.
 
 ## [0.28.0] - 2026-08-06
 

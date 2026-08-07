@@ -1613,6 +1613,119 @@ mod cpu_tests {
         assert_eq!(data[32 + center_idx], 0); // B
     }
 
+    /// The semi-planar letterbox fill splits luma from chroma at
+    /// `row_stride * height` and advances both planes by the stride. Nv16
+    /// tensors *always* carry a 64-byte-aligned stride wider than the logical
+    /// width, so this is the normal case, not an edge case — the plane boundary
+    /// and every row offset move with the pitch.
+    #[test]
+    fn test_fill_image_outside_crop_nv16_strided() {
+        const SENTINEL: u8 = 0x11;
+        let (w, h) = (96usize, 8usize);
+
+        let mut dst = TensorDyn::image(
+            w,
+            h,
+            PixelFormat::Nv16,
+            DType::U8,
+            mem(),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+
+        let stride = dst.effective_row_stride().unwrap();
+        assert!(
+            stride > w,
+            "test needs a padded Nv16 destination to be meaningful (stride={stride}, w={w})"
+        );
+        {
+            let t = dst.as_u8_mut().unwrap();
+            let mut map = t.map_mut().unwrap();
+            assert_eq!(
+                map.as_slice().len(),
+                stride * h * 2,
+                "Nv16 maps luma + full-height chroma at the padded pitch"
+            );
+            map.as_mut_slice().fill(SENTINEL);
+        }
+
+        // The fill colour resolved exactly as `fill_image_outside_crop_u8` does.
+        let rgba = [255u8, 0, 0, 255];
+        let (y_fill, u_fill, v_fill) = {
+            let t = dst.as_u8().unwrap();
+            let cm = crate::colorimetry::resolve_colorimetry(t.colorimetry(), t.height());
+            let cp = crate::cpu::ColorParams {
+                matrix: crate::colorimetry::yuv_matrix(cm.encoding.unwrap()),
+                range: crate::colorimetry::yuv_range(cm.range.unwrap()),
+                encoding: cm.encoding.unwrap(),
+                range_kind: cm.range.unwrap(),
+                src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
+                dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
+            };
+            let yuyv = CPUProcessor::rgba_to_yuyv(rgba, cp);
+            (yuyv[0], yuyv[1], yuyv[3])
+        };
+        assert_ne!(y_fill, SENTINEL, "fill luma must differ from the sentinel");
+
+        // Content occupies columns 32..64 of rows 2..6; everything else is border.
+        let crop = Rect::new(32, 2, 32, 4);
+        CPUProcessor::fill_image_outside_crop_u8(dst.as_u8_mut().unwrap(), rgba, crop).unwrap();
+
+        let t = dst.as_u8().unwrap();
+        let map = t.map().unwrap();
+        let data = map.as_slice();
+        let (luma, chroma) = data.split_at(stride * h);
+
+        for y in 0..h {
+            let border_row = y < crop.top || y >= crop.top + crop.height;
+            for x in 0..w {
+                let inside = !border_row && x >= crop.left && x < crop.left + crop.width;
+                let want = if inside { SENTINEL } else { y_fill };
+                assert_eq!(
+                    luma[y * stride + x],
+                    want,
+                    "luma ({x},{y}): expected {want:#04x} (inside_crop={inside})"
+                );
+            }
+            // Row padding past the logical width must never be filled.
+            for x in w..stride {
+                assert_eq!(
+                    luma[y * stride + x],
+                    SENTINEL,
+                    "luma row {y} padding byte {x} was filled"
+                );
+            }
+        }
+
+        // Nv16 chroma is full height with one (Cb,Cr) pair per two luma columns,
+        // so the border maps to half-width columns at the SAME pitch.
+        for y in 0..h {
+            let border_row = y < crop.top || y >= crop.top + crop.height;
+            for cx in 0..w / 2 {
+                let inside =
+                    !border_row && cx >= crop.left / 2 && cx < (crop.left + crop.width) / 2;
+                let (want_u, want_v) = if inside {
+                    (SENTINEL, SENTINEL)
+                } else {
+                    (u_fill, v_fill)
+                };
+                let off = y * stride + cx * 2;
+                assert_eq!(
+                    (chroma[off], chroma[off + 1]),
+                    (want_u, want_v),
+                    "chroma pair {cx} of row {y} (inside_crop={inside})"
+                );
+            }
+            for x in w..stride {
+                assert_eq!(
+                    chroma[y * stride + x],
+                    SENTINEL,
+                    "chroma row {y} padding byte {x} was filled"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_convert_rgba_to_bgra() {
         use edgefirst_tensor::TensorMemory;

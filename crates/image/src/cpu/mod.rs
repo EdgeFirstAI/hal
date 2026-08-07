@@ -917,9 +917,17 @@ impl CPUProcessor {
                 {
                     let tmp_u8 = tmp.as_u8().unwrap();
                     let (rows, row_len) = logical_surface(tmp_u8)?;
+                    let src_stride = tensor_row_stride(tmp_u8);
                     let dst_stride_bytes = dst.effective_row_stride().ok_or(Error::NotAnImage)?;
                     let src_map = tmp_u8.map_read()?;
-                    let src_rows = src_map.as_slice().chunks(row_len).take(rows);
+                    guard_plane(
+                        src_map.as_slice().len(),
+                        src_stride,
+                        rows,
+                        row_len,
+                        "widen src",
+                    )?;
+                    let src_rows = src_map.as_slice().chunks(src_stride).take(rows);
                     let elem = d.size();
                     if !dst_stride_bytes.is_multiple_of(elem) {
                         return Err(Error::InvalidShape(format!(
@@ -932,6 +940,14 @@ impl CPUProcessor {
                         DType::F32 => {
                             let dst_t = dst.as_f32_mut().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
+                            // Counted in elements, not bytes — same invariant.
+                            guard_plane(
+                                dst_map.as_slice().len(),
+                                dst_stride,
+                                rows,
+                                row_len,
+                                "widen f32 dst",
+                            )?;
                             // NEON-accelerated u8→f32 `/255` widen (bit-identical
                             // to the scalar `b as f32 / 255.0`); the scalar
                             // iterator form did not vectorise. See cpu::simd.
@@ -944,6 +960,13 @@ impl CPUProcessor {
                         DType::F16 => {
                             let dst_t = dst.as_f16_mut().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
+                            guard_plane(
+                                dst_map.as_slice().len(),
+                                dst_stride,
+                                rows,
+                                row_len,
+                                "widen f16 dst",
+                            )?;
                             // u8→f16 `/255` widen; uses native FP16
                             // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
                             // (Orin), scalar `half::f16::from_f32` elsewhere.

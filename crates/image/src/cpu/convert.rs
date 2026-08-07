@@ -40,6 +40,38 @@ fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
     }
 }
 
+/// One row of a YUYV-destination convert, split into its whole macropixels and
+/// the trailing unpaired pixel an odd width leaves over. See [`split_yuyv_row`].
+type YuyvRowSplit<'s, 'd> = (&'s [u8], &'d mut [u8], Option<(&'s [u8], &'d mut [u8])>);
+
+/// Split one row of a YUYV-destination convert into its whole macropixels and,
+/// at an odd width, the trailing unpaired pixel.
+///
+/// YUYV packs two pixels into a 4-byte `[Y0, U, Y1, V]` macropixel, so an
+/// odd-width row ends with a pixel that has no partner. Its destination is the
+/// 2 bytes `[Y, U]` — a row is `width * 2` bytes, which leaves no room for the
+/// trailing `V`, so that pixel's chroma is necessarily half-written whatever we
+/// do. Encoding it anyway is still right: the alternative is leaving whatever
+/// the destination held before, and a caller that did not pre-clear its buffer
+/// then reads stale bytes as pixel data.
+///
+/// Returns `(paired_src, paired_dst, tail)`; `tail` is `None` at even widths.
+fn split_yuyv_row<'s, 'd>(
+    src: &'s [u8],
+    dst: &'d mut [u8],
+    src_bpp: usize,
+) -> YuyvRowSplit<'s, 'd> {
+    let pairs = dst.len() / 4;
+    let (dst_pairs, dst_tail) = dst.split_at_mut(pairs * 4);
+    let (src_pairs, src_tail) = src.split_at((pairs * 2 * src_bpp).min(src.len()));
+    let tail = if dst_tail.len() >= 2 && src_tail.len() >= src_bpp {
+        Some((src_tail, dst_tail))
+    } else {
+        None
+    };
+    (src_pairs, dst_pairs, tail)
+}
+
 /// Select the luma-encode mapping for grey→YUV. Full-range destinations keep
 /// the grey value as Y directly; limited-range destinations compress it into
 /// 16..=235.
@@ -878,6 +910,7 @@ impl CPUProcessor {
         // Full-range luma maps directly into Y; limited-range compresses it.
         let y_enc = luma_encoder(cp.dst_full_range);
         Self::for_each_row(src, dst, "grey→yuyv", |s, d| {
+            let (s, d, tail) = split_yuyv_row(s, d, 1);
             for (s, d) in s
                 .as_chunks::<2>()
                 .0
@@ -889,6 +922,10 @@ impl CPUProcessor {
 
                 d[2] = y_enc(s[1]);
                 d[3] = 128;
+            }
+            if let Some((s, d)) = tail {
+                d[0] = y_enc(s[0]);
+                d[1] = 128;
             }
         })
     }
@@ -992,6 +1029,7 @@ impl CPUProcessor {
         };
 
         Self::for_each_row(src, dst, "rgba→yuyv", |src, dst| {
+            let (src, dst, tail) = split_yuyv_row(src, dst, 4);
             let src = src.as_chunks::<{ 8 * 32 }>();
             let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
 
@@ -1007,6 +1045,13 @@ impl CPUProcessor {
             let d = dst.1.as_chunks_mut::<4>().0;
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 process_rgba_to_yuyv(s, d);
+            }
+
+            if let Some((s, d)) = tail {
+                let mut pair = [0u8; 4];
+                process_rgba_to_yuyv(&[s[0], s[1], s[2], s[3], s[0], s[1], s[2], s[3]], &mut pair);
+                d[0] = pair[0];
+                d[1] = pair[1];
             }
         })
     }
@@ -1114,6 +1159,7 @@ impl CPUProcessor {
         };
 
         Self::for_each_row(src, dst, "rgb→yuyv", |src, dst| {
+            let (src, dst, tail) = split_yuyv_row(src, dst, 3);
             let src = src.as_chunks::<{ 6 * 32 }>();
             let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
             for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
@@ -1128,6 +1174,13 @@ impl CPUProcessor {
             let d = dst.1.as_chunks_mut::<4>().0;
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 process_rgb_to_yuyv(s, d);
+            }
+
+            if let Some((s, d)) = tail {
+                let mut pair = [0u8; 4];
+                process_rgb_to_yuyv(&[s[0], s[1], s[2], s[0], s[1], s[2]], &mut pair);
+                d[0] = pair[0];
+                d[1] = pair[1];
             }
         })
     }

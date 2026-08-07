@@ -3849,6 +3849,19 @@ where
     /// whole tensor are the one coherent destination model — there is no
     /// separate `dst_rect`.
     ///
+    /// # Known limitation: bottom-right multi-row views
+    ///
+    /// A multi-row view is mapped as `parent_pitch × rows` bytes **from its own
+    /// offset**, so the window it asks for overruns the allocation by
+    /// `region.x * bpp` whenever the view is both offset horizontally *and*
+    /// reaches the parent's last row. Such a view constructs fine but fails at
+    /// [`map`](TensorTrait::map) time with [`Error::InsufficientCapacity`] —
+    /// loudly, never as an out-of-bounds access. For a tiled destination this is
+    /// the bottom row of tiles at every column but the first. The single-row
+    /// case is already special-cased below (it keeps its own tight stride); the
+    /// general fix is to clamp the last row's exposure to the view's own row
+    /// bytes, which is not yet implemented.
+    ///
     /// # Errors
     ///
     /// - [`Error::RegionOutOfBounds`] if `region` exceeds the image bounds.
