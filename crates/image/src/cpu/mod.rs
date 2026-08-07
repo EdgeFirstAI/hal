@@ -253,6 +253,50 @@ fn tensor_row_stride(tensor: &Tensor<u8>) -> usize {
     })
 }
 
+/// The `(rows, row_bytes)` of an image tensor's **logical** pixel surface: how
+/// many rows a converter may write, and how many bytes of each row are pixels.
+///
+/// Everything between `row_bytes` and [`tensor_row_stride`] is off-limits. For
+/// an allocation-padded tensor those bytes are dead padding; for a
+/// [`Tensor::view`](edgefirst_tensor::Tensor::view) destination they are the
+/// **parent image's neighbouring columns**, so a writer that treats the mapped
+/// slice as one flat buffer both mis-places its own rows and corrupts pixels
+/// that are not its to write.
+fn logical_surface(tensor: &Tensor<u8>) -> Result<(usize, usize)> {
+    use edgefirst_tensor::PixelLayout;
+    let fmt = tensor.format().ok_or(Error::NotAnImage)?;
+    let w = tensor.width().ok_or(Error::NotAnImage)?;
+    let h = tensor.height().ok_or(Error::NotAnImage)?;
+    Ok(match fmt.layout() {
+        PixelLayout::Packed => (h, w * fmt.channels()),
+        PixelLayout::Planar => (fmt.channels() * h, w),
+        PixelLayout::SemiPlanar => (fmt.combined_plane_height(h).unwrap_or(h), w),
+        // `PixelLayout` is non-exhaustive; treat any future layout as one row
+        // per shape row at the tensor's own pitch (see `row_stride_for`).
+        _ => (h, row_stride_for(w, fmt)),
+    })
+}
+
+/// Iterate `(src_row, dst_row)` pairs over a pair of image surfaces, each row
+/// clipped to its own logical width so neither side's stride padding — nor a
+/// view destination's neighbouring parent pixels — is read or written.
+///
+/// Callers must have validated both surfaces with [`guard_plane`] first.
+fn packed_row_pairs<'s, 'd>(
+    src: &'s [u8],
+    src_stride: usize,
+    src_row_bytes: usize,
+    dst: &'d mut [u8],
+    dst_stride: usize,
+    dst_row_bytes: usize,
+    rows: usize,
+) -> impl Iterator<Item = (&'s [u8], &'d mut [u8])> {
+    src.chunks(src_stride)
+        .zip(dst.chunks_mut(dst_stride))
+        .take(rows)
+        .map(move |(s, d)| (&s[..src_row_bytes], &mut d[..dst_row_bytes]))
+}
+
 /// Split a contiguous semi-planar (NV12/NV16/NV24) tensor's mapped bytes into
 /// `(luma, chroma)` planes at the `stride * src_h` boundary, validating the map
 /// holds the full combined plane first. A bare `split_at` would panic if an
@@ -357,6 +401,37 @@ pub(crate) fn apply_int8_xor_bias(data: &mut [u8], fmt: PixelFormat) {
             }
         }
     }
+}
+
+/// Row-confined [`apply_int8_xor_bias`] for a destination whose row pitch may
+/// exceed its pixel bytes — an allocation-padded tensor, or a `Tensor::view()`
+/// whose pitch is the parent's and whose trailing bytes are the parent's
+/// neighbouring pixels.
+fn apply_int8_xor_bias_rows(tensor: &mut Tensor<u8>, fmt: PixelFormat) -> Result<()> {
+    use edgefirst_tensor::PixelLayout;
+    let (rows, row_bytes) = logical_surface(tensor)?;
+    let stride = tensor_row_stride(tensor);
+    // A planar alpha channel is a whole trailing plane, so the rows to bias are
+    // the leading `channels - 1` planes rather than a prefix of each row.
+    let color_rows = if fmt.has_alpha() && fmt.layout() == PixelLayout::Planar {
+        rows / fmt.channels() * (fmt.channels() - 1)
+    } else {
+        rows
+    };
+    // Within a colour row the packed-alpha skip still applies; a planar row is
+    // all colour, so bias it as a format without alpha.
+    let row_fmt = if fmt.layout() == PixelLayout::Planar {
+        PixelFormat::Grey
+    } else {
+        fmt
+    };
+    let mut map = tensor.map_mut()?;
+    let buf = map.as_mut_slice();
+    guard_plane(buf.len(), stride, rows, row_bytes, "int8 bias dst")?;
+    for row in buf.chunks_mut(stride).take(color_rows) {
+        apply_int8_xor_bias(&mut row[..row_bytes], row_fmt);
+    }
+    Ok(())
 }
 
 impl CPUProcessor {
@@ -588,7 +663,7 @@ impl CPUProcessor {
                 Self::swizzle_rb_4chan(dst)
             }
             (Rgba, Bgra) => {
-                dst.map_mut()?.copy_from_slice(&src.map_read()?);
+                Self::copy_image(src, dst)?;
                 Self::swizzle_rb_4chan(dst)
             }
             (Rgb, Bgra) => {
@@ -633,14 +708,18 @@ impl CPUProcessor {
             src_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
             dst_full_range: cm.range == Some(edgefirst_tensor::ColorRange::Full),
         };
+        let dst_stride = tensor_row_stride(dst);
         let mut dst_map = dst.map_mut()?;
-        let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h);
+        let dst_tup = (dst_map.as_mut_slice(), dst_w, dst_h, dst_stride);
         Self::fill_outside_crop_dispatch(dst_tup, dst_fmt, rgba, crop, cp)
     }
 
-    /// Common fill dispatch by format.
+    /// Common fill dispatch by format. The tuple is
+    /// `(bytes, logical_width, logical_height, row_stride)` — the stride is the
+    /// destination's real byte pitch, which for a `view()` destination is the
+    /// parent image's, not `width × bpp`.
     fn fill_outside_crop_dispatch(
-        dst: (&mut [u8], usize, usize),
+        dst: (&mut [u8], usize, usize, usize),
         fmt: PixelFormat,
         rgba: [u8; 4],
         crop: Rect,
@@ -652,7 +731,7 @@ impl CPUProcessor {
             Rgb => Self::fill_image_outside_crop_(dst, Self::rgba_to_rgb(rgba), crop),
             Grey => Self::fill_image_outside_crop_(dst, Self::rgba_to_grey(rgba), crop),
             Yuyv => Self::fill_image_outside_crop_(
-                (dst.0, dst.1 / 2, dst.2),
+                (dst.0, dst.1 / 2, dst.2, dst.3),
                 Self::rgba_to_yuyv(rgba, cp),
                 Rect::new(crop.left / 2, crop.top, crop.width.div_ceil(2), crop.height),
             ),
@@ -794,9 +873,7 @@ impl CPUProcessor {
                     src_u8, dst_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
                 )?;
                 // Apply XOR 0x80 bias in-place (u8 → i8 conversion)
-                let mut map = dst_u8.map_mut()?;
-                apply_int8_xor_bias(map.as_mut_slice(), dst_fmt);
-                Ok(())
+                apply_int8_xor_bias_rows(dst_u8, dst_fmt)
             }
             (DType::U8, d @ (DType::F32 | DType::F16)) => {
                 let src_u8 = src.as_u8().unwrap();
@@ -830,28 +907,52 @@ impl CPUProcessor {
                 }
                 // Widen the u8 scratch into the float destination, then restore
                 // the scratch for reuse on the next call.
+                //
+                // The scratch is tight, but `dst` need not be: an allocation-
+                // padded float tensor, or a `Tensor::view()` whose pitch is the
+                // parent's, has a wider row than its pixels. Widen row by row so
+                // each output row lands at the destination's own pitch and the
+                // bytes past it stay untouched. On a tight destination the two
+                // pitches coincide and this is the previous flat widen.
                 {
                     let tmp_u8 = tmp.as_u8().unwrap();
+                    let (rows, row_len) = logical_surface(tmp_u8)?;
+                    let dst_stride_bytes = dst.effective_row_stride().ok_or(Error::NotAnImage)?;
                     let src_map = tmp_u8.map_read()?;
+                    let src_rows = src_map.as_slice().chunks(row_len).take(rows);
+                    let elem = d.size();
+                    if !dst_stride_bytes.is_multiple_of(elem) {
+                        return Err(Error::InvalidShape(format!(
+                            "{d} destination row stride {dst_stride_bytes} is not a multiple of \
+                             the element size {elem}"
+                        )));
+                    }
+                    let dst_stride = dst_stride_bytes / elem;
                     match d {
                         DType::F32 => {
                             let dst_t = dst.as_f32_mut().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
-                            debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
                             // NEON-accelerated u8→f32 `/255` widen (bit-identical
                             // to the scalar `b as f32 / 255.0`); the scalar
                             // iterator form did not vectorise. See cpu::simd.
-                            simd::widen_u8_to_f32_norm(src_map.as_slice(), dst_map.as_mut_slice());
+                            for (s, dr) in
+                                src_rows.zip(dst_map.as_mut_slice().chunks_mut(dst_stride))
+                            {
+                                simd::widen_u8_to_f32_norm(s, &mut dr[..row_len]);
+                            }
                         }
                         DType::F16 => {
                             let dst_t = dst.as_f16_mut().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
-                            debug_assert_eq!(src_map.as_slice().len(), dst_map.as_slice().len());
                             // u8→f16 `/255` widen; uses native FP16
                             // (`ucvtf`+`fdiv`) at runtime on FEAT_FP16 CPUs
                             // (Orin), scalar `half::f16::from_f32` elsewhere.
                             // See cpu::simd.
-                            simd::widen_u8_to_f16_norm(src_map.as_slice(), dst_map.as_mut_slice());
+                            for (s, dr) in
+                                src_rows.zip(dst_map.as_mut_slice().chunks_mut(dst_stride))
+                            {
+                                simd::widen_u8_to_f16_norm(s, &mut dr[..row_len]);
+                            }
                         }
                         _ => unreachable!(),
                     }

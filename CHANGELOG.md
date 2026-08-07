@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CPU format converts into a destination view** (`edgefirst-image`): a
+  `convert()` whose destination was a `Tensor::view()` of a **wider** parent
+  wrote its rows tightly packed into the head of the parent buffer instead of
+  at the parent's row pitch, so a 16×8 view of a 64×48 RGBA parent landed as a
+  64×2 band and left the rest of the view untouched. The 0.28.0 fix covered the
+  resize path; the pure format-convert writers still assumed `width × bpp`. The
+  packed writers (`Rgb`/`Rgba`/`Bgra`/`Grey`/`Yuyv`), the same-format copy, the
+  BGRA channel swizzle, the letterbox border fill, the int8 bias, and the
+  float widen now all take the destination's real pitch and confine each write
+  to that row's pixels, so neither stride padding nor the pixels beside a view
+  are touched. Previously `Rgba`→`Rgba` and `Rgb`→`Rgb` into a view failed
+  outright with `InvalidShape` rather than mis-writing. Output into an
+  exact-sized destination is unchanged, byte for byte.
+
 ## [0.28.0] - 2026-08-06
 
 ### Added

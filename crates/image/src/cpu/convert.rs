@@ -486,11 +486,11 @@ impl CPUProcessor {
             height: src_h as u32,
         };
 
-        let dst_w = dst.width().unwrap();
+        let dst_rs = super::tensor_row_stride(dst);
         Ok(yuv::yuyv422_to_rgb(
             &src,
             dst.map_mut()?.as_mut_slice(),
-            dst_w as u32 * 3,
+            dst_rs as u32,
             cp.range,
             cp.matrix,
         )?)
@@ -663,11 +663,11 @@ impl CPUProcessor {
             height: src_h as u32,
         };
 
-        let dst_w = dst.width().unwrap();
+        let dst_rs = super::tensor_row_stride(dst);
         Ok(yuv::vyuy422_to_rgb(
             &src,
             dst.map_mut()?.as_mut_slice(),
-            dst_w as u32 * 3,
+            dst_rs as u32,
             cp.range,
             cp.matrix,
         )?)
@@ -877,24 +877,20 @@ impl CPUProcessor {
     ) -> Result<()> {
         // Full-range luma maps directly into Y; limited-range compresses it.
         let y_enc = luma_encoder(cp.dst_full_range);
-        let src = src.map_read()?;
-        let src = src.as_slice();
+        Self::for_each_row(src, dst, "grey→yuyv", |s, d| {
+            for (s, d) in s
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(d.as_chunks_mut::<4>().0.iter_mut())
+            {
+                d[0] = y_enc(s[0]);
+                d[1] = 128;
 
-        let mut dst = dst.map_mut()?;
-        let dst = dst.as_mut_slice();
-        for (s, d) in src
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(dst.as_chunks_mut::<4>().0.iter_mut())
-        {
-            d[0] = y_enc(s[0]);
-            d[1] = 128;
-
-            d[2] = y_enc(s[1]);
-            d[3] = 128;
-        }
-        Ok(())
+                d[2] = y_enc(s[1]);
+                d[3] = 128;
+            }
+        })
     }
 
     pub(super) fn convert_grey_to_nv16(
@@ -938,11 +934,13 @@ impl CPUProcessor {
     pub(super) fn convert_rgba_to_rgb(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
+        let src_rs = super::tensor_row_stride(src);
+        let dst_rs = super::tensor_row_stride(dst);
         Ok(yuv::rgba_to_rgb(
             src.map_read()?.as_slice(),
-            (src_w * 4) as u32,
+            src_rs as u32,
             dst.map_mut()?.as_mut_slice(),
-            (dst.width().unwrap() * 3) as u32,
+            dst_rs as u32,
             src_w as u32,
             src_h as u32,
         )?)
@@ -983,12 +981,6 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        let src = src.map_read()?;
-        let src = src.as_slice();
-
-        let mut dst = dst.map_mut()?;
-        let dst = dst.as_mut_slice();
-
         // RGB→YUV coefficients resolved from the destination colorimetry.
         let c = YuyvEncodeCoeffs::from_params(cp);
         let process_rgba_to_yuyv = |s: &[u8; 8], d: &mut [u8; 4]| {
@@ -999,24 +991,24 @@ impl CPUProcessor {
             );
         };
 
-        let src = src.as_chunks::<{ 8 * 32 }>();
-        let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
+        Self::for_each_row(src, dst, "rgba→yuyv", |src, dst| {
+            let src = src.as_chunks::<{ 8 * 32 }>();
+            let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
 
-        for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
-            let s = s.as_chunks::<8>().0;
-            let d = d.as_chunks_mut::<4>().0;
+            for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
+                let s = s.as_chunks::<8>().0;
+                let d = d.as_chunks_mut::<4>().0;
+                for (s, d) in s.iter().zip(d.iter_mut()) {
+                    process_rgba_to_yuyv(s, d);
+                }
+            }
+
+            let s = src.1.as_chunks::<8>().0;
+            let d = dst.1.as_chunks_mut::<4>().0;
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 process_rgba_to_yuyv(s, d);
             }
-        }
-
-        let s = src.1.as_chunks::<8>().0;
-        let d = dst.1.as_chunks_mut::<4>().0;
-        for (s, d) in s.iter().zip(d.iter_mut()) {
-            process_rgba_to_yuyv(s, d);
-        }
-
-        Ok(())
+        })
     }
 
     pub(super) fn convert_rgba_to_nv16(
@@ -1064,11 +1056,13 @@ impl CPUProcessor {
     pub(super) fn convert_rgb_to_rgba(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
         let src_w = src.width().unwrap();
         let src_h = src.height().unwrap();
+        let src_rs = super::tensor_row_stride(src);
+        let dst_rs = super::tensor_row_stride(dst);
         Ok(yuv::rgb_to_rgba(
             src.map_read()?.as_slice(),
-            (src_w * 3) as u32,
+            src_rs as u32,
             dst.map_mut()?.as_mut_slice(),
-            (dst.width().unwrap() * 4) as u32,
+            dst_rs as u32,
             src_w as u32,
             src_h as u32,
         )?)
@@ -1109,12 +1103,6 @@ impl CPUProcessor {
         dst: &mut Tensor<u8>,
         cp: ColorParams,
     ) -> Result<()> {
-        let src = src.map_read()?;
-        let src = src.as_slice();
-
-        let mut dst = dst.map_mut()?;
-        let dst = dst.as_mut_slice();
-
         // RGB→YUV coefficients resolved from the destination colorimetry.
         let c = YuyvEncodeCoeffs::from_params(cp);
         let process_rgb_to_yuyv = |s: &[u8; 6], d: &mut [u8; 4]| {
@@ -1125,23 +1113,23 @@ impl CPUProcessor {
             );
         };
 
-        let src = src.as_chunks::<{ 6 * 32 }>();
-        let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
-        for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
-            let s = s.as_chunks::<6>().0;
-            let d = d.as_chunks_mut::<4>().0;
+        Self::for_each_row(src, dst, "rgb→yuyv", |src, dst| {
+            let src = src.as_chunks::<{ 6 * 32 }>();
+            let dst = dst.as_chunks_mut::<{ 4 * 32 }>();
+            for (s, d) in src.0.iter().zip(dst.0.iter_mut()) {
+                let s = s.as_chunks::<6>().0;
+                let d = d.as_chunks_mut::<4>().0;
+                for (s, d) in s.iter().zip(d.iter_mut()) {
+                    process_rgb_to_yuyv(s, d);
+                }
+            }
+
+            let s = src.1.as_chunks::<6>().0;
+            let d = dst.1.as_chunks_mut::<4>().0;
             for (s, d) in s.iter().zip(d.iter_mut()) {
                 process_rgb_to_yuyv(s, d);
             }
-        }
-
-        let s = src.1.as_chunks::<6>().0;
-        let d = dst.1.as_chunks_mut::<4>().0;
-        for (s, d) in s.iter().zip(d.iter_mut()) {
-            process_rgb_to_yuyv(s, d);
-        }
-
-        Ok(())
+        })
     }
 
     pub(super) fn convert_rgb_to_nv16(
@@ -1186,29 +1174,78 @@ impl CPUProcessor {
         )?)
     }
 
-    pub(super) fn copy_image(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+    /// Run `f(src_row, dst_row)` over the logical rows of a source/destination
+    /// pair, each row clipped to its own pixel bytes.
+    ///
+    /// The row-confined form of "map both tensors and walk the slices": that
+    /// flat walk is only correct when both sides are tightly packed, and it
+    /// silently mis-places every row of a padded destination — or, for a
+    /// `Tensor::view()` destination, packs the whole output into the head of the
+    /// parent buffer and overwrites pixels beside the view.
+    fn for_each_row(
+        src: &Tensor<u8>,
+        dst: &mut Tensor<u8>,
+        what: &str,
+        mut f: impl FnMut(&[u8], &mut [u8]),
+    ) -> Result<()> {
+        let (src_rows, src_row_bytes) = super::logical_surface(src)?;
+        let (dst_rows, dst_row_bytes) = super::logical_surface(dst)?;
+        if src_rows != dst_rows {
+            return Err(Error::InvalidShape(format!(
+                "{what} row-count mismatch: {src_rows} source rows vs {dst_rows} destination rows"
+            )));
+        }
+        let src_stride = super::tensor_row_stride(src);
+        let dst_stride = super::tensor_row_stride(dst);
         let src_map = src.map_read()?;
         let mut dst_map = dst.map_mut()?;
         let (s, d) = (src_map.as_slice(), dst_map.as_mut_slice());
-        // Guard the length before `copy_from_slice` (which panics on mismatch),
-        // for parity with `prepare_dst_base_cpu`.
-        if s.len() != d.len() {
-            return Err(Error::InvalidShape(format!(
-                "copy_image source/destination size mismatch: {} vs {} bytes",
-                s.len(),
-                d.len()
-            )));
+        super::guard_plane(s.len(), src_stride, src_rows, src_row_bytes, what)?;
+        super::guard_plane(d.len(), dst_stride, dst_rows, dst_row_bytes, what)?;
+        for (s, d) in super::packed_row_pairs(
+            s,
+            src_stride,
+            src_row_bytes,
+            d,
+            dst_stride,
+            dst_row_bytes,
+            dst_rows,
+        ) {
+            f(s, d);
         }
-        d.copy_from_slice(s);
         Ok(())
     }
 
+    /// Row-wise copy between two same-format images. Each side is walked at its
+    /// own row pitch, so a padded — or `view()`-derived — destination lands its
+    /// rows at the parent pitch instead of packing them into the buffer head.
+    pub(super) fn copy_image(src: &Tensor<u8>, dst: &mut Tensor<u8>) -> Result<()> {
+        let (src_rows, src_row_bytes) = super::logical_surface(src)?;
+        let (dst_rows, dst_row_bytes) = super::logical_surface(dst)?;
+        if (src_rows, src_row_bytes) != (dst_rows, dst_row_bytes) {
+            return Err(Error::InvalidShape(format!(
+                "copy_image source/destination geometry mismatch: \
+                 {src_rows}x{src_row_bytes} vs {dst_rows}x{dst_row_bytes} bytes"
+            )));
+        }
+        Self::for_each_row(src, dst, "copy_image", |s, d| d.copy_from_slice(s))
+    }
+
     /// Swap R and B channels in-place for an interleaved 4-channel image.
+    ///
+    /// Confined to each row's logical bytes: past them lies stride padding or,
+    /// for a `view()` destination, the parent image's neighbouring pixels, which
+    /// a whole-buffer swizzle would silently recolour.
     pub(super) fn swizzle_rb_4chan(dst: &mut Tensor<u8>) -> Result<()> {
+        let (rows, row_bytes) = super::logical_surface(dst)?;
+        let stride = super::tensor_row_stride(dst);
         let mut map = dst.map_mut()?;
         let buf = map.as_mut_slice();
-        for chunk in buf.chunks_exact_mut(4) {
-            chunk.swap(0, 2);
+        super::guard_plane(buf.len(), stride, rows, row_bytes, "swizzle dst")?;
+        for row in buf.chunks_mut(stride).take(rows) {
+            for chunk in row[..row_bytes].chunks_exact_mut(4) {
+                chunk.swap(0, 2);
+            }
         }
         Ok(())
     }

@@ -116,6 +116,14 @@ when set, or the tight minimum otherwise.  Several callers name the same concept
 differently: `grid_row_stride`, `row_stride`, `bytes_per_row`, `tex_width`, and
 `pitch_width` all refer to this single physical row pitch value.
 
+Every CPU writer must take its pitch from that accessor (via
+`cpu::tensor_row_stride`) and confine each write to that row's pixel bytes,
+which `cpu::logical_surface` reports. Assuming `width * bpp`, or treating the
+mapped slice as one flat buffer, is wrong twice over for a `Tensor::view()`
+destination: its pitch is the **parent's**, and the bytes past each row are the
+parent's neighbouring columns rather than dead padding. `cpu::for_each_row` is
+the shared row-confined walk for source/destination pairs.
+
 The byte size of the backing allocation is `total_combined_height * row_stride`,
 **not** the element-count product of the shape.  `total_combined_height` is the
 combined luma + chroma row count (`PixelFormat::combined_plane_height()`), e.g.
