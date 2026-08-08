@@ -447,47 +447,49 @@ impl CPUProcessor {
         }
     }
 
+    /// Fill the letterbox border of one image surface with `pix`.
+    ///
+    /// Rows advance by `dst_stride`, and each row is clipped to its own
+    /// `dst_width * N` pixel bytes: for an allocation-padded destination the
+    /// remainder is dead padding, and for a `Tensor::view()` destination it is
+    /// the parent image's neighbouring columns — the border must not spill into
+    /// either. On a tightly-packed destination (stride == row bytes) this fills
+    /// exactly the pixels the previous flat-index form did.
     pub(super) fn fill_image_outside_crop_<const N: usize>(
-        (dst, dst_width, _dst_height): (&mut [u8], usize, usize),
+        (dst, dst_width, dst_height, dst_stride): (&mut [u8], usize, usize, usize),
         pix: [u8; N],
         crop: Rect,
     ) -> Result<()> {
-        use rayon::{
-            iter::{IntoParallelRefMutIterator, ParallelIterator},
-            prelude::ParallelSliceMut,
-        };
+        use rayon::{iter::ParallelIterator, prelude::ParallelSliceMut};
 
-        let s = dst.as_chunks_mut::<N>().0;
-        // calculate the top/bottom
-        let top_offset = (0, (crop.top * dst_width + crop.left));
-        let bottom_offset = (
-            ((crop.top + crop.height) * dst_width + crop.left).min(s.len()),
-            s.len(),
-        );
+        let row_bytes = dst_width * N;
+        super::guard_plane(
+            dst.len(),
+            dst_stride,
+            dst_height,
+            row_bytes,
+            "letterbox fill",
+        )?;
 
-        s[top_offset.0..top_offset.1]
-            .par_iter_mut()
-            .for_each(|x| *x = pix);
+        let left = crop.left.min(dst_width);
+        let right = (crop.left + crop.width).min(dst_width);
+        let bottom = crop.top + crop.height;
 
-        s[bottom_offset.0..bottom_offset.1]
-            .par_iter_mut()
-            .for_each(|x| *x = pix);
-
-        if dst_width == crop.width {
-            return Ok(());
-        }
-
-        // the middle part has a stride as well
-        let middle_stride = dst_width - crop.width;
-        let middle_offset = (
-            (crop.top * dst_width + crop.left + crop.width),
-            ((crop.top + crop.height) * dst_width + crop.left + crop.width).min(s.len()),
-        );
-
-        s[middle_offset.0..middle_offset.1]
-            .par_chunks_exact_mut(dst_width)
-            .for_each(|row| {
-                for p in &mut row[0..middle_stride] {
+        dst.par_chunks_mut(dst_stride)
+            .take(dst_height)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let px = row[..row_bytes].as_chunks_mut::<N>().0;
+                let border = if y < crop.top || y >= bottom {
+                    // Whole row is above/below the content.
+                    &mut px[..]
+                } else {
+                    for p in &mut px[..left] {
+                        *p = pix;
+                    }
+                    &mut px[right..]
+                };
+                for p in border {
                     *p = pix;
                 }
             });
@@ -495,82 +497,75 @@ impl CPUProcessor {
         Ok(())
     }
 
+    /// Planar variant: each of the `N` planes is `dst_height` rows of
+    /// `dst_stride` bytes, and gets the border of its own channel value.
     pub(super) fn fill_image_outside_crop_planar<const N: usize>(
-        (dst, dst_width, dst_height): (&mut [u8], usize, usize),
+        (dst, dst_width, dst_height, dst_stride): (&mut [u8], usize, usize, usize),
         pix: [u8; N],
         crop: Rect,
     ) -> Result<()> {
-        use rayon::{
-            iter::{IntoParallelRefMutIterator, ParallelIterator},
-            prelude::ParallelSliceMut,
-        };
+        use rayon::{iter::ParallelIterator, prelude::ParallelSliceMut};
 
-        let s_rem = dst;
+        let plane = dst_stride.checked_mul(dst_height).ok_or_else(|| {
+            Error::InvalidShape(format!(
+                "planar fill plane size overflow (stride={dst_stride}, h={dst_height})"
+            ))
+        })?;
+        // `par_chunks_exact_mut` silently drops a short tail, which zipped with
+        // `pix` would skip planes rather than fail, so require all `N` up front.
+        let need = plane.saturating_mul(N);
+        if dst.len() < need {
+            return Err(Error::InvalidShape(format!(
+                "planar fill dst {} bytes < {N} planes of {plane} (stride={dst_stride}, \
+                 h={dst_height})",
+                dst.len()
+            )));
+        }
 
-        s_rem
-            .par_chunks_exact_mut(dst_height * dst_width)
+        dst.par_chunks_exact_mut(plane)
             .zip(pix)
-            .for_each(|(s, p)| {
-                let top_offset = (0, (crop.top * dst_width + crop.left));
-                let bottom_offset = (
-                    ((crop.top + crop.height) * dst_width + crop.left).min(s.len()),
-                    s.len(),
-                );
-
-                s[top_offset.0..top_offset.1]
-                    .par_iter_mut()
-                    .for_each(|x| *x = p);
-
-                s[bottom_offset.0..bottom_offset.1]
-                    .par_iter_mut()
-                    .for_each(|x| *x = p);
-
-                if dst_width == crop.width {
-                    return;
-                }
-
-                // the middle part has a stride as well
-                let middle_stride = dst_width - crop.width;
-                let middle_offset = (
-                    (crop.top * dst_width + crop.left + crop.width),
-                    ((crop.top + crop.height) * dst_width + crop.left + crop.width).min(s.len()),
-                );
-
-                s[middle_offset.0..middle_offset.1]
-                    .par_chunks_exact_mut(dst_width)
-                    .for_each(|row| {
-                        for x in &mut row[0..middle_stride] {
-                            *x = p;
-                        }
-                    });
-            });
-        Ok(())
+            .try_for_each(|(s, p)| {
+                Self::fill_image_outside_crop_::<1>(
+                    (s, dst_width, dst_height, dst_stride),
+                    [p],
+                    crop,
+                )
+            })
     }
 
     pub(super) fn fill_image_outside_crop_yuv_semiplanar(
-        (dst, dst_width, dst_height): (&mut [u8], usize, usize),
+        (dst, dst_width, dst_height, dst_stride): (&mut [u8], usize, usize, usize),
         y: u8,
         uv: [u8; 2],
         mut crop: Rect,
     ) -> Result<()> {
         // Validate the buffer holds the luma plane before splitting so a
         // caller-supplied (untrusted) dst cannot panic the `split_at_mut`.
-        let luma = dst_width.checked_mul(dst_height).ok_or_else(|| {
+        let luma = dst_stride.checked_mul(dst_height).ok_or_else(|| {
             Error::InvalidShape(format!(
-                "semiplanar fill luma size overflow (w={dst_width}, h={dst_height})"
+                "semiplanar fill luma size overflow (stride={dst_stride}, h={dst_height})"
             ))
         })?;
         if dst.len() < luma {
             return Err(Error::InvalidShape(format!(
-                "semiplanar fill dst {} bytes < luma plane {luma} (w={dst_width}, h={dst_height})",
+                "semiplanar fill dst {} bytes < luma plane {luma} (stride={dst_stride}, \
+                 h={dst_height})",
                 dst.len()
             )));
         }
         let (y_plane, uv_plane) = dst.split_at_mut(luma);
-        Self::fill_image_outside_crop_::<1>((y_plane, dst_width, dst_height), [y], crop)?;
+        Self::fill_image_outside_crop_::<1>(
+            (y_plane, dst_width, dst_height, dst_stride),
+            [y],
+            crop,
+        )?;
         crop.left /= 2;
         crop.width /= 2;
-        Self::fill_image_outside_crop_::<2>((uv_plane, dst_width / 2, dst_height), uv, crop)?;
+        Self::fill_image_outside_crop_::<2>(
+            (uv_plane, dst_width / 2, dst_height, dst_stride),
+            uv,
+            crop,
+        )?;
         Ok(())
     }
 }

@@ -289,9 +289,16 @@ pub(in crate::opengl_headless) struct AngleDisplay {
 
 impl AngleDisplay {
     /// Assemble the capability surface for this display (see
-    /// `PlatformCaps`): IOSurface transfer, float render support from the
-    /// shared display's extension probes, and no process-wide GL
-    /// serialization — ANGLE/Metal contexts run in parallel (A0 spike).
+    /// `PlatformCaps`): IOSurface transfer and float render support from the
+    /// shared display's extension probes.
+    ///
+    /// **Not the live capability surface** — the worker reads
+    /// `GLProcessorST::platform_caps`, which is the single implementation on
+    /// every platform. Kept as the display-level view; note in particular
+    /// that the serialization policy is decided there, by
+    /// `requires_full_serialization`, and is `Full` on ANGLE. This method's
+    /// `serialize_gl` is not consulted.
+    #[allow(dead_code)]
     pub(in crate::opengl_headless) fn platform_caps(&self) -> super::PlatformCaps {
         super::PlatformCaps {
             transfer_backend: super::super::TransferBackend::IOSurface,
@@ -299,7 +306,7 @@ impl AngleDisplay {
                 f32: self.shared.supports_f32_color,
                 f16: self.shared.supports_f16_color,
             },
-            serialize_gl: false,
+            serialize_gl: true,
             external_oes: false,
             native_fence_sync: false,
         }

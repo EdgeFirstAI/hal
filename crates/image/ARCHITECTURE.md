@@ -116,6 +116,14 @@ when set, or the tight minimum otherwise.  Several callers name the same concept
 differently: `grid_row_stride`, `row_stride`, `bytes_per_row`, `tex_width`, and
 `pitch_width` all refer to this single physical row pitch value.
 
+Every CPU writer must take its pitch from that accessor (via
+`cpu::tensor_row_stride`) and confine each write to that row's pixel bytes,
+which `cpu::logical_surface` reports. Assuming `width * bpp`, or treating the
+mapped slice as one flat buffer, is wrong twice over for a `Tensor::view()`
+destination: its pitch is the **parent's**, and the bytes past each row are the
+parent's neighbouring columns rather than dead padding. `cpu::for_each_row` is
+the shared row-confined walk for source/destination pairs.
+
 The byte size of the backing allocation is `total_combined_height * row_stride`,
 **not** the element-count product of the shape.  `total_combined_height` is the
 combined luma + chroma row count (`PixelFormat::combined_plane_height()`), e.g.
@@ -260,6 +268,16 @@ path, no type parameters leaking into the engine):
 `external_oes`, `native_fence_sync`) is captured ONCE per processor at worker startup and
 feeds the pure decision tables — platform differences never appear as
 new `cfg` branches inside the engine.
+
+`serialize_gl` selects between running several processors' GL work in
+parallel and serializing every message process-wide, and it is decided by
+`requires_full_serialization` from the GL_RENDERER string. Parallelism is
+validated on **Mali G310, V3D and Tegra/Orin only**; Vivante (driver races)
+and ANGLE (per-draw state lost under concurrent contexts) are serialized.
+Adding a driver to the parallel set means running it through
+`tests/gl_concurrent_stress.rs` first — ANGLE shipped wrong pixels for a
+release because it was assumed to behave like the drivers that had been
+measured.
 
 **Porting checklist (Windows/ANGLE-D3D11 lands as a leaf, not a
 fork):** implement the trait (`init_display` over a shared
