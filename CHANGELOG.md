@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-08-08
+
+### Fixed
+
+- **Silently wrong pixels under concurrent GL on macOS** (`edgefirst-image`):
+  when one process ran several `ImageProcessor`s with GL work in flight at
+  once, a convert could execute with the per-draw state it had programmed
+  lost — a tiled convert's source region reset to identity, so the
+  destination received the whole source stretched into the tile instead of
+  the requested crop, or received nothing at all. Wrong output, no error.
+  ANGLE (the only GL implementation on macOS) was taking the parallel
+  serialization policy without ever having been validated for it; the policy
+  was measured on Mali, V3D and Tegra only. ANGLE now serializes GL messages
+  process-wide, as Vivante and paravirtual GPUs already did.
+  `EDGEFIRST_GL_SERIALIZE=lifecycle` restores the old behaviour for anyone
+  re-measuring. This costs throughput only where one process drives several
+  processors concurrently — a single-processor pipeline is unaffected — and
+  no other platform's policy changes.
+
+- **CPU format converts into a destination view** (`edgefirst-image`): a
+  `convert()` whose destination was a `Tensor::view()` of a **wider** parent
+  wrote its rows tightly packed into the head of the parent buffer instead of
+  at the parent's row pitch, so a 16×8 view of a 64×48 RGBA parent landed as a
+  64×2 band and left the rest of the view untouched. The 0.28.0 fix covered the
+  resize path; the pure format-convert writers still assumed `width × bpp`. The
+  packed writers (`Rgb`/`Rgba`/`Bgra`/`Grey`/`Yuyv`), the same-format copy, the
+  BGRA channel swizzle, the letterbox border fill, the int8 bias, and the
+  float widen now all take the destination's real pitch and confine each write
+  to that row's pixels, so neither stride padding nor the pixels beside a view
+  are touched. Previously `Rgba`→`Rgba` and `Rgb`→`Rgb` into a view failed
+  outright with `InvalidShape` rather than mis-writing. Output into an
+  exact-sized destination is unchanged, byte for byte — except for odd-width
+  YUYV, which was already wrong and is corrected below.
+- **Odd-width YUYV destinations** (`edgefirst-image`): `Rgb`/`Rgba`/`Grey` →
+  `Yuyv` encoded each 4-byte `[Y0,U,Y1,V]` macropixel by walking the whole
+  destination buffer as one run, which paired chroma **across row boundaries**
+  at an odd width — every row after the first took its U/V from the wrong
+  pixels, and the final two bytes of the buffer were never written at all.
+  Each row is now encoded independently, and the trailing unpaired pixel an odd
+  width leaves over gets its own `[Y, U]` written (a row is `width × 2` bytes,
+  which structurally has no room for that pixel's `V`). The letterbox border
+  fill had the same gap — it filled in whole macropixels and never touched the
+  trailing pixel's bytes — and now fills it under the same rule. Even widths
+  are unaffected.
+
 ## [0.28.0] - 2026-08-06
 
 ### Added

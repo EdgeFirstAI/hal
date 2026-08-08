@@ -1619,3 +1619,105 @@ fn fused_nv_planar_parity_matrix() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Odd-width YUYV destinations
+// ---------------------------------------------------------------------------
+
+/// Convert `src_fmt` → YUYV at `w`×`h` and assert every destination byte was
+/// written — no poison survives.
+///
+/// YUYV packs two pixels per 4-byte `[Y0,U,Y1,V]` macropixel, so an odd width
+/// ends with an unpaired pixel whose row has room for only its `[Y,U]`. The
+/// per-row encoders must still write those 2 bytes; skipping them leaves the
+/// caller reading whatever the buffer held before as pixel data.
+fn yuyv_dst_fully_written(w: usize, h: usize, src_fmt: PixelFormat, label: &str) {
+    const POISON: u8 = 0xAB;
+
+    let mut src = TensorDyn::image(
+        w,
+        h,
+        src_fmt,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    {
+        let mut map = src.as_u8_mut().unwrap().map_mut().unwrap();
+        for (i, b) in map.as_mut_slice().iter_mut().enumerate() {
+            *b = (i.wrapping_mul(37).wrapping_add(11) % 251) as u8;
+        }
+    }
+
+    let mut dst = TensorDyn::image(
+        w,
+        h,
+        PixelFormat::Yuyv,
+        DType::U8,
+        Some(TensorMemory::Mem),
+        edgefirst_tensor::CpuAccess::ReadWrite,
+    )
+    .unwrap();
+    dst.as_u8_mut()
+        .unwrap()
+        .map_mut()
+        .unwrap()
+        .as_mut_slice()
+        .fill(POISON);
+
+    CPUProcessor::default()
+        .convert(&src, &mut dst, Rotation::None, Flip::None, Crop::default())
+        .unwrap_or_else(|e| panic!("{label}: convert failed: {e}"));
+
+    let dst_u8 = dst.as_u8().unwrap();
+    let stride = dst_u8.effective_row_stride().unwrap_or(w * 2);
+    let map = dst_u8.map().unwrap();
+    let out = map.as_slice();
+    let row_bytes = w * 2;
+
+    for y in 0..h {
+        let row = &out[y * stride..y * stride + row_bytes];
+        assert!(
+            !row.iter().all(|&b| b == POISON),
+            "{label}: row {y} was not written at all"
+        );
+        // The trailing pixel of an odd-width row is the regression: it is the
+        // only part a per-row `chunks::<4>()` walk drops.
+        let tail = &row[row_bytes.saturating_sub(2)..];
+        assert!(
+            tail.iter().any(|&b| b != POISON),
+            "{label}: row {y} trailing pixel left unwritten (bytes {tail:?})"
+        );
+    }
+}
+
+#[test]
+fn d7_odd_width_rgb_to_yuyv_writes_every_byte() {
+    for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
+        yuyv_dst_fully_written(w, h, PixelFormat::Rgb, &format!("rgb→yuyv {w}x{h}"));
+    }
+}
+
+#[test]
+fn d7_odd_width_rgba_to_yuyv_writes_every_byte() {
+    for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
+        yuyv_dst_fully_written(w, h, PixelFormat::Rgba, &format!("rgba→yuyv {w}x{h}"));
+    }
+}
+
+#[test]
+fn d7_odd_width_grey_to_yuyv_writes_every_byte() {
+    for (w, h) in [(5, 3), (7, 1), (1, 4), (65, 33)] {
+        yuyv_dst_fully_written(w, h, PixelFormat::Grey, &format!("grey→yuyv {w}x{h}"));
+    }
+}
+
+/// Even-width YUYV must be unchanged by the odd-width tail handling: every
+/// macropixel is a full pair, so the tail branch never runs.
+#[test]
+fn d7_even_width_rgb_to_yuyv_writes_every_byte() {
+    for (w, h) in [(4, 2), (64, 32)] {
+        yuyv_dst_fully_written(w, h, PixelFormat::Rgb, &format!("rgb→yuyv {w}x{h}"));
+    }
+}
