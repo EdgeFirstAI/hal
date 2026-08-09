@@ -42,18 +42,49 @@ jobs:
       - name: Create release tag
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
-          # Same treatment for consistency. These three are GitHub-controlled
-          # (a repo slug, a validated tag, a 40-hex SHA) rather than
+          # Same treatment for consistency. These are GitHub-controlled
+          # (a repo slug, a validated tag, a 40-hex SHA, a PR URL) rather than
           # attacker-controlled, but keeping every expression out of the
           # script body means a reader never has to work out which is which.
           REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
           MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::RELEASE_TAG_TOKEN secret is not set on this repo/org — cannot create release tag."
             exit 1
           fi
+
+          # POST git/refs alone creates a *lightweight* tag: a ref pointing
+          # straight at the commit, with no tag object behind it. `git
+          # describe` without --tags only walks annotated tags, so a
+          # lightweight tag here is invisible to it (and to anything else
+          # that assumes release tags are annotated). An annotated tag is
+          # its own object — tagger, date, message — that the ref then
+          # points to, so it has to be created first via git/tags.
+          #
+          # Not signed: GPG/SSH signing needs a private key available to
+          # the Actions runner, which isn't set up. The unsigned annotated
+          # tag object is still real Git metadata and fixes `git describe`;
+          # signing can be layered on later if the key management exists.
+          MESSAGE=$(printf 'Release %s\n\n%s' "$TAG" "$PR_URL")
+          TAG_SHA=$(jq -n \
+            --arg tag "$TAG" \
+            --arg message "$MESSAGE" \
+            --arg object "$MERGE_SHA" \
+            --arg name "github-actions[bot]" \
+            --arg email "support@edgefirst.ai" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{tag: $tag, message: $message, object: $object, type: "commit",
+              tagger: {name: $name, email: $email, date: $date}}' \
+            | gh api "repos/${REPO}/git/tags" --input - --jq '.sha')
+
+          if [ -z "$TAG_SHA" ]; then
+            echo "::error::Failed to create annotated tag object for ${TAG}."
+            exit 1
+          fi
+
           gh api "repos/${REPO}/git/refs" \
             -f ref="refs/tags/${TAG}" \
-            -f sha="${MERGE_SHA}"
+            -f sha="${TAG_SHA}"

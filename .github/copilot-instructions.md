@@ -179,10 +179,13 @@ Merging the release PR triggers `.github/workflows/tag-release.yml`, which:
 - runs only for merged PRs whose head branch matches `release/X.Y.Z`
   (strict three-field numeric version, no suffixes)
 - derives the tag name `vX.Y.Z` from the branch name
-- creates the tag at the PR's merge commit through the GitHub API,
+- creates an **annotated** (unsigned) tag object at the PR's merge commit
+  through the GitHub API, then points `refs/tags/vX.Y.Z` at it —
   authenticated with the `RELEASE_TAG_TOKEN` secret (a PAT, so the new tag
   still triggers `release.yml`; the workflow fails with a clear error if
-  the secret is missing)
+  the secret is missing). Annotated, because plain `git describe` (no
+  `--tags`) only walks annotated tags — a lightweight tag would be
+  invisible to it.
 
 **Never run `git tag` for a release** — manual tagging has been removed
 from the process. If the tag does not appear after the merge, inspect the
