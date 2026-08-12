@@ -1,0 +1,4 @@
+# Host build artefacts must not reach a build context: the benchmark image
+# compiles the TurboJPEG arm itself, and a host-built binary would be linked
+# against the wrong glibc.
+benchmarks/modules/turbojpeg/build/

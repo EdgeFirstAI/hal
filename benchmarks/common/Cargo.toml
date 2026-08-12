@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "edgefirst-bench-common"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared helpers for EdgeFirst Article-1 JPEG→letterbox benchmark modules"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+edgefirst-codec = { path = "../../crates/codec" }
+edgefirst-hal = { path = "../../crates/hal", default-features = false, features = ["tracing"] }
+edgefirst-image = { path = "../../crates/image" }
+edgefirst-tensor = { path = "../../crates/tensor" }
+libc = "0.2"

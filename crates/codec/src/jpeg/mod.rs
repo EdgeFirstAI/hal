@@ -4,14 +4,20 @@
 //! Custom baseline JPEG decoder with a zero-allocation hot loop and strided
 //! native output.
 //!
-//! The decoder emits the source's native format only — `Grey` for greyscale
-//! (1-component) JPEGs, and the matching semi-planar format for colour
-//! (3-component) JPEGs by subsampling: `Nv12` for 4:2:0, `Nv16` for 4:2:2,
-//! `Nv24` for 4:4:4. It never converts to RGB and never rotates: colour and
-//! geometry are applied downstream by `ImageProcessor::convert()`. EXIF
-//! orientation is reported in [`ImageInfo`].
+//! The decoder emits the source's native format by default — `Grey` for
+//! greyscale (1-component) JPEGs, and the matching semi-planar format for
+//! colour (3-component) JPEGs by subsampling: `Nv12` for 4:2:0, `Nv16` for
+//! 4:2:2, `Nv24` for 4:4:4. Callers may opt into a **pure CPU** fused output
+//! via [`crate::ImageDecoder::set_output_format`]: `Rgb` (4:4:4 sources) or
+//! `Nv12` (any colour source), converted at the MCU write stage in a single
+//! software-decode pass (not a GPU hybrid). The decoder never rotates:
+//! geometry and any remaining preprocessing are applied downstream by
+//! `ImageProcessor::convert()`. EXIF orientation is reported in
+//! [`ImageInfo`].
 
 pub mod bitstream;
+pub mod color;
+pub mod cpu;
 pub mod huffman;
 pub mod idct;
 pub mod markers;
@@ -55,6 +61,8 @@ use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 pub struct JpegDecoderState {
     /// MCU scratch buffers (per-component IDCT output for one MCU row band).
     mcu_scratch: Option<mcu::McuScratch>,
+    /// Optional fused-output preference (see [`resolve_output_format`]).
+    pub(crate) preferred_format: Option<PixelFormat>,
     /// V4L2 hardware decoder, lazily probed on first decode. Probed at most
     /// once; a ready context is reused (and amortises per-image setup) across
     /// decodes.
@@ -71,6 +79,7 @@ impl JpegDecoderState {
     pub fn new() -> Self {
         Self {
             mcu_scratch: None,
+            preferred_format: None,
             #[cfg(all(target_os = "linux", feature = "v4l2"))]
             v4l2: v4l2::V4l2Probe::default(),
             #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
@@ -124,6 +133,30 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
                 components: n as u8,
             },
         )),
+    }
+}
+
+/// Resolve the decode output format from the native format and an optional
+/// caller preference (fused decode outputs):
+///
+/// - `Rgb`: honoured for 4:4:4 colour JPEGs only (native `Nv24`), where the
+///   write stage fuses YCbCr→RGB with no chroma resampling. Other sources
+///   fall back to native.
+/// - `Nv12`: honoured for any colour JPEG — the MCU writer downsamples
+///   chroma (2×2 for 4:4:4, vertical for 4:2:2; native 4:2:0 passes through).
+/// - Anything else (or `None`): native format.
+fn resolve_output_format(native: PixelFormat, preferred: Option<PixelFormat>) -> PixelFormat {
+    match preferred {
+        Some(PixelFormat::Rgb) if native == PixelFormat::Nv24 => PixelFormat::Rgb,
+        Some(PixelFormat::Nv12)
+            if matches!(
+                native,
+                PixelFormat::Nv12 | PixelFormat::Nv16 | PixelFormat::Nv24
+            ) =>
+        {
+            PixelFormat::Nv12
+        }
+        _ => native,
     }
 }
 
@@ -191,7 +224,13 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     };
     let img_w = headers.header.width as usize;
     let img_h = headers.header.height as usize;
-    let output_fmt = native_format(&headers)?;
+    let native_fmt = native_format(&headers)?;
+    let output_fmt = resolve_output_format(native_fmt, state.preferred_format);
+    // Fused (non-native) outputs are a CPU-decoder feature: the hardware
+    // decoders produce fixed formats, so bypass them when the resolved output
+    // differs from native.
+    #[cfg(all(target_os = "linux", any(feature = "v4l2", feature = "nvjpeg")))]
+    let allow_hw = output_fmt == native_fmt;
 
     // NV12 supports odd dimensions. Odd *height* gives a `H + ceil(H/2)`
     // combined-plane height (`PixelFormat::image_shape`). Odd *width* rounds the
@@ -234,7 +273,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     // zero-copy `convert()`. A non-CUDA destination or any failure cascades to
     // the V4L2/CPU decoders.
     #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
-    {
+    if allow_hw {
         match state
             .nvjpeg
             .try_decode::<T>(data, &headers, dst, output_fmt, img_w, img_h, dst_stride)
@@ -258,7 +297,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     // Try the V4L2 hardware decoder next when available; a probed-but-failing
     // device resets itself and falls through to the CPU decoder transparently.
     #[cfg(all(target_os = "linux", feature = "v4l2"))]
-    {
+    if allow_hw {
         match state
             .v4l2
             .try_decode::<T>(data, &headers, dst, output_fmt, img_w, img_h, dst_stride)
@@ -295,7 +334,13 @@ pub fn decode_jpeg_into<T: ImagePixel>(
         mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
     }
 
-    dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
+    // RGB output carries no chroma colorimetry (matches the nvJPEG path);
+    // clear any stale value left on a recycled pool tensor.
+    if output_fmt == PixelFormat::Rgb {
+        dst.set_colorimetry(None);
+    } else {
+        dst.set_colorimetry(Some(edgefirst_tensor::Colorimetry::jfif()));
+    }
 
     Ok(ImageInfo {
         width: img_w,

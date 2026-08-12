@@ -9,15 +9,22 @@ avoided.
 
 The core principle: **allocate once at init, decode in the hot loop**.
 
-A second principle drives the data path: the decoder emits each image in its
-**native pixel format** and does nothing else — no colour conversion, no
-resize, no rotation. JPEG decodes to the NV format matching its own chroma
-sampling — `Nv12` (4:2:0), `Nv16` (4:2:2), `Nv24` (4:4:4) — or `Grey`
-(greyscale); PNG decodes to `Rgb` / `Rgba` / `Grey`. Everything beyond raw decode —
-colour-space conversion, EXIF orientation, resize, crop — belongs to
-[`ImageProcessor::convert()`](../image), which runs on the GPU where available.
-This keeps the decode path branch-free and lets a single `convert()` fold all
-the geometry/colour work into one pass.
+A second principle drives the data path: by default the decoder emits each
+image in its **native pixel format** and does nothing else — no colour
+conversion, no resize, no rotation. JPEG decodes to the NV format matching its
+own chroma sampling — `Nv12` (4:2:0), `Nv16` (4:2:2), `Nv24` (4:4:4) — or
+`Grey` (greyscale); PNG decodes to `Rgb` / `Rgba` / `Grey`. Everything beyond
+raw decode — colour-space conversion, EXIF orientation, resize, crop — belongs
+to [`ImageProcessor::convert()`](../image), which runs on the GPU where
+available. This keeps the decode path branch-free and lets a single
+`convert()` fold all the geometry/colour work into one pass.
+
+One measured exception: `ImageDecoder::set_output_format` lets a caller opt
+into a **pure CPU fused decode output** — `Rgb` (4:4:4 sources) or `Nv12`
+(any colour source) — where the conversion happens inside the software MCU
+write stage (not a GPU hybrid). Callers still run `ImageProcessor::convert()`
+afterward for model-input preprocessing. See
+[Fused Decode Output](#fused-decode-output-opt-in-pure-cpu).
 
 ## Crate Position in the Workspace
 
@@ -55,17 +62,19 @@ dependency graph clean.
 
 | Module           | Purpose                                              |
 |------------------|------------------------------------------------------|
-| `mod.rs`         | `JpegDecoderState`, `decode_jpeg_into<T>()`, `native_format()`, nvJPEG→V4L2→CPU dispatch seam, EXIF reporting |
+| `mod.rs`         | `JpegDecoderState`, `decode_jpeg_into<T>()`, `native_format()` + `resolve_output_format()`, nvJPEG→V4L2→CPU dispatch seam, EXIF reporting |
 | `types.rs`       | `Component`, `SamplingFactor`, `ImageHeader`, `QuantTable`, `ZIGZAG` |
 | `markers.rs`     | SOF/SOS/DQT/DHT/DRI/APP marker parsing               |
 | `bitstream.rs`   | 64-bit bit buffer with FF/00 byte-stuffing, bulk refill |
-| `huffman.rs`     | 11-bit lookahead Huffman LUT, `decode_block()` with dequant fusion |
-| `idct/mod.rs`    | IDCT dispatcher (scalar/NEON/SSE4.1/SSE2 selection via function pointers) |
-| `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path    |
-| `idct/neon.rs`   | NEON 8×8 IDCT: 4-wide Loeffler butterfly, 4×4 transpose, DC-only fill |
-| `idct/sse2.rs`   | SSE2 8×8 IDCT: 4-wide Loeffler butterfly, emulated mullo_epi32 |
-| `idct/sse41.rs`  | SSE4.1 8×8 IDCT: native mullo_epi32, min/max clamping |
-| `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, chroma downsample for the non-matching subsamplings (`avg_block`) |
+| `cpu.rs`         | Runtime `NeonTier` / `IntelTier` probes: Huffman lookahead width, entropy prefetch, and SIMD kernel selection per micro-architecture / ISA |
+| `huffman.rs`     | Tier-sized lookahead Huffman LUT + combined code+magnitude fast-AC LUT, `decode_block()` emitting quantised `i16` coefficients |
+| `color.rs`       | Fused YCbCr→RGB row conversion (Q14 `SQRDMULH` / matching SSE4.1 `qrdmulh`, NEON + Intel + bit-exact scalar) |
+| `idct.rs`        | IDCT dispatcher (scalar/NEON/x86 via `NeonTier`/`IntelTier`); kernels dequantise internally |
+| `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path; the reference every SIMD kernel is asserted against, so it wraps and saturates where the vector kernels are forced to |
+| `idct/neon.rs`   | NEON 8×8 IDCT on 16-bit coefficients: 8-lane dequant, lane-indexed `vmull` Loeffler butterfly, sparse bottom-row/right-column shortcuts, register-resident workspace |
+| `idct/sse2.rs`   | x86 8×8 IDCT: 16-bit-lane `islow` Loeffler, `pmullw` dequant + `pmaddwd` butterflies (shared by all Intel tiers) |
+| `idct/avx2.rs`   | VEX-encoded build of the `sse2.rs` kernel |
+| `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample), chroma downsample for the non-matching subsamplings (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
@@ -107,9 +116,43 @@ JPEG output is `u8` only — the NV formats and `Grey` are byte layouts — so a
 non-`u8` destination is rejected with `CodecError::UnsupportedDtype`. The PNG
 path supports the full set of tensor element types (see below).
 
-No colour conversion, resize, or rotation happens here. Callers that need
-`Rgb`/`Rgba`/`Bgra`, a resize, or EXIF orientation applied run
-`ImageProcessor::convert()` on the native decode.
+No colour conversion, resize, or rotation happens here (unless the caller
+opts into a fused output, below). Callers that need `Rgb`/`Rgba`/`Bgra`, a
+resize, or EXIF orientation applied run `ImageProcessor::convert()` on the
+native decode.
+
+### Fused Decode Output (opt-in, pure CPU)
+
+`ImageDecoder::set_output_format(Some(fmt))` requests a conversion **inside
+the MCU write stage** of the **software** JPEG decoder, where the IDCT output
+is still hot in cache — one CPU pass instead of decode-to-NV followed by a
+full-image colour step. This is **not** a GPU hybrid path and is unrelated to
+nvJPEG: whenever the resolved output differs from native, the V4L2 and nvJPEG
+backends are bypassed so the CPU path can honour the preference.
+
+`resolve_output_format()` honours the preference only where it is a pure win
+and silently falls back to native otherwise, so callers can set it
+unconditionally:
+
+- **`Rgb`** — 4:4:4 colour JPEGs only (every component at full resolution, so
+  no chroma resampling is needed). Each MCU row band goes through the
+  `color.rs` YCbCr→RGB kernel: Q14 fixed point on the `SQRDMULH`
+  rounding-doubling high-half multiply (baseline ASIMD, so the same kernel
+  runs A53 → Apple Silicon), `vst3q_u8` interleaved stores, and a scalar path
+  that reproduces the arithmetic bit-for-bit. Other subsamplings fall back to
+  native NV output.
+- **`Nv12`** — any colour JPEG. 4:2:0 passes through; 4:4:4 is 2×2
+  box-averaged and 4:2:2 vertically averaged with NEON row kernels at the
+  write stage.
+
+Callers still run [`ImageProcessor::convert()`](../image) on the fused result
+for model-input preprocessing (letterbox / resize / EXIF orientation / further
+format work). With fused RGB that convert step is typically a pure resize —
+the colour conversion already happened in the decode write stage. Measured
+end-to-end (decode + 640×640 letterbox, COCO): ~1 ms/frame faster than NV24 +
+convert on Cortex-A53, ~0.3–0.4 ms on A55/A76/A78AE. The fused RGB output
+clears the destination's colorimetry; fused NV12 keeps JFIF BT.601 full-range
+like any native NV output.
 
 ### EXIF Orientation Is Reported, Not Applied
 
@@ -257,28 +300,64 @@ The custom baseline JPEG decoder processes images through these stages:
    success it returns the `ImageInfo`; on `Fallback` (no device / unsupported
    capture format / transient hardware failure) the CPU path below runs.
 4. **MCU decode loop** (`mcu.rs`): for each MCU row:
-   a. **Huffman decode** (`huffman.rs`): 11-bit lookahead LUT decodes DC/AC
-      coefficients with dequantisation fused into the decode step.
+   a. **Huffman decode** (`huffman.rs`): tier-sized lookahead LUT decodes DC/AC
+      coefficients into a quantised `i16[64]` block (libjpeg-turbo `JCOEF`
+      model — the entropy loop is multiply-free).
    b. **IDCT** (`idct/`): two-pass Loeffler 8×8 IDCT with a DC-only fast path
-      converts frequency coefficients → spatial component samples.
-   c. **Native write** (`mcu.rs`): `write_grey_rows` copies the luma plane for
+      dequantises on load and converts frequency coefficients → spatial
+      component samples.
+   c. **Write** (`mcu.rs`): `write_grey_rows` copies the luma plane for
       `Grey`; `write_nv12_rows` writes the Y plane and the interleaved Cb/Cr
       plane, downsampling chroma to 4:2:0 via `avg_block` (passthrough for an
-      already-4:2:0 source, block-average for 4:2:2 / 4:4:4 / 4:4:0). Both write
-      at the tensor's `effective_row_stride()`.
+      already-4:2:0 source, block-average for 4:2:2 / 4:4:4 / 4:4:0). With a
+      fused output resolved, `write_rgb_rows` converts YCbCr→RGB per row
+      (`color.rs`), or the NEON chroma-downsample kernels feed the NV12
+      writer. All write at the tensor's `effective_row_stride()`.
 5. **Return** `ImageInfo` with decoded dimensions, native format, row stride,
    and the reported EXIF orientation.
+
+**Untrusted input.** Everything above runs on attacker-controlled bytes, so
+three places take deliberate care:
+
+- **DHT counts** (`huffman.rs`) are checked against Kraft's inequality before
+  the lookahead table is filled. The fill indexes by code value shifted up to
+  the table width, so an oversubscribed level — three 1-bit codes, say — walks
+  off the end of the allocation; the segment is rejected instead.
+- **A truncated scan** (`bitstream.rs`, `mcu.rs`) cannot be caught block by
+  block: the buffer zero-pads past end-of-data, and zero is both a valid DC
+  code and a valid EOB, so a scan that simply stops decodes as well-formed
+  empty blocks. `BitStream::overran()` records that a consumer was handed bits
+  the file never held, and the scan loop turns that into `InvalidData`.
+- **Coefficient × quantiser** can overflow the 16-bit lanes the IDCT kernels
+  dequantise into (JPEG syntax allows 1023 × 255). Every kernel including the
+  scalar reference absorbs that as defined wrapping/saturating arithmetic —
+  see `IdctFn` for what is and is not guaranteed about the resulting pixels.
 
 **Key optimisations:**
 - `JpegDecoderState` persists across frames — `McuScratch` buffers grow to the
   high-water mark and are reused. After the first decode at a given resolution,
-  the JPEG decoder performs zero heap allocations.
-- Dequantisation is fused into Huffman decode: `decode_block()` multiplies each
-  coefficient by the quant table entry during decode, not as a separate pass.
+  the JPEG decoder performs zero heap allocations (per-scan Huffman table
+  pointers and DC predictors live in fixed-size stack arrays).
+- Combined **fast-AC LUT** (stb_image model): where a Huffman code *and* its
+  magnitude bits both fit in the tier's lookahead window, a single table hit
+  yields the sign-extended coefficient, zero-run, and total bits to consume —
+  one peek + one consume per coefficient on the fast path, for DC and AC
+  alike. Misses (EOB/ZRL, long codes) fall back to the two-step LUT.
+- Runtime **`NeonTier`** / **`IntelTier`** (`cpu.rs`): one binary picks Huffman
+  lookahead width, entropy prefetch distance, and SIMD kernels per
+  micro-architecture / ISA. AArch64 uses HWCAP `dotprod`/`i8mm` plus a Linux
+  sysfs MIDR probe that promotes big out-of-order cores (A76/A78AE/X1…) that
+  HWCAP alone cannot distinguish from the A55. x86_64 probes `avx2` >
+  `sse4.1` > `sse2`. Override with `EDGEFIRST_CODEC_FORCE_NEON=…` or
+  `EDGEFIRST_CODEC_FORCE_INTEL=scalar|sse2|sse41|avx2` for A/B.
+- Dequantisation lives inside the IDCT kernels (turbo `JCOEF` model): the
+  entropy decoder emits raw quantised `i16` coefficients (128-byte block clear,
+  no per-coefficient multiply) and the SIMD kernels dequantise 8 lanes at a
+  time on load.
 - DC-only IDCT fast path: when all 63 AC coefficients are zero, the IDCT reduces
   to a constant fill (single multiply + shift).
-- Function pointer dispatch for the IDCT: selected once at init based on CPU
-  feature detection (NEON on AArch64, SSE4.1 > SSE2 on x86-64, scalar fallback).
+- Function pointer dispatch for the IDCT: selected once at init from the active
+  CPU tier (NEON on AArch64; AVX2 > SSE4.1 > SSE2 on x86-64; scalar fallback).
 
 ### NV Output Path
 
@@ -312,32 +391,41 @@ sampling ratio and picks the NV format that already matches, so the common
 cases never touch `avg_block` at all. It runs only for the last row, where no
 NV format fits the source.
 
-### IDCT SIMD Kernels
+### IDCT and Write-Path SIMD Kernels
 
-The IDCT is the only SIMD-dispatched kernel remaining in the CPU path (colour
-conversion and chroma upsampling were removed when the codec moved to native
-output — colour now belongs to `convert()`, and chroma is a simple block-average
-into 4:2:0).
+SIMD is used for IDCT, fused YCbCr→RGB (`color.rs`), UV interleave, and chroma
+downsample (`mcu.rs`). Native NV output still skips RGB for the usual decode
+path; fused RGB and exotic NV12 averaging take the color/downsample kernels.
 
-**NEON (AArch64)** — selected via
+**NEON (AArch64)** — gated by `NeonTier` +
 `std::arch::is_aarch64_feature_detected!("neon")`:
 
 | Kernel   | Strategy                                          | Throughput              |
 |----------|---------------------------------------------------|-------------------------|
-| **IDCT** | 4-wide Loeffler butterfly with `int32x4_t`, 4×4 transpose via `vzip`, DC-only fills 8 bytes via `vdup`/`vst1` | 4 cols/rows per iteration |
+| **IDCT** | 16-bit coefficients end-to-end (libjpeg-turbo `jidctint-neon` model): 8-lane `vmulq_s16` dequant, Loeffler butterfly via `vmull_s16`/`vmlal_s16` 16×16→32 multiplies, `vrshrn` descale, register-resident `int16x8` workspace (no memory round-trip), `trn`-based 16-bit and 8-bit 8×8 transposes. Sparse shortcuts skip the butterfly for all-zero bottom rows (pass 1) and all-zero right columns (both passes) — the dominant shapes of quantised natural-image blocks. DC-only fills 8 bytes via `vdup`/`vst1` | 8 columns per pass-1 sweep, 8 rows per pass-2 sweep |
 
-**x86-64** — tiered dispatch SSE4.1 > SSE2 > scalar via
-`is_x86_feature_detected!()`:
+The butterfly constants are held in two `int16x8` registers and addressed by
+lane (`vmull_laneq_s16`), not splatted per multiply: the butterfly is inlined
+four times, so `vdup_n_s16(FIX_x)` at each use site cost 64 `dup`s per block.
+The `black_box` on the constant pointers in `idct_8x8_neon_inner` is what makes
+that stick — see the comment there.
+| **Color / UV** | Q14 `SQRDMULH` YCbCr→RGB; `vst2` UV interleave; NEON 2×2 / 1×2 chroma downsample | 8–16 samples/iter |
+
+**x86-64** — gated by `IntelTier` (`EDGEFIRST_CODEC_FORCE_INTEL` for A/B):
 
 | Kernel   | Tier   | Strategy                                          | Throughput              |
 |----------|--------|---------------------------------------------------|-------------------------|
-| **IDCT** | SSE4.1 | 4-wide Loeffler with native `_mm_mullo_epi32`, `_mm_min_epi32`/`_mm_max_epi32` clamp | 4 cols/rows per iteration |
-| **IDCT** | SSE2   | 4-wide Loeffler with emulated `mullo_epi32` (4 instructions), comparison-based clamp | 4 cols/rows per iteration |
+| **IDCT** | SSE2 / SSE4.1 / AVX2 | 16-bit-lane `islow` Loeffler: `pmullw` dequant folded into the load, every butterfly term a `pmaddwd` | whole 8-wide row per register |
+| **Color** | SSE4.1 / AVX2 | Bit-exact Q14 `qrdmulh` matching the scalar/NEON model | 16 pixels/iter |
+| **UV** | SSE2+ | Unpack interleave; SSE2 2×2 / 1×2 truncating downsample | 8–16 samples/iter |
 
-SSE4.1 improvements over SSE2: native `_mm_mullo_epi32` replaces 4-instruction
-emulation (~30% fewer IDCT instructions); `_mm_min_epi32`/`_mm_max_epi32`
-replaces the 5-instruction comparison-based clamp with a 2-instruction
-branchless clamp.
+All three x86 tiers share one IDCT kernel. In 16-bit lanes a 128-bit register
+already holds a full row of eight coefficients, and `pmaddwd` needs only SSE2,
+so SSE4.1 has nothing to add and a 256-bit *single-block* kernel would only buy
+lane-crossing shuffles; AVX2 gets the same code VEX-encoded. Genuine 256-bit
+width would require processing two blocks side by side. The constant pairs are
+an exact integer regrouping of the scalar butterfly, so all tiers are bit-exact
+with `idct/scalar.rs`.
 
 ### PNG Decode Flow
 
@@ -597,7 +685,9 @@ codec.decode_jpeg                                       [user-facing fn]
 │   │ field: target = "dst_dma" | "scratch"
 │   └── codec.decode_jpeg.v4l2_copy_out                 ← scratch → tensor write (absent on the zero-copy target)
 │       field: kind = "nv12" | "grey" | "yuv24_to_nv24"
-└── codec.decode_jpeg.mcu_loop                          ← Huffman + IDCT + native Grey/NV12/NV24 write (CPU path only)
+└── codec.decode_jpeg.mcu_loop                          ← Huffman + IDCT + write stage (CPU path only)
+    ├── codec.decode_jpeg.mcu_row.huffman_idct          ← per MCU-row entropy + IDCT
+    ├── codec.decode_jpeg.write_nv12 / write_nv16 / write_nv24 / write_grey / write_rgb
 
 codec.decode_png                                        [user-facing fn]
 │ fields: dtype, n_bytes
@@ -624,7 +714,7 @@ frame or error recovery. For nvJPEG, `nvjpeg_sync` is the GPU decode time and
 | `codec.decode_jpeg.nvjpeg`        | The nvJPEG GPU decode: map the PBO, `nvjpegGetImageInfo`, decode interleaved `Rgb` into the device pointer, synchronise, unmap. `target = "rgbi"`. Absent when V4L2/CPU decodes. | nvJPEG single-image GPU decode (`nvjpegDecode`). |
 | `codec.decode_jpeg.nvjpeg_map` / `nvjpeg_unmap` | The `cuda_map()` / drop round-trips to the PBO's owning GL worker thread (`cudaGraphicsMapResources` / `Unmap`). Isolates the per-frame GL-thread interop cost. | CUDA-GL interop buffer map/unmap. |
 | `codec.decode_jpeg.nvjpeg_submit` / `nvjpeg_sync` | `nvjpegDecode` enqueue on the per-decoder CUDA stream, then `cudaStreamSynchronize`. `nvjpeg_sync`'s duration is the GPU decode time (resolution/entropy dependent). | Async CUDA decode + stream sync. |
-| `codec.decode_jpeg.mcu_loop`      | The CPU core loop: per MCU row, Huffman-decode + dequant-fuse → two-pass Loeffler IDCT (scalar / NEON / SSE4.1 / SSE2) → native `Grey`/`Nv12`/`Nv16`/`Nv24` write, strided into the tensor. Allocation-free after warmup. Absent when hardware decodes. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, IDCT handwritten and SIMD-dispatched. |
+| `codec.decode_jpeg.mcu_loop`      | The CPU core loop: per MCU row, Huffman-decode (quantised `i16`) → dequantising two-pass Loeffler IDCT (scalar / NEON / x86 islow) → native `Grey`/`Nv12`/`Nv16`/`Nv24` write (or the fused `Rgb`/`Nv12` write), strided into the tensor. Allocation-free after warmup. Absent when hardware decodes. Child spans: `mcu_row.huffman_idct`, `write_nv12` / `write_nv16` / `write_nv24` / `write_grey` / `write_rgb`. | Equivalent to libjpeg's `jpeg_read_scanlines` loop, IDCT handwritten and SIMD-dispatched. |
 | `codec.decode_jpeg.v4l2_rebuild`  | Full V4L2 stream setup: OUTPUT buffer allocation + mmap + `STREAMON`, JPEG staging, `SOURCE_CHANGE` wait, CAPTURE format negotiation, `REQBUFS(DMABUF)`, `STREAMON`. Runs on the first frame, OUTPUT overflow, or error recovery. | A stateful V4L2 decoder session open + format negotiation. |
 | `codec.decode_jpeg.v4l2_reconfigure` | The geometry-change hot path: `STREAMOFF`/`REQBUFS(0)` on CAPTURE only, JPEG staging + `QBUF` while OUTPUT keeps streaming, `SOURCE_CHANGE` wait, `G_FMT` stale-geometry guard, renegotiation, `REQBUFS(1, DMABUF)`, `STREAMON`. ~1 ms — DMABUF makes `REQBUFS` allocation-free, vs ~110 ms for an MMAP buffer reallocation. | The V4L2 stateful-decoder dynamic-resolution-change sequence. |
 | `codec.decode_jpeg.v4l2_collect`  | The per-frame hardware decode: queue the CAPTURE dmabuf (`target` names where the hardware writes — the destination tensor for zero-copy, or the persistent scratch), poll for completion, dequeue both buffers. Dominated by the hardware decode itself. | A V4L2 M2M `QBUF` → `poll` → `DQBUF` cycle. |
@@ -638,16 +728,16 @@ frame or error recovery. For nvJPEG, `nvjpeg_sync` is the GPU decode time and
 
 | Output Format | JPEG | PNG  | Notes                              |
 |---------------|------|------|------------------------------------|
-| Nv12          | ✓    | —    | 4:2:0 colour JPEG (and the fallback for exotic subsamplings): Y + interleaved UV |
+| Nv12          | ✓    | —    | 4:2:0 colour JPEG (and the fallback for exotic subsamplings): Y + interleaved UV. Also the fused-output target for any colour JPEG (opt-in). |
 | Nv16          | ✓    | —    | 4:2:2 colour JPEG: Y + interleaved UV at half horizontal chroma |
 | Nv24          | ✓    | —    | 4:4:4 colour JPEG: Y + interleaved UV at full resolution |
 | Grey          | ✓    | ✓    | Single luma component              |
-| Rgb           | —    | ✓    | Native PNG RGB                     |
+| Rgb           | opt-in | ✓  | PNG native; JPEG via the fused 4:4:4 output (`set_output_format`) |
 | Rgba          | —    | ✓    | Native PNG RGBA                    |
 
-`Rgb`/`Rgba`/`Bgra` from a JPEG, and any resize/rotation, come from
-`ImageProcessor::convert()` applied to the native decode — they are deliberately
-not codec responsibilities.
+`Rgba`/`Bgra` from a JPEG, `Rgb` from non-4:4:4 JPEGs, and any resize/rotation
+come from `ImageProcessor::convert()` applied to the native decode — they are
+deliberately not codec responsibilities.
 
 ## Supported Source Features
 
@@ -720,7 +810,7 @@ call. The edgefirst-codec PNG layer reuses `ImageDecoder.input_buffer` for
 |--------------------------|------------------|------------------------------|
 | JPEG `McuScratch`        | No allocations   | Grows to high-water mark     |
 | JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
-| JPEG IDCT workspace      | No allocations   | Stack-allocated `[i32; 64]`  |
+| JPEG IDCT workspace      | No allocations   | Stack-allocated (`[i32; 64]` scalar/SSE; NEON keeps it in registers) |
 | JPEG native row write    | No allocations   | Strided into pre-allocated tensor |
 | V4L2 streaming session   | No allocations   | OUTPUT buffer + DMA scratch persist; geometry changes are ioctl-only |
 | zune-png `decode()`      | 1 `Vec` / call   | Returns owned `Vec<u16/u8>`  |

@@ -249,7 +249,7 @@ See [README.md § Benchmarking](README.md#benchmarking) for full instructions on
 | `parallel_processors_benchmark` | `edgefirst-image` | Multi-processor GL throughput scaling; shows where the serialization policy binds |
 | `opencv_benchmark` | `edgefirst-image` | OpenCV baseline comparison for same operations |
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO detection/segmentation post-processing, NMS, dequantization |
-| `codec_benchmark` | `edgefirst-codec` | JPEG/PNG decode into pre-allocated tensors vs. image crate and zune-png; NEON SIMD on AArch64, SSE4.1/SSSE3 on x86-64, vectorised type conversion |
+| `codec_benchmark` | `edgefirst-codec` | JPEG/PNG decode into pre-allocated tensors vs. image crate and zune-png; NEON tiers on AArch64, `IntelTier` (SSE2/SSE4.1/AVX2) on x86-64, vectorised type conversion |
 | `tracker_benchmark` | `edgefirst-tracker` | ByteTrack association and track lifecycle |
 
 `crates/image` also carries a `sanity_check` binary. It is an adaptive smoke check
@@ -362,6 +362,100 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 | **Notes** | Apple Silicon developer platform. ANGLE supplies `libEGL.dylib` and `libGLESv2.dylib` — either the signed EdgeFirst release via `scripts/fetch-angle.sh` or the Homebrew tap — and translates GLES 3.0 → Metal, so the same shader source used on Linux GPUs runs unchanged. Since 0.25.0 macOS runs the shared GL engine and inherits its full conversion matrix; the GL rows in the tables below predate that and still reflect the old YUYV→RGBA-only backend (Known Gap #17). |
 
 ---
+
+## JPEG Decode: EdgeFirst vs libjpeg-turbo
+
+**Scope:** JPEG bytes → decoded raster in memory. Letterbox / model-input
+preprocessing (`ImageProcessor::convert()`) is a separate measurement and is not
+included here. Two arms:
+
+| Arm | EdgeFirst | libjpeg-turbo |
+|-----|-----------|---------------|
+| **YUV** | `--decode-only --decode-fmt native` (NV12/16/24) | `--decode-only --format yuv` (`tjDecompressToYUV2`) |
+| **RGB** | `--decode-only --decode-fmt rgb` (fused MCU write) | `--decode-only --format rgb` (`TJPF_RGB`) |
+
+Layouts differ on the YUV arm (semi-planar NV* vs planar YUV); both stop after
+decode into a YUV buffer with no RGB colour step. COCO `val2017` is 4:4:4, so
+the fused RGB write engages.
+
+Both arms are native binaries — `hal_cpu` (Rust) and `modules/turbojpeg/bench.c`
+(C) — measured by harnesses that agree on image selection, preload before
+timing, `CLOCK_MONOTONIC` around decode alone, percentile index and MP/s. A
+Python driver on one side only would put interpreter dispatch and FFI
+marshalling inside the timed region.
+
+**On the two IDCT columns.** libjpeg-turbo can decompress with either the
+accurate `islow` IDCT or the faster, lower-accuracy `ifast` one. **`islow` is
+its default**, and it is the kernel EdgeFirst implements, so the `islow` columns
+are the like-for-like comparison and the one claims should quote. `ifast` is
+reported alongside because it is what a caller gets when asking for speed over
+fidelity; comparing against it silently would compare two different accuracy
+classes.
+
+Interleaved best-of-N in a single session per host with all arms alternating,
+pinned to one core; x86 n=800 best-of-5, boards n=200 best-of-3. Positive means
+EdgeFirst is faster.
+
+| Board | Core | Arm | EdgeFirst | Turbo `islow` | vs `islow` | Turbo `ifast` | vs `ifast` |
+|-------|------|-----|-----------|---------------|------------|---------------|------------|
+| rpi5-hailo | A76 | YUV | **2.661 ms** | 3.162 ms | **+18.8%** | 2.890 ms | **+8.6%** |
+| | | RGB | **2.812 ms** | 3.355 ms | **+19.3%** | 3.093 ms | **+10.0%** |
+| x86-desktop | Rocket Lake i9-11900K | YUV | **1.276 ms** | 1.359 ms | **+6.5%** | 1.280 ms | +0.3% |
+| | | RGB | **1.330 ms** | 1.439 ms | **+8.2%** | 1.362 ms | **+2.4%** |
+| imx95-pro | A55 | YUV | 7.070 ms | 7.036 ms | −0.5% | **6.547 ms** | −7.4% |
+| | | RGB | **7.404 ms** | 7.518 ms | +1.5% | **7.074 ms** | −4.5% |
+| imx8mp-frdm | A53 | YUV | 7.890 ms | **7.515 ms** | −4.8% | **6.901 ms** | −12.5% |
+| | | RGB | 8.202 ms | **7.961 ms** | −2.9% | **7.317 ms** | −10.8% |
+
+- **Out-of-order cores are a clear win.** The A76 is 18.8% / 19.3% faster than
+  libjpeg-turbo at matching accuracy and still 8.6% / 10.0% faster than its
+  `ifast` kernel. x86 is 6.5% / 8.2% faster at matching accuracy; against
+  `ifast` the YUV arm is parity and RGB holds +2.4%.
+- **The A55 is parity** at matching accuracy, 4.5–7.4% behind `ifast`.
+- **The A53 is behind**, 2.9–4.8% at matching accuracy and 10.8–12.5% against
+  `ifast`. In-order cores pay for every instruction, and our remaining cost is
+  in the IDCT and the MCU write stage.
+
+### SIMD tier value (x86-desktop)
+
+Same host and workload, `EDGEFIRST_CODEC_FORCE_INTEL=…`, n=800 best-of-3.
+
+| Tier | YUV | vs scalar | RGB | vs scalar |
+|------|-----|-----------|-----|-----------|
+| `scalar` | 2.297 ms | 1.00× | 2.971 ms | 1.00× |
+| `sse2` | **1.272 ms** | **1.81×** | 1.968 ms | 1.51× |
+| `sse41` | 1.272 ms | 1.81× | **1.339 ms** | **2.22×** |
+| `avx2` / auto | 1.270 ms | 1.81× | 1.330 ms | 2.23× |
+
+The two arms earn their tiers in different places. The `islow` IDCT needs only
+SSE2, and it is the whole YUV win — SSE4.1 and AVX2 add nothing there. RGB adds
+the colour kernel, which needs `pshufb`, so SSE4.1 is worth a further 32% on
+that arm. AVX2 is within noise of SSE4.1 on both: at 8×8, wider registers buy
+little beyond the VEX encoding.
+
+Per-block IDCT cost (in-tree microbenchmark `idct_kernel_cost`): **21.5 ns**
+on Rocket Lake, **81.1 ns** on the A76, **212.6 ns** on the A55, **220.8 ns** on
+the A53.
+
+### Reproduce
+
+```bash
+# Decoder A/B, aarch64 boards over SSH (cross-builds both arms)
+./benchmarks/scripts/decode-ab-matrix.sh imx95-pro rpi5-hailo
+
+# Decoder A/B, x86 / AWS Batch
+docker build -f benchmarks/docker/Dockerfile -t edgefirst-hal-jpeg-bench .
+docker run --rm -v /path/to/coco:/data/coco:ro -v "$PWD/results:/results" \
+  -e BOARD=x86-desktop -e FORMATS=yuv,rgb edgefirst-hal-jpeg-bench
+
+# Single arm on the host (DCT=fast for the ifast columns)
+make -C benchmarks/modules/turbojpeg
+./benchmarks/modules/turbojpeg/build/turbojpeg_bench \
+  --limit 800 --warmup 40 --decode-only --format yuv --dct accurate
+
+# IDCT kernel microbenchmark
+cargo test -p edgefirst-codec --release -- --ignored --nocapture idct_kernel_cost
+```
 
 ## Benchmark Results
 

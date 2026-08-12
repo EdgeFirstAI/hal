@@ -40,6 +40,25 @@ fn luma_mapper(full_range: bool) -> fn(u8) -> u8 {
     }
 }
 
+/// YUV↔RGB conversion mode for the `yuv` crate.
+///
+/// `Balanced` relies on Q15 rounded-doubling multiply-accumulate (`SQRDMLAH`,
+/// Armv8.1 "rdm"). Cores without it — Cortex-A53/A35-class — emulate the op
+/// with a `vqrdmulh`+`vqadd` pair per accumulate, roughly doubling the cost of
+/// every conversion row. On those cores `Fast` (lower-precision integer
+/// approximation, error ≤ ~2/255) is 2×+ faster and visually
+/// indistinguishable; everywhere else `Balanced` keeps full precision.
+#[inline]
+fn yuv_mode() -> yuv::YuvConversionMode {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !std::arch::is_aarch64_feature_detected!("rdm") {
+            return yuv::YuvConversionMode::Fast;
+        }
+    }
+    yuv::YuvConversionMode::Balanced
+}
+
 /// One row of a YUYV-destination convert, split into its whole macropixels and
 /// the trailing unpaired pixel an odd width leaves over. See [`split_yuyv_row`].
 type YuyvRowSplit<'s, 'd> = (&'s [u8], &'d mut [u8], Option<(&'s [u8], &'d mut [u8])>);
@@ -432,14 +451,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv12(src, dst, |img, out, stride| {
-            yuv::yuv_nv12_to_rgb(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv12_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -452,14 +464,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv12(src, dst, |img, out, stride| {
-            yuv::yuv_nv12_to_rgba(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv12_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -1094,7 +1099,7 @@ impl CPUProcessor {
             src_rs as u32,
             cp.range,
             cp.matrix,
-            yuv::YuvConversionMode::Balanced,
+            yuv_mode(),
         )?)
     }
 
@@ -1223,7 +1228,7 @@ impl CPUProcessor {
             src_rs as u32,
             cp.range,
             cp.matrix,
-            yuv::YuvConversionMode::Balanced,
+            yuv_mode(),
         )?)
     }
 
@@ -1352,14 +1357,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv16(src, dst, |img, out, stride| {
-            yuv::yuv_nv16_to_rgb(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv16_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -1369,14 +1367,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv16(src, dst, |img, out, stride| {
-            yuv::yuv_nv16_to_rgba(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv16_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -1433,14 +1424,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv24(src, dst, |img, out, stride| {
-            yuv::yuv_nv24_to_rgb(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv24_to_rgb(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -1450,14 +1434,7 @@ impl CPUProcessor {
         cp: ColorParams,
     ) -> Result<()> {
         Self::convert_nv24(src, dst, |img, out, stride| {
-            yuv::yuv_nv24_to_rgba(
-                img,
-                out,
-                stride,
-                cp.range,
-                cp.matrix,
-                yuv::YuvConversionMode::Balanced,
-            )
+            yuv::yuv_nv24_to_rgba(img, out, stride, cp.range, cp.matrix, yuv_mode())
         })
     }
 
@@ -1891,30 +1868,15 @@ impl CPUProcessor {
             {
                 let rgb = &mut scratch[..sh * out_w * 3];
                 let decode = match src_fmt {
-                    Nv12 => yuv::yuv_nv12_to_rgb(
-                        &img,
-                        rgb,
-                        rgb_stride,
-                        cp.range,
-                        cp.matrix,
-                        yuv::YuvConversionMode::Balanced,
-                    ),
-                    Nv16 => yuv::yuv_nv16_to_rgb(
-                        &img,
-                        rgb,
-                        rgb_stride,
-                        cp.range,
-                        cp.matrix,
-                        yuv::YuvConversionMode::Balanced,
-                    ),
-                    Nv24 => yuv::yuv_nv24_to_rgb(
-                        &img,
-                        rgb,
-                        rgb_stride,
-                        cp.range,
-                        cp.matrix,
-                        yuv::YuvConversionMode::Balanced,
-                    ),
+                    Nv12 => {
+                        yuv::yuv_nv12_to_rgb(&img, rgb, rgb_stride, cp.range, cp.matrix, yuv_mode())
+                    }
+                    Nv16 => {
+                        yuv::yuv_nv16_to_rgb(&img, rgb, rgb_stride, cp.range, cp.matrix, yuv_mode())
+                    }
+                    Nv24 => {
+                        yuv::yuv_nv24_to_rgb(&img, rgb, rgb_stride, cp.range, cp.matrix, yuv_mode())
+                    }
                     _ => unreachable!(),
                 };
                 if let Err(e) = decode {
