@@ -16,10 +16,13 @@ use std::io::Read;
 /// The scratch buffers grow to the high-water mark and are reused across calls
 /// — no per-frame allocations after the first few frames.
 ///
-/// The decoder always produces the source's native format and configures the
-/// destination tensor's dimensions + pixel format accordingly (JPEG →
-/// `Nv12`/`Grey`, PNG → `Rgb`/`Rgba`/`Grey`). It never colour-converts or
-/// rotates; use `ImageProcessor::convert()` for that.
+/// By default the decoder produces the source's native format and configures
+/// the destination tensor's dimensions + pixel format accordingly (JPEG →
+/// `Nv12`/`Nv16`/`Nv24`/`Grey`, PNG → `Rgb`/`Rgba`/`Grey`).
+/// [`set_output_format`](Self::set_output_format) opts a JPEG decode into a
+/// fused `Rgb` or `Nv12` output, where the colour conversion or chroma
+/// downsample happens at the MCU write stage instead of in a second pass. The
+/// decoder never rotates or resizes; use `ImageProcessor::convert()` for that.
 ///
 /// # Example
 ///
@@ -58,8 +61,31 @@ impl ImageDecoder {
         }
     }
 
+    /// Request a fused decode output format instead of the source's native
+    /// format (JPEG only; PNG is unaffected).
+    ///
+    /// This is a **pure CPU, single-pass** path inside the software JPEG
+    /// decoder — colour conversion / chroma downsample happens at the MCU
+    /// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG
+    /// are bypassed whenever the resolved output differs from native.
+    ///
+    /// - `Some(Rgb)`: 4:4:4 colour JPEGs decode straight to interleaved RGB.
+    ///   Other sources fall back to native.
+    /// - `Some(Nv12)`: colour JPEGs decode to NV12, downsampling chroma at
+    ///   the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
+    /// - `None` (default): native format (`Nv12`/`Nv16`/`Nv24`/`Grey`).
+    ///
+    /// Callers still run `ImageProcessor::convert()` on the result for
+    /// model-input preprocessing (letterbox, resize, EXIF orientation). With
+    /// fused RGB that convert step is typically a pure resize.
+    pub fn set_output_format(&mut self, format: Option<edgefirst_tensor::PixelFormat>) {
+        self.jpeg_state.preferred_format = format;
+    }
+
     /// Decode image data into a typed tensor, configuring its dimensions and
-    /// pixel format to the decoded native format.
+    /// pixel format to the decoded output format — the source's native format
+    /// unless [`set_output_format`](Self::set_output_format) selected a fused
+    /// one.
     ///
     /// Detects the image format (JPEG or PNG) from magic bytes.
     ///
@@ -67,9 +93,10 @@ impl ImageDecoder {
     ///
     /// - [`CodecError::InsufficientCapacity`] if the image is larger than the
     ///   tensor's allocation
-    /// - [`CodecError::UnsupportedDtype`] if `T` is not valid for the native
-    ///   format (JPEG NV12/GREY require `u8`)
-    /// - [`CodecError::InvalidData`] if the data is not a valid JPEG or PNG
+    /// - [`CodecError::UnsupportedDtype`] if `T` is not valid for the output
+    ///   format (JPEG NV12/NV16/NV24/RGB/GREY require `u8`)
+    /// - [`CodecError::InvalidData`] if the data is not a valid JPEG or PNG,
+    ///   including a JPEG whose entropy-coded scan is truncated
     pub fn decode_into<T: ImagePixel>(
         &mut self,
         data: &[u8],

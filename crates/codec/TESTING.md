@@ -13,11 +13,14 @@ Inline `#[cfg(test)]` modules in each source file:
 | `pixel.rs`            | `ImagePixel::from_u8`/`from_u16` for all 5 types     |
 | `png.rs`              | Colorspace → `PixelFormat` mapping, u8/u16 correctness |
 | `jpeg/bitstream.rs`   | Bit read, byte-stuffing, sign extension             |
-| `jpeg/huffman.rs`     | Table build, symbol decode, block decode            |
+| `jpeg/huffman.rs`     | Table build, symbol decode, block decode; malformed DHT rejection (truncated values, oversubscribed code lengths) |
 | `jpeg/markers.rs`     | Minimal JPEG parse, invalid data rejection          |
-| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average) |
+| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average); UV interleave / downsample SIMD parity; truncated scan rejected rather than decoded as zero blocks |
+| `jpeg/color.rs`       | YCbCr→RGB scalar vs float (±1); dispatch bit-exact vs scalar |
+| `jpeg/cpu.rs`         | `NeonTier` / `IntelTier` probe sanity + entropy helpers |
 | `jpeg/idct/scalar.rs` | DC-only shortcut, known coefficient IDCT            |
-| `jpeg/idct/{neon,sse2,sse41}.rs` | Scalar↔SIMD parity per kernel            |
+| `jpeg/idct/{neon,sse2,avx2}.rs` | Scalar↔SIMD parity per kernel (bit-exact on x86, ±1 on NEON) |
+| `jpeg/idct.rs`        | Selected-tier dispatch; coefficients that overflow the 16-bit dequant neither panic under overflow checks nor write outside the block |
 | `jpeg/v4l2/format.rs` | `classify()` CAPTURE FourCC → `CapKind`             |
 | `jpeg/v4l2/mod.rs`    | Backend helpers (geometry/format negotiation logic) |
 | `jpeg/nvjpeg/mod.rs`  | Graceful degradation without a GPU: a non-CUDA destination falls through untouched, an unavailable or unprobed probe returns `None` without writing the tensor, circuit-breaker threshold sanity |
@@ -245,6 +248,23 @@ Benchmark comparisons:
 - `edgefirst-codec` custom JPEG decoder vs `image` crate
 - `edgefirst-codec` vs raw `zune-png` (PNG overhead of strided copy)
 - Strided vs tight decode (measures stride padding overhead)
+
+### CPU-tier A/B
+
+Force the software JPEG ISA / micro-arch policy for apples-to-apples A/B:
+
+```bash
+# AArch64
+EDGEFIRST_CODEC_FORCE_NEON=scalar|baseline|plus|high \
+  cargo bench -p edgefirst-codec --bench codec_benchmark
+
+# x86_64
+EDGEFIRST_CODEC_FORCE_INTEL=scalar|sse2|sse41|avx2 \
+  cargo bench -p edgefirst-codec --bench codec_benchmark
+```
+
+The same env vars apply to `hal_cpu` under `benchmarks/` and to the
+`benchmarks/docker` image entrypoint.
 
 The nvJPEG GPU decode benchmark cells (`codec/jpeg/nvjpeg/rgbi/*`) that measure
 JPEG decode into a CUDA-backed PBO live in `crates/image/benches/nvjpeg_benchmark.rs`

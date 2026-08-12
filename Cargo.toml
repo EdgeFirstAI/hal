@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Standalone article / comparison harness — not part of the HAL dependency graph.
+exclude = ["benchmarks"]
 default-members = [
     "crates/hal",
     "crates/tensor",

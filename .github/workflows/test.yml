@@ -52,8 +52,14 @@ name: Test
 on:
   push:
     branches: [main, develop, 'release/**']
+    paths-ignore:
+      - 'benchmarks/**'
+      - 'BENCHMARKS_PLAN.md'
   pull_request:
     branches: [main, develop, 'release/**']
+    paths-ignore:
+      - 'benchmarks/**'
+      - 'BENCHMARKS_PLAN.md'
   workflow_dispatch:
 
 defaults:

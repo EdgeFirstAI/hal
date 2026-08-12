@@ -39,8 +39,21 @@ env.sh
 .remember
 .mcp.json
 
-# Benchmark intermediate data (JSON results, logs)
-/benchmarks/
+# Benchmark harness sources under benchmarks/ are tracked.
+# Ignore run outputs, build artifacts, and legacy per-platform JSON dumps.
+/benchmarks/results/**
+!/benchmarks/results/.gitkeep
+/benchmarks/**/target/
+/benchmarks/modules/turbojpeg/build/
+/benchmarks/imx*/
+/benchmarks/rpi*/
+/benchmarks/x86*/
+/benchmarks/orin*/
+/benchmarks/jetson*/
+/benchmarks/maivin/
+/benchmarks/*.json
+/benchmarks/*.txt
+/benchmarks/*.csv
 
 # Local-only proof-of-concept spike projects. Each lives outside the
 # workspace (its own Cargo.toml with `[workspace]` section) and gets
@@ -55,3 +68,4 @@ crates/capi/build/
 # affects untracked files; new vetted fixtures need `git add -f`.
 *.tflite
 *.onnx
+/benchmarks/docker/coco-smoke/

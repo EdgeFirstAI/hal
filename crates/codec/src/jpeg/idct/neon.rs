@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! NEON-optimised 8×8 IDCT.
+//! NEON-optimised 8×8 IDCT on 16-bit coefficients (libjpeg-turbo model).
 //!
-//! Uses 32-bit integer arithmetic with the same Loeffler butterfly as the
-//! scalar path, but processes 4 columns/rows at a time using NEON SIMD.
-//! Includes a 4×4 transpose macro for the column→row transition.
+//! The entropy decoder hands us **quantised** `i16` coefficients; this kernel
+//! dequantises 8 lanes at a time (`vmulq_s16`, wrapping — same contract as
+//! turbo's `jsimd_idct_islow_neon`), runs the Loeffler butterfly with
+//! `vmull_s16` 16×16→32 multiplies, and keeps the inter-pass workspace in
+//! `int16x8` registers (no memory round-trip). Sparse shortcuts skip the
+//! arithmetic for the two dominant block shapes of quantised natural images:
+//! all-zero bottom rows (4–7) in pass 1 and all-zero right columns (4–7) in
+//! pass 2.
 
 use std::arch::aarch64::*;
 
@@ -13,234 +18,470 @@ use std::arch::aarch64::*;
 const PASS1_BITS: i32 = 2;
 const CONST_BITS: i32 = 13;
 
-/// Loeffler constants (must match scalar).
-const FIX_0_298: i32 = 2446;
-const FIX_0_390: i32 = 3196;
-const FIX_0_541: i32 = 4433;
-const FIX_0_765: i32 = 6270;
-const FIX_0_899: i32 = 7373;
-const FIX_1_175: i32 = 9633;
-const FIX_1_501: i32 = 12299;
-const FIX_1_847: i32 = 15137;
-const FIX_1_961: i32 = 16069;
-const FIX_2_053: i32 = 16819;
-const FIX_2_562: i32 = 20995;
-const FIX_3_072: i32 = 25172;
+/// Loeffler constants (must match scalar). All fit in i16 for `vmull_s16`.
+const FIX_0_298: i16 = 2446;
+const FIX_0_390: i16 = 3196;
+const FIX_0_541: i16 = 4433;
+const FIX_0_765: i16 = 6270;
+const FIX_0_899: i16 = 7373;
+const FIX_1_175: i16 = 9633;
+const FIX_1_501: i16 = 12299;
+const FIX_1_847: i16 = 15137;
+const FIX_1_961: i16 = 16069;
+const FIX_2_053: i16 = 16819;
+const FIX_2_562: i16 = 20995;
+const FIX_3_072: i16 = 25172;
+/// FIX_0_541 + FIX_0_765 — single multiply in the sparse even part.
+const FIX_1_306: i16 = FIX_0_541 + FIX_0_765;
 
-/// Transpose a 4×4 matrix of int32x4_t vectors.
-macro_rules! transpose4x4 {
-    ($r0:expr, $r1:expr, $r2:expr, $r3:expr) => {{
-        // Step 1: interleave pairs
-        let a0 = vzip1q_s32($r0, $r2);
-        let a1 = vzip2q_s32($r0, $r2);
-        let a2 = vzip1q_s32($r1, $r3);
-        let a3 = vzip2q_s32($r1, $r3);
-        // Step 2: interleave quads
-        $r0 = vzip1q_s32(a0, a2);
-        $r1 = vzip2q_s32(a0, a2);
-        $r2 = vzip1q_s32(a1, a3);
-        $r3 = vzip2q_s32(a1, a3);
-    }};
-}
+/// Butterfly constants packed for lane-indexed multiplies.
+///
+/// Written as `vmull_s16(x, vdup_n_s16(K))`, each constant is rebuilt with a
+/// `mov`/`dup` pair at every use site: the butterfly is inlined four times
+/// (two halves × two passes), so the kernel carried 64 `dup`s per block —
+/// 17% of its instructions. The `_laneq_` forms below name the constant as a
+/// lane of a register instead, so each multiply is a bare `smull`/`smlal`.
+const K0: [i16; 8] = [
+    FIX_0_541, FIX_0_765, FIX_1_847, FIX_1_175, FIX_0_298, FIX_2_053, FIX_3_072, FIX_1_501,
+];
+const K1: [i16; 8] = [
+    -FIX_0_899, -FIX_2_562, FIX_1_961, FIX_0_390, FIX_1_306, 0, 0, 0,
+];
 
-/// Loeffler butterfly on 4 lanes (even part).
-/// Returns (tmp0, tmp1, tmp2, tmp3) with half-round bias added.
+/// Full Loeffler butterfly on 4 lanes of 8 inputs. Returns the 8 outputs in
+/// natural order **before** descaling (32-bit, no rounding bias applied).
 #[inline(always)]
-unsafe fn even_part_neon(
-    s0: int32x4_t,
-    s2: int32x4_t,
-    s4: int32x4_t,
-    s6: int32x4_t,
-    bias: int32x4_t,
-) -> (int32x4_t, int32x4_t, int32x4_t, int32x4_t) {
-    let tmp0 = vshlq_n_s32::<CONST_BITS>(s0);
-    let tmp2 = vshlq_n_s32::<CONST_BITS>(s4);
-
+#[allow(clippy::too_many_arguments)] // eight DCT coefficients is the Loeffler contract
+unsafe fn butterfly8(
+    s0: int16x4_t,
+    s1: int16x4_t,
+    s2: int16x4_t,
+    s3: int16x4_t,
+    s4: int16x4_t,
+    s5: int16x4_t,
+    s6: int16x4_t,
+    s7: int16x4_t,
+    k0: int16x8_t,
+    k1: int16x8_t,
+) -> [int32x4_t; 8] {
+    // Even part.
+    let tmp0 = vshll_n_s16::<{ CONST_BITS }>(s0);
+    let tmp2 = vshll_n_s16::<{ CONST_BITS }>(s4);
     let tmp10 = vaddq_s32(tmp0, tmp2);
     let tmp11 = vsubq_s32(tmp0, tmp2);
 
-    let z1 = vaddq_s32(s2, s6);
-    let fix_0541 = vdupq_n_s32(FIX_0_541);
-    let fix_0765 = vdupq_n_s32(FIX_0_765);
-    let fix_1847 = vdupq_n_s32(FIX_1_847);
+    let z1 = vadd_s16(s2, s6);
+    let tmp13 = vmlal_laneq_s16::<1>(vmull_laneq_s16::<0>(z1, k0), s2, k0);
+    let tmp12 = vmlsl_laneq_s16::<2>(vmull_laneq_s16::<0>(z1, k0), s6, k0);
 
-    let tmp13 = vaddq_s32(vmulq_s32(z1, fix_0541), vmulq_s32(s2, fix_0765));
-    let tmp12 = vsubq_s32(vmulq_s32(z1, fix_0541), vmulq_s32(s6, fix_1847));
+    let t0 = vaddq_s32(tmp10, tmp13);
+    let t3 = vsubq_s32(tmp10, tmp13);
+    let t1 = vaddq_s32(tmp11, tmp12);
+    let t2 = vsubq_s32(tmp11, tmp12);
 
-    let t0 = vaddq_s32(vaddq_s32(tmp10, tmp13), bias);
-    let t3 = vaddq_s32(vsubq_s32(tmp10, tmp13), bias);
-    let t1 = vaddq_s32(vaddq_s32(tmp11, tmp12), bias);
-    let t2 = vaddq_s32(vsubq_s32(tmp11, tmp12), bias);
+    // Odd part.
+    let z1 = vadd_s16(s7, s1);
+    let z2 = vadd_s16(s5, s3);
+    let z3 = vadd_s16(s7, s3);
+    let z4 = vadd_s16(s5, s1);
+    let z5 = vmlal_laneq_s16::<3>(vmull_laneq_s16::<3>(z3, k0), z4, k0);
 
-    (t0, t1, t2, t3)
+    let p7 = vmull_laneq_s16::<4>(s7, k0);
+    let p5 = vmull_laneq_s16::<5>(s5, k0);
+    let p3 = vmull_laneq_s16::<6>(s3, k0);
+    let p1 = vmull_laneq_s16::<7>(s1, k0);
+
+    let z1n = vmull_laneq_s16::<0>(z1, k1);
+    let z2n = vmull_laneq_s16::<1>(z2, k1);
+    let z3n = vsubq_s32(z5, vmull_laneq_s16::<2>(z3, k1));
+    let z4n = vsubq_s32(z5, vmull_laneq_s16::<3>(z4, k1));
+
+    let o0 = vaddq_s32(vaddq_s32(p7, z1n), z3n);
+    let o1 = vaddq_s32(vaddq_s32(p5, z2n), z4n);
+    let o2 = vaddq_s32(vaddq_s32(p3, z2n), z3n);
+    let o3 = vaddq_s32(vaddq_s32(p1, z1n), z4n);
+
+    [
+        vaddq_s32(t0, o3),
+        vaddq_s32(t1, o2),
+        vaddq_s32(t2, o1),
+        vaddq_s32(t3, o0),
+        vsubq_s32(t3, o0),
+        vsubq_s32(t2, o1),
+        vsubq_s32(t1, o2),
+        vsubq_s32(t0, o3),
+    ]
 }
 
-/// Loeffler butterfly on 4 lanes (odd part).
-/// Returns (tmp0_odd, tmp1_odd, tmp2_odd, tmp3_odd).
+/// Sparse Loeffler butterfly: inputs 4–7 are known zero (bottom rows in
+/// pass 1, right columns in pass 2). Algebraically identical to [`butterfly8`]
+/// with `s4 = s5 = s6 = s7 = 0`; ten multiplies instead of fourteen.
 #[inline(always)]
-unsafe fn odd_part_neon(
-    s1: int32x4_t,
-    s3: int32x4_t,
-    s5: int32x4_t,
-    s7: int32x4_t,
-) -> (int32x4_t, int32x4_t, int32x4_t, int32x4_t) {
-    let z1 = vaddq_s32(s7, s1);
-    let z2 = vaddq_s32(s5, s3);
-    let z3 = vaddq_s32(s7, s3);
-    let z4 = vaddq_s32(s5, s1);
-    let z5 = vmulq_s32(vaddq_s32(z3, z4), vdupq_n_s32(FIX_1_175));
+unsafe fn butterfly8_sparse(
+    s0: int16x4_t,
+    s1: int16x4_t,
+    s2: int16x4_t,
+    s3: int16x4_t,
+    k0: int16x8_t,
+    k1: int16x8_t,
+) -> [int32x4_t; 8] {
+    // Even part: tmp2 = 0 so tmp10 = tmp11 = tmp0; z1 collapses to s2.
+    let tmp0 = vshll_n_s16::<{ CONST_BITS }>(s0);
+    let tmp13 = vmull_laneq_s16::<4>(s2, k1);
+    let tmp12 = vmull_laneq_s16::<0>(s2, k0);
 
-    let p7 = vmulq_s32(s7, vdupq_n_s32(FIX_0_298));
-    let p5 = vmulq_s32(s5, vdupq_n_s32(FIX_2_053));
-    let p3 = vmulq_s32(s3, vdupq_n_s32(FIX_3_072));
-    let p1 = vmulq_s32(s1, vdupq_n_s32(FIX_1_501));
+    let t0 = vaddq_s32(tmp0, tmp13);
+    let t3 = vsubq_s32(tmp0, tmp13);
+    let t1 = vaddq_s32(tmp0, tmp12);
+    let t2 = vsubq_s32(tmp0, tmp12);
 
-    let z1 = vmulq_s32(z1, vdupq_n_s32(-FIX_0_899));
-    let z2 = vmulq_s32(z2, vdupq_n_s32(-FIX_2_562));
-    let z3 = vaddq_s32(vmulq_s32(z3, vdupq_n_s32(-FIX_1_961)), z5);
-    let z4 = vaddq_s32(vmulq_s32(z4, vdupq_n_s32(-FIX_0_390)), z5);
+    // Odd part: z1 = s1, z2 = z3 = s3, z4 = s1; p7 = p5 = 0.
+    let z5 = vmlal_laneq_s16::<3>(vmull_laneq_s16::<3>(s3, k0), s1, k0);
+    let p3 = vmull_laneq_s16::<6>(s3, k0);
+    let p1 = vmull_laneq_s16::<7>(s1, k0);
 
-    let tmp0_odd = vaddq_s32(vaddq_s32(p7, z1), z3);
-    let tmp1_odd = vaddq_s32(vaddq_s32(p5, z2), z4);
-    let tmp2_odd = vaddq_s32(vaddq_s32(p3, z2), z3);
-    let tmp3_odd = vaddq_s32(vaddq_s32(p1, z1), z4);
+    let z1n = vmull_laneq_s16::<0>(s1, k1);
+    let z2n = vmull_laneq_s16::<1>(s3, k1);
+    let z3n = vsubq_s32(z5, vmull_laneq_s16::<2>(s3, k1));
+    let z4n = vsubq_s32(z5, vmull_laneq_s16::<3>(s1, k1));
 
-    (tmp0_odd, tmp1_odd, tmp2_odd, tmp3_odd)
+    let o0 = vaddq_s32(z1n, z3n);
+    let o1 = vaddq_s32(z2n, z4n);
+    let o2 = vaddq_s32(vaddq_s32(p3, z2n), z3n);
+    let o3 = vaddq_s32(vaddq_s32(p1, z1n), z4n);
+
+    [
+        vaddq_s32(t0, o3),
+        vaddq_s32(t1, o2),
+        vaddq_s32(t2, o1),
+        vaddq_s32(t3, o0),
+        vsubq_s32(t3, o0),
+        vsubq_s32(t2, o1),
+        vsubq_s32(t1, o2),
+        vsubq_s32(t0, o3),
+    ]
 }
 
-/// NEON 8×8 IDCT: processes 4 columns at a time, transposes, then 4 rows.
+/// Descale one pass-1 output: round-to-nearest shift by CONST_BITS-PASS1_BITS,
+/// **saturating** into `i16`.
 ///
-/// Two passes of the Loeffler butterfly, each processing 4 elements in
-/// parallel. Between passes, a 4×4 transpose reorders the data.
-pub fn idct_8x8_neon(coeffs: &[i32; 64], output: &mut [u8], stride: usize) {
-    unsafe { idct_8x8_neon_inner(coeffs, output, stride) }
+/// `sqrshrn` rather than plain `rshrn`, at identical cost, so that a coefficient
+/// stream extreme enough to overflow the 16-bit workspace lands on the same
+/// pixels here as under the x86 kernels' `packssdw` and the scalar reference —
+/// see [`super::IdctFn`]. Real streams never come near the saturation point.
+#[inline(always)]
+unsafe fn descale_p1(x: int32x4_t) -> int16x4_t {
+    vqrshrn_n_s32::<{ CONST_BITS - PASS1_BITS }>(x)
+}
+
+/// NEON 8×8 IDCT on quantised i16 coefficients (natural order) with the
+/// component quant table (natural order).
+pub fn idct_8x8_neon(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8], stride: usize) {
+    unsafe { idct_8x8_neon_inner(coeffs, quant, output, stride) }
 }
 
 #[target_feature(enable = "neon")]
-unsafe fn idct_8x8_neon_inner(coeffs: &[i32; 64], output: &mut [u8], stride: usize) {
-    let mut workspace = [0i32; 64];
+unsafe fn idct_8x8_neon_inner(
+    coeffs: &[i16; 64],
+    quant: &[u16; 64],
+    output: &mut [u8],
+    stride: usize,
+) {
+    // Load quantised rows and detect the two dominant sparsity shapes before
+    // dequantising (zero quantised ⇒ zero dequantised).
+    let c0 = vld1q_s16(coeffs.as_ptr());
+    let c1 = vld1q_s16(coeffs.as_ptr().add(8));
+    let c2 = vld1q_s16(coeffs.as_ptr().add(16));
+    let c3 = vld1q_s16(coeffs.as_ptr().add(24));
+    let c4 = vld1q_s16(coeffs.as_ptr().add(32));
+    let c5 = vld1q_s16(coeffs.as_ptr().add(40));
+    let c6 = vld1q_s16(coeffs.as_ptr().add(48));
+    let c7 = vld1q_s16(coeffs.as_ptr().add(56));
 
-    // Pass 1: columns. Process columns 0-3 then 4-7 (4 at a time).
-    let half = vdupq_n_s32(1 << (CONST_BITS - 1));
+    let bottom_or = vorrq_s16(vorrq_s16(c4, c5), vorrq_s16(c6, c7));
+    let all_or = vorrq_s16(vorrq_s16(vorrq_s16(c0, c1), vorrq_s16(c2, c3)), bottom_or);
+    let bottom_u64 = vreinterpretq_u64_s16(bottom_or);
+    let bottom_zero = (vgetq_lane_u64::<0>(bottom_u64) | vgetq_lane_u64::<1>(bottom_u64)) == 0;
+    // Columns 4–7 across all rows sit in the high 64 bits of each row vector.
+    let right_zero = vgetq_lane_u64::<1>(vreinterpretq_u64_s16(all_or)) == 0;
 
-    for col_group in 0..2 {
-        let base = col_group * 4;
+    // Dequantise (16-bit wrapping multiply — turbo's contract; valid baseline
+    // streams never overflow, corrupt ones only garble their own pixels).
+    let dq = |c: int16x8_t, i: usize| -> int16x8_t {
+        vmulq_s16(
+            c,
+            vreinterpretq_s16_u16(vld1q_u16(quant.as_ptr().add(i * 8))),
+        )
+    };
+    let r0 = dq(c0, 0);
+    let r1 = dq(c1, 1);
+    let r2 = dq(c2, 2);
+    let r3 = dq(c3, 3);
+    let zero8 = vdupq_n_s16(0);
+    let (r4, r5, r6, r7) = if bottom_zero {
+        (zero8, zero8, zero8, zero8)
+    } else {
+        (dq(c4, 4), dq(c5, 5), dq(c6, 6), dq(c7, 7))
+    };
 
-        // Load 8 rows of 4 coefficients each
-        let s0 = vld1q_s32(coeffs.as_ptr().add(base));
-        let s1 = vld1q_s32(coeffs.as_ptr().add(8 + base));
-        let s2 = vld1q_s32(coeffs.as_ptr().add(16 + base));
-        let s3 = vld1q_s32(coeffs.as_ptr().add(24 + base));
-        let s4 = vld1q_s32(coeffs.as_ptr().add(32 + base));
-        let s5 = vld1q_s32(coeffs.as_ptr().add(40 + base));
-        let s6 = vld1q_s32(coeffs.as_ptr().add(48 + base));
-        let s7 = vld1q_s32(coeffs.as_ptr().add(56 + base));
+    // Butterfly constants, loaded once per block rather than rebuilt at every
+    // multiply (see [`K0`]). The barrier is load-bearing: with the addresses
+    // visible LLVM folds each lane back to its literal value and re-emits the
+    // `dup`s the lane form was meant to remove, undoing the whole change. Hiding
+    // the pointers forces one real load and keeps both vectors live across the
+    // four butterflies. Costs two more spill slots and saves ~100 instructions
+    // per block; a no-op for correctness if a future LLVM stops honouring it.
+    let k0 = vld1q_s16(std::hint::black_box(K0.as_ptr()));
+    let k1 = vld1q_s16(std::hint::black_box(K1.as_ptr()));
 
-        let (t0, t1, t2, t3) = even_part_neon(s0, s2, s4, s6, half);
-        let (o0, o1, o2, o3) = odd_part_neon(s1, s3, s5, s7);
-
-        // Combine and descale
-        let r0 = vshrq_n_s32::<{ 13 - 2 }>(vaddq_s32(t0, o3));
-        let r7 = vshrq_n_s32::<{ 13 - 2 }>(vsubq_s32(t0, o3));
-        let r1 = vshrq_n_s32::<{ 13 - 2 }>(vaddq_s32(t1, o2));
-        let r6 = vshrq_n_s32::<{ 13 - 2 }>(vsubq_s32(t1, o2));
-        let r2 = vshrq_n_s32::<{ 13 - 2 }>(vaddq_s32(t2, o1));
-        let r5 = vshrq_n_s32::<{ 13 - 2 }>(vsubq_s32(t2, o1));
-        let r3 = vshrq_n_s32::<{ 13 - 2 }>(vaddq_s32(t3, o0));
-        let r4 = vshrq_n_s32::<{ 13 - 2 }>(vsubq_s32(t3, o0));
-
-        // Store to workspace
-        vst1q_s32(workspace.as_mut_ptr().add(base), r0);
-        vst1q_s32(workspace.as_mut_ptr().add(8 + base), r1);
-        vst1q_s32(workspace.as_mut_ptr().add(16 + base), r2);
-        vst1q_s32(workspace.as_mut_ptr().add(24 + base), r3);
-        vst1q_s32(workspace.as_mut_ptr().add(32 + base), r4);
-        vst1q_s32(workspace.as_mut_ptr().add(40 + base), r5);
-        vst1q_s32(workspace.as_mut_ptr().add(48 + base), r6);
-        vst1q_s32(workspace.as_mut_ptr().add(56 + base), r7);
-    }
-
-    // Pass 2: rows. Process rows 0-3 then 4-7 (4 at a time).
-    // We need to transpose 4×8 blocks, process them, then write output.
-    let range_shift = CONST_BITS + PASS1_BITS + 3;
-    let bias_val = (1 << (range_shift - 1)) + (128 << range_shift);
-    let bias = vdupq_n_s32(bias_val);
-    let zero = vdupq_n_s32(0);
-    let max255 = vdupq_n_s32(255);
-
-    for row_group in 0..2 {
-        let row_base = row_group * 4 * 8; // rows 0-3 or 4-7
-
-        // Load 4 rows of 8 values each, but we need to transpose to get
-        // columns. Load as 4×4 blocks and transpose.
-        // Left half (columns 0-3)
-        let mut r0l = vld1q_s32(workspace.as_ptr().add(row_base));
-        let mut r1l = vld1q_s32(workspace.as_ptr().add(row_base + 8));
-        let mut r2l = vld1q_s32(workspace.as_ptr().add(row_base + 16));
-        let mut r3l = vld1q_s32(workspace.as_ptr().add(row_base + 24));
-        transpose4x4!(r0l, r1l, r2l, r3l);
-
-        // Right half (columns 4-7)
-        let mut r0r = vld1q_s32(workspace.as_ptr().add(row_base + 4));
-        let mut r1r = vld1q_s32(workspace.as_ptr().add(row_base + 8 + 4));
-        let mut r2r = vld1q_s32(workspace.as_ptr().add(row_base + 16 + 4));
-        let mut r3r = vld1q_s32(workspace.as_ptr().add(row_base + 24 + 4));
-        transpose4x4!(r0r, r1r, r2r, r3r);
-
-        // Now: r0l=col0(4rows), r1l=col1, r2l=col2, r3l=col3
-        //      r0r=col4, r1r=col5, r2r=col6, r3r=col7
-        // These are the 8 "columns" of the 4 rows we're processing
-        let s0 = r0l;
-        let s1 = r1l;
-        let s2 = r2l;
-        let s3 = r3l;
-        let s4 = r0r;
-        let s5 = r1r;
-        let s6 = r2r;
-        let s7 = r3r;
-
-        let (t0, t1, t2, t3) = even_part_neon(s0, s2, s4, s6, bias);
-        let (o0, o1, o2, o3) = odd_part_neon(s1, s3, s5, s7);
-
-        // Combine, descale, and clamp to [0, 255]
-        let clamp = |v: int32x4_t| -> int32x4_t {
-            let shifted = vshrq_n_s32::<{ 13 + 2 + 3 }>(v);
-            vminq_s32(vmaxq_s32(shifted, zero), max255)
+    // Pass 1 (columns): lanes are columns, inputs indexed by row. Left half
+    // (cols 0–3) from the low halves, right half from the highs.
+    let zero4 = vdup_n_s16(0);
+    let pass1_half = |h0: int16x4_t,
+                      h1: int16x4_t,
+                      h2: int16x4_t,
+                      h3: int16x4_t,
+                      h4: int16x4_t,
+                      h5: int16x4_t,
+                      h6: int16x4_t,
+                      h7: int16x4_t,
+                      sparse: bool|
+     -> [int16x4_t; 8] {
+        let x = if sparse {
+            butterfly8_sparse(h0, h1, h2, h3, k0, k1)
+        } else {
+            butterfly8(h0, h1, h2, h3, h4, h5, h6, h7, k0, k1)
         };
+        [
+            descale_p1(x[0]),
+            descale_p1(x[1]),
+            descale_p1(x[2]),
+            descale_p1(x[3]),
+            descale_p1(x[4]),
+            descale_p1(x[5]),
+            descale_p1(x[6]),
+            descale_p1(x[7]),
+        ]
+    };
 
-        let out0 = clamp(vaddq_s32(t0, o3));
-        let out7 = clamp(vsubq_s32(t0, o3));
-        let out1 = clamp(vaddq_s32(t1, o2));
-        let out6 = clamp(vsubq_s32(t1, o2));
-        let out2 = clamp(vaddq_s32(t2, o1));
-        let out5 = clamp(vsubq_s32(t2, o1));
-        let out3 = clamp(vaddq_s32(t3, o0));
-        let out4 = clamp(vsubq_s32(t3, o0));
+    let wl = pass1_half(
+        vget_low_s16(r0),
+        vget_low_s16(r1),
+        vget_low_s16(r2),
+        vget_low_s16(r3),
+        vget_low_s16(r4),
+        vget_low_s16(r5),
+        vget_low_s16(r6),
+        vget_low_s16(r7),
+        bottom_zero,
+    );
+    let wr = if right_zero {
+        [zero4; 8]
+    } else {
+        pass1_half(
+            vget_high_s16(r0),
+            vget_high_s16(r1),
+            vget_high_s16(r2),
+            vget_high_s16(r3),
+            vget_high_s16(r4),
+            vget_high_s16(r5),
+            vget_high_s16(r6),
+            vget_high_s16(r7),
+            bottom_zero,
+        )
+    };
 
-        // Write output: extract 4 rows, 8 pixels each.
-        // Each outN vector holds column N's values for the 4 rows in this group.
-        // We need to gather column 0..7 for each row.
-        // Store to a temporary, then extract rows.
-        let mut tmp = [0i32; 32]; // 4 rows × 8 columns
-                                  // Store columns into row-major temp via scatter
-        vst1q_s32(tmp.as_mut_ptr(), out0); // col 0, rows 0-3
-        vst1q_s32(tmp.as_mut_ptr().add(4), out1); // col 1, rows 0-3
-        vst1q_s32(tmp.as_mut_ptr().add(8), out2);
-        vst1q_s32(tmp.as_mut_ptr().add(12), out3);
-        vst1q_s32(tmp.as_mut_ptr().add(16), out4);
-        vst1q_s32(tmp.as_mut_ptr().add(20), out5);
-        vst1q_s32(tmp.as_mut_ptr().add(24), out6);
-        vst1q_s32(tmp.as_mut_ptr().add(28), out7);
+    // Workspace rows (lanes = columns) → transpose to columns (lanes = rows).
+    let w0 = vcombine_s16(wl[0], wr[0]);
+    let w1 = vcombine_s16(wl[1], wr[1]);
+    let w2 = vcombine_s16(wl[2], wr[2]);
+    let w3 = vcombine_s16(wl[3], wr[3]);
+    let w4 = vcombine_s16(wl[4], wr[4]);
+    let w5 = vcombine_s16(wl[5], wr[5]);
+    let w6 = vcombine_s16(wl[6], wr[6]);
+    let w7 = vcombine_s16(wl[7], wr[7]);
 
-        // Extract each row (gather from column-major tmp)
-        for local_row in 0..4 {
-            let row_idx = row_group * 4 + local_row;
-            let out_ptr = output.as_mut_ptr().add(row_idx * stride);
-            for col in 0..8 {
-                *out_ptr.add(col) = tmp[col * 4 + local_row] as u8;
-            }
+    let (t0, t1, t2, t3, t4, t5, t6, t7) = transpose_8x8_s16(w0, w1, w2, w3, w4, w5, w6, w7);
+
+    // Pass 2 (rows): lanes are rows. If the right workspace half was zero the
+    // transposed columns 4–7 are zero — sparse butterfly, no check needed.
+    let pass2_half = |g0: int16x4_t,
+                      g1: int16x4_t,
+                      g2: int16x4_t,
+                      g3: int16x4_t,
+                      g4: int16x4_t,
+                      g5: int16x4_t,
+                      g6: int16x4_t,
+                      g7: int16x4_t|
+     -> [int32x4_t; 8] {
+        if right_zero {
+            butterfly8_sparse(g0, g1, g2, g3, k0, k1)
+        } else {
+            butterfly8(g0, g1, g2, g3, g4, g5, g6, g7, k0, k1)
         }
-    }
+    };
+
+    let lo = pass2_half(
+        vget_low_s16(t0),
+        vget_low_s16(t1),
+        vget_low_s16(t2),
+        vget_low_s16(t3),
+        vget_low_s16(t4),
+        vget_low_s16(t5),
+        vget_low_s16(t6),
+        vget_low_s16(t7),
+    );
+    let hi = pass2_half(
+        vget_high_s16(t0),
+        vget_high_s16(t1),
+        vget_high_s16(t2),
+        vget_high_s16(t3),
+        vget_high_s16(t4),
+        vget_high_s16(t5),
+        vget_high_s16(t6),
+        vget_high_s16(t7),
+    );
+
+    // Final descale: ((x + 2^15) >> 16 + 2) >> 2 + 128, saturated to u8 —
+    // equal to the scalar ((x + 2^17 + 128·2^18) >> 18).clamp(0,255) within ±1.
+    let off128 = vdupq_n_s16(128);
+    let narrow = |a: int32x4_t, b: int32x4_t| -> uint8x8_t {
+        let v = vcombine_s16(vrshrn_n_s32::<16>(a), vrshrn_n_s32::<16>(b));
+        vqmovun_s16(vaddq_s16(vrshrq_n_s16::<2>(v), off128))
+    };
+    // u_j lanes = rows 0..7 of output column j.
+    let u0 = narrow(lo[0], hi[0]);
+    let u1 = narrow(lo[1], hi[1]);
+    let u2 = narrow(lo[2], hi[2]);
+    let u3 = narrow(lo[3], hi[3]);
+    let u4 = narrow(lo[4], hi[4]);
+    let u5 = narrow(lo[5], hi[5]);
+    let u6 = narrow(lo[6], hi[6]);
+    let u7 = narrow(lo[7], hi[7]);
+
+    // Transpose 8×8 bytes (columns → rows) and store row-major.
+    let (y0, y1, y2, y3, y4, y5, y6, y7) = transpose_8x8_u8(u0, u1, u2, u3, u4, u5, u6, u7);
+    let out = output.as_mut_ptr();
+    vst1_u8(out, y0);
+    vst1_u8(out.add(stride), y1);
+    vst1_u8(out.add(2 * stride), y2);
+    vst1_u8(out.add(3 * stride), y3);
+    vst1_u8(out.add(4 * stride), y4);
+    vst1_u8(out.add(5 * stride), y5);
+    vst1_u8(out.add(6 * stride), y6);
+    vst1_u8(out.add(7 * stride), y7);
+}
+
+/// 8×8 transpose of int16x8 vectors (three trn stages: 16 → 32 → 64 bit).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn transpose_8x8_s16(
+    w0: int16x8_t,
+    w1: int16x8_t,
+    w2: int16x8_t,
+    w3: int16x8_t,
+    w4: int16x8_t,
+    w5: int16x8_t,
+    w6: int16x8_t,
+    w7: int16x8_t,
+) -> (
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+    int16x8_t,
+) {
+    let a0 = vtrn1q_s16(w0, w1);
+    let a1 = vtrn2q_s16(w0, w1);
+    let a2 = vtrn1q_s16(w2, w3);
+    let a3 = vtrn2q_s16(w2, w3);
+    let a4 = vtrn1q_s16(w4, w5);
+    let a5 = vtrn2q_s16(w4, w5);
+    let a6 = vtrn1q_s16(w6, w7);
+    let a7 = vtrn2q_s16(w6, w7);
+
+    let t32 = |x: int16x8_t| vreinterpretq_s32_s16(x);
+    let f32 = |x: int32x4_t| vreinterpretq_s16_s32(x);
+    let b0 = f32(vtrn1q_s32(t32(a0), t32(a2)));
+    let b2 = f32(vtrn2q_s32(t32(a0), t32(a2)));
+    let b1 = f32(vtrn1q_s32(t32(a1), t32(a3)));
+    let b3 = f32(vtrn2q_s32(t32(a1), t32(a3)));
+    let b4 = f32(vtrn1q_s32(t32(a4), t32(a6)));
+    let b6 = f32(vtrn2q_s32(t32(a4), t32(a6)));
+    let b5 = f32(vtrn1q_s32(t32(a5), t32(a7)));
+    let b7 = f32(vtrn2q_s32(t32(a5), t32(a7)));
+
+    let t64 = |x: int16x8_t| vreinterpretq_s64_s16(x);
+    let f64 = |x: int64x2_t| vreinterpretq_s16_s64(x);
+    (
+        f64(vtrn1q_s64(t64(b0), t64(b4))),
+        f64(vtrn1q_s64(t64(b1), t64(b5))),
+        f64(vtrn1q_s64(t64(b2), t64(b6))),
+        f64(vtrn1q_s64(t64(b3), t64(b7))),
+        f64(vtrn2q_s64(t64(b0), t64(b4))),
+        f64(vtrn2q_s64(t64(b1), t64(b5))),
+        f64(vtrn2q_s64(t64(b2), t64(b6))),
+        f64(vtrn2q_s64(t64(b3), t64(b7))),
+    )
+}
+
+/// 8×8 transpose of uint8x8 vectors (three trn stages: 8 → 16 → 32 bit).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn transpose_8x8_u8(
+    u0: uint8x8_t,
+    u1: uint8x8_t,
+    u2: uint8x8_t,
+    u3: uint8x8_t,
+    u4: uint8x8_t,
+    u5: uint8x8_t,
+    u6: uint8x8_t,
+    u7: uint8x8_t,
+) -> (
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+    uint8x8_t,
+) {
+    let a0 = vtrn1_u8(u0, u1);
+    let a1 = vtrn2_u8(u0, u1);
+    let a2 = vtrn1_u8(u2, u3);
+    let a3 = vtrn2_u8(u2, u3);
+    let a4 = vtrn1_u8(u4, u5);
+    let a5 = vtrn2_u8(u4, u5);
+    let a6 = vtrn1_u8(u6, u7);
+    let a7 = vtrn2_u8(u6, u7);
+
+    let t16 = |x: uint8x8_t| vreinterpret_u16_u8(x);
+    let f16 = |x: uint16x4_t| vreinterpret_u8_u16(x);
+    let b0 = f16(vtrn1_u16(t16(a0), t16(a2)));
+    let b2 = f16(vtrn2_u16(t16(a0), t16(a2)));
+    let b1 = f16(vtrn1_u16(t16(a1), t16(a3)));
+    let b3 = f16(vtrn2_u16(t16(a1), t16(a3)));
+    let b4 = f16(vtrn1_u16(t16(a4), t16(a6)));
+    let b6 = f16(vtrn2_u16(t16(a4), t16(a6)));
+    let b5 = f16(vtrn1_u16(t16(a5), t16(a7)));
+    let b7 = f16(vtrn2_u16(t16(a5), t16(a7)));
+
+    let t32 = |x: uint8x8_t| vreinterpret_u32_u8(x);
+    let f32 = |x: uint32x2_t| vreinterpret_u8_u32(x);
+    (
+        f32(vtrn1_u32(t32(b0), t32(b4))),
+        f32(vtrn1_u32(t32(b1), t32(b5))),
+        f32(vtrn1_u32(t32(b2), t32(b6))),
+        f32(vtrn1_u32(t32(b3), t32(b7))),
+        f32(vtrn2_u32(t32(b0), t32(b4))),
+        f32(vtrn2_u32(t32(b1), t32(b5))),
+        f32(vtrn2_u32(t32(b2), t32(b6))),
+        f32(vtrn2_u32(t32(b3), t32(b7))),
+    )
 }
 
 /// NEON DC-only IDCT: fill 8×8 block with a single value.
@@ -248,8 +489,11 @@ pub fn idct_dc_only_neon(dc_value: i32, output: &mut [u8], stride: usize) {
     let range_shift = CONST_BITS + PASS1_BITS + 3;
     let round = 1 << (range_shift - 1);
     let bias = round + (128 << range_shift);
-    let scaled = dc_value << (CONST_BITS + PASS1_BITS);
-    let val = ((scaled + bias) >> range_shift).clamp(0, 255) as u8;
+    // Wrapping: in-contract values cannot overflow here, but the argument is an
+    // i32 and a caller that hands over a wider one must get the same defined
+    // result the block kernels give, not a debug-build panic.
+    let scaled = dc_value.wrapping_shl((CONST_BITS + PASS1_BITS) as u32);
+    let val = (scaled.wrapping_add(bias) >> range_shift).clamp(0, 255) as u8;
 
     // Use NEON to fill 8 bytes at once
     unsafe {
@@ -265,10 +509,12 @@ mod tests {
     use super::super::scalar::{idct_8x8_scalar, idct_dc_only_scalar};
     use super::{idct_8x8_neon, idct_dc_only_neon};
 
+    const UNIT_QUANT: [u16; 64] = [1u16; 64];
+
     /// Deterministic synthetic IDCT coefficient block: DC + a few AC terms.
     /// Values chosen so that no output pixel saturates (all outputs stay in ~30..220).
-    fn make_test_coeffs() -> [i32; 64] {
-        let mut c = [0i32; 64];
+    fn make_test_coeffs() -> [i16; 64] {
+        let mut c = [0i16; 64];
         // DC coefficient
         c[0] = 256;
         // A handful of AC terms at positions that give non-trivial output
@@ -282,25 +528,16 @@ mod tests {
         c
     }
 
-    #[test]
-    fn idct_8x8_parity() {
-        if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("SIMD feature not available, skipping");
-            return;
-        }
-
-        let coeffs = make_test_coeffs();
+    fn assert_parity(coeffs: &[i16; 64], quant: &[u16; 64], label: &str) {
         let mut scalar_out = [0u8; 64];
         let mut simd_out = [0u8; 64];
-
-        idct_8x8_scalar(&coeffs, &mut scalar_out, 8);
-        idct_8x8_neon(&coeffs, &mut simd_out, 8);
-
+        idct_8x8_scalar(coeffs, quant, &mut scalar_out, 8);
+        idct_8x8_neon(coeffs, quant, &mut simd_out, 8);
         for i in 0..64 {
             let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
             assert!(
                 diff <= 1,
-                "parity mismatch at index {i}: scalar={}, simd={}, diff={}",
+                "{label}: parity mismatch at index {i}: scalar={}, simd={}, diff={}",
                 scalar_out[i],
                 simd_out[i],
                 diff
@@ -309,29 +546,87 @@ mod tests {
     }
 
     #[test]
+    fn idct_8x8_parity() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        // Default coefficients live in rows 0–3 / cols 0–3: exercises both
+        // sparse shortcuts (bottom rows zero + right columns zero).
+        assert_parity(&make_test_coeffs(), &UNIT_QUANT, "sparse");
+    }
+
+    /// Coefficients in columns 4–7 defeat the right-half skip; parity must
+    /// hold on the full-width path too.
+    #[test]
+    fn idct_8x8_parity_right_half_coeffs() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut coeffs = make_test_coeffs();
+        coeffs[5] = 18; // row 0, col 5
+        coeffs[12] = -14; // row 1, col 4
+        coeffs[23] = 9; // row 2, col 7
+        assert_parity(&coeffs, &UNIT_QUANT, "right-half");
+    }
+
+    /// Coefficients in rows 4–7 defeat the bottom-rows skip (full pass-1
+    /// butterfly), while columns 4–7 stay zero (sparse pass 2).
+    #[test]
+    fn idct_8x8_parity_bottom_row_coeffs() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut coeffs = make_test_coeffs();
+        coeffs[32] = 15; // row 4, col 0
+        coeffs[41] = -11; // row 5, col 1
+        coeffs[58] = 7; // row 7, col 2
+        assert_parity(&coeffs, &UNIT_QUANT, "bottom-rows");
+    }
+
+    /// Dense block: every sparsity shortcut defeated.
+    #[test]
+    fn idct_8x8_parity_dense() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut coeffs = make_test_coeffs();
+        coeffs[5] = 18; // row 0, col 5
+        coeffs[36] = -9; // row 4, col 4
+        coeffs[63] = 5; // row 7, col 7
+        assert_parity(&coeffs, &UNIT_QUANT, "dense");
+    }
+
+    /// Real-shape quant table must be applied identically to scalar.
+    #[test]
+    fn idct_8x8_parity_with_quant() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut quant = [0u16; 64];
+        for (i, q) in quant.iter_mut().enumerate() {
+            *q = 2 + (i as u16 % 13);
+        }
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 64;
+        coeffs[1] = 12;
+        coeffs[8] = -9;
+        coeffs[18] = 5;
+        coeffs[35] = -3; // row 4, col 3
+        assert_parity(&coeffs, &quant, "quant");
+    }
+
+    #[test]
     fn idct_8x8_parity_zero_block() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
             eprintln!("SIMD feature not available, skipping");
             return;
         }
-
-        let coeffs = [0i32; 64];
-        let mut scalar_out = [0u8; 64];
-        let mut simd_out = [0u8; 64];
-
-        idct_8x8_scalar(&coeffs, &mut scalar_out, 8);
-        idct_8x8_neon(&coeffs, &mut simd_out, 8);
-
-        for i in 0..64 {
-            let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
-            assert!(
-                diff <= 1,
-                "zero-block parity mismatch at index {i}: scalar={}, simd={}, diff={}",
-                scalar_out[i],
-                simd_out[i],
-                diff
-            );
-        }
+        assert_parity(&[0i16; 64], &UNIT_QUANT, "zero-block");
     }
 
     #[test]
@@ -346,8 +641,8 @@ mod tests {
         let mut scalar_out = vec![0u8; stride * 8];
         let mut simd_out = vec![0u8; stride * 8];
 
-        idct_8x8_scalar(&coeffs, &mut scalar_out, stride);
-        idct_8x8_neon(&coeffs, &mut simd_out, stride);
+        idct_8x8_scalar(&coeffs, &UNIT_QUANT, &mut scalar_out, stride);
+        idct_8x8_neon(&coeffs, &UNIT_QUANT, &mut simd_out, stride);
 
         for row in 0..8 {
             for col in 0..8 {
