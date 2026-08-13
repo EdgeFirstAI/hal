@@ -153,8 +153,14 @@ impl PboHandle {
                 // GL reported success but handed back a null pointer. It
                 // considers the buffer mapped, so release it rather than
                 // strand it mapped forever.
-                self.finish_map(None, writable);
+                //
+                // Order matters: the cleanup unmap runs while this thread
+                // still holds the `Mapping` claim, so waiters stay parked
+                // and cannot start a fresh `map_buffer` that would race
+                // this unmap on the GL queue. Only once it has completed is
+                // `Unmapped` published.
                 let _ = self.ops.unmap_buffer(self.buffer_id);
+                self.finish_map(None, writable);
                 return Err(Error::InvalidSize(self.size));
             };
             self.finish_map(Some(base), writable);
@@ -315,8 +321,14 @@ where
         self.handle.buffer_id
     }
 
-    /// Returns true if the PBO is currently mapped for CPU access —
-    /// exclusively, or by one or more read-only holders.
+    /// Returns true unless the PBO is fully unmapped.
+    ///
+    /// That covers an exclusive map, one or more read-only holders, AND a
+    /// map or unmap another thread currently has in flight — during those
+    /// windows the GL buffer is (or is about to be) mapped, and no other
+    /// mapping may begin, so reporting `false` would be misleading. Use it
+    /// as "is this buffer free for GL operations?", not as "does a CPU
+    /// pointer exist right now".
     pub fn is_mapped(&self) -> bool {
         self.handle.is_mapped()
     }
@@ -665,8 +677,12 @@ mod tests {
         }
     }
 
-    // SAFETY: MockPboOps returns a valid pointer to a Vec<u8> that remains
-    // valid while the Mutex is held (tests are single-threaded).
+    // SAFETY: the returned pointer addresses a `Vec<u8>` that is allocated
+    // once in `new` and never resized, so it stays valid for the whole life
+    // of the `MockPboOps` — which outlives every map handed out, since the
+    // tensor holds an `Arc` to it. The storage mutex is NOT what keeps the
+    // pointer alive (`map_buffer` releases it before returning); it only
+    // guards the length assertion.
     unsafe impl PboOps for MockPboOps {
         fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
             self.maps.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -720,6 +736,74 @@ mod tests {
         assert!(tensor.is_mapped());
         let result = tensor.map();
         assert!(result.is_err(), "second map while mapped should fail");
+    }
+
+    /// Mock whose `map_buffer` reports success but hands back a null
+    /// pointer — the one path where a claimed map has to be released again.
+    #[derive(Default)]
+    struct NullMappingOps {
+        unmaps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NullMappingOps {
+        fn unmap_count(&self) -> usize {
+            self.unmaps.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    // SAFETY: never produces a usable pointer, so no caller can dereference
+    // one; the mapping it returns is rejected before reaching a slice.
+    unsafe impl PboOps for NullMappingOps {
+        fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
+            Ok(PboMapping {
+                ptr: std::ptr::null_mut(),
+                size,
+            })
+        }
+
+        fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            self.unmaps
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn delete_buffer(&self, _buffer_id: u32) {}
+    }
+
+    /// A map that "succeeds" with a null pointer leaves GL considering the
+    /// buffer mapped, so it must be released and the state returned to
+    /// unmapped — otherwise the buffer is stranded and every later map
+    /// fails. The release happens before `Unmapped` is published, so no
+    /// waiter can start a map that races the cleanup unmap.
+    #[test]
+    fn null_mapping_releases_the_buffer_and_resets_state() {
+        let ops = Arc::new(NullMappingOps::default());
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let tensor = PboTensor::<u8>::from_pbo(12, 8, &[8], None, dyn_ops).unwrap();
+
+        let Err(err) = tensor.map_read() else {
+            panic!("a null mapping must not succeed");
+        };
+        assert!(
+            matches!(err, Error::InvalidSize(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            ops.unmap_count(),
+            1,
+            "GL still holds the buffer mapped — the failed map must release it"
+        );
+        assert!(
+            !tensor.is_mapped(),
+            "state must return to Unmapped so later maps can proceed"
+        );
+
+        // Not stranded: the buffer can be claimed again.
+        let Err(err) = tensor.map_read() else {
+            panic!("still null, so it must still fail");
+        };
+        assert!(matches!(err, Error::InvalidSize(_)));
+        assert_eq!(ops.unmap_count(), 2, "and released again");
     }
 
     /// Several read-only holders share ONE GL mapping. This is what lets
