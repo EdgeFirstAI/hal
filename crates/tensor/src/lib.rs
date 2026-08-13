@@ -6735,6 +6735,13 @@ mod tests {
     }
 
     /// Take [`FD_LOCK`] exclusively. Poison-tolerant, see [`fd_lock_shared`].
+    ///
+    /// Linux-only, like all four of its callers: the fd-leak tests read fd
+    /// state out of `/proc`, which no other platform provides. Ungated, it
+    /// is dead code on macOS and the lint denies that.
+    /// [`fd_lock_shared`] stays available everywhere — macOS tests declare
+    /// fd activity too.
+    #[cfg(target_os = "linux")]
     pub fn fd_lock_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
         FD_LOCK.write().unwrap_or_else(PoisonError::into_inner)
     }
