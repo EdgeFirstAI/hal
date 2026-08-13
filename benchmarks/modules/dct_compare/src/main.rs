@@ -83,13 +83,20 @@ fn main() -> Result<()> {
         };
         let _ = t_fast.load_image(&mut dec_fast, &data)?;
 
-        // Compare the decoded planes over the valid image region only: rows
-        // of `width` bytes at the tensor stride, over the combined plane
-        // height (Y + interleaved UV for Nv24; Y-only for Grey).
+        // Compare the decoded planes over the valid image region only: the
+        // luma rows carry `width` bytes; the chroma rows of the semi-planar
+        // formats carry interleaved CbCr — 2·width for Nv24 (full-res),
+        // even(width) for Nv12/Nv16 (2 bytes per 2-wide pair). Row count
+        // comes from the format's combined plane height, so Nv12's half-
+        // height chroma and Grey's absence of chroma are both respected.
         let stride = t_acc.effective_row_stride().unwrap_or(ia.width);
-        let plane_rows = match ia.format {
-            PixelFormat::Grey => ia.height,
-            _ => ia.height * 3, // Nv24: Y rows + UV rows (2 bytes/px over w/2… full-res UV)
+        let plane_rows = ia
+            .format
+            .combined_plane_height(ia.height)
+            .unwrap_or(ia.height);
+        let chroma_row_bytes = match ia.format {
+            PixelFormat::Nv24 => ia.width * 2,
+            _ => ia.width.next_multiple_of(2),
         };
         let a = t_acc.map()?;
         let f = t_fast.map()?;
@@ -98,7 +105,12 @@ fn main() -> Result<()> {
         let mut count = 0usize;
         for r in 0..plane_rows {
             let off = r * stride;
-            let w = ia.width.min(stride);
+            let w = if r < ia.height {
+                ia.width
+            } else {
+                chroma_row_bytes
+            }
+            .min(stride);
             for i in off..off + w {
                 let (x, y) = (a[i] as f64, f[i] as f64);
                 dot += x * y;

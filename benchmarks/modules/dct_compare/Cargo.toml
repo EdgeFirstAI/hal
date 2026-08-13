@@ -16,5 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-edgefirst-codec = { path = "../../../crates/codec" }
+# default-features off: the v4l2/nvjpeg hardware decoders would bypass the
+# software IDCT this harness exists to compare.
+edgefirst-codec = { path = "../../../crates/codec", default-features = false }
 edgefirst-tensor = { path = "../../../crates/tensor" }

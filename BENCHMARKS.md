@@ -1,6 +1,6 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.9
+**Version:** 3.10
 **Last Updated:** June 16, 2026
 **Status:** 0.25.0 release refresh. The full bench matrix was re-collected on the 0.25.0
 converged-GL-engine code across imx8mp-frdm (Vivante GC7000UL + G2D), imx95-frdm
@@ -1437,7 +1437,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 3.10 | 2026-08-12 | JPEG decode A/B refresh (`CARGO_PROFILE=release`, no perf/trace, interleaved best-of-3, n=200, pinned): A53 within 1% of turbo `islow`; A55 ahead of `islow`; add orin-nano A78AE row. x86 unchanged. |
+| 3.10 | 2026-08-13 | JPEG decode section rebuilt as the six-arm sweep (`decode-ab-sweep.sh`): EdgeFirst accurate + opt-in `fast` (`DctMethod::Fast`) vs turbo `islow`/`ifast`, zune-jpeg, and the image crate, across A53/A55/A76/A78AE/Rocket Lake. Accurate beats both turbo kernels everywhere (+11.7% A53 … +28.7% A78AE vs `islow`); `fast` beats `ifast` by 14–32% with its accuracy envelope stated (cosine ≥ 0.99985, PSNR ≥ 42 dB, max Δ 24 over 1000 COCO images). x86 re-captured after the SSE4.1 fused-RGB block-kernel fix. orin-nano row captured on the `adis-uav1` fallback (turbo baseline within 0.1% of the prior capture). |
 | 3.9 | 2026-06-16 | 0.25.0 release refresh: full bench matrix re-collected on the converged-GL-engine code across imx8mp-frdm, imx95-frdm, rpi5-hailo, and jetson-orin-nano, plus the existing mbp-m2-max rows. Confirms the GL-convergence captures within measurement noise (imx95 GL 1080p YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no GPU regressions. Allocation table updated for the imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p). macOS GL rows remain the pre-convergence capture (Known Gap #17). |
 | 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA same-size convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Add mbp-m2-max **CPU-only** rows to letterbox / decoder / mask-decode / codec tables; add mbp-m2-max **GL** rows (YUYV→RGBA only) to the same-size format-conversion and 4K-convert tables. Letterbox GL rows pending Gap #17 closure. |
 | 3.7 | 2026-05-22 | Add macOS platform (Apple M2 Max, `mbp-m2-max`) with CPU baseline benchmarks. |

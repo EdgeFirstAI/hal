@@ -279,24 +279,31 @@ costs it a further 0.489 ms (A55) / 0.614 ms (A53) end to end. Since the flag
 selects nothing but the IDCT, that premium is added to the IDCT row. Re-profile
 with `--dct accurate` to measure it directly rather than by difference.
 
-**Still open:** a residual 1.0% A53 YUV gap vs turbo `islow` (published
-interleaved best-of-3, n=200, release profile). A two-block IDCT is deferred
-(A53 spill risk). A55 is ahead of `islow`. Two-block AVX2 IDCT on x86 is still
-untried. The JPEG Decode A/B table in `BENCHMARKS.md` is hand-maintained from
-`decode-ab-publish.sh`; the generated tables further down that file must not be
-typed in by hand.
+**Still open:** the entropy↔IDCT instruction interleave on in-order cores
+needs a hand-scheduled fused block loop (compiler-level fusion measured a
+wash on A53/A55 and −2.9% on A76); x86 has no fast-DCT kernel yet
+(`DctMethod::Fast` is advisory there); the fast mode's mAP impact is
+unmeasured. Two-block AVX2 IDCT on x86 is still untried. The JPEG Decode A/B
+table in `BENCHMARKS.md` is hand-maintained from `decode-ab-sweep.sh`; the
+generated tables further down that file must not be typed in by hand.
 
 ### Settled — do not re-test
 
 Each of these was measured and rejected; the reasons generalise.
 
-- **Folding AC EOB/ZRL into the combined `fast_ac` table**: −6%. Terminating the
-  block from inside the hit path costs a test on every coefficient to save one
-  miss per block.
+- **Folding AC EOB/ZRL into `fast_ac` with an in-path terminator test**: −6%.
+  Testing for EOB on every coefficient to save one miss per block loses.
+  What *did* land is the run-0xFF sentinel encoding: EOB resolves through the
+  `k >= 64` bounds branch the loop already executes, so the common exit costs
+  no extra hot-path compare — the lesson is about where the branch lives, not
+  whether the fold is possible.
 - **Passing the bit buffer as a by-value `BitState` struct**: +17% instructions.
   LLVM would not scalarise the aggregate and copied 24 bytes between stack slots
-  in the loop header. The fix that did work was inlining the *cold* refill and
-  slow-symbol paths, so the buffer stays in registers instead of a stack slot.
+  in the loop header. The design that superseded it is the `BitCursor` copy
+  owned by an `#[inline(never)]` `decode_block`: the cursor is a provably
+  non-escaping local of the outlined function, so it lives in registers — and
+  the outlining is load-bearing (inlined into the MCU loop it cost ~20% on the
+  A53 from merged register pressure).
 - **Raising the refill threshold**: refill already early-outs on `avail >= 32`
   and a bulk refill leaves ≥57 bits, so it touches memory about every fourth
   coefficient. A higher threshold makes refills more frequent, not fewer.

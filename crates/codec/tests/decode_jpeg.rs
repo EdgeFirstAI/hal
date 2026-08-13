@@ -741,6 +741,31 @@ fn fast_dct_mode_close_to_accurate_and_off_by_default() {
         dec.set_dct_method(DctMethod::Accurate);
         let info_a = t_acc.load_image(&mut dec, &jpeg).unwrap();
 
+        // The default really is Accurate: a fresh decoder with no setter (and
+        // without the documented env override) must be bit-identical to the
+        // explicit-Accurate decode.
+        std::env::remove_var("EDGEFIRST_CODEC_DCT");
+        let mut t_def = Tensor::<u8>::image(
+            4096,
+            4096,
+            PixelFormat::Nv24,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut dec_default = ImageDecoder::new();
+        let info_d = t_def.load_image(&mut dec_default, &jpeg).unwrap();
+        assert_eq!(info_a.format, info_d.format);
+        {
+            let a = t_acc.map().unwrap();
+            let d = t_def.map().unwrap();
+            assert_eq!(
+                &a[..],
+                &d[..],
+                "{name}: default decode != explicit Accurate"
+            );
+        }
+
         dec.set_dct_method(DctMethod::Fast);
         let info_f = t_fast.load_image(&mut dec, &jpeg).unwrap();
         assert_eq!(info_a.format, info_f.format);

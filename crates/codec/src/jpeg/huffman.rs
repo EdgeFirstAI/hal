@@ -357,6 +357,13 @@ impl HuffmanCache {
                 return Ok(table);
             }
         }
+        // Rebuilding for a different payload: drop any table still parked in
+        // the slot. It was built for the OLD payload, and leaving it there
+        // lets a later matching intern hand it out under the new fingerprint
+        // (reachable via a duplicate DHT for the same slot within one frame,
+        // or an error exit that skipped `restore`) — decoding with the wrong
+        // codes.
+        slot.table = None;
         let table = HuffmanTable::build(counts, values, class != 0)?;
         slot.counts = *counts;
         slot.values.clear();
@@ -943,6 +950,39 @@ mod tests {
             }
         }
         assert!(!bs.overran(), "stream over-consumed");
+    }
+
+    /// A fingerprint change must evict any table still parked in the slot:
+    /// intern payload A, restore it, intern payload B (miss) with NO restore
+    /// (as after a decode error), then intern B again — the hit must not hand
+    /// back A's table under B's fingerprint.
+    #[test]
+    fn cache_rebuild_evicts_stale_table() {
+        let mut counts = [0u8; 16];
+        counts[0] = 2;
+        let values_a = [0u8, 1];
+        let values_b = [2u8, 3];
+        let mut cache = HuffmanCache::default();
+
+        let ta = cache.intern(1, 0, &counts, &values_a).unwrap();
+        cache.restore(
+            &mut [None, None, None, None],
+            &mut [Some(ta), None, None, None],
+        );
+
+        // Payload change; the returned table is dropped without a restore.
+        let _tb = cache.intern(1, 0, &counts, &values_b).unwrap();
+
+        // Same payload again: must be a freshly built B table, not stale A.
+        let tb2 = cache.intern(1, 0, &counts, &values_b).unwrap();
+        let data = [0b0000_0000];
+        let bs = BitStream::new(&data, 0);
+        let mut cur = bs.cursor();
+        assert_eq!(
+            tb2.decode_symbol(&mut cur).unwrap(),
+            2,
+            "stale table for the previous DHT payload was returned"
+        );
     }
 
     #[test]

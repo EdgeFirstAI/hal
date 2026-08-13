@@ -9,6 +9,25 @@ use crate::pixel::ImagePixel;
 use edgefirst_tensor::{Tensor, TensorDyn};
 use std::io::Read;
 
+/// IDCT accuracy/speed selection for the software JPEG decoder.
+///
+/// [`Accurate`](Self::Accurate) is the default and the kernel every published
+/// benchmark quotes: the `islow`-class Loeffler IDCT, bit-comparable to
+/// libjpeg-turbo's default. [`Fast`](Self::Fast) opts into the AAN
+/// `ifast`-class kernel — roughly an eighth of the multiplies, at a small,
+/// bounded pixel accuracy cost (and the documented `ifast` degeneration at
+/// very high quality factors). Fast is advisory: paths without a fast kernel
+/// (non-NEON tiers, hardware V4L2/nvJPEG decoders, PNG) use their normal
+/// accurate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DctMethod {
+    /// Accurate `islow`-class IDCT (default).
+    #[default]
+    Accurate,
+    /// Fast AAN `ifast`-class IDCT (opt-in).
+    Fast,
+}
+
 /// Reusable image decoder with internal scratch buffers.
 ///
 /// Create one `ImageDecoder` at program initialisation and pass it to
@@ -42,25 +61,6 @@ use std::io::Read;
 ///     let _info = tensor.load_image(&mut decoder, &frame);
 /// }
 /// ```
-/// IDCT accuracy/speed selection for the software JPEG decoder.
-///
-/// [`Accurate`](Self::Accurate) is the default and the kernel every published
-/// benchmark quotes: the `islow`-class Loeffler IDCT, bit-comparable to
-/// libjpeg-turbo's default. [`Fast`](Self::Fast) opts into the AAN
-/// `ifast`-class kernel — roughly an eighth of the multiplies, at a small,
-/// bounded pixel accuracy cost (and the documented `ifast` degeneration at
-/// very high quality factors). Fast is advisory: paths without a fast kernel
-/// (non-NEON tiers, hardware V4L2/nvJPEG decoders, PNG) use their normal
-/// accurate path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DctMethod {
-    /// Accurate `islow`-class IDCT (default).
-    #[default]
-    Accurate,
-    /// Fast AAN `ifast`-class IDCT (opt-in).
-    Fast,
-}
-
 pub struct ImageDecoder {
     /// Reusable JPEG decoder state (Huffman tables, MCU scratch buffers).
     pub(crate) jpeg_state: crate::jpeg::JpegDecoderState,
