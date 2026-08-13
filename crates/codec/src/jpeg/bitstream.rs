@@ -44,6 +44,15 @@ fn any_byte_ff(w: u64) -> bool {
 ///
 /// Bits are buffered top-aligned in a u64 accumulator. Handles JPEG's
 /// byte-stuffing convention (0xFF 0x00 → single 0xFF data byte).
+///
+/// The hot block loop does not operate on this struct directly: it takes a
+/// [`BitCursor`] copy of the state ([`Self::cursor`]), runs on that, and
+/// [`Self::commit`]s at exit. `&mut BitStream` is caller-visible memory, so
+/// LLVM must keep its fields coherent across every potential exit — `perf
+/// annotate` on Cortex-A53 showed a store of `avail` back into the struct on
+/// every decoded coefficient. The cursor is a function-local the optimizer
+/// can prove non-escaping, which keeps the whole state in registers
+/// (libjpeg-turbo's `BITREAD_LOAD_STATE` / `BITREAD_SAVE_STATE` discipline).
 pub struct BitStream<'a> {
     data: &'a [u8],
     pos: usize,
@@ -56,6 +65,20 @@ pub struct BitStream<'a> {
     prefetch: usize,
     /// Set once the buffer has handed out bits past the end of the entropy
     /// data. Only ever written on the exhausted branch of the cold refill.
+    overran: bool,
+}
+
+/// Register-resident working copy of a [`BitStream`]'s state.
+///
+/// Created by [`BitStream::cursor`], written back by [`BitStream::commit`].
+/// All hot-path operations live here; `BitStream` methods delegate through a
+/// cursor so there is a single implementation of the refill logic.
+pub struct BitCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+    bits: u64,
+    avail: i32,
+    prefetch: usize,
     overran: bool,
 }
 
@@ -86,6 +109,31 @@ impl<'a> BitStream<'a> {
         self.pos
     }
 
+    /// Copy the state into a register-resident working cursor.
+    #[inline(always)]
+    pub fn cursor(&self) -> BitCursor<'a> {
+        BitCursor {
+            data: self.data,
+            pos: self.pos,
+            bits: self.bits,
+            avail: self.avail,
+            prefetch: self.prefetch,
+            overran: self.overran,
+        }
+    }
+
+    /// Write a cursor's state back. Must be called on every exit path of a
+    /// loop that took a [`Self::cursor`], including error exits.
+    #[inline(always)]
+    pub fn commit(&mut self, cur: BitCursor<'a>) {
+        self.pos = cur.pos;
+        self.bits = cur.bits;
+        self.avail = cur.avail;
+        self.overran = cur.overran;
+    }
+}
+
+impl<'a> BitCursor<'a> {
     #[inline(always)]
     fn prefetch_ahead(&self) {
         if self.prefetch == 0 {
@@ -180,14 +228,6 @@ impl<'a> BitStream<'a> {
         }
     }
 
-    /// Whether the stream was ever asked for bits past the end of the entropy
-    /// data, i.e. the scan is truncated and part of the image is zero padding
-    /// rather than decoded content.
-    #[inline]
-    pub fn overran(&self) -> bool {
-        self.overran
-    }
-
     /// Peek at the top `n` bits without consuming them (n ≤ 56).
     ///
     /// Does **not** refill — the caller must uphold the [`refill`] contract.
@@ -213,12 +253,34 @@ impl<'a> BitStream<'a> {
         self.consume(n);
         val
     }
+}
+
+impl<'a> BitStream<'a> {
+    /// Top up the buffer to ≥ 32 bits. Cold-path convenience that round-trips
+    /// through a [`BitCursor`]; hot loops hold their own cursor instead.
+    #[inline]
+    fn refill(&mut self) {
+        let mut cur = self.cursor();
+        cur.refill();
+        self.commit(cur);
+    }
+
+    /// Whether the stream was ever asked for bits past the end of the entropy
+    /// data, i.e. the scan is truncated and part of the image is zero padding
+    /// rather than decoded content.
+    #[inline]
+    pub fn overran(&self) -> bool {
+        self.overran
+    }
 
     /// Read `n` bits with an internal refill (test helper).
     #[cfg(test)]
     pub fn read_bits(&mut self, n: u8) -> u32 {
-        self.refill();
-        self.get_bits(n)
+        let mut cur = self.cursor();
+        cur.refill();
+        let val = cur.get_bits(n);
+        self.commit(cur);
+        val
     }
 
     /// JPEG sign-extension (libjpeg `HUFF_EXTEND`) — branchless.

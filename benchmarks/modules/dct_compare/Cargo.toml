@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dct_compare"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fast-vs-accurate DCT pixel similarity over a JPEG corpus"
+
+[[bin]]
+name = "dct_compare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+edgefirst-codec = { path = "../../../crates/codec" }
+edgefirst-tensor = { path = "../../../crates/tensor" }

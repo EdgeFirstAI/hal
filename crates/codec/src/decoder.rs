@@ -42,6 +42,25 @@ use std::io::Read;
 ///     let _info = tensor.load_image(&mut decoder, &frame);
 /// }
 /// ```
+/// IDCT accuracy/speed selection for the software JPEG decoder.
+///
+/// [`Accurate`](Self::Accurate) is the default and the kernel every published
+/// benchmark quotes: the `islow`-class Loeffler IDCT, bit-comparable to
+/// libjpeg-turbo's default. [`Fast`](Self::Fast) opts into the AAN
+/// `ifast`-class kernel — roughly an eighth of the multiplies, at a small,
+/// bounded pixel accuracy cost (and the documented `ifast` degeneration at
+/// very high quality factors). Fast is advisory: paths without a fast kernel
+/// (non-NEON tiers, hardware V4L2/nvJPEG decoders, PNG) use their normal
+/// accurate path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DctMethod {
+    /// Accurate `islow`-class IDCT (default).
+    #[default]
+    Accurate,
+    /// Fast AAN `ifast`-class IDCT (opt-in).
+    Fast,
+}
+
 pub struct ImageDecoder {
     /// Reusable JPEG decoder state (Huffman tables, MCU scratch buffers).
     pub(crate) jpeg_state: crate::jpeg::JpegDecoderState,
@@ -80,6 +99,13 @@ impl ImageDecoder {
     /// fused RGB that convert step is typically a pure resize.
     pub fn set_output_format(&mut self, format: Option<edgefirst_tensor::PixelFormat>) {
         self.jpeg_state.preferred_format = format;
+    }
+
+    /// Select the software JPEG IDCT kernel class — see [`DctMethod`].
+    /// Off (Accurate) by default; `EDGEFIRST_CODEC_DCT=fast` in the
+    /// environment flips a **new** decoder's default for A/B runs.
+    pub fn set_dct_method(&mut self, method: DctMethod) {
+        self.jpeg_state.fast_dct = method == DctMethod::Fast;
     }
 
     /// Decode image data into a typed tensor, configuring its dimensions and

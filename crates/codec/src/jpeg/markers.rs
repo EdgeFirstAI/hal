@@ -4,7 +4,7 @@
 //! JPEG marker segment parsing (SOF, SOS, DQT, DHT, DRI, APP/EXIF).
 
 use crate::error::{CodecError, UnsupportedFeature};
-use crate::jpeg::huffman::HuffmanTable;
+use crate::jpeg::huffman::{HuffmanCache, HuffmanTable};
 use crate::jpeg::types::{marker, Component, ImageHeader, QuantTable, SamplingFactor, ZIGZAG};
 
 /// Read a big-endian u16 from two bytes.
@@ -34,6 +34,15 @@ pub struct JpegHeaders {
 /// Returns `CodecError::InvalidData` for malformed markers, missing SOF/SOS,
 /// progressive JPEGs, or truncated data.
 pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
+    parse_markers_with_cache(data, None)
+}
+
+/// Like [`parse_markers`], but reuses Huffman LUTs from `cache` when the DHT
+/// payload matches the previous frame (tables are **moved** out of the cache).
+pub(crate) fn parse_markers_with_cache(
+    data: &[u8],
+    mut cache: Option<&mut HuffmanCache>,
+) -> crate::Result<JpegHeaders> {
     if data.len() < 4 || data[0] != 0xFF || data[1] != marker::SOI {
         return Err(CodecError::InvalidData("not a JPEG (missing SOI)".into()));
     }
@@ -259,10 +268,14 @@ pub fn parse_markers(data: &[u8]) -> crate::Result<JpegHeaders> {
                     if off + total > data.len() {
                         return Err(CodecError::InvalidData("truncated DHT values".into()));
                     }
-                    let values = data[off..off + total].to_vec();
+                    let values = &data[off..off + total];
                     off += total;
 
-                    let table = HuffmanTable::build(&counts, &values)?;
+                    let table = if let Some(ref mut c) = cache {
+                        c.intern(table_class, table_id, &counts, values)?
+                    } else {
+                        HuffmanTable::build(&counts, values, table_class != 0)?
+                    };
                     if table_class == 0 {
                         dc_tables[table_id] = Some(table);
                     } else {
@@ -465,5 +478,18 @@ mod tests {
         assert_eq!(headers.header.height, 720);
         assert_eq!(headers.header.components.len(), 3);
         assert!(!headers.header.is_progressive);
+    }
+
+    #[test]
+    fn huffman_cache_second_parse_takes_tables() {
+        let data = minimal_jpeg();
+        let mut cache = HuffmanCache::default();
+        let mut h1 = parse_markers_with_cache(&data, Some(&mut cache)).unwrap();
+        assert!(h1.dc_tables[0].is_some());
+        cache.restore(&mut h1.dc_tables, &mut h1.ac_tables);
+        let mut h2 = parse_markers_with_cache(&data, Some(&mut cache)).unwrap();
+        assert!(h2.dc_tables[0].is_some());
+        assert!(h2.ac_tables[0].is_some());
+        cache.restore(&mut h2.dc_tables, &mut h2.ac_tables);
     }
 }

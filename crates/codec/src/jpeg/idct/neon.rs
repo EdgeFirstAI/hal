@@ -10,7 +10,10 @@
 //! `int16x8` registers (no memory round-trip). Sparse shortcuts skip the
 //! arithmetic for the two dominant block shapes of quantised natural images:
 //! all-zero bottom rows (4–7) in pass 1 and all-zero right columns (4–7) in
-//! pass 2.
+//! pass 2. A further per-half DC-only path (rows 1–7 of a 4×8 half all zero)
+//! broadcasts `dequant(row0) << PASS1_BITS`, matching turbo islow special
+//! case 2 — the remaining in-order gap after whole-block DC-only is taken in
+//! the MCU loop.
 
 use std::arch::aarch64::*;
 
@@ -176,8 +179,104 @@ unsafe fn descale_p1(x: int32x4_t) -> int16x4_t {
 
 /// NEON 8×8 IDCT on quantised i16 coefficients (natural order) with the
 /// component quant table (natural order).
+#[inline(always)]
 pub fn idct_8x8_neon(coeffs: &[i16; 64], quant: &[u16; 64], output: &mut [u8], stride: usize) {
     unsafe { idct_8x8_neon_inner(coeffs, quant, output, stride) }
+}
+
+/// NEON 8×8 IDCT with an entropy-derived sparsity hint.
+///
+/// `last_k` is the highest zigzag index the block decoder wrote (an upper
+/// bound on occupancy — see [`huffman::BlockInfo`]). Because the zigzag order
+/// fills the top-left corner first, small `last_k` proves whole regions zero
+/// without touching the coefficient memory:
+///
+/// - `last_k ≤ 1`: AC only at (0,1) — left 4×8 half is DC-broadcast shape,
+///   right half entirely zero.
+/// - `last_k ≤ 9`: the prefix stays in rows 0–3 / cols 0–2 — sparse pass-1
+///   butterfly on the left half, right half zero.
+/// - `last_k ≤ 13`: adds naturals 32/25/18/11 (row 4 possible, cols still
+///   ≤ 3) — full-width pass-1 with rows 5–7 as zero registers.
+/// - otherwise: the value-based detection kernel (which still finds shapes
+///   the prefix bound cannot prove, e.g. all-zero bottom rows behind a high
+///   `last_k`).
+///
+/// The proven-sparse tiers use only 64-bit `vld1_s16` loads for the rows that
+/// participate — the Cortex-A53's load path is 64 bits wide, and the skipped
+/// rows/halves never touch the cache. Bit-exact with [`idct_8x8_neon`]: every
+/// dropped term is exactly zero, and the shared tail is the same code.
+///
+/// [`huffman::BlockInfo`]: crate::jpeg::huffman::BlockInfo
+#[inline(always)]
+pub fn idct_8x8_neon_k(
+    coeffs: &[i16; 64],
+    quant: &[u16; 64],
+    last_k: u8,
+    output: &mut [u8],
+    stride: usize,
+) {
+    unsafe { idct_8x8_neon_k_inner(coeffs, quant, last_k, output, stride) }
+}
+
+#[target_feature(enable = "neon")]
+unsafe fn idct_8x8_neon_k_inner(
+    coeffs: &[i16; 64],
+    quant: &[u16; 64],
+    last_k: u8,
+    output: &mut [u8],
+    stride: usize,
+) {
+    if last_k > 13 {
+        return idct_8x8_neon_inner(coeffs, quant, output, stride);
+    }
+
+    let k0 = vld1q_s16(std::hint::black_box(K0.as_ptr()));
+    let k1 = vld1q_s16(std::hint::black_box(K1.as_ptr()));
+    let zero4 = vdup_n_s16(0);
+
+    // Dequantise one 4-lane left-half row (cols 0–3): 64-bit loads only.
+    let dqd = |i: usize| -> int16x4_t {
+        vmul_s16(
+            vld1_s16(coeffs.as_ptr().add(i * 8)),
+            vreinterpret_s16_u16(vld1_u16(quant.as_ptr().add(i * 8))),
+        )
+    };
+
+    let r0 = dqd(0);
+    let wl: [int16x4_t; 8] = if last_k <= 1 {
+        // Column IDCT of [v, 0, …, 0] is saturate(v << PASS1_BITS) per row.
+        let dc = vqmovn_s32(vshll_n_s16::<{ PASS1_BITS }>(r0));
+        [dc; 8]
+    } else {
+        let x = if last_k <= 9 {
+            butterfly8_sparse(r0, dqd(1), dqd(2), dqd(3), k0, k1)
+        } else {
+            butterfly8(
+                r0,
+                dqd(1),
+                dqd(2),
+                dqd(3),
+                dqd(4),
+                zero4,
+                zero4,
+                zero4,
+                k0,
+                k1,
+            )
+        };
+        [
+            descale_p1(x[0]),
+            descale_p1(x[1]),
+            descale_p1(x[2]),
+            descale_p1(x[3]),
+            descale_p1(x[4]),
+            descale_p1(x[5]),
+            descale_p1(x[6]),
+            descale_p1(x[7]),
+        ]
+    };
+
+    finish_pass2_store(wl, [zero4; 8], true, k0, k1, output, stride);
 }
 
 #[target_feature(enable = "neon")]
@@ -199,11 +298,20 @@ unsafe fn idct_8x8_neon_inner(
     let c7 = vld1q_s16(coeffs.as_ptr().add(56));
 
     let bottom_or = vorrq_s16(vorrq_s16(c4, c5), vorrq_s16(c6, c7));
-    let all_or = vorrq_s16(vorrq_s16(vorrq_s16(c0, c1), vorrq_s16(c2, c3)), bottom_or);
+    let top_ac = vorrq_s16(vorrq_s16(c1, c2), c3);
+    let ac_or = vorrq_s16(top_ac, bottom_or);
+    let all_or = vorrq_s16(c0, ac_or);
     let bottom_u64 = vreinterpretq_u64_s16(bottom_or);
     let bottom_zero = (vgetq_lane_u64::<0>(bottom_u64) | vgetq_lane_u64::<1>(bottom_u64)) == 0;
     // Columns 4–7 across all rows sit in the high 64 bits of each row vector.
     let right_zero = vgetq_lane_u64::<1>(vreinterpretq_u64_s16(all_or)) == 0;
+    // Rows 1–7 of a 4×8 half all zero → that half is DC-only (turbo islow).
+    // Whole-block DC-only is already taken in the MCU loop via `has_ac`; this
+    // catches the common "AC only in the top-left 4×4" / "row 0 only" shapes
+    // that still enter the full kernel.
+    let ac_u64 = vreinterpretq_u64_s16(ac_or);
+    let left_ac_zero = vgetq_lane_u64::<0>(ac_u64) == 0;
+    let right_ac_zero = vgetq_lane_u64::<1>(ac_u64) == 0;
 
     // Dequantise (16-bit wrapping multiply — turbo's contract; valid baseline
     // streams never overflow, corrupt ones only garble their own pixels).
@@ -214,14 +322,23 @@ unsafe fn idct_8x8_neon_inner(
         )
     };
     let r0 = dq(c0, 0);
-    let r1 = dq(c1, 1);
-    let r2 = dq(c2, 2);
-    let r3 = dq(c3, 3);
     let zero8 = vdupq_n_s16(0);
-    let (r4, r5, r6, r7) = if bottom_zero {
-        (zero8, zero8, zero8, zero8)
+    // Row-0-only (both 4×8 halves DC in pass 1): skip AC dequant entirely.
+    let skip_ac_dequant = left_ac_zero && (right_zero || right_ac_zero);
+    let (r1, r2, r3, r4, r5, r6, r7) = if skip_ac_dequant {
+        (zero8, zero8, zero8, zero8, zero8, zero8, zero8)
+    } else if bottom_zero {
+        (dq(c1, 1), dq(c2, 2), dq(c3, 3), zero8, zero8, zero8, zero8)
     } else {
-        (dq(c4, 4), dq(c5, 5), dq(c6, 6), dq(c7, 7))
+        (
+            dq(c1, 1),
+            dq(c2, 2),
+            dq(c3, 3),
+            dq(c4, 4),
+            dq(c5, 5),
+            dq(c6, 6),
+            dq(c7, 7),
+        )
     };
 
     // Butterfly constants, loaded once per block rather than rebuilt at every
@@ -264,19 +381,29 @@ unsafe fn idct_8x8_neon_inner(
         ]
     };
 
-    let wl = pass1_half(
-        vget_low_s16(r0),
-        vget_low_s16(r1),
-        vget_low_s16(r2),
-        vget_low_s16(r3),
-        vget_low_s16(r4),
-        vget_low_s16(r5),
-        vget_low_s16(r6),
-        vget_low_s16(r7),
-        bottom_zero,
-    );
+    let wl = if left_ac_zero {
+        // Column IDCT of [dc, 0,0,0,0,0,0,0] is saturate(dc << PASS1_BITS)
+        // in every row — same as descale_p1 of the 32-bit even part.
+        let dc = vqmovn_s32(vshll_n_s16::<{ PASS1_BITS }>(vget_low_s16(r0)));
+        [dc; 8]
+    } else {
+        pass1_half(
+            vget_low_s16(r0),
+            vget_low_s16(r1),
+            vget_low_s16(r2),
+            vget_low_s16(r3),
+            vget_low_s16(r4),
+            vget_low_s16(r5),
+            vget_low_s16(r6),
+            vget_low_s16(r7),
+            bottom_zero,
+        )
+    };
     let wr = if right_zero {
         [zero4; 8]
+    } else if right_ac_zero {
+        let dc = vqmovn_s32(vshll_n_s16::<{ PASS1_BITS }>(vget_high_s16(r0)));
+        [dc; 8]
     } else {
         pass1_half(
             vget_high_s16(r0),
@@ -291,6 +418,22 @@ unsafe fn idct_8x8_neon_inner(
         )
     };
 
+    finish_pass2_store(wl, wr, right_zero, k0, k1, output, stride);
+}
+
+/// Shared tail of the 8×8 kernels: combine the pass-1 half results, transpose,
+/// run pass 2 (sparse when the right workspace half is known zero), descale,
+/// and store. `#[inline(always)]` so each caller keeps its registers.
+#[inline(always)]
+unsafe fn finish_pass2_store(
+    wl: [int16x4_t; 8],
+    wr: [int16x4_t; 8],
+    right_zero: bool,
+    k0: int16x8_t,
+    k1: int16x8_t,
+    output: &mut [u8],
+    stride: usize,
+) {
     // Workspace rows (lanes = columns) → transpose to columns (lanes = rows).
     let w0 = vcombine_s16(wl[0], wr[0]);
     let w1 = vcombine_s16(wl[1], wr[1]);
@@ -375,7 +518,7 @@ unsafe fn idct_8x8_neon_inner(
 /// 8×8 transpose of int16x8 vectors (three trn stages: 16 → 32 → 64 bit).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn transpose_8x8_s16(
+pub(crate) unsafe fn transpose_8x8_s16(
     w0: int16x8_t,
     w1: int16x8_t,
     w2: int16x8_t,
@@ -431,7 +574,7 @@ unsafe fn transpose_8x8_s16(
 /// 8×8 transpose of uint8x8 vectors (three trn stages: 8 → 16 → 32 bit).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-unsafe fn transpose_8x8_u8(
+pub(crate) unsafe fn transpose_8x8_u8(
     u0: uint8x8_t,
     u1: uint8x8_t,
     u2: uint8x8_t,
@@ -485,6 +628,7 @@ unsafe fn transpose_8x8_u8(
 }
 
 /// NEON DC-only IDCT: fill 8×8 block with a single value.
+#[inline(always)]
 pub fn idct_dc_only_neon(dc_value: i32, output: &mut [u8], stride: usize) {
     let range_shift = CONST_BITS + PASS1_BITS + 3;
     let round = 1 << (range_shift - 1);
@@ -507,7 +651,8 @@ pub fn idct_dc_only_neon(dc_value: i32, output: &mut [u8], stride: usize) {
 #[cfg(test)]
 mod tests {
     use super::super::scalar::{idct_8x8_scalar, idct_dc_only_scalar};
-    use super::{idct_8x8_neon, idct_dc_only_neon};
+    use super::{idct_8x8_neon, idct_8x8_neon_k, idct_dc_only_neon};
+    use crate::jpeg::types::ZIGZAG;
 
     const UNIT_QUANT: [u16; 64] = [1u16; 64];
 
@@ -554,6 +699,40 @@ mod tests {
         // Default coefficients live in rows 0–3 / cols 0–3: exercises both
         // sparse shortcuts (bottom rows zero + right columns zero).
         assert_parity(&make_test_coeffs(), &UNIT_QUANT, "sparse");
+    }
+
+    /// Rows 1–7 zero: per-half DC-only shortcut (turbo islow case 2).
+    #[test]
+    fn idct_8x8_parity_row0_only() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 256;
+        coeffs[1] = 40;
+        coeffs[2] = -16;
+        coeffs[3] = 8;
+        assert_parity(&coeffs, &UNIT_QUANT, "row0-left");
+        coeffs[4] = 22;
+        coeffs[7] = -9;
+        assert_parity(&coeffs, &UNIT_QUANT, "row0-both-halves");
+    }
+
+    /// Left 4×8 is DC-only; right 4×8 has AC — the two halves take different
+    /// shortcuts.
+    #[test]
+    fn idct_8x8_parity_left_dc_right_ac() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut coeffs = [0i16; 64];
+        coeffs[0] = 200;
+        coeffs[5] = 18;
+        coeffs[12] = -14;
+        coeffs[23] = 9;
+        assert_parity(&coeffs, &UNIT_QUANT, "left-dc-right-ac");
     }
 
     /// Coefficients in columns 4–7 defeat the right-half skip; parity must
@@ -655,6 +834,58 @@ mod tests {
                     simd_out[i],
                     diff
                 );
+            }
+        }
+    }
+
+    /// The entropy-hinted kernel must be bit-identical to the value-detection
+    /// kernel for every tier. For each `last_k`, build a block whose occupied
+    /// zigzag prefix ends exactly at `last_k` (worst case for the tier bound)
+    /// and compare against the scalar reference.
+    #[test]
+    fn idct_8x8_k_tiers_match_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("SIMD feature not available, skipping");
+            return;
+        }
+        let mut quant = [0u16; 64];
+        for (i, q) in quant.iter_mut().enumerate() {
+            *q = 1 + (i as u16 % 7);
+        }
+        for last_k in 1..64u8 {
+            let mut coeffs = [0i16; 64];
+            coeffs[0] = 300;
+            // Fill the whole prefix with non-zeros: every position the bound
+            // permits is occupied, so a tier that loads too little fails loudly.
+            for k in 1..=last_k {
+                let natural = ZIGZAG[k as usize] as usize;
+                coeffs[natural] = if k % 2 == 0 { 17 } else { -13 };
+            }
+            let mut scalar_out = [0u8; 64];
+            let mut simd_out = [0u8; 64];
+            idct_8x8_scalar(&coeffs, &quant, &mut scalar_out, 8);
+            idct_8x8_neon_k(&coeffs, &quant, last_k, &mut simd_out, 8);
+            for i in 0..64 {
+                let diff = (scalar_out[i] as i32 - simd_out[i] as i32).abs();
+                assert!(
+                    diff <= 1,
+                    "last_k={last_k}: mismatch at {i}: scalar={} simd={}",
+                    scalar_out[i],
+                    simd_out[i]
+                );
+            }
+            // A sparser block under the same bound (only the last position
+            // occupied) must also match — the hint is an upper bound.
+            let mut coeffs2 = [0i16; 64];
+            coeffs2[0] = -180;
+            coeffs2[ZIGZAG[last_k as usize] as usize] = 21;
+            let mut scalar2 = [0u8; 64];
+            let mut simd2 = [0u8; 64];
+            idct_8x8_scalar(&coeffs2, &quant, &mut scalar2, 8);
+            idct_8x8_neon_k(&coeffs2, &quant, last_k, &mut simd2, 8);
+            for i in 0..64 {
+                let diff = (scalar2[i] as i32 - simd2[i] as i32).abs();
+                assert!(diff <= 1, "sparse last_k={last_k}: mismatch at {i}");
             }
         }
     }

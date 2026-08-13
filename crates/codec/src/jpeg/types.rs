@@ -111,3 +111,20 @@ pub const ZIGZAG: [u8; 64] = [
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
+
+/// [`ZIGZAG`] padded to cover any `k + run` the block decoder can form
+/// (`k ≤ 63` plus a run byte ≤ 255, including the baked EOB sentinel run of
+/// 0xFF), so the natural-index load can issue *before* the `k >= 64` bounds
+/// branch. On in-order cores that load feeds the coefficient store's address;
+/// hoisting it above the branch hides its L1 latency behind instructions the
+/// loop already executes. Entries past 63 are never used (the bounds branch
+/// diverts first) — zero keeps any speculative read in-bounds and harmless.
+pub const ZIGZAG_EXT: [u8; 320] = {
+    let mut t = [0u8; 320];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = ZIGZAG[i];
+        i += 1;
+    }
+    t
+};

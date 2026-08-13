@@ -154,8 +154,12 @@ The image is the portable OSS contract. How you schedule it on cloud CPUs
 # One-time dataset sync (~820 MB)
 ./benchmarks/scripts/sync-coco.sh imx8mp-frdm rpi5-hailo orin-nano
 
-# Decode-only HAL vs TurboJPEG (YUV + RGB) — supports PR decoder claims
+# Decode-only HAL vs TurboJPEG (YUV + RGB) — smoke / investigation
 ./benchmarks/scripts/decode-ab-matrix.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
+
+# Published decoder A/B (release, interleaved best-of-3, n=200)
+CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
+  ./benchmarks/scripts/decode-ab-publish.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
 # Full HAL COCO matrix (decode + letterbox convert, all HAL backends)
 ./benchmarks/scripts/deploy-and-run.sh imx8mp-frdm imx95-pro rpi5-hailo
@@ -275,8 +279,12 @@ costs it a further 0.489 ms (A55) / 0.614 ms (A53) end to end. Since the flag
 selects nothing but the IDCT, that premium is added to the IDCT row. Re-profile
 with `--dct accurate` to measure it directly rather than by difference.
 
-**Still open:** the residual IDCT deficit, the `mcu loop / write` stage (now the
-larger of the two on the A55), and a two-block AVX2 IDCT on x86.
+**Still open:** a residual 1.0% A53 YUV gap vs turbo `islow` (published
+interleaved best-of-3, n=200, release profile). A two-block IDCT is deferred
+(A53 spill risk). A55 is ahead of `islow`. Two-block AVX2 IDCT on x86 is still
+untried. The JPEG Decode A/B table in `BENCHMARKS.md` is hand-maintained from
+`decode-ab-publish.sh`; the generated tables further down that file must not be
+typed in by hand.
 
 ### Settled — do not re-test
 

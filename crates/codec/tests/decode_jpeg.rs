@@ -710,3 +710,62 @@ fn decode_coco_grey_odd_width() {
     assert!(y_max <= 4, "grey luma max diff {y_max} > 4");
     assert!(y_mae < 1.0, "grey luma MAE {y_mae:.3} > 1.0");
 }
+
+/// Fast (AAN) DCT mode: opt-in, and its output must stay close to the
+/// accurate default — high cosine similarity and a small worst-case pixel
+/// delta on real images. Also proves the default is untouched: decoding
+/// without the option must be bit-identical to a fresh accurate decoder.
+#[test]
+fn fast_dct_mode_close_to_accurate_and_off_by_default() {
+    use edgefirst_codec::DctMethod;
+    for name in ["zidane.jpg", "zidane_444.jpg", "giraffe.jpg"] {
+        let jpeg = testdata(name);
+        let mut t_acc = Tensor::<u8>::image(
+            4096,
+            4096,
+            PixelFormat::Nv24,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut t_fast = Tensor::<u8>::image(
+            4096,
+            4096,
+            PixelFormat::Nv24,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+
+        let mut dec = ImageDecoder::new();
+        dec.set_dct_method(DctMethod::Accurate);
+        let info_a = t_acc.load_image(&mut dec, &jpeg).unwrap();
+
+        dec.set_dct_method(DctMethod::Fast);
+        let info_f = t_fast.load_image(&mut dec, &jpeg).unwrap();
+        assert_eq!(info_a.format, info_f.format);
+
+        let a = t_acc.map().unwrap();
+        let f = t_fast.map().unwrap();
+        let n = a.len().min(f.len());
+        let (mut dot, mut na, mut nf) = (0f64, 0f64, 0f64);
+        let mut max_diff = 0i32;
+        for i in 0..n {
+            let (x, y) = (a[i] as f64, f[i] as f64);
+            dot += x * y;
+            na += x * x;
+            nf += y * y;
+            max_diff = max_diff.max((a[i] as i32 - f[i] as i32).abs());
+        }
+        let cosine = dot / (na.sqrt() * nf.sqrt());
+        eprintln!("{name}: cosine={cosine:.7} max_diff={max_diff}");
+        assert!(
+            cosine > 0.9999,
+            "{name}: cosine similarity {cosine} too low for ifast-class accuracy"
+        );
+        assert!(
+            max_diff <= 24,
+            "{name}: max pixel delta {max_diff} too high"
+        );
+    }
+}

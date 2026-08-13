@@ -61,8 +61,16 @@ use edgefirst_tensor::{PixelFormat, Tensor, TensorTrait};
 pub struct JpegDecoderState {
     /// MCU scratch buffers (per-component IDCT output for one MCU row band).
     mcu_scratch: Option<mcu::McuScratch>,
+    /// Huffman LUTs reused across frames when the DHT payload is unchanged.
+    /// Tables are moved into [`markers::JpegHeaders`] for the decode and
+    /// restored afterwards so a cache hit allocates nothing.
+    huffman_cache: huffman::HuffmanCache,
     /// Optional fused-output preference (see [`resolve_output_format`]).
     pub(crate) preferred_format: Option<PixelFormat>,
+    /// Opt-in fast (AAN `ifast`-class) IDCT — see [`crate::DctMethod`].
+    /// Default false; `EDGEFIRST_CODEC_DCT=fast` flips the constructor
+    /// default so benchmarks can A/B without code changes.
+    pub(crate) fast_dct: bool,
     /// V4L2 hardware decoder, lazily probed on first decode. Probed at most
     /// once; a ready context is reused (and amortises per-image setup) across
     /// decodes.
@@ -79,7 +87,11 @@ impl JpegDecoderState {
     pub fn new() -> Self {
         Self {
             mcu_scratch: None,
+            huffman_cache: huffman::HuffmanCache::default(),
             preferred_format: None,
+            fast_dct: std::env::var("EDGEFIRST_CODEC_DCT")
+                .map(|v| v.trim().eq_ignore_ascii_case("fast"))
+                .unwrap_or(false),
             #[cfg(all(target_os = "linux", feature = "v4l2"))]
             v4l2: v4l2::V4l2Probe::default(),
             #[cfg(all(target_os = "linux", feature = "nvjpeg"))]
@@ -218,13 +230,28 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     )
     .entered();
 
-    let headers = {
+    let mut headers = {
         let _s = tracing::trace_span!("codec.decode_jpeg.parse_markers").entered();
-        markers::parse_markers(data)?
+        markers::parse_markers_with_cache(data, Some(&mut state.huffman_cache))?
     };
+    let result = decode_jpeg_into_parsed(data, dst, state, &headers);
+    state
+        .huffman_cache
+        .restore(&mut headers.dc_tables, &mut headers.ac_tables);
+    result
+}
+
+/// Decode using already-parsed headers. Huffman tables live in `headers` for
+/// the duration of this call; the caller restores them to the cache after.
+fn decode_jpeg_into_parsed<T: ImagePixel>(
+    data: &[u8],
+    dst: &mut Tensor<T>,
+    state: &mut JpegDecoderState,
+    headers: &markers::JpegHeaders,
+) -> crate::Result<ImageInfo> {
     let img_w = headers.header.width as usize;
     let img_h = headers.header.height as usize;
-    let native_fmt = native_format(&headers)?;
+    let native_fmt = native_format(headers)?;
     let output_fmt = resolve_output_format(native_fmt, state.preferred_format);
     // Fused (non-native) outputs are a CPU-decoder feature: the hardware
     // decoders produce fixed formats, so bypass them when the resolved output
@@ -276,7 +303,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     if allow_hw {
         match state
             .nvjpeg
-            .try_decode::<T>(data, &headers, dst, output_fmt, img_w, img_h, dst_stride)
+            .try_decode::<T>(data, headers, dst, output_fmt, img_w, img_h, dst_stride)
         {
             Ok(Some(mut info)) => {
                 info.rotation_degrees = rotation_degrees;
@@ -300,7 +327,7 @@ pub fn decode_jpeg_into<T: ImagePixel>(
     if allow_hw {
         match state
             .v4l2
-            .try_decode::<T>(data, &headers, dst, output_fmt, img_w, img_h, dst_stride)
+            .try_decode::<T>(data, headers, dst, output_fmt, img_w, img_h, dst_stride)
         {
             Ok(Some(mut info)) => {
                 info.rotation_degrees = rotation_degrees;
@@ -318,8 +345,8 @@ pub fn decode_jpeg_into<T: ImagePixel>(
 
     // CPU decode: MCU loop writes NV12/GREY u8 directly into the tensor.
     match &mut state.mcu_scratch {
-        Some(scratch) => scratch.ensure_capacity(&headers),
-        None => state.mcu_scratch = Some(mcu::McuScratch::new(&headers)),
+        Some(scratch) => scratch.ensure_capacity(headers),
+        None => state.mcu_scratch = Some(mcu::McuScratch::new(headers)),
     }
     let mcu_scratch = state.mcu_scratch.as_mut().unwrap();
 
@@ -331,7 +358,15 @@ pub fn decode_jpeg_into<T: ImagePixel>(
             std::slice::from_raw_parts_mut(dst_bytes.as_mut_ptr() as *mut u8, dst_bytes.len())
         };
         let _s = tracing::trace_span!("codec.decode_jpeg.mcu_loop").entered();
-        mcu::decode_image(data, &headers, mcu_scratch, dst_u8, dst_stride, output_fmt)?;
+        mcu::decode_image(
+            data,
+            headers,
+            mcu_scratch,
+            dst_u8,
+            dst_stride,
+            output_fmt,
+            state.fast_dct,
+        )?;
     }
 
     // RGB output carries no chroma colorimetry (matches the nvJPEG path);

@@ -70,11 +70,12 @@ dependency graph clean.
 | `huffman.rs`     | Tier-sized lookahead Huffman LUT + combined code+magnitude fast-AC LUT, `decode_block()` emitting quantised `i16` coefficients |
 | `color.rs`       | Fused YCbCr→RGB row conversion (Q14 `SQRDMULH` / matching SSE4.1 `qrdmulh`, NEON + Intel + bit-exact scalar) |
 | `idct.rs`        | IDCT dispatcher (scalar/NEON/x86 via `NeonTier`/`IntelTier`); kernels dequantise internally |
+| `idct/fast.rs`   | Opt-in AAN `ifast`-class IDCT (`DctMethod::Fast`, off by default): AAN scale factors folded into the dequant table, four Q15 `SQDMULH` constants, 16-bit lanes end to end; scalar reference + NEON kernel, bit-exact to each other. COCO-measured accuracy vs the default kernel: cosine ≥ 0.99985, PSNR ≥ 42 dB, max pixel delta 24 |
 | `idct/scalar.rs` | Two-pass Loeffler 8×8 IDCT with DC-only fast path; the reference every SIMD kernel is asserted against, so it wraps and saturates where the vector kernels are forced to |
 | `idct/neon.rs`   | NEON 8×8 IDCT on 16-bit coefficients: 8-lane dequant, lane-indexed `vmull` Loeffler butterfly, sparse bottom-row/right-column shortcuts, register-resident workspace |
 | `idct/sse2.rs`   | x86 8×8 IDCT: 16-bit-lane `islow` Loeffler, `pmullw` dequant + `pmaddwd` butterflies (shared by all Intel tiers) |
 | `idct/avx2.rs`   | VEX-encoded build of the `sse2.rs` kernel |
-| `mcu.rs`         | MCU decode loop, `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample), chroma downsample for the non-matching subsamplings (`avg_block`) |
+| `mcu.rs`         | MCU decode loops — dedicated 4:4:4 1×1 direct loop (`decode_image_444_direct`: tables resolved to plain locals, no sampling loops; the generic loop's frame spilled past the register file and cost 4–8% on every core) + generic sampling loop — `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample), chroma downsample for the non-matching subsamplings (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
@@ -135,10 +136,12 @@ and silently falls back to native otherwise, so callers can set it
 unconditionally:
 
 - **`Rgb`** — 4:4:4 colour JPEGs only (every component at full resolution, so
-  no chroma resampling is needed). Each MCU row band goes through the
-  `color.rs` YCbCr→RGB kernel: Q14 fixed point on the `SQRDMULH`
+  no chroma resampling is needed). Standard 1×1 sampling converts each MCU
+  through the `color.rs` YCbCr→RGB kernel as it is produced (no planar
+  scratch); other 4:4:4 MCU sizes still convert a full MCU-row band via
+  `write_rgb_rows`. The kernel is Q14 fixed point on the `SQRDMULH`
   rounding-doubling high-half multiply (baseline ASIMD, so the same kernel
-  runs A53 → Apple Silicon), `vst3q_u8` interleaved stores, and a scalar path
+  runs A53 → Apple Silicon), `vst3` interleaved stores, and a scalar path
   that reproduces the arithmetic bit-for-bit. Other subsamplings fall back to
   native NV output.
 - **`Nv12`** — any colour JPEG. 4:2:0 passes through; 4:4:4 is 2×2
@@ -289,8 +292,10 @@ processor.convert(&tensor, &mut dst, rot, flip, Crop::new())?;
 The custom baseline JPEG decoder processes images through these stages:
 
 1. **Marker parsing** (`markers.rs`): parse SOF0, DQT, DHT, DRI, SOS, APP1
-   segments. Build Huffman tables, quantisation tables, and read the EXIF
-   orientation tag (reported only).
+   segments. Quantisation tables are built from DQT; Huffman LUTs are taken
+   from `JpegDecoderState`'s `HuffmanCache` when the DHT payload matches the
+   previous frame (moved, not cloned), otherwise rebuilt. EXIF orientation is
+   read and reported only.
 2. **Native format + capacity** (`mod.rs`): derive the native format
    (`native_format()`: 1 component → `Grey`; 3 components → `Nv24`/`Nv16`/`Nv12`
    from the chroma-to-luma sampling ratio) and reconfigure the destination
@@ -309,10 +314,13 @@ The custom baseline JPEG decoder processes images through these stages:
    c. **Write** (`mcu.rs`): `write_grey_rows` copies the luma plane for
       `Grey`; `write_nv12_rows` writes the Y plane and the interleaved Cb/Cr
       plane, downsampling chroma to 4:2:0 via `avg_block` (passthrough for an
-      already-4:2:0 source, block-average for 4:2:2 / 4:4:4 / 4:4:0). With a
-      fused output resolved, `write_rgb_rows` converts YCbCr→RGB per row
-      (`color.rs`), or the NEON chroma-downsample kernels feed the NV12
-      writer. All write at the tensor's `effective_row_stride()`.
+      already-4:2:0 source, block-average for 4:2:2 / 4:4:4 / 4:4:0). Standard
+      4:4:4 (1×1 sampling) writes NV24 UV per MCU (`write_nv24_uv_block`) so
+      chroma never lands in the planar scratch. With fused `Rgb` on that same
+      1×1 path, `ycbcr_to_rgb_blocks` converts paired 8×8 MCUs through
+      `color.rs` (16-pixel `vst3q_u8` NEON, one dispatch per pair) instead of
+      a second full-row pass. Other fused RGB (non-1×1 4:4:4) still uses
+      `write_rgb_rows`. All write at the tensor's `effective_row_stride()`.
 5. **Return** `ImageInfo` with decoded dimensions, native format, row stride,
    and the reported EXIF orientation.
 
@@ -335,14 +343,55 @@ three places take deliberate care:
 
 **Key optimisations:**
 - `JpegDecoderState` persists across frames — `McuScratch` buffers grow to the
-  high-water mark and are reused. After the first decode at a given resolution,
-  the JPEG decoder performs zero heap allocations (per-scan Huffman table
-  pointers and DC predictors live in fixed-size stack arrays).
+  high-water mark and are reused. Huffman LUTs live in `HuffmanCache` and are
+  moved into the parse result for the decode, then restored: when the DHT
+  payload is unchanged (typical of a camera stream), the second frame onwards
+  allocates nothing for table construction. After the first decode at a given
+  resolution, the JPEG decoder performs zero heap allocations (per-scan Huffman
+  table pointers and DC predictors live in fixed-size stack arrays).
 - Combined **fast-AC LUT** (stb_image model): where a Huffman code *and* its
   magnitude bits both fit in the tier's lookahead window, a single table hit
   yields the sign-extended coefficient, zero-run, and total bits to consume —
   one peek + one consume per coefficient on the fast path, for DC and AC
-  alike. Misses (EOB/ZRL, long codes) fall back to the two-step LUT.
+  alike. Size-0 symbols are baked in rather than treated as misses: DC size 0
+  (predictor unchanged) is a plain value-0 hit, ZRL is a run-15/value-0 hit
+  (the written zero lands in a slot the clear discipline already guarantees is
+  zero), and **EOB carries a run-0xFF sentinel** that pushes `k` past 63 so the
+  block decoder's existing bounds branch resolves end-of-block — the common
+  block exit costs no extra hot-path compare and never touches the two-step
+  LUT. Only long codes (> `fast_bits`) still fall back.
+- **Paired-coefficient probe** (`HuffmanTable::pair_ac`, `NeonTier::High`
+  only): decodes up to two coefficients per table hit when both fit the
+  lookahead window (~54% of COCO AC coefficients at 10 bits). Singles bake as
+  phantom pairs (value-0 second write into the next undecoded slot, `k`
+  advanced by `(val2 != 0)` — branchless) so the probe keeps the single
+  table's ~94% hit rate. A pair whose first coefficient lands on zigzag 63
+  rewinds to a single via the `fast_ac` probe: the entry's second symbol was
+  built from the next block's bits. Per-tier because in-order A53/A55 retire
+  the phantom overhead with no OoO slack to hide it (measured −1-3%), while
+  the A76 gains ~2.7%; the instantiation is selected once per decode as a fn
+  pointer — keeping a second live call site in the MCU loop cost ~7% on the
+  A53.
+- **Register-resident bit cursor** (`BitCursor`): the block decoder copies the
+  `BitStream` state into a function-local cursor and commits it back on every
+  exit. `&mut BitStream` is caller-visible memory, and `perf annotate` on
+  Cortex-A53 showed `avail` written back to the struct on every decoded
+  coefficient; the cursor keeps the whole bit buffer in registers
+  (libjpeg-turbo `BITREAD_LOAD_STATE`/`SAVE_STATE` discipline).
+  `decode_block` is `#[inline(never)]` to keep its register-allocation problem
+  out of the MCU loop's already-spilling frame — letting it inline cost ~20%
+  of A53 decode time (measured 7.68 → 9.23 ms p50 on imx8mp COCO).
+- **Entropy-derived IDCT sparsity** (`BlockInfo::last_k`): the highest zigzag
+  index written is a free by-product of the scan order, and because zigzag
+  fills the top-left corner first, a small `last_k` proves whole regions zero.
+  The NEON kernel picks a tier from it without re-deriving sparsity from the
+  coefficient vectors (`last_k ≤ 1` DC-broadcast left half, `≤ 9` sparse
+  butterfly, `≤ 13` full-left/zero-right, else the value-detection kernel),
+  loading only the rows that participate — 64-bit `vld1_s16` loads on the
+  proven-sparse tiers, which matches the Cortex-A53's 64-bit load path. The
+  de-zigzag table is padded (`ZIGZAG_EXT[320]`) so the natural-index load can
+  issue before the bounds branch instead of address-stalling the coefficient
+  store.
 - Runtime **`NeonTier`** / **`IntelTier`** (`cpu.rs`): one binary picks Huffman
   lookahead width, entropy prefetch distance, and SIMD kernels per
   micro-architecture / ISA. AArch64 uses HWCAP `dotprod`/`i8mm` plus a Linux
@@ -355,19 +404,25 @@ three places take deliberate care:
   no per-coefficient multiply) and the SIMD kernels dequantise 8 lanes at a
   time on load.
 - DC-only IDCT fast path: when all 63 AC coefficients are zero, the IDCT reduces
-  to a constant fill (single multiply + shift).
-- Function pointer dispatch for the IDCT: selected once at init from the active
-  CPU tier (NEON on AArch64; AVX2 > SSE4.1 > SSE2 on x86-64; scalar fallback).
+  to a constant fill (single multiply + shift). The NEON 8×8 kernel further
+  special-cases each 4×8 half whose rows 1–7 are zero (turbo islow case 2).
+- On AArch64 the MCU loop binds the NEON IDCT as a fn-item (direct `bl` per
+  block) rather than an `IdctFn` pointer; other ISAs still select a pointer
+  once at decode start.
 
 ### NV Output Path
 
 For a colour JPEG the decoder produces a semi-planar NV format directly,
 skipping any YCbCr→RGB conversion:
 
-- The Y plane is copied from the IDCT luma output at the tensor's row stride.
+- The Y plane is copied from the IDCT luma output at the tensor's row stride
+  (or written directly during IDCT for full MCU-row bands).
 - The Cb/Cr components are interleaved pair-wise into the UV plane that follows
-  the Y plane, at the source's own chroma resolution. `avg_block` downsamples
-  first only for the exotic subsamplings that have no matching NV format.
+  the Y plane, at the source's own chroma resolution. Standard 4:4:4 (1×1)
+  interleaves each 8×8 chroma block as it is produced (`write_nv24_uv_block`);
+  4:2:2 and non-1×1 4:4:4 still gather a planar MCU-row band then `vst2`
+  a full row. `avg_block` downsamples first only for the exotic subsamplings
+  that have no matching NV format.
 
 These NV formats are the codec's only colour output. The chroma carries the
 source's JFIF (BT.601 full-range) colorimetry; mapping that to RGB is the
@@ -402,7 +457,7 @@ path; fused RGB and exotic NV12 averaging take the color/downsample kernels.
 
 | Kernel   | Strategy                                          | Throughput              |
 |----------|---------------------------------------------------|-------------------------|
-| **IDCT** | 16-bit coefficients end-to-end (libjpeg-turbo `jidctint-neon` model): 8-lane `vmulq_s16` dequant, Loeffler butterfly via `vmull_s16`/`vmlal_s16` 16×16→32 multiplies, `vrshrn` descale, register-resident `int16x8` workspace (no memory round-trip), `trn`-based 16-bit and 8-bit 8×8 transposes. Sparse shortcuts skip the butterfly for all-zero bottom rows (pass 1) and all-zero right columns (both passes) — the dominant shapes of quantised natural-image blocks. DC-only fills 8 bytes via `vdup`/`vst1` | 8 columns per pass-1 sweep, 8 rows per pass-2 sweep |
+| **IDCT** | 16-bit coefficients end-to-end (libjpeg-turbo `jidctint-neon` model): 8-lane `vmulq_s16` dequant, Loeffler butterfly via `vmull_s16`/`vmlal_s16` 16×16→32 multiplies, `vrshrn` descale, register-resident `int16x8` workspace (no memory round-trip), `trn`-based 16-bit and 8-bit 8×8 transposes. Sparse shortcuts skip the butterfly for all-zero bottom rows (pass 1) and all-zero right columns (both passes); a further per-half DC-only path (rows 1–7 of a 4×8 half all zero) broadcasts `saturate(dequant(row0) << PASS1_BITS)`, matching turbo's islow special case 2 — the remaining in-order gap after whole-block DC-only is taken in the MCU loop. DC-only fills 8 bytes via `vdup`/`vst1` | 8 columns per pass-1 sweep, 8 rows per pass-2 sweep |
 
 The butterfly constants are held in two `int16x8` registers and addressed by
 lane (`vmull_laneq_s16`), not splatted per multiply: the butterfly is inlined
@@ -686,8 +741,9 @@ codec.decode_jpeg                                       [user-facing fn]
 │   └── codec.decode_jpeg.v4l2_copy_out                 ← scratch → tensor write (absent on the zero-copy target)
 │       field: kind = "nv12" | "grey" | "yuv24_to_nv24"
 └── codec.decode_jpeg.mcu_loop                          ← Huffman + IDCT + write stage (CPU path only)
-    ├── codec.decode_jpeg.mcu_row.huffman_idct          ← per MCU-row entropy + IDCT
+    ├── codec.decode_jpeg.mcu_row.huffman_idct          ← per MCU-row entropy + IDCT (4:4:4 1×1 also writes NV24 UV / fused RGB here)
     ├── codec.decode_jpeg.write_nv12 / write_nv16 / write_nv24 / write_grey / write_rgb
+        (write_nv24 / write_rgb absent for standard 1×1 4:4:4 — those writes are folded into huffman_idct)
 
 codec.decode_png                                        [user-facing fn]
 │ fields: dtype, n_bytes
@@ -809,7 +865,7 @@ call. The edgefirst-codec PNG layer reuses `ImageDecoder.input_buffer` for
 | Layer                    | After Warmup     | Notes                        |
 |--------------------------|------------------|------------------------------|
 | JPEG `McuScratch`        | No allocations   | Grows to high-water mark     |
-| JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
+| JPEG Huffman/quant tables| No allocations   | LUTs reused when DHT unchanged; otherwise rebuilt from marker data |
 | JPEG IDCT workspace      | No allocations   | Stack-allocated (`[i32; 64]` scalar/SSE; NEON keeps it in registers) |
 | JPEG native row write    | No allocations   | Strided into pre-allocated tensor |
 | V4L2 streaming session   | No allocations   | OUTPUT buffer + DMA scratch persist; geometry changes are ioctl-only |
