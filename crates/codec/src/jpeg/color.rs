@@ -84,6 +84,117 @@ fn ycbcr_to_rgb_row_scalar(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], start
     }
 }
 
+/// Convert one or two adjacent 8×8 4:4:4 MCU blocks to interleaved RGB.
+///
+/// Pairing two full blocks keeps the 16-pixel `vst3q` kernel and does one ISA
+/// dispatch for the whole pair. Calling [`ycbcr_to_rgb_row`] per 8-pixel MCU
+/// row was thousands of extra calls (and a feature-detect each time) on
+/// in-order A53/A55.
+#[allow(clippy::too_many_arguments)]
+pub fn ycbcr_to_rgb_blocks(
+    y0: &[u8; 64],
+    cb0: &[u8; 64],
+    cr0: &[u8; 64],
+    right: Option<(&[u8; 64], &[u8; 64], &[u8; 64])>,
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    cols0: usize,
+    cols1: usize,
+    rows: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use super::cpu::{neon_tier, NeonTier};
+        if !matches!(neon_tier(), NeonTier::Scalar)
+            && std::arch::is_aarch64_feature_detected!("neon")
+        {
+            if let Some((y1, cb1, cr1)) = right {
+                if cols0 == 8 && cols1 == 8 {
+                    // SAFETY: 8×`rows` source samples per plane; destination
+                    // holds 16 RGB pixels per row at `stride`.
+                    unsafe {
+                        ycbcr_to_rgb_block16_neon(
+                            y0, cb0, cr0, y1, cb1, cr1, dst, stride, x, y, rows,
+                        );
+                    }
+                    return;
+                }
+            } else if cols0 == 8 {
+                // SAFETY: 8×`rows` source samples; 8 RGB pixels per row.
+                unsafe { ycbcr_to_rgb_block8_neon(y0, cb0, cr0, dst, stride, x, y, rows) };
+                return;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if super::cpu::intel_tier().has_sse41() {
+            if let Some((y1, cb1, cr1)) = right {
+                if cols0 == 8 && cols1 == 8 {
+                    // SAFETY: SSE4.1 probed; same bounds contract as NEON above.
+                    unsafe {
+                        ycbcr_to_rgb_block16_sse41(
+                            y0, cb0, cr0, y1, cb1, cr1, dst, stride, x, y, rows,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+    for r in 0..rows {
+        let d = (y + r) * stride + x * 3;
+        ycbcr_to_rgb_row(
+            &y0[r * 8..],
+            &cb0[r * 8..],
+            &cr0[r * 8..],
+            &mut dst[d..],
+            cols0,
+        );
+        if let Some((y1, cb1, cr1)) = right {
+            if cols1 > 0 {
+                let d1 = d + cols0 * 3;
+                ycbcr_to_rgb_row(
+                    &y1[r * 8..],
+                    &cb1[r * 8..],
+                    &cr1[r * 8..],
+                    &mut dst[d1..],
+                    cols1,
+                );
+            }
+        }
+    }
+}
+
+/// Q14 butterfly on 8 i16 lanes → packed u8. Shared by the row and MCU-block
+/// NEON writers so 8-wide and 16-wide stores stay bit-identical.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn ycbcr_half_neon(
+    yv: core::arch::aarch64::int16x8_t,
+    cbv: core::arch::aarch64::int16x8_t,
+    crv: core::arch::aarch64::int16x8_t,
+) -> (
+    core::arch::aarch64::uint8x8_t,
+    core::arch::aarch64::uint8x8_t,
+    core::arch::aarch64::uint8x8_t,
+) {
+    use core::arch::aarch64::*;
+    let c128 = vdupq_n_s16(128);
+    let cb2 = vshlq_n_s16::<1>(vsubq_s16(cbv, c128));
+    let cr2 = vshlq_n_s16::<1>(vsubq_s16(crv, c128));
+    let r = vaddq_s16(yv, vqrdmulhq_n_s16(cr2, CR_R));
+    let g = vsubq_s16(
+        vsubq_s16(yv, vqrdmulhq_n_s16(cb2, CB_G)),
+        vqrdmulhq_n_s16(cr2, CR_G),
+    );
+    let b = vaddq_s16(yv, vqrdmulhq_n_s16(cb2, CB_B));
+    (vqmovun_s16(r), vqmovun_s16(g), vqmovun_s16(b))
+}
+
 /// 16 pixels per iteration: two 8-lane s16 halves through the Q14 butterfly,
 /// then one `vst3q_u8` interleaved store.
 #[cfg(target_arch = "aarch64")]
@@ -91,36 +202,18 @@ fn ycbcr_to_rgb_row_scalar(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], start
 unsafe fn ycbcr_to_rgb_row_neon(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
     use core::arch::aarch64::*;
 
-    #[inline(always)]
-    unsafe fn half(
-        yv: int16x8_t,
-        cbv: int16x8_t,
-        crv: int16x8_t,
-    ) -> (uint8x8_t, uint8x8_t, uint8x8_t) {
-        let c128 = vdupq_n_s16(128);
-        let cb2 = vshlq_n_s16::<1>(vsubq_s16(cbv, c128));
-        let cr2 = vshlq_n_s16::<1>(vsubq_s16(crv, c128));
-        let r = vaddq_s16(yv, vqrdmulhq_n_s16(cr2, CR_R));
-        let g = vsubq_s16(
-            vsubq_s16(yv, vqrdmulhq_n_s16(cb2, CB_G)),
-            vqrdmulhq_n_s16(cr2, CR_G),
-        );
-        let b = vaddq_s16(yv, vqrdmulhq_n_s16(cb2, CB_B));
-        (vqmovun_s16(r), vqmovun_s16(g), vqmovun_s16(b))
-    }
-
     let mut i = 0usize;
     while i + 16 <= n {
         let yq = vld1q_u8(y.as_ptr().add(i));
         let cbq = vld1q_u8(cb.as_ptr().add(i));
         let crq = vld1q_u8(cr.as_ptr().add(i));
 
-        let (r_lo, g_lo, b_lo) = half(
+        let (r_lo, g_lo, b_lo) = ycbcr_half_neon(
             vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(yq))),
             vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(cbq))),
             vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(crq))),
         );
-        let (r_hi, g_hi, b_hi) = half(
+        let (r_hi, g_hi, b_hi) = ycbcr_half_neon(
             vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(yq))),
             vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(cbq))),
             vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(crq))),
@@ -135,7 +228,7 @@ unsafe fn ycbcr_to_rgb_row_neon(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], 
         i += 16;
     }
     while i + 8 <= n {
-        let (r, g, b) = half(
+        let (r, g, b) = ycbcr_half_neon(
             vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y.as_ptr().add(i)))),
             vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cb.as_ptr().add(i)))),
             vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cr.as_ptr().add(i)))),
@@ -144,6 +237,80 @@ unsafe fn ycbcr_to_rgb_row_neon(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], 
         i += 8;
     }
     ycbcr_to_rgb_row_scalar(y, cb, cr, dst, i, n);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ycbcr_to_rgb_block8_neon(
+    y: &[u8; 64],
+    cb: &[u8; 64],
+    cr: &[u8; 64],
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y0: usize,
+    rows: usize,
+) {
+    use core::arch::aarch64::*;
+    for r in 0..rows {
+        let src = r * 8;
+        let (rv, gv, bv) = ycbcr_half_neon(
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y.as_ptr().add(src)))),
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cb.as_ptr().add(src)))),
+            vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cr.as_ptr().add(src)))),
+        );
+        let d = (y0 + r) * stride + x * 3;
+        vst3_u8(dst.as_mut_ptr().add(d), uint8x8x3_t(rv, gv, bv));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ycbcr_to_rgb_block16_neon(
+    y0: &[u8; 64],
+    cb0: &[u8; 64],
+    cr0: &[u8; 64],
+    y1: &[u8; 64],
+    cb1: &[u8; 64],
+    cr1: &[u8; 64],
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    rows: usize,
+) {
+    use core::arch::aarch64::*;
+    for r in 0..rows {
+        let src = r * 8;
+        let yq = vcombine_u8(vld1_u8(y0.as_ptr().add(src)), vld1_u8(y1.as_ptr().add(src)));
+        let cbq = vcombine_u8(
+            vld1_u8(cb0.as_ptr().add(src)),
+            vld1_u8(cb1.as_ptr().add(src)),
+        );
+        let crq = vcombine_u8(
+            vld1_u8(cr0.as_ptr().add(src)),
+            vld1_u8(cr1.as_ptr().add(src)),
+        );
+        let (r_lo, g_lo, b_lo) = ycbcr_half_neon(
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(yq))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(cbq))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(crq))),
+        );
+        let (r_hi, g_hi, b_hi) = ycbcr_half_neon(
+            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(yq))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(cbq))),
+            vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(crq))),
+        );
+        let rgb = uint8x16x3_t(
+            vcombine_u8(r_lo, r_hi),
+            vcombine_u8(g_lo, g_hi),
+            vcombine_u8(b_lo, b_hi),
+        );
+        let d = (y + r) * stride + x * 3;
+        vst3q_u8(dst.as_mut_ptr().add(d), rgb);
+    }
 }
 
 /// `pshufb` selector byte meaning "write zero".
@@ -203,24 +370,96 @@ use core::arch::x86_64::__m128i;
 ///
 /// `pmulhrsw` computes `(a·b + 0x4000) >> 15`, which is exactly the scalar
 /// `qrdmulh` and NEON's `SQRDMULH`, so all three paths are bit-identical.
+/// One 8-pixel half: Q14 butterfly on i16 lanes. Shared by the row and
+/// MCU-block SSE4.1 writers so both stay bit-identical (`pmulhrsw` matches
+/// scalar `qrdmulh` and NEON `SQRDMULH` exactly).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn ycbcr_half_sse41(
+    yv: core::arch::x86_64::__m128i,
+    cbv: core::arch::x86_64::__m128i,
+    crv: core::arch::x86_64::__m128i,
+) -> (
+    core::arch::x86_64::__m128i,
+    core::arch::x86_64::__m128i,
+    core::arch::x86_64::__m128i,
+) {
+    use core::arch::x86_64::*;
+    let c128 = _mm_set1_epi16(128);
+    let cb2 = _mm_slli_epi16::<1>(_mm_sub_epi16(cbv, c128));
+    let cr2 = _mm_slli_epi16::<1>(_mm_sub_epi16(crv, c128));
+    let r = _mm_add_epi16(yv, _mm_mulhrs_epi16(cr2, _mm_set1_epi16(CR_R)));
+    let g = _mm_sub_epi16(
+        _mm_sub_epi16(yv, _mm_mulhrs_epi16(cb2, _mm_set1_epi16(CB_G))),
+        _mm_mulhrs_epi16(cr2, _mm_set1_epi16(CR_G)),
+    );
+    let b = _mm_add_epi16(yv, _mm_mulhrs_epi16(cb2, _mm_set1_epi16(CB_B)));
+    (r, g, b)
+}
+
+/// Paired 8×8 blocks → 16 RGB pixels per row (SSE4.1). x86 mirror of
+/// `ycbcr_to_rgb_block16_neon`: without it the fused-RGB write fell to the
+/// scalar row tail on x86 (the 16-wide row kernel never engages at 8-pixel
+/// block width), which cost ~70% on the RGB arm of Rocket Lake after the
+/// per-MCU write path landed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ycbcr_to_rgb_block16_sse41(
+    y0: &[u8; 64],
+    cb0: &[u8; 64],
+    cr0: &[u8; 64],
+    y1: &[u8; 64],
+    cb1: &[u8; 64],
+    cr1: &[u8; 64],
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    rows: usize,
+) {
+    use core::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
+    for r in 0..rows {
+        let src = r * 8;
+        let pair = |a: &[u8; 64], b: &[u8; 64]| -> __m128i {
+            _mm_unpacklo_epi64(
+                _mm_loadl_epi64(a.as_ptr().add(src) as *const __m128i),
+                _mm_loadl_epi64(b.as_ptr().add(src) as *const __m128i),
+            )
+        };
+        let yq = pair(y0, y1);
+        let cbq = pair(cb0, cb1);
+        let crq = pair(cr0, cr1);
+        let (r_lo, g_lo, b_lo) = ycbcr_half_sse41(
+            _mm_unpacklo_epi8(yq, zero),
+            _mm_unpacklo_epi8(cbq, zero),
+            _mm_unpacklo_epi8(crq, zero),
+        );
+        let (r_hi, g_hi, b_hi) = ycbcr_half_sse41(
+            _mm_unpackhi_epi8(yq, zero),
+            _mm_unpackhi_epi8(cbq, zero),
+            _mm_unpackhi_epi8(crq, zero),
+        );
+        let d = (y + r) * stride + x * 3;
+        store_rgb16(
+            _mm_packus_epi16(r_lo, r_hi),
+            _mm_packus_epi16(g_lo, g_hi),
+            _mm_packus_epi16(b_lo, b_hi),
+            dst.as_mut_ptr().add(d),
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn ycbcr_to_rgb_row_sse41(y: &[u8], cb: &[u8], cr: &[u8], dst: &mut [u8], n: usize) {
     use core::arch::x86_64::*;
 
-    /// One 8-pixel half: Q14 butterfly on i16 lanes.
     #[inline(always)]
     unsafe fn half(yv: __m128i, cbv: __m128i, crv: __m128i) -> (__m128i, __m128i, __m128i) {
-        let c128 = _mm_set1_epi16(128);
-        let cb2 = _mm_slli_epi16::<1>(_mm_sub_epi16(cbv, c128));
-        let cr2 = _mm_slli_epi16::<1>(_mm_sub_epi16(crv, c128));
-        let r = _mm_add_epi16(yv, _mm_mulhrs_epi16(cr2, _mm_set1_epi16(CR_R)));
-        let g = _mm_sub_epi16(
-            _mm_sub_epi16(yv, _mm_mulhrs_epi16(cb2, _mm_set1_epi16(CB_G))),
-            _mm_mulhrs_epi16(cr2, _mm_set1_epi16(CR_G)),
-        );
-        let b = _mm_add_epi16(yv, _mm_mulhrs_epi16(cb2, _mm_set1_epi16(CB_B)));
-        (r, g, b)
+        ycbcr_half_sse41(yv, cbv, crv)
     }
 
     let mut i = 0usize;
@@ -351,6 +590,60 @@ mod tests {
         let mut exp = vec![0u8; n * 3];
         ycbcr_to_rgb_row(&y, &cb, &cr, &mut got, n);
         ycbcr_to_rgb_row_scalar(&y, &cb, &cr, &mut exp, 0, n);
+        assert_eq!(got, exp);
+    }
+
+    #[test]
+    fn mcu_blocks_match_row_kernel() {
+        let mut y0 = [0u8; 64];
+        let mut cb0 = [0u8; 64];
+        let mut cr0 = [0u8; 64];
+        let mut y1 = [0u8; 64];
+        let mut cb1 = [0u8; 64];
+        let mut cr1 = [0u8; 64];
+        let a = lcg_bytes(3, 64);
+        let b = lcg_bytes(5, 64);
+        let c = lcg_bytes(7, 64);
+        let d = lcg_bytes(11, 64);
+        let e = lcg_bytes(13, 64);
+        let f = lcg_bytes(17, 64);
+        y0.copy_from_slice(&a);
+        cb0.copy_from_slice(&b);
+        cr0.copy_from_slice(&c);
+        y1.copy_from_slice(&d);
+        cb1.copy_from_slice(&e);
+        cr1.copy_from_slice(&f);
+
+        let stride = 16 * 3;
+        let mut got = vec![0u8; 8 * stride];
+        ycbcr_to_rgb_blocks(
+            &y0,
+            &cb0,
+            &cr0,
+            Some((&y1, &cb1, &cr1)),
+            &mut got,
+            stride,
+            0,
+            0,
+            8,
+            8,
+            8,
+        );
+
+        let mut exp = vec![0u8; 8 * stride];
+        for r in 0..8 {
+            let mut yrow = [0u8; 16];
+            let mut cbrow = [0u8; 16];
+            let mut crrow = [0u8; 16];
+            yrow[..8].copy_from_slice(&y0[r * 8..r * 8 + 8]);
+            yrow[8..].copy_from_slice(&y1[r * 8..r * 8 + 8]);
+            cbrow[..8].copy_from_slice(&cb0[r * 8..r * 8 + 8]);
+            cbrow[8..].copy_from_slice(&cb1[r * 8..r * 8 + 8]);
+            crrow[..8].copy_from_slice(&cr0[r * 8..r * 8 + 8]);
+            crrow[8..].copy_from_slice(&cr1[r * 8..r * 8 + 8]);
+            let d = r * stride;
+            ycbcr_to_rgb_row_scalar(&yrow, &cbrow, &crrow, &mut exp[d..], 0, 16);
+        }
         assert_eq!(got, exp);
     }
 

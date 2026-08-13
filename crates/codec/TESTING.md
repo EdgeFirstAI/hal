@@ -19,7 +19,7 @@ Inline `#[cfg(test)]` modules in each source file:
 | `jpeg/color.rs`       | YCbCr→RGB scalar vs float (±1); dispatch bit-exact vs scalar |
 | `jpeg/cpu.rs`         | `NeonTier` / `IntelTier` probe sanity + entropy helpers |
 | `jpeg/idct/scalar.rs` | DC-only shortcut, known coefficient IDCT            |
-| `jpeg/idct/{neon,sse2,avx2}.rs` | Scalar↔SIMD parity per kernel (bit-exact on x86, ±1 on NEON) |
+| `jpeg/idct/{neon,sse2,avx2}.rs` | Scalar↔SIMD parity per kernel (bit-exact on x86, ±1 on NEON); NEON also covers per-half DC-only (row-0-only, left-DC/right-AC) |
 | `jpeg/idct.rs`        | Selected-tier dispatch; coefficients that overflow the 16-bit dequant neither panic under overflow checks nor write outside the block |
 | `jpeg/v4l2/format.rs` | `classify()` CAPTURE FourCC → `CapKind`             |
 | `jpeg/v4l2/mod.rs`    | Backend helpers (geometry/format negotiation logic) |
@@ -192,7 +192,7 @@ allocation-free in the hot loop.
 | Layer                    | After Warmup     | Notes                        |
 |--------------------------|------------------|------------------------------|
 | JPEG `McuScratch`        | No allocations   | Grows to high-water mark     |
-| JPEG Huffman/quant tables| No allocations   | Rebuilt from marker data     |
+| JPEG Huffman/quant tables| No allocations   | LUTs reused when DHT unchanged; otherwise rebuilt from marker data |
 | JPEG IDCT workspace      | No allocations   | Stack-allocated `[i32; 64]`  |
 | JPEG native row write    | No allocations   | Strided into pre-allocated tensor |
 | V4L2 streaming session   | No allocations   | OUTPUT buffer + DMA scratch persist; geometry changes are ioctl-only |

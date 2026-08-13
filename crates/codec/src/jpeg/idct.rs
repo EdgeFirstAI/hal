@@ -3,6 +3,7 @@
 
 //! IDCT dispatcher — selects scalar, NEON, AVX2, SSE4.1, or SSE2.
 
+pub mod fast;
 pub mod scalar;
 
 #[cfg(target_arch = "aarch64")]

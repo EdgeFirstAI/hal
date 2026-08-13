@@ -13,7 +13,7 @@
 use crate::error::CodecError;
 use crate::jpeg::bitstream::BitStream;
 use crate::jpeg::huffman::{self, HuffmanTable};
-use crate::jpeg::idct::{self, IdctDcOnlyFn, IdctFn};
+use crate::jpeg::idct;
 use crate::jpeg::markers::JpegHeaders;
 use edgefirst_tensor::PixelFormat;
 
@@ -65,6 +65,7 @@ impl McuScratch {
 /// sampling shader applies (logical wrap vs. physical placement), keeping the
 /// codec and shader provably in agreement. `output_format` must be `Grey`,
 /// `Nv12`, `Nv16`, or `Nv24`.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_image(
     data: &[u8],
     headers: &JpegHeaders,
@@ -72,6 +73,7 @@ pub fn decode_image(
     dst: &mut [u8],
     grid_row_stride: usize,
     output_format: PixelFormat,
+    fast_dct: bool,
 ) -> crate::Result<()> {
     let hdr = &headers.header;
     let img_w = hdr.width as usize;
@@ -134,10 +136,421 @@ pub fn decode_image(
         )));
     }
 
-    let idct_fn: IdctFn = idct::select_idct();
-    let idct_dc_fn: IdctDcOnlyFn = idct::select_idct_dc_only();
+    // Bind the IDCT as a fn-item (not a `fn` pointer). An indirect call per
+    // block is cheap on OoO cores and not on in-order A53/A55 (~20k blocks
+    // on a 640×640 4:4:4 frame). The NEON entry is `#[target_feature]` so a
+    // direct `bl` is legal; the 8×8 kernel stays outlined (one I-cache copy).
+    //
+    // The opt-in fast (AAN) kernel exists on the NEON path only; elsewhere
+    // `fast_dct` is advisory and the accurate path runs (see `DctMethod`).
+    // The dequant tables must match the kernel class: the fast kernels take
+    // AAN-prescaled tables, so both are resolved here, together.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::jpeg::cpu::{neon_tier, NeonTier};
+        if !matches!(neon_tier(), NeonTier::Scalar)
+            && std::arch::is_aarch64_feature_detected!("neon")
+        {
+            if fast_dct {
+                let quants: [[u16; 64]; 4] = core::array::from_fn(|i| {
+                    idct::fast::derive_fast_quant(&headers.quant_tables[i].values)
+                });
+                // SAFETY: NEON was probed above.
+                return unsafe {
+                    decode_image_neon_fast(
+                        data,
+                        headers,
+                        scratch,
+                        dst,
+                        grid_row_stride,
+                        output_format,
+                        &quants,
+                    )
+                };
+            }
+            let quants: [[u16; 64]; 4] = core::array::from_fn(|i| headers.quant_tables[i].values);
+            // SAFETY: NEON was probed above.
+            return unsafe {
+                decode_image_neon(
+                    data,
+                    headers,
+                    scratch,
+                    dst,
+                    grid_row_stride,
+                    output_format,
+                    &quants,
+                )
+            };
+        }
+    }
+    let _ = fast_dct; // advisory: no fast kernels outside the NEON path
+    let quants: [[u16; 64]; 4] = core::array::from_fn(|i| headers.quant_tables[i].values);
+    // Non-NEON kernels ignore the entropy-derived `last_k` sparsity hint.
+    let idct_fn = idct::select_idct();
+    decode_image_idct(
+        data,
+        headers,
+        scratch,
+        dst,
+        grid_row_stride,
+        output_format,
+        &quants,
+        move |coeffs: &[i16; 64], quant: &[u16; 64], _last_k: u8, out: &mut [u8], stride: usize| {
+            idct_fn(coeffs, quant, out, stride)
+        },
+        idct::select_idct_dc_only(),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn decode_image_neon(
+    data: &[u8],
+    headers: &JpegHeaders,
+    scratch: &mut McuScratch,
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    output_format: PixelFormat,
+    quants: &[[u16; 64]; 4],
+) -> crate::Result<()> {
+    decode_image_idct(
+        data,
+        headers,
+        scratch,
+        dst,
+        grid_row_stride,
+        output_format,
+        quants,
+        crate::jpeg::idct::neon::idct_8x8_neon_k,
+        crate::jpeg::idct::neon::idct_dc_only_neon,
+    )
+}
+
+/// Fast (AAN) kernel binding — `quants` must be AAN-prescaled
+/// ([`idct::fast::derive_fast_quant`]).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn decode_image_neon_fast(
+    data: &[u8],
+    headers: &JpegHeaders,
+    scratch: &mut McuScratch,
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    output_format: PixelFormat,
+    quants: &[[u16; 64]; 4],
+) -> crate::Result<()> {
+    decode_image_idct(
+        data,
+        headers,
+        scratch,
+        dst,
+        grid_row_stride,
+        output_format,
+        quants,
+        crate::jpeg::idct::fast::idct_8x8_neon_fast_k,
+        crate::jpeg::idct::fast::idct_dc_only_fast_neon,
+    )
+}
+
+/// Dedicated decode loop for the dominant colour shape: 3 components, all
+/// 1×1 sampling (4:4:4), writing NV24 or fused RGB directly per MCU.
+///
+/// The generic loop's sampling-factor machinery (per-component block loops,
+/// `Option` table lookups, planar scratch strides) forces a stack frame past
+/// the register file, and `perf annotate` on Cortex-A53/A55 showed the block
+/// loop reloading spilled state per block (`ldr/str [sp, #448..784]`). This
+/// shape — every COCO image, most camera 4:4:4 streams — needs none of it:
+/// one Y, one Cb, one Cr block per MCU, tables and quant pointers resolved
+/// once into plain locals.
+///
+/// Behaviour is bit-identical to the generic loop's `direct_444` arms, which
+/// dispatch here instead.
+#[allow(clippy::too_many_arguments)]
+fn decode_image_444_direct<Idct, IdctDc>(
+    data: &[u8],
+    headers: &JpegHeaders,
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    output_format: PixelFormat,
+    quants: &[[u16; 64]; 4],
+    idct_fn: Idct,
+    idct_dc_fn: IdctDc,
+) -> crate::Result<()>
+where
+    Idct: Copy + Fn(&[i16; 64], &[u16; 64], u8, &mut [u8], usize),
+    IdctDc: Copy + Fn(i32, &mut [u8], usize),
+{
+    let hdr = &headers.header;
+    let img_w = hdr.width as usize;
+    let img_h = hdr.height as usize;
+    let is_rgb = output_format == PixelFormat::Rgb;
+
+    // Resolve per-component tables once into plain references — no per-block
+    // Option indexing in the loop.
+    let comp_tables = |i: usize| -> crate::Result<(&HuffmanTable, &HuffmanTable, &[u16; 64])> {
+        let c = &hdr.components[i];
+        let dc = headers.dc_tables[c.dc_table_id as usize]
+            .as_ref()
+            .ok_or_else(|| {
+                CodecError::InvalidData(format!("missing DC Huffman table {}", c.dc_table_id))
+            })?;
+        let ac = headers.ac_tables[c.ac_table_id as usize]
+            .as_ref()
+            .ok_or_else(|| {
+                CodecError::InvalidData(format!("missing AC Huffman table {}", c.ac_table_id))
+            })?;
+        Ok((dc, ac, &quants[c.quant_table_id as usize]))
+    };
+    let (dc_y, ac_y, q_y) = comp_tables(0)?;
+    let (dc_cb, ac_cb, q_cb) = comp_tables(1)?;
+    let (dc_cr, ac_cr, q_cr) = comp_tables(2)?;
+
+    // Same per-tier monomorphisation as the generic loop.
+    type DecodeBlockFn = for<'d> fn(
+        &mut BitStream<'d>,
+        &HuffmanTable,
+        &HuffmanTable,
+        &mut [i16; 64],
+        &mut i32,
+        &mut bool,
+    ) -> crate::Result<huffman::BlockInfo>;
+    let decode_block_fn: DecodeBlockFn = if crate::jpeg::cpu::entropy_pair_decode() {
+        huffman::decode_block::<true>
+    } else {
+        huffman::decode_block::<false>
+    };
+
+    let mut dc_pred = [0i32; 3];
+    let mut bs = BitStream::with_prefetch(
+        data,
+        headers.scan_data_offset,
+        crate::jpeg::cpu::entropy_prefetch_distance(),
+    );
+
+    let mcus_x = hdr.mcus_x();
+    let mcus_y = hdr.mcus_y();
+    let restart_interval = headers.restart_interval as usize;
+    let mut mcu_count = 0usize;
+
+    let mut coeffs = [0i16; 64];
+    let mut prev_has_ac = true; // force full clear on first block
+    let mut y_blk = [0u8; 64];
+    let mut cb_blk = [0u8; 64];
+    let mut cr_blk = [0u8; 64];
+
+    for mcu_row in 0..mcus_y {
+        let y_start = mcu_row * 8;
+        let num_rows = 8usize.min(img_h - y_start);
+        let _entropy =
+            tracing::trace_span!("codec.decode_jpeg.mcu_row.huffman_idct", row = mcu_row).entered();
+
+        let mut pend_y = [0u8; 64];
+        let mut pend_cb = [0u8; 64];
+        let mut pend_cr = [0u8; 64];
+        let mut pend_x = 0usize;
+        let mut has_pend = false;
+        for mcu_col in 0..mcus_x {
+            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval) {
+                bs.skip_restart_marker();
+                dc_pred = [0i32; 3];
+                prev_has_ac = true;
+            }
+
+            let x_offset = mcu_col * 8;
+
+            // Y block: straight into dst for interior NV24 MCUs, else via
+            // y_blk (fused RGB, or edge clipping).
+            let blk = decode_block_fn(
+                &mut bs,
+                dc_y,
+                ac_y,
+                &mut coeffs,
+                &mut dc_pred[0],
+                &mut prev_has_ac,
+            )?;
+            if !is_rgb {
+                let dst_off = y_start * grid_row_stride + x_offset;
+                let cols_fit = grid_row_stride.saturating_sub(x_offset).min(8);
+                if num_rows == 8 && cols_fit == 8 {
+                    idct_into(
+                        blk.has_ac,
+                        blk.last_k,
+                        &coeffs,
+                        q_y,
+                        &mut dst[dst_off..],
+                        grid_row_stride,
+                        idct_fn,
+                        idct_dc_fn,
+                    );
+                } else {
+                    idct_into(
+                        blk.has_ac, blk.last_k, &coeffs, q_y, &mut y_blk, 8, idct_fn, idct_dc_fn,
+                    );
+                    for r in 0..num_rows {
+                        let d = dst_off + r * grid_row_stride;
+                        dst[d..d + cols_fit].copy_from_slice(&y_blk[r * 8..r * 8 + cols_fit]);
+                    }
+                }
+            } else {
+                idct_into(
+                    blk.has_ac, blk.last_k, &coeffs, q_y, &mut y_blk, 8, idct_fn, idct_dc_fn,
+                );
+            }
+
+            let blk = decode_block_fn(
+                &mut bs,
+                dc_cb,
+                ac_cb,
+                &mut coeffs,
+                &mut dc_pred[1],
+                &mut prev_has_ac,
+            )?;
+            idct_into(
+                blk.has_ac,
+                blk.last_k,
+                &coeffs,
+                q_cb,
+                &mut cb_blk,
+                8,
+                idct_fn,
+                idct_dc_fn,
+            );
+
+            let blk = decode_block_fn(
+                &mut bs,
+                dc_cr,
+                ac_cr,
+                &mut coeffs,
+                &mut dc_pred[2],
+                &mut prev_has_ac,
+            )?;
+            idct_into(
+                blk.has_ac,
+                blk.last_k,
+                &coeffs,
+                q_cr,
+                &mut cr_blk,
+                8,
+                idct_fn,
+                idct_dc_fn,
+            );
+
+            // Write stage — identical to the generic loop's direct_444 tail.
+            let x = x_offset;
+            let cols = img_w.saturating_sub(x).min(8);
+            let rows = num_rows;
+            if is_rgb {
+                if has_pend {
+                    crate::jpeg::color::ycbcr_to_rgb_blocks(
+                        &pend_y,
+                        &pend_cb,
+                        &pend_cr,
+                        Some((&y_blk, &cb_blk, &cr_blk)),
+                        dst,
+                        grid_row_stride,
+                        pend_x,
+                        y_start,
+                        8,
+                        cols,
+                        rows,
+                    );
+                    has_pend = false;
+                } else if mcu_col + 1 < mcus_x
+                    && cols == 8
+                    && img_w.saturating_sub(x + 8).min(8) == 8
+                {
+                    pend_y = y_blk;
+                    pend_cb = cb_blk;
+                    pend_cr = cr_blk;
+                    pend_x = x;
+                    has_pend = true;
+                } else if cols > 0 && rows > 0 {
+                    crate::jpeg::color::ycbcr_to_rgb_blocks(
+                        &y_blk,
+                        &cb_blk,
+                        &cr_blk,
+                        None,
+                        dst,
+                        grid_row_stride,
+                        x,
+                        y_start,
+                        cols,
+                        0,
+                        rows,
+                    );
+                }
+            } else if cols > 0 && rows > 0 {
+                write_nv24_uv_block(
+                    &cb_blk,
+                    &cr_blk,
+                    dst,
+                    grid_row_stride,
+                    x,
+                    y_start,
+                    cols,
+                    rows,
+                    img_h,
+                );
+            }
+
+            mcu_count += 1;
+        }
+        debug_assert!(!has_pend, "pending RGB MCU not flushed at end of row");
+    }
+
+    if bs.overran() {
+        return Err(CodecError::InvalidData(
+            "truncated entropy-coded scan".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_image_idct<Idct, IdctDc>(
+    data: &[u8],
+    headers: &JpegHeaders,
+    scratch: &mut McuScratch,
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    output_format: PixelFormat,
+    quants: &[[u16; 64]; 4],
+    idct_fn: Idct,
+    idct_dc_fn: IdctDc,
+) -> crate::Result<()>
+where
+    Idct: Copy + Fn(&[i16; 64], &[u16; 64], u8, &mut [u8], usize),
+    IdctDc: Copy + Fn(i32, &mut [u8], usize),
+{
+    let hdr = &headers.header;
+    let img_w = hdr.width as usize;
+    let img_h = hdr.height as usize;
+    let num_components = hdr.components.len();
+    let is_rgb = output_format == PixelFormat::Rgb;
 
     let is_greyscale = num_components == 1;
+
+    // Standard 4:4:4 (1×1 sampling on every component) with per-MCU NV24 UV /
+    // fused RGB writes: dedicated tight loop (see decode_image_444_direct).
+    if num_components == 3
+        && hdr.max_h_samp == 1
+        && hdr.max_v_samp == 1
+        && matches!(output_format, PixelFormat::Nv24 | PixelFormat::Rgb)
+    {
+        return decode_image_444_direct(
+            data,
+            headers,
+            dst,
+            grid_row_stride,
+            output_format,
+            quants,
+            idct_fn,
+            idct_dc_fn,
+        );
+    }
 
     // Fixed-size per-component state — no heap allocation per decode. JPEG
     // baseline allows at most 4 components (we only emit 1- and 3-component
@@ -166,6 +579,23 @@ pub fn decode_image(
         );
     }
 
+    // Paired-coefficient probe: a per-tier choice (OoO cores win, in-order
+    // cores lose — see cpu::entropy_pair_decode). Monomorphised, selected
+    // once per decode: one indirect call per block costs less than keeping a
+    // second live call site in the loop (which cost ~7% on the A53).
+    type DecodeBlockFn = for<'d> fn(
+        &mut BitStream<'d>,
+        &HuffmanTable,
+        &HuffmanTable,
+        &mut [i16; 64],
+        &mut i32,
+        &mut bool,
+    ) -> crate::Result<huffman::BlockInfo>;
+    let decode_block_fn: DecodeBlockFn = if crate::jpeg::cpu::entropy_pair_decode() {
+        huffman::decode_block::<true>
+    } else {
+        huffman::decode_block::<false>
+    };
     let mut dc_pred = [0i32; 4];
     let mut bs = BitStream::with_prefetch(
         data,
@@ -188,8 +618,9 @@ pub fn decode_image(
         let num_rows = mcu_pixel_h.min(img_h - y_start);
         // Direct Y→dst for full MCU-row bands (avoids planar scratch + memcpy).
         // Partial bottom bands still go through scratch + clipped copy.
-        // Chroma still uses planar MCU-row scratch + full-row NEON `vst2`
-        // interleave — 8-wide per-block interleave loses the SIMD path.
+        // 4:4:4 1×1 (COCO + fused RGB) writes chroma per MCU instead — see
+        // `direct_444`. Other chroma still uses planar scratch + full-row
+        // NEON `vst2` interleave.
         let y_direct = !is_greyscale
             && output_format != PixelFormat::Grey
             && !is_rgb
@@ -217,13 +648,13 @@ pub fn decode_image(
                     let blocks_v = comp.sampling.v as usize;
                     let comp_stride = mcus_x * blocks_h * 8;
 
-                    let quant = &headers.quant_tables[comp.quant_table_id as usize].values;
+                    let quant = &quants[comp.quant_table_id as usize];
 
                     let mut bv = 0usize;
                     while bv < blocks_v {
                         let mut bh = 0usize;
                         while bh < blocks_h {
-                            let has_ac = huffman::decode_block(
+                            let blk = decode_block_fn(
                                 &mut bs,
                                 dc_tables[ci].expect("resolved above for every component"),
                                 ac_tables[ci].expect("resolved above for every component"),
@@ -231,6 +662,8 @@ pub fn decode_image(
                                 &mut dc_pred[ci],
                                 &mut prev_has_ac,
                             )?;
+                            let has_ac = blk.has_ac;
+                            let last_k = blk.last_k;
 
                             let x_offset = mcu_col * blocks_h * 8 + bh * 8;
                             let y_offset = bv * 8;
@@ -238,17 +671,16 @@ pub fn decode_image(
                             if y_direct && ci == 0 {
                                 let dst_off = (y_start + y_offset) * grid_row_stride + x_offset;
                                 if x_offset + 8 <= grid_row_stride {
-                                    if has_ac {
-                                        idct_fn(
-                                            &coeffs,
-                                            quant,
-                                            &mut dst[dst_off..],
-                                            grid_row_stride,
-                                        );
-                                    } else {
-                                        let dc = dc_only_coefficient(coeffs[0], quant[0]);
-                                        idct_dc_fn(dc, &mut dst[dst_off..], grid_row_stride);
-                                    }
+                                    idct_into(
+                                        has_ac,
+                                        last_k,
+                                        &coeffs,
+                                        quant,
+                                        &mut dst[dst_off..],
+                                        grid_row_stride,
+                                        idct_fn,
+                                        idct_dc_fn,
+                                    );
                                 } else {
                                     // Right-edge MCU whose 8-wide block spills past the
                                     // physical row (MCU-aligned width > grid width, e.g.
@@ -257,12 +689,10 @@ pub fn decode_image(
                                     // fit — writing through would corrupt the next
                                     // row's left edge.
                                     let mut tmp = [0u8; 64];
-                                    if has_ac {
-                                        idct_fn(&coeffs, quant, &mut tmp, 8);
-                                    } else {
-                                        let dc = dc_only_coefficient(coeffs[0], quant[0]);
-                                        idct_dc_fn(dc, &mut tmp, 8);
-                                    }
+                                    idct_into(
+                                        has_ac, last_k, &coeffs, quant, &mut tmp, 8, idct_fn,
+                                        idct_dc_fn,
+                                    );
                                     let cols = grid_row_stride - x_offset; // < 8
                                     for r in 0..8 {
                                         let d = dst_off + r * grid_row_stride;
@@ -272,12 +702,16 @@ pub fn decode_image(
                             } else {
                                 let buf_offset = y_offset * comp_stride + x_offset;
                                 let buf = &mut scratch.component_bufs[ci];
-                                if has_ac {
-                                    idct_fn(&coeffs, quant, &mut buf[buf_offset..], comp_stride);
-                                } else {
-                                    let dc = dc_only_coefficient(coeffs[0], quant[0]);
-                                    idct_dc_fn(dc, &mut buf[buf_offset..], comp_stride);
-                                }
+                                idct_into(
+                                    has_ac,
+                                    last_k,
+                                    &coeffs,
+                                    quant,
+                                    &mut buf[buf_offset..],
+                                    comp_stride,
+                                    idct_fn,
+                                    idct_dc_fn,
+                                );
                             }
                             bh += 1;
                         }
@@ -389,6 +823,103 @@ pub fn decode_image(
 #[inline(always)]
 fn dc_only_coefficient(coeff: i16, quant: u16) -> i32 {
     coeff.wrapping_mul(quant as i16) as i32
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn idct_into<Idct, IdctDc>(
+    has_ac: bool,
+    last_k: u8,
+    coeffs: &[i16; 64],
+    quant: &[u16; 64],
+    dst: &mut [u8],
+    stride: usize,
+    idct_fn: Idct,
+    idct_dc_fn: IdctDc,
+) where
+    Idct: Copy + Fn(&[i16; 64], &[u16; 64], u8, &mut [u8], usize),
+    IdctDc: Copy + Fn(i32, &mut [u8], usize),
+{
+    if has_ac {
+        idct_fn(coeffs, quant, last_k, dst, stride);
+    } else {
+        let dc = dc_only_coefficient(coeffs[0], quant[0]);
+        idct_dc_fn(dc, dst, stride);
+    }
+}
+
+/// Interleave one 8×8 Cb/Cr block into the NV24 UV plane (4:4:4 1×1).
+///
+/// UV for luma row `y` starts at `img_h * stride + y * 2 * stride` and is
+/// `2*img_w` contiguous bytes — the same linear layout as
+/// [`write_nv16_nv24_rows`]. 8-wide `vst2` keeps a SIMD store without the
+/// planar scratch + full-row second pass.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn write_nv24_uv_block(
+    cb: &[u8; 64],
+    cr: &[u8; 64],
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    cols: usize,
+    rows: usize,
+    img_h: usize,
+) {
+    let uv_off = img_h * stride;
+    if cols == 8 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::jpeg::cpu::{neon_tier, NeonTier};
+            if !matches!(neon_tier(), NeonTier::Scalar)
+                && std::arch::is_aarch64_feature_detected!("neon")
+            {
+                // SAFETY: 8 Cb + 8 Cr bytes → 16 interleaved destination bytes.
+                unsafe {
+                    use core::arch::aarch64::{uint8x8x2_t, vld1_u8, vst2_u8};
+                    for r in 0..rows {
+                        let base = uv_off + (y + r) * 2 * stride + x * 2;
+                        let src = r * 8;
+                        let b = vld1_u8(cb.as_ptr().add(src));
+                        let rv = vld1_u8(cr.as_ptr().add(src));
+                        vst2_u8(dst.as_mut_ptr().add(base), uint8x8x2_t(b, rv));
+                    }
+                }
+                return;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::jpeg::cpu::intel_tier().has_sse2() && is_x86_feature_detected!("sse2") {
+                // SAFETY: 8+8 source bytes unpack to 16 destination bytes.
+                unsafe {
+                    use core::arch::x86_64::{
+                        _mm_loadl_epi64, _mm_storeu_si128, _mm_unpacklo_epi8,
+                    };
+                    for r in 0..rows {
+                        let base = uv_off + (y + r) * 2 * stride + x * 2;
+                        let src = r * 8;
+                        let b = _mm_loadl_epi64(cb.as_ptr().add(src) as *const _);
+                        let rv = _mm_loadl_epi64(cr.as_ptr().add(src) as *const _);
+                        _mm_storeu_si128(
+                            dst.as_mut_ptr().add(base) as *mut _,
+                            _mm_unpacklo_epi8(b, rv),
+                        );
+                    }
+                }
+                return;
+            }
+        }
+    }
+    for r in 0..rows {
+        let base = uv_off + (y + r) * 2 * stride + x * 2;
+        let src = r * 8;
+        for c in 0..cols {
+            dst[base + c * 2] = cb[src + c];
+            dst[base + c * 2 + 1] = cr[src + c];
+        }
+    }
 }
 
 /// Write interleaved RGB rows from the 4:4:4 planar band scratch (fused
@@ -1054,12 +1585,20 @@ mod tests {
         let mut out = vec![0u8; stride * img_h * 3];
 
         // Whole file decodes; the same file cut to its first MCUs does not.
-        decode_image(&jpeg, &headers, &mut scratch, &mut out, stride, fmt).unwrap();
+        decode_image(&jpeg, &headers, &mut scratch, &mut out, stride, fmt, false).unwrap();
 
         for keep in [0usize, 64, 4096] {
             let cut = (headers.scan_data_offset + keep).min(jpeg.len());
-            let err = decode_image(&jpeg[..cut], &headers, &mut scratch, &mut out, stride, fmt)
-                .expect_err("truncated scan decoded as if complete");
+            let err = decode_image(
+                &jpeg[..cut],
+                &headers,
+                &mut scratch,
+                &mut out,
+                stride,
+                fmt,
+                false,
+            )
+            .expect_err("truncated scan decoded as if complete");
             assert!(
                 matches!(err, CodecError::InvalidData(_)),
                 "keep={keep}: unexpected error {err:?}"
@@ -1090,6 +1629,7 @@ mod tests {
                 &mut nv24,
                 even_w,
                 PixelFormat::Nv24,
+                false,
             )
             .unwrap();
 
@@ -1102,6 +1642,7 @@ mod tests {
                 &mut rgb,
                 rgb_stride,
                 PixelFormat::Rgb,
+                false,
             )
             .unwrap();
 
@@ -1147,6 +1688,7 @@ mod tests {
             &mut nv24,
             even_w,
             PixelFormat::Nv24,
+            false,
         )
         .unwrap();
 
@@ -1158,6 +1700,7 @@ mod tests {
             &mut nv12,
             even_w,
             PixelFormat::Nv12,
+            false,
         )
         .unwrap();
 
@@ -1207,6 +1750,7 @@ mod tests {
             &mut nv24,
             even_w,
             PixelFormat::Nv24,
+            false,
         )
         .unwrap();
         let mut grey = vec![0u8; img_w * img_h];
@@ -1217,6 +1761,7 @@ mod tests {
             &mut grey,
             img_w,
             PixelFormat::Grey,
+            false,
         )
         .unwrap();
         let mut diffs = 0;
@@ -1246,6 +1791,7 @@ mod tests {
             &mut rgb,
             img_w * 3,
             PixelFormat::Rgb,
+            false,
         );
         assert!(err.is_err());
     }
@@ -1275,8 +1821,26 @@ mod tests {
         let mut buf_tight = vec![0u8; rows * tight];
         let mut buf_padded = vec![0u8; rows * padded];
 
-        decode_image(&jpeg, &headers, &mut scratch, &mut buf_tight, tight, fmt).unwrap();
-        decode_image(&jpeg, &headers, &mut scratch, &mut buf_padded, padded, fmt).unwrap();
+        decode_image(
+            &jpeg,
+            &headers,
+            &mut scratch,
+            &mut buf_tight,
+            tight,
+            fmt,
+            false,
+        )
+        .unwrap();
+        decode_image(
+            &jpeg,
+            &headers,
+            &mut scratch,
+            &mut buf_padded,
+            padded,
+            fmt,
+            false,
+        )
+        .unwrap();
 
         // Luma (img_h rows) + chroma (ceil(img_h/2) rows) live on the same grid,
         // each placed at its stride. The natural-width content of every used row

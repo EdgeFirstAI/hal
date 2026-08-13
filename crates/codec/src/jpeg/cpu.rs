@@ -70,6 +70,18 @@ impl NeonTier {
         }
     }
 
+    /// Whether the block decoder should use the paired-coefficient probe
+    /// (`HuffmanTable::pair_ac`). Out-of-order cores win from halving the
+    /// serial probe chain (~2.7% on A76); in-order A53/A55 lose ~1-3% — the
+    /// phantom-single path retires more instructions per coefficient and a
+    /// 2-wide in-order pipe pays for all of them (measured on imx8mp/imx95,
+    /// COCO decode-only, 2026-08).
+    #[inline]
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub fn entropy_pair_decode(self) -> bool {
+        matches!(self, Self::High)
+    }
+
     /// Prefetch distance (bytes ahead in the entropy stream).
     /// A53 dual-issues `prfm` for free; keep distances modest to avoid pollution.
     #[inline]
@@ -165,6 +177,20 @@ pub fn entropy_huffman_fast_bits() -> u8 {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         10
+    }
+}
+
+/// Whether the active arch tier uses the paired-coefficient entropy probe.
+/// x86 is unmeasured and stays on the single-coefficient path for now.
+#[inline]
+pub fn entropy_pair_decode() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_tier().entropy_pair_decode()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
     }
 }
 

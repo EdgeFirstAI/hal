@@ -154,8 +154,12 @@ The image is the portable OSS contract. How you schedule it on cloud CPUs
 # One-time dataset sync (~820 MB)
 ./benchmarks/scripts/sync-coco.sh imx8mp-frdm rpi5-hailo orin-nano
 
-# Decode-only HAL vs TurboJPEG (YUV + RGB) — supports PR decoder claims
+# Decode-only HAL vs TurboJPEG (YUV + RGB) — smoke / investigation
 ./benchmarks/scripts/decode-ab-matrix.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
+
+# Published decoder A/B (release, interleaved best-of-3, n=200)
+CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
+  ./benchmarks/scripts/decode-ab-publish.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
 # Full HAL COCO matrix (decode + letterbox convert, all HAL backends)
 ./benchmarks/scripts/deploy-and-run.sh imx8mp-frdm imx95-pro rpi5-hailo
@@ -275,20 +279,31 @@ costs it a further 0.489 ms (A55) / 0.614 ms (A53) end to end. Since the flag
 selects nothing but the IDCT, that premium is added to the IDCT row. Re-profile
 with `--dct accurate` to measure it directly rather than by difference.
 
-**Still open:** the residual IDCT deficit, the `mcu loop / write` stage (now the
-larger of the two on the A55), and a two-block AVX2 IDCT on x86.
+**Still open:** the entropy↔IDCT instruction interleave on in-order cores
+needs a hand-scheduled fused block loop (compiler-level fusion measured a
+wash on A53/A55 and −2.9% on A76); x86 has no fast-DCT kernel yet
+(`DctMethod::Fast` is advisory there); the fast mode's mAP impact is
+unmeasured. Two-block AVX2 IDCT on x86 is still untried. The JPEG Decode A/B
+table in `BENCHMARKS.md` is hand-maintained from `decode-ab-sweep.sh`; the
+generated tables further down that file must not be typed in by hand.
 
 ### Settled — do not re-test
 
 Each of these was measured and rejected; the reasons generalise.
 
-- **Folding AC EOB/ZRL into the combined `fast_ac` table**: −6%. Terminating the
-  block from inside the hit path costs a test on every coefficient to save one
-  miss per block.
+- **Folding AC EOB/ZRL into `fast_ac` with an in-path terminator test**: −6%.
+  Testing for EOB on every coefficient to save one miss per block loses.
+  What *did* land is the run-0xFF sentinel encoding: EOB resolves through the
+  `k >= 64` bounds branch the loop already executes, so the common exit costs
+  no extra hot-path compare — the lesson is about where the branch lives, not
+  whether the fold is possible.
 - **Passing the bit buffer as a by-value `BitState` struct**: +17% instructions.
   LLVM would not scalarise the aggregate and copied 24 bytes between stack slots
-  in the loop header. The fix that did work was inlining the *cold* refill and
-  slow-symbol paths, so the buffer stays in registers instead of a stack slot.
+  in the loop header. The design that superseded it is the `BitCursor` copy
+  owned by an `#[inline(never)]` `decode_block`: the cursor is a provably
+  non-escaping local of the outlined function, so it lives in registers — and
+  the outlining is load-bearing (inlined into the MCU loop it cost ~20% on the
+  A53 from merged register pressure).
 - **Raising the refill threshold**: refill already early-outs on `avail >= 32`
   and a bulk refill leaves ≥57 bits, so it touches memory about every fourth
   coefficient. A higher threshold makes refills more frequent, not fewer.

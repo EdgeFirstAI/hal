@@ -358,6 +358,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dct_compare"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "edgefirst-codec",
+ "edgefirst-tensor",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,6 +882,8 @@ dependencies = [
  "num-traits",
  "ravif",
  "rayon",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1625,6 +1637,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
+name = "rust_jpeg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "image",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2080,6 +2103,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "zune-jpeg"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+dependencies = [
+ "zune-core",
 ]
 
 [[package]]

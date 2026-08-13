@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dct_compare"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fast-vs-accurate DCT pixel similarity over a JPEG corpus"
+
+[[bin]]
+name = "dct_compare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# default-features off: the v4l2/nvjpeg hardware decoders would bypass the
+# software IDCT this harness exists to compare.
+edgefirst-codec = { path = "../../../crates/codec", default-features = false }
+edgefirst-tensor = { path = "../../../crates/tensor" }
