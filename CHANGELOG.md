@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Several threads can now read one PBO-backed tensor at the same time**
+  (`edgefirst-tensor`): a PBO allowed exactly one CPU mapping, so a second
+  `map_read()` of the same buffer failed with `PboMapped` even though
+  read-only holders cannot disturb one another. Any pipeline that fans one
+  source buffer out across worker threads hit this — most visibly tiled
+  (SAHI) pre-processing, where several workers convert different crops of
+  the same decoded frame and all but one failed, taking their whole frame
+  down with them. Read-only maps now share one GL mapping and are
+  refcounted, unmapping when the last holder drops. Writable maps are
+  unchanged and still exclusive in both directions: a writer will not join
+  readers, and a reader will not join a writer.
+
 ## [0.28.1] - 2026-08-08
 
 ### Fixed

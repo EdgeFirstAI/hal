@@ -13,10 +13,7 @@ use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
 };
 
 /// Raw mapped pointer from a PBO. CPU-accessible while the buffer is mapped.
@@ -64,7 +61,162 @@ struct PboHandle {
     ops: Arc<dyn PboOps>,
     buffer_id: u32,
     size: usize,
-    mapped: AtomicBool,
+    map_state: Mutex<MapState>,
+    /// Wakes threads waiting out an in-flight GL map/unmap. Needed because
+    /// `map_state` is deliberately NOT held across `PboOps` calls — see
+    /// [`PboHandle::acquire_map`].
+    map_cv: Condvar,
+}
+
+/// CPU-map state of a PBO's single GL buffer.
+///
+/// A GL buffer has exactly one mapping at a time, so these describe that
+/// one mapping's ownership rather than per-[`PboMap`] state:
+///
+/// * `Unmapped` — no CPU mapping exists.
+/// * `Exclusive` — one writable map holds it. Nothing else may map until
+///   that map drops.
+/// * `Shared` — `readers` read-only maps over ONE mapping, unmapped when
+///   the last of them drops.
+///
+/// Read sharing exists because tiled (SAHI) pre-processing has several
+/// worker threads convert different crops of the SAME source tensor
+/// concurrently, each taking `map_read()`. Read-only holders cannot observe
+/// one another's writes because there are none, so one mapping serves them
+/// all. Under a single-map rule every reader but one failed with
+/// [`Error::PboMapped`], which left callers no option but to serialize the
+/// workers that share a source.
+enum MapState {
+    Unmapped,
+    /// A thread is inside `PboOps::map_buffer` for this buffer right now.
+    /// Others must wait it out rather than start a second GL map.
+    Mapping,
+    Exclusive,
+    Shared {
+        readers: usize,
+        ptr: PboPtr,
+    },
+    /// A thread is inside `PboOps::unmap_buffer` for this buffer right now.
+    Unmapping,
+}
+
+impl PboHandle {
+    /// Acquire a CPU mapping of this buffer, returning the base pointer.
+    ///
+    /// Read-only acquisitions join an existing read-only mapping (bumping
+    /// its refcount) or create one. Writable acquisitions are exclusive.
+    /// Returns [`Error::PboMapped`] whenever the request cannot share what
+    /// is already held: anything against an exclusive map, or a writable
+    /// request against readers.
+    ///
+    /// # Locking
+    ///
+    /// `map_state` is NEVER held across a [`PboOps`] call. Those calls are
+    /// blocking round-trips to the GL thread, and the work the GL thread
+    /// runs (a convert, say) maps tensors itself — so a thread that waited
+    /// on GL while holding this mutex would deadlock against the very GL
+    /// thread it is waiting for. The in-flight GL call is published as
+    /// [`MapState::Mapping`] / [`MapState::Unmapping`] instead, and other
+    /// threads wait on `map_cv` until it resolves.
+    fn acquire_map(&self, writable: bool) -> Result<PboPtr> {
+        loop {
+            let mut guard = self.map_state.lock().expect("PBO map state mutex poisoned");
+            // Wait out any GL map/unmap another thread is mid-way through.
+            while matches!(*guard, MapState::Mapping | MapState::Unmapping) {
+                guard = self
+                    .map_cv
+                    .wait(guard)
+                    .expect("PBO map state mutex poisoned");
+            }
+            match &mut *guard {
+                MapState::Shared { readers, ptr } if !writable => {
+                    *readers += 1;
+                    return Ok(PboPtr(ptr.0));
+                }
+                MapState::Shared { .. } | MapState::Exclusive => return Err(Error::PboMapped),
+                // Ruled out by the wait above; re-check rather than assume.
+                MapState::Mapping | MapState::Unmapping => continue,
+                MapState::Unmapped => *guard = MapState::Mapping,
+            }
+            drop(guard);
+
+            // No lock held here — see this function's Locking note.
+            let mapped = self.ops.map_buffer(self.buffer_id, self.size);
+            let base = match mapped {
+                Ok(mapping) => NonNull::new(mapping.ptr as *mut c_void),
+                Err(e) => {
+                    self.finish_map(None, writable);
+                    return Err(e);
+                }
+            };
+            let Some(base) = base else {
+                // GL reported success but handed back a null pointer. It
+                // considers the buffer mapped, so release it rather than
+                // strand it mapped forever.
+                self.finish_map(None, writable);
+                let _ = self.ops.unmap_buffer(self.buffer_id);
+                return Err(Error::InvalidSize(self.size));
+            };
+            self.finish_map(Some(base), writable);
+            return Ok(PboPtr(base));
+        }
+    }
+
+    /// Publish the outcome of a GL map this thread had claimed via
+    /// [`MapState::Mapping`], waking anyone who waited on it. `None` means
+    /// the map failed and the buffer is unmapped again.
+    fn finish_map(&self, base: Option<NonNull<c_void>>, writable: bool) {
+        let mut guard = self.map_state.lock().expect("PBO map state mutex poisoned");
+        *guard = match base {
+            None => MapState::Unmapped,
+            Some(_) if writable => MapState::Exclusive,
+            Some(base) => MapState::Shared {
+                readers: 1,
+                ptr: PboPtr(base),
+            },
+        };
+        self.map_cv.notify_all();
+    }
+
+    /// Release one acquisition, unmapping the GL buffer once the last
+    /// holder is gone. Same locking rule as [`Self::acquire_map`]: the GL
+    /// unmap runs with no lock held.
+    fn release_map(&self) {
+        let mut guard = self.map_state.lock().expect("PBO map state mutex poisoned");
+        let last_holder = match &mut *guard {
+            MapState::Shared { readers, .. } => {
+                *readers = readers.saturating_sub(1);
+                *readers == 0
+            }
+            MapState::Exclusive => true,
+            // Nothing held — a release with no matching acquire. (A caller
+            // holding an acquisition cannot observe Mapping/Unmapping:
+            // only the last holder enters Unmapping, and it is this one.)
+            MapState::Unmapped | MapState::Mapping | MapState::Unmapping => false,
+        };
+        if !last_holder {
+            return;
+        }
+        *guard = MapState::Unmapping;
+        drop(guard);
+
+        trace!("Unmapping PBO buffer_id={}", self.buffer_id);
+        if let Err(e) = self.ops.unmap_buffer(self.buffer_id) {
+            log::warn!("Failed to unmap PBO buffer {}: {e}", self.buffer_id);
+        }
+
+        let mut guard = self.map_state.lock().expect("PBO map state mutex poisoned");
+        *guard = MapState::Unmapped;
+        self.map_cv.notify_all();
+    }
+
+    /// Whether any CPU mapping is currently held or being established.
+    fn is_mapped(&self) -> bool {
+        !matches!(
+            *self.map_state.lock().expect("PBO map state mutex poisoned"),
+            MapState::Unmapped
+        )
+    }
 }
 
 impl Drop for PboHandle {
@@ -149,7 +301,8 @@ where
                 ops,
                 buffer_id,
                 size,
-                mapped: AtomicBool::new(false),
+                map_state: Mutex::new(MapState::Unmapped),
+                map_cv: Condvar::new(),
             }),
             identity: BufferIdentity::new(),
             view_offset: 0,
@@ -162,9 +315,10 @@ where
         self.handle.buffer_id
     }
 
-    /// Returns true if the PBO is currently mapped for CPU access.
+    /// Returns true if the PBO is currently mapped for CPU access —
+    /// exclusively, or by one or more read-only holders.
     pub fn is_mapped(&self) -> bool {
-        self.handle.mapped.load(Ordering::Acquire)
+        self.handle.is_mapped()
     }
 }
 
@@ -317,36 +471,20 @@ where
         byte_size_override: Option<usize>,
         access: crate::CpuAccess,
     ) -> Result<TensorMap<T>> {
-        if self.handle.mapped.swap(true, Ordering::AcqRel) {
-            return Err(Error::PboMapped);
-        }
         // Always map the full GL allocation (`handle.size`); the slice length is
         // narrowed by `byte_size_override` (or the logical shape) at access time.
-        match self
-            .handle
-            .ops
-            .map_buffer(self.handle.buffer_id, self.handle.size)
-        {
-            Ok(mapping) => {
-                let pbo_ptr = PboPtr(
-                    NonNull::new(mapping.ptr as *mut c_void)
-                        .ok_or(Error::InvalidSize(self.handle.size))?,
-                );
-                Ok(TensorMap::Pbo(PboMap {
-                    ptr: Arc::new(Mutex::new(pbo_ptr)),
-                    shape: self.shape.clone(),
-                    handle: Arc::clone(&self.handle),
-                    byte_size_override,
-                    view_offset: self.view_offset,
-                    writable: access.writes(),
-                    _marker: PhantomData,
-                }))
-            }
-            Err(e) => {
-                self.handle.mapped.store(false, Ordering::Release);
-                Err(e)
-            }
-        }
+        let writable = access.writes();
+        let ptr = self.handle.acquire_map(writable)?;
+        Ok(TensorMap::Pbo(PboMap {
+            ptr: Arc::new(Mutex::new(ptr)),
+            shape: self.shape.clone(),
+            handle: Arc::clone(&self.handle),
+            byte_size_override,
+            view_offset: self.view_offset,
+            writable,
+            released: false,
+            _marker: PhantomData,
+        }))
     }
 }
 
@@ -384,6 +522,13 @@ where
     /// The GL mapping itself stays MAP_READ|MAP_WRITE (bit narrowing is a
     /// follow-up); this enforces the API contract uniformly.
     writable: bool,
+    /// Whether this map has already released its acquisition. `unmap()` is
+    /// public on the trait AND called from `Drop`, so without this an
+    /// explicit unmap followed by the drop would release twice — which,
+    /// now that read-only maps are refcounted, would drop a *sibling*
+    /// reader's mapping out from under it rather than being the harmless
+    /// double-store it used to be.
+    released: bool,
     _marker: PhantomData<T>,
 }
 
@@ -408,11 +553,11 @@ where
     }
 
     fn unmap(&mut self) {
-        trace!("Unmapping PboMap buffer_id={}", self.handle.buffer_id);
-        if let Err(e) = self.handle.ops.unmap_buffer(self.handle.buffer_id) {
-            log::warn!("Failed to unmap PBO buffer {}: {e}", self.handle.buffer_id);
+        if self.released {
+            return;
         }
-        self.handle.mapped.store(false, Ordering::Release);
+        self.released = true;
+        self.handle.release_map();
     }
 
     fn as_slice(&self) -> &[T] {
@@ -493,15 +638,30 @@ mod tests {
     use super::*;
 
     /// Mock PboOps that uses a Vec<u8> as backing storage instead of GL.
+    ///
+    /// Counts map/unmap calls so tests can assert that N read-only holders
+    /// share ONE GL mapping rather than each taking their own.
     struct MockPboOps {
         storage: Mutex<Vec<u8>>,
+        maps: std::sync::atomic::AtomicUsize,
+        unmaps: std::sync::atomic::AtomicUsize,
     }
 
     impl MockPboOps {
         fn new(size: usize) -> Arc<Self> {
             Arc::new(Self {
                 storage: Mutex::new(vec![0u8; size]),
+                maps: std::sync::atomic::AtomicUsize::new(0),
+                unmaps: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        fn map_count(&self) -> usize {
+            self.maps.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn unmap_count(&self) -> usize {
+            self.unmaps.load(std::sync::atomic::Ordering::Acquire)
         }
     }
 
@@ -509,6 +669,7 @@ mod tests {
     // valid while the Mutex is held (tests are single-threaded).
     unsafe impl PboOps for MockPboOps {
         fn map_buffer(&self, _buffer_id: u32, size: usize) -> Result<PboMapping> {
+            self.maps.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let storage = self.storage.lock().expect("lock");
             assert_eq!(storage.len(), size);
             Ok(PboMapping {
@@ -518,6 +679,8 @@ mod tests {
         }
 
         fn unmap_buffer(&self, _buffer_id: u32) -> Result<()> {
+            self.unmaps
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             Ok(())
         }
 
@@ -557,6 +720,101 @@ mod tests {
         assert!(tensor.is_mapped());
         let result = tensor.map();
         assert!(result.is_err(), "second map while mapped should fail");
+    }
+
+    /// Several read-only holders share ONE GL mapping. This is what lets
+    /// tiled pre-processing run several workers over one source tensor;
+    /// before read sharing, every reader after the first failed.
+    #[test]
+    fn read_maps_share_one_gl_mapping() {
+        let ops = MockPboOps::new(8);
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let tensor = PboTensor::<u8>::from_pbo(9, 8, &[8], None, dyn_ops).unwrap();
+
+        let r1 = tensor.map_read().expect("first read map");
+        let r2 = tensor
+            .map_read()
+            .expect("second read map must share, not fail");
+        let r3 = tensor
+            .map_read()
+            .expect("third read map must share, not fail");
+
+        assert_eq!(ops.map_count(), 1, "one GL mapping serves every reader");
+        assert_eq!(ops.unmap_count(), 0, "nothing unmapped while readers live");
+        assert!(tensor.is_mapped());
+        // All readers address the same bytes.
+        assert_eq!(r1.as_slice(), r2.as_slice());
+        assert_eq!(r2.as_slice(), r3.as_slice());
+
+        drop(r1);
+        drop(r2);
+        assert_eq!(
+            ops.unmap_count(),
+            0,
+            "the mapping outlives every reader but the last"
+        );
+        assert!(tensor.is_mapped());
+
+        drop(r3);
+        assert_eq!(ops.unmap_count(), 1, "last reader out unmaps, exactly once");
+        assert!(!tensor.is_mapped());
+    }
+
+    /// Read sharing must not weaken write exclusion in either direction.
+    #[test]
+    fn writers_and_readers_still_exclude_each_other() {
+        let ops = MockPboOps::new(8);
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let tensor = PboTensor::<u8>::from_pbo(10, 8, &[8], None, dyn_ops).unwrap();
+
+        let reader = tensor.map_read().expect("read map");
+        assert!(
+            tensor.map().is_err(),
+            "a writer must not join an existing reader set"
+        );
+        drop(reader);
+
+        let writer = tensor.map().expect("write map after readers drained");
+        assert!(
+            tensor.map_read().is_err(),
+            "a reader must not join an exclusive writer"
+        );
+        assert!(
+            tensor.map().is_err(),
+            "a second writer must not join an exclusive writer"
+        );
+        drop(writer);
+
+        // Fully released — a fresh map of either kind succeeds again.
+        assert!(tensor.map_read().is_ok());
+    }
+
+    /// `unmap()` is public on the trait and also runs from `Drop`. With
+    /// refcounted readers a double release would unmap a SIBLING reader's
+    /// mapping, so each map must release at most once.
+    #[test]
+    fn explicit_unmap_then_drop_releases_only_once() {
+        let ops = MockPboOps::new(8);
+        let dyn_ops: Arc<dyn PboOps> = ops.clone();
+        let tensor = PboTensor::<u8>::from_pbo(11, 8, &[8], None, dyn_ops).unwrap();
+
+        let keeper = tensor.map_read().expect("reader that must survive");
+        let mut early = tensor.map_read().expect("reader unmapped by hand");
+        early.unmap();
+        drop(early); // Drop must NOT release a second time.
+
+        assert_eq!(
+            ops.unmap_count(),
+            0,
+            "one reader still holds the mapping — it must not be unmapped"
+        );
+        assert!(tensor.is_mapped(), "the surviving reader still holds it");
+        // The survivor's pointer is still valid and readable.
+        assert_eq!(keeper.as_slice().len(), 8);
+
+        drop(keeper);
+        assert_eq!(ops.unmap_count(), 1);
+        assert!(!tensor.is_mapped());
     }
 
     #[test]
