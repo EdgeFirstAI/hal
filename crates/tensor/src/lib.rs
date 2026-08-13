@@ -4701,9 +4701,7 @@ mod dtype_tests {
 
 #[cfg(test)]
 mod image_tests {
-    // fd-lock discipline lives with FD_LOCK in the sibling `tests` module.
     use super::*;
-    use crate::tests::fd_lock_shared;
 
     #[test]
     fn image_shape_per_layout() {
@@ -4793,7 +4791,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_non_aligned_packed_width_pads_zero_copy() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // RGBA u8 at width=4 → 4*4 = 16 bytes/row, not 64-byte aligned. RGBA has
         // a real IOSurface FourCC, so an explicit `Some(TensorMemory::Dma)`
         // request now allocates a padded image IOSurface (64-aligned
@@ -4832,7 +4830,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_rejects_indivisible_pixel_pitch_without_pad_hint() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Width=10 RGB f32 → 120 B/row, not 64-byte aligned, and (Rgb,
         // F32) has no IOSurface mapping so the padded-stride tolerance
         // does not apply. The next 64-multiple (128 B) isn't an integer
@@ -4872,7 +4870,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_packed_rgb_u8_contract() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Packed RGB u8 @Dma is a designed RGBA8888 mapping at
         // (W*3/4, H) — the INT8 NPU input layout, shared with Android.
         // width%4 != 0 cannot form whole texels → loud InvalidArgument…
@@ -4932,7 +4930,7 @@ mod image_tests {
     #[cfg(target_os = "macos")]
     fn image_tensor_dma_planar_f16_alignment() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // PlanarRgb F16 uses single-channel row pitch (width * 2 bytes).
         // Width=16 → 32 bytes/row (not aligned); width=32 → 64 bytes/row (aligned).
         let err = Tensor::<half::f16>::image(
@@ -4978,7 +4976,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_preserves_logical_width() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Skip if DMA not available (e.g. sandboxed CI lacking dma_heap access).
         if !is_dma_available() {
             eprintln!("SKIPPED: DMA heap not available");
@@ -5048,7 +5046,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_rejects_foreign_strided_map() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // A FOREIGN (imported via from_fd) DMA tensor with row_stride set
         // should still refuse CPU mapping — external allocator owns the
         // layout. This protects the V4L2 / GStreamer use case.
@@ -5080,7 +5078,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_map_rejects_tampered_stride() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Round-3 PR feedback (C1): `set_row_stride` is public and only
         // validates `stride >= min_stride`, not that the new stride × height
         // fits the underlying buffer. A caller that tampers with the stride
@@ -5139,7 +5137,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_rejects_too_small_stride() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // 640×480 RGBA8 natural pitch = 2560, request 2400 → should error.
         let err = Tensor::<u8>::image_with_stride(
             640,
@@ -5156,7 +5154,7 @@ mod image_tests {
     #[cfg(target_os = "linux")]
     fn image_tensor_with_stride_rejects_non_packed() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // NV12 is SemiPlanar → not supported. (Linux-only because
         // `TensorMemory::Dma` itself is a Linux-only enum variant.)
         let err = Tensor::<u8>::image_with_stride(
@@ -5416,7 +5414,7 @@ mod cpu_access_tests {
     #[cfg(target_os = "macos")]
     fn iosurface_read_only_lock_roundtrip() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         let Ok(t) = Tensor::<u8>::new(&[64], Some(TensorMemory::Dma), None) else {
             eprintln!("SKIPPED: IOSurface unavailable");
             return;
@@ -5477,7 +5475,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_tensor() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         let shape = vec![1];
         let tensor = DmaTensor::<f32>::new(&shape, Some("dma_tensor"));
         let dma_enabled = tensor.is_ok();
@@ -5529,7 +5527,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_dma_tensor() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         match access(
             "/dev/dma_heap/linux,cma",
             AccessFlags::R_OK | AccessFlags::W_OK,
@@ -5627,7 +5625,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_shm_tensor() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         let shape = vec![2, 3, 4];
         let tensor =
             ShmTensor::<f32>::new(&shape, Some("test_tensor")).expect("Failed to create tensor");
@@ -5857,7 +5855,7 @@ mod tests {
     #[test]
     fn subview_shares_buffer_identity_all_backends() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // u8 has align 1, so every byte offset is valid for the alignment check;
         // this isolates the identity-sharing contract from alignment concerns.
         let assert_shares = |memory: TensorMemory, label: &str| {
@@ -5976,7 +5974,7 @@ mod tests {
     #[cfg(unix)]
     fn shm_subview_partitions_parent_buffer() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Mirrors `mem_subview_partitions_parent_buffer` for Shm: one [2,4] u8
         // parent shared segment (8 bytes); two [1,4] sub-views at byte offsets 0
         // and 4 must share the segment (zero-copy, via cloned fd) and be
@@ -6016,7 +6014,7 @@ mod tests {
     #[cfg(unix)]
     fn shm_subview_rejects_unaligned_and_oob() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         if !crate::is_shm_available() {
             eprintln!("SKIPPED: shm not available");
             return;
@@ -6035,7 +6033,7 @@ mod tests {
     fn dma_subview_matches_mem_subview() {
         // Serialize against the fd-leak tests: this test opens DMA fds (alloc +
         // clone_fd), which would otherwise perturb their fd counts.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Identical sub-view semantics across Dma (shared fd) and Mem (shared
         // Arc): same offsets → same logical windows → same partition.
         let dma = match Tensor::<u8>::new(&[8], Some(TensorMemory::Dma), None) {
@@ -6070,7 +6068,7 @@ mod tests {
         // `row_stride × rows` window zero-copy at the view's offset (the GPU
         // batched-render-to-DMA case). Mirrors
         // `mem_strided_subview_maps_offset_and_byte_size` on a Dma parent.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         let parent = match Tensor::<u8>::new(&[2048], Some(TensorMemory::Dma), None) {
             Ok(t) => t,
             Err(_) => {
@@ -6108,7 +6106,7 @@ mod tests {
         // keys its EGLImage import/pitch on that snapshot (not the view's tight
         // stride), so single-row and multi-row sibling views collapse onto the
         // same parent import.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // 8x4 RGBA with a padded 64-byte row stride (tight row = 8*4 = 32).
         let parent = match Tensor::<u8>::image_with_stride(
             8,
@@ -6293,7 +6291,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_fs_magic_normalizes_sign_extended_values() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Magics whose bit 31 is set. HUGETLBFS is the one that matters
         // most in practice: a MFD_HUGETLB memfd is the likeliest fd to land
         // in the UnknownBufferType arm.
@@ -6338,7 +6336,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_from_fd_dma_imports_as_dma() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         if !is_dma_available() {
             log::warn!("SKIPPED: {} - DMA memory not available", function!());
             return;
@@ -6364,7 +6362,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_from_fd_shm_imports_as_shm() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         if !is_shm_available() {
             log::warn!("SKIPPED: {} - SHM memory not available", function!());
             return;
@@ -6392,7 +6390,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_from_fd_rejects_unknown_filesystem() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
 
         let (read_end, _write_end) = nix::unistd::pipe().unwrap();
 
@@ -6498,7 +6496,7 @@ mod tests {
     #[cfg(feature = "ndarray")]
     #[test]
     fn test_ndarray() {
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         let shape = vec![2, 3, 4];
         let tensor = Tensor::<f32>::new(&shape, None, None).expect("Failed to create tensor");
 
@@ -6858,7 +6856,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn configure_image_preserves_iosurface_physical_stride() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         // Pool: GREY/R8 IOSurface 100 wide → bytesPerRow padded to 128.
         let mut pool = Tensor::<u8>::image(
             100,
@@ -6954,7 +6952,7 @@ mod tests {
     #[cfg(unix)]
     fn test_shm_available_and_usable() {
         // Declares this test as an fd-opener; see FD_LOCK.
-        let _lock = fd_lock_shared();
+        let _lock = crate::tests::fd_lock_shared();
         assert!(
             is_shm_available(),
             "SHM memory allocation should be available on Unix systems"
