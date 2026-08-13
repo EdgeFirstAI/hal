@@ -250,6 +250,14 @@ pub fn peak_rss_mb() -> f64 {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Darwin reports ru_maxrss in bytes (Linux uses kilobytes).
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            return ru.ru_maxrss as f64 / (1024.0 * 1024.0);
+        }
+    }
     0.0
 }
 

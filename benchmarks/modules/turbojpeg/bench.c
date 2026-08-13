@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -82,6 +83,13 @@ static const char *tj_err(void) { return tj.error ? tj.error() : "(no tjGetError
  * only the versioned one. */
 static void tj_load(void) {
     static const char *candidates[] = {
+#ifdef __APPLE__
+        "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+        "/opt/homebrew/lib/libturbojpeg.dylib",
+        "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+        "libturbojpeg.dylib",
+        "libturbojpeg.0.dylib",
+#endif
         "libturbojpeg.so.0",
         "libturbojpeg.so",
         "libturbojpeg.so.0.2.0",
@@ -133,8 +141,13 @@ static double percentile(const double *sorted, size_t n, double p) {
     return sorted[idx];
 }
 
-/* VmHWM, matching peak_rss_mb(). */
+/* Peak RSS, matching peak_rss_mb(). Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
 static double peak_rss_mb(void) {
+#ifdef __APPLE__
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+    return (double)ru.ru_maxrss / (1024.0 * 1024.0);
+#else
     FILE *f = fopen("/proc/self/status", "r");
     if (!f) return 0.0;
     char line[256];
@@ -148,6 +161,7 @@ static double peak_rss_mb(void) {
     }
     fclose(f);
     return mb;
+#endif
 }
 
 /* Process CPU time over the run; the decode loop is single-threaded, so this
