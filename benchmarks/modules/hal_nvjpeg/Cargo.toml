@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "hal_v4l2_gl"
+name = "hal_nvjpeg"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "HAL V4L2 JPEG (mxc-jpeg) + HAL GL letterbox (plan W2, i.MX 95)"
+description = "HAL nvJPEG GPU decode arm (Jetson Orin; hardware-decode table)"
 
 [[bin]]
-name = "hal_v4l2_gl"
+name = "hal_nvjpeg"
 path = "src/main.rs"
 
 [dependencies]

@@ -16,6 +16,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
-zune-jpeg = "0.5.15"
+# SIMD features listed explicitly, not left to defaults: zune-jpeg 0.5.15
+# defaults to ["x86", "neon", "std"], but the published A/B depends on the
+# comparator running its best SIMD path on every arch, so a future upstream
+# default change must not be able to silently drop `neon` (NEON IDCT,
+# color-convert, and upsampling kernels on aarch64) or `x86` (AVX2/SSE).
+zune-jpeg = { version = "0.5.15", features = ["x86", "neon", "std"] }
 zune-core = "0.5"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+libc = "0.2"

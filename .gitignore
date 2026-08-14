@@ -45,6 +45,8 @@ env.sh
 !/benchmarks/results/.gitkeep
 /benchmarks/**/target/
 /benchmarks/modules/turbojpeg/build/
+/benchmarks/modules/stb/build/
+/benchmarks/modules/wuffs/build/
 /benchmarks/imx*/
 /benchmarks/rpi*/
 /benchmarks/x86*/

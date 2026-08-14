@@ -421,3 +421,18 @@ fn v4l2_zero_copy_dma_nv12() {
     let reference = decode(&jpeg, w, h, PixelFormat::Nv12, false);
     assert_close(&reference, &zc, "zero-copy-dma");
 }
+
+/// The public probe backing the hardware benchmark arms' fail-fast guards.
+/// Not device-gated: it must answer (not panic) with or without a decoder
+/// device, and the `EDGEFIRST_DISABLE_V4L2` opt-out must force `false` even
+/// when one is present. (This file is Linux-gated; off-Linux the function is
+/// compile-time `false`.)
+#[test]
+fn v4l2_available_probe_honours_disable_env() {
+    // Safety of env mutation: the workspace mandates --test-threads=1.
+    std::env::set_var("EDGEFIRST_DISABLE_V4L2", "1");
+    assert!(!edgefirst_codec::v4l2_available());
+    std::env::remove_var("EDGEFIRST_DISABLE_V4L2");
+    // Un-gated result is platform-dependent; just require it to answer.
+    let _present: bool = edgefirst_codec::v4l2_available();
+}

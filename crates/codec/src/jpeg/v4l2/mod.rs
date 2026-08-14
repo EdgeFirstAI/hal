@@ -94,6 +94,13 @@ enum DecodeErr {
     Fatal(CodecError),
 }
 
+/// One-shot availability probe: opens and drops the first working decoder
+/// device. Backs the crate-level `v4l2_available()`; the decode path keeps its
+/// own lazy [`V4l2Probe`] and is unaffected (V4L2 nodes are multi-open).
+pub(crate) fn device_available() -> bool {
+    device::probe().is_some()
+}
+
 /// Lazily-probed V4L2 backend state, stored on the reusable decoder state so
 /// the device is probed at most once and the context is reused across decodes.
 //

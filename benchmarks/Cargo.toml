@@ -14,6 +14,8 @@ members = [
     "modules/hal_gl",
     "modules/hal_g2d",
     "modules/hal_v4l2_gl",
+    "modules/hal_nvjpeg",
+    "modules/hal_v4l2_cpu",
 ]
 
 [workspace.package]

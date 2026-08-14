@@ -11,8 +11,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use edgefirst_codec::{peek_info, ImageDecoder, ImageLoad};
 use edgefirst_image::{
-    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait,
-    Region, Rotation,
+    ComputeBackend, Crop, Flip, ImageProcessor, ImageProcessorConfig, ImageProcessorTrait, Region,
+    Rotation,
 };
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, TensorDyn, TensorMemory};
 use std::fs::{self, File};
@@ -87,6 +87,19 @@ pub struct BenchArgs {
     /// Model-input preprocessing is out of scope for this mode.
     #[arg(long, env = "EDGEFIRST_BENCH_DECODE_ONLY", default_value_t = false)]
     pub decode_only: bool,
+
+    /// Convert to full-resolution RGB instead of the 640×640 letterbox:
+    /// decode → NV*/GREY → same-size RGB, a pure colour-conversion second
+    /// pass with no scaling.
+    ///
+    /// For the hardware-decode table's "full cost to RGB" rows: hardware
+    /// JPEG blocks that emit only their stream's native YUV layout (e.g.
+    /// i.MX mxc-jpeg) need this pass before an RGB consumer can use the
+    /// pixels, while NV12-native consumers stop at `--decode-only`. The
+    /// per-frame decode/convert split is reported so both costs publish
+    /// from one run. Ignored when `--decode-only` is set.
+    #[arg(long, default_value_t = false)]
+    pub full_res_convert: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -183,9 +196,7 @@ pub fn list_jpegs(dir: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>> {
     if let Some(n) = limit {
         if n > 0 && n < paths.len() {
             let len = paths.len();
-            paths = (0..n)
-                .map(|i| paths[i * len / n].clone())
-                .collect();
+            paths = (0..n).map(|i| paths[i * len / n].clone()).collect();
         } else if n > 0 {
             paths.truncate(n);
         }
@@ -202,8 +213,27 @@ pub struct TimingStats {
     pub ms_p50: f64,
     pub ms_p95: f64,
     pub ms_p99: f64,
+    pub ms_mean: f64,
+    /// ~95% confidence interval for the median (nonparametric, order-statistic
+    /// ranks n/2 ∓ 1.96·√n/2 — no distribution assumption on the samples).
+    pub ms_p50_ci_lo: f64,
+    pub ms_p50_ci_hi: f64,
     pub mpix_per_s: f64,
     pub peak_rss_mb: f64,
+}
+
+/// 0-based sorted-sample indices bounding the ~95% CI for the median
+/// (normal approximation to the binomial: 1-based ranks
+/// ⌊n/2 − 1.96·√n/2⌋ and ⌈n/2 + 1 + 1.96·√n/2⌉, clamped to [1, n]).
+pub fn median_ci_indices(n: usize) -> (usize, usize) {
+    if n == 0 {
+        return (0, 0);
+    }
+    let nf = n as f64;
+    let half_width = 0.98 * nf.sqrt(); // 1.96·√n / 2
+    let lo_rank = (nf / 2.0 - half_width).floor().max(1.0);
+    let hi_rank = (nf / 2.0 + 1.0 + half_width).ceil().min(nf);
+    (lo_rank as usize - 1, hi_rank as usize - 1)
 }
 
 impl TimingStats {
@@ -223,11 +253,16 @@ impl TimingStats {
         } else {
             0.0
         };
+        let ms_mean = if n > 0 { sum_ms / n as f64 } else { 0.0 };
+        let (ci_lo, ci_hi) = median_ci_indices(n);
         Self {
             n,
             ms_p50: pct(0.50),
             ms_p95: pct(0.95),
             ms_p99: pct(0.99),
+            ms_mean,
+            ms_p50_ci_lo: if n > 0 { samples_ms[ci_lo] } else { 0.0 },
+            ms_p50_ci_hi: if n > 0 { samples_ms[ci_hi] } else { 0.0 },
             mpix_per_s,
             peak_rss_mb: peak_rss_mb(),
         }
@@ -276,15 +311,19 @@ pub fn write_summary_csv(
     let mut f = File::create(path).with_context(|| format!("create {}", path.display()))?;
     writeln!(
         f,
-        "board,class,module,ms_p50,ms_p95,ms_p99,mpix_per_s,peak_rss_mb,\
+        "board,class,module,ms_p50,ms_p95,ms_p99,ms_mean,ms_p50_ci_lo,ms_p50_ci_hi,\
+         mpix_per_s,peak_rss_mb,\
          cpu_pct_process,cpu_pct_system,cpu_pct_peak_core,n_images,notes"
     )?;
     writeln!(
         f,
-        "{board},{class},{module},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{},{}",
+        "{board},{class},{module},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{},{}",
         stats.ms_p50,
         stats.ms_p95,
         stats.ms_p99,
+        stats.ms_mean,
+        stats.ms_p50_ci_lo,
+        stats.ms_p50_ci_hi,
         stats.mpix_per_s,
         stats.peak_rss_mb,
         cpu.process_pct,
@@ -366,10 +405,12 @@ fn resolve_src_memory(cfg: &HalModuleConfig, args: &BenchArgs) -> Option<TensorM
     }
 }
 
-/// Letterbox crop; when the decoded image is smaller than the pooled tensor,
-/// pin `source` so the GPU samples only the live sub-rect (profiler pattern).
-fn letterbox_crop(info_w: usize, info_h: usize, tensor: &TensorDyn) -> Crop {
-    let mut crop = Crop::letterbox(LETTERBOX_PAD);
+/// Finish a per-frame crop: when the decoded image is smaller than the pooled
+/// tensor, pin `source` so the GPU samples only the live sub-rect (profiler
+/// pattern). `base` carries the fit — letterbox for the model-input pipeline,
+/// `Crop::no_crop()` for the full-resolution colour-conversion pass.
+fn frame_crop(base: Crop, info_w: usize, info_h: usize, tensor: &TensorDyn) -> Crop {
+    let mut crop = base;
     let shape = tensor.shape();
     let tensor_h = shape.first().copied().unwrap_or(0);
     let tensor_w = shape.get(1).copied().unwrap_or(0);
@@ -377,6 +418,37 @@ fn letterbox_crop(info_w: usize, info_h: usize, tensor: &TensorDyn) -> Crop {
         crop.source = Some(Region::new(0, 0, info_w, info_h));
     }
     crop
+}
+
+/// Per-frame convert setup: build the crop and, in full-res mode, reconfigure
+/// the pooled destination to this frame's dimensions so the convert is a pure
+/// NV*/GREY→RGB colour conversion (no scaling). The pool is sized for the
+/// largest frame, so `configure_image` only moves logical dims — a realloc
+/// would show up as `identity_churn`. Note the GL backend still re-imports an
+/// EGLImage per *distinct* configured geometry (cached per size; required for
+/// correct pitch), so on varying-size corpora the GL convert leg carries real
+/// per-new-size import cost that is measured convert work, not allocation
+/// churn — see BENCHMARKS.md § Hardware decoders.
+fn prepare_convert(
+    args: &BenchArgs,
+    info_w: usize,
+    info_h: usize,
+    input: &TensorDyn,
+    output: &mut TensorDyn,
+) -> Result<Crop> {
+    if args.full_res_convert {
+        output
+            .configure_image(info_w, info_h, PixelFormat::Rgb)
+            .context("configure full-res RGB dst")?;
+        Ok(frame_crop(Crop::no_crop(), info_w, info_h, input))
+    } else {
+        Ok(frame_crop(
+            Crop::letterbox(LETTERBOX_PAD),
+            info_w,
+            info_h,
+            input,
+        ))
+    }
 }
 
 /// HAL JPEG latency sweep: decode → optional letterbox convert.
@@ -398,8 +470,9 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match edgefirst_hal::trace::start_tracing(path.to_str().unwrap_or("/tmp/hal-bench-trace.json"))
-        {
+        match edgefirst_hal::trace::start_tracing(
+            path.to_str().unwrap_or("/tmp/hal-bench-trace.json"),
+        ) {
             Ok(()) => {
                 tracing_active = true;
                 eprintln!("  chrome trace → {}", path.display());
@@ -412,6 +485,8 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
     let paths = list_jpegs(&coco, args.effective_limit())?;
     let scope = if args.decode_only {
         "decode-only"
+    } else if args.full_res_convert {
+        "decode+fullres-rgb"
     } else {
         "decode+letterbox"
     };
@@ -439,7 +514,10 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
             bytes,
         ));
     }
-    eprintln!("  max source: {max_w}×{max_h}  (preloaded {} JPEGs)", images.len());
+    eprintln!(
+        "  max source: {max_w}×{max_h}  (preloaded {} JPEGs)",
+        images.len()
+    );
 
     let src_memory = resolve_src_memory(&cfg, args);
     // Keep dst on the same policy for CPU modules; GPU modules keep auto (DMA).
@@ -454,10 +532,17 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
     let mut output = if args.decode_only {
         None
     } else {
+        // Full-res mode pools the dst at the largest source dims (reconfigured
+        // per frame); letterbox mode keeps the fixed model-input shape.
+        let (out_w, out_h) = if args.full_res_convert {
+            (max_w.next_multiple_of(2), max_h)
+        } else {
+            (MODEL_W, MODEL_H)
+        };
         Some(
             proc.create_image(
-                MODEL_W,
-                MODEL_H,
+                out_w,
+                out_h,
                 PixelFormat::Rgb,
                 DType::U8,
                 dst_memory,
@@ -477,7 +562,10 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
     let pool_h = max_h * 3;
     let src_cap = pool_w * pool_h; // Grey R8 bytes (= element count)
     let src_id0 = input.buffer_identity().id();
-    let dst_id0 = output.as_ref().map(|o| o.buffer_identity().id()).unwrap_or(0);
+    let dst_id0 = output
+        .as_ref()
+        .map(|o| o.buffer_identity().id())
+        .unwrap_or(0);
     eprintln!(
         "  pool: Grey R8  {pool_w}×{pool_h}  capacity≈{src_cap} B  src_mem={src_mem}  dst_mem={dst_mem}  src_id={src_id0}  dst_id={dst_id0}  tensor_mem={:?}",
         args.tensor_mem
@@ -537,7 +625,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
             .load_image(&mut decoder, first)
             .context("warmup decode")?;
         if let Some(output) = output.as_mut() {
-            let crop = letterbox_crop(info.width, info.height, &input);
+            let crop = prepare_convert(args, info.width, info.height, &input, output)?;
             convert_one(
                 &mut proc,
                 &mut cpu_fallback,
@@ -566,7 +654,7 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
             .with_context(|| format!("decode {name}"))?;
         let t1 = Instant::now();
         let t2 = if let Some(output) = output.as_mut() {
-            let crop = letterbox_crop(info.width, info.height, &input);
+            let crop = prepare_convert(args, info.width, info.height, &input, output)?;
             convert_one(
                 &mut proc,
                 &mut cpu_fallback,
@@ -627,18 +715,20 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
     let stats = TimingStats::from_samples(&mut samples_ms, total_mpix);
     decode_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     convert_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let dec_p50 = decode_ms
-        .get(decode_ms.len() / 2)
-        .copied()
-        .unwrap_or(0.0);
-    let cvt_p50 = convert_ms
-        .get(convert_ms.len() / 2)
-        .copied()
-        .unwrap_or(0.0);
+    let dec_p50 = decode_ms.get(decode_ms.len() / 2).copied().unwrap_or(0.0);
+    let cvt_p50 = convert_ms.get(convert_ms.len() / 2).copied().unwrap_or(0.0);
 
     eprintln!(
-        "  p50={:.3} ms  (decode_p50={:.3} convert_p50={:.3})  p95={:.3}  p99={:.3}  {:.1} MP/s",
-        stats.ms_p50, dec_p50, cvt_p50, stats.ms_p95, stats.ms_p99, stats.mpix_per_s
+        "  p50={:.3} ms  ci95=[{:.3},{:.3}]  mean={:.3}  (decode_p50={:.3} convert_p50={:.3})  p95={:.3}  p99={:.3}  {:.1} MP/s",
+        stats.ms_p50,
+        stats.ms_p50_ci_lo,
+        stats.ms_p50_ci_hi,
+        stats.ms_mean,
+        dec_p50,
+        cvt_p50,
+        stats.ms_p95,
+        stats.ms_p99,
+        stats.mpix_per_s
     );
     eprintln!(
         "  cpu: process={:.1}%  system={:.1}%  peak_core={:.1}%  fallback_frames={cpu_fallback_frames}",
@@ -649,13 +739,15 @@ pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingSt
         stats.n
     );
     if identity_churn > 0 {
-        eprintln!(
-            "  WARNING: BufferIdentity changed during the hot loop — pool reuse is broken"
-        );
+        eprintln!("  WARNING: BufferIdentity changed during the hot loop — pool reuse is broken");
     }
 
     let module_name = args.module.as_deref().unwrap_or(cfg.module);
-    let csv_class = if args.decode_only { "decode" } else { cfg.class };
+    let csv_class = if args.decode_only {
+        "decode"
+    } else {
+        cfg.class
+    };
     if let Some(csv) = &args.csv {
         write_summary_csv(
             csv,

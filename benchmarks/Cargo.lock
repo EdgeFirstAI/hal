@@ -837,12 +837,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "hal_nvjpeg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "edgefirst-bench-common",
+ "edgefirst-codec",
+]
+
+[[package]]
+name = "hal_v4l2_cpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "edgefirst-bench-common",
+ "edgefirst-codec",
+]
+
+[[package]]
 name = "hal_v4l2_gl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "edgefirst-bench-common",
+ "edgefirst-codec",
 ]
 
 [[package]]
@@ -1643,6 +1664,7 @@ dependencies = [
  "anyhow",
  "clap",
  "image",
+ "libc",
  "zune-core",
  "zune-jpeg",
 ]

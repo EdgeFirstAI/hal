@@ -857,6 +857,13 @@ See [README.md § Benchmarking](../README.md#benchmarking) for full instructions
 | `decoder_benchmark` | `edgefirst-decoder` | YOLO post-processing, NMS, dequantization |
 | `opencv_benchmark` | `edgefirst-image` | Cross-library comparison (requires `--features opencv`) |
 
+The standalone `benchmarks/` workspace (excluded from the root workspace and CI
+triggers) carries the JPEG decoder A/B harness: `hal_cpu`, `rust_jpeg`
+(zune/image), `turbojpeg_bench`, `stb_bench`, `wuffs_bench`, plus the hardware
+arms `hal_v4l2_gl`, `hal_v4l2_cpu`, `hal_nvjpeg` and the `hal_gl`/`hal_g2d`
+pipeline arms — see `benchmarks/README.md` for the module map, protocol rules,
+and corpus tooling.
+
 **Key env vars:** `EDGEFIRST_FORCE_BACKEND={cpu,opengl,g2d}`, `EDGEFIRST_FORCE_TRANSFER=pbo`
 
 **JSON convention:** `benchmarks/<platform>/<name>.json` (platforms: `imx8mp-frdm`, `imx95-frdm`, `rpi5-hailo`, `x86-desktop`)

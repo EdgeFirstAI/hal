@@ -1,7 +1,7 @@
 # EdgeFirst HAL - Benchmarks
 
-**Version:** 3.10
-**Last Updated:** June 16, 2026
+**Version:** 3.11
+**Last Updated:** August 13, 2026
 **Status:** 0.25.0 release refresh. The full bench matrix was re-collected on the 0.25.0
 converged-GL-engine code across imx8mp-frdm (Vivante GC7000UL + G2D), imx95-frdm
 (Mali-G310 + DPU-G2D), rpi5-hailo (V3D 7.1), and jetson-orin-nano (NVIDIA Tegra Orin,
@@ -367,7 +367,7 @@ JSON files are collected in `benchmarks/<platform>/` and processed by `.github/s
 
 **Scope:** JPEG bytes → decoded raster in memory. Letterbox / model-input
 preprocessing (`ImageProcessor::convert()`) is a separate measurement and is not
-included here. Six arms:
+included here. Eight arms:
 
 | Arm | Command |
 |-----|---------|
@@ -375,22 +375,44 @@ included here. Six arms:
 | **EdgeFirst `fast`** | same, `EDGEFIRST_CODEC_DCT=fast` — opt-in AAN `ifast`-class IDCT (`DctMethod::Fast`) |
 | **Turbo `islow`** | `turbojpeg_bench --dct accurate` — libjpeg-turbo's default IDCT |
 | **Turbo `ifast`** | `turbojpeg_bench --dct fast` |
-| **zune-jpeg** | `rust_jpeg --engine zune` — YCbCr out on the YUV arm, RGB on the RGB arm |
-| **image crate** | `rust_jpeg --engine image` — `load_from_memory` + `to_rgb8` (allocates per call; RGB only, its API exposes no raw-YUV output) |
+| **zune-jpeg** | `rust_jpeg --engine zune` — YCbCr out on the YUV arm, RGB on the RGB arm; built with its `x86` **and `neon`** SIMD features (both default-on in zune-jpeg 0.5.15, pinned explicitly in the harness), so its NEON IDCT / colour-convert / upsampling kernels are active on the ARM boards |
+| **image crate** | `rust_jpeg --engine image` — **zune-jpeg behind the `image` 0.25 wrapper**, not an independent decoder: `load_from_memory` + `to_rgb8` (allocates per call; RGB only, its API exposes no raw-YUV output). Its row measures the wrapper's per-call allocation and colour handling on top of zune |
+| **stb_image** | `stb_bench` — v2.30 single-header baseline (public domain/MIT); fixed accurate-class IDCT with SSE2 (auto) / NEON (enabled) SIMD; RGB only, allocates per call (its API has no decode-into). Pixel parity vs djpeg accurate: max abs diff 3, mean ≤0.07 |
+| **Wuffs** | `wuffs_bench` — Google's memory-safe decoder, v0.4.0-alpha.10 transpiled C (Apache-2.0); single fixed IDCT, **bit-exact** vs djpeg accurate (max abs diff 0 on every parity sample); RGB only (3-byte, via its swizzler), high-water buffer reuse |
 
 The YUV arm stops after decode into a YUV layout with no RGB colour step
 (EdgeFirst `--decode-fmt native` NV12/16/24, turbo `tjDecompressToYUV2`
 planar, zune interleaved YCbCr); the RGB arm decodes to interleaved RGB
-(EdgeFirst's fused MCU write, `TJPF_RGB`, zune/image RGB). COCO `val2017`
+(EdgeFirst's fused MCU write, `TJPF_RGB`, zune/image RGB). The YUV output
+layouts are the right conceptual comparison — every arm stops in YCbCr —
+but they are not byte-identical: turbo writes fully-planar, row-padded
+Y/Cb/Cr planes while EdgeFirst writes semi-planar NV formats, so the write
+patterns differ even though neither pays a colour conversion. COCO `val2017`
 is 4:4:4, so the fused RGB write engages. zune's YUV arm skips COCO's few
 greyscale images (its Luma→YCbCr mapping is unimplemented); the other arms
 decode them.
 
-All arms are native binaries — `hal_cpu` / `rust_jpeg` (Rust) and
-`modules/turbojpeg/bench.c` (C) — measured by harnesses that agree on image
-selection, preload before timing, `CLOCK_MONOTONIC` around decode alone,
-percentile index and MP/s. A Python driver on one side only would put
-interpreter dispatch and FFI marshalling inside the timed region.
+All arms are native binaries — `hal_cpu` / `rust_jpeg` (Rust) and the C
+arms `modules/turbojpeg/bench.c`, `stb_bench`, and `wuffs_bench` (the
+latter two built on the shared `modules/cbench/cbench.h` harness header) —
+measured by harnesses that agree on image selection, preload before timing,
+`CLOCK_MONOTONIC` around decode alone, percentile index, median-CI ranks,
+and MP/s. A Python driver on one side only would put interpreter dispatch
+and FFI marshalling inside the timed region.
+
+Buffer policy is matched wherever each API allows it: EdgeFirst decodes into
+a reused tensor pool, turbo into a reused high-water output buffer, and zune
+via `decode_into` into a reused buffer — no arm pays a steady-state
+allocation per frame. The `image` arm allocates per call by design; that is
+the wrapper overhead its row exists to show. Every arm decodes
+single-threaded on one pinned core (zune-jpeg itself is single-threaded —
+the multi-core post-processing zune-image advertises is not in play),
+matching libjpeg-turbo's one-thread-per-image model, and timing stops at the
+decoded raster, the same decode-only convention `tjbench` uses. mozjpeg has
+no row because its decoder *is* libjpeg-turbo's (it is an encoder-focused
+fork); Intel IPP has no row because Intel discontinued its JPEG codec sample
+(UIC), leaving no supported IPP JPEG decoder to benchmark short of
+hand-assembling one from primitives.
 
 **On the IDCT accuracy classes.** libjpeg-turbo decompresses with either the
 accurate `islow` IDCT or the faster, lower-accuracy `ifast` one; **`islow` is
@@ -398,57 +420,275 @@ its default**, and it is the kernel EdgeFirst's default implements, so
 EdgeFirst↔`islow` is the like-for-like comparison and the one claims should
 quote. EdgeFirst's opt-in `fast` mode is the same trade turbo's `ifast`
 makes, so `fast`↔`ifast` is the like-for-like comparison within the fast
-class. Measured on 1000 COCO images (`dct_compare`), EdgeFirst `fast` vs the
-default kernel: cosine similarity mean 0.99998 / worst 0.99985, PSNR mean
-51.4 dB / worst 42.1 dB, max pixel delta 24. mAP impact is not yet measured;
-`fast` stays opt-in.
+class. The measured `islow`↔`ifast` gaps (5–11%) sit inside libjpeg-turbo's
+own documented range — its `doc/libjpeg.txt` puts `ifast` "generally about
+5-15% faster" than `islow` on non-AVX2 CPUs and "similar" on AVX2, and its
+3.0 ChangeLog calls the fast algorithms "a legacy feature" — so a reader
+remembering a larger historical `ifast` advantage is remembering older
+hardware. Measured on 1000 COCO images (`dct_compare`), EdgeFirst `fast` vs
+the default kernel: cosine similarity mean 0.99998 / worst 0.99985, PSNR
+mean 51.4 dB / worst 42.1 dB, max pixel delta 24. mAP impact is not yet
+measured; `fast` stays opt-in.
 
-Interleaved best-of-3 in a single session per host with all arms alternating,
-pinned to one core, n=200 (`decode-ab-sweep.sh`, `CARGO_PROFILE=release`, no
-perf/trace). Captured 2026-08-13: register-cached bit cursor, fast-AC
-terminator baking, entropy-derived IDCT tiers, paired-coefficient probe (High
-tier), dedicated 4:4:4 MCU loop, SSE4.1 fused-RGB block kernel. The orin-nano
-row was captured on the fallback unit (`adis-uav1`, Orin Nano Super devkit) —
-its turbo baseline matches the prior orin-nano capture within 0.1%, so the
-rows are comparable. x86-desktop is `sebstation` (same i9-11900K host as the
-prior x86 captures).
+Re-captured 2026-08-13 under the updated protocol (`decode-ab-sweep.sh`,
+`CARGO_PROFILE=release`, no perf/trace): three interleaved rounds per host
+with all arms alternating inside each round, pinned to one core, n=200 drawn
+evenly spaced across the corpus by **every** arm; the quoted number is the
+**median across rounds' p50s**, with each round's p50, the min–max spread,
+the mean, and a nonparametric 95% CI on the median recorded in the run
+outputs, and per-host build/run `provenance.txt` (toolchains, comparator
+library path/version, governor, clocks) written next to them. Decoder state:
+register-cached bit cursor, fast-AC terminator baking, entropy-derived IDCT
+tiers, paired-coefficient probe (High tier), dedicated 4:4:4 MCU loop,
+SSE4.1 fused-RGB block kernel. The orin-nano row was captured on the
+fallback unit (`adis-uav1`, Orin Nano Super devkit; the prior capture
+established its turbo baseline matches orin-nano within 0.1%). x86-desktop
+is `sebstation` (same i9-11900K host as prior x86 captures). Round spreads
+were below 1% for nearly every cell; no run failed.
 
 All numbers are p50 ms; lower is better. **Bold** marks the fastest arm in
 each accuracy class (accurate: EdgeFirst vs turbo `islow`; fast: EdgeFirst
 `fast` vs turbo `ifast`).
 
-| Board | Core | Arm | EdgeFirst | EF `fast` | Turbo `islow` | Turbo `ifast` | zune-jpeg | image |
-|-------|------|-----|-----------|-----------|---------------|---------------|-----------|-------|
-| rpi5-hailo | A76 | YUV | **2.392** | **2.100** | 3.156 | 2.889 | 3.973 | — |
-| | | RGB | **2.604** | **2.298** | 3.361 | 3.110 | 4.237 | 4.709 |
-| orin-nano | A78AE | YUV | **3.664** | **3.130** | 5.137 | 4.612 | 6.131 | — |
-| | | RGB | **3.991** | **3.437** | 5.481 | 4.960 | 6.554 | 8.050 |
-| x86-desktop | Rocket Lake i9-11900K | YUV | **1.207** | 1.212 | 1.437 | 1.358 | 1.810 | — |
-| | | RGB | **1.300** | 1.294 | 1.490 | 1.418 | 1.822 | 1.919 |
-| imx95-pro | A55 | YUV | **6.067** | **5.310** | 7.031 | 6.562 | 11.150 | — |
-| | | RGB | **6.385** | **5.669** | 7.507 | 7.044 | 11.656 | 12.129 |
-| imx8mp-frdm | A53 | YUV | **6.729** | **5.963** | 7.620 | 6.927 | 12.378 | — |
-| | | RGB | **7.079** | **6.340** | 7.945 | 7.332 | 12.980 | 13.722 |
+| Board | Core | Arm | EdgeFirst | EF `fast` | Turbo `islow` | Turbo `ifast` | zune-jpeg | image | stb | Wuffs |
+|-------|------|-----|-----------|-----------|---------------|---------------|-----------|-------|-----|-------|
+| rpi5-hailo | A76 | YUV | **2.372** | **2.072** | 3.173 | 2.900 | 4.115 | — | — | — |
+| | | RGB | **2.574** | **2.263** | 3.356 | 3.110 | 4.411 | 4.939 | 5.423 | 7.312 |
+| orin-nano | A78AE | YUV | **3.719** | **3.178** | 5.144 | 4.627 | 6.404 | — | — | — |
+| | | RGB | **4.012** | **3.461** | 5.491 | 4.984 | 6.834 | 8.385 | 7.859 | 9.884 |
+| x86-desktop | Rocket Lake i9-11900K | YUV | **1.222** | 1.221 | 1.433 | 1.364 | 1.911 | — | — | — |
+| | | RGB | **1.323** | 1.321 | 1.504 | 1.432 | 1.932 | 2.041 | 2.511 | 2.726 |
+| imx95-pro | A55 | YUV | **6.032** | **5.270** | 7.044 | 6.576 | 11.457 | — | — | — |
+| | | RGB | **6.340** | **5.601** | 7.558 | 7.057 | 12.006 | 12.986 | 13.206 | 21.389 |
+| imx8mp-frdm | A53 | YUV | **6.745** | **5.941** | 7.747 | 6.954 | 13.504 | — | — | — |
+| | | RGB | **7.073** | **6.359** | 7.934 | 7.305 | 13.878 | 14.607 | 14.890 | 23.266 |
 
-- **EdgeFirst's accurate default beats turbo's `islow` everywhere** — +11.7%
-  / +10.9% on the A53, +13.7% / +14.9% on the A55, +24.2% / +22.5% on the
-  A76, +28.7% / +27.2% on the A78AE, +16.0% / +12.8% on Rocket Lake — and it
-  also beats turbo's **`ifast`** on every platform (+2.9% A53 … +20.6%
+- **EdgeFirst's accurate default beats turbo's `islow` everywhere** — +12.9%
+  / +10.9% on the A53, +14.4% / +16.1% on the A55, +25.2% / +23.3% on the
+  A76, +27.7% / +26.9% on the A78AE, +14.7% / +12.0% on Rocket Lake — and it
+  also beats turbo's **`ifast`** on every platform (+3.0% A53 … +19.6%
   A78AE) while producing `islow`-class pixels.
-- **The opt-in `fast` mode extends the lead within the fast class**: +13.9%
-  / +13.5% over `ifast` on the A53, +19.1% / +19.5% on the A55, +27.3% /
-  +26.1% on the A76, +32.1% / +30.7% on the A78AE. On x86 there is no fast
+- **The opt-in `fast` mode extends the lead within the fast class**: +14.6%
+  / +12.9% over `ifast` on the A53, +19.9% / +20.6% on the A55, +28.6% /
+  +27.2% on the A76, +31.3% / +30.6% on the A78AE. On x86 there is no fast
   kernel yet — the option is advisory and runs the accurate path (the
   `fast` and default rows measure the same code there).
-- **Against the Rust ecosystem**, EdgeFirst is 1.5× faster than zune-jpeg
-  on Rocket Lake, 1.7× on the A76/A78AE, and 1.8–1.9× on the in-order
-  A53/A55 (zune has no strong in-order tuning); the image crate (zune-jpeg
-  internally, plus a per-call allocation and RGB conversion) trails
-  further.
-- COCO val2017 contains no restart-interval (DRI) files (1000 checked), so
-  turbo's fast Huffman path — which its own ChangeLog documents as disabled
-  for DRI streams at a ~20% cost — ran for the whole corpus. On DRI camera
-  streams EdgeFirst's lead grows: its fast entropy path handles restarts.
+- **Against the Rust ecosystem**, EdgeFirst is 1.6× faster than zune-jpeg
+  on Rocket Lake, 1.7× on the A76/A78AE, and 1.9–2.0× on the in-order
+  A55/A53 — and the ARM rows are measured against zune's **NEON build**
+  (its `neon` feature, default-on in 0.5.15, gates real NEON IDCT,
+  colour-convert, and upsampling kernels), so the widening in-order gap is
+  scheduling and tuning, not a scalar-vs-SIMD artifact. The image crate
+  (zune-jpeg internally, plus a per-call allocation and RGB conversion)
+  trails further.
+- **stb_image and Wuffs are the floor, as expected**: stb runs 1.9–2.1×
+  behind EdgeFirst's RGB arm across hosts, and Wuffs 2.1× (x86) to 3.4×
+  (A55), its memory-safety cost growing with core simplicity and image
+  size. Both decode correctly — Wuffs bit-exactly matches the accurate
+  reference and stb sits within ±3 LSB (see the arm table) — so their rows
+  are like-for-like within the accurate class.
+- **The DRI (restart-marker) claim is now measured, not asserted.** COCO
+  val2017 itself has zero DRI files (all 5000 checked with
+  `corpus_stats.py`: 4990 baseline 4:4:4, 10 greyscale, none progressive),
+  so `make-dri-corpus.sh` re-serialised it **losslessly** (`jpegtran
+  -restart 1` — identical DCT coefficients, only restart markers added).
+  On that corpus turbo `islow` pays +5.4% (x86), +10.4% (A76), +11.7%
+  (A78AE), +15.6% (A55), +15.7% (A53) — approaching the ≤20% its own README
+  documents for the disabled fast-Huffman path — while EdgeFirst pays
+  ≤1.1% on every host. EdgeFirst's accurate-class lead therefore grows on
+  restart-carrying camera streams: to +18.2% on x86, +31.6% on the A76,
+  +34.8% on the A78AE, +25.6% on the A55, +24.8% on the A53.
+
+### Control corpora
+
+The same eight-arm sweep ran over five control corpora (see
+`benchmarks/README.md` § Corpora for recipes and licensing; per-run
+summaries, CIs, and provenance live under
+`benchmarks/results/<board>/decode-ab-sweep/<corpus>/` from the capture):
+`val2017-yuv420` (the same 5000 images transcoded to 4:2:0), `val2017-dri`
+(lossless restart-marker isolate, discussed above), and the CLIC 2025
+large-image set (62 files, 1.8–4.2 MP, p50 2.8 MP) encoded at 4:2:0 and
+4:4:4 from identical pixels plus a 4:2:0 DRI variant.
+
+**The headline gap is not corpus-driven.** The specific objection these
+controls answer: zune-jpeg's deficit against turbo on x86 could be an
+artifact of COCO being 4:4:4 and ~0.27 MP. Measured on the i9-11900K (YUV
+arm, p50 ms):
+
+| Corpus | Turbo `islow` | zune-jpeg | zune deficit |
+|--------|---------------|-----------|--------------|
+| val2017 (4:4:4, 0.27 MP) | 1.433 | 1.911 | 1.33× |
+| val2017-yuv420 (same images, 4:2:0) | 0.748 | 1.137 | **1.52×** |
+| CLIC 4:2:0 (2.8 MP) | 5.555 | 8.697 | **1.57×** |
+| CLIC 4:4:4 (2.8 MP) | 8.824 | 11.709 | 1.33× |
+
+zune never closes to within 10% of turbo on any control; moving to 4:2:0 —
+the subsampling where turbo's SIMD upsampling engages — *widens* its
+deficit. The COCO-measured gap generalises.
+
+EdgeFirst's accurate-class lead across every corpus (turbo `islow` p50 ÷
+EdgeFirst p50, YUV arm):
+
+| Board | val2017 | val2017-yuv420 | val2017-dri | CLIC 4:2:0 | CLIC 4:4:4 | CLIC 4:2:0-dri |
+|-------|---------|----------------|-------------|-----------|-----------|----------------|
+| x86-desktop | 1.17× | 1.12× | 1.22× | 1.09× | 1.22× | 1.11× |
+| rpi5-hailo (A76) | 1.34× | 1.26× | 1.46× | 1.20× | 1.31× | 1.31× |
+| orin-nano (A78AE) | 1.38× | 1.32× | 1.53× | 1.29× | 1.51× | 1.41× |
+| imx95-pro (A55) | 1.17× | 1.05× | 1.34× | 1.01× | 1.27× | 1.13× |
+| imx8mp-frdm (A53) | 1.15× | 1.00× | 1.33× | 1.00× | 1.31× | 1.15× |
+
+EdgeFirst leads or ties every cell. The two 1.00× cells — both on the
+in-order A53, on the 4:2:0 corpora where turbo is strongest — are the
+honest edge: the accurate class is a dead heat there (3.78 vs 3.80 ms on
+the small set, 30.40 vs 30.42 ms on CLIC), and at large 4:2:0 turbo
+`ifast` edges `hal_fast` by 1.4% (27.20 vs 27.59 ms) — the only fast-class
+cell EdgeFirst does not win across five hosts and six corpora. DRI widens
+the lead everywhere, most on the cores cameras actually ship.
+
+One footnote for readers of the raw summaries: on the 4:2:0 corpora the
+EdgeFirst *RGB* rows decode to native NV12, not RGB — the fused
+YCbCr→RGB write engages only for 4:4:4 sources, so an `rgb` request on
+4:2:0 resolves to the native layout (timings match the YUV row). Those
+cells are not comparable to the other arms' true-RGB rows and are excluded
+from RGB comparisons on 4:2:0 corpora; a fused 4:2:0→RGB path is a noted
+future optimization.
+
+### AWS cloud baselines
+
+The same decode-only matrix ran on AWS Batch (2026-08-13) across the five
+reproducible instance classes reviewers publish against — one job per
+corpus per queue, each on an exclusively-owned on-demand instance (the job
+requests the full 8 vCPUs), ECS AL2023 AMIs, the multi-arch
+`edgefirst-hal-jpeg-bench` container built from this tree, three
+interleaved rounds inside one session per instance, arms pinned to core 0,
+n=200. The container matrix carries six arms (EdgeFirst accurate, turbo
+`islow`, zune, image, stb, Wuffs — no fast-class arms). COCO val2017,
+YUV/RGB p50 ms, median of rounds; **bold** = fastest:
+
+| Queue | CPU | Arm | EdgeFirst | Turbo `islow` | zune-jpeg | image | stb | Wuffs |
+|-------|-----|-----|-----------|---------------|-----------|-------|-----|-------|
+| aws-m8g | Graviton4 (Neoverse-V2) | YUV | **1.376** | 2.117 | 2.547 | — | — | — |
+| | | RGB | **1.457** | 2.200 | 2.663 | 3.379 | 3.794 | 3.793 |
+| aws-c7g | Graviton3 (Neoverse-V1) | YUV | **1.665** | 2.529 | 2.984 | — | — | — |
+| | | RGB | **1.781** | 2.642 | 3.126 | 3.850 | 4.353 | 4.753 |
+| aws-m6g | Graviton2 (Neoverse-N1) | YUV | **2.292** | 3.271 | 3.968 | — | — | — |
+| | | RGB | **2.489** | 3.460 | 4.201 | 4.823 | 6.043 | 6.927 |
+| aws-m7i | Sapphire Rapids | YUV | **1.760** | 2.070 | 2.637 | — | — | — |
+| | | RGB | **1.882** | 2.184 | 2.667 | 2.826 | 3.417 | 3.272 |
+| aws-c7a | Genoa (Zen 4) | YUV | **1.455** | 1.667 | 2.131 | — | — | — |
+| | | RGB | **1.556** | 1.735 | 2.084 | 2.283 | 3.192 | 2.756 |
+
+- **EdgeFirst's largest leads anywhere are on the Graviton parts** — the
+  Arm baselines other published codec numbers use: 1.54× over turbo
+  `islow` on Graviton4, 1.52× on Graviton3, 1.43× on Graviton2 (COCO,
+  YUV), holding 1.32–1.63× across every control corpus. On the modern x86
+  servers the lead is 1.15–1.18× (1.07–1.24× across corpora) — EdgeFirst
+  is fastest in **every cloud cell**.
+- **The zune verdict replicates on the exact instances others benchmark
+  on**: zune trails turbo by 1.18–1.28× on COCO and the gap *widens* to
+  1.32–1.56× on the 4:2:0 corpora, on every queue — same shape as the
+  workstation and SBC results.
+- **Cross-corpus caveat**: unlike the board sweeps, each corpus ran on its
+  own freshly-launched instance, so within-corpus arm ratios are
+  same-silicon and tight (round spreads <1%) but cross-corpus deltas
+  carry instance-to-instance variance — the m7i pair shows it (its
+  val2017 and val2017-dri jobs landed on different-turbo-bin instances,
+  producing a nonphysical negative DRI delta). DRI penalties are therefore
+  quoted from the board captures, where the corpus pairs shared one
+  session; the cloud runs agree in direction on the other four queues
+  (turbo +8.8–10.0%, EdgeFirst +0.9–2.8%).
+
+### Hardware decoders
+
+The arms above are deliberately CPU-only. SoC hardware decode paths are
+measured separately — same corpora, same harness, published as their own
+table rather than mixed into the CPU comparison, because the resource being
+spent differs:
+
+- **i.MX 95 (V4L2 mxc-jpeg)** performs no colour-space conversion. Verified
+  on-target via `VIDIOC_ENUM_FMT`: the decode node's RGB capture formats
+  exist only for RGB-*encoded* JPEGs (the mirror of the encoder node's RGB
+  inputs); standard YCbCr streams decode to their native sampling —
+  4:2:0→NV12, 4:2:2→YUYV, 4:4:4→YUV3, greyscale→GREY. The table therefore
+  carries **two rows**: `hal_v4l2_* --decode-only` (JPEG → NV* in DMA — the
+  stopping point for consumers that take NV12 directly, e.g. GL-sampled
+  model preprocessing) and `--full-res-convert` (adds the full-resolution
+  NV*→RGB second pass, via GPU (`hal_v4l2_gl`) or CPU (`hal_v4l2_cpu`) — the
+  full cost for RGB consumers), with the per-frame decode/convert split
+  reported so both audiences can read their number from one run. Both passes
+  follow the pool-reuse discipline: `ImageProcessor::create_image()`
+  allocates the decode source and the RGB destination once, sized to the
+  dataset's largest frame, before the timed loop (warmup then absorbs
+  first-touch faults, EGL import, and V4L2 queue setup); per-frame work only
+  reconfigures logical dimensions. Buffer creation is never inside the timed
+  region, and the harness verifies the pools actually held — a
+  `BufferIdentity` change during the hot loop counts as `identity_churn` and
+  warns loudly (0 on the captured runs).
+- **Jetson Orin (nvJPEG)** is **not** a dedicated JPEG engine on this SoC:
+  only the GPU_HYBRID backend exists (Huffman on CPU, IDCT/postprocess on
+  the **shared CUDA cores** — the NVJPG ASIC is unreachable through CUDA
+  nvJPEG). Decoding therefore competes with anything else on the GPU, most
+  importantly AI inference; that contention is real, is the reason the
+  backend is opt-in (`EDGEFIRST_ENABLE_NVJPEG`), and is **out of scope for
+  these benchmarks** — concurrent decode-plus-inference impact will be
+  measured separately. Its fixed output is interleaved RGB (no NV12 in
+  CUDA 12.3.3), so it has no NV-native row.
+
+Captured 2026-08-13 with the same protocol as the CPU sweep (median of 3
+interleaved rounds, n=200 / all 62 CLIC files, pinned harness core; raw
+logs under `benchmarks/results/<board>/hw-decode/<corpus>/`). The EdgeFirst
+CPU column repeats the same board's CPU decode (YUV arm) for reference.
+
+**i.MX 95 V4L2 (mxc-jpeg), p50 ms.** decode-only stops at native NV*-in-DMA
+with near-zero CPU; the full-res rows add the NV*→RGB second pass
+(decode + convert split in parentheses):
+
+| Corpus | decode-only | + RGB, CPU convert | + RGB, GL convert | EdgeFirst CPU |
+|--------|-------------|--------------------|-------------------|---------------|
+| val2017 | 4.54 | 6.77 (4.47 + 2.35) | 9.11 (5.87 + 2.97) | 6.03 |
+| val2017-yuv420 | 2.53 | 4.44 (2.38 + 2.05) | 7.00 (3.78 + 2.98) | 3.37 |
+| val2017-dri | 4.39 | 6.65 (4.33 + 2.34) | 8.98 (5.77 + 2.99) | 6.05 |
+| CLIC 4:2:0 | 21.12 | 44.0 (21.6 + 23.2) | 47.6 (28.6 + 18.7) | 27.68 |
+| CLIC 4:4:4 | 42.15 | 62.7 (42.3 + 19.2) | 71.6 (51.2 + 18.0) | 40.70 |
+| CLIC 4:2:0-dri | 21.24 | 44.6 (21.8 + 23.5) | 47.5 (28.9 + 18.7) | 27.95 |
+
+What the splits show: the hardware block is **~25% faster than CPU decode
+on 4:2:0 and COCO** while freeing the core, and — unlike every CPU decoder
+— is **indifferent to restart markers** (val2017-dri matches val2017 within
+noise); at large 4:4:4 the tuned CPU decoder edges it. The two converters
+cross over exactly where predicted: at ~0.27 MP the CPU convert wins (GL's
+per-frame import/sync overhead dominates small frames) while at 2.8 MP the
+GL convert leg is cheaper (18.7 vs 23.2 ms) — though GL work visibly
+contends with the V4L2 decode leg (28.6 vs 21.6 ms decode under GL), so at
+these sizes the CPU-convert total still wins. One cost the full-res GL leg
+carries by design: reconfiguring the pooled RGB destination to each frame's
+dimensions requires a fresh EGLImage import per *distinct* geometry
+(imports are cached per size; reusing a stale-geometry image would sample
+at the wrong pitch), so varying-size corpora pay real import cost inside
+the convert leg that the fixed-size letterbox path does not — a genuine
+cost of GL output at native sizes, not harness overhead. NV12-native consumers should
+read the decode-only column; RGB consumers the full-cost columns.
+
+**Jetson Orin nvJPEG (GPU_HYBRID, RGB out), p50 ms** — captured on the
+orin-nano stand-in (`adis-uav1`), per-frame engagement verified via
+`codec.decode_jpeg.nvjpeg_*` tracing spans:
+
+| Corpus | nvJPEG | EdgeFirst CPU |
+|--------|--------|---------------|
+| val2017 | 4.72 | 3.72 |
+| val2017-yuv420 | 2.47 | 2.03 |
+| val2017-dri | 4.40 | 3.75 |
+| CLIC 4:2:0 | 16.46 | 15.73 |
+| CLIC 4:4:4 | 22.95 | 22.78 |
+| CLIC 4:2:0-dri | 16.69 | 15.69 |
+
+nvJPEG's GPU_HYBRID never beats the tuned CPU decoder outright at any size
+here, and its throughput tracks bitstream entropy — the Huffman leg stays
+on the CPU, so the large high-entropy CLIC files bottleneck exactly where a
+CPU decoder does. Its value on this SoC is GPU-resident RGB output and
+partial CPU offload (it is, however, restart-marker-indifferent like the
+i.MX block), not latency — which is why it stays opt-in and why the
+decode-plus-inference contention measurement is scoped separately.
 
 ### SIMD tier value (x86-desktop)
 
@@ -471,13 +711,44 @@ Per-block IDCT cost (in-tree microbenchmark `idct_kernel_cost`): **21.5 ns**
 on Rocket Lake, **81.1 ns** on the A76, **212.6 ns** on the A55, **220.8 ns** on
 the A53.
 
+### Build & run provenance
+
+Every sweep writes `results/<board>/decode-ab-*/provenance.txt` recording
+what a reader needs to reproduce (or falsify) that host's numbers: rustc and
+cargo-zigbuild versions, build profile and run parameters, the zune-jpeg /
+image crate versions from `Cargo.lock` (with zune's `x86`+`neon` SIMD
+features pinned explicitly in the harness manifest), the host kernel and CPU
+model, the pinned core's cpufreq governor and current/max clocks, and the
+loader-resolved libturbojpeg path with its owning package. The C arm
+additionally resolves the library it actually loaded via `dladdr` and embeds
+that path in its console output and CSV notes. The turbo provenance matters
+doubly on ARM: libjpeg-turbo 3.2 removed its GNU-assembler NEON
+implementation, so ARM builds need GCC 12+ or Clang for full performance —
+the recorded library version is what makes the ARM baselines checkable.
+Harness compilers are mixed by construction and recorded as such: the
+turbojpeg harness is compiled remotely with the host gcc on x86 targets
+(its timed region runs inside the dlopened system libturbojpeg either
+way), while the stb/wuffs arms — whose decoders compile into the binary —
+are cross-built with zig cc (clang) for both architectures; the provenance
+records both compilers.
+
 ### Reproduce
 
 ```bash
-# Full six-arm decoder sweep, aarch64 boards + x86_64 hosts over SSH
-# (release profile, interleaved best-of-3; EdgeFirst accurate/fast, turbo
-# islow/ifast, zune-jpeg, image crate)
+# Full eight-arm decoder sweep, aarch64 boards + x86_64 hosts over SSH
+# (release profile, interleaved rounds, median-of-3 reported with per-round
+# p50s and spread; EdgeFirst accurate/fast, turbo islow/ifast, zune-jpeg,
+# image crate, stb_image, Wuffs; provenance.txt written per host; results
+# land under results/<host>/decode-ab-sweep/<corpus>/)
 ./benchmarks/scripts/decode-ab-sweep.sh imx8mp-frdm imx95-pro rpi5-hailo adis-uav1 sebstation
+
+# Same sweep against a control corpus (staged by scripts/sync-corpus.sh)
+EDGEFIRST_BENCH_COCO_REMOTE=/data/corpora/val2017-yuv420 \
+  ./benchmarks/scripts/decode-ab-sweep.sh rpi5-hailo
+
+# Hardware-decode rows (i.MX 95 V4L2 / Jetson nvJPEG; see the hardware table)
+# hal_v4l2_gl --decode-only | hal_v4l2_cpu --full-res-convert |
+# hal_v4l2_gl --full-res-convert | hal_nvjpeg --decode-only --decode-fmt native
 
 # Three-arm publish subset (EdgeFirst accurate vs turbo islow/ifast only)
 CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
@@ -1437,6 +1708,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.11 | 2026-08-13 | JPEG decode section re-captured and expanded for publication: eight arms (stb_image and Wuffs added, both pixel-parity-verified against djpeg accurate — Wuffs bit-exact, stb ±3 LSB), median-of-3-interleaved-rounds protocol with per-round spread, mean, and nonparametric 95% median CIs, identical strided image selection for every arm, and per-host build/run provenance. New sections: control corpora (val2017-yuv420 / lossless val2017-dri / CLIC 2025 4:2:0+4:4:4+DRI — the zune-vs-turbo gap is shown to be general, not corpus-driven, and the DRI claim is measured), AWS cloud baselines (Graviton2/3/4, Sapphire Rapids, Genoa — EdgeFirst fastest in every cell, largest leads on Graviton), hardware decoders (i.MX 95 V4L2 decode-only + full-res NV*→RGB second pass via CPU/GL with decode/convert split; Orin nvJPEG scoped as shared-CUDA-core GPU_HYBRID), and build & run provenance. Headline: accurate beats turbo `islow` everywhere (+12.9% A53 … +27.7% A78AE; 1.43–1.54× on Graviton). |
 | 3.10 | 2026-08-13 | JPEG decode section rebuilt as the six-arm sweep (`decode-ab-sweep.sh`): EdgeFirst accurate + opt-in `fast` (`DctMethod::Fast`) vs turbo `islow`/`ifast`, zune-jpeg, and the image crate, across A53/A55/A76/A78AE/Rocket Lake. Accurate beats both turbo kernels everywhere (+11.7% A53 … +28.7% A78AE vs `islow`); `fast` beats `ifast` by 14–32% with its accuracy envelope stated (cosine ≥ 0.99985, PSNR ≥ 42 dB, max Δ 24 over 1000 COCO images). x86 re-captured after the SSE4.1 fused-RGB block-kernel fix. orin-nano row captured on the `adis-uav1` fallback (turbo baseline within 0.1% of the prior capture). |
 | 3.9 | 2026-06-16 | 0.25.0 release refresh: full bench matrix re-collected on the converged-GL-engine code across imx8mp-frdm, imx95-frdm, rpi5-hailo, and jetson-orin-nano, plus the existing mbp-m2-max rows. Confirms the GL-convergence captures within measurement noise (imx95 GL 1080p YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no GPU regressions. Allocation table updated for the imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p). macOS GL rows remain the pre-convergence capture (Known Gap #17). |
 | 3.8 | 2026-05-24 | macOS GL backend lands via ANGLE + IOSurface. `TensorMemory::Dma` extended to back IOSurface on macOS, with `is_gpu_buffer_available()` as the portable probe. Capture buffer-infrastructure numbers on mbp-m2-max for Mem/Shm/Dma (alloc 16 µs constant for IOSurface, memcpy 2–2.7× faster than SHM at every resolution). YUYV→RGBA same-size convert: 1.3× at 1080p, 4.8× at 4K vs CPU. Add mbp-m2-max **CPU-only** rows to letterbox / decoder / mask-decode / codec tables; add mbp-m2-max **GL** rows (YUYV→RGBA only) to the same-size format-conversion and 4K-convert tables. Letterbox GL rows pending Gap #17 closure. |

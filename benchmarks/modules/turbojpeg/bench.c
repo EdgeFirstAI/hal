@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -67,6 +68,9 @@ static struct {
     const char *path;
 } tj;
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn, format(printf, 1, 2)))
+#endif
 static void die(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -117,6 +121,12 @@ static void tj_load(void) {
     tj.error = (tj_error_fn)dlsym(tj.handle, "tjGetErrorStr");
     if (!tj.init || !tj.destroy || !tj.header || !tj.to_yuv || !tj.decompress || !tj.bufsize_yuv)
         die("libturbojpeg at %s is missing required symbols", tj.path);
+
+    /* The candidate string may be relative ("libturbojpeg.so.0"); record the
+     * loader's resolved absolute path so the run's provenance names the exact
+     * library file measured. */
+    Dl_info info;
+    if (dladdr((void *)tj.init, &info) && info.dli_fname) tj.path = info.dli_fname;
 }
 
 /* --- timing / stats: identical definitions to benchmarks/common ---------- */
@@ -139,6 +149,24 @@ static double percentile(const double *sorted, size_t n, double p) {
     size_t idx = (size_t)(pos + 0.5);
     if (idx >= n) idx = n - 1;
     return sorted[idx];
+}
+
+/* 0-based sorted-sample indices bounding the ~95% CI for the median, identical
+ * to benchmarks/common median_ci_indices(): 1-based ranks
+ * floor(n/2 - 1.96*sqrt(n)/2) and ceil(n/2 + 1 + 1.96*sqrt(n)/2), clamped. */
+static void median_ci_indices(size_t n, size_t *lo, size_t *hi) {
+    if (n == 0) {
+        *lo = *hi = 0;
+        return;
+    }
+    double nf = (double)n;
+    double half_width = 0.98 * sqrt(nf); /* 1.96*sqrt(n)/2 */
+    double lo_rank = floor(nf / 2.0 - half_width);
+    double hi_rank = ceil(nf / 2.0 + 1.0 + half_width);
+    if (lo_rank < 1.0) lo_rank = 1.0;
+    if (hi_rank > nf) hi_rank = nf;
+    *lo = (size_t)lo_rank - 1;
+    *hi = (size_t)hi_rank - 1;
 }
 
 /* Peak RSS, matching peak_rss_mb(). Linux VmHWM is kB; Darwin ru_maxrss is bytes. */
@@ -385,25 +413,35 @@ int main(int argc, char **argv) {
     double p50 = percentile(samples, n, 0.50);
     double p95 = percentile(samples, n, 0.95);
     double p99 = percentile(samples, n, 0.99);
+    double mean = n > 0 ? sum_ms / (double)n : 0.0;
+    size_t ci_lo_idx, ci_hi_idx;
+    median_ci_indices(n, &ci_lo_idx, &ci_hi_idx);
+    double ci_lo = n > 0 ? samples[ci_lo_idx] : 0.0;
+    double ci_hi = n > 0 ? samples[ci_hi_idx] : 0.0;
     double mpix_per_s = sum_ms > 0.0 ? total_mpix / (sum_ms / 1000.0) : 0.0;
     double rss = peak_rss_mb();
 
-    fprintf(stderr, "  p50=%.3f ms  p95=%.3f ms  p99=%.3f ms  %.1f MP/s  peak RSS=%.1f MB  n=%zu\n",
-            p50, p95, p99, mpix_per_s, rss, n);
+    fprintf(stderr,
+            "  p50=%.3f ms  ci95=[%.3f,%.3f]  mean=%.3f  p95=%.3f ms  p99=%.3f ms  %.1f MP/s  "
+            "peak RSS=%.1f MB  n=%zu\n",
+            p50, ci_lo, ci_hi, mean, p95, p99, mpix_per_s, rss, n);
     fprintf(stderr, "  cpu: process=%.1f%%\n", cpu_pct);
 
     if (csv_path) {
-        char notes[160];
-        snprintf(notes, sizeof(notes), "backend=%s;scope=decode-only;harness=c;dct=%s", backend,
-                 dct);
+        char notes[288];
+        snprintf(notes, sizeof(notes), "backend=%s;scope=decode-only;harness=c;dct=%s;lib=%s",
+                 backend, dct, tj.path);
         FILE *f = fopen(csv_path, "w");
         if (!f) die("create %s", csv_path);
         fprintf(f,
-                "board,class,module,ms_p50,ms_p95,ms_p99,mpix_per_s,peak_rss_mb,"
+                "board,class,module,ms_p50,ms_p95,ms_p99,ms_mean,ms_p50_ci_lo,ms_p50_ci_hi,"
+                "mpix_per_s,peak_rss_mb,"
                 "cpu_pct_process,cpu_pct_system,cpu_pct_peak_core,n_images,notes\n");
-        fprintf(f, "%s,decode,turbojpeg,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%zu,%s\n",
-                board, p50, p95, p99, mpix_per_s, rss, cpu_pct, 0.0, cpu_pct, n,
-                notes);
+        fprintf(f,
+                "%s,decode,turbojpeg,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%zu,"
+                "%s\n",
+                board, p50, p95, p99, mean, ci_lo, ci_hi, mpix_per_s, rss, cpu_pct, 0.0, cpu_pct,
+                n, notes);
         fclose(f);
     }
 

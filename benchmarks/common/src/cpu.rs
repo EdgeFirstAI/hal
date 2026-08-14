@@ -144,7 +144,13 @@ fn read_per_core_busy_idle() -> Vec<(u64, u64)> {
         }
         let mut parts = line.split_whitespace();
         let Some(name) = parts.next() else { continue };
-        if name == "cpu" || !name.bytes().nth(3).is_some_and(|c| c.is_ascii_digit()) {
+        if name == "cpu"
+            || !name
+                .as_bytes()
+                .get(3)
+                .copied()
+                .is_some_and(|c| c.is_ascii_digit())
+        {
             continue;
         }
         // user nice system idle iowait irq softirq steal guest guest_nice

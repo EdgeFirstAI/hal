@@ -2,3 +2,12 @@
 # compiles the TurboJPEG arm itself, and a host-built binary would be linked
 # against the wrong glibc.
 benchmarks/modules/turbojpeg/build/
+
+# Cargo build trees, results, fetched single-file deps, and git history are
+# gigabytes the image build never reads (all binaries build in-container).
+target/
+benchmarks/target/
+benchmarks/results/
+benchmarks/modules/stb/build/
+benchmarks/modules/wuffs/build/
+.git/
