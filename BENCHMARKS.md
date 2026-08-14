@@ -659,48 +659,73 @@ same shape as the YUV arm above.
 
 ### AWS cloud baselines
 
-The same decode-only matrix ran on AWS Batch (2026-08-13) across the five
-reproducible instance classes reviewers publish against — one job per
-corpus per queue, each on an exclusively-owned on-demand instance (the job
-requests the full 8 vCPUs), ECS AL2023 AMIs, the multi-arch
-`edgefirst-hal-jpeg-bench` container built from this tree, three
-interleaved rounds inside one session per instance, arms pinned to core 0,
-n=200. The container matrix carries six arms (EdgeFirst accurate, turbo
-`islow`, zune, image, stb, Wuffs — no fast-class arms). COCO val2017,
-YUV/RGB p50 ms, median of rounds; **bold** = fastest:
+The same decode-only matrix ran on AWS Batch (2026-08-14, re-captured against
+the fused native-4:2:0→RGB decoder in this revision) across the five
+reproducible instance classes reviewers publish against and **all six
+corpora** — one job per corpus per queue (30 jobs total), each on an
+exclusively-owned on-demand instance (the job requests the full 8 vCPUs),
+ECS AL2023 AMIs, the multi-arch `edgefirst-hal-jpeg-bench` container built
+from this tree, three interleaved rounds inside one session per instance,
+arms pinned to core 0, n=200. The container matrix carries six arms
+(EdgeFirst accurate, turbo `islow`, zune, image, stb, Wuffs — no fast-class
+arms). COCO val2017, YUV/RGB p50 ms, median of rounds; **bold** = fastest:
 
 | Queue | CPU | Arm | EdgeFirst | Turbo `islow` | zune-jpeg | image | stb | Wuffs |
 |-------|-----|-----|-----------|---------------|-----------|-------|-----|-------|
-| aws-m8g | Graviton4 (Neoverse-V2) | YUV | **1.376** | 2.117 | 2.547 | — | — | — |
-| | | RGB | **1.457** | 2.200 | 2.663 | 3.379 | 3.794 | 3.793 |
-| aws-c7g | Graviton3 (Neoverse-V1) | YUV | **1.665** | 2.529 | 2.984 | — | — | — |
-| | | RGB | **1.781** | 2.642 | 3.126 | 3.850 | 4.353 | 4.753 |
-| aws-m6g | Graviton2 (Neoverse-N1) | YUV | **2.292** | 3.271 | 3.968 | — | — | — |
-| | | RGB | **2.489** | 3.460 | 4.201 | 4.823 | 6.043 | 6.927 |
-| aws-m7i | Sapphire Rapids | YUV | **1.760** | 2.070 | 2.637 | — | — | — |
-| | | RGB | **1.882** | 2.184 | 2.667 | 2.826 | 3.417 | 3.272 |
-| aws-c7a | Genoa (Zen 4) | YUV | **1.455** | 1.667 | 2.131 | — | — | — |
-| | | RGB | **1.556** | 1.735 | 2.084 | 2.283 | 3.192 | 2.756 |
+| aws-m8g | Graviton4 (Neoverse-V2) | YUV | **1.367** | 2.127 | 2.535 | — | — | — |
+| | | RGB | **1.454** | 2.202 | 2.657 | 3.390 | 3.798 | 3.801 |
+| aws-c7g | Graviton3 (Neoverse-V1) | YUV | **1.656** | 2.531 | 2.952 | — | — | — |
+| | | RGB | **1.767** | 2.637 | 3.100 | 3.825 | 4.350 | 4.751 |
+| aws-m6g | Graviton2 (Neoverse-N1) | YUV | **2.321** | 3.281 | 3.972 | — | — | — |
+| | | RGB | **2.513** | 3.464 | 4.218 | 4.850 | 6.033 | 6.937 |
+| aws-m7i | Sapphire Rapids | YUV | **1.598** | 1.908 | 2.433 | — | — | — |
+| | | RGB | **1.700** | 1.997 | 2.427 | 2.622 | 3.178 | 3.027 |
+| aws-c7a | Genoa (Zen 4) | YUV | **1.440** | 1.656 | 2.133 | — | — | — |
+| | | RGB | **1.539** | 1.742 | 2.084 | 2.311 | 3.193 | 2.770 |
+
+EdgeFirst's accurate-class lead (turbo `islow` p50 ÷ EdgeFirst p50) across
+all six corpora — YUV and, new in this revision, the fused-RGB arm on the
+native-4:2:0 corpora:
+
+| Queue | val2017 | val2017-yuv420 | val2017-dri | CLIC 4:2:0 | CLIC 4:4:4 | CLIC 4:2:0-dri |
+|-------|---------|----------------|-------------|-----------|-----------|----------------|
+| aws-m8g (Graviton4) | 1.56× | 1.45× | 1.62× | 1.39× | 1.59× | 1.48× |
+| aws-c7g (Graviton3) | 1.53× | 1.45× | 1.63× | 1.41× | 1.62× | 1.51× |
+| aws-m6g (Graviton2) | 1.41× | 1.34× | 1.53× | 1.31× | 1.43× | 1.41× |
+| aws-m7i (Sapphire Rapids) | 1.19× | 1.16× | 1.26× | 1.10× | 1.22× | 1.16× |
+| aws-c7a (Genoa) | 1.15× | 1.11× | 1.25× | 1.08× | 1.17× | 1.14× |
+
+| Queue | val2017 RGB | val2017-yuv420 RGB | val2017-dri RGB | CLIC 4:2:0 RGB | CLIC 4:4:4 RGB | CLIC 4:2:0-dri RGB |
+|-------|-------------|---------------------|-------------------|-----------------|-----------------|----------------------|
+| aws-m8g (Graviton4) | 1.51× | 1.51× | 1.61× | 1.48× | 1.60× | 1.55× |
+| aws-c7g (Graviton3) | 1.49× | 1.52× | 1.60× | 1.50× | 1.61× | 1.56× |
+| aws-m6g (Graviton2) | 1.38× | 1.42× | 1.50× | 1.41× | 1.39× | 1.49× |
+| aws-m7i (Sapphire Rapids) | 1.18× | 1.16× | 1.22× | 1.16× | 1.17× | 1.20× |
+| aws-c7a (Genoa) | 1.13× | 1.15× | 1.21× | 1.14× | 1.10× | 1.20× |
+
+EdgeFirst is fastest in every cloud cell, YUV and RGB, every corpus. The RGB
+leads track the YUV leads closely on every queue — the same "box upsample
+costs less than turbo's fancy upsample" shape measured on the physical
+boards holds in the cloud too, with no queue-specific surprise.
 
 - **EdgeFirst's largest leads anywhere are on the Graviton parts** — the
-  Arm baselines other published codec numbers use: 1.54× over turbo
-  `islow` on Graviton4, 1.52× on Graviton3, 1.43× on Graviton2 (COCO,
-  YUV), holding 1.32–1.63× across every control corpus. On the modern x86
-  servers the lead is 1.15–1.18× (1.07–1.24× across corpora) — EdgeFirst
-  is fastest in **every cloud cell**.
+  Arm baselines other published codec numbers use: **1.31×–1.63×** across
+  every corpus (YUV), **1.38×–1.61×** (RGB). On the modern x86 servers the
+  lead is **1.08×–1.26×** (YUV), **1.10×–1.22×** (RGB).
 - **The zune verdict replicates on the exact instances others benchmark
-  on**: zune trails turbo by 1.18–1.28× on COCO and the gap *widens* to
-  1.32–1.56× on the 4:2:0 corpora, on every queue — same shape as the
+  on**: zune trails turbo by 1.17×–1.29× on COCO and the gap *widens* to
+  1.32×–1.56× on the 4:2:0 corpora, on every queue — same shape as the
   workstation and SBC results.
-- **Cross-corpus caveat**: unlike the board sweeps, each corpus ran on its
-  own freshly-launched instance, so within-corpus arm ratios are
-  same-silicon and tight (round spreads <1%) but cross-corpus deltas
-  carry instance-to-instance variance — the m7i pair shows it (its
-  val2017 and val2017-dri jobs landed on different-turbo-bin instances,
-  producing a nonphysical negative DRI delta). DRI penalties are therefore
-  quoted from the board captures, where the corpus pairs shared one
-  session; the cloud runs agree in direction on the other four queues
-  (turbo +8.8–10.0%, EdgeFirst +0.9–2.8%).
+- **The m7i cross-corpus anomaly from the prior capture does not
+  reproduce.** The previous revision's val2017/val2017-dri pair landed on
+  different-turbo-bin m7i instances and produced a nonphysical negative DRI
+  delta; this revision's fresh 6-corpus capture (all on newly-launched
+  instances) shows a **physically sensible, positive DRI penalty on every
+  queue including m7i** — turbo pays +5.5% to +9.7%, EdgeFirst +0.4% to
+  +4.0%, m7i included (+5.5% / +0.4%). That was an instance-bin artifact of
+  one specific prior launch, not a property of the m7i queue — consistent
+  with the second-instance finding below that m7i absolute latency, not its
+  competitive ratio, is what varies instance-to-instance.
 - **Instance-bin variance is now bounded, not inferred.** A second
   independently-launched on-demand instance per queue re-ran the val2017
   headline corpus (same job definition, same container image, same
@@ -708,17 +733,16 @@ YUV/RGB p50 ms, median of rounds; **bold** = fastest:
   instance on every arm (m8g, c7g, m6g, c7a — both absolute p50s and the
   EdgeFirst÷turbo ratio). **m7i is the outlier**: its second instance ran
   **6–7% faster** on every arm (hal 1.760 ms → 1.638 ms, turbo `islow`
-  2.070 ms → 1.941 ms) — confirming the m7i cross-corpus anomaly above is a
-  real per-instance effect (turbo bin / CPU stepping / noisy neighbour),
-  not a one-off. The reassuring part: **the ratio barely moves even when
-  the absolute time does** — turbo ÷ EdgeFirst on m7i YUV is 1.176× on
-  instance 1 and 1.185× on instance 2, a 0.8-point spread against a 6.9%
-  swing in the underlying numbers, because whatever changed the instance's
-  speed changed both arms together (same session, same silicon). That is
-  what licenses quoting the cloud ratios directly rather than only the
-  board captures: absolute latency varies instance-to-instance on at least
-  one queue, but the competitive ratio this document actually claims does
-  not.
+  2.070 ms → 1.941 ms, from the prior single-corpus capture) — confirming a
+  real per-instance effect (turbo bin / CPU stepping / noisy neighbour), not
+  a one-off. The reassuring part: **the ratio barely moves even when the
+  absolute time does** — turbo ÷ EdgeFirst on m7i YUV is 1.176× on instance
+  1 and 1.185× on instance 2, a 0.8-point spread against a 6.9% swing in the
+  underlying numbers, because whatever changed the instance's speed changed
+  both arms together (same session, same silicon). That is what licenses
+  quoting the cloud ratios directly rather than only the board captures:
+  absolute latency varies instance-to-instance on at least one queue, but
+  the competitive ratio this document actually claims does not.
 
 ### Hardware decoders
 
@@ -1903,7 +1927,7 @@ allocation.
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 3.12 | 2026-08-14 | Response to the v3.11 pre-publication review (`docs/BENCHMARKS_JPEG_REVIEW_v3.11.md`). Blocking: v0.22.1 `Image Codec Decode` JPEG rows marked superseded in place; nvJPEG June-vs-August conclusions reconciled (pre-optimization CPU baseline / single fixture vs corpus / full `load_image` vs decode-only); the "two releases behind" banner scoped to the GL/preprocessing matrix only. High: implemented the fused native-4:2:0→RGB decode path (`write_rgb_rows_420`, box chroma upsample) that was the one previously-unmeasured cell a libjpeg-turbo-literate reader would expect EdgeFirst to lose on — it wins everywhere instead, including a fast-class sweep with no loss cell; measured zune's `neon` feature is genuinely engaged (1.16–1.20× A/B on rpi5-hailo, not inferred from a features table); measured Wuffs' RGB row is on its 3-byte swizzle slow path (1.52–1.59× behind its native 4-byte output); published per-board libjpeg-turbo version/package-source/compiler table (none of the five original hosts actually run turbo 3.2+). Medium: added a Max-spread column to the headline table (and corrected the "sub-1%" prose it was previously not measuring); unified ratio (not percentage) framing throughout with YUV/RGB labels; quantified the zune greyscale-skip asymmetry at exactly zero images in the n=200 sample; ran a second independently-launched AWS instance per queue (bounds instance-bin variance at ≤0.6% on 4/5 queues, confirms a real ~7% effect on the m7i queue that barely moves the published ratio); added `mbp-m2-max` to the eight-arm sweep (largest accurate-class lead of any board, 1.41×). |
+| 3.12 | 2026-08-14 | Response to the v3.11 pre-publication review (`docs/BENCHMARKS_JPEG_REVIEW_v3.11.md`). Blocking: v0.22.1 `Image Codec Decode` JPEG rows marked superseded in place; nvJPEG June-vs-August conclusions reconciled (pre-optimization CPU baseline / single fixture vs corpus / full `load_image` vs decode-only); the "two releases behind" banner scoped to the GL/preprocessing matrix only. High: implemented the fused native-4:2:0→RGB decode path (`write_rgb_rows_420`, box chroma upsample) that was the one previously-unmeasured cell a libjpeg-turbo-literate reader would expect EdgeFirst to lose on — it wins everywhere instead, including a fast-class sweep with no loss cell; measured zune's `neon` feature is genuinely engaged (1.16–1.20× A/B on rpi5-hailo, not inferred from a features table); measured Wuffs' RGB row is on its 3-byte swizzle slow path (1.52–1.59× behind its native 4-byte output); published per-board libjpeg-turbo version/package-source/compiler table (none of the five original hosts actually run turbo 3.2+). Medium: added a Max-spread column to the headline table (and corrected the "sub-1%" prose it was previously not measuring); unified ratio (not percentage) framing throughout with YUV/RGB labels; quantified the zune greyscale-skip asymmetry at exactly zero images in the n=200 sample; ran a second independently-launched AWS instance per queue (bounds instance-bin variance at ≤0.6% on 4/5 queues, confirms a real ~7% effect on the m7i queue that barely moves the published ratio); added `mbp-m2-max` to the eight-arm sweep (largest accurate-class lead of any board, 1.41×). Follow-up same revision: rebuilt and pushed the multi-arch `edgefirst-hal-jpeg-bench` container against the fused-RGB codec and re-ran the full 30-job AWS Batch matrix (5 queues × 6 corpora, not just the val2017 headline) — EdgeFirst fastest in every cloud cell, YUV and RGB, on every corpus; the prior revision's m7i cross-corpus DRI anomaly does not reproduce on a fresh, all-corpora capture (every queue now shows a physically sensible positive DRI penalty). |
 | 3.11 | 2026-08-13 | JPEG decode section re-captured and expanded for publication: eight arms (stb_image and Wuffs added, both pixel-parity-verified against djpeg accurate — Wuffs bit-exact, stb ±3 LSB), median-of-3-interleaved-rounds protocol with per-round spread, mean, and nonparametric 95% median CIs, identical strided image selection for every arm, and per-host build/run provenance. New sections: control corpora (val2017-yuv420 / lossless val2017-dri / CLIC 2025 4:2:0+4:4:4+DRI — the zune-vs-turbo gap is shown to be general, not corpus-driven, and the DRI claim is measured), AWS cloud baselines (Graviton2/3/4, Sapphire Rapids, Genoa — EdgeFirst fastest in every cell, largest leads on Graviton), hardware decoders (i.MX 95 V4L2 decode-only + full-res NV*→RGB second pass via CPU/GL with decode/convert split; Orin nvJPEG scoped as shared-CUDA-core GPU_HYBRID), and build & run provenance. Headline: accurate beats turbo `islow` everywhere (+12.9% A53 … +27.7% A78AE; 1.43–1.54× on Graviton). |
 | 3.10 | 2026-08-13 | JPEG decode section rebuilt as the six-arm sweep (`decode-ab-sweep.sh`): EdgeFirst accurate + opt-in `fast` (`DctMethod::Fast`) vs turbo `islow`/`ifast`, zune-jpeg, and the image crate, across A53/A55/A76/A78AE/Rocket Lake. Accurate beats both turbo kernels everywhere (+11.7% A53 … +28.7% A78AE vs `islow`); `fast` beats `ifast` by 14–32% with its accuracy envelope stated (cosine ≥ 0.99985, PSNR ≥ 42 dB, max Δ 24 over 1000 COCO images). x86 re-captured after the SSE4.1 fused-RGB block-kernel fix. orin-nano row captured on the `adis-uav1` fallback (turbo baseline within 0.1% of the prior capture). |
 | 3.9 | 2026-06-16 | 0.25.0 release refresh: full bench matrix re-collected on the converged-GL-engine code across imx8mp-frdm, imx95-frdm, rpi5-hailo, and jetson-orin-nano, plus the existing mbp-m2-max rows. Confirms the GL-convergence captures within measurement noise (imx95 GL 1080p YUYV→RGBA letterbox 1.2 ms → 957 µs, NV12→RGBA 1.2 ms → 830 µs); no GPU regressions. Allocation table updated for the imx8mp DMA-alloc improvement (38 ms → 1.8 ms at 720p). macOS GL rows remain the pre-convergence capture (Known Gap #17). |
