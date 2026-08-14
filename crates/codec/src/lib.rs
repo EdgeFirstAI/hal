@@ -79,5 +79,22 @@ pub fn nvjpeg_available() -> bool {
     }
 }
 
+/// Returns `true` when a V4L2 memory-to-memory JPEG decoder (e.g. the i.MX
+/// mxc-jpeg block) is present and not opted out via `EDGEFIRST_DISABLE_V4L2`.
+/// Opens and drops the device once; the decode path re-probes lazily and
+/// keeps its own context. Always `false` on other platforms or when the
+/// `v4l2` feature is disabled. Useful for benchmarks and consumers that must
+/// fail fast instead of silently falling back to the CPU decoder.
+pub fn v4l2_available() -> bool {
+    #[cfg(all(target_os = "linux", feature = "v4l2"))]
+    {
+        jpeg::v4l2_available()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "v4l2")))]
+    {
+        false
+    }
+}
+
 /// Result type for codec operations.
 pub type Result<T> = std::result::Result<T, CodecError>;

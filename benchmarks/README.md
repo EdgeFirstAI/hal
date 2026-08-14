@@ -17,16 +17,32 @@ benchmarks/
 ├── common/           # Shared Rust helpers (COCO walk, timing, CSV)
 ├── docker/           # Multi-processor container image (Dockerfile + entrypoint)
 ├── probe/            # Capability probe script
-├── scripts/          # sync-coco, deploy-and-run, decode-ab-matrix,
-│                     # perf-compare-decode, fixture-decode-matrix
+├── scripts/          # sync-coco, sync-corpus, deploy-and-run, decode-ab-*,
+│                     # make-coco-yuv420, make-dri-corpus, fetch-clic2025,
+│                     # corpus_stats.py, perf-compare-decode, fixture-decode-matrix
 ├── modules/
 │   ├── hal_cpu/      # HAL decode + HAL CPU convert          (Rust)
 │   ├── turbojpeg/    # libjpeg-turbo decode, reference arm    (C)
+│   ├── rust_jpeg/    # zune-jpeg + image-crate arms           (Rust)
+│   ├── stb/          # stb_image arm (single header, RGB)     (C)
+│   ├── wuffs/        # Wuffs v0.4 JPEG arm (Google, RGB)      (C)
+│   ├── cbench/       # shared C harness header (stb, wuffs)
+│   ├── dct_compare/  # fast-vs-accurate DCT pixel similarity  (Rust)
 │   ├── hal_gl/       # HAL decode → NV12 + HAL GL convert     (Rust)
 │   ├── hal_g2d/      # HAL decode → NV12 + HAL G2D (i.MX)     (Rust)
-│   └── hal_v4l2_gl/  # HAL V4L2 JPEG + HAL GL (i.MX 95)       (Rust)
-└── results/<board>/  # CSV outputs (gitignored)
+│   ├── hal_v4l2_gl/  # HAL V4L2 JPEG + HAL GL (i.MX 95)       (Rust)
+│   ├── hal_v4l2_cpu/ # HAL V4L2 JPEG + HAL CPU convert         (Rust)
+│   └── hal_nvjpeg/   # HAL nvJPEG GPU decode (Jetson Orin)     (Rust)
+└── results/<board>/  # CSV outputs + provenance.txt (gitignored)
 ```
+
+The `stb` and `wuffs` modules do not vendor their upstream sources: `make`
+fetches `stb_image.h` (pinned commit) and `wuffs-v0.4.c` (pinned release tag)
+with sha256 verification into their gitignored `build/` directories. Both are
+RGB-only arms — neither library exposes a raw-YUV output — and both compile
+their harness from `modules/cbench/cbench.h`, whose timing/stats/selection
+definitions are copies of `turbojpeg/bench.c`'s (which mirror
+`benchmarks/common`); a change to any of the three must be applied to all.
 
 ## Constants
 
@@ -36,6 +52,34 @@ benchmarks/
 | Output | 640×640 centered letterbox, pad **114**, RGB |
 | Smoke | `--limit 50` (default), 10 warmup |
 | Full | omit `--limit` (all 5000 JPEGs); latency only, no mAP |
+
+## Corpora
+
+COCO val2017 is the primary corpus. Measured with `scripts/corpus_stats.py`
+(full 5000): 4990 baseline 4:4:4 + 10 greyscale, none progressive, zero
+restart-interval (DRI) files, p50 0.273 MP. The control corpora below answer
+the specific objections a published comparison meets; each output directory
+carries a `MANIFEST.txt` recording its exact recipe and tool versions.
+
+| Corpus | Script | Isolates |
+|--------|--------|----------|
+| `val2017-yuv420` | `make-coco-yuv420.sh` (djpeg\|cjpeg `-quality 90 -sample 2x2`) | 4:2:0 vs the 4:4:4 corpus (add `--with-444-twin` for the same-quality 4:4:4 pair — the pure subsampling isolate) |
+| `val2017-dri` | `make-dri-corpus.sh` (`jpegtran -restart 1`, **lossless**) | restart-marker handling alone — identical DCT coefficients, only DRI added |
+| `CLIC2025/jpeg-yuv420` + `jpeg-yuv444` | `fetch-clic2025.sh` (pinned downloads + sha256; cjpeg q90 both subsamplings from identical pixels) | large images (62 files, ~1.8–4.2 MP, p50 2.8 MP) vs COCO's ~0.27 MP |
+| `CLIC2025/jpeg-yuv420-dri` | `make-dri-corpus.sh` on the above | restarts at large-image scale |
+
+CLIC 2025 images are Unsplash-licensed (commercial use OK, no attribution).
+COCO images carry individual Flickr CC licenses (some NC): never publish or
+redistribute COCO-derived JPEGs — generate locally, sync to private storage
+only.
+
+Sync any corpus to boards with `scripts/sync-corpus.sh --src DIR [host...]`
+(lands at `/data/corpora/<basename>`), then point a sweep at it:
+
+```bash
+EDGEFIRST_BENCH_COCO_REMOTE=/data/corpora/val2017-yuv420 \
+  ./benchmarks/scripts/decode-ab-sweep.sh rpi5-hailo
+```
 
 ## Build profile
 
@@ -67,13 +111,25 @@ cargo run --profile profiling --manifest-path benchmarks/modules/hal_cpu/Cargo.t
 make -C benchmarks/modules/turbojpeg
 ./benchmarks/modules/turbojpeg/build/turbojpeg_bench --limit 50 --board x86-desktop \
   --decode-only --format yuv --csv benchmarks/results/x86-desktop/turbojpeg.csv
+
+# stb_image / Wuffs arms (single-file deps fetched + sha256-checked by make)
+make -C benchmarks/modules/stb && make -C benchmarks/modules/wuffs
+./benchmarks/modules/stb/build/stb_bench --limit 50 --board x86-desktop \
+  --decode-only --format rgb --csv benchmarks/results/x86-desktop/stb.csv
+./benchmarks/modules/wuffs/build/wuffs_bench --limit 50 --board x86-desktop \
+  --decode-only --format rgb --csv benchmarks/results/x86-desktop/wuffs.csv
 ```
 
 ## Docker / multi-processor
 
-The `benchmarks/docker/` image packages `hal_cpu` so the same binary can be run
-on varied Intel (and other) CPUs to collect per-processor numbers and guide
-ISA-tier opts (`IntelTier` / `NeonTier`).
+The `benchmarks/docker/` image packages every CPU arm — `hal_cpu`,
+`turbojpeg_bench`, `rust_jpeg` (zune + image), `stb_bench`, `wuffs_bench` — so
+the same binaries run on varied Intel/AMD/Graviton CPUs (multi-arch bases;
+build arm64 with `docker buildx build --platform linux/arm64`) to collect
+per-processor numbers and guide ISA-tier opts (`IntelTier` / `NeonTier`). For
+AWS Batch, `DATASET_S3=s3://…/corpus.tar.gz` (job-role credentials) or
+`DATASET_URL=https://…` fetches the corpus before the run; `MODULES` selects
+arms (default all six; image/stb/wuffs are rgb-only and skip the yuv pass).
 
 Default container work is a **decode-only** YUV + RGB matrix (no letterbox /
 `ImageProcessor::convert`):
@@ -137,7 +193,7 @@ docker run --rm \
 | `LIMIT` / `WARMUP` | Smoke knobs (`LIMIT=0` = full set) |
 | `EDGEFIRST_CODEC_FORCE_INTEL` | `scalar\|sse2\|sse41\|avx2` A/B |
 | `EDGEFIRST_CODEC_FORCE_NEON` | `scalar\|baseline\|plus\|high` A/B (aarch64 images) |
-| `MODULES` | Comma list: `hal_cpu`, `turbojpeg` (default both) |
+| `MODULES` | Comma list: `hal_cpu`, `turbojpeg`, `zune`, `image`, `stb`, `wuffs` (default all six; `image`/`stb`/`wuffs` are rgb-only) |
 | `FORMATS` | Comma list: `yuv`, `rgb` (default both) |
 | `TENSOR_MEM` | `mem\|dma\|auto` (default `mem`) |
 | `EXTRA_ARGS` | Extra argv appended to `hal_cpu` |
@@ -157,7 +213,7 @@ The image is the portable OSS contract. How you schedule it on cloud CPUs
 # Decode-only HAL vs TurboJPEG (YUV + RGB) — smoke / investigation
 ./benchmarks/scripts/decode-ab-matrix.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
-# Published decoder A/B (release, interleaved best-of-3, n=200)
+# Published decoder A/B (release, interleaved rounds, median-of-3 + spread, n=200)
 CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
   ./benchmarks/scripts/decode-ab-publish.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
@@ -319,8 +375,10 @@ Each of these was measured and rejected; the reasons generalise.
 
 - **Interleave the arms.** This host is shared with a `powersave` governor and
   turbo enabled; single runs of the same binary drift by up to 40%, and one
-  briefly showed a faster kernel as a regression. Every published number is
-  best-of-N with the arms alternating inside one loop.
+  briefly showed a faster kernel as a regression. Every published number comes
+  from N interleaved rounds with the arms alternating inside one loop, reported
+  as the median across rounds with each round's p50 and the min-max spread
+  (best-of-N favours the low tail and is no longer the claim number).
 - **`libturbojpeg` ships stripped.** Group its samples by mapping each IP to the
   nearest preceding `endbr64`/call target on x86, or every `bl` target in the
   disassembly on aarch64. The hot functions then identify as `decode_mcu` and

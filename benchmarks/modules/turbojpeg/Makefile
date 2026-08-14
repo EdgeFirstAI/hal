@@ -11,11 +11,11 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
 UNAME_S := $(shell uname -s)
-# libdl is a separate library on Linux; on Darwin dlopen lives in libSystem.
+# libdl/libm are separate libraries on Linux; on Darwin both live in libSystem.
 ifeq ($(UNAME_S),Darwin)
 LDLIBS  :=
 else
-LDLIBS  := -ldl
+LDLIBS  := -ldl -lm
 endif
 BUILD   := build
 
@@ -24,10 +24,10 @@ BUILD   := build
 # Linux even when this Makefile runs on Darwin.
 ifeq ($(shell command -v aarch64-linux-gnu-gcc 2>/dev/null),)
 AARCH64_CC ?= zig cc -target aarch64-linux-gnu
-AARCH64_LDLIBS := -ldl
+AARCH64_LDLIBS := -ldl -lm
 else
 AARCH64_CC ?= aarch64-linux-gnu-gcc
-AARCH64_LDLIBS := -ldl -static-libgcc
+AARCH64_LDLIBS := -ldl -lm -static-libgcc
 endif
 
 .PHONY: all aarch64 clean

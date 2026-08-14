@@ -6,7 +6,9 @@
 #
 # Release profile, no perf/trace instrumentation. Arms alternate inside one
 # session (HAL / turbo islow / turbo ifast × YUV / RGB), pinned to one core.
-# Best-of-N p50 is the claim number.
+# The claim number is the MEDIAN p50 across rounds, reported with every
+# round's p50 and the min–max spread (best-of-N favours the low tail).
+# Build/run provenance for each host is captured to provenance.txt.
 #
 # Usage:
 #   EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
@@ -68,6 +70,50 @@ EOS
 parse_p50() {
   # First "p50=N.NNN ms" in a log (HAL prints decode_p50 afterwards).
   grep -oE 'p50=[0-9.]+ ms' "$1" | head -1 | sed -E 's/p50=([0-9.]+) ms/\1/'
+}
+
+# "median min max" of the newline-separated numbers on stdin (even count
+# averages the two middle values).
+median_spread() {
+  sort -g | awk '
+    { a[NR] = $1 }
+    END {
+      if (NR == 0) exit 1
+      m = (NR % 2) ? a[(NR + 1) / 2] : (a[NR / 2] + a[NR / 2 + 1]) / 2
+      printf "%.3f %.3f %.3f\n", m, a[1], a[NR]
+    }'
+}
+
+# Toolchain on the build side; kernel / CPU / governor / clocks / libturbojpeg
+# resolution on the run side. What a reader needs to reproduce the numbers.
+capture_provenance() { # host out_dir
+  local host="$1" out="$2"
+  {
+    echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "--- local build ---"
+    echo "rustc: $(rustc -V 2>/dev/null || echo unknown)"
+    echo "cargo-zigbuild: $(cargo zigbuild --version 2>/dev/null || echo unknown)"
+    echo "profile: ${PROFILE}  n=${LIMIT}  warmup=${WARMUP}  rounds=${ROUNDS}  pin=${PIN}"
+    echo "turbojpeg cross cc: zig $(zig version 2>/dev/null || echo unknown)"
+    echo "--- ${host} ---"
+    ssh "${host}" "bash -s" -- "${PIN}" <<'EOS'
+PIN="${1:-0}"
+uname -a
+grep -m1 -E 'model name|^Model' /proc/cpuinfo 2>/dev/null || true
+for f in scaling_governor scaling_cur_freq cpuinfo_max_freq; do
+  p="/sys/devices/system/cpu/cpu${PIN}/cpufreq/${f}"
+  [ -r "$p" ] && echo "cpu${PIN} ${f}: $(cat "$p")"
+done
+lib="$(ldconfig -p 2>/dev/null | awk '/libturbojpeg\.so/ { print $NF; exit }')"
+echo "libturbojpeg: ${lib:-not-in-ldconfig}"
+if [ -n "${lib:-}" ]; then
+  real="$(readlink -f "${lib}")"
+  echo "libturbojpeg resolved: ${real}"
+  command -v dpkg >/dev/null 2>&1 && dpkg -S "${real}" 2>/dev/null | head -1
+fi
+true
+EOS
+  } >"${out}/provenance.txt" 2>&1 || echo "  WARN: provenance capture incomplete (see ${out}/provenance.txt)"
 }
 
 echo "==> Building hal_cpu for ${TARGET_TRIPLE} (profile=${PROFILE})"
@@ -145,22 +191,32 @@ for target in "${TARGETS[@]}"; do
     done
   done
 
+  capture_provenance "${host}" "${out_dir}"
+
   {
-    echo "==== ${board_label} best-of-${ROUNDS} (n=${LIMIT}, pin=${PIN}, profile=${PROFILE})"
+    echo "==== ${board_label} median-of-${ROUNDS} (n=${LIMIT}, pin=${PIN}, profile=${PROFILE})"
     for arm in hal tj_islow tj_ifast; do
       for fmt in yuv rgb; do
-        best=""
+        vals=""
         rounds=""
         for round in $(seq 1 "${ROUNDS}"); do
           f="${out_dir}/r${round}_${arm}_${fmt}.log"
+          [[ -f "${f}" ]] || continue
           p="$(parse_p50 "${f}" || true)"
           [[ -z "${p}" ]] && continue
           rounds="${rounds}${rounds:+, }r${round}=${p}"
-          if [[ -z "${best}" ]] || awk "BEGIN{exit !(${p} < ${best})}"; then
-            best="${p}"
-          fi
+          vals="${vals}${vals:+ }${p}"
         done
-        printf "  %-10s %-4s  best=%s ms  (%s)\n" "${arm}" "${fmt}" "${best:-?}" "${rounds:-no p50}"
+        if [[ -n "${vals}" ]]; then
+          read -r med lo hi < <(printf '%s\n' ${vals} | median_spread)
+          n_rounds="$(printf '%s\n' ${vals} | wc -l | tr -d ' ')"
+          short=""
+          [[ "${n_rounds}" != "${ROUNDS}" ]] && short=" [only ${n_rounds}/${ROUNDS} rounds]"
+          printf "  %-10s %-4s  median=%s ms  spread=[%s,%s]  (%s)%s\n" \
+            "${arm}" "${fmt}" "${med}" "${lo}" "${hi}" "${rounds}" "${short}"
+        else
+          printf "  %-10s %-4s  median=?  (no p50)\n" "${arm}" "${fmt}"
+        fi
       done
     done
   } | tee "${out_dir}/summary.txt"

@@ -1,23 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! HAL V4L2 mem2mem JPEG (e.g. mxc-jpeg) → NV12 + HAL OpenGL letterbox.
+//! HAL V4L2 mem2mem JPEG (e.g. mxc-jpeg) + HAL **CPU** convert — the
+//! CPU-second-pass variant of `hal_v4l2_gl` for the i.MX 95 hardware-decode
+//! table.
 //!
-//! Forces `EDGEFIRST_FORCE_BACKEND=opengl` and leaves V4L2 enabled. For the
-//! i.MX 95 hardware-decode table:
-//!
-//! - `--decode-only` — V4L2 JPEG → native NV*/GREY, no convert: the row for
-//!   consumers that take NV12 directly.
-//! - `--full-res-convert` — adds the full-resolution NV*→RGB GPU convert:
-//!   the full cost for RGB consumers. The mxc-jpeg block does no
-//!   colour-space conversion (its RGB capture formats serve only
-//!   RGB-encoded JPEGs), so this second pass is not optional for RGB.
-//!   `hal_v4l2_cpu` is the CPU-convert counterpart. The decode/convert
-//!   split is reported per run.
-//!
-//! Startup asserts a V4L2 JPEG device is actually present so the arm fails
-//! loudly off-target instead of silently publishing CPU-decode numbers under
-//! a hardware label.
+//! The mxc-jpeg block performs no colour-space conversion (verified on-target
+//! via `VIDIOC_ENUM_FMT`: its RGB capture formats serve only RGB-encoded
+//! JPEGs; YCbCr streams decode to NV12/YUYV/YUV3/GREY per their sampling),
+//! so an RGB consumer pays a second pass. Run this arm with
+//! `--full-res-convert` to measure hardware decode + full-resolution
+//! NV*→RGB on the CPU; `hal_v4l2_gl --full-res-convert` is the GPU-convert
+//! counterpart, and `--decode-only` is the stop-at-NV12 row. The per-frame
+//! decode/convert split is reported either way.
 
 use clap::Parser;
 use edgefirst_bench_common::{run_hal_module, BenchArgs, DecodeFmt, HalModuleConfig};
@@ -40,9 +35,9 @@ fn main() -> anyhow::Result<()> {
     );
     run_hal_module(
         HalModuleConfig {
-            class: "hw_gl",
-            module: "hal_v4l2_gl",
-            force_backend: "opengl",
+            class: "hw_cpu",
+            module: "hal_v4l2_cpu",
+            force_backend: "cpu",
             disable_v4l2: false,
             prefer_heap_src: false,
         },

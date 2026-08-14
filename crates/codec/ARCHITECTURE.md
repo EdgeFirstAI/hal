@@ -79,6 +79,18 @@ dependency graph clean.
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
+Both hardware backends expose crate-level runtime probes —
+`edgefirst_codec::v4l2_available()` (opens and drops the first working
+decoder device; honours `EDGEFIRST_DISABLE_V4L2`) and
+`edgefirst_codec::nvjpeg_available()` (honours the `EDGEFIRST_ENABLE_NVJPEG`
+opt-in) — for consumers that must fail fast rather than silently fall back
+to the CPU decoder (e.g. the hardware-decode benchmark arms). Routing note:
+hardware decoders are only attempted when no fused output is requested
+(`allow_hw = output_fmt == native_fmt`); a fused `Rgb`/`Nv12` preference
+selects the CPU decoder even when a hardware backend is available. nvJPEG,
+whose fixed output is interleaved RGB, engages under a `native` request and
+reconfigures the destination to `Rgb` itself.
+
 ### nvJPEG Backend Module Map (`jpeg/nvjpeg/`, Linux + `nvjpeg` feature)
 
 | Module        | Purpose                                                |

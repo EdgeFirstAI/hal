@@ -23,6 +23,7 @@ Inline `#[cfg(test)]` modules in each source file:
 | `jpeg/idct.rs`        | Selected-tier dispatch; coefficients that overflow the 16-bit dequant neither panic under overflow checks nor write outside the block |
 | `jpeg/v4l2/format.rs` | `classify()` CAPTURE FourCC → `CapKind`             |
 | `jpeg/v4l2/mod.rs`    | Backend helpers (geometry/format negotiation logic) |
+| `tests/v4l2_jpeg.rs` (`v4l2_available_probe_honours_disable_env`) | Public `v4l2_available()` probe (Linux lanes; compile-time `false` elsewhere): answers without panicking, `EDGEFIRST_DISABLE_V4L2` forces `false` — the fail-fast guard for the `hal_v4l2_*` benchmark arms |
 | `jpeg/nvjpeg/mod.rs`  | Graceful degradation without a GPU: a non-CUDA destination falls through untouched, an unavailable or unprobed probe returns `None` without writing the tensor, circuit-breaker threshold sanity |
 
 ### Integration Tests
