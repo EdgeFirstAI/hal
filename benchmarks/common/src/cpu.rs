@@ -113,6 +113,36 @@ impl CpuPeakTracker {
     }
 }
 
+/// Advisory scheduling hint for boards with no `taskset`-equivalent (macOS):
+/// bias the calling thread toward the performance cores and away from being
+/// pre-empted by lower-QoS background work. Not a hard pin — the scheduler
+/// can still migrate the thread — but it's the best substitute available on
+/// Apple Silicon, where unpinned P-core/E-core migration between rounds is a
+/// measured source of extra spread (see BENCHMARKS.md's mbp-m2-max
+/// discussion). Call once, before the timed loop. No-op on non-macOS.
+#[cfg(target_os = "macos")]
+pub fn pin_qos() {
+    // QOS_CLASS_USER_INTERACTIVE = 0x21, from Apple's <pthread/qos.h>; no
+    // `libc`-crate binding exists for this Apple-specific API, so it's
+    // declared directly.
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    const QOS_CLASS_USER_INTERACTIVE: qos_class_t = 0x21;
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    // SAFETY: FFI call with no pointer arguments; a nonzero return (e.g. the
+    // thread already has an explicit QoS class) is advisory-only and safe to
+    // ignore — this is a best-effort scheduling hint, not a correctness
+    // requirement.
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn pin_qos() {}
+
 fn proc_hz() -> f64 {
     // POSIX clocks per second; 100 on virtually every Linux embedded target.
     unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 }.max(1.0)

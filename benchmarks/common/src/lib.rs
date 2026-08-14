@@ -5,7 +5,7 @@
 
 mod cpu;
 
-pub use cpu::{CpuPeakTracker, CpuSnapshot, CpuStats};
+pub use cpu::{pin_qos, CpuPeakTracker, CpuSnapshot, CpuStats};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -463,6 +463,7 @@ fn prepare_convert(
 /// TurboJPEG `--decode-only`; convert / letterbox is preprocessing and is not
 /// included.
 pub fn run_hal_module(cfg: HalModuleConfig, args: &BenchArgs) -> Result<TimingStats> {
+    cpu::pin_qos();
     cfg.apply_env();
 
     let mut tracing_active = false;

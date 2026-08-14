@@ -120,6 +120,7 @@ static const char *wuffs_decode_one(WuffsBench *b, const CbenchImage *img) {
 }
 
 int main(int argc, char **argv) {
+    cbench_pin_qos();
     CbenchArgs args = cbench_parse_args(argc, argv);
     if (strcmp(args.format, "rgb") != 0)
         cbench_die("--format must be rgb (this arm decodes via Wuffs' RGB-family swizzles)");

@@ -39,6 +39,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
+/* macOS has no taskset-equivalent core pinning; see cbench.h's identical
+ * helper for the reasoning (this binary doesn't include cbench.h, so it
+ * gets its own copy). Advisory only, no-op on non-Apple platforms. */
+static void bench_pin_qos(void) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
 /* --- TurboJPEG ABI (subset). Values from turbojpeg.h. ------------------- */
 #define TJPF_RGB 0
 #define TJPF_BGR 1
@@ -341,6 +354,7 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
+    bench_pin_qos();
     const char *coco = getenv("EDGEFIRST_BENCH_COCO");
     const char *board = "unknown";
     const char *format = "yuv";

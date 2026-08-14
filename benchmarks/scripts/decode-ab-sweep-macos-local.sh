@@ -11,15 +11,21 @@
 # (results/mbp-m2-max/decode-ab-sweep/<corpus>/summary.txt) as the real
 # sweep — see BENCHMARKS.md § JPEG Decode for how these numbers are used.
 #
-# macOS has no taskset-equivalent, so this runs unpinned; see BENCHMARKS.md's
-# discussion of the resulting spread on this board specifically.
+# macOS has no taskset-equivalent hard pin; every arm's main() calls an
+# advisory QOS_CLASS_USER_INTERACTIVE hint instead (see
+# benchmarks/common/src/cpu.rs::pin_qos and the matching copies in
+# rust_jpeg/turbojpeg/cbench.h) and this script defaults to 5 rounds instead
+# of 3 to average out more of what the hint can't fix. See BENCHMARKS.md's
+# discussion of this board's spread.
 #
 # Usage:
 #   ./benchmarks/scripts/decode-ab-sweep-macos-local.sh /path/to/coco/val2017
 #   ./benchmarks/scripts/decode-ab-sweep-macos-local.sh /path/to/corpora/val2017-yuv420
 #
 # Env:
-#   LIMIT / WARMUP / ROUNDS   as decode-ab-sweep.sh (default 200 / 20 / 3)
+#   LIMIT / WARMUP / ROUNDS   as decode-ab-sweep.sh (default 200 / 20 / 5;
+#                             ROUNDS defaults higher here than the Linux
+#                             boards' 3, to compensate for unpinned scheduling)
 #   SKIP_BUILD=1              skip the cargo/make build step (binaries already built)
 
 set -euo pipefail
@@ -29,7 +35,7 @@ BENCH_WS="${ROOT}/benchmarks"
 RESULTS="${BENCH_WS}/results"
 LIMIT="${LIMIT:-200}"
 WARMUP="${WARMUP:-20}"
-ROUNDS="${ROUNDS:-3}"
+ROUNDS="${ROUNDS:-5}"
 
 if [[ $# -ne 1 ]]; then
   echo "usage: $0 <coco-dir>" >&2
@@ -56,6 +62,24 @@ fi
 
 out_dir="${RESULTS}/mbp-m2-max/decode-ab-sweep/${CORPUS_NAME}"
 mkdir -p "${out_dir}"
+
+# Provenance (review v3.12 §1.3/§4.10): captured once before the round loop.
+# Power/thermal state matters on a MacBook in a way it doesn't on a plugged
+# board — AC vs battery, Low Power Mode, and chassis thermal state all move
+# these numbers.
+{
+  echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "host: $(hostname)  macOS $(sw_vers -productVersion 2>/dev/null)  $(uname -m)"
+  echo "cpu: $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  echo "compiler: $(cc --version 2>/dev/null | head -1)"
+  echo "rustc: $(rustc --version 2>/dev/null)"
+  turbo_ver="$(brew list --versions jpeg-turbo 2>/dev/null || echo 'not via Homebrew')"
+  echo "libjpeg-turbo: ${turbo_ver}"
+  echo "power: $(pmset -g batt 2>/dev/null | head -1)"
+  echo "low power mode: $(pmset -g 2>/dev/null | awk '/lowpowermode/{print $2}')"
+  pmset -g therm 2>/dev/null || echo "thermal: no warning level recorded"
+} > "${out_dir}/provenance.txt"
+cat "${out_dir}/provenance.txt"
 
 parse_p50() {
   grep -oE 'p50=[0-9.]+ ms' "$1" | head -1 | sed -E 's/p50=([0-9.]+) ms/\1/'

@@ -31,6 +31,26 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
+/* macOS has no taskset-equivalent core pinning, and unpinned P-core/E-core
+ * migration between rounds is a real, measured source of extra spread on
+ * mbp-m2-max (see BENCHMARKS.md's discussion of this board's Max-spread
+ * column). QOS_CLASS_USER_INTERACTIVE is an *advisory* hint, not a hard
+ * affinity pin — the scheduler is still free to migrate the thread — but it
+ * biases toward the performance cores and away from being pre-empted by
+ * lower-QoS background work, which is the best available substitute for
+ * taskset on this platform. Call once, before the timed loop. No-op
+ * (including on non-Apple platforms, where taskset does the real job).
+ */
+static void cbench_pin_qos(void) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, format(printf, 1, 2)))
 #endif

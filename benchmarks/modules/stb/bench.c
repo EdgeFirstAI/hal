@@ -38,6 +38,7 @@
 #pragma GCC diagnostic pop
 
 int main(int argc, char **argv) {
+    cbench_pin_qos();
     CbenchArgs args = cbench_parse_args(argc, argv);
     if (strcmp(args.format, "rgb") != 0)
         cbench_die("--format must be rgb (stb_image exposes no raw-YUV output)");
