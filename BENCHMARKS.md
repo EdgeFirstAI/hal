@@ -615,8 +615,14 @@ EdgeFirst p50, YUV arm):
 | mbp-m2-max | 1.41× | 1.37× | 1.49× | 1.32× | 1.40× | 1.41× |
 
 (val2017-yuv420, CLIC 4:2:0, and CLIC 4:2:0-dri re-captured for this revision
-alongside the new RGB arm below; the shift from the previous capture is
-within normal round-to-round variance — see the Max spread discussion
+alongside the new RGB arm below. The YUV shift from the previous capture
+(e.g. x86 val2017-yuv420 1.12× → 1.15×) is attributed to measurement
+variance, not to the `write_rgb_rows_420` change — confirmed by inspecting
+the diff: the fused-RGB path added new code (`write_rgb_rows_420`,
+`expand_row_2x`, the `is_native_420` guard) without touching
+`write_nv12_rows`/`write_nv16_nv24_rows`, which is what the YUV arm decodes
+through on every corpus. The shift is within the round-to-round spread this
+document already measures and publishes — see the Max spread discussion
 above.)
 
 EdgeFirst leads or ties every cell. The two 1.00× cells — both on the
@@ -637,8 +643,17 @@ narrow or reverse (turbo's SIMD chroma upsampling is strongest there). It
 is now measured, using a 2×2 nearest-neighbour (box) chroma upsample fused
 into the write — not libjpeg's fancy/triangle filter, a deliberate
 speed/accuracy tradeoff (44–50 dB PSNR vs a reference decode, see the JPEG
-Decode arm table). EdgeFirst's accurate-class RGB lead (turbo `islow` p50 ÷
-EdgeFirst p50) on the two native-4:2:0 corpora:
+Decode arm table). **The box upsample is opt-in, not the default**: it only
+engages behind `set_output_format(Some(Rgb))` (Rust) /
+`hal_codec_set_output_format(HAL_PIXEL_FORMAT_RGB)` (C) /
+`set_output_format(PixelFormat.Rgb)` (Python) — the same explicit gate every
+fused decode output already goes through. A caller who never calls that API
+gets the native `Nv12` decode (no chroma resampling of any kind) regardless
+of subsampling, so "EdgeFirst's default RGB output" is not a phrase that
+applies here — there is no default RGB output; RGB is always a caller
+request, and this document's headline default-vs-default claims (the IDCT
+accuracy class) are unaffected by it. EdgeFirst's accurate-class RGB lead
+(turbo `islow` p50 ÷ EdgeFirst p50) on the two native-4:2:0 corpora:
 
 | Board | val2017-yuv420 RGB | CLIC 4:2:0 RGB | CLIC 4:2:0-dri RGB |
 |-------|---------------------|-----------------|---------------------|
@@ -682,6 +697,12 @@ arms). COCO val2017, YUV/RGB p50 ms, median of rounds; **bold** = fastest:
 | | | RGB | **1.700** | 1.997 | 2.427 | 2.622 | 3.178 | 3.027 |
 | aws-c7a | Genoa (Zen 4) | YUV | **1.440** | 1.656 | 2.133 | — | — | — |
 | | | RGB | **1.539** | 1.742 | 2.084 | 2.311 | 3.193 | 2.770 |
+
+The Wuffs column above is measured on its 3-byte-swizzle path, same as the
+board tables — see § JPEG Decode's "floor" bullet for the 1.52–1.59× penalty
+this costs it versus its native 4-byte output; the container matrix does
+not carry an `EDGEFIRST_WUFFS_FORCE_4BPP` cell, so read the Wuffs numbers
+here with that caveat rather than at face value.
 
 EdgeFirst's accurate-class lead (turbo `islow` p50 ÷ EdgeFirst p50) across
 all six corpora — YUV and, new in this revision, the fused-RGB arm on the
@@ -888,14 +909,22 @@ Per-board libjpeg-turbo package and compiler, from each host's
 | rpi5-hailo | A76 | 1:2.1.5-4 | Raspberry Pi OS / Debian apt (`libturbojpeg0`) | GCC 14.2.0 |
 | orin-nano (adis-uav1 stand-in) | A78AE | 2.1.2-0ubuntu1 | Ubuntu apt (`libturbojpeg`) | GCC 11.4.0 |
 | x86-desktop (sebstation) | Rocket Lake | 1:2.1.5-4ubuntu4 | Ubuntu apt (`libturbojpeg0`) | GCC 15.2.0 |
+| mbp-m2-max | M2 Max | 3.2.0 (bottled) | Homebrew (`jpeg-turbo`) | Apple clang 21.0.0 (macOS 27.0) |
 
-None of the five hosts actually runs libjpeg-turbo 3.2+ — the newest are
-3.0.1/3.1.2 (imx8mp/imx95-pro, both pre-dating the GNU-assembler NEON
-removal), the rest are the older 2.1.x series. The 3.2 NEON-assembler-removal
-risk named above is a real thing to check on *future* re-captures (especially
-if a board image updates its `libturbojpeg0` package), but it is not in play
-for any number in this document today — every ARM host here has its classic
-GNU-assembler NEON kernels intact.
+Six of six hosts now have full provenance. None of the five Linux/Yocto
+hosts run libjpeg-turbo 3.2+ — the newest are 3.0.1/3.1.2 (imx8mp/imx95-pro,
+both pre-dating the GNU-assembler NEON removal), the rest are the older
+2.1.x series. The 3.2 NEON-assembler-removal risk named above is a real
+thing to check on *future* Linux re-captures (especially if a board image
+updates its `libturbojpeg0` package), but it is not in play for any Linux
+number in this document today — every Linux/aarch64 host here has its
+classic GNU-assembler NEON kernels intact. mbp-m2-max is a separate case:
+its Homebrew bottle is turbo 3.2.0, but the GNU-assembler removal is a
+Linux/Android toolchain concern (inline `.S` files invoked from GCC/Clang on
+those platforms) — Apple's toolchain has always built libjpeg-turbo's
+Arm SIMD kernels through the C-intrinsics path, not the GAS one, so the 3.2
+change doesn't apply to it the same way. Not independently verified from the
+bottle's build logs; flagged here rather than asserted as fact.
 
 ### Reproduce
 
@@ -938,14 +967,12 @@ make -C benchmarks/modules/turbojpeg
 # IDCT kernel microbenchmark
 cargo test -p edgefirst-codec --release -- --ignored --nocapture idct_kernel_cost
 
-# mbp-m2-max: no SSH target (this machine IS the board) — build natively and
-# run each arm directly against a local corpus copy, unpinned (no
-# taskset-equivalent on macOS). See benchmarks/results/mbp-m2-max/decode-ab-sweep/
-# for the captured summaries; there is no committed local-runner script
-# (the boards above are the reproducible path) — mirror decode-ab-sweep.sh's
-# per-arm commands with EDGEFIRST_BENCH_COCO pointed at a local corpus dir.
-cargo build --release -p hal_cpu -p rust_jpeg
-make -C benchmarks/modules/turbojpeg && make -C benchmarks/modules/stb && make -C benchmarks/modules/wuffs
+# mbp-m2-max: no SSH target (this machine IS the board) — same methodology,
+# eight arms, interleaved rounds, run directly against a local corpus copy.
+# Builds hal_cpu/rust_jpeg/turbojpeg_bench/stb_bench/wuffs_bench itself
+# (SKIP_BUILD=1 to reuse existing binaries). Unpinned — macOS has no
+# taskset-equivalent; see BENCHMARKS.md's discussion of this board's spread.
+./benchmarks/scripts/decode-ab-sweep-macos-local.sh /path/to/coco/val2017
 
 # Wuffs 3-byte-swizzle-vs-4-byte-native A/B (see the JPEG Decode "floor" bullet)
 EDGEFIRST_WUFFS_FORCE_4BPP=1 EDGEFIRST_BENCH_COCO=/path/to/coco/val2017 \
