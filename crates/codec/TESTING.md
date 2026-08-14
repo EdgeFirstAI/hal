@@ -15,7 +15,7 @@ Inline `#[cfg(test)]` modules in each source file:
 | `jpeg/bitstream.rs`   | Bit read, byte-stuffing, sign extension             |
 | `jpeg/huffman.rs`     | Table build, symbol decode, block decode; malformed DHT rejection (truncated values, oversubscribed code lengths) |
 | `jpeg/markers.rs`     | Minimal JPEG parse, invalid data rejection          |
-| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average); UV interleave / downsample SIMD parity; truncated scan rejected rather than decoded as zero blocks; fused `Rgb` output matches NV24 + row conversion (`fused_rgb_matches_nv24_plus_row_conversion`) and is refused for non-4:4:4 sources (`fused_rgb_rejects_subsampled_sources`) |
+| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average); UV interleave / downsample SIMD parity; truncated scan rejected rather than decoded as zero blocks; fused `Rgb` matches NV24/NV12 decode + row conversion for both 4:4:4 and native 4:2:0 sources (`expand_row_2x` box upsample); fused `Rgb` rejected for non-4:4:4/non-4:2:0 subsamplings (e.g. true 4:2:2) |
 | `jpeg/color.rs`       | YCbCr→RGB scalar vs float (±1); dispatch bit-exact vs scalar |
 | `jpeg/cpu.rs`         | `NeonTier` / `IntelTier` probe sanity + entropy helpers |
 | `jpeg/idct/scalar.rs` | DC-only shortcut, known coefficient IDCT            |

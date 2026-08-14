@@ -20,8 +20,9 @@ available. This keeps the decode path branch-free and lets a single
 `convert()` fold all the geometry/colour work into one pass.
 
 One measured exception: `ImageDecoder::set_output_format` lets a caller opt
-into a **pure CPU fused decode output** — `Rgb` (4:4:4 sources) or `Nv12`
-(any colour source) — where the conversion happens inside the software MCU
+into a **pure CPU fused decode output** — `Rgb` (4:4:4 or native 4:2:0
+sources) or `Nv12` (any colour source) — where the conversion happens inside
+the software MCU
 write stage (not a GPU hybrid). Callers still run `ImageProcessor::convert()`
 afterward for model-input preprocessing. See
 [Fused Decode Output](#fused-decode-output-opt-in-pure-cpu).
@@ -75,7 +76,7 @@ dependency graph clean.
 | `idct/neon.rs`   | NEON 8×8 IDCT on 16-bit coefficients: 8-lane dequant, lane-indexed `vmull` Loeffler butterfly, sparse bottom-row/right-column shortcuts, register-resident workspace |
 | `idct/sse2.rs`   | x86 8×8 IDCT: 16-bit-lane `islow` Loeffler, `pmullw` dequant + `pmaddwd` butterflies (shared by all Intel tiers) |
 | `idct/avx2.rs`   | VEX-encoded build of the `sse2.rs` kernel |
-| `mcu.rs`         | MCU decode loops — dedicated 4:4:4 1×1 direct loop (`decode_image_444_direct`: tables resolved to plain locals, no sampling loops; the generic loop's frame spilled past the register file and cost 4–8% on every core) + generic sampling loop — `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample), chroma downsample for the non-matching subsamplings (`avg_block`) |
+| `mcu.rs`         | MCU decode loops — dedicated 4:4:4 1×1 direct loop (`decode_image_444_direct`: tables resolved to plain locals, no sampling loops; the generic loop's frame spilled past the register file and cost 4–8% on every core) + generic sampling loop — `McuScratch`, native `Grey`/`Nv12`/`Nv16`/`Nv24` row writes, fused `Rgb`/`Nv12` writes (NEON/SSE chroma downsample for `Nv12`; `write_rgb_rows_420` box-upsamples native 4:2:0 chroma into `Rgb`), chroma downsample for the non-matching subsamplings (`avg_block`) |
 | `v4l2/`          | Optional Linux hardware JPEG backend (see below)     |
 | `nvjpeg/`        | Optional nvJPEG GPU backend (Linux + CUDA, see below) |
 
@@ -147,15 +148,25 @@ backends are bypassed so the CPU path can honour the preference.
 and silently falls back to native otherwise, so callers can set it
 unconditionally:
 
-- **`Rgb`** — 4:4:4 colour JPEGs only (every component at full resolution, so
-  no chroma resampling is needed). Standard 1×1 sampling converts each MCU
-  through the `color.rs` YCbCr→RGB kernel as it is produced (no planar
-  scratch); other 4:4:4 MCU sizes still convert a full MCU-row band via
-  `write_rgb_rows`. The kernel is Q14 fixed point on the `SQRDMULH`
-  rounding-doubling high-half multiply (baseline ASIMD, so the same kernel
-  runs A53 → Apple Silicon), `vst3` interleaved stores, and a scalar path
-  that reproduces the arithmetic bit-for-bit. Other subsamplings fall back to
-  native NV output.
+- **`Rgb`** — 4:4:4 colour JPEGs (every component at full resolution, so no
+  chroma resampling is needed) and native 4:2:0 colour JPEGs (`mcu::is_native_420`:
+  luma 2×2, both chroma 1×1 — the dominant real-world subsampling). For 4:4:4,
+  standard 1×1 sampling converts each MCU through the `color.rs` YCbCr→RGB
+  kernel as it is produced (no planar scratch); other 4:4:4 MCU sizes still
+  convert a full MCU-row band via `write_rgb_rows`. The kernel is Q14 fixed
+  point on the `SQRDMULH` rounding-doubling high-half multiply (baseline
+  ASIMD, so the same kernel runs A53 → Apple Silicon), `vst3` interleaved
+  stores, and a scalar path that reproduces the arithmetic bit-for-bit. For
+  native 4:2:0, `write_rgb_rows_420` does a 2×2 **nearest-neighbour (box)**
+  chroma upsample — not libjpeg's fancy/triangle filter — into two reused
+  `McuScratch` rows, then calls the same `ycbcr_to_rgb_row` kernel (one
+  upsample pass serves the 2 luma rows a chroma sample covers, since
+  nearest-neighbour repeats it vertically too). Box upsampling is a
+  deliberate speed tradeoff, measured at 44–50 dB PSNR / max pixel delta
+  20–24 against PIL's fancy-upsampled reference on the COCO-family test
+  fixtures (`examples/dump_rgb420.rs`) — comparable to the existing
+  accurate-vs-`fast`-DCT accuracy cost (see BENCHMARKS.md). Other
+  subsamplings (4:2:2, 4:1:1, ...) fall back to native NV output.
 - **`Nv12`** — any colour JPEG. 4:2:0 passes through; 4:4:4 is 2×2
   box-averaged and 4:2:2 vertically averaged with NEON row kernels at the
   write stage.
@@ -331,8 +342,11 @@ The custom baseline JPEG decoder processes images through these stages:
       chroma never lands in the planar scratch. With fused `Rgb` on that same
       1×1 path, `ycbcr_to_rgb_blocks` converts paired 8×8 MCUs through
       `color.rs` (16-pixel `vst3q_u8` NEON, one dispatch per pair) instead of
-      a second full-row pass. Other fused RGB (non-1×1 4:4:4) still uses
-      `write_rgb_rows`. All write at the tensor's `effective_row_stride()`.
+      a second full-row pass. Other fused RGB on a 4:4:4-equivalent source
+      still uses `write_rgb_rows`; fused RGB on a native 4:2:0 source uses
+      `write_rgb_rows_420` (box chroma upsample, see [Fused Decode
+      Output](#fused-decode-output-opt-in-pure-cpu)). All write at the
+      tensor's `effective_row_stride()`.
 5. **Return** `ImageInfo` with decoded dimensions, native format, row stride,
    and the reported EXIF orientation.
 

@@ -88,8 +88,12 @@ impl ImageDecoder {
     /// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG
     /// are bypassed whenever the resolved output differs from native.
     ///
-    /// - `Some(Rgb)`: 4:4:4 colour JPEGs decode straight to interleaved RGB.
-    ///   Other sources fall back to native.
+    /// - `Some(Rgb)`: 4:4:4 colour JPEGs decode straight to interleaved RGB
+    ///   (no chroma resampling); native 4:2:0 colour JPEGs also decode
+    ///   straight to RGB, with a 2×2 nearest-neighbour (box) chroma upsample
+    ///   fused into the write — not libjpeg's fancy/triangle upsampling, a
+    ///   deliberate speed tradeoff (see BENCHMARKS.md). Other sources (4:2:2,
+    ///   non-standard subsamplings) fall back to native.
     /// - `Some(Nv12)`: colour JPEGs decode to NV12, downsampling chroma at
     ///   the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
     /// - `None` (default): native format (`Nv12`/`Nv16`/`Nv24`/`Grey`).

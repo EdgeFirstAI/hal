@@ -22,6 +22,11 @@ pub struct McuScratch {
     /// Per-component IDCT output buffers for one MCU row band. Indexed by
     /// component, each `mcus_x * sampling.h * 8` wide × `sampling.v * 8` tall.
     component_bufs: Vec<Vec<u8>>,
+    /// Full-width horizontally-upsampled Cb/Cr rows for the fused 4:2:0→RGB
+    /// write (see `write_rgb_rows_420`). Empty until first grown by
+    /// `ensure_capacity`/`new` for an image wide enough to need them.
+    upsample_cb: Vec<u8>,
+    upsample_cr: Vec<u8>,
 }
 
 impl McuScratch {
@@ -35,7 +40,12 @@ impl McuScratch {
             let row_pixels = hdr.mcus_x() * mcu_w;
             component_bufs.push(vec![0u8; row_pixels * mcu_h]);
         }
-        Self { component_bufs }
+        let img_w = hdr.width as usize;
+        Self {
+            component_bufs,
+            upsample_cb: vec![0u8; img_w],
+            upsample_cr: vec![0u8; img_w],
+        }
     }
 
     /// Grow buffers if needed (for a larger image than previously seen).
@@ -50,7 +60,27 @@ impl McuScratch {
                 self.component_bufs[i].resize(buf_size, 0);
             }
         }
+        let img_w = hdr.width as usize;
+        if self.upsample_cb.len() < img_w {
+            self.upsample_cb.resize(img_w, 0);
+            self.upsample_cr.resize(img_w, 0);
+        }
     }
+}
+
+/// True for the canonical 4:2:0 shape: 3 components, luma sampled 2×2, both
+/// chroma components sampled 1×1 (i.e. chroma is exactly half resolution on
+/// both axes). This is the dominant real-world JPEG subsampling and the one
+/// [`write_rgb_rows_420`] targets; anything else (4:2:2, 4:1:1, non-standard
+/// factors) still falls back to native output for a fused RGB request.
+pub(crate) fn is_native_420(hdr: &crate::jpeg::types::ImageHeader) -> bool {
+    hdr.components.len() == 3
+        && hdr.max_h_samp == 2
+        && hdr.max_v_samp == 2
+        && hdr.components[0].sampling.h == 2
+        && hdr.components[0].sampling.v == 2
+        && hdr.components[1].sampling == crate::jpeg::types::SamplingFactor { h: 1, v: 1 }
+        && hdr.components[2].sampling == crate::jpeg::types::SamplingFactor { h: 1, v: 1 }
 }
 
 /// Decode all MCUs and write output pixels into `dst` on a fixed **physical
@@ -89,19 +119,23 @@ pub fn decode_image(
     // checks (not `debug_assert!`) because `decode_image` is public and takes a
     // caller-supplied `dst`/`grid_row_stride`: malformed/untrusted dimensions
     // must return an error, not panic or write out of bounds in release builds.
-    // Fused RGB output (COCO fast path): only offered for 4:4:4 sources where
-    // every component is full resolution (sampling == max on both axes, e.g.
-    // 1×1 everywhere, or the 1×2-everywhere variant), so the write stage is a
-    // straight per-row YCbCr→RGB conversion with no chroma resampling.
+    // Fused RGB output: offered for two source shapes. 4:4:4-equivalent
+    // (every component full resolution — sampling == max on both axes, e.g.
+    // 1×1 everywhere, or the 1×2-everywhere variant) needs a straight per-row
+    // YCbCr→RGB conversion with no chroma resampling. Native 4:2:0 (luma 2×2,
+    // chroma 1×1 — the dominant real-world subsampling) needs a 2×2 nearest
+    // chroma upsample folded into the same write (see `write_rgb_rows_420`).
+    // Anything else (4:2:2, 4:1:1, ...) still falls back to native output.
     let is_rgb = output_format == PixelFormat::Rgb;
-    if is_rgb
-        && (num_components != 3
-            || hdr
+    if is_rgb {
+        let all_match_max = num_components == 3
+            && hdr
                 .components
                 .iter()
-                .any(|c| c.sampling.h != hdr.max_h_samp || c.sampling.v != hdr.max_v_samp))
-    {
-        return Err(CodecError::UnsupportedFormat(output_format));
+                .all(|c| c.sampling.h == hdr.max_h_samp && c.sampling.v == hdr.max_v_samp);
+        if !all_match_max && !is_native_420(hdr) {
+            return Err(CodecError::UnsupportedFormat(output_format));
+        }
     }
 
     let writes_only_luma = num_components == 1 || output_format == PixelFormat::Grey;
@@ -725,7 +759,28 @@ where
             }
         }
 
-        if is_rgb {
+        if is_rgb && is_native_420(hdr) {
+            let _w =
+                tracing::trace_span!("codec.decode_jpeg.write_rgb_420", row = mcu_row).entered();
+            let y_stride = mcus_x * hdr.max_h_samp as usize * 8;
+            let c_stride = mcus_x * hdr.components[1].sampling.h as usize * 8;
+            // Chroma-row offset of the component buffer's local row 0, same
+            // addressing as `write_nv12_rows`'s native-4:2:0 passthrough.
+            let band_src0 = y_start / 2;
+            write_rgb_rows_420(
+                &scratch.component_bufs,
+                y_stride,
+                c_stride,
+                &mut scratch.upsample_cb,
+                &mut scratch.upsample_cr,
+                dst,
+                grid_row_stride,
+                y_start,
+                num_rows,
+                img_w,
+                band_src0,
+            );
+        } else if is_rgb {
             let _w = tracing::trace_span!("codec.decode_jpeg.write_rgb", row = mcu_row).entered();
             // All components sample at max rate (checked above) → one shared
             // full-resolution buffer stride.
@@ -946,6 +1001,91 @@ fn write_rgb_rows(
             &mut dst[d..d + img_w * 3],
             img_w,
         );
+    }
+}
+
+/// Nearest-neighbour horizontal 2× upsample: `src[i]` → `dst[2i]`,
+/// `dst[2i+1]`. `dst.len()` may be odd (an odd image width), in which case
+/// the last source sample contributes only the final `dst` entry.
+#[inline]
+fn expand_row_2x(src: &[u8], dst: &mut [u8]) {
+    let pairs = dst.len() / 2;
+    for i in 0..pairs {
+        let v = src[i];
+        dst[i * 2] = v;
+        dst[i * 2 + 1] = v;
+    }
+    if dst.len() % 2 == 1 {
+        dst[pairs * 2] = src[pairs];
+    }
+}
+
+/// Write interleaved RGB rows for a native 4:2:0 source (see
+/// [`is_native_420`]): a 2×2 nearest-neighbour chroma upsample fused into the
+/// YCbCr→RGB write, reusing [`crate::jpeg::color::ycbcr_to_rgb_row`]'s SIMD
+/// kernels on the upsampled row rather than hand-writing a subsampled colour
+/// kernel. Luma is full resolution (`y_stride`-wide band); Cb/Cr are half
+/// resolution on both axes (`c_stride`-wide, one chroma row serves 2 luma
+/// rows) — nearest-neighbour vertical upsampling means the same expanded
+/// chroma row is reused for both, halving the upsample work versus expanding
+/// every luma row independently.
+///
+/// This is a *box* upsample (replicate, matching the existing chroma
+/// *downsample* kernels' box-average philosophy), not libjpeg's fancy
+/// (triangle-filtered) upsampling — a deliberate accuracy/speed tradeoff
+/// documented in BENCHMARKS.md alongside its measured cost.
+///
+/// `upsample_cb`/`upsample_cr` are reused scratch rows (`McuScratch`), each
+/// at least `img_w` bytes. `band_src0` is the chroma-row offset of the
+/// component buffers' local row 0 in the full-image chroma grid (`y_start /
+/// 2`, matching `write_nv12_rows`'s native-4:2:0 addressing).
+#[allow(clippy::too_many_arguments)]
+fn write_rgb_rows_420(
+    comp_bufs: &[Vec<u8>],
+    y_stride: usize,
+    c_stride: usize,
+    upsample_cb: &mut [u8],
+    upsample_cr: &mut [u8],
+    dst: &mut [u8],
+    grid_row_stride: usize,
+    y_start: usize,
+    num_rows: usize,
+    img_w: usize,
+    band_src0: usize,
+) {
+    let (y_buf, cb_buf, cr_buf) = (&comp_bufs[0], &comp_bufs[1], &comp_bufs[2]);
+    let chroma_w = img_w.div_ceil(2);
+
+    let mut row = 0usize;
+    while row < num_rows {
+        let global_luma_row = y_start + row;
+        let c_local_row = global_luma_row / 2 - band_src0;
+        let c_off = c_local_row * c_stride;
+        expand_row_2x(&cb_buf[c_off..c_off + chroma_w], &mut upsample_cb[..img_w]);
+        expand_row_2x(&cr_buf[c_off..c_off + chroma_w], &mut upsample_cr[..img_w]);
+
+        let s0 = row * y_stride;
+        let d0 = (y_start + row) * grid_row_stride;
+        crate::jpeg::color::ycbcr_to_rgb_row(
+            &y_buf[s0..s0 + img_w],
+            &upsample_cb[..img_w],
+            &upsample_cr[..img_w],
+            &mut dst[d0..d0 + img_w * 3],
+            img_w,
+        );
+
+        if row + 1 < num_rows {
+            let s1 = s0 + y_stride;
+            let d1 = d0 + grid_row_stride;
+            crate::jpeg::color::ycbcr_to_rgb_row(
+                &y_buf[s1..s1 + img_w],
+                &upsample_cb[..img_w],
+                &upsample_cr[..img_w],
+                &mut dst[d1..d1 + img_w * 3],
+                img_w,
+            );
+        }
+        row += 2;
     }
 }
 
@@ -1775,10 +1915,11 @@ mod tests {
         assert_eq!(diffs, 0, "y_direct luma differs from scratch-copied luma");
     }
 
-    /// Fused RGB is refused for non-4:4:4 sources.
+    /// Fused RGB is refused for sources that are neither 4:4:4-equivalent nor
+    /// native 4:2:0 — e.g. true 4:2:2 (horizontal-only chroma subsampling).
     #[test]
-    fn fused_rgb_rejects_subsampled_sources() {
-        let jpeg = test_jpeg("zidane.jpg"); // 4:2:0
+    fn fused_rgb_rejects_non_420_subsampled_sources() {
+        let jpeg = test_jpeg("jaguar_422.jpg"); // luma 2x2, chroma 1x2 (4:2:2)
         let headers = super::super::markers::parse_markers(&jpeg).unwrap();
         let img_w = headers.header.width as usize;
         let img_h = headers.header.height as usize;
@@ -1794,6 +1935,82 @@ mod tests {
             false,
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn expand_row_2x_nearest_neighbour() {
+        let src = [10u8, 20, 30];
+        let mut dst = [0u8; 6];
+        expand_row_2x(&src, &mut dst);
+        assert_eq!(dst, [10, 10, 20, 20, 30, 30]);
+
+        // Odd destination width: the last source sample contributes once.
+        let mut dst_odd = [0u8; 5];
+        expand_row_2x(&src, &mut dst_odd);
+        assert_eq!(dst_odd, [10, 10, 20, 20, 30]);
+    }
+
+    /// Fused RGB from a native 4:2:0 source must equal the NV12 decode's
+    /// chroma, box-upsampled 2×2 nearest-neighbour, run through the same
+    /// `ycbcr_to_rgb_row` kernel the 4:4:4 fused path uses.
+    #[test]
+    fn fused_rgb_420_matches_nv12_plus_box_upsample() {
+        let jpeg = test_jpeg("zidane.jpg"); // 1280x720, native 4:2:0
+        let headers = super::super::markers::parse_markers(&jpeg).unwrap();
+        assert!(is_native_420(&headers.header));
+        let img_w = headers.header.width as usize;
+        let img_h = headers.header.height as usize;
+        let even_w = img_w.next_multiple_of(2);
+
+        let mut scratch = McuScratch::new(&headers);
+        let mut nv12 = vec![0u8; even_w * (img_h + img_h.div_ceil(2))];
+        decode_image(
+            &jpeg,
+            &headers,
+            &mut scratch,
+            &mut nv12,
+            even_w,
+            PixelFormat::Nv12,
+            false,
+        )
+        .unwrap();
+
+        let rgb_stride = img_w * 3;
+        let mut rgb = vec![0u8; rgb_stride * img_h];
+        decode_image(
+            &jpeg,
+            &headers,
+            &mut scratch,
+            &mut rgb,
+            rgb_stride,
+            PixelFormat::Rgb,
+            false,
+        )
+        .unwrap();
+
+        let uv_plane = img_h * even_w;
+        let chroma_w = img_w.div_ceil(2);
+        let mut cb_row = vec![0u8; img_w];
+        let mut cr_row = vec![0u8; img_w];
+        let mut cb_half = vec![0u8; chroma_w];
+        let mut cr_half = vec![0u8; chroma_w];
+        let mut expect = vec![0u8; img_w * 3];
+        for y in 0..img_h {
+            let y_row = &nv12[y * even_w..y * even_w + img_w];
+            let uv_row = uv_plane + (y / 2) * even_w;
+            for x in 0..chroma_w {
+                cb_half[x] = nv12[uv_row + x * 2];
+                cr_half[x] = nv12[uv_row + x * 2 + 1];
+            }
+            expand_row_2x(&cb_half, &mut cb_row);
+            expand_row_2x(&cr_half, &mut cr_row);
+            crate::jpeg::color::ycbcr_to_rgb_row(y_row, &cb_row, &cr_row, &mut expect, img_w);
+            assert_eq!(
+                &rgb[y * rgb_stride..y * rgb_stride + img_w * 3],
+                &expect[..],
+                "row {y}"
+            );
+        }
     }
 
     /// The fixed-grid contract: decoding into a buffer whose physical row pitch
