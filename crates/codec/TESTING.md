@@ -15,7 +15,7 @@ Inline `#[cfg(test)]` modules in each source file:
 | `jpeg/bitstream.rs`   | Bit read, byte-stuffing, sign extension             |
 | `jpeg/huffman.rs`     | Table build, symbol decode, block decode; malformed DHT rejection (truncated values, oversubscribed code lengths) |
 | `jpeg/markers.rs`     | Minimal JPEG parse, invalid data rejection          |
-| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average); UV interleave / downsample SIMD parity; truncated scan rejected rather than decoded as zero blocks |
+| `jpeg/mcu.rs`         | `avg_block` chroma downsampling (passthrough + 2×2 average); UV interleave / downsample SIMD parity; truncated scan rejected rather than decoded as zero blocks; fused `Rgb` output matches NV24 + row conversion (`fused_rgb_matches_nv24_plus_row_conversion`) and is refused for non-4:4:4 sources (`fused_rgb_rejects_subsampled_sources`) |
 | `jpeg/color.rs`       | YCbCr→RGB scalar vs float (±1); dispatch bit-exact vs scalar |
 | `jpeg/cpu.rs`         | `NeonTier` / `IntelTier` probe sanity + entropy helpers |
 | `jpeg/idct/scalar.rs` | DC-only shortcut, known coefficient IDCT            |
@@ -32,7 +32,7 @@ Located in `crates/codec/tests/`:
 
 | File                    | What It Tests                                      |
 |-------------------------|----------------------------------------------------|
-| `decode_jpeg.rs`        | JPEG → native `Nv12`/`Nv16`/`Nv24`/`Grey`, pixel accuracy vs the `image` crate, strided decode, capacity/error handling, reuse patterns, non-`u8` rejection |
+| `decode_jpeg.rs`        | JPEG → native `Nv12`/`Nv16`/`Nv24`/`Grey`, pixel accuracy vs the `image` crate, strided decode, capacity/error handling, reuse patterns, non-`u8` rejection; `DctMethod::Fast` decodes and stays close to `Accurate` while off by default (`fast_dct_mode_close_to_accurate_and_off_by_default`) |
 | `decode_png.rs`         | PNG → Tensor<u8/u16/i8/i16/f32>, native colorspace |
 | `decode_tensordyn.rs`   | TensorDyn decode for all dtypes, file path API     |
 | `exif_orientations.rs`  | End-to-end EXIF orientation reporting (JPEG + PNG): native dims preserved, `(rotation_degrees, flip_horizontal)` per tag |

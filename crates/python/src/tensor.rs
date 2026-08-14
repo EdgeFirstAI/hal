@@ -88,6 +88,95 @@ thread_local! {
         RefCell::new(edgefirst_hal::codec::ImageDecoder::new());
 }
 
+/// IDCT accuracy/speed selection for the software JPEG decoder.
+///
+/// :attr:`Accurate` is the default: the `islow`-class Loeffler IDCT,
+/// bit-comparable to libjpeg-turbo's default. :attr:`Fast` opts into the
+/// AAN `ifast`-class kernel — roughly an eighth of the multiplies, at a
+/// small, bounded pixel accuracy cost. Fast is advisory: paths without a
+/// fast kernel (non-NEON tiers, the V4L2/nvJPEG hardware decoders, and PNG)
+/// use their normal accurate path. Applies to the thread-local decoder used
+/// by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`; set via
+/// :func:`set_dct_method`. Each thread has its own decoder state, so this
+/// must be set on every thread that decodes images.
+#[pyo3::pyclass(name = "DctMethod", eq, eq_int, from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PyDctMethod {
+    /// Accurate `islow`-class IDCT (default).
+    #[default]
+    Accurate = 0,
+    /// Fast AAN `ifast`-class IDCT (opt-in).
+    Fast = 1,
+}
+
+impl From<PyDctMethod> for edgefirst_hal::codec::DctMethod {
+    fn from(m: PyDctMethod) -> Self {
+        match m {
+            PyDctMethod::Accurate => edgefirst_hal::codec::DctMethod::Accurate,
+            PyDctMethod::Fast => edgefirst_hal::codec::DctMethod::Fast,
+        }
+    }
+}
+
+/// Select the software JPEG IDCT kernel class for the thread-local decoder
+/// used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`.
+/// This only affects the calling thread; call it on every thread that
+/// decodes images if you want a non-default setting everywhere.
+///
+/// Accurate by default. See :class:`DctMethod` for the accuracy/speed
+/// tradeoff. ``EDGEFIRST_CODEC_DCT=fast`` in the environment flips a
+/// **new** thread's default for A/B runs.
+///
+/// Args:
+///     method: IDCT kernel class.
+#[pyo3::pyfunction]
+pub fn set_dct_method(method: PyDctMethod) {
+    DECODER.with(|cell| cell.borrow_mut().set_dct_method(method.into()));
+}
+
+/// Request a fused JPEG decode output format instead of the source's
+/// native format, for the thread-local decoder used by
+/// :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`. Only
+/// affects the calling thread. PNG decodes are unaffected.
+///
+/// This is a **pure CPU, single-pass** path inside the software JPEG
+/// decoder — colour conversion / chroma downsample happens at the MCU
+/// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG are
+/// bypassed whenever the resolved output differs from native.
+///
+/// - ``PixelFormat.RGB``: 4:4:4 colour JPEGs decode straight to interleaved
+///   RGB. Other sources fall back to native.
+/// - ``PixelFormat.NV12``: colour JPEGs decode to NV12, downsampling
+///   chroma at the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
+/// - Any other format is ignored; the decode falls back to native.
+/// - ``None`` (default): native format (``Nv12``/``Nv16``/``Nv24``/``Grey``).
+///
+/// Callers still run ``ImageProcessor.convert()`` on the result for
+/// model-input preprocessing (letterbox, resize, EXIF orientation). With
+/// fused RGB that convert step is typically a pure resize.
+///
+/// Args:
+///     format: Requested fused output format, or ``None`` to restore native
+///         output.
+#[pyo3::pyfunction]
+#[pyo3(signature = (format=None))]
+pub fn set_output_format(format: Option<crate::image::PyPixelFormat>) {
+    let fmt = format.map(edgefirst_hal::tensor::PixelFormat::from);
+    DECODER.with(|cell| cell.borrow_mut().set_output_format(fmt));
+}
+
+/// True when a V4L2 hardware JPEG decoder (e.g. the i.MX ``mxc-jpeg``
+/// block) is present and not opted out via ``EDGEFIRST_DISABLE_V4L2``.
+///
+/// Opens and drops the device once; the decode path re-probes lazily and
+/// keeps its own context. Always ``False`` on platforms without V4L2
+/// hardware decode support. Useful for benchmarks and callers that must
+/// fail fast instead of silently falling back to the CPU decoder.
+#[pyo3::pyfunction]
+pub fn is_v4l2_available() -> bool {
+    edgefirst_hal::codec::v4l2_available()
+}
+
 /// Metadata returned by ``decode_image`` / ``decode_image_file``.
 #[pyclass(name = "ImageInfo", get_all, skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -1067,6 +1156,10 @@ impl PyTensor {
     /// This is the preferred API for real-time pipelines: allocate once via
     /// ``ImageProcessor.create_image()``, then call ``decode_image()`` in
     /// the main loop to avoid per-frame allocations.
+    ///
+    /// Call :func:`set_output_format` beforehand to opt a JPEG source into a
+    /// fused ``Rgb``/``Nv12`` output instead, computed in the same decode
+    /// pass.
     ///
     /// Args:
     ///     data: Raw JPEG or PNG bytes.

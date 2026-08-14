@@ -75,6 +75,13 @@ boxes, scores, classes, masks = decoder.decode(outputs)
 processor.draw_masks(decoder, outputs, model_input)
 ```
 
+`ef.set_output_format(ef.PixelFormat.Rgb)` (4:4:4 sources) or
+`ef.set_output_format(ef.PixelFormat.Nv12)` (any colour source) opts a
+JPEG decode into fusing that colour conversion into the decode itself,
+in place of decode-then-`convert()`; `ef.set_dct_method(ef.DctMethod.Fast)`
+trades a small, bounded accuracy loss for a faster IDCT. See
+[`crates/python/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/README.md#quick-start).
+
 **Rust:**
 
 The umbrella `edgefirst-hal` crate re-exports its sub-crates as modules,
@@ -104,6 +111,13 @@ let mut output =
 processor.convert(&input, &mut output, Rotation::None, Flip::None,
     Crop::letterbox([114, 114, 114, 255]))?;
 ```
+
+`decoder.set_output_format(Some(PixelFormat::Rgb))` (4:4:4 sources) or
+`Some(PixelFormat::Nv12)` (any colour source) fuses that colour
+conversion into the decode itself, in place of decode-then-`convert()`;
+`decoder.set_dct_method(DctMethod::Fast)` trades a small, bounded
+accuracy loss for a faster IDCT. See
+[`crates/codec/ARCHITECTURE.md#fused-decode-output-opt-in-pure-cpu`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md#fused-decode-output-opt-in-pure-cpu).
 
 If you prefer to depend on the sub-crates directly (e.g. to opt out of
 features or to track them at independent versions), add the relevant
