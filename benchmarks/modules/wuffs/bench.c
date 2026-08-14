@@ -46,6 +46,31 @@ typedef struct {
     uint32_t width, height;
 } WuffsBench;
 
+typedef struct {
+    uint32_t repr;
+    size_t bpp;
+    const char *name;
+} WuffsCandidate;
+
+#define WUFFS_CANDIDATE_COUNT 4
+
+/* Default probe order: 3-byte formats first (matches the other RGB arms). */
+static const WuffsCandidate wuffs_candidates_3bpp_first[WUFFS_CANDIDATE_COUNT] = {
+    {WUFFS_BASE__PIXEL_FORMAT__RGB, 3, "RGB"},
+    {WUFFS_BASE__PIXEL_FORMAT__BGR, 3, "BGR"},
+    {WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL, 4, "RGBA_NONPREMUL"},
+    {WUFFS_BASE__PIXEL_FORMAT__BGRA_NONPREMUL, 4, "BGRA_NONPREMUL"},
+};
+
+/* EDGEFIRST_WUFFS_FORCE_4BPP=1 order: 4-byte formats first, to measure
+ * Wuffs' native (non-swizzled) output path directly. */
+static const WuffsCandidate wuffs_candidates_4bpp_first[WUFFS_CANDIDATE_COUNT] = {
+    {WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL, 4, "RGBA_NONPREMUL"},
+    {WUFFS_BASE__PIXEL_FORMAT__BGRA_NONPREMUL, 4, "BGRA_NONPREMUL"},
+    {WUFFS_BASE__PIXEL_FORMAT__RGB, 3, "RGB"},
+    {WUFFS_BASE__PIXEL_FORMAT__BGR, 3, "BGR"},
+};
+
 /* Full per-image decode: reset, parse config, swizzle-decode the frame.
  * Returns NULL on success or a status message on failure. */
 static const char *wuffs_decode_one(WuffsBench *b, const CbenchImage *img) {
@@ -108,20 +133,17 @@ int main(int argc, char **argv) {
     if (!b.dec) cbench_die("wuffs_jpeg__decoder__alloc failed");
 
     /* Pick the destination format once, before anything is timed: prefer the
-     * 3-byte formats that match the other RGB arms, fall back to 4-byte. */
-    static const struct {
-        uint32_t repr;
-        size_t bpp;
-        const char *name;
-    } candidates[] = {
-        {WUFFS_BASE__PIXEL_FORMAT__RGB, 3, "RGB"},
-        {WUFFS_BASE__PIXEL_FORMAT__BGR, 3, "BGR"},
-        {WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL, 4, "RGBA_NONPREMUL"},
-        {WUFFS_BASE__PIXEL_FORMAT__BGRA_NONPREMUL, 4, "BGRA_NONPREMUL"},
-    };
+     * 3-byte formats that match the other RGB arms, fall back to 4-byte.
+     * EDGEFIRST_WUFFS_FORCE_4BPP=1 skips straight to the 4-byte candidates,
+     * for an isolated 3-byte-swizzle-vs-4-byte-native A/B on Wuffs' own
+     * decoder (not a comparison against another arm) — see BENCHMARKS.md
+     * § JPEG Decode's Wuffs accuracy/performance note. */
+    int force_4bpp = getenv("EDGEFIRST_WUFFS_FORCE_4BPP") != NULL;
+    const WuffsCandidate *candidates = force_4bpp ? wuffs_candidates_4bpp_first
+                                                   : wuffs_candidates_3bpp_first;
     const char *fmt_name = NULL;
     const char *probe_err = "no candidate tried";
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
+    for (size_t i = 0; i < WUFFS_CANDIDATE_COUNT; i++) {
         b.pixfmt = candidates[i].repr;
         b.bytes_per_pixel = candidates[i].bpp;
         probe_err = wuffs_decode_one(&b, &images[0]);
