@@ -69,16 +69,23 @@ def parse_jpeg(path):
         if marker == 0xD9:  # EOI
             break
         seglen = struct.unpack(">H", data[i + 2 : i + 4])[0]
+        # A truncated/corrupt file can declare a segment running past EOF (or
+        # an impossible <2 length); stop parsing and let the caller count the
+        # file as unparsed rather than raising out of the whole run.
+        if seglen < 2 or i + 2 + seglen > n:
+            break
         seg = data[i + 4 : i + 2 + seglen]
         if marker == 0xDD:
             facts["dri"] = True
         elif marker in SOF_MARKERS:
+            if len(seg) < 6:  # truncated SOF payload
+                break
             facts["progressive"] = marker in PROGRESSIVE_SOFS
             _prec, h, w, ncomp = struct.unpack(">BHHB", seg[0:6])
             facts["height"], facts["width"], facts["ncomp"] = h, w, ncomp
             if ncomp == 1:
                 facts["subsampling"] = "grey"
-            elif ncomp >= 3:
+            elif ncomp >= 3 and len(seg) >= 8:
                 # Luma sampling factors relative to 1x1 chroma.
                 hv = seg[6 + 1]
                 lh, lv = hv >> 4, hv & 0xF

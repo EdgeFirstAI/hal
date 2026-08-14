@@ -189,7 +189,10 @@ for target in "${TARGETS[@]}"; do
   else
     echo "  WARN: stb/wuffs cross-build failed; their arms will FAIL on ${target}"
   fi
-  ssh "${target}" "chmod +x ${REMOTE_BIN_DIR}/hal_cpu ${REMOTE_BIN_DIR}/rust_jpeg ${REMOTE_BIN_DIR}/turbojpeg_bench ${REMOTE_BIN_DIR}/stb_bench ${REMOTE_BIN_DIR}/wuffs_bench"
+  ssh "${target}" "chmod +x ${REMOTE_BIN_DIR}/hal_cpu ${REMOTE_BIN_DIR}/rust_jpeg ${REMOTE_BIN_DIR}/turbojpeg_bench"
+  # Tolerant for the optional arms: absent binaries (failed cross-build/scp
+  # above) must not kill the sweep under set -e — their runs FAIL per-cell.
+  ssh "${target}" "chmod +x ${REMOTE_BIN_DIR}/stb_bench ${REMOTE_BIN_DIR}/wuffs_bench 2>/dev/null" || true
 
   pin_cmd="taskset -c ${PIN}"
   if ! ssh "${target}" "command -v taskset >/dev/null"; then
