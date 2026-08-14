@@ -31,7 +31,7 @@ that downstream integrators must follow.
 |--------|--------|----------------|
 | [`lib.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/lib.rs) | local | crate-wide setup, panic-safe FFI helpers, error reporting |
 | [`tensor.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tensor.rs) | local | `hal_tensor_*` create/map/reshape/fd-share, `HalCpuAccess`/`HalCompression` enums, AHardwareBuffer wrap + handle surface, `hal_tensor_view`/`hal_tensor_batch` sub-regions, `hal_plane_descriptor_*` |
-| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | `hal_image_processor_*`, `hal_image_desc_*` builder, tensor image load/save, pre-allocated codec decode, draw masks (and tracked variants) |
+| [`image.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/image.rs) | local | `hal_image_processor_*`, `hal_image_desc_*` builder, tensor image load/save, pre-allocated codec decode, codec configuration (`hal_codec_set_dct_method`, `hal_codec_set_output_format`/`_reset_output_format`, `hal_is_v4l2_available`), draw masks (and tracked variants) |
 | [`decoder.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/decoder.rs) | local | `hal_decoder_*` create / decode detection / decode segmentation |
 | [`tiling.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tiling.rs) | local | SAHI tiling — `hal_tile_grid`, the `hal_image_processor_*_tile*` GPU paths, `hal_lift_tile_boxes` / `hal_merge_tiled_detections`, and the `hal_tiled_frame_accumulator_*` streaming fan-in |
 | [`tracker.rs`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/src/tracker.rs) | local | `hal_bytetrack_*` create / update / get_active_tracks |

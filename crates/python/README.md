@@ -64,6 +64,15 @@ JPEG decodes to `Nv12` and PNG to `Rgb`/`Rgba`/`Grey`, so `info.format`
 above is the source's native format, not RGB. The `convert()` call is what
 gets you to the format your model wants.
 
+Call `ef.set_output_format(ef.PixelFormat.Rgb)` (4:4:4 sources) or
+`ef.set_output_format(ef.PixelFormat.Nv12)` (any colour source) before
+decoding to fuse that conversion into the JPEG decode itself instead —
+a pure-CPU, single-pass alternative to decode-then-`convert()`.
+`ef.set_dct_method(ef.DctMethod.Fast)` trades a small, bounded accuracy
+loss for a faster IDCT. Both apply to the thread-local shared decoder
+used by `decode_image()` / `decode_image_file()`; call
+`ef.set_output_format(None)` to restore native output.
+
 ## Role in edgefirst-hal
 
 The `edgefirst-hal` package on PyPI is the Python face of the EdgeFirst

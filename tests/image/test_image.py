@@ -283,6 +283,56 @@ def test_decode_native_odd_dimensions(fixture, fmt):
     assert calculate_similarity_rms_u8(n, expected) > threshold
 
 
+def test_set_output_format_fused_rgb():
+    """set_output_format(PixelFormat.Rgb) fuses colour conversion into the
+    JPEG MCU write stage for a 4:4:4 source; the decoder reports Rgb
+    directly instead of the native Nv24, and pixels match PIL's decode."""
+    import edgefirst_hal as hal
+
+    fixture = "testdata/zidane_444.jpg"
+    if not os.path.exists(fixture):
+        pytest.skip(f"{fixture} fixture missing")
+    w, h = _image_size(fixture)
+    hal.set_output_format(PixelFormat.Rgb)
+    try:
+        src = Tensor.image(w, h, format=PixelFormat.Rgb, access="readwrite")
+        info = src.decode_image_file(fixture)
+        assert info.format == PixelFormat.Rgb
+        assert (info.width, info.height) == (w, h)
+        n = np.zeros((h, w, 3), dtype=np.uint8)
+        src.normalize_to_numpy(n)
+        expected = load_image(fixture, "RGB")
+        # Same BT.601-full-vs-PIL tolerance as the other native-decode oracles.
+        assert calculate_similarity_rms_u8(n, expected) > 0.95
+    finally:
+        hal.set_output_format(None)
+
+
+def test_set_dct_method_fast_decodes():
+    """set_dct_method(DctMethod.Fast) selects the AAN ifast kernel; decode
+    still succeeds and reports the same native format and dimensions as the
+    default Accurate kernel (accuracy is measured on-target, see
+    CHANGELOG.md)."""
+    import edgefirst_hal as hal
+
+    w, h = _image_size("testdata/zidane.jpg")
+    hal.set_dct_method(hal.DctMethod.Fast)
+    try:
+        src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
+        info = src.decode_image_file("testdata/zidane.jpg")
+    finally:
+        hal.set_dct_method(hal.DctMethod.Accurate)
+    assert info.format == PixelFormat.Nv12
+    assert (info.width, info.height) == (w, h)
+
+
+def test_is_v4l2_available_returns_bool():
+    """is_v4l2_available() must be callable and return a bool (True or False)."""
+    import edgefirst_hal as hal
+
+    assert isinstance(hal.is_v4l2_available(), bool)
+
+
 # ---------------------------------------------------------------------------
 # Strided zero-copy + DMA buffer-protocol tests.
 #

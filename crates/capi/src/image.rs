@@ -10,7 +10,7 @@ use crate::decoder::{HalDecoder, HalDetectBoxList, HalProtoData, HalSegmentation
 use crate::error::{set_error, set_error_null};
 use crate::tensor::{HalDtype, HalTensor, HalTensorMemory};
 use crate::{check_null, try_or_errno, try_or_null, HalByteTrack, HalTrackInfoList};
-use edgefirst_codec::{CodecError, ImageDecoder, ImageLoad};
+use edgefirst_codec::{CodecError, DctMethod, ImageDecoder, ImageLoad};
 use edgefirst_decoder::{DetectBox, Segmentation};
 #[allow(deprecated)]
 use edgefirst_image::{
@@ -559,7 +559,10 @@ pub unsafe extern "C" fn hal_tensor_new_image_desc(desc: *const HalImageDesc) ->
 /// with that format and the decoded dimensions. Use the tensor's pixel format
 /// accessor (`hal_tensor_pixel_format()`) to inspect the result, and the image
 /// processor convert API (`hal_image_processor_convert()`) if a different
-/// format such as RGB is required.
+/// format such as RGB is required. Call `hal_codec_set_output_format()`
+/// beforehand to opt a JPEG source into a fused RGB/NV12 output instead,
+/// computed in the same decode pass; `hal_codec_set_dct_method()` selects the
+/// IDCT accuracy/speed tradeoff.
 ///
 /// @note EXIF orientation is reported but never applied. The decoder writes
 /// the source's native (unrotated) pixels and dimensions; callers that need an
@@ -687,6 +690,107 @@ pub unsafe extern "C" fn hal_tensor_decode_image_file(
             out_flip_horizontal,
         )
     }
+}
+
+// ============================================================================
+// Codec Configuration Functions
+// ============================================================================
+
+/// IDCT accuracy/speed selection for the software JPEG decoder.
+///
+/// Applies to the shared decoder used by `hal_tensor_decode_image()` /
+/// `hal_tensor_decode_image_file()`. Set via `hal_codec_set_dct_method()`.
+///
+/// @see hal_codec_set_dct_method
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HalDctMethod {
+    /// Accurate `islow`-class IDCT (default). Bit-comparable to
+    /// libjpeg-turbo's default kernel.
+    #[default]
+    Accurate = 0,
+    /// Fast AAN `ifast`-class IDCT (opt-in). NEON-only; advisory (falls
+    /// back to Accurate) on tiers without a fast kernel, hardware
+    /// (V4L2/nvJPEG) decode, and PNG.
+    Fast = 1,
+}
+
+impl From<HalDctMethod> for DctMethod {
+    fn from(m: HalDctMethod) -> Self {
+        match m {
+            HalDctMethod::Accurate => DctMethod::Accurate,
+            HalDctMethod::Fast => DctMethod::Fast,
+        }
+    }
+}
+
+/// Select the software JPEG IDCT kernel class for the shared decoder used
+/// by `hal_tensor_decode_image()` / `hal_tensor_decode_image_file()`.
+///
+/// Accurate by default. See `HalDctMethod` for the accuracy/speed tradeoff.
+///
+/// @param method IDCT kernel class
+///
+/// @see HalDctMethod, hal_tensor_decode_image
+#[no_mangle]
+pub extern "C" fn hal_codec_set_dct_method(method: HalDctMethod) {
+    CODEC_DECODER.with(|cell| cell.borrow_mut().set_dct_method(method.into()));
+}
+
+/// Request a fused JPEG decode output format instead of the source's native
+/// format, for the shared decoder used by `hal_tensor_decode_image()` /
+/// `hal_tensor_decode_image_file()`. PNG decodes are unaffected.
+///
+/// This is a **pure CPU, single-pass** path inside the software JPEG
+/// decoder — colour conversion / chroma downsample happens at the MCU
+/// write stage. It is **not** a GPU hybrid or nvJPEG path; V4L2/nvJPEG are
+/// bypassed whenever the resolved output differs from native.
+///
+/// - `HAL_PIXEL_FORMAT_RGB`: 4:4:4 colour JPEGs decode straight to
+///   interleaved RGB. Other sources fall back to native.
+/// - `HAL_PIXEL_FORMAT_NV12`: colour JPEGs decode to NV12, downsampling
+///   chroma at the write stage (2×2 average for 4:4:4, vertical for
+///   4:2:2).
+/// - Any other format is ignored; the decode falls back to native.
+///
+/// Call `hal_codec_reset_output_format()` to return to native output (the
+/// default). Callers still run `hal_image_processor_convert()` on the
+/// result for model-input preprocessing (letterbox, resize, EXIF
+/// orientation); with fused RGB that convert step is typically a pure
+/// resize.
+///
+/// @param format Requested fused output format
+///
+/// @see hal_codec_reset_output_format, hal_tensor_decode_image
+#[no_mangle]
+pub extern "C" fn hal_codec_set_output_format(format: HalPixelFormat) {
+    CODEC_DECODER.with(|cell| {
+        cell.borrow_mut()
+            .set_output_format(Some(format.to_pixel_format()))
+    });
+}
+
+/// Reset the shared JPEG decoder to its default native output format,
+/// undoing a prior `hal_codec_set_output_format()` call.
+///
+/// @see hal_codec_set_output_format
+#[no_mangle]
+pub extern "C" fn hal_codec_reset_output_format() {
+    CODEC_DECODER.with(|cell| cell.borrow_mut().set_output_format(None));
+}
+
+/// Report whether a V4L2 hardware JPEG decoder (e.g. the i.MX `mxc-jpeg`
+/// block) is present and not opted out via `EDGEFIRST_DISABLE_V4L2`.
+///
+/// Opens and drops the device once; `hal_tensor_decode_image()` re-probes
+/// lazily and keeps its own context. Always `false` on platforms without
+/// V4L2 hardware decode support. Useful for benchmarks and callers that
+/// must fail fast instead of silently falling back to the CPU decoder.
+///
+/// @return true if a V4L2 hardware JPEG decoder is available
+#[no_mangle]
+pub extern "C" fn hal_is_v4l2_available() -> bool {
+    edgefirst_codec::v4l2_available()
 }
 
 /// Save an image tensor as JPEG.
@@ -2139,6 +2243,26 @@ mod tests {
     use super::*;
     use crate::tensor::{hal_tensor_dtype, hal_tensor_free};
     use std::ffi::CString;
+
+    #[test]
+    fn test_codec_set_dct_method() {
+        // Infallible thread-local setters: exercise both variants and leave
+        // the decoder reset to the default for any test sharing this thread.
+        hal_codec_set_dct_method(HalDctMethod::Fast);
+        hal_codec_set_dct_method(HalDctMethod::Accurate);
+    }
+
+    #[test]
+    fn test_codec_set_and_reset_output_format() {
+        hal_codec_set_output_format(HalPixelFormat::Rgb);
+        hal_codec_set_output_format(HalPixelFormat::Nv12);
+        hal_codec_reset_output_format();
+    }
+
+    #[test]
+    fn test_is_v4l2_available() {
+        let _available = hal_is_v4l2_available();
+    }
 
     #[test]
     fn test_image_desc_lifecycle_and_create() {

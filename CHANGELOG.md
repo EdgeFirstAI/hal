@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-08-13
+
+### Added
+
+- **Opt-in fast JPEG IDCT and fused decode output** (`edgefirst-codec`):
+  `ImageDecoder::set_dct_method(DctMethod::Fast)` selects an AAN
+  `ifast`-class kernel (roughly an eighth of the multiplies of the default
+  `Accurate`/`islow` kernel; NEON-only, advisory elsewhere — non-NEON tiers,
+  the V4L2/nvJPEG hardware decoders, and PNG keep their normal accurate
+  path). The NEON kernel is bit-exact with its scalar reference; accuracy
+  against the accurate kernel on 1000 COCO images measures cosine mean
+  0.9999807 / worst 0.9998482, PSNR mean 51.4 dB / worst 42.1 dB, max pixel
+  delta 24. Off by default; `EDGEFIRST_CODEC_DCT=fast` flips a **new**
+  decoder's default for A/B runs. `ImageDecoder::set_output_format(Some(Rgb
+  | Nv12))` fuses colour conversion or chroma downsampling into the MCU
+  write stage instead of a second pass (4:4:4 JPEGs to interleaved `Rgb`;
+  colour JPEGs to `Nv12` with 2×2-average or vertical chroma downsampling),
+  so a caller's subsequent `convert()` becomes a pure resize; native output
+  (`Nv12`/`Nv16`/`Nv24`/`Grey`) stays the default, and V4L2/nvJPEG are
+  bypassed whenever the resolved output differs from native. New
+  `edgefirst_codec::v4l2_available()` reports whether a V4L2 hardware JPEG
+  decoder (e.g. i.MX `mxc-jpeg`) is present and not opted out via
+  `EDGEFIRST_DISABLE_V4L2`, without decoding anything — for benchmarks and
+  callers that need to fail fast instead of silently falling back to CPU.
+  Reaches the C and Python surfaces too: `HalDctMethod` +
+  `hal_codec_set_dct_method()`, `hal_codec_set_output_format()` /
+  `hal_codec_reset_output_format()` (configuring the shared decoder behind
+  `hal_tensor_decode_image()`), and `hal_is_v4l2_available()`; Python's
+  `DctMethod` + `set_dct_method()`, `set_output_format(format=None)`
+  (`None` restores native output), and `is_v4l2_available()`, all
+  documented in `edgefirst_hal.pyi`.
+
+### Changed
+
+- **JPEG software decoder rewritten for both in-order and out-of-order
+  cores** (`edgefirst-codec`): entropy decode, the MCU loop, and the IDCT
+  dispatch were restructured around per-target profiling on Cortex-A53/A55
+  (imx8mp/imx95), A76 (rpi5), A78AE (Orin Nano), and x86 Rocket Lake.
+  Entropy decode — 52–58% of decode time in every profile — now runs on a
+  register-resident 64-bit bit buffer with bulk 8-byte refill, a combined
+  code+magnitude fast-AC Huffman LUT (one peek and one consume per
+  coefficient), and zero per-decode heap allocations; `decode_block` is
+  `#[inline(never)]` and holds its bitstream state in registers across every
+  exit (letting it inline into the MCU loop's frame cost ~20% on the A53). A
+  paired-coefficient probe (`NeonTier::High` only) decodes up to two
+  coefficients per Huffman-table hit. The IDCT is rewritten in 16-bit lanes
+  throughout on the libjpeg-turbo `islow` shape — the x86 kernel needs only
+  SSE2 now (`idct/sse41.rs` removed), aarch64 NEON no longer rebuilds its
+  Loeffler constants per block, a dedicated 4:4:4 1×1 loop drops the generic
+  loop's spilled frame, and an SSE4.1 paired-block kernel fixes the fused-RGB
+  write on x86 falling to scalar colour conversion. Every kernel remains
+  bit-exact with its scalar reference. Net effect, decode-only vs.
+  libjpeg-turbo's own default `islow` IDCT (COCO val2017, best-of-3): rpi5
+  A76 +18.8% YUV / +19.3% RGB, x86 Rocket Lake +6.5% / +8.2%, imx95 A55
+  −0.5% / +1.5%, imx8mp A53 −4.8% / −2.9% — the accurate decoder now beats
+  libjpeg-turbo's `islow` **and** its fast `ifast` IDCT on every platform
+  measured, while still producing `islow`-class pixels. Hardening added
+  while fuzzing the rewrite: Huffman tables are validated against Kraft's
+  inequality at build time, a truncated entropy-coded scan is rejected
+  rather than decoded from zero-padding, and the IDCT range contract now
+  holds through the DC-only shortcut in every kernel.
+
 ### Fixed
 
 - **Several threads can now read one PBO-backed tensor at the same time**

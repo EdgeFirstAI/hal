@@ -6,7 +6,7 @@
 crates/capi/
 ├── src/
 │   ├── tensor.rs       # #[test] module — hal_tensor_* functions
-│   ├── image.rs        # #[test] module — hal_image_processor_* functions
+│   ├── image.rs        # #[test] module — hal_image_processor_* functions, hal_codec_* configuration (DCT method, fused output format, V4L2 availability)
 │   ├── decoder.rs      # #[test] module — hal_decoder_* functions
 │   ├── tracker.rs      # #[test] module — hal_bytetrack_* functions
 │   ├── colorimetry.rs  # #[test] module — V4L2 colorimetry conversion

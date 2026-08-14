@@ -11,7 +11,7 @@ sub-crate's `ARCHITECTURE.md`:
 | Crate | Per-crate architecture |
 |-------|------------------------|
 | `tensor` | [crates/tensor/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/ARCHITECTURE.md) — backend dispatch (DMA-BUF/IOSurface/AHardwareBuffer/SHM/Mem/PBO), multi-plane DMA-BUF, BufferIdentity, CpuAccess + compression metadata |
-| `codec` | [crates/codec/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) — custom baseline JPEG decoder, SIMD dispatch (NEON/SSE4.1/SSSE3/SSE2), zero-allocation scratch model, strided/EXIF-rotated output |
+| `codec` | [crates/codec/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/ARCHITECTURE.md) — custom baseline JPEG decoder, SIMD dispatch (NEON/AVX2/SSE4.1/SSE2), opt-in fused RGB/NV12 decode output and `DctMethod` accuracy/speed selection, zero-allocation scratch model, strided output with EXIF orientation reported (not applied) |
 | `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — unified GL engine (one `GLProcessorST`; Linux DMA-BUF, macOS/iOS ANGLE + IOSurface, Android AHardwareBuffer), `GlPlatform` porting seam, EGL image cache, batch engine (`convert_deferred`/`flush`), G2D, CPU, Vivante workarounds, shutdown safety |
 | `decoder` | [crates/decoder/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) — model-type selection, dshape contract, per-scale framework, fused proto path |
 | `tracker` | [crates/tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) — ByteTrack two-pass association, Kalman state |

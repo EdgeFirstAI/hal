@@ -67,6 +67,10 @@ pub mod edgefirst_hal {
         m.add_class::<tensor::PyImageInfo>()?;
         m.add_class::<tensor::PyCudaMap>()?;
         m.add_class::<tensor::PyTensorMap>()?;
+        m.add_class::<tensor::PyDctMethod>()?;
+        m.add_function(wrap_pyfunction!(tensor::set_dct_method, m)?)?;
+        m.add_function(wrap_pyfunction!(tensor::set_output_format, m)?)?;
+        m.add_function(wrap_pyfunction!(tensor::is_v4l2_available, m)?)?;
         m.add_class::<colorimetry::PyColorSpace>()?;
         m.add_class::<colorimetry::PyColorTransfer>()?;
         m.add_class::<colorimetry::PyColorEncoding>()?;
