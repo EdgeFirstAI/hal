@@ -480,8 +480,10 @@ typedef enum HalCompression {
 /**
  * IDCT accuracy/speed selection for the software JPEG decoder.
  *
- * Applies to the shared decoder used by `hal_tensor_decode_image()` /
+ * Applies to the thread-local decoder used by `hal_tensor_decode_image()` /
  * `hal_tensor_decode_image_file()`. Set via `hal_codec_set_dct_method()`.
+ * Each thread has its own decoder state, so this must be set on every
+ * thread that decodes images.
  *
  * @see hal_codec_set_dct_method
  */
@@ -2174,8 +2176,10 @@ int hal_tensor_decode_image_file(struct hal_tensor *tensor,
                                  bool *out_flip_horizontal);
 
 /**
- * Select the software JPEG IDCT kernel class for the shared decoder used
- * by `hal_tensor_decode_image()` / `hal_tensor_decode_image_file()`.
+ * Select the software JPEG IDCT kernel class for the thread-local decoder
+ * used by `hal_tensor_decode_image()` / `hal_tensor_decode_image_file()`.
+ * This only affects the calling thread; call it on every thread that
+ * decodes images if you want a non-default setting everywhere.
  *
  * Accurate by default. See `HalDctMethod` for the accuracy/speed tradeoff.
  *
@@ -2187,8 +2191,9 @@ void hal_codec_set_dct_method(enum HalDctMethod method);
 
 /**
  * Request a fused JPEG decode output format instead of the source's native
- * format, for the shared decoder used by `hal_tensor_decode_image()` /
- * `hal_tensor_decode_image_file()`. PNG decodes are unaffected.
+ * format, for the thread-local decoder used by `hal_tensor_decode_image()`
+ * / `hal_tensor_decode_image_file()`. Only affects the calling thread. PNG
+ * decodes are unaffected.
  *
  * This is a **pure CPU, single-pass** path inside the software JPEG
  * decoder — colour conversion / chroma downsample happens at the MCU
@@ -2215,8 +2220,8 @@ void hal_codec_set_dct_method(enum HalDctMethod method);
 void hal_codec_set_output_format(enum hal_pixel_format format);
 
 /**
- * Reset the shared JPEG decoder to its default native output format,
- * undoing a prior `hal_codec_set_output_format()` call.
+ * Reset the calling thread's JPEG decoder to its default native output
+ * format, undoing a prior `hal_codec_set_output_format()` call.
  *
  * @see hal_codec_set_output_format
  */

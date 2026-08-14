@@ -64,9 +64,10 @@ class DctMethod(enum.Enum):
     AAN ``ifast``-class kernel — roughly an eighth of the multiplies, at a
     small, bounded pixel accuracy cost. Fast is advisory: paths without a
     fast kernel (non-NEON tiers, the V4L2/nvJPEG hardware decoders, and
-    PNG) use their normal accurate path. Applies to the shared decoder used
-    by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`; set
-    via :func:`set_dct_method`.
+    PNG) use their normal accurate path. Applies to the thread-local decoder
+    used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`;
+    set via :func:`set_dct_method`. Each thread has its own decoder state,
+    so this must be set on every thread that decodes images.
     """
 
     Accurate: DctMethod
@@ -75,8 +76,10 @@ class DctMethod(enum.Enum):
     """Fast AAN ``ifast``-class IDCT (opt-in)."""
 
 def set_dct_method(method: DctMethod) -> None:
-    """Select the software JPEG IDCT kernel class for the shared decoder
-    used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`.
+    """Select the software JPEG IDCT kernel class for the thread-local
+    decoder used by :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`.
+    This only affects the calling thread; call it on every thread that
+    decodes images if you want a non-default setting everywhere.
 
     Accurate by default. See :class:`DctMethod` for the accuracy/speed
     tradeoff. ``EDGEFIRST_CODEC_DCT=fast`` in the environment flips a
@@ -88,8 +91,9 @@ def set_dct_method(method: DctMethod) -> None:
 
 def set_output_format(format: Optional[PixelFormat] = None) -> None:
     """Request a fused JPEG decode output format instead of the source's
-    native format, for the shared decoder used by :meth:`Tensor.decode_image`
-    / :meth:`Tensor.decode_image_file`. PNG decodes are unaffected.
+    native format, for the thread-local decoder used by
+    :meth:`Tensor.decode_image` / :meth:`Tensor.decode_image_file`. Only
+    affects the calling thread. PNG decodes are unaffected.
 
     This is a **pure CPU, single-pass** path inside the software JPEG
     decoder — colour conversion / chroma downsample happens at the MCU

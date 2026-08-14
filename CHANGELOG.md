@@ -33,8 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers that need to fail fast instead of silently falling back to CPU.
   Reaches the C and Python surfaces too: `HalDctMethod` +
   `hal_codec_set_dct_method()`, `hal_codec_set_output_format()` /
-  `hal_codec_reset_output_format()` (configuring the shared decoder behind
-  `hal_tensor_decode_image()`), and `hal_is_v4l2_available()`; Python's
+  `hal_codec_reset_output_format()` (configuring the thread-local decoder
+  behind `hal_tensor_decode_image()`), and `hal_is_v4l2_available()`; Python's
   `DctMethod` + `set_dct_method()`, `set_output_format(format=None)`
   (`None` restores native output), and `is_v4l2_available()`, all
   documented in `edgefirst_hal.pyi`.
