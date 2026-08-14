@@ -43,6 +43,34 @@ RUN make -C modules/wuffs clean \
     && make -C modules/wuffs \
     && cp modules/wuffs/build/wuffs_bench /usr/local/bin/wuffs_bench
 
+# Build/toolchain provenance for the runtime image (see BENCHMARKS.md §1.2/§2.2
+# of the v3.12 review): the runtime stage below is debian-slim with no
+# compilers installed, so this has to be captured here and carried across.
+RUN { rustc --version; cargo --version; gcc --version | head -1; } > /opt/build-provenance.txt
+
+# --- Source-built libjpeg-turbo control (review §1.2/§2.2): baked into the
+# same image as an alternate .so, not a separate image variant, so a job
+# opts into it via EDGEFIRST_TURBOJPEG_LIB rather than pulling a different
+# tag. Settles whether the ARM ~1.16x vs ~1.36x split (packaged turbo 3.x vs
+# 2.1.x on the physical boards) is a version confound or coincidence, on
+# Graviton. Version pinned to what BENCHMARKS.md's board provenance table
+# already asks for ("3.1.2 or later"); nasm needed for x86 SIMD, cmake
+# selects the right ASM backend per arch automatically.
+FROM build AS turbo-src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake nasm \
+    && rm -rf /var/lib/apt/lists/*
+ARG TURBO_SRC_VERSION=3.1.2
+RUN curl -fSL -o /tmp/turbo-src.tar.gz \
+        "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/${TURBO_SRC_VERSION}.tar.gz" \
+    && mkdir -p /tmp/turbo-src \
+    && tar -xzf /tmp/turbo-src.tar.gz -C /tmp/turbo-src --strip-components=1 \
+    && cmake -S /tmp/turbo-src -B /tmp/turbo-build \
+        -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=OFF -DWITH_JPEG8=1 \
+    && cmake --build /tmp/turbo-build --parallel \
+    && cp /tmp/turbo-build/libturbojpeg.so.0.* /opt/libturbojpeg-src.so \
+    && echo "${TURBO_SRC_VERSION}" > /opt/turbo-src-version.txt
+
 FROM debian:bookworm-slim AS runtime
 
 # awscli: lets a Batch job pull the corpus with its job-role credentials
@@ -61,6 +89,9 @@ COPY --from=build /usr/local/bin/rust_jpeg /usr/local/bin/rust_jpeg
 COPY --from=build /usr/local/bin/turbojpeg_bench /usr/local/bin/turbojpeg_bench
 COPY --from=build /usr/local/bin/stb_bench /usr/local/bin/stb_bench
 COPY --from=build /usr/local/bin/wuffs_bench /usr/local/bin/wuffs_bench
+COPY --from=build /opt/build-provenance.txt /opt/build-provenance.txt
+COPY --from=turbo-src /opt/libturbojpeg-src.so /opt/libturbojpeg-src.so
+COPY --from=turbo-src /opt/turbo-src-version.txt /opt/turbo-src-version.txt
 COPY benchmarks/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 # Tiny always-present fixtures + optional 50-image COCO smoke set (gitignored
 # host staging under benchmarks/docker/coco-smoke/).

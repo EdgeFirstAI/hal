@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Full decoder A/B sweep (BENCHMARKS.md § JPEG Decode): eight arms per host.
+# Full decoder A/B sweep (BENCHMARKS.md § JPEG Decode): eight arms per host,
+# plus a ninth RGB-only arm on the native-4:2:0 corpora.
 #
-#   hal        EdgeFirst accurate (islow-class, the default)
-#   hal_fast   EdgeFirst DctMethod::Fast (AAN, opt-in; EDGEFIRST_CODEC_DCT=fast)
-#   tj_islow   libjpeg-turbo accurate IDCT (its default)
-#   tj_ifast   libjpeg-turbo fast IDCT
-#   zune       zune-jpeg (Rust; YCbCr / RGB output)
-#   image      image crate (Rust; RGB only — its API has no raw-YUV output)
-#   stb        stb_image (C single-header; RGB only, allocates per call)
-#   wuffs      Wuffs v0.4 (Google, memory-safe C; RGB only)
+#   hal              EdgeFirst accurate (islow-class, the default)
+#   hal_fast         EdgeFirst DctMethod::Fast (AAN, opt-in; EDGEFIRST_CODEC_DCT=fast)
+#   tj_islow         libjpeg-turbo accurate IDCT (its default)
+#   tj_ifast         libjpeg-turbo fast IDCT
+#   tj_fastupsample  libjpeg-turbo accurate IDCT + TJFLAG_FASTUPSAMPLE (RGB
+#                    only): the matched-accuracy-class comparator for
+#                    EdgeFirst's fused native-4:2:0 box chroma upsample —
+#                    same discipline as tj_islow/tj_ifast for the IDCT
+#   zune             zune-jpeg (Rust; YCbCr / RGB output)
+#   image            image crate (Rust; RGB only — its API has no raw-YUV output)
+#   stb              stb_image (C single-header; RGB only, allocates per call)
+#   wuffs            Wuffs v0.4 (Google, memory-safe C; RGB only)
 #
 # Release profile, no perf/trace. Arms alternate inside one session per round,
 # pinned to one core. The claim number is the MEDIAN p50 across rounds, with
@@ -238,6 +243,14 @@ for target in "${TARGETS[@]}"; do
         run_arm wuffs "${round}" "${fmt}" \
           "./wuffs_bench --limit ${LIMIT} --warmup ${WARMUP} --board '${target}' \
            --decode-only --format rgb"
+        # Matched-accuracy-class comparator for EdgeFirst's fused native-4:2:0
+        # box chroma upsample: turbo's TJFLAG_FASTUPSAMPLE selects the same
+        # box/nearest-neighbour accuracy class, same discipline as tj_islow
+        # vs tj_ifast for the IDCT. RGB-only — --upsample is a no-op on the
+        # YUV arm (tjDecompressToYUV2 never resamples chroma).
+        run_arm tj_fastupsample "${round}" "${fmt}" \
+          "./turbojpeg_bench --limit ${LIMIT} --warmup ${WARMUP} --board '${target}' \
+           --decode-only --format rgb --dct accurate --upsample fast"
       fi
     done
   done
@@ -246,10 +259,10 @@ for target in "${TARGETS[@]}"; do
 
   {
     echo "==== ${target} ${CORPUS_NAME} median-of-${ROUNDS} (n=${LIMIT}, pin=${PIN}, profile=${PROFILE})"
-    for arm in hal hal_fast tj_islow tj_ifast zune image stb wuffs; do
+    for arm in hal hal_fast tj_islow tj_ifast tj_fastupsample zune image stb wuffs; do
       for fmt in yuv rgb; do
         case "${arm}" in
-          image | stb | wuffs) [[ "${fmt}" == yuv ]] && continue ;;
+          tj_fastupsample | image | stb | wuffs) [[ "${fmt}" == yuv ]] && continue ;;
         esac
         vals=""
         rounds=""

@@ -30,7 +30,7 @@
 #                          median across rounds); CSVs gain a _rN suffix
 #   PIN                    optional core to pin every arm to via taskset
 #   TENSOR_MEM             mem|dma|auto (default mem)
-#   MODULES                comma list: hal_cpu,turbojpeg,zune,image,stb,wuffs
+#   MODULES                comma list: hal_cpu,turbojpeg,turbojpeg_fastupsample,zune,image,stb,wuffs
 #                          (default all six; zune covers yuv+rgb, image/stb/
 #                          wuffs are rgb-only and skip the yuv pass)
 #   FORMATS                comma list: yuv,rgb (default both)
@@ -135,6 +135,35 @@ fi
 
 export EDGEFIRST_BENCH_COCO="${COCO}"
 
+# Container provenance (BENCHMARKS.md review v3.12 §2.2): everything a
+# reader needs to reproduce or falsify this job's numbers, written once per
+# job to RESULTS_DIR (not per-round — none of this changes within a job).
+{
+  echo "captured: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "board: ${BOARD}"
+  echo "--- build (from the image's build stage; runtime stage has no compilers) ---"
+  cat /opt/build-provenance.txt 2>/dev/null || echo "(missing)"
+  echo "--- base image ---"
+  grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release 2>/dev/null || echo "(no /etc/os-release)"
+  echo "--- libturbojpeg (packaged, apt) ---"
+  dpkg -s libturbojpeg0 2>/dev/null | grep -E '^(Package|Version|Architecture):' \
+    || echo "libturbojpeg0: dpkg query failed"
+  lib="$(ldconfig -p 2>/dev/null | awk '/libturbojpeg\.so/ { print $NF; exit }')"
+  echo "libturbojpeg resolved: ${lib:-not-in-ldconfig}"
+  echo "--- libturbojpeg (source-built control, baked into the image) ---"
+  if [[ -f /opt/turbo-src-version.txt ]]; then
+    echo "available at /opt/libturbojpeg-src.so, version $(cat /opt/turbo-src-version.txt)"
+    echo "select it with EDGEFIRST_TURBOJPEG_LIB=/opt/libturbojpeg-src.so"
+  else
+    echo "(not baked into this image)"
+  fi
+  if [[ -n "${EDGEFIRST_TURBOJPEG_LIB:-}" ]]; then
+    echo "*** this job overrides libturbojpeg: EDGEFIRST_TURBOJPEG_LIB=${EDGEFIRST_TURBOJPEG_LIB} ***"
+  fi
+} > "${RESULTS_DIR}/${BOARD}_provenance.txt" 2>&1
+echo "==> provenance: ${RESULTS_DIR}/${BOARD}_provenance.txt" >&2
+cat "${RESULTS_DIR}/${BOARD}_provenance.txt" >&2
+
 tier_tag="auto"
 if [[ -n "${EDGEFIRST_CODEC_FORCE_INTEL:-}" ]]; then
   tier_tag="intel-${EDGEFIRST_CODEC_FORCE_INTEL}"
@@ -206,6 +235,29 @@ for fmt in "${fmts[@]}"; do
         echo "===== CSV ${csv} ====="
         cat "${csv}"
         ;;
+      turbojpeg_fastupsample)
+        # Matched-accuracy-class comparator for EdgeFirst's fused native-4:2:0
+        # box chroma upsample (see BENCHMARKS.md § JPEG Decode). RGB-only:
+        # --upsample is a no-op on tjDecompressToYUV2, which never resamples.
+        if [[ "${fmt}" != rgb ]]; then
+          echo "(skip turbojpeg_fastupsample: rgb-only arm, format=${fmt})" >&2
+          continue
+        fi
+        csv="${RESULTS_DIR}/${BOARD}_turbojpeg_fastupsample_rgb${rtag:-}.csv"
+        echo "===== MODULE turbojpeg_fastupsample decode-only format=rgb (${BOARD}) =====" >&2
+        run_pinned /usr/local/bin/turbojpeg_bench \
+          --coco "${COCO}" \
+          --board "${BOARD}" \
+          --warmup "${WARMUP}" \
+          --decode-only \
+          --format rgb \
+          --dct "${DCT}" \
+          --upsample fast \
+          --csv "${csv}" \
+          "${limit_args[@]}"
+        echo "===== CSV ${csv} ====="
+        cat "${csv}"
+        ;;
       zune)
         csv="${RESULTS_DIR}/${BOARD}_zune_${fmt}${rtag:-}.csv"
         echo "===== MODULE zune decode-only format=${fmt} (${BOARD}) =====" >&2
@@ -259,7 +311,7 @@ for fmt in "${fmts[@]}"; do
       "")
         ;;
       *)
-        echo "error: unknown MODULE '${mod}' (expected hal_cpu|turbojpeg|zune|image|stb|wuffs)" >&2
+        echo "error: unknown MODULE '${mod}' (expected hal_cpu|turbojpeg|turbojpeg_fastupsample|zune|image|stb|wuffs)" >&2
         exit 1
         ;;
     esac

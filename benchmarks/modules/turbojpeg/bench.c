@@ -42,6 +42,7 @@
 /* --- TurboJPEG ABI (subset). Values from turbojpeg.h. ------------------- */
 #define TJPF_RGB 0
 #define TJPF_BGR 1
+#define TJFLAG_FASTUPSAMPLE 256
 #define TJFLAG_FASTDCT 2048
 #define TJFLAG_ACCURATEDCT 4096
 
@@ -84,8 +85,18 @@ static const char *tj_err(void) { return tj.error ? tj.error() : "(no tjGetError
 
 /* Same candidate list as the retired Python driver: distributions disagree on
  * whether libturbojpeg ships a bare .so, and Jetson/Ubuntu images often have
- * only the versioned one. */
+ * only the versioned one.
+ *
+ * EDGEFIRST_TURBOJPEG_LIB, if set, overrides the search entirely and dlopens
+ * that exact path — for A/B'ing a source-built libjpeg-turbo against the
+ * distro-packaged one on the same host without uninstalling either. */
 static void tj_load(void) {
+    const char *override = getenv("EDGEFIRST_TURBOJPEG_LIB");
+    if (override && *override) {
+        tj.handle = dlopen(override, RTLD_NOW);
+        if (!tj.handle) die("EDGEFIRST_TURBOJPEG_LIB=%s: dlopen failed: %s", override, dlerror());
+        tj.path = override;
+    }
     static const char *candidates[] = {
 #ifdef __APPLE__
         "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",
@@ -103,11 +114,13 @@ static void tj_load(void) {
         "/usr/lib/x86_64-linux-gnu/libturbojpeg.so",
         "/opt/libjpeg-turbo/lib64/libturbojpeg.so",
     };
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
-        tj.handle = dlopen(candidates[i], RTLD_NOW);
-        if (tj.handle) {
-            tj.path = candidates[i];
-            break;
+    if (!tj.handle) {
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
+            tj.handle = dlopen(candidates[i], RTLD_NOW);
+            if (tj.handle) {
+                tj.path = candidates[i];
+                break;
+            }
         }
     }
     if (!tj.handle) die("libturbojpeg not found (%s)", dlerror());
@@ -274,7 +287,12 @@ static Image *preload(char **paths, size_t total, size_t limit, size_t *out_n) {
 typedef struct {
     void *handle;
     int pixel_format; /* -1 = YUV, else TJPF_* */
-    int dct_flag;     /* TJFLAG_ACCURATEDCT or TJFLAG_FASTDCT */
+    /* TJFLAG_ACCURATEDCT/TJFLAG_FASTDCT, OR'd with TJFLAG_FASTUPSAMPLE when
+     * --upsample fast is selected. Chroma upsampling only happens on the
+     * tjDecompress2 (RGB) path — tjDecompressToYUV2 decodes to native
+     * subsampled YUV with no resampling — so the flag is a harmless no-op
+     * there, but it's set unconditionally to keep one flags field. */
+    int flags;
     unsigned char *buf;
     size_t buf_cap;
     int width, height;
@@ -301,11 +319,11 @@ static void decode_one(Decoder *d, const Image *img) {
 
     if (d->pixel_format < 0) {
         if (tj.to_yuv(d->handle, img->bytes, (unsigned long)img->len, d->buf, w, 1, h,
-                      d->dct_flag))
+                      d->flags))
             die("tjDecompressToYUV2 failed on %s: %s", img->name, tj_err());
     } else {
         if (tj.decompress(d->handle, img->bytes, (unsigned long)img->len, d->buf, w, 0, h,
-                          d->pixel_format, d->dct_flag))
+                          d->pixel_format, d->flags))
             die("tjDecompress2 failed on %s: %s", img->name, tj_err());
     }
     d->width = w;
@@ -315,7 +333,8 @@ static void decode_one(Decoder *d, const Image *img) {
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--coco DIR] [--limit N] [--warmup N] [--board LABEL]\n"
-            "          [--format yuv|rgb|bgr] [--dct accurate|fast] [--decode-only]\n"
+            "          [--format yuv|rgb|bgr] [--dct accurate|fast]\n"
+            "          [--upsample accurate|fast] [--decode-only]\n"
             "          [--csv PATH] [--verbose]\n",
             argv0);
     exit(2);
@@ -326,6 +345,7 @@ int main(int argc, char **argv) {
     const char *board = "unknown";
     const char *format = "yuv";
     const char *dct = "accurate";
+    const char *upsample = "accurate";
     const char *csv_path = NULL;
     size_t limit = 50, warmup = 10;
     int verbose = 0;
@@ -340,6 +360,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--board")) board = NEXT("--board");
         else if (!strcmp(a, "--format")) format = NEXT("--format");
         else if (!strcmp(a, "--dct")) dct = NEXT("--dct");
+        else if (!strcmp(a, "--upsample")) upsample = NEXT("--upsample");
         else if (!strcmp(a, "--csv")) csv_path = NEXT("--csv");
         else if (!strcmp(a, "--verbose")) verbose = 1;
         /* Accepted and ignored: this binary only does decode-only, which is
@@ -365,6 +386,17 @@ int main(int argc, char **argv) {
     else if (!strcmp(dct, "fast")) dct_flag = TJFLAG_FASTDCT;
     else die("--dct must be accurate or fast (got %s)", dct);
 
+    /* Accuracy-class match for chroma upsampling, same discipline as --dct:
+     * turbo's default (this binary's default too) is "fancy"/triangle
+     * upsampling (do_fancy_upsampling=TRUE); TJFLAG_FASTUPSAMPLE selects its
+     * box/nearest-neighbour fast path — the same accuracy class EdgeFirst's
+     * fused 4:2:0->RGB write uses. Only meaningful on the RGB (tjDecompress2)
+     * path; harmless no-op on tjDecompressToYUV2, which never upsamples. */
+    int upsample_flag;
+    if (!strcmp(upsample, "accurate")) upsample_flag = 0;
+    else if (!strcmp(upsample, "fast")) upsample_flag = TJFLAG_FASTUPSAMPLE;
+    else die("--upsample must be accurate or fast (got %s)", upsample);
+
     tj_load();
 
     size_t total = 0, n = 0;
@@ -374,15 +406,17 @@ int main(int argc, char **argv) {
     const char *backend = pixel_format < 0   ? "libturbojpeg-yuv"
                           : pixel_format == TJPF_RGB ? "libturbojpeg-rgb"
                                                      : "libturbojpeg-bgr";
-    fprintf(stderr, "=== turbojpeg (decode-only, format=%s, dct=%s) — %zu images, decoder=%s ===\n",
-            format, dct, n, backend);
+    fprintf(stderr,
+            "=== turbojpeg (decode-only, format=%s, dct=%s, upsample=%s) — %zu images, "
+            "decoder=%s ===\n",
+            format, dct, upsample, n, backend);
     fprintf(stderr, "  lib: %s\n", tj.path);
 
     Decoder d = {0};
     d.handle = tj.init();
     if (!d.handle) die("tjInitDecompress failed: %s", tj_err());
     d.pixel_format = pixel_format;
-    d.dct_flag = dct_flag;
+    d.flags = dct_flag | upsample_flag;
 
     /* Warm up over the whole measured pipeline so decoder setup and first-touch
      * page faults land here rather than in the samples. */
@@ -429,8 +463,9 @@ int main(int argc, char **argv) {
 
     if (csv_path) {
         char notes[288];
-        snprintf(notes, sizeof(notes), "backend=%s;scope=decode-only;harness=c;dct=%s;lib=%s",
-                 backend, dct, tj.path);
+        snprintf(notes, sizeof(notes),
+                 "backend=%s;scope=decode-only;harness=c;dct=%s;upsample=%s;lib=%s", backend, dct,
+                 upsample, tj.path);
         FILE *f = fopen(csv_path, "w");
         if (!f) die("create %s", csv_path);
         fprintf(f,

@@ -33,5 +33,15 @@ beyond this module's scope.
 which is both what HAL implements and libjpeg-turbo's own decompression default;
 `fast` selects `ifast`, a different accuracy class that runs 5–8% quicker.
 
+`--upsample` selects the chroma-upsampling accuracy class on the `--format
+rgb` path (no-op on `yuv`, which never upsamples). Defaults to `accurate`
+(libjpeg's fancy/triangle filter, `do_fancy_upsampling=TRUE`, also turbo's
+own default); `fast` sets `TJFLAG_FASTUPSAMPLE` (box/nearest-neighbour) — the
+accuracy class EdgeFirst's fused native-4:2:0→RGB write uses, so this is the
+matched-accuracy-class comparator for that arm, same discipline as `--dct`.
+
 `libturbojpeg` is resolved at run time by `dlopen`, so the aarch64 cross build
-needs no board headers or libraries — only `aarch64-linux-gnu-gcc`.
+needs no board headers or libraries — only `aarch64-linux-gnu-gcc`. Set
+`EDGEFIRST_TURBOJPEG_LIB=/path/to/libturbojpeg.so` to dlopen an exact path
+instead of the built-in candidate search — for A/B'ing a source-built
+libjpeg-turbo against the distro-packaged one on the same host.
