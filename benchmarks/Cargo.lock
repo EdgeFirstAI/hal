@@ -1665,7 +1665,10 @@ dependencies = [
  "clap",
  "edgefirst-codec",
  "edgefirst-tensor",
+ "image",
  "libloading",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

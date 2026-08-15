@@ -15,10 +15,12 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
 UNAME_S := $(shell uname -s)
+# libdl is separate from libm on Linux (both live in libSystem on Darwin);
+# cbench.h's --parity mode dlopens libturbojpeg.
 ifeq ($(UNAME_S),Darwin)
 LDLIBS  :=
 else
-LDLIBS  := -lm
+LDLIBS  := -lm -ldl
 endif
 BUILD   := build
 
@@ -32,10 +34,10 @@ SHA256_CHECK := $(shell command -v sha256sum >/dev/null 2>&1 && echo "sha256sum 
 
 ifeq ($(shell command -v aarch64-linux-gnu-gcc 2>/dev/null),)
 AARCH64_CC ?= zig cc -target aarch64-linux-gnu
-AARCH64_LDLIBS := -lm
+AARCH64_LDLIBS := -lm -ldl
 else
 AARCH64_CC ?= aarch64-linux-gnu-gcc
-AARCH64_LDLIBS := -lm -static-libgcc
+AARCH64_LDLIBS := -lm -ldl -static-libgcc
 endif
 X86_64_CC ?= zig cc -target x86_64-linux-gnu
 
@@ -63,7 +65,7 @@ $(BUILD)/wuffs_bench.aarch64: bench.c ../cbench/cbench.h $(BUILD)/wuffs-v0.4.c |
 x86_64: $(BUILD)/wuffs_bench.x86_64
 
 $(BUILD)/wuffs_bench.x86_64: bench.c ../cbench/cbench.h $(BUILD)/wuffs-v0.4.c | $(BUILD)
-	$(X86_64_CC) $(CFLAGS) $(INCLUDES) -o $@ bench.c -lm
+	$(X86_64_CC) $(CFLAGS) $(INCLUDES) -o $@ bench.c -lm -ldl
 
 clean:
 	rm -rf $(BUILD)

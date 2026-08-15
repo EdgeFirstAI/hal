@@ -119,11 +119,43 @@ static const char *wuffs_decode_one(WuffsBench *b, const CbenchImage *img) {
     return NULL;
 }
 
+/* --parity: matches CbenchParityDecodeFn. Always forces 3-byte RGB (not
+ * whichever candidate the perf probe order picks) — the like-for-like
+ * output layout every other RGB arm's parity check compares. Lazily
+ * allocates its own WuffsBench decoder/scratch on first call, reused across
+ * the corpus the same way the timed loop reuses its own. */
+static int wuffs_parity_decode(const CbenchImage *img, unsigned char **out, size_t *out_cap,
+                               int *w, int *h) {
+    static WuffsBench b = {0};
+    if (!b.dec) {
+        b.dec = wuffs_jpeg__decoder__alloc();
+        if (!b.dec) cbench_die("wuffs_jpeg__decoder__alloc failed");
+        b.pixfmt = WUFFS_BASE__PIXEL_FORMAT__RGB;
+        b.bytes_per_pixel = 3;
+    }
+    const char *err = wuffs_decode_one(&b, img);
+    if (err) return 1;
+    size_t need = (size_t)b.width * (size_t)b.height * 3;
+    if (need > *out_cap) {
+        *out = (unsigned char *)realloc(*out, need);
+        if (!*out) cbench_die("out of memory for %zu byte output", need);
+        *out_cap = need;
+    }
+    memcpy(*out, b.dst, need);
+    *w = (int)b.width;
+    *h = (int)b.height;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     cbench_pin_qos();
     CbenchArgs args = cbench_parse_args(argc, argv);
     if (strcmp(args.format, "rgb") != 0)
         cbench_die("--format must be rgb (this arm decodes via Wuffs' RGB-family swizzles)");
+    if (args.parity) {
+        cbench_run_parity(&args, "wuffs", wuffs_parity_decode);
+        return 0;
+    }
 
     size_t total = 0, n = 0;
     char **paths = cbench_list_jpegs(args.coco, &total);

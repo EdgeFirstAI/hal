@@ -37,11 +37,32 @@
 #include "stb_image.h"
 #pragma GCC diagnostic pop
 
+/* --parity: matches CbenchParityDecodeFn — tight RGB into a reused buffer. */
+static int stb_parity_decode(const CbenchImage *img, unsigned char **out, size_t *out_cap, int *w,
+                             int *h) {
+    int comp;
+    unsigned char *px = stbi_load_from_memory(img->bytes, (int)img->len, w, h, &comp, 3);
+    if (!px) return 1;
+    size_t need = (size_t)(*w) * (size_t)(*h) * 3;
+    if (need > *out_cap) {
+        *out = (unsigned char *)realloc(*out, need);
+        if (!*out) cbench_die("out of memory for %zu byte output", need);
+        *out_cap = need;
+    }
+    memcpy(*out, px, need);
+    stbi_image_free(px);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     cbench_pin_qos();
     CbenchArgs args = cbench_parse_args(argc, argv);
     if (strcmp(args.format, "rgb") != 0)
         cbench_die("--format must be rgb (stb_image exposes no raw-YUV output)");
+    if (args.parity) {
+        cbench_run_parity(&args, "stb", stb_parity_decode);
+        return 0;
+    }
 
     size_t total = 0, n = 0;
     char **paths = cbench_list_jpegs(args.coco, &total);

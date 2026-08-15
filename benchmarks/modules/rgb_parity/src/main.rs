@@ -1,49 +1,89 @@
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pixel-parity check for EdgeFirst's fused native-4:2:0 RGB decode
-//! (`write_rgb_rows_420`/`expand_row_2x`, 2x2 nearest-neighbour "box" chroma
-//! upsample) against libjpeg-turbo's matched-accuracy-class RGB path
-//! (`TJFLAG_ACCURATEDCT | TJFLAG_FASTUPSAMPLE` — same IDCT, same box/nearest
-//! chroma upsample, no fancy/triangle filtering).
+//! Pixel-parity check against libjpeg-turbo `islow` — the single in-process
+//! accuracy reference every other decode arm is measured against (see
+//! BENCHMARKS.md § JPEG Decode). `islow` is never measured against itself;
+//! every other arm gets a cosine / mean\|Δ\| / max\|Δ\| / PSNR row, plus a
+//! phase-shift diagnostic on 4:2:0 sources.
 //!
-//! This is `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` item #1 (blocking): the two
-//! implementations can both be correctly described as "box" and still differ
-//! by a half-pixel if their replication phase disagrees — which source chroma
-//! sample each of the 2x2 output pixels inherits. A phase bug would corrupt
-//! every 4:2:0 RGB decode silently, since throughput benchmarks never look at
-//! pixel values.
+//! Two reference configurations select Table A (conformance, matched filter
+//! class) vs Table B (accuracy cost, always plain accurate `islow`):
 //!
-//! Reports max abs delta / PSNR / cosine similarity the same way
-//! `dct_compare` does, plus a phase-shift diagnostic: mean abs diff between
-//! the two decodes at 8 neighbouring 1px (dx, dy) offsets. If any shifted
-//! alignment scores lower mean abs diff than the unshifted (0, 0) comparison,
-//! that is direct evidence of a systematic replication-phase disagreement.
+//! - `--reference matched` (default): 4:2:0 sources compare against
+//!   `islow + TJFLAG_FASTUPSAMPLE` (turbo's own box/nearest chroma upsample —
+//!   the like-for-like comparison for EdgeFirst's box-upsample RGB path);
+//!   4:4:4 sources are unaffected by the flag (no chroma resampling either
+//!   side).
+//! - `--reference accurate`: always plain `islow`, no upsample flag — what a
+//!   speed option (EdgeFirst `fast`, turbo `ifast`) trades away against the
+//!   accurate baseline, independent of chroma-filter choice.
+//!
+//! Four engines: `edgefirst-accurate`/`edgefirst-fast` (this crate, via
+//! `edgefirst-codec`), `zune` (zune-jpeg direct), `image` (the `image` crate,
+//! RGB only — wraps zune, see the arm-table note on why both are kept).
+//!
+//! `--yplane` compares EdgeFirst's native NV12/16/24 Y-plane against
+//! `tjDecompressToYUV2` instead of the RGB path (`edgefirst-*` engines only —
+//! the RGB-only comparator engines have no raw-YUV output to compare).
 //!
 //! ```bash
-//! rgb_parity --dir /data/coco/val2017-yuv420 --limit 200
+//! rgb_parity --dir /data/coco/val2017-yuv420 --engine edgefirst-accurate --reference matched
+//! rgb_parity --dir /data/coco/val2017 --engine zune --reference accurate
+//! rgb_parity --dir /data/coco/val2017-yuv420 --engine edgefirst-accurate --yplane
 //! ```
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
-use edgefirst_codec::{ImageDecoder, ImageLoad};
+use clap::{Parser, ValueEnum};
+use edgefirst_codec::{CodecError, DctMethod, ImageDecoder, ImageLoad};
 use edgefirst_tensor::{CpuAccess, PixelFormat, Tensor, TensorMemory, TensorTrait};
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_uchar, c_ulong, c_void, CStr};
 
 const TJPF_RGB: c_int = 0;
 const TJFLAG_FASTUPSAMPLE: c_int = 256;
+const TJFLAG_FASTDCT: c_int = 2048;
 const TJFLAG_ACCURATEDCT: c_int = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Engine {
+    EdgefirstAccurate,
+    EdgefirstFast,
+    Zune,
+    Image,
+    /// Table B only: turbo `ifast` vs plain accurate `islow` — both sides
+    /// decoded in-process via the same dlopen'd library, just two
+    /// `tjDecompress2` calls with different flags. `--reference` is ignored
+    /// (always plain `islow`; `ifast` has no box-upsample filter class of
+    /// its own to be "matched" against).
+    TurboIfast,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Reference {
+    /// Table A (conformance): 4:2:0 sources vs `islow + TJFLAG_FASTUPSAMPLE`.
+    Matched,
+    /// Table B (accuracy cost): always plain accurate `islow`.
+    Accurate,
+}
 
 #[derive(Parser)]
 struct Args {
-    /// JPEG corpus directory (native 4:2:0 sources — non-matching images are
-    /// skipped and counted, since the fused path only engages for them).
+    /// JPEG corpus directory.
     #[arg(long, env = "EDGEFIRST_BENCH_COCO")]
     dir: std::path::PathBuf,
     /// Maximum number of images (0 = all).
     #[arg(long, default_value_t = 200)]
     limit: usize,
+    #[arg(long, value_enum, default_value_t = Engine::EdgefirstAccurate)]
+    engine: Engine,
+    #[arg(long, value_enum, default_value_t = Reference::Matched)]
+    reference: Reference,
+    /// Compare EdgeFirst's native NV12/16/24 Y-plane against
+    /// `tjDecompressToYUV2` instead of the RGB path. `edgefirst-*` engines
+    /// only.
+    #[arg(long)]
+    yplane: bool,
     /// Print each image's stats, not just the aggregate.
     #[arg(long)]
     verbose: bool,
@@ -74,6 +114,18 @@ type TjDecompress = unsafe extern "C" fn(
     c_int,
     c_int,
 ) -> c_int;
+type TjBufSizeYuv2 = unsafe extern "C" fn(c_int, c_int, c_int, c_int) -> c_ulong;
+type TjDecompressToYuv2 = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_uchar,
+    c_ulong,
+    *mut c_uchar,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+) -> c_int;
+type TjPlaneWidth = unsafe extern "C" fn(c_int, c_int, c_int) -> c_int;
 type TjErrorStr = unsafe extern "C" fn() -> *const c_char;
 
 /// Same candidate list as `benchmarks/modules/turbojpeg/bench.c`'s `tj_load`.
@@ -108,6 +160,9 @@ struct TurboJpeg {
     destroy: TjDestroy,
     header: TjHeader,
     decompress: TjDecompress,
+    buf_size_yuv2: TjBufSizeYuv2,
+    decompress_to_yuv2: TjDecompressToYuv2,
+    plane_width: TjPlaneWidth,
     error: TjErrorStr,
     path: String,
 }
@@ -136,6 +191,9 @@ impl TurboJpeg {
         let destroy: TjDestroy = *unsafe { lib.get(b"tjDestroy\0") }?;
         let header: TjHeader = *unsafe { lib.get(b"tjDecompressHeader3\0") }?;
         let decompress: TjDecompress = *unsafe { lib.get(b"tjDecompress2\0") }?;
+        let buf_size_yuv2: TjBufSizeYuv2 = *unsafe { lib.get(b"tjBufSizeYUV2\0") }?;
+        let decompress_to_yuv2: TjDecompressToYuv2 = *unsafe { lib.get(b"tjDecompressToYUV2\0") }?;
+        let plane_width: TjPlaneWidth = *unsafe { lib.get(b"tjPlaneWidth\0") }?;
         let error: TjErrorStr = *unsafe { lib.get(b"tjGetErrorStr\0") }?;
         let handle = unsafe { init() };
         if handle.is_null() {
@@ -147,6 +205,9 @@ impl TurboJpeg {
             destroy,
             header,
             decompress,
+            buf_size_yuv2,
+            decompress_to_yuv2,
+            plane_width,
             error,
             path,
         })
@@ -163,10 +224,11 @@ impl TurboJpeg {
         }
     }
 
-    /// Decode to interleaved RGB with accurate IDCT + box/nearest chroma
-    /// upsample (`TJFLAG_FASTUPSAMPLE`) — the matched-accuracy-class
-    /// comparison point for EdgeFirst's fused box-upsample RGB path.
-    fn decode_rgb_box(&self, jpeg: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
+    /// Decode to interleaved RGB with accurate IDCT, optionally with
+    /// `TJFLAG_FASTUPSAMPLE` (box/nearest chroma upsample — Table A's matched
+    /// config for 4:2:0 sources; omitted for Table B's accurate-vs-accurate
+    /// comparison).
+    fn decode_rgb(&self, jpeg: &[u8], flags: c_int) -> Result<(usize, usize, Vec<u8>)> {
         let mut w = 0i32;
         let mut h = 0i32;
         let mut subsamp = 0i32;
@@ -194,12 +256,71 @@ impl TurboJpeg {
                 0,
                 h,
                 TJPF_RGB,
-                TJFLAG_ACCURATEDCT | TJFLAG_FASTUPSAMPLE,
+                flags,
             ) != 0
             {
                 bail!("tjDecompress2: {}", self.err());
             }
             Ok((w as usize, h as usize, buf))
+        }
+    }
+
+    /// Decode to a planar Y/U/V buffer (row alignment 1) with accurate IDCT
+    /// and return a *tight* `width * height` Y plane — the comparison
+    /// surface for EdgeFirst's semi-planar NV* arms, whose Y plane is
+    /// likewise full-resolution and independent of chroma subsampling.
+    ///
+    /// `align=1` does **not** mean the Y plane's row stride equals `width`:
+    /// `tjPlaneWidth(0, width, subsamp)` rounds up to the chroma-subsampling
+    /// grid (e.g. 427 → 428 for 4:2:0, matching EdgeFirst's own
+    /// `even_width` convention) even at align 1, since the luma plane must
+    /// stay aligned with the chroma blocks it feeds. Assuming stride==width
+    /// on an odd-width source silently drifts the row-extraction offset by
+    /// one byte per row, compounding into a large apparent mismatch by the
+    /// bottom of the image — this bit a first draft of this function
+    /// (confirmed via cross-check against `decode_rgb`'s RGB→Y before
+    /// tracking down `tjPlaneWidth`; the codec itself was never wrong).
+    fn decode_y_plane(&self, jpeg: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
+        let mut w = 0i32;
+        let mut h = 0i32;
+        let mut subsamp = 0i32;
+        let mut colorspace = 0i32;
+        unsafe {
+            if (self.header)(
+                self.handle,
+                jpeg.as_ptr(),
+                jpeg.len() as c_ulong,
+                &mut w,
+                &mut h,
+                &mut subsamp,
+                &mut colorspace,
+            ) != 0
+            {
+                bail!("tjDecompressHeader3: {}", self.err());
+            }
+            let need = (self.buf_size_yuv2)(w, 1, h, subsamp);
+            let mut buf = vec![0u8; need as usize];
+            if (self.decompress_to_yuv2)(
+                self.handle,
+                jpeg.as_ptr(),
+                jpeg.len() as c_ulong,
+                buf.as_mut_ptr(),
+                w,
+                1,
+                h,
+                TJFLAG_ACCURATEDCT,
+            ) != 0
+            {
+                bail!("tjDecompressToYUV2: {}", self.err());
+            }
+            let y_stride = (self.plane_width)(0, w, subsamp) as usize;
+            let (wu, hu) = (w as usize, h as usize);
+            let mut y_plane = vec![0u8; wu * hu];
+            for row in 0..hu {
+                y_plane[row * wu..row * wu + wu]
+                    .copy_from_slice(&buf[row * y_stride..row * y_stride + wu]);
+            }
+            Ok((wu, hu, y_plane))
         }
     }
 }
@@ -211,12 +332,49 @@ impl Drop for TurboJpeg {
     }
 }
 
-/// mean|d|, max|d| (RGB channel bytes) between `a` and `b` when `b` is
-/// shifted by `(dx, dy)` pixels relative to `a`, over the interior region
-/// common to both after the shift (a 1px border is more than enough margin
-/// for a 1px probe). `stride`/`w3` are byte strides (`width * 3`).
-fn shifted_diff(a: &[u8], b: &[u8], w: usize, h: usize, dx: i32, dy: i32) -> f64 {
-    let w3 = w * 3;
+/// mean|d|, max|d| between two same-length single-channel or interleaved
+/// byte buffers, and cosine/PSNR over the same data.
+struct Stats {
+    cosine: f64,
+    mean_abs: f64,
+    max_abs: i32,
+    psnr: f64,
+}
+
+fn compare(a: &[u8], b: &[u8]) -> Stats {
+    let (mut dot, mut na, mut nf, mut se, mut sum_abs) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    let mut max_diff = 0i32;
+    for i in 0..a.len() {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        dot += x * y;
+        na += x * x;
+        nf += y * y;
+        let d = (a[i] as i32 - b[i] as i32).abs();
+        se += (d * d) as f64;
+        sum_abs += d as f64;
+        max_diff = max_diff.max(d);
+    }
+    let cosine = dot / (na.sqrt() * nf.sqrt()).max(1e-12);
+    let mse = se / a.len() as f64;
+    let psnr = if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    };
+    Stats {
+        cosine,
+        mean_abs: sum_abs / a.len() as f64,
+        max_abs: max_diff,
+        psnr,
+    }
+}
+
+/// mean|d| (RGB channel bytes) between `a` and `b` when `b` is shifted by
+/// `(dx, dy)` pixels relative to `a`, over the interior region common to both
+/// after the shift. `w`/`h` are pixel dimensions; `channels` is 3 for RGB, 1
+/// for a Y plane.
+fn shifted_diff(a: &[u8], b: &[u8], w: usize, h: usize, channels: usize, dx: i32, dy: i32) -> f64 {
+    let stride = w * channels;
     let mut sum = 0f64;
     let mut count = 0usize;
     let y0 = dy.max(0) as usize;
@@ -224,14 +382,12 @@ fn shifted_diff(a: &[u8], b: &[u8], w: usize, h: usize, dx: i32, dy: i32) -> f64
     let x0 = dx.max(0) as usize;
     let x1 = (w as i32 + dx.min(0)) as usize;
     for y in y0..y1 {
-        let ay = y;
         let by = (y as i32 - dy) as usize;
         for x in x0..x1 {
-            let ax = x;
             let bx = (x as i32 - dx) as usize;
-            for c in 0..3 {
-                let av = a[ay * w3 + ax * 3 + c] as f64;
-                let bv = b[by * w3 + bx * 3 + c] as f64;
+            for c in 0..channels {
+                let av = a[y * stride + x * channels + c] as f64;
+                let bv = b[by * stride + bx * channels + c] as f64;
                 sum += (av - bv).abs();
                 count += 1;
             }
@@ -244,13 +400,77 @@ fn shifted_diff(a: &[u8], b: &[u8], w: usize, h: usize, dx: i32, dy: i32) -> f64
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let tj = TurboJpeg::load(args.lib.as_deref())?;
-    eprintln!("libturbojpeg: {}", tj.path);
+/// One image's worth of EdgeFirst decode, in RGB mode: tight-packed
+/// (`width*3` stride) so it's directly comparable to turbo's buffer. `Ok(None)`
+/// means this arm doesn't support the source (e.g. `CodecError::UnsupportedFormat`
+/// on a non-4:4:4/non-4:2:0 subsampling, or a zune/image decode error on an
+/// image that engine can't handle — same "skip, not a fault" convention the
+/// original box-upsample-only version of this tool used).
+fn decode_engine_rgb(
+    engine: Engine,
+    ef_tensor: &mut Tensor<u8>,
+    ef_decoder: &mut ImageDecoder,
+    zune_buf: &mut Vec<u8>,
+    data: &[u8],
+) -> Result<Option<(usize, usize, Vec<u8>)>> {
+    match engine {
+        Engine::EdgefirstAccurate | Engine::EdgefirstFast => {
+            match ef_tensor.load_image(ef_decoder, data) {
+                Ok(info) => {
+                    let map = ef_tensor.map()?;
+                    let hal_data: &[u8] = &map;
+                    let stride = info.row_stride;
+                    let w3 = info.width * 3;
+                    let mut tight = vec![0u8; w3 * info.height];
+                    for y in 0..info.height {
+                        tight[y * w3..y * w3 + w3]
+                            .copy_from_slice(&hal_data[y * stride..y * stride + w3]);
+                    }
+                    Ok(Some((info.width, info.height, tight)))
+                }
+                Err(CodecError::UnsupportedFormat(_)) => Ok(None),
+                Err(_) => Ok(None),
+            }
+        }
+        Engine::Zune => {
+            let opts = zune_core::options::DecoderOptions::default()
+                .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB);
+            let mut dec =
+                zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), opts);
+            if dec.decode_headers().is_err() {
+                return Ok(None);
+            }
+            let Some(need) = dec.output_buffer_size() else {
+                return Ok(None);
+            };
+            if zune_buf.len() < need {
+                zune_buf.resize(need, 0);
+            }
+            if dec.decode_into(zune_buf).is_err() {
+                return Ok(None);
+            }
+            let Some((w, h)) = dec.dimensions() else {
+                return Ok(None);
+            };
+            Ok(Some((w, h, zune_buf[..need].to_vec())))
+        }
+        Engine::Image => {
+            match image::load_from_memory_with_format(data, image::ImageFormat::Jpeg) {
+                Ok(img) => {
+                    let rgb = img.to_rgb8();
+                    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+                    Ok(Some((w, h, rgb.into_raw())))
+                }
+                Err(_) => Ok(None),
+            }
+        }
+        Engine::TurboIfast => unreachable!("run_rgb branches TurboIfast to tj.decode_rgb directly"),
+    }
+}
 
-    let mut files: Vec<_> = std::fs::read_dir(&args.dir)
-        .with_context(|| format!("reading {}", args.dir.display()))?
+fn list_files(dir: &std::path::Path, limit: usize) -> Result<Vec<std::path::PathBuf>> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             p.extension()
@@ -259,10 +479,37 @@ fn main() -> Result<()> {
         })
         .collect();
     files.sort();
-    if args.limit > 0 {
-        files.truncate(args.limit);
+    if limit > 0 && limit < files.len() {
+        let len = files.len();
+        files = (0..limit).map(|i| files[i * len / limit].clone()).collect();
     }
-    anyhow::ensure!(!files.is_empty(), "no JPEGs in {}", args.dir.display());
+    anyhow::ensure!(!files.is_empty(), "no JPEGs in {}", dir.display());
+    Ok(files)
+}
+
+fn engine_name(e: Engine) -> &'static str {
+    match e {
+        Engine::EdgefirstAccurate => "edgefirst-accurate",
+        Engine::EdgefirstFast => "edgefirst-fast",
+        Engine::Zune => "zune",
+        Engine::Image => "image",
+        Engine::TurboIfast => "turbo-ifast",
+    }
+}
+
+fn run_rgb(args: &Args, tj: &TurboJpeg, files: &[std::path::PathBuf]) -> Result<()> {
+    // TurboIfast always compares against plain accurate islow — Table B
+    // only, no matched-config filter class to join Table A under.
+    let turbo_flags = if args.engine == Engine::TurboIfast {
+        TJFLAG_ACCURATEDCT
+    } else {
+        TJFLAG_ACCURATEDCT
+            | if args.reference == Reference::Matched {
+                TJFLAG_FASTUPSAMPLE
+            } else {
+                0
+            }
+    };
 
     let mut tensor = Tensor::<u8>::image(
         8192,
@@ -273,84 +520,54 @@ fn main() -> Result<()> {
     )?;
     let mut decoder = ImageDecoder::new();
     decoder.set_output_format(Some(PixelFormat::Rgb));
+    if args.engine == Engine::EdgefirstFast {
+        decoder.set_dct_method(DctMethod::Fast);
+    }
+    let mut zune_buf = Vec::new();
 
     let mut n_images = 0usize;
-    let mut n_skipped_not_420 = 0usize;
+    let mut n_skipped = 0usize;
     let mut n_dim_mismatch = 0usize;
     let mut worst_cosine = 1.0f64;
     let mut worst_psnr = f64::INFINITY;
     let mut global_max_diff = 0i32;
     let mut sum_cosine = 0.0f64;
+    let mut sum_mean_abs = 0.0f64;
     let mut sum_psnr = 0.0f64;
-    // Best (lowest) mean|d| shift seen across the whole corpus, and how often
-    // a nonzero shift beat (0, 0) on a given image — the phase-bug signal.
     let mut zero_shift_never_best = 0usize;
     let offsets: Vec<(i32, i32)> = (-1..=1)
         .flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
         .collect();
 
-    for path in &files {
+    for path in files {
         let data = std::fs::read(path)?;
-        let hal = match tensor.load_image(&mut decoder, &data) {
-            Ok(info) => info,
-            // Not 4:2:0/4:4:4-equivalent (`UnsupportedFormat`) or otherwise
-            // corrupt/unsupported: skip both arms. `UnsupportedFormat` is
-            // the expected, common case here — most corpora mix in a few
-            // greyscale/4:2:2 images fused RGB doesn't engage for.
-            Err(edgefirst_codec::CodecError::UnsupportedFormat(_)) => {
-                n_skipped_not_420 += 1;
-                continue;
-            }
-            Err(_) => continue,
+        let Some((ew, eh, engine_rgb)) = (if args.engine == Engine::TurboIfast {
+            tj.decode_rgb(&data, TJFLAG_FASTDCT).ok()
+        } else {
+            decode_engine_rgb(args.engine, &mut tensor, &mut decoder, &mut zune_buf, &data)?
+        }) else {
+            n_skipped += 1;
+            continue;
         };
-        let (tw, th, turbo_rgb) = match tj.decode_rgb_box(&data) {
+        let (tw, th, turbo_rgb) = match tj.decode_rgb(&data, turbo_flags) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if tw != hal.width || th != hal.height {
+        if tw != ew || th != eh {
             n_dim_mismatch += 1;
             continue;
         }
 
-        let map = tensor.map()?;
-        let hal_data: &[u8] = &map;
-        let stride = hal.row_stride;
-        let w3 = hal.width * 3;
-        // Tight-pack HAL's output for the shift-diagnostic helper (which
-        // assumes `width*3` stride); turbo's buffer is already tight.
-        let mut hal_tight = vec![0u8; w3 * hal.height];
-        for y in 0..hal.height {
-            hal_tight[y * w3..y * w3 + w3].copy_from_slice(&hal_data[y * stride..y * stride + w3]);
-        }
-        drop(map);
+        let stats = compare(&engine_rgb, &turbo_rgb);
 
-        let (mut dot, mut na, mut nf, mut se) = (0f64, 0f64, 0f64, 0f64);
-        let mut max_diff = 0i32;
-        for i in 0..w3 * hal.height {
-            let (x, y) = (hal_tight[i] as f64, turbo_rgb[i] as f64);
-            dot += x * y;
-            na += x * x;
-            nf += y * y;
-            let d = (hal_tight[i] as i32 - turbo_rgb[i] as i32).abs();
-            se += (d * d) as f64;
-            max_diff = max_diff.max(d);
-        }
-        let cosine = dot / (na.sqrt() * nf.sqrt()).max(1e-12);
-        let mse = se / (w3 * hal.height) as f64;
-        let psnr = if mse == 0.0 {
-            f64::INFINITY
-        } else {
-            10.0 * (255.0f64 * 255.0 / mse).log10()
-        };
-
-        let zero_shift_diff = shifted_diff(&hal_tight, &turbo_rgb, hal.width, hal.height, 0, 0);
+        let zero_shift_diff = shifted_diff(&engine_rgb, &turbo_rgb, ew, eh, 3, 0, 0);
         let mut best_shift = (0i32, 0i32);
         let mut best_diff = zero_shift_diff;
         for &(dx, dy) in &offsets {
             if dx == 0 && dy == 0 {
                 continue;
             }
-            let d = shifted_diff(&hal_tight, &turbo_rgb, hal.width, hal.height, dx, dy);
+            let d = shifted_diff(&engine_rgb, &turbo_rgb, ew, eh, 3, dx, dy);
             if d < best_diff {
                 best_diff = d;
                 best_shift = (dx, dy);
@@ -361,41 +578,178 @@ fn main() -> Result<()> {
         }
 
         n_images += 1;
-        sum_cosine += cosine;
-        sum_psnr += psnr.min(99.0);
-        worst_cosine = worst_cosine.min(cosine);
-        worst_psnr = worst_psnr.min(psnr);
-        global_max_diff = global_max_diff.max(max_diff);
+        sum_cosine += stats.cosine;
+        sum_mean_abs += stats.mean_abs;
+        sum_psnr += stats.psnr.min(99.0);
+        worst_cosine = worst_cosine.min(stats.cosine);
+        worst_psnr = worst_psnr.min(stats.psnr);
+        global_max_diff = global_max_diff.max(stats.max_abs);
         if args.verbose {
             println!(
-                "{}: cosine={cosine:.7} psnr={psnr:.2} dB max|d|={max_diff} \
-                 zero_shift_mean|d|={zero_shift_diff:.4} best_shift={best_shift:?} \
-                 best_mean|d|={best_diff:.4}",
-                path.file_name().unwrap().to_string_lossy()
+                "{}: cosine={:.7} mean|d|={:.4} max|d|={} psnr={:.2} \
+                 zero_shift_mean|d|={zero_shift_diff:.4} best_shift={best_shift:?}",
+                path.file_name().unwrap().to_string_lossy(),
+                stats.cosine,
+                stats.mean_abs,
+                stats.max_abs,
+                stats.psnr,
             );
         }
     }
 
-    anyhow::ensure!(n_images > 0, "no native-4:2:0 images decoded on both arms");
+    anyhow::ensure!(n_images > 0, "no images decoded on both arms");
 
+    let ref_label = if args.engine == Engine::TurboIfast {
+        "islow accurate (Table B, --reference ignored)"
+    } else {
+        match args.reference {
+            Reference::Matched => "islow + TJFLAG_FASTUPSAMPLE (matched, Table A)",
+            Reference::Accurate => "islow accurate (Table B)",
+        }
+    };
     println!(
-        "== EdgeFirst box-upsample RGB vs turbo TJFLAG_FASTUPSAMPLE RGB over {n_images} images"
+        "== {} RGB vs turbo {ref_label} over {n_images} images",
+        engine_name(args.engine)
     );
-    println!("   (skipped: {n_skipped_not_420} not native-4:2:0, {n_dim_mismatch} dim mismatch)");
+    println!("   (skipped: {n_skipped} unsupported, {n_dim_mismatch} dim mismatch)");
     println!(
-        "  cosine:  mean={:.7}  worst={:.7}",
+        "  cosine:   mean={:.7}  worst={:.7}",
         sum_cosine / n_images as f64,
         worst_cosine
     );
+    println!("  mean|d|:  {:.4}", sum_mean_abs / n_images as f64);
+    println!("  max|d|:   {global_max_diff}");
     println!(
-        "  psnr:    mean={:.2} dB  worst={:.2} dB",
+        "  psnr:     mean={:.2} dB  worst={:.2} dB",
         sum_psnr / n_images as f64,
         worst_psnr
     );
-    println!("  max|d|:  {global_max_diff}");
     println!(
-        "  phase:   {zero_shift_never_best}/{n_images} images where a ±1px shift beat zero-shift \
+        "  phase:    {zero_shift_never_best}/{n_images} images where a ±1px shift beat zero-shift \
          alignment (0 expected if the replication phase matches)"
     );
     Ok(())
+}
+
+fn run_yplane(args: &Args, tj: &TurboJpeg, files: &[std::path::PathBuf]) -> Result<()> {
+    let mut tensor = Tensor::<u8>::image(
+        8192,
+        8192,
+        PixelFormat::Nv12,
+        Some(TensorMemory::Mem),
+        CpuAccess::ReadWrite,
+    )?;
+    let mut decoder = ImageDecoder::new();
+    // No set_output_format: leave the decoder on its native NV12/16/24
+    // output — the Y plane is full-resolution and identically laid out
+    // (row_stride pitch, first `height * row_stride` bytes) regardless of
+    // which NV* variant the source's chroma subsampling selects.
+    if args.engine == Engine::EdgefirstFast {
+        decoder.set_dct_method(DctMethod::Fast);
+    }
+
+    let mut n_images = 0usize;
+    let mut n_skipped = 0usize;
+    let mut n_dim_mismatch = 0usize;
+    let mut worst_cosine = 1.0f64;
+    let mut worst_psnr = f64::INFINITY;
+    let mut global_max_diff = 0i32;
+    let mut sum_cosine = 0.0f64;
+    let mut sum_mean_abs = 0.0f64;
+    let mut sum_psnr = 0.0f64;
+
+    for path in files {
+        let data = std::fs::read(path)?;
+        let info = match tensor.load_image(&mut decoder, &data) {
+            Ok(info) => info,
+            Err(_) => {
+                n_skipped += 1;
+                continue;
+            }
+        };
+        let (tw, th, turbo_y) = match tj.decode_y_plane(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if tw != info.width || th != info.height {
+            n_dim_mismatch += 1;
+            continue;
+        }
+
+        let map = tensor.map()?;
+        let hal_data: &[u8] = &map;
+        let stride = info.row_stride;
+        let mut ef_y = vec![0u8; info.width * info.height];
+        for y in 0..info.height {
+            ef_y[y * info.width..y * info.width + info.width]
+                .copy_from_slice(&hal_data[y * stride..y * stride + info.width]);
+        }
+        drop(map);
+
+        let stats = compare(&ef_y, &turbo_y);
+        n_images += 1;
+        sum_cosine += stats.cosine;
+        sum_mean_abs += stats.mean_abs;
+        sum_psnr += stats.psnr.min(99.0);
+        worst_cosine = worst_cosine.min(stats.cosine);
+        worst_psnr = worst_psnr.min(stats.psnr);
+        global_max_diff = global_max_diff.max(stats.max_abs);
+        if args.verbose {
+            println!(
+                "{}: cosine={:.7} mean|d|={:.4} max|d|={} psnr={:.2}",
+                path.file_name().unwrap().to_string_lossy(),
+                stats.cosine,
+                stats.mean_abs,
+                stats.max_abs,
+                stats.psnr,
+            );
+        }
+    }
+
+    anyhow::ensure!(n_images > 0, "no images decoded on both arms");
+
+    println!(
+        "== {} Y-plane (native NV12/16/24) vs turbo tjDecompressToYUV2 islow over {n_images} images",
+        engine_name(args.engine)
+    );
+    println!("   (skipped: {n_skipped} unsupported, {n_dim_mismatch} dim mismatch)");
+    println!(
+        "  cosine:   mean={:.7}  worst={:.7}",
+        sum_cosine / n_images as f64,
+        worst_cosine
+    );
+    println!("  mean|d|:  {:.4}", sum_mean_abs / n_images as f64);
+    println!("  max|d|:   {global_max_diff}");
+    println!(
+        "  psnr:     mean={:.2} dB  worst={:.2} dB",
+        sum_psnr / n_images as f64,
+        worst_psnr
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.yplane {
+        anyhow::ensure!(
+            matches!(
+                args.engine,
+                Engine::EdgefirstAccurate | Engine::EdgefirstFast
+            ),
+            "--yplane only supports --engine edgefirst-accurate|edgefirst-fast: the Y-plane \
+             comparison targets EdgeFirst's native NV12/16/24 output, which zune/image have no \
+             equivalent of (RGB-only comparator engines)"
+        );
+    }
+
+    let tj = TurboJpeg::load(args.lib.as_deref())?;
+    eprintln!("libturbojpeg: {}", tj.path);
+
+    let files = list_files(&args.dir, args.limit)?;
+
+    if args.yplane {
+        run_yplane(&args, &tj, &files)
+    } else {
+        run_rgb(&args, &tj, &files)
+    }
 }
