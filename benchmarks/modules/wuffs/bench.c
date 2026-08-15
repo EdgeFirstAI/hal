@@ -139,7 +139,8 @@ int main(int argc, char **argv) {
      * for an isolated 3-byte-swizzle-vs-4-byte-native A/B on Wuffs' own
      * decoder (not a comparison against another arm) — see BENCHMARKS.md
      * § JPEG Decode's Wuffs accuracy/performance note. */
-    int force_4bpp = getenv("EDGEFIRST_WUFFS_FORCE_4BPP") != NULL;
+    const char *force_4bpp_env = getenv("EDGEFIRST_WUFFS_FORCE_4BPP");
+    int force_4bpp = force_4bpp_env != NULL && strcmp(force_4bpp_env, "1") == 0;
     const WuffsCandidate *candidates = force_4bpp ? wuffs_candidates_4bpp_first
                                                    : wuffs_candidates_3bpp_first;
     const char *fmt_name = NULL;

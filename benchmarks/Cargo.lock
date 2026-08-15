@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-codec"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "edgefirst-tensor",
  "kamadak-exif",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-decoder"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "argminmax",
  "edgefirst-tensor",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-egl"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "libc",
  "libloading",
@@ -537,14 +537,14 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-gl"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "gl_generator",
 ]
 
 [[package]]
 name = "edgefirst-hal"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "edgefirst-codec",
  "edgefirst-decoder",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-image"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "ctor",
  "dma-heap",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tensor"
-version = "0.28.1"
+version = "0.28.3"
 dependencies = [
  "ctor",
  "dma-heap",

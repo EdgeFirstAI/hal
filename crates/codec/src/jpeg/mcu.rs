@@ -23,8 +23,8 @@ pub struct McuScratch {
     /// component, each `mcus_x * sampling.h * 8` wide × `sampling.v * 8` tall.
     component_bufs: Vec<Vec<u8>>,
     /// Full-width horizontally-upsampled Cb/Cr rows for the fused 4:2:0→RGB
-    /// write (see `write_rgb_rows_420`). Empty until first grown by
-    /// `ensure_capacity`/`new` for an image wide enough to need them.
+    /// write (see `write_rgb_rows_420`). Allocated to `img_w` by `new`;
+    /// `ensure_capacity` grows (never shrinks) them for a later, wider image.
     upsample_cb: Vec<u8>,
     upsample_cr: Vec<u8>,
 }
