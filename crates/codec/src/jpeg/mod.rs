@@ -75,6 +75,11 @@ pub struct JpegDecoderState {
     huffman_cache: huffman::HuffmanCache,
     /// Optional fused-output preference (see [`resolve_output_format`]).
     pub(crate) preferred_format: Option<PixelFormat>,
+    /// Chroma upsampling filter for a fused native-4:2:0 `Rgb` decode — see
+    /// [`crate::ChromaUpsample`]. Only `Box` is implemented; the field
+    /// exists so the type is threaded through end to end before a second
+    /// filter is added, rather than retrofitted later.
+    pub(crate) chroma_upsample: crate::decoder::ChromaUpsample,
     /// Opt-in fast (AAN `ifast`-class) IDCT — see [`crate::DctMethod`].
     /// Default false; `EDGEFIRST_CODEC_DCT=fast` flips the constructor
     /// default so benchmarks can A/B without code changes.
@@ -97,6 +102,7 @@ impl JpegDecoderState {
             mcu_scratch: None,
             huffman_cache: huffman::HuffmanCache::default(),
             preferred_format: None,
+            chroma_upsample: crate::decoder::ChromaUpsample::default(),
             fast_dct: std::env::var("EDGEFIRST_CODEC_DCT")
                 .map(|v| v.trim().eq_ignore_ascii_case("fast"))
                 .unwrap_or(false),
@@ -165,8 +171,13 @@ fn native_format(headers: &markers::JpegHeaders) -> crate::Result<PixelFormat> {
 ///   nearest-neighbour chroma upsample fused into the write). `native ==
 ///   Nv12` alone is not sufficient: non-standard subsamplings (4:1:1, mismatched
 ///   Cb/Cr) also downsample to `Nv12` in [`native_format`] but aren't the
-///   shape the fused RGB write targets, so they fall back to native rather
-///   than erroring. Other sources (4:2:2, greyscale) fall back to native.
+///   shape the fused RGB write targets. An explicit `Rgb` request on any
+///   other source (4:2:2, greyscale, or a non-standard subsampling) returns
+///   [`CodecError::UnsupportedFormat`] rather than silently substituting the
+///   native format — a caller who asks for RGB and doesn't check
+///   [`ImageInfo::format`](crate::ImageInfo) must not be handed a
+///   differently-shaped buffer with no indication anything changed. See
+///   `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` item #3.
 /// - `Nv12`: honoured for any colour JPEG — the MCU writer downsamples
 ///   chroma (2×2 for 4:4:4, vertical for 4:2:2; native 4:2:0 passes through).
 /// - Anything else (or `None`): native format.
@@ -174,14 +185,15 @@ fn resolve_output_format(
     headers: &markers::JpegHeaders,
     native: PixelFormat,
     preferred: Option<PixelFormat>,
-) -> PixelFormat {
-    match preferred {
+) -> crate::Result<PixelFormat> {
+    Ok(match preferred {
         Some(PixelFormat::Rgb) if native == PixelFormat::Nv24 => PixelFormat::Rgb,
         Some(PixelFormat::Rgb)
             if native == PixelFormat::Nv12 && mcu::is_native_420(&headers.header) =>
         {
             PixelFormat::Rgb
         }
+        Some(PixelFormat::Rgb) => return Err(CodecError::UnsupportedFormat(PixelFormat::Rgb)),
         Some(PixelFormat::Nv12)
             if matches!(
                 native,
@@ -191,7 +203,7 @@ fn resolve_output_format(
             PixelFormat::Nv12
         }
         _ => native,
-    }
+    })
 }
 
 /// Native luma/primary-plane row stride in bytes for a freshly decoded image.
@@ -274,7 +286,7 @@ fn decode_jpeg_into_parsed<T: ImagePixel>(
     let img_w = headers.header.width as usize;
     let img_h = headers.header.height as usize;
     let native_fmt = native_format(headers)?;
-    let output_fmt = resolve_output_format(headers, native_fmt, state.preferred_format);
+    let output_fmt = resolve_output_format(headers, native_fmt, state.preferred_format)?;
     // Fused (non-native) outputs are a CPU-decoder feature: the hardware
     // decoders produce fixed formats, so bypass them when the resolved output
     // differs from native.

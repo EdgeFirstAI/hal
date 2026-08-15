@@ -647,6 +647,128 @@ mod tests {
         assert_eq!(got, exp);
     }
 
+    /// Reference for the block16 kernels: two 8×8 blocks placed side by side
+    /// (16 wide) and converted with the scalar row kernel, row by row —
+    /// mirrors `mcu_blocks_match_row_kernel`'s construction so both the
+    /// dispatch-level and kernel-forced tests check the same thing.
+    fn block16_reference(
+        y0: &[u8; 64],
+        cb0: &[u8; 64],
+        cr0: &[u8; 64],
+        y1: &[u8; 64],
+        cb1: &[u8; 64],
+        cr1: &[u8; 64],
+        stride: usize,
+    ) -> Vec<u8> {
+        let mut exp = vec![0u8; 8 * stride];
+        for r in 0..8 {
+            let mut yrow = [0u8; 16];
+            let mut cbrow = [0u8; 16];
+            let mut crrow = [0u8; 16];
+            yrow[..8].copy_from_slice(&y0[r * 8..r * 8 + 8]);
+            yrow[8..].copy_from_slice(&y1[r * 8..r * 8 + 8]);
+            cbrow[..8].copy_from_slice(&cb0[r * 8..r * 8 + 8]);
+            cbrow[8..].copy_from_slice(&cb1[r * 8..r * 8 + 8]);
+            crrow[..8].copy_from_slice(&cr0[r * 8..r * 8 + 8]);
+            crrow[8..].copy_from_slice(&cr1[r * 8..r * 8 + 8]);
+            let d = r * stride;
+            ycbcr_to_rgb_row_scalar(&yrow, &cbrow, &crrow, &mut exp[d..], 0, 16);
+        }
+        exp
+    }
+
+    /// The fused-RGB **block** SSE4.1 kernel (`ycbcr_to_rgb_block16_sse41`,
+    /// the direct-write 4:4:4 path — see `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md`
+    /// item #5) must be bit-identical to the scalar model, called directly
+    /// rather than through `ycbcr_to_rgb_blocks`'s dispatch — dispatch-only
+    /// coverage (`mcu_blocks_match_row_kernel`) only ever exercises whichever
+    /// tier the CI/dev host happens to have, which is exactly the "benchmarks
+    /// never catch a fallback divergence" gap the review flags.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn block16_sse41_matches_scalar() {
+        if !is_x86_feature_detected!("sse4.1") {
+            eprintln!("skip: host has no sse4.1");
+            return;
+        }
+        let mut y0 = [0u8; 64];
+        let mut cb0 = [0u8; 64];
+        let mut cr0 = [0u8; 64];
+        let mut y1 = [0u8; 64];
+        let mut cb1 = [0u8; 64];
+        let mut cr1 = [0u8; 64];
+        y0.copy_from_slice(&lcg_bytes(3, 64));
+        cb0.copy_from_slice(&lcg_bytes(5, 64));
+        cr0.copy_from_slice(&lcg_bytes(7, 64));
+        y1.copy_from_slice(&lcg_bytes(11, 64));
+        cb1.copy_from_slice(&lcg_bytes(13, 64));
+        cr1.copy_from_slice(&lcg_bytes(17, 64));
+
+        let stride = 16 * 3;
+        let mut got = vec![0u8; 8 * stride];
+        // SAFETY: sse4.1 checked above; buffers sized for 8 rows x 16px.
+        unsafe {
+            ycbcr_to_rgb_block16_sse41(&y0, &cb0, &cr0, &y1, &cb1, &cr1, &mut got, stride, 0, 0, 8);
+        }
+        let exp = block16_reference(&y0, &cb0, &cr0, &y1, &cb1, &cr1, stride);
+        assert_eq!(got, exp);
+    }
+
+    /// ARM never gets the SSE4.1 path — its fused-RGB block write is the NEON
+    /// kernels below (`ycbcr_to_rgb_block16_neon`/`block8_neon`), called
+    /// directly rather than through dispatch for the same reason as the
+    /// SSE4.1 test above. Covers both the paired-block (16px) and
+    /// single-block (8px, right-edge MCU) kernels.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn block_neon_kernels_match_scalar() {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            eprintln!("skip: host has no neon");
+            return;
+        }
+        let mut y0 = [0u8; 64];
+        let mut cb0 = [0u8; 64];
+        let mut cr0 = [0u8; 64];
+        let mut y1 = [0u8; 64];
+        let mut cb1 = [0u8; 64];
+        let mut cr1 = [0u8; 64];
+        y0.copy_from_slice(&lcg_bytes(3, 64));
+        cb0.copy_from_slice(&lcg_bytes(5, 64));
+        cr0.copy_from_slice(&lcg_bytes(7, 64));
+        y1.copy_from_slice(&lcg_bytes(11, 64));
+        cb1.copy_from_slice(&lcg_bytes(13, 64));
+        cr1.copy_from_slice(&lcg_bytes(17, 64));
+
+        let stride16 = 16 * 3;
+        let mut got16 = vec![0u8; 8 * stride16];
+        // SAFETY: neon checked above; buffers sized for 8 rows x 16px.
+        unsafe {
+            ycbcr_to_rgb_block16_neon(
+                &y0, &cb0, &cr0, &y1, &cb1, &cr1, &mut got16, stride16, 0, 0, 8,
+            );
+        }
+        let exp16 = block16_reference(&y0, &cb0, &cr0, &y1, &cb1, &cr1, stride16);
+        assert_eq!(got16, exp16, "block16_neon");
+
+        let stride8 = 8 * 3;
+        let mut got8 = vec![0u8; 8 * stride8];
+        // SAFETY: neon checked above; buffer sized for 8 rows x 8px.
+        unsafe { ycbcr_to_rgb_block8_neon(&y0, &cb0, &cr0, &mut got8, stride8, 0, 0, 8) };
+        let mut exp8 = vec![0u8; 8 * stride8];
+        for r in 0..8 {
+            let d = r * stride8;
+            ycbcr_to_rgb_row_scalar(
+                &y0[r * 8..r * 8 + 8],
+                &cb0[r * 8..r * 8 + 8],
+                &cr0[r * 8..r * 8 + 8],
+                &mut exp8[d..],
+                0,
+                8,
+            );
+        }
+        assert_eq!(got8, exp8, "block8_neon");
+    }
+
     /// Both x86 kernels must be bit-identical to the scalar model, not just
     /// whichever one this host's tier happens to select.
     #[cfg(target_arch = "x86_64")]

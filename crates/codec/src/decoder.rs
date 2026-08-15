@@ -28,6 +28,25 @@ pub enum DctMethod {
     Fast,
 }
 
+/// Chroma upsampling filter for a fused native-4:2:0 `Rgb` decode (see
+/// [`ImageDecoder::set_output_format`]).
+///
+/// [`Box`](Self::Box) — 2×2 nearest-neighbour replication — is the only
+/// filter implemented today; the type exists so that a future
+/// fancy/triangle-filtered mode (libjpeg-turbo's default, and a materially
+/// more expensive one — see BENCHMARKS.md) can be added as a new variant
+/// without a breaking API change to
+/// [`ImageDecoder::set_chroma_upsample`]. `#[non_exhaustive]` for the same
+/// reason: adding a variant later must not be a semver break for callers who
+/// match on this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ChromaUpsample {
+    /// 2×2 nearest-neighbour (box) chroma replication.
+    #[default]
+    Box,
+}
+
 /// Reusable image decoder with internal scratch buffers.
 ///
 /// Create one `ImageDecoder` at program initialisation and pass it to
@@ -93,7 +112,11 @@ impl ImageDecoder {
     ///   straight to RGB, with a 2×2 nearest-neighbour (box) chroma upsample
     ///   fused into the write — not libjpeg's fancy/triangle upsampling, a
     ///   deliberate speed tradeoff (see BENCHMARKS.md). Other sources (4:2:2,
-    ///   non-standard subsamplings) fall back to native.
+    ///   greyscale, non-standard subsamplings) cannot honour an RGB request:
+    ///   the decode returns [`CodecError::UnsupportedFormat`] rather than
+    ///   silently substituting the native semi-planar format. Check the
+    ///   source's subsampling first (e.g. via [`crate::peek_info`]) if it
+    ///   isn't known to be 4:4:4 or 4:2:0.
     /// - `Some(Nv12)`: colour JPEGs decode to NV12, downsampling chroma at
     ///   the write stage (2×2 average for 4:4:4, vertical for 4:2:2).
     /// - `None` (default): native format (`Nv12`/`Nv16`/`Nv24`/`Grey`).
@@ -110,6 +133,17 @@ impl ImageDecoder {
     /// environment flips a **new** decoder's default for A/B runs.
     pub fn set_dct_method(&mut self, method: DctMethod) {
         self.jpeg_state.fast_dct = method == DctMethod::Fast;
+    }
+
+    /// Select the chroma upsampling filter for a fused native-4:2:0 `Rgb`
+    /// decode — see [`ChromaUpsample`]. [`ChromaUpsample::Box`] (the
+    /// default) is the only filter implemented today; this setter exists so
+    /// a future filter can be selected without changing
+    /// [`set_output_format`](Self::set_output_format)'s signature. Has no
+    /// effect on 4:4:4 sources (no chroma resampling occurs there) or when
+    /// the output format isn't `Rgb`.
+    pub fn set_chroma_upsample(&mut self, mode: ChromaUpsample) {
+        self.jpeg_state.chroma_upsample = mode;
     }
 
     /// Decode image data into a typed tensor, configuring its dimensions and

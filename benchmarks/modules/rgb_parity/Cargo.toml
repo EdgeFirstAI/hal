@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "rgb_parity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pixel-parity check: EdgeFirst fused 4:2:0 RGB box upsample vs libjpeg-turbo TJFLAG_FASTUPSAMPLE"
+
+[[bin]]
+name = "rgb_parity"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# default-features off: the v4l2/nvjpeg hardware decoders would bypass the
+# software fused-RGB write this harness exists to check.
+edgefirst-codec = { path = "../../../crates/codec", default-features = false }
+edgefirst-tensor = { path = "../../../crates/tensor" }
+libloading = "0.9"

@@ -72,7 +72,8 @@ impl McuScratch {
 /// chroma components sampled 1×1 (i.e. chroma is exactly half resolution on
 /// both axes). This is the dominant real-world JPEG subsampling and the one
 /// [`write_rgb_rows_420`] targets; anything else (4:2:2, 4:1:1, non-standard
-/// factors) still falls back to native output for a fused RGB request.
+/// factors) cannot honour an `Rgb` request — see `resolve_output_format` in
+/// `jpeg/mod.rs`.
 pub(crate) fn is_native_420(hdr: &crate::jpeg::types::ImageHeader) -> bool {
     hdr.components.len() == 3
         && hdr.max_h_samp == 2
@@ -125,7 +126,13 @@ pub fn decode_image(
     // YCbCr→RGB conversion with no chroma resampling. Native 4:2:0 (luma 2×2,
     // chroma 1×1 — the dominant real-world subsampling) needs a 2×2 nearest
     // chroma upsample folded into the same write (see `write_rgb_rows_420`).
-    // Anything else (4:2:2, 4:1:1, ...) still falls back to native output.
+    // Anything else (4:2:2, 4:1:1, ...) errors rather than silently
+    // substituting a different format — this function's caller
+    // (`resolve_output_format` in `jpeg/mod.rs`) already resolves an `Rgb`
+    // preference on those sources to the native format before ever calling
+    // `decode_image` with `Rgb`, so this check exists to reject a caller who
+    // invokes `decode_image` directly (as this module's own tests do) rather
+    // than through `ImageDecoder`.
     let is_rgb = output_format == PixelFormat::Rgb;
     if is_rgb {
         let all_match_max = num_components == 3
@@ -1948,6 +1955,91 @@ mod tests {
         let mut dst_odd = [0u8; 5];
         expand_row_2x(&src, &mut dst_odd);
         assert_eq!(dst_odd, [10, 10, 20, 20, 30]);
+    }
+
+    /// Reference oracle for [`write_rgb_rows_420`]: expand chroma via
+    /// [`expand_row_2x`] (both axes) and convert with
+    /// [`crate::jpeg::color::ycbcr_to_rgb_row`], row by row — the same
+    /// composition `write_rgb_rows_420` performs internally, but computed
+    /// independently (no shared addressing arithmetic) so the two can be
+    /// checked against each other.
+    fn reference_rgb_420(y: &[u8], cb: &[u8], cr: &[u8], img_w: usize, img_h: usize) -> Vec<u8> {
+        let chroma_w = img_w.div_ceil(2);
+        let mut out = vec![0u8; img_w * 3 * img_h];
+        let mut cb_row = vec![0u8; img_w];
+        let mut cr_row = vec![0u8; img_w];
+        for row in 0..img_h {
+            let c_row = row / 2;
+            expand_row_2x(
+                &cb[c_row * chroma_w..c_row * chroma_w + chroma_w],
+                &mut cb_row,
+            );
+            expand_row_2x(
+                &cr[c_row * chroma_w..c_row * chroma_w + chroma_w],
+                &mut cr_row,
+            );
+            crate::jpeg::color::ycbcr_to_rgb_row(
+                &y[row * img_w..row * img_w + img_w],
+                &cb_row,
+                &cr_row,
+                &mut out[row * img_w * 3..(row + 1) * img_w * 3],
+                img_w,
+            );
+        }
+        out
+    }
+
+    /// Deterministic, non-constant synthetic Y/Cb/Cr planes for a given
+    /// `img_w x img_h`, sized exactly to what [`write_rgb_rows_420`] expects
+    /// (`y_stride == img_w`, chroma planes `ceil(w/2) x ceil(h/2)` — the
+    /// review's "final replicated column/row has no second source sample"
+    /// edge case). Distinct per-pixel values (rather than a flat fill) so a
+    /// transposed or off-by-one row/column bug shows up as a mismatch rather
+    /// than accidentally cancelling out.
+    fn synthetic_420_planes(img_w: usize, img_h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let chroma_w = img_w.div_ceil(2);
+        let chroma_h = img_h.div_ceil(2);
+        let y: Vec<u8> = (0..img_w * img_h).map(|i| (i * 7 + 11) as u8).collect();
+        let cb: Vec<u8> = (0..chroma_w * chroma_h)
+            .map(|i| (i * 5 + 40) as u8)
+            .collect();
+        let cr: Vec<u8> = (0..chroma_w * chroma_h)
+            .map(|i| (i * 3 + 90) as u8)
+            .collect();
+        (y, cb, cr)
+    }
+
+    /// `write_rgb_rows_420`/`expand_row_2x` at the odd-dimension edges the
+    /// review flagged: `1x1`, odd-width x even-height, even-width x
+    /// odd-height, and odd x odd. For a 4:2:0 source the chroma planes are
+    /// `ceil(w/2) x ceil(h/2)`, so the final replicated column and/or row has
+    /// no second source sample on every one of these shapes — exactly what
+    /// throughput benchmarks (even-dimensioned COCO/CLIC) never exercise.
+    #[test]
+    fn write_rgb_rows_420_odd_dimensions() {
+        for (img_w, img_h) in [(1, 1), (3, 2), (2, 3), (3, 3), (5, 4), (4, 5), (7, 9)] {
+            let (y, cb, cr) = synthetic_420_planes(img_w, img_h);
+            let expect = reference_rgb_420(&y, &cb, &cr, img_w, img_h);
+
+            let comp_bufs = vec![y, cb, cr];
+            let mut upsample_cb = vec![0u8; img_w];
+            let mut upsample_cr = vec![0u8; img_w];
+            let mut dst = vec![0u8; img_w * 3 * img_h];
+            write_rgb_rows_420(
+                &comp_bufs,
+                img_w,
+                img_w.div_ceil(2),
+                &mut upsample_cb,
+                &mut upsample_cr,
+                &mut dst,
+                img_w * 3,
+                0,
+                img_h,
+                img_w,
+                0,
+            );
+            assert_eq!(dst, expect, "{img_w}x{img_h}");
+        }
     }
 
     /// Fused RGB from a native 4:2:0 source must equal the NV12 decode's
