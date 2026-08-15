@@ -186,7 +186,12 @@ impl CPUProcessor {
         // pixels row-by-row into a tight scratch before proceeding.
         // The copy is gated on `actual_src_stride != tight_stride` so it is
         // a no-op for all already-tight sources.
-        let mut src_map = src.map()?;
+        // Read-only: nothing here writes the source. A read-write map takes the
+        // PBO's exclusive map state, so two threads cropping the SAME source
+        // concurrently (SAHI tiling across several pre-processing workers) made
+        // the second one fail with `PboMapped`. `map_read` joins the shared
+        // read mapping instead, which is what that state exists for.
+        let src_map = src.map_read()?;
         // When the source is padded (stride != tight), de-stride it into the
         // processor-owned scratch (reused across calls — no per-call alloc).
         // `destrided` records whether we populated the scratch this call.
@@ -203,10 +208,10 @@ impl CPUProcessor {
                     .copy_from_slice(src_row);
             }
         }
-        let src_for_proc: &mut [u8] = if destrided {
-            &mut self.resize_destride_scratch[..src_h * tight_stride]
+        let src_for_proc: &[u8] = if destrided {
+            &self.resize_destride_scratch[..src_h * tight_stride]
         } else {
-            src_map.as_mut_slice()
+            src_map.as_slice()
         };
         let mut dst_map = dst.map()?;
 
@@ -258,7 +263,10 @@ impl CPUProcessor {
             });
 
         if needs_resize {
-            let src_view = fast_image_resize::images::Image::from_slice_u8(
+            // `ImageRef` (read-only) rather than `Image::from_slice_u8`, which
+            // needs `&mut [u8]` and was the only reason the source map above
+            // had to be read-write. The resizer only ever reads the source.
+            let src_view = fast_image_resize::images::ImageRef::new(
                 src_w as u32,
                 src_h as u32,
                 src_for_proc,

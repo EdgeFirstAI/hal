@@ -7,10 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-08-15
+
+### Fixed
+
+- **Tiled (SAHI) pre-processing no longer drops frames when several workers
+  crop the same image at once** (`edgefirst-image`). The CPU resize path
+  mapped its *source* read-write, which claims a PBO's exclusive CPU
+  mapping — so when a second pre-processing worker started a tile of the
+  same source frame, its map failed with `PboMapped` and the whole parent
+  frame was abandoned. It now takes the shared read-only mapping that
+  0.28.1's read-sharing work (`fix(tensor): let read-only PBO maps share
+  one GL mapping`) added for exactly this case; that change covered the GL
+  upload path, but this CPU fallback still asked for a writable map even
+  though it only ever reads the source. Affected hosts running tiled
+  inference with more than one pre-processing worker on the PBO transfer
+  path — that is, wherever DMA-buf is unavailable and the GL backend
+  declines the destination — where it showed up as intermittent skipped
+  frames and, because an abandoned frame produces no prediction,
+  depressed accuracy. Unchanged on hosts using DMA-buf transfers.
 ## [0.28.2] - 2026-08-13
 
 ### Added
-
 - **Opt-in fast JPEG IDCT and fused decode output** (`edgefirst-codec`):
   `ImageDecoder::set_dct_method(DctMethod::Fast)` selects an AAN
   `ifast`-class kernel (roughly an eighth of the multiplies of the default
