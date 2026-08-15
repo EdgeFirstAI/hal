@@ -26,9 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declines the destination — where it showed up as intermittent skipped
   frames and, because an abandoned frame produces no prediction,
   depressed accuracy. Unchanged on hosts using DMA-buf transfers.
+## [0.28.2] - 2026-08-13
 
 ### Added
-
 - **Opt-in fast JPEG IDCT and fused decode output** (`edgefirst-codec`):
   `ImageDecoder::set_dct_method(DctMethod::Fast)` selects an AAN
   `ifast`-class kernel (roughly an eighth of the multiplies of the default
