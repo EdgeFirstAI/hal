@@ -56,13 +56,20 @@ RUN { rustc --version; cargo --version; gcc --version | head -1; } > /opt/build-
 # Graviton. Version pinned to what BENCHMARKS.md's board provenance table
 # already asks for ("3.1.2 or later"); nasm needed for x86 SIMD, cmake
 # selects the right ASM backend per arch automatically.
+#
+# Pinned by immutable commit (the tag ref is movable) and SHA-256 verified
+# before extraction, same reproducibility bar as the stb/wuffs single-file
+# fetches above (Copilot review on PR #145).
 FROM build AS turbo-src
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake nasm \
     && rm -rf /var/lib/apt/lists/*
 ARG TURBO_SRC_VERSION=3.1.2
+ARG TURBO_SRC_COMMIT=4e151a4ad91001b3aa8c2ece2205c15f487ce320
+ARG TURBO_SRC_SHA256=de49f4f268ac2845173c0a51055e1a78cf4636b05724c0c31dfc2af8284da962
 RUN curl -fSL -o /tmp/turbo-src.tar.gz \
-        "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/${TURBO_SRC_VERSION}.tar.gz" \
+        "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/${TURBO_SRC_COMMIT}.tar.gz" \
+    && echo "${TURBO_SRC_SHA256}  /tmp/turbo-src.tar.gz" | sha256sum -c - \
     && mkdir -p /tmp/turbo-src \
     && tar -xzf /tmp/turbo-src.tar.gz -C /tmp/turbo-src --strip-components=1 \
     && cmake -S /tmp/turbo-src -B /tmp/turbo-build \
