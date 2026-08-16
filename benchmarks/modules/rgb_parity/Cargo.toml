@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "rgb_parity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pixel-parity check: every RGB/YUV decode arm vs libjpeg-turbo islow (in-process, dlopen), the single accuracy reference — see BENCHMARKS.md § JPEG Decode"
+
+[[bin]]
+name = "rgb_parity"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# default-features off: the v4l2/nvjpeg hardware decoders would bypass the
+# software fused-RGB write this harness exists to check.
+edgefirst-codec = { path = "../../../crates/codec", default-features = false }
+edgefirst-tensor = { path = "../../../crates/tensor" }
+libloading = "0.9"
+# Rust-ecosystem comparator engines (--engine zune|image). Same versions/
+# features as rust_jpeg's Cargo.toml — see the comment there on why `neon`/
+# `x86` are listed explicitly rather than left to zune-jpeg's defaults.
+zune-jpeg = { version = "0.5.15", features = ["x86", "neon", "std"] }
+zune-core = "0.5"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }

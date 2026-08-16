@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Fused native-4:2:0→RGB JPEG decode** (`edgefirst-codec`): the opt-in
+  `set_output_format(Some(Rgb))` fused path (previously 4:4:4 sources only)
+  now also covers native 4:2:0 colour JPEGs — by far the dominant real-world
+  subsampling — via a 2×2 nearest-neighbour (box) chroma upsample fused into
+  the MCU write stage, reusing the existing `ycbcr_to_rgb_row` SIMD kernels
+  on the upsampled row. This is a deliberate speed-over-fancy-filtering
+  tradeoff (not libjpeg's triangle upsampling), measured at 44–50 dB PSNR /
+  max pixel delta 20–24 against a reference decode on the COCO-family test
+  fixtures — comparable to the already-documented accurate-vs-`DctMethod::Fast`
+  accuracy cost. 4:2:2 and other non-4:2:0/non-4:4:4 subsamplings now return
+  `CodecError::UnsupportedFormat` instead of silently falling back to native
+  output. No public API change beyond that: same `set_output_format` entry
+  point on Rust, C, and Python.
+
 ## [0.28.3] - 2026-08-15
 
 ### Fixed

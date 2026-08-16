@@ -18,6 +18,7 @@
 
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -30,6 +31,26 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
+/* macOS has no taskset-equivalent core pinning, and unpinned P-core/E-core
+ * migration between rounds is a real, measured source of extra spread on
+ * mbp-m2-max (see BENCHMARKS.md's discussion of this board's Max-spread
+ * column). QOS_CLASS_USER_INTERACTIVE is an *advisory* hint, not a hard
+ * affinity pin — the scheduler is still free to migrate the thread — but it
+ * biases toward the performance cores and away from being pre-empted by
+ * lower-QoS background work, which is the best available substitute for
+ * taskset on this platform. Call once, before the timed loop. No-op
+ * (including on non-Apple platforms, where taskset does the real job).
+ */
+static void cbench_pin_qos(void) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, format(printf, 1, 2)))
@@ -190,12 +211,19 @@ typedef struct {
     const char *csv_path;
     size_t limit, warmup;
     int verbose;
+    /* --parity: skip the timed loop entirely and instead report pixel
+     * parity (cosine/mean|d|/max|d|/PSNR) against dlopen'd libturbojpeg
+     * islow — see cbench_run_parity(). `parity_lib` overrides the search,
+     * same env var the Rust parity/turbojpeg arms use. */
+    int parity;
+    const char *parity_lib;
 } CbenchArgs;
 
 static void cbench_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--coco DIR] [--limit N] [--warmup N] [--board LABEL]\n"
-            "          [--format rgb] [--decode-only] [--csv PATH] [--verbose]\n",
+            "          [--format rgb] [--decode-only] [--csv PATH] [--verbose]\n"
+            "          [--parity]\n",
             argv0);
     exit(2);
 }
@@ -209,6 +237,8 @@ static CbenchArgs cbench_parse_args(int argc, char **argv) {
         .limit = 50,
         .warmup = 10,
         .verbose = 0,
+        .parity = 0,
+        .parity_lib = getenv("EDGEFIRST_TURBOJPEG_LIB"),
     };
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -221,6 +251,7 @@ static CbenchArgs cbench_parse_args(int argc, char **argv) {
         else if (!strcmp(arg, "--format")) a.format = CBENCH_NEXT("--format");
         else if (!strcmp(arg, "--csv")) a.csv_path = CBENCH_NEXT("--csv");
         else if (!strcmp(arg, "--verbose")) a.verbose = 1;
+        else if (!strcmp(arg, "--parity")) a.parity = 1;
         /* Accepted and ignored: these arms only do decode-only, which is what
          * the flag selects on the HAL side. */
         else if (!strcmp(arg, "--decode-only")) continue;
@@ -268,6 +299,206 @@ static void cbench_report(const CbenchArgs *a, const char *module, const char *n
                 0.0, cpu_pct, n, notes);
         fclose(f);
     }
+}
+
+/* --- accuracy parity vs TurboJPEG islow (--parity) ----------------------- */
+/*
+ * Neither stb_image nor Wuffs does box-upsample chroma resampling of its
+ * own, so both are always graded against plain accurate `islow` — never
+ * `TJFLAG_FASTUPSAMPLE` (that flag is EdgeFirst's/turbo's matched-config
+ * comparison, not applicable here). This retires the doc-comment-only
+ * "measured against djpeg" claims each arm's header used to carry with a
+ * real, reproducible, in-process number tied to a `--parity` invocation
+ * anyone can re-run — see BENCHMARKS.md § JPEG Decode.
+ */
+
+#define CBENCH_TJPF_RGB 0
+#define CBENCH_TJFLAG_ACCURATEDCT 4096
+
+typedef void *(*cbench_tj_init_fn)(void);
+typedef int (*cbench_tj_destroy_fn)(void *);
+typedef int (*cbench_tj_header_fn)(void *, const unsigned char *, unsigned long, int *, int *,
+                                   int *, int *);
+typedef int (*cbench_tj_decomp_fn)(void *, const unsigned char *, unsigned long, unsigned char *,
+                                   int, int, int, int, int);
+typedef char *(*cbench_tj_error_fn)(void);
+
+typedef struct {
+    void *handle;
+    cbench_tj_init_fn init;
+    cbench_tj_destroy_fn destroy;
+    cbench_tj_header_fn header;
+    cbench_tj_decomp_fn decompress;
+    cbench_tj_error_fn error;
+    const char *path;
+} CbenchTurboJpeg;
+
+/* Same candidate list as rgb_parity / turbojpeg/bench.c's tj_load. */
+static void cbench_tj_load(CbenchTurboJpeg *tj, const char *override) {
+    if (override && *override) {
+        tj->handle = dlopen(override, RTLD_NOW);
+        if (!tj->handle) cbench_die("EDGEFIRST_TURBOJPEG_LIB=%s: dlopen failed: %s", override,
+                                    dlerror());
+        tj->path = override;
+    }
+    static const char *candidates[] = {
+#ifdef __APPLE__
+        "/opt/homebrew/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+        "/opt/homebrew/lib/libturbojpeg.dylib",
+        "/usr/local/opt/jpeg-turbo/lib/libturbojpeg.dylib",
+        "libturbojpeg.dylib",
+        "libturbojpeg.0.dylib",
+#endif
+        "libturbojpeg.so.0",
+        "libturbojpeg.so",
+        "libturbojpeg.so.0.2.0",
+        "/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0",
+        "/usr/lib/aarch64-linux-gnu/libturbojpeg.so",
+        "/usr/lib/x86_64-linux-gnu/libturbojpeg.so.0",
+        "/usr/lib/x86_64-linux-gnu/libturbojpeg.so",
+        "/opt/libjpeg-turbo/lib64/libturbojpeg.so",
+    };
+    if (!tj->handle) {
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates); i++) {
+            tj->handle = dlopen(candidates[i], RTLD_NOW);
+            if (tj->handle) {
+                tj->path = candidates[i];
+                break;
+            }
+        }
+    }
+    if (!tj->handle) cbench_die("libturbojpeg not found (%s)", dlerror());
+
+    tj->init = (cbench_tj_init_fn)dlsym(tj->handle, "tjInitDecompress");
+    tj->destroy = (cbench_tj_destroy_fn)dlsym(tj->handle, "tjDestroy");
+    tj->header = (cbench_tj_header_fn)dlsym(tj->handle, "tjDecompressHeader3");
+    tj->decompress = (cbench_tj_decomp_fn)dlsym(tj->handle, "tjDecompress2");
+    tj->error = (cbench_tj_error_fn)dlsym(tj->handle, "tjGetErrorStr");
+    if (!tj->init || !tj->destroy || !tj->header || !tj->decompress)
+        cbench_die("libturbojpeg at %s is missing required symbols", tj->path);
+
+    Dl_info info;
+    if (dladdr((void *)tj->init, &info) && info.dli_fname) tj->path = info.dli_fname;
+}
+
+static const char *cbench_tj_err(const CbenchTurboJpeg *tj) {
+    return tj->error ? tj->error() : "(no tjGetErrorStr)";
+}
+
+/* Decode `img` to tight interleaved RGB into `*out` (realloc'd as needed,
+ * `*out_cap` tracks the allocation so repeat calls reuse it — same
+ * high-water-mark discipline the timed loop uses). Returns 0 on success,
+ * nonzero to skip this image (recorded, not fatal — a handful of
+ * arm-specific decode rejections, e.g. a shape one decoder declines, should
+ * not abort an otherwise-representative parity run). */
+typedef int (*CbenchParityDecodeFn)(const CbenchImage *img, unsigned char **out, size_t *out_cap,
+                                    int *w, int *h);
+
+static double cbench_parity_psnr(double mse) {
+    return mse == 0.0 ? INFINITY : 10.0 * log10(255.0 * 255.0 / mse);
+}
+
+/* Runs the full corpus through `decode_fn` and through dlopen'd turbo
+ * islow, reports aggregate cosine/mean|d|/max|d|/PSNR — the Table
+ * A conformance numbers for an arm with no chroma-upsample filter choice
+ * of its own (see the file-level comment above). */
+static void cbench_run_parity(const CbenchArgs *a, const char *module,
+                              CbenchParityDecodeFn decode_fn) {
+    CbenchTurboJpeg tj = {0};
+    cbench_tj_load(&tj, a->parity_lib);
+    fprintf(stderr, "libturbojpeg: %s\n", tj.path);
+    void *handle = tj.init();
+    if (!handle) cbench_die("tjInitDecompress failed: %s", cbench_tj_err(&tj));
+
+    size_t total = 0, n = 0;
+    char **paths = cbench_list_jpegs(a->coco, &total);
+    CbenchImage *images = cbench_preload(paths, total, a->limit, &n);
+
+    unsigned char *own_buf = NULL;
+    size_t own_cap = 0;
+    unsigned char *tj_buf = NULL;
+    size_t tj_cap = 0;
+
+    size_t n_images = 0, n_skipped = 0, n_dim_mismatch = 0;
+    double worst_cosine = 1.0, worst_psnr = INFINITY;
+    int global_max_diff = 0;
+    double sum_cosine = 0.0, sum_mean_abs = 0.0, sum_psnr = 0.0;
+
+    for (size_t i = 0; i < n; i++) {
+        int ow, oh;
+        if (decode_fn(&images[i], &own_buf, &own_cap, &ow, &oh) != 0) {
+            n_skipped++;
+            continue;
+        }
+
+        int tw, th, subsamp, colorspace;
+        if (tj.header(handle, images[i].bytes, (unsigned long)images[i].len, &tw, &th, &subsamp,
+                      &colorspace))
+            cbench_die("tjDecompressHeader3 failed on %s: %s", images[i].name, cbench_tj_err(&tj));
+        size_t need = (size_t)tw * (size_t)th * 3;
+        if (need > tj_cap) {
+            tj_buf = (unsigned char *)realloc(tj_buf, need);
+            if (!tj_buf) cbench_die("out of memory for %zu byte output", need);
+            tj_cap = need;
+        }
+        if (tj.decompress(handle, images[i].bytes, (unsigned long)images[i].len, tj_buf, tw, 0, th,
+                          CBENCH_TJPF_RGB, CBENCH_TJFLAG_ACCURATEDCT))
+            cbench_die("tjDecompress2 failed on %s: %s", images[i].name, cbench_tj_err(&tj));
+
+        if (tw != ow || th != oh) {
+            n_dim_mismatch++;
+            continue;
+        }
+
+        size_t count = (size_t)ow * (size_t)oh * 3;
+        double dot = 0.0, na = 0.0, nf = 0.0, se = 0.0, sum_abs = 0.0;
+        int max_diff = 0;
+        for (size_t p = 0; p < count; p++) {
+            double x = (double)own_buf[p], y = (double)tj_buf[p];
+            dot += x * y;
+            na += x * x;
+            nf += y * y;
+            int d = (int)own_buf[p] - (int)tj_buf[p];
+            if (d < 0) d = -d;
+            se += (double)(d * d);
+            sum_abs += (double)d;
+            if (d > max_diff) max_diff = d;
+        }
+        double cosine = dot / (sqrt(na) * sqrt(nf) > 1e-12 ? sqrt(na) * sqrt(nf) : 1e-12);
+        double psnr = cbench_parity_psnr(se / (double)count);
+
+        n_images++;
+        sum_cosine += cosine;
+        sum_mean_abs += sum_abs / (double)count;
+        sum_psnr += (psnr > 99.0 ? 99.0 : psnr);
+        if (cosine < worst_cosine) worst_cosine = cosine;
+        if (psnr < worst_psnr) worst_psnr = psnr;
+        if (max_diff > global_max_diff) global_max_diff = max_diff;
+        if (a->verbose)
+            fprintf(stderr, "%s: cosine=%.7f max|d|=%d psnr=%.2f\n", images[i].name, cosine,
+                    max_diff, psnr);
+    }
+
+    if (n_images == 0) cbench_die("no images decoded on both arms");
+
+    printf("== %s RGB vs turbo islow accurate over %zu images\n", module, n_images);
+    printf("   (skipped: %zu unsupported, %zu dim mismatch)\n", n_skipped, n_dim_mismatch);
+    printf("  cosine:   mean=%.7f  worst=%.7f\n", sum_cosine / (double)n_images, worst_cosine);
+    printf("  mean|d|:  %.4f\n", sum_mean_abs / (double)n_images);
+    printf("  max|d|:   %d\n", global_max_diff);
+    printf("  psnr:     mean=%.2f dB  worst=%.2f dB\n", sum_psnr / (double)n_images, worst_psnr);
+
+    free(own_buf);
+    free(tj_buf);
+    tj.destroy(handle);
+    dlclose(tj.handle);
+    for (size_t i = 0; i < n; i++) {
+        free(images[i].bytes);
+        free(images[i].name);
+    }
+    free(images);
+    for (size_t i = 0; i < total; i++) free(paths[i]);
+    free(paths);
 }
 
 #endif /* EDGEFIRST_CBENCH_H */

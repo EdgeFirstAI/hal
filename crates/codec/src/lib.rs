@@ -55,7 +55,7 @@ mod pixel;
 mod png;
 mod traits;
 
-pub use decoder::{peek_info, DctMethod, ImageDecoder};
+pub use decoder::{peek_info, ChromaUpsample, DctMethod, ImageDecoder};
 pub use error::{CodecError, UnsupportedFeature};
 pub use options::ImageInfo;
 pub use pixel::ImagePixel;

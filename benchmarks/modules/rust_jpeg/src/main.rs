@@ -66,7 +66,30 @@ fn peak_rss_mb() -> f64 {
     }
 }
 
+/// Advisory scheduling hint for macOS, which has no `taskset`-equivalent
+/// core pinning; matches `benchmarks/common::cpu::pin_qos` (duplicated
+/// rather than depending on that crate, which pulls in edgefirst-codec/
+/// image — this binary deliberately stays independent of the HAL it's
+/// compared against). No-op on non-macOS.
+#[cfg(target_os = "macos")]
+fn pin_qos() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    const QOS_CLASS_USER_INTERACTIVE: qos_class_t = 0x21;
+    extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    // SAFETY: FFI call with no pointer arguments; a nonzero return is
+    // advisory-only and safe to ignore.
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn pin_qos() {}
+
 fn main() -> Result<()> {
+    pin_qos();
     let args = Args::parse();
     let mut files: Vec<_> = std::fs::read_dir(&args.coco)
         .with_context(|| format!("reading {}", args.coco.display()))?

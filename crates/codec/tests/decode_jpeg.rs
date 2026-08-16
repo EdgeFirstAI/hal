@@ -659,6 +659,34 @@ fn decode_jaguar_nv24() {
     check_native_decode_dims("jaguar_444.jpg", PixelFormat::Nv24, 789, 384);
 }
 
+/// `set_output_format(Rgb)` on a source that isn't 4:4:4-equivalent or
+/// native 4:2:0 must fail, not silently hand back the native semi-planar
+/// format — see `docs/BENCHMARKS_JPEG_REVIEW_v3.13.md` item #3. Covers
+/// 4:2:2 (native `Nv16`) and greyscale (native `Grey`, no chroma at all).
+#[test]
+fn rgb_request_errors_on_unsupported_subsampling() {
+    for (fixture, w, h) in [("zidane_422.jpg", 1280, 720), ("grey.jpg", 1024, 681)] {
+        let jpeg = testdata(fixture);
+        let mut tensor = Tensor::<u8>::image(
+            w,
+            h,
+            PixelFormat::Rgb,
+            Some(TensorMemory::Mem),
+            edgefirst_tensor::CpuAccess::ReadWrite,
+        )
+        .unwrap();
+        let mut decoder = ImageDecoder::new();
+        decoder.set_output_format(Some(PixelFormat::Rgb));
+        let err = tensor
+            .load_image(&mut decoder, &jpeg)
+            .expect_err(&format!("{fixture}: RGB request should be rejected"));
+        assert!(
+            matches!(err, CodecError::UnsupportedFormat(PixelFormat::Rgb)),
+            "{fixture}: expected UnsupportedFormat(Rgb), got {err:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Real-world COCO odd-width greyscale fixture. The end-to-end odd-dimension
 // decode+convert coverage for the colour formats (NV12/NV16/NV24) lives in the

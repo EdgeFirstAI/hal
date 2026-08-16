@@ -9,6 +9,7 @@ resolver = "3"
 members = [
     "common",
     "modules/dct_compare",
+    "modules/rgb_parity",
     "modules/hal_cpu",
     "modules/rust_jpeg",
     "modules/hal_gl",
