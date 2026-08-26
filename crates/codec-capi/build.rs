@@ -95,8 +95,9 @@ fn main() {
 /// On MSVC, `dylib=edgefirst_tensor` still resolves `edgefirst_tensor.lib`,
 /// which is the staticlib cargo writes next to the DLL. Linking that
 /// staticlib into this Rust cdylib duplicates rust std (LNK2005:
-/// `rust_panic`, alloc hooks, …). The import library is
-/// `edgefirst_tensor.dll.lib`.
+/// `rust_panic`, alloc hooks, …). In `target/` the import library is
+/// `edgefirst_tensor.dll.lib`; `scripts/package-capi.sh` publishes it as
+/// `lib/edgefirst_tensor.lib` next to `bin/edgefirst_tensor.dll`.
 fn link_tensor_cdylib(target_os: &str, tensor_lib_dir: &Path) {
     if target_os == "windows" {
         println!(

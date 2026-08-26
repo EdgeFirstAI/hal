@@ -24,38 +24,21 @@ tree will not find the .so files unless you also set one of:
   cc ... -Wl,-rpath,"$PWD/lib" ...
   # or install into a directory listed by ldconfig (Linux) / install_name_tool (macOS)
 
-Windows: copy the DLLs next to the executable, or add `lib\` to PATH. There is
-no SONAME chain on Windows.
+Windows. The archive is `bin/*.dll` (load) and `lib/*.lib` (link). The
+`.lib` files are DLL import libraries, not the Rust staticlib cargo also
+writes during the build. Link against `lib\`, put `bin\` on PATH or copy
+the DLLs next to the executable. There is no SONAME chain on Windows:
+
+  cl /I include decode.c /link /LIBPATH:lib edgefirst_codec.lib edgefirst_tensor.lib
+  copy bin\edgefirst_codec.dll . & copy bin\edgefirst_tensor.dll .
 
 ABI stability. These libraries ship SONAME `.so.0` (major 0). No ABI stability
 is offered before 1.0: a binary built against 0.x may misbehave if it loads a
 different 0.y. Pin the archive version you built against.
 
-One archive. Static `.a` files are the bulk of the uncompressed tree (roughly
-85%); the shared libraries are the rest. 0.29 ships both in a single tarball
-because most downloads compress to ~21 MB and splitting would be a second
-artifact for a minority of consumers. Most users only need the `.so` / `.dylib`
-/ DLL chain. A separate `-static` archive is deferred.
-
-Static linking. The archive also ships `libedgefirst_*.a`. Because both the
-shared library and the archive sit in the same `libdir`, this command still
-links dynamically — the linker prefers the `.so` / `.dylib`:
-
-  pkg-config --static --cflags --libs edgefirst-image
-
-A genuinely static link must force the archives. On Linux:
-
-  cc -std=c11 -o convert convert.c $(pkg-config --static --cflags edgefirst-image) \
-     -Wl,-Bstatic $(pkg-config --static --libs edgefirst-image) -Wl,-Bdynamic
-
-On macOS, pass the `.a` files explicitly (ld64 has no `-Bstatic` equivalent
-that only wraps `-l` flags):
-
-  cc -std=c11 -o convert convert.c $(pkg-config --cflags edgefirst-image) \
-     "$PWD/lib/libedgefirst_image.a" "$PWD/lib/libedgefirst_tensor.a" -lm -lpthread
-
-`Libs.private` carries the system libraries the archives need (`-lm -ldl
--lpthread` on Linux; `-lm -lpthread` on macOS — there is no `libdl`).
+Shared libraries only. The archive ships the C ABI: headers and the
+`.so` / `.dylib` / DLL (+ Windows import `.lib`) chain. It does not ship
+Rust staticlibs (`libedgefirst_*.a` or cargo's `edgefirst_*.lib`).
 
 Minimal usage (decode a JPEG into a tensor)
 -------------------------------------------

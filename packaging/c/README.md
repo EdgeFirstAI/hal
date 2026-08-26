@@ -19,6 +19,6 @@ Detection boxes live in header-only `edgefirst/detect.h`. See `INSTALL.txt` for 
 
 **No ABI stability is offered before 1.0.** SONAME is `.so.0` (major 0); pin the archive version you built against.
 
-0.29 ships static `.a` archives in the same tarball as the shared libraries (they dominate uncompressed size; the download still compresses to ~21 MB). Most consumers only need the `.so` / `.dylib` / DLL chain. See `INSTALL.txt` for a recipe that actually static-links — `pkg-config --static` alone still prefers the shared library.
+The archive is the C ABI only: headers plus shared libraries. Linux and macOS ship the `.so` / `.dylib` in `lib/`. Windows ships `bin/edgefirst_*.dll` and `lib/edgefirst_*.lib` import libraries (never cargo's `*.dll.lib`, never the Rust staticlib). See `INSTALL.txt`.
 
 The five per-crate READMEs (`crates/*-capi/README.md` in the source tree) document each library's API. This file is the archive index.

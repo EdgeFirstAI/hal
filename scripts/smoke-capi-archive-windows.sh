@@ -30,6 +30,19 @@ fi
 
 INC="${PREFIX}/include"
 LIB="${PREFIX}/lib"
+BIN="${PREFIX}/bin"
+
+if [[ ! -d "${BIN}" ]]; then
+  echo "FAIL: archive has no bin/ — Windows DLLs belong in bin/, import libs in lib/" >&2
+  exit 1
+fi
+# Published names are lib/edgefirst_X.lib (import) and bin/edgefirst_X.dll.
+# Cargo's edgefirst_X.dll.lib and the Rust staticlib must not appear.
+if find "${PREFIX}" \( -name '*.dll.lib' -o -name '*.a' \) | grep -q .; then
+  echo "FAIL: archive ships cargo's .dll.lib or a static library; C packages are shared-only" >&2
+  find "${PREFIX}" \( -name '*.dll.lib' -o -name '*.a' \) >&2
+  exit 1
+fi
 
 # Prefer cl (MSVC), then clang-cl, then clang.
 CC=""
@@ -47,17 +60,11 @@ echo "using compiler: ${CC}"
 
 find_implib() {
   local leaf="$1"
-  local f
-  for f in \
-      "${LIB}/edgefirst_${leaf}.dll.lib" \
-      "${LIB}/edgefirst_${leaf}.lib" \
-      "${LIB}/libedgefirst_${leaf}.dll.a"
-  do
-    if [[ -f "${f}" ]]; then
-      printf '%s' "${f}"
-      return 0
-    fi
-  done
+  local f="${LIB}/edgefirst_${leaf}.lib"
+  if [[ -f "${f}" ]]; then
+    printf '%s' "${f}"
+    return 0
+  fi
   return 1
 }
 
@@ -96,24 +103,16 @@ for leaf in tensor image codec decoder tracker; do
       ;;
   esac
   # Running requires the DLL next to the exe (no SONAME / rpath on Windows).
-  dll=""
-  for f in "${LIB}/edgefirst_${leaf}.dll" "${LIB}/libedgefirst_${leaf}.dll"; do
-    if [[ -f "${f}" ]]; then
-      dll="${f}"
-      break
-    fi
-  done
-  if [[ -z "${dll}" ]]; then
-    echo "FAIL: no DLL for ${leaf} in ${LIB}" >&2
+  dll="${BIN}/edgefirst_${leaf}.dll"
+  if [[ ! -f "${dll}" ]]; then
+    echo "FAIL: no DLL for ${leaf} in ${BIN}" >&2
     exit 1
   fi
   cp "${dll}" "$(dirname "${exe}")/"
-  # Tensor is a DT_NEEDED of the other four; copy it too when present.
-  for extra in "${LIB}/edgefirst_tensor.dll" "${LIB}/libedgefirst_tensor.dll"; do
-    if [[ -f "${extra}" ]]; then
-      cp "${extra}" "$(dirname "${exe}")/"
-    fi
-  done
+  # Siblings load edgefirst_tensor.dll at process start; copy it too.
+  if [[ -f "${BIN}/edgefirst_tensor.dll" ]]; then
+    cp "${BIN}/edgefirst_tensor.dll" "$(dirname "${exe}")/"
+  fi
   if ! "${exe}"; then
     echo "FAIL: run ${leaf} (compile succeeded, load/execute failed)" >&2
     exit 1

@@ -7,11 +7,9 @@
 # catches a missing detect.h, a broken .pc Requires line, or a SONAME that
 # does not resolve at runtime.
 #
-# Also:
-#   - compiles the C example extracted from the packaged INSTALL.txt so the
-#     two cannot drift
-#   - links each library with -Wl,-Bstatic around the edgefirst -l flags
-#     (Linux) or the explicit .a files (macOS), proving Libs.private
+# Also compiles the C example extracted from the packaged INSTALL.txt so
+# the two cannot drift. The archive is shared-library only (no
+# libedgefirst_*.a); static linking is not part of the package contract.
 #
 # Usage: scripts/smoke-capi-archive.sh <archive.tar.gz>
 set -euo pipefail
@@ -45,8 +43,6 @@ fi
 export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
 export LD_LIBRARY_PATH="${PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export DYLD_LIBRARY_PATH="${PREFIX}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
-
-uname_s="$(uname -s)"
 
 ran=0
 for leaf in tensor image codec decoder tracker; do
@@ -105,81 +101,9 @@ if ! "${CC}" -std=c11 -Wall -Wextra -Werror -o "${example_bin}" "${example_c}" \
 fi
 echo "INSTALL example compiles"
 
-# ---------------------------------------------------------------------------
-# Static link: force the edgefirst archives, leave system libs dynamic.
-# ---------------------------------------------------------------------------
-split_pkg_libs() {
-  # Sets ef_libs ( -ledgefirst_* ) and sys_libs (the rest of --libs-only-l).
-  local leaf="$1"
-  ef_libs=""
-  sys_libs=""
-  local tok
-  # shellcheck disable=SC2046
-  for tok in $(pkg-config --static --libs-only-l "edgefirst-${leaf}"); do
-    case "${tok}" in
-      -ledgefirst_*) ef_libs="${ef_libs} ${tok}" ;;
-      *) sys_libs="${sys_libs} ${tok}" ;;
-    esac
-  done
-}
-
-static_ran=0
-for leaf in tensor image codec decoder tracker; do
-  src="${WORKDIR}/${leaf}.c"
-  bin="${WORKDIR}/${leaf}.static.bin"
-  # shellcheck disable=SC2046
-  cflags="$(pkg-config --static --cflags "edgefirst-${leaf}")"
-  libdirs="$(pkg-config --static --libs-only-L "edgefirst-${leaf}")"
-  split_pkg_libs "${leaf}"
-  if [[ "${uname_s}" == Darwin ]]; then
-    a_files=""
-    for tok in ${ef_libs}; do
-      name="${tok#-l}"
-      a="${PREFIX}/lib/lib${name}.a"
-      if [[ ! -f "${a}" ]]; then
-        echo "FAIL: missing static archive ${a}" >&2
-        exit 1
-      fi
-      a_files="${a_files} ${a}"
-    done
-    # shellcheck disable=SC2086
-    if ! "${CC}" -std=c11 -Wall -Wextra -Werror -o "${bin}" "${src}" \
-        ${cflags} ${a_files} ${sys_libs}; then
-      echo "FAIL: static compile ${leaf}" >&2
-      exit 1
-    fi
-    if command -v otool >/dev/null 2>&1; then
-      if otool -L "${bin}" | grep -q 'libedgefirst_'; then
-        echo "FAIL: ${leaf} still dynamically linked to an edgefirst lib" >&2
-        otool -L "${bin}" >&2
-        exit 1
-      fi
-    fi
-  else
-    # shellcheck disable=SC2086
-    if ! "${CC}" -std=c11 -Wall -Wextra -Werror -o "${bin}" "${src}" \
-        ${cflags} ${libdirs} -Wl,-Bstatic ${ef_libs} -Wl,-Bdynamic ${sys_libs}; then
-      echo "FAIL: static compile ${leaf}" >&2
-      exit 1
-    fi
-    if command -v ldd >/dev/null 2>&1; then
-      if ldd "${bin}" | grep -q edgefirst; then
-        echo "FAIL: ${leaf} still dynamically linked to an edgefirst lib" >&2
-        ldd "${bin}" >&2
-        exit 1
-      fi
-    fi
-  fi
-  if ! "${bin}"; then
-    echo "FAIL: run static ${leaf}" >&2
-    exit 1
-  fi
-  static_ran=$((static_ran + 1))
-  echo "ok static ${leaf}"
-done
-
-if [[ "${static_ran}" -ne 5 ]]; then
-  echo "FAIL: only ${static_ran}/5 libraries static-smoked" >&2
+if find "${PREFIX}" -name '*.a' | grep -q .; then
+  echo "FAIL: archive ships a static library; C packages are shared objects only" >&2
+  find "${PREFIX}" -name '*.a' >&2
   exit 1
 fi
-echo "ALL PACKAGED LIBRARIES LINK TRULY STATIC"
+echo "ARCHIVE IS SHARED-LIBRARY ONLY"

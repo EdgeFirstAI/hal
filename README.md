@@ -54,7 +54,8 @@ relocatable — see [`packaging/c/INSTALL.txt`](packaging/c/INSTALL.txt) for
 pkg-config, runtime search path, and a JPEG→tensor example. Link
 `libedgefirst_tensor` plus any of codec / image / decoder / tracker. Headers
 live under `include/edgefirst/` (`tensor.h`, `codec.h`, `image.h`, `decoder.h`,
-`tracker.h`, `detect.h`). **No ABI stability is offered before 1.0.**
+`tracker.h`, `detect.h`). Windows ships `bin/*.dll` and `lib/*.lib` import
+libraries. **No ABI stability is offered before 1.0.**
 
 ### Basic usage
 

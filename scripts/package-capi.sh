@@ -87,6 +87,8 @@ PKG_NAME="edgefirst-hal-${VERSION}-${TARGET}"
 STAGE="${OUTDIR}/${PKG_NAME}"
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/include/edgefirst" "${STAGE}/lib/pkgconfig"
+# Windows: DLLs in bin/, import libraries in lib/. Unix: shared objects in lib/.
+# The archive never ships a Rust staticlib (libedgefirst_*.a / edgefirst_*.lib).
 
 cp LICENSE NOTICE packaging/c/INSTALL.txt packaging/c/README.md "${STAGE}/"
 
@@ -116,27 +118,37 @@ for leaf in ${LEAVES}; do
     copy_or_die "${LIBDIR}/libedgefirst_${leaf}.dylib" "${STAGE}/lib/${REAL}"
     ln -s "${REAL}" "${STAGE}/lib/libedgefirst_${leaf}.dylib"
   elif [[ "${TARGET}" == *-windows ]]; then
+    mkdir -p "${STAGE}/bin"
+    # Cargo writes edgefirst_X.dll + edgefirst_X.dll.lib (import) +
+    # edgefirst_X.lib (Rust staticlib) into the same directory. Ship the
+    # DLL and the import library under the conventional names
+    # bin/edgefirst_X.dll and lib/edgefirst_X.lib. Never copy the staticlib:
+    # linking a C consumer against it embeds a second rust std.
     if [[ -f "${LIBDIR}/edgefirst_${leaf}.dll" ]]; then
-      copy_or_die "${LIBDIR}/edgefirst_${leaf}.dll" "${STAGE}/lib/edgefirst_${leaf}.dll"
-      if [[ -f "${LIBDIR}/edgefirst_${leaf}.dll.lib" ]]; then
-        cp "${LIBDIR}/edgefirst_${leaf}.dll.lib" "${STAGE}/lib/"
-      elif [[ -f "${LIBDIR}/edgefirst_${leaf}.lib" ]]; then
-        cp "${LIBDIR}/edgefirst_${leaf}.lib" "${STAGE}/lib/"
-      fi
+      copy_or_die "${LIBDIR}/edgefirst_${leaf}.dll" "${STAGE}/bin/edgefirst_${leaf}.dll"
+      implib="${LIBDIR}/edgefirst_${leaf}.dll.lib"
     elif [[ -f "${LIBDIR}/libedgefirst_${leaf}.dll" ]]; then
-      copy_or_die "${LIBDIR}/libedgefirst_${leaf}.dll" "${STAGE}/lib/libedgefirst_${leaf}.dll"
-      [[ -f "${LIBDIR}/libedgefirst_${leaf}.dll.a" ]] && \
-        cp "${LIBDIR}/libedgefirst_${leaf}.dll.a" "${STAGE}/lib/"
+      copy_or_die "${LIBDIR}/libedgefirst_${leaf}.dll" "${STAGE}/bin/edgefirst_${leaf}.dll"
+      implib="${LIBDIR}/libedgefirst_${leaf}.dll.a"
     else
       echo "FAIL: no DLL for ${leaf} in ${LIBDIR}" >&2
+      exit 1
+    fi
+    if [[ ! -s "${implib}" ]]; then
+      echo "FAIL: missing DLL import library ${implib} (refusing to ship the Rust staticlib)" >&2
+      exit 1
+    fi
+    copy_or_die "${implib}" "${STAGE}/lib/edgefirst_${leaf}.lib"
+    # Import libraries are a few hundred KB. The Rust staticlib is tens of MB;
+    # if we ever copy the wrong file, fail here instead of publishing it.
+    implib_bytes="$(wc -c < "${STAGE}/lib/edgefirst_${leaf}.lib")"
+    if [[ "${implib_bytes}" -gt 5000000 ]]; then
+      echo "FAIL: ${STAGE}/lib/edgefirst_${leaf}.lib is ${implib_bytes} B — that is the Rust staticlib, not the DLL import library" >&2
       exit 1
     fi
   else
     echo "FAIL: unknown target family in '${TARGET}' (want *-linux, *-macos, *-windows)" >&2
     exit 1
-  fi
-  if [[ -f "${LIBDIR}/libedgefirst_${leaf}.a" ]]; then
-    cp "${LIBDIR}/libedgefirst_${leaf}.a" "${STAGE}/lib/"
   fi
 done
 
