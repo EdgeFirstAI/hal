@@ -33,8 +33,8 @@ This directory contains the CI/CD workflows for EdgeFirst HAL.
 | `doc-tests` | ubuntu-22.04-xlarge | Rust documentation tests |
 | `build-and-test-x86` | ubuntu-22.04-xlarge | x86_64 build, test, Rust + Python + C API coverage |
 | `build-and-test-macos` | macos-latest | ANGLE/IOSurface GL path, C API, coverage |
-| `build-ios` | macos-latest | Clippy + build + link validation (device and simulator) |
-| `build-android` | ubuntu-22.04 | Clippy + build + link validation (arm64 and x86_64) |
+| `build-ios` | macos-latest | Clippy + build the native Rust API (device and simulator) |
+| `build-android` | ubuntu-22.04 | Clippy + build the native Rust API (arm64 and x86_64) |
 | `build-windows` | windows-latest | `cargo check` only |
 | `software-gl-coverage` | ubuntu-22.04-xlarge | GL tests under Mesa llvmpipe, for coverage of the GL paths no hardware runner reaches |
 | `build-arm` | ubuntu-22.04-arm-xlarge | Cross-build aarch64 test binaries (also feeds the hardware runner) |
@@ -48,12 +48,15 @@ Three-phase on-target testing keeps the hardware runner doing only what it must:
 `process-hardware-coverage` converts the raw profiling data back on a host with the
 matching toolchain.
 
-The iOS and Android lanes are build-and-link only. GitHub has no runner that can
-execute either GPU stack, so on-device correctness is gated separately (Android via
-the internal hal-mobile Device Farm harness — see
-[TESTING.md](../../TESTING.md#android-on-device-validation-device-farm)).
+The iOS and Android lanes build the native Rust API only (`edgefirst-tensor`,
+`-image`, `-codec`, `-decoder`, `-tracker`) — this repo's mobile responsibility ends
+at "the Rust API compiles and lints clean" on those targets. Bindings, packaging,
+and any C artifact for mobile belong to `mobile-sdk`, which binds to these crates
+via boltffi. GitHub has no runner that can execute either GPU stack, so on-device
+correctness is gated separately (Android via the internal hal-mobile Device Farm
+harness — see [TESTING.md](../../TESTING.md#android-on-device-validation-device-farm)).
 
-The macOS and iOS lanes fetch the signed ANGLE xcframeworks from the **public**
+The macOS test lane fetches the signed ANGLE xcframeworks from the **public**
 `EdgeFirstAI/angle-package` release via `scripts/fetch-angle.sh`. No credentials are
 involved, so the full ANGLE-backed validation runs on pushes, same-repo PRs, and fork
 PRs alike. (Fork PRs still need a maintainer to approve the run, per GitHub's default

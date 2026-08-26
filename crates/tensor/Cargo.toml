@@ -2,6 +2,7 @@
 name = "edgefirst-tensor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Zero-copy tensor memory management with DMA, shared memory, and heap backends"
 homepage.workspace = true
@@ -12,13 +13,34 @@ keywords = ["tensor", "dma", "shared-memory", "zero-copy", "edge-ai"]
 categories = ["data-structures", "memory-management", "embedded", "science"]
 documentation = "https://docs.rs/edgefirst-tensor"
 
+[lints]
+workspace = true
+
 [features]
-default = ["ndarray"]
+default = ["ndarray", "static"]
+# The static backend compiles the tensor implementation in; every Rust
+# consumer uses this. The dynamic backend makes TensorDyn a thin newtype
+# over the opaque C handle and links no implementation, so the four -capi
+# leaves can call into libedgefirst_tensor.so instead of embedding a private
+# copy. Mutually exclusive — see the compile_error! guard in lib.rs.
+static = []
+dynamic = ["dep:edgefirst-tensor-ffi"]
+# Opt-in only, never enabled by a production consumer: `tensor-ffi`
+# deliberately declares its `ef_tensor_*` symbols with no `#[link]`
+# attribute, so linking is normally the CONSUMER's decision (each `-capi`
+# leaf's own build). This feature exists solely so `edgefirst-tensor`'s own
+# `--features dynamic` test/doctest binaries (which have no other consumer
+# to make that decision for them) can link `libedgefirst_tensor.so` built by
+# `edgefirst-tensor-capi`. See `build.rs` and `tests/dynamic_primitives.rs`.
+dynamic-test-link = []
 ndarray = ["dep:ndarray"]
+# Perfetto/Chrome trace capture. Lived in the edgefirst-hal meta-crate until
+# 0.29; that crate was 55 lines of re-exports plus this, so it was deleted and
+# the real code moved to the crate every other one already depends on.
+tracing = ["dep:tracing-chrome", "dep:tracing-subscriber"]
 
 [dependencies]
-ctor = { workspace = true }
-env_logger = { workspace = true }
+edgefirst-tensor-ffi = { workspace = true, optional = true }
 half = { workspace = true }
 libloading = { workspace = true }
 log = { workspace = true }
@@ -26,27 +48,29 @@ ndarray = { workspace = true, optional = true }
 num-traits = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+tracing-chrome = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 uuid = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-dma-heap = { workspace = true }
+# Errno constants for the dynamic backend, plus DMA/IOSurface FFI. Always on
+# so Windows/Android C-API leaves that compile `dynamic` still type-check.
 libc = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", not(miri)))'.dependencies]
+dma-heap = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-# Raw FFI bindings to IOSurface and CoreFoundation; lighter touch than the
-# objc2 wrappers and matches the production spike at
-# spikes/angle_iosurface/. The IOSurface and CoreFoundation frameworks are
-# linked via the `#[link]` attribute inside the iosurface module. Both
-# frameworks ship on macOS AND iOS, so the `iosurface` module (and this
-# `libc` dep) are available on either Apple OS.
-libc = { workspace = true }
-
 [dev-dependencies]
+ctor = { workspace = true }
+env_logger = { workspace = true }
 edgefirst-bench = { workspace = true }
 serde_json = { workspace = true }
+# `tests/dynamic_primitives.rs` drives `ef_tensor_builder_*` directly to
+# build a tensor as "another producer" would, independent of this crate's
+# own `dynamic`-backend constructors -- not re-exported by this crate's own
+# public API, so the integration test needs its own dependency edge.
+edgefirst-tensor-ffi = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 procfs = { workspace = true }

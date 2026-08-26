@@ -14,6 +14,19 @@ build-backend = "maturin"
 [tool.maturin]
 all-features = false
 
+[tool.ruff]
+# The real floor, matching every crates/python-*/pyproject.toml
+# (requires-python = ">=3.8") and the abi3-py38 build. Without it ruff assumes
+# a modern interpreter and offers to rewrite `Optional[X]` to `X | None` and
+# `List[x]` to `list[x]` in runtime code — valid only on 3.10 and 3.9. Those
+# autofixes would have broken every 3.8 and 3.9 user. This is a statement of
+# fact about the project, not a relaxation: it makes the linter correct.
+#
+# Rule selection is deliberately left at ruff's defaults rather than pinned to
+# a `select` list, so a ruff upgrade adds checks instead of silently keeping
+# the set this repo happened to be clean against.
+target-version = "py38"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

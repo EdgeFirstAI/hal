@@ -429,7 +429,7 @@ impl GlPlatform for AngleClientBuffer {
         fmt: super::PackedImportFormat,
     ) -> Result<IoSurfacePbuffer>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         let surface_ref = img.iosurface_ref().ok_or_else(|| {
             Error::NotSupported("packed import: tensor is not IOSurface-backed".into())

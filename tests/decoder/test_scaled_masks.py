@@ -20,9 +20,9 @@ Verifies:
 
 from __future__ import annotations
 
+import edgefirst.decoder as ef
+import edgefirst.image as efi
 import numpy as np
-
-import edgefirst_hal
 
 W, H = 640, 640
 PROTO_H, PROTO_W = 160, 160
@@ -57,8 +57,8 @@ def _hal_metadata():
     }
 
 
-def _to_tensor(arr: np.ndarray) -> edgefirst_hal.Tensor:
-    t = edgefirst_hal.Tensor(list(arr.shape), dtype=arr.dtype.name)
+def _to_tensor(arr: np.ndarray) -> ef.Tensor:
+    t = ef.Tensor(list(arr.shape), dtype=arr.dtype.name)
     t.from_numpy(arr)
     return t
 
@@ -124,19 +124,19 @@ def _numpy_reference_retina(protos_nchw, coefs, bbox_xyxy_norm, target_w, target
     mask_full = (1.0 / (1.0 + np.exp(-logits)) > 0.5).astype(np.uint8) * 255
 
     x0, y0, x1, y1 = bbox_xyxy_norm
-    px0 = int(round(x0 * target_w))
-    py0 = int(round(y0 * target_h))
-    px1 = int(round(x1 * target_w))
-    py1 = int(round(y1 * target_h))
+    px0 = round(x0 * target_w)
+    py0 = round(y0 * target_h)
+    px1 = round(x1 * target_w)
+    py1 = round(y1 * target_h)
     return mask_full[py0:py1, px0:px1]
 
 
 def _make_decoder():
-    return edgefirst_hal.Decoder(
+    return ef.Decoder(
         _hal_metadata(),
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
 
 
@@ -147,7 +147,7 @@ def test_scaled_output_is_binary_0_or_255():
     combined, protos = _build_validator_pattern_tensors(rng, placements)
 
     decoder = _make_decoder()
-    ip = edgefirst_hal.ImageProcessor()
+    ip = efi.ImageProcessor()
 
     boxes, scores, classes, proto_data = decoder.decode_proto(
         [_to_tensor(combined), _to_tensor(protos)], max_boxes=300
@@ -161,7 +161,7 @@ def test_scaled_output_is_binary_0_or_255():
         classes,
         proto_data,
         letterbox=None,
-        resolution=edgefirst_hal.MaskResolution.Scaled(W, H),
+        resolution=efi.MaskResolution.Scaled(W, H),
     )
     assert len(masks) == len(boxes)
 
@@ -180,7 +180,7 @@ def test_scaled_bbox_crop_dims_match_target_resolution():
     placements = [(0.10, 0.15, 0.35, 0.55)]
     combined, protos = _build_validator_pattern_tensors(rng, placements)
     decoder = _make_decoder()
-    ip = edgefirst_hal.ImageProcessor()
+    ip = efi.ImageProcessor()
     boxes, scores, classes, proto_data = decoder.decode_proto(
         [_to_tensor(combined), _to_tensor(protos)], max_boxes=300
     )
@@ -190,11 +190,11 @@ def test_scaled_bbox_crop_dims_match_target_resolution():
         scores,
         classes,
         proto_data,
-        resolution=edgefirst_hal.MaskResolution.Scaled(W, H),
+        resolution=efi.MaskResolution.Scaled(W, H),
     )
     for b, m in zip(boxes, masks):
-        expected_w = int(round((b[2] - b[0]) * W))
-        expected_h = int(round((b[3] - b[1]) * H))
+        expected_w = round((b[2] - b[0]) * W)
+        expected_h = round((b[3] - b[1]) * H)
         assert m.shape == (expected_h, expected_w, 1), (
             f"expected ({expected_h}, {expected_w}, 1) got {m.shape} "
             f"for bbox {b.tolist()}"
@@ -211,7 +211,7 @@ def test_scaled_binary_threshold_matches_greater_than_127():
     placements = [(0.20, 0.25, 0.55, 0.70)]
     combined, protos = _build_validator_pattern_tensors(rng, placements)
     decoder = _make_decoder()
-    ip = edgefirst_hal.ImageProcessor()
+    ip = efi.ImageProcessor()
     boxes, scores, classes, proto_data = decoder.decode_proto(
         [_to_tensor(combined), _to_tensor(protos)], max_boxes=300
     )
@@ -221,7 +221,7 @@ def test_scaled_binary_threshold_matches_greater_than_127():
         scores,
         classes,
         proto_data,
-        resolution=edgefirst_hal.MaskResolution.Scaled(W, H),
+        resolution=efi.MaskResolution.Scaled(W, H),
     )
     assert len(masks) >= 1
     m = masks[0][..., 0]
@@ -281,13 +281,13 @@ def test_scaled_matches_numpy_retina_reference():
             },
         ],
     }
-    decoder = edgefirst_hal.Decoder(
+    decoder = ef.Decoder(
         hal_metadata,
         score_threshold=0.5,
         iou_threshold=0.5,
-        nms=edgefirst_hal.Nms.ClassAgnostic,
+        nms=ef.Nms.ClassAgnostic,
     )
-    ip = edgefirst_hal.ImageProcessor()
+    ip = efi.ImageProcessor()
     boxes, scores, classes, proto_data = decoder.decode_proto(
         [_to_tensor(combined), _to_tensor(protos)], max_boxes=10
     )
@@ -298,7 +298,7 @@ def test_scaled_matches_numpy_retina_reference():
         scores,
         classes,
         proto_data,
-        resolution=edgefirst_hal.MaskResolution.Scaled(target_w, target_h),
+        resolution=efi.MaskResolution.Scaled(target_w, target_h),
     )
     hal_tile = hal_masks[0][..., 0]
 
@@ -331,10 +331,10 @@ def test_scaled_matches_numpy_retina_reference():
             )
             logits[yi, xi] = float(np.dot(val, coefs))
     mask_full = (1.0 / (1.0 + np.exp(-logits)) > 0.5).astype(np.uint8) * 255
-    px0 = int(round(bbox_hal[0] * target_w))
-    py0 = int(round(bbox_hal[1] * target_h))
-    px1 = int(round(bbox_hal[2] * target_w))
-    py1 = int(round(bbox_hal[3] * target_h))
+    px0 = round(bbox_hal[0] * target_w)
+    py0 = round(bbox_hal[1] * target_h)
+    px1 = round(bbox_hal[2] * target_w)
+    py1 = round(bbox_hal[3] * target_h)
     ref_tile = mask_full[py0:py1, px0:px1]
 
     assert hal_tile.shape == ref_tile.shape, (

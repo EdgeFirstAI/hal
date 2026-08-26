@@ -288,7 +288,7 @@ for the GPU-side fused algorithm.
 ## Tracing Spans
 
 Every public decode entry point emits a [`tracing::trace_span!`] tree. The
-spans are recorded as Chrome JSON when [`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
+spans are recorded as Chrome JSON when [`edgefirst_tensor::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/trace.rs)
 is active and have near-zero overhead otherwise (a single relaxed atomic
 load per call site).
 
@@ -440,8 +440,7 @@ quality issue. The decoder math is correct in both cases.
 | Depends on | [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) | `TensorDyn`, `Tensor<T>`, `TensorMap` for reading model output buffers |
 | Optional dep | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) (feature `tracker`) | `Tracker<DetectBox>` for `decode_tracked()` |
 | Consumed by | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | `DetectBox`, `Segmentation`, proto data for `draw_*` rendering APIs |
-| Consumed by | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | re-export as `edgefirst_hal::decoder` |
-| Consumed by | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | C-API bindings for `Decoder`, `DetectBox`, `Segmentation` |
+| Consumed by | [`edgefirst-decoder-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder-capi/) | C-API bindings for `Decoder`, `DetectBox`, `Segmentation` |
 
 ## Cross-References
 

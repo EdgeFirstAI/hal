@@ -1,0 +1,98 @@
+EdgeFirst HAL — C libraries
+===========================
+
+This archive is relocatable. Extract it anywhere; the pkg-config files derive
+`prefix` from their own location, so they work from an arbitrary directory.
+
+  tar xzf edgefirst-hal-<version>-<target>.tar.gz
+  cd edgefirst-hal-<version>-<target>
+
+Point pkg-config at the extracted tree:
+
+  export PKG_CONFIG_PATH="$PWD/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+Compile a consumer. `edgefirst-codec` pulls `edgefirst-tensor` through
+`Requires:`, so a JPEG decoder is two libraries and one pkg-config invocation:
+
+  cc -std=c11 -o decode decode.c $(pkg-config --cflags --libs edgefirst-codec)
+
+Runtime. `Libs:` does not embed an rpath, so a binary that linked against this
+tree will not find the .so files unless you also set one of:
+
+  export LD_LIBRARY_PATH="$PWD/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"   # Linux
+  export DYLD_LIBRARY_PATH="$PWD/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"  # macOS
+  cc ... -Wl,-rpath,"$PWD/lib" ...
+  # or install into a directory listed by ldconfig (Linux) / install_name_tool (macOS)
+
+Windows: copy the DLLs next to the executable, or add `lib\` to PATH. There is
+no SONAME chain on Windows.
+
+ABI stability. These libraries ship SONAME `.so.0` (major 0). No ABI stability
+is offered before 1.0: a binary built against 0.x may misbehave if it loads a
+different 0.y. Pin the archive version you built against.
+
+One archive. Static `.a` files are the bulk of the uncompressed tree (roughly
+85%); the shared libraries are the rest. 0.29 ships both in a single tarball
+because most downloads compress to ~21 MB and splitting would be a second
+artifact for a minority of consumers. Most users only need the `.so` / `.dylib`
+/ DLL chain. A separate `-static` archive is deferred.
+
+Static linking. The archive also ships `libedgefirst_*.a`. Because both the
+shared library and the archive sit in the same `libdir`, this command still
+links dynamically — the linker prefers the `.so` / `.dylib`:
+
+  pkg-config --static --cflags --libs edgefirst-image
+
+A genuinely static link must force the archives. On Linux:
+
+  cc -std=c11 -o convert convert.c $(pkg-config --static --cflags edgefirst-image) \
+     -Wl,-Bstatic $(pkg-config --static --libs edgefirst-image) -Wl,-Bdynamic
+
+On macOS, pass the `.a` files explicitly (ld64 has no `-Bstatic` equivalent
+that only wraps `-l` flags):
+
+  cc -std=c11 -o convert convert.c $(pkg-config --cflags edgefirst-image) \
+     "$PWD/lib/libedgefirst_image.a" "$PWD/lib/libedgefirst_tensor.a" -lm -lpthread
+
+`Libs.private` carries the system libraries the archives need (`-lm -ldl
+-lpthread` on Linux; `-lm -lpthread` on macOS — there is no `libdl`).
+
+Minimal usage (decode a JPEG into a tensor)
+-------------------------------------------
+
+  #include <edgefirst/codec.h>
+  #include <stdio.h>
+
+  int main(void) {
+      unsigned char jpeg[] = { /* ... */ };
+      ef_image_decoder *d = ef_image_decoder_new();
+      if (!d) return 1;
+      ef_tensor *dst = ef_tensor_image_alloc(640, 480, "NV12", EF_DTYPE_U8,
+                                             1, EF_STORAGE_KIND_MEM, EF_CPU_ACCESS_READ_WRITE);
+      if (!dst) { ef_image_decoder_free(d); return 1; }
+      if (ef_image_decoder_decode_into(d, jpeg, sizeof jpeg, dst) != 0) {
+          fprintf(stderr, "%s\n", ef_tensor_last_error_message());
+          ef_tensor_free(dst);
+          ef_image_decoder_free(d);
+          return 1;
+      }
+      ef_tensor_free(dst);
+      ef_image_decoder_free(d);
+      return 0;
+  }
+
+  cc -std=c11 -o decode decode.c $(pkg-config --cflags --libs edgefirst-codec)
+
+The five libraries, and what they need
+--------------------------------------
+
+  edgefirst-tensor    no sibling (the base)
+  edgefirst-codec     Requires: edgefirst-tensor
+  edgefirst-image     Requires: edgefirst-tensor; detect.h via decoder-abi
+  edgefirst-decoder   Requires: edgefirst-tensor; detect.h via decoder-abi
+  edgefirst-tracker   detections as a plain array; Requires.private: decoder
+
+`edgefirst/detect.h` is header-only. There is no `libedgefirst_detect`.
+
+Home: https://github.com/EdgeFirstAI/hal
+License: Apache-2.0 (see LICENSE)

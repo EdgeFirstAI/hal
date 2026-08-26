@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 
-use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
+use edgefirst_tensor::{DetectBox, ProtoData, Segmentation};
 use std::panic::AssertUnwindSafe;
 use std::ptr::NonNull;
 use std::thread::JoinHandle;
@@ -109,23 +109,23 @@ fn pbo_elem_count(
     format: edgefirst_tensor::PixelFormat,
 ) -> Option<usize> {
     // Element count == product of the canonical image shape (the PBO holds u8,
-    // one byte per element). Delegating to `image_shape` keeps the combined
+    // one byte per element). Delegating to `allocation_shape` keeps the combined
     // semi-planar height in lockstep with every other consumer (and is exact
     // for odd heights — `height*3/2` truncation under-sized odd-H NV12 by a
     // row, and the old NV24 arm fell through to `channels` = far too small).
     // `checked_mul` so a wrapped count can't silently undersize the PBO.
     format
-        .image_shape(width, height)?
+        .allocation_shape(width, height)?
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
 }
 
 /// Compute the tensor shape for a PBO image of the given format — the canonical
-/// [`PixelFormat::image_shape`] (Planar `[C,H,W]`, SemiPlanar `[total_h, W]`
+/// [`PixelFormat::allocation_shape`] (Planar `[C,H,W]`, SemiPlanar `[total_h, W]`
 /// with the odd-height-exact combined-plane height, Packed `[H,W,C]`).
 fn pbo_shape(width: usize, height: usize, format: edgefirst_tensor::PixelFormat) -> Vec<usize> {
     format
-        .image_shape(width, height)
+        .allocation_shape(width, height)
         .unwrap_or_else(|| vec![height, width, format.channels()])
 }
 
@@ -143,7 +143,7 @@ fn register_pbo_cuda<T>(
     size: usize,
     sender: &Sender<GLProcessorMessage>,
 ) where
-    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
 {
     if !edgefirst_tensor::is_cuda_available() {
         return;
@@ -298,8 +298,21 @@ fn panic_message(info: &(dyn std::any::Any + Send)) -> String {
 }
 
 impl GLProcessorThreaded {
-    /// Creates a new OpenGL multi-threaded image converter.
+    /// Creates a new OpenGL multi-threaded image converter whose import
+    /// caches use the environment/default capacity.
     pub fn new(kind: Option<EglDisplayKind>) -> Result<Self, Error> {
+        Self::with_cache_capacity(kind, None)
+    }
+
+    /// As [`new`](Self::new), with an explicit per-cache import capacity —
+    /// [`ImageProcessorConfig::egl_cache_capacity`], which documents what the
+    /// number bounds and takes precedence over the environment.
+    ///
+    /// [`ImageProcessorConfig::egl_cache_capacity`]: crate::ImageProcessorConfig::egl_cache_capacity
+    pub fn with_cache_capacity(
+        kind: Option<EglDisplayKind>,
+        capacity: Option<usize>,
+    ) -> Result<Self, Error> {
         let (send, mut recv) = tokio::sync::mpsc::channel::<GLProcessorMessage>(1);
 
         let (create_ctx_send, create_ctx_recv) = tokio::sync::oneshot::channel();
@@ -314,13 +327,13 @@ impl GLProcessorThreaded {
                 let _guard = super::context::GL_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                GLProcessorST::new(kind)
+                GLProcessorST::new(kind, capacity)
             };
             // macOS: ANGLE serializes internally. Android: the system EGL
             // is specification-conformant thread-safe. Neither needs the
             // Linux lifecycle lock.
             #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
-            let init_result = GLProcessorST::new(kind);
+            let init_result = GLProcessorST::new(kind, capacity);
             let mut gl_converter = match init_result {
                 Ok(gl) => gl,
                 Err(e) => {
@@ -333,6 +346,26 @@ impl GLProcessorThreaded {
             let caps = gl_converter.platform_caps();
             let _ = create_ctx_send.send(Ok(caps));
             let mut poisoned = false;
+            // Tracks which PBO buffer_ids currently have an outstanding GL
+            // mapping, scoped to this one GL context/thread -- the ONE
+            // place every PboOps call against this context's buffers
+            // actually serializes, regardless of which `PboHandle`
+            // (edgefirst-tensor) issued the `PboMap`/`PboUnmap` message.
+            // `PboHandle::acquire_map`'s own per-handle `Mutex<MapState>`
+            // enforces "at most one mapping" WITHIN one handle, including
+            // read-sharing (several readers reuse ONE mapping without ever
+            // re-sending `PboMap` here) -- but it has no visibility into a
+            // SEPARATE `PboHandle` for the same real `buffer_id`, which
+            // task 11's cross-cdylib PBO import made newly reachable: a
+            // producer's own tensor and a reconstructed cross-package
+            // consumer tensor for the same `buffer_id` are two independent
+            // `PboHandle`s, each believing it is the only mapper.
+            // `glMapBufferRange` on an already-mapped buffer is undefined
+            // behaviour per the GL spec, so THIS set -- not the per-handle
+            // mutex, which never sees another handle's calls -- is what
+            // actually prevents that.
+            let mut mapped_pbo_buffers: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
             // Per-message serialization policy: Full where the platform
             // demands it (`caps.serialize_gl` — Vivante/galcore is not
             // thread-safe for concurrent GL across contexts), LifecycleOnly
@@ -707,6 +740,19 @@ impl GLProcessorThreaded {
                         });
                     }
                     GLProcessorMessage::PboMap(buffer_id, size, resp) => {
+                        if !mapped_pbo_buffers.insert(buffer_id) {
+                            // Already mapped by SOME PboHandle against this
+                            // context -- refuse rather than call
+                            // glMapBufferRange a second time (undefined
+                            // behaviour). See `mapped_pbo_buffers`'s own
+                            // doc comment above.
+                            let _ = resp.send(Err(crate::Error::OpenGl(format!(
+                                "PBO buffer {buffer_id} is already mapped in this GL context \
+                                 (a producer and a reconstructed cross-package consumer may \
+                                 both hold a live tensor over it)"
+                            ))));
+                            continue;
+                        }
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             edgefirst_gl::gl::BindBuffer(
                                 edgefirst_gl::gl::PIXEL_PACK_BUFFER,
@@ -730,6 +776,14 @@ impl GLProcessorThreaded {
                                 })
                             }
                         }));
+                        let mapped_ok = matches!(result, Ok(Ok(_)));
+                        if !mapped_ok {
+                            // The map did not actually take -- release the
+                            // reservation so a retry (or the OTHER handle
+                            // that lost this race) is not permanently
+                            // blocked by a mapping that never happened.
+                            mapped_pbo_buffers.remove(&buffer_id);
+                        }
                         let _ = resp.send(match result {
                             Ok(res) => res,
                             Err(e) => {
@@ -742,6 +796,13 @@ impl GLProcessorThreaded {
                         });
                     }
                     GLProcessorMessage::PboUnmap(buffer_id, resp) => {
+                        // Always release the reservation, regardless of
+                        // whether the GL unmap itself reports success below
+                        // -- mirrors `PboHandle::release_map`'s own
+                        // "state returns to Unmapped either way" contract
+                        // (edgefirst-tensor), so a failed unmap cannot
+                        // permanently strand this buffer_id as "mapped".
+                        mapped_pbo_buffers.remove(&buffer_id);
                         let result = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             edgefirst_gl::gl::BindBuffer(
                                 edgefirst_gl::gl::PIXEL_PACK_BUFFER,
@@ -770,6 +831,13 @@ impl GLProcessorThreaded {
                         });
                     }
                     GLProcessorMessage::PboDelete(buffer_id) => {
+                        // Defensive: a live mapping should never reach here
+                        // (PboHandle::Drop unmaps before deleting), but a
+                        // stale reservation for a since-deleted (and
+                        // possibly buffer_id-recycled) buffer would
+                        // otherwise wrongly block every future map of a NEW
+                        // buffer that reuses the same id.
+                        mapped_pbo_buffers.remove(&buffer_id);
                         if let Err(e) = std::panic::catch_unwind(AssertUnwindSafe(|| unsafe {
                             edgefirst_gl::gl::DeleteBuffers(1, &buffer_id);
                         })) {
@@ -1156,7 +1224,8 @@ impl GLProcessorThreaded {
         let pbo_tensor =
             edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
                 .map_err(|e| Error::OpenGl(format!("PBO tensor creation failed: {e:?}")))?;
-        let mut tensor = edgefirst_tensor::Tensor::from_pbo(pbo_tensor);
+        let mut tensor = edgefirst_tensor::Tensor::from_pbo(pbo_tensor)
+            .map_err(|e| Error::OpenGl(format!("PBO tensor wrap failed: {e:?}")))?;
         tensor
             .set_format(format)
             .map_err(|e| Error::OpenGl(format!("Failed to set format on PBO tensor: {e:?}")))?;
@@ -1222,7 +1291,7 @@ impl GLProcessorThreaded {
                 let pbo =
                     edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops)
                         .map_err(map_err)?;
-                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
@@ -1232,7 +1301,7 @@ impl GLProcessorThreaded {
                     buffer_id, size, &shape, None, ops,
                 )
                 .map_err(map_err)?;
-                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
@@ -1242,7 +1311,7 @@ impl GLProcessorThreaded {
                     buffer_id, size, &shape, None, ops,
                 )
                 .map_err(map_err)?;
-                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo);
+                let mut t = edgefirst_tensor::Tensor::from_pbo(pbo).map_err(map_err)?;
                 t.set_format(format).map_err(set_err)?;
                 register_pbo_cuda(&mut t, buffer_id, size, sender);
                 Ok(TensorDyn::from(t))
@@ -1280,8 +1349,8 @@ impl Drop for GLProcessorThreaded {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{pbo_elem_count, pbo_shape};
-    use edgefirst_tensor::PixelFormat;
+    use super::{pbo_elem_count, pbo_shape, GLProcessorThreaded, GlPboOps};
+    use edgefirst_tensor::{PixelFormat, TensorTrait};
 
     #[test]
     fn elem_count_per_format() {
@@ -1313,5 +1382,100 @@ mod tests {
         assert_eq!(pbo_shape(8, 4, PixelFormat::Nv16), vec![4 * 2, 8]);
         // Packed: [height, width, channels].
         assert_eq!(pbo_shape(8, 4, PixelFormat::Rgba), vec![4, 8, 4]);
+    }
+
+    /// Regression test for the cross-handle PBO map race task 11's review
+    /// found: `PboHandle::acquire_map`'s per-handle `Mutex<MapState>`
+    /// (`edgefirst-tensor`) has no visibility into a SEPARATE `PboHandle`
+    /// for the same real `buffer_id` -- exactly what a cross-cdylib
+    /// reconstructed consumer tensor now is, alongside the producer's own
+    /// tensor, since task 11 wired a real `kind::PBO` `import_descriptor`
+    /// arm. Simulates that with two independent `PboTensor`s built
+    /// directly (rather than through the full descriptor/vtable round
+    /// trip, which needs a second compiled `.so` to be meaningful) that
+    /// both point at the SAME real GL buffer via a fresh [`GlPboOps`]
+    /// wrapping the SAME sender -- exactly the relationship `import_descriptor`'s
+    /// PBO arm produces between a producer's handle and a reconstructed
+    /// one. Without `mapped_pbo_buffers`, the second map would reach
+    /// `glMapBufferRange` on an already-mapped buffer (undefined
+    /// behaviour); this asserts it is refused instead, and that the
+    /// refusal is a real, releasable reservation rather than a permanently
+    /// stuck `buffer_id`.
+    #[test]
+    #[cfg(target_os = "linux")] // PBO destinations are Linux-only
+    fn concurrent_maps_from_two_independent_handles_on_one_buffer_do_not_corrupt_gl_state() {
+        let gl = match GLProcessorThreaded::new(None) {
+            Ok(gl) => gl,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: concurrent_maps_from_two_independent_handles... - \
+                     OpenGL not available: {e:?}"
+                );
+                return;
+            }
+        };
+        let tensor_a = match gl.create_pbo_image(64, 64, PixelFormat::Rgba) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "SKIPPED: concurrent_maps_from_two_independent_handles... - \
+                     PBO not supported: {e:?}"
+                );
+                return;
+            }
+        };
+        let pbo_a = tensor_a.as_pbo().expect("just created a PBO tensor");
+        let buffer_id = pbo_a.buffer_id();
+        let size = tensor_a.capacity_bytes();
+        let shape = tensor_a.shape().to_vec();
+
+        // A second, independent PboHandle for the IDENTICAL real buffer --
+        // same relationship a producer's handle and a reconstructed
+        // consumer's handle have to the same GL context.
+        let ops_b: std::sync::Arc<dyn edgefirst_tensor::PboOps> = std::sync::Arc::new(GlPboOps {
+            sender: gl.sender.as_ref().unwrap().downgrade(),
+        });
+        let tensor_b =
+            edgefirst_tensor::PboTensor::<u8>::from_pbo(buffer_id, size, &shape, None, ops_b)
+                .expect("from_pbo against a real, already-created buffer_id must succeed");
+
+        // tensor_a maps first and holds the mapping open.
+        let map_a = tensor_a.map().expect("first map must succeed");
+
+        // tensor_b's own Mutex<MapState> starts at Unmapped and knows
+        // nothing about tensor_a's outstanding mapping -- without the
+        // GL-thread-level fix this reaches glMapBufferRange a second time.
+        let map_b_result = tensor_b.map();
+        // `glMapBufferRange` on an already-mapped buffer is UNDEFINED
+        // BEHAVIOUR per the GL spec, not guaranteed to fail cleanly on
+        // every driver -- so this asserts the SPECIFIC refusal
+        // `mapped_pbo_buffers` produces (matching this file's own error
+        // text), not merely "some error occurred", which a
+        // driver-dependent null return could also produce and would make
+        // this test pass even with the fix reverted.
+        let Err(map_b_err) = map_b_result else {
+            panic!(
+                "a second, independent handle mapping the SAME real buffer while the \
+                     first mapping is still open must be refused, not silently succeed"
+            );
+        };
+        let msg = format!("{map_b_err:?}");
+        assert!(
+            msg.contains("already mapped"),
+            "must be refused specifically by the GL-thread-level reservation check \
+             (mapped_pbo_buffers), not some other error path: {msg}"
+        );
+
+        drop(map_a);
+
+        // Once the first mapping releases, the SAME second handle must be
+        // able to map successfully -- proves the refusal above was a real,
+        // releasable reservation, not a permanently stuck buffer_id.
+        let map_b_after = tensor_b.map();
+        assert!(
+            map_b_after.is_ok(),
+            "after the first handle's mapping releases, the second handle must be able to \
+             map the same buffer: {map_b_after:?}"
+        );
     }
 }

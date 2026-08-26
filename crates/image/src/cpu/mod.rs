@@ -4,10 +4,10 @@
 use crate::{
     Crop, Error, Flip, FunctionTimer, ImageProcessorTrait, Rect, ResolvedCrop, Result, Rotation,
 };
-use edgefirst_decoder::{DetectBox, ProtoData, Segmentation};
 use edgefirst_tensor::{
     DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
 };
+use edgefirst_tensor::{DetectBox, ProtoData, Segmentation};
 
 mod convert;
 mod masks;
@@ -193,8 +193,8 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
                     "background pixel format does not match dst".into(),
                 ));
             }
-            let bg_u8 = bg.as_u8().ok_or(Error::NotAnImage)?;
-            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+            let bg_u8 = bg.as_typed::<u8>().ok_or(Error::NotAnImage)?;
+            let dst_u8 = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
             let bg_map = bg_u8.map_read()?;
             let mut dst_map = dst_u8.map_mut()?;
             let bg_slice = bg_map.as_slice();
@@ -207,7 +207,7 @@ fn prepare_dst_base_cpu(dst: &mut TensorDyn, background: Option<&TensorDyn>) -> 
             dst_slice.copy_from_slice(bg_slice);
         }
         None => {
-            let dst_u8 = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+            let dst_u8 = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
             let mut dst_map = dst_u8.map_mut()?;
             dst_map.as_mut_slice().fill(0);
         }
@@ -803,7 +803,7 @@ impl ImageProcessorTrait for CPUProcessor {
         // output, never assume the caller cleared dst. Every call writes
         // the base layer first (bg copy or zero fill) and then the masks.
         prepare_dst_base_cpu(dst, overlay.background)?;
-        let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+        let dst = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
         self.draw_decoded_masks_impl(
             dst,
             detect,
@@ -821,7 +821,7 @@ impl ImageProcessorTrait for CPUProcessor {
         overlay: crate::MaskOverlay<'_>,
     ) -> Result<()> {
         prepare_dst_base_cpu(dst, overlay.background)?;
-        let dst = dst.as_u8_mut().ok_or(Error::NotAnImage)?;
+        let dst = dst.as_typed_mut::<u8>().ok_or(Error::NotAnImage)?;
         self.draw_proto_masks_impl(
             dst,
             detect,
@@ -880,8 +880,8 @@ impl CPUProcessor {
         };
         match (src.dtype(), dst.dtype()) {
             (DType::U8, DType::U8) => {
-                let src = src.as_u8().unwrap();
-                let dst = dst.as_u8_mut().unwrap();
+                let src = src.as_typed::<u8>().unwrap();
+                let dst = dst.as_typed_mut::<u8>().unwrap();
                 self.convert_u8(
                     src, dst, src_fmt, dst_fmt, rotation, flip, crop, src_params, dst_params,
                 )
@@ -889,8 +889,8 @@ impl CPUProcessor {
             (DType::U8, DType::I8) => {
                 // Int8 output: reinterpret the i8 destination as u8 (layout-
                 // identical), convert directly into it, then XOR 0x80 in-place.
-                let src_u8 = src.as_u8().unwrap();
-                let dst_i8 = dst.as_i8_mut().unwrap();
+                let src_u8 = src.as_typed::<u8>().unwrap();
+                let dst_i8 = dst.as_typed_mut::<i8>().unwrap();
                 // SAFETY: Tensor<i8> and Tensor<u8> are layout-identical
                 // (same element size, no T-dependent drop glue). Same
                 // rationale as gl::processor::tensor_i8_as_u8_mut.
@@ -902,7 +902,7 @@ impl CPUProcessor {
                 apply_int8_xor_bias_rows(dst_u8, dst_fmt)
             }
             (DType::U8, d @ (DType::F32 | DType::F16)) => {
-                let src_u8 = src.as_u8().unwrap();
+                let src_u8 = src.as_typed::<u8>().unwrap();
                 let dw = dst.width().ok_or(Error::NotAnImage)?;
                 let dh = dst.height().ok_or(Error::NotAnImage)?;
                 // Reuse the scratch tensor when format and dimensions match;
@@ -925,7 +925,7 @@ impl CPUProcessor {
                     )?
                 };
                 {
-                    let tmp_u8 = tmp.as_u8_mut().unwrap();
+                    let tmp_u8 = tmp.as_typed_mut::<u8>().unwrap();
                     self.convert_u8(
                         src_u8, tmp_u8, src_fmt, dst_fmt, rotation, flip, crop, src_params,
                         dst_params,
@@ -941,7 +941,7 @@ impl CPUProcessor {
                 // bytes past it stay untouched. On a tight destination the two
                 // pitches coincide and this is the previous flat widen.
                 {
-                    let tmp_u8 = tmp.as_u8().unwrap();
+                    let tmp_u8 = tmp.as_typed::<u8>().unwrap();
                     let (rows, row_len) = logical_surface(tmp_u8)?;
                     let src_stride = tensor_row_stride(tmp_u8);
                     let dst_stride_bytes = dst.effective_row_stride().ok_or(Error::NotAnImage)?;
@@ -964,7 +964,7 @@ impl CPUProcessor {
                     let dst_stride = dst_stride_bytes / elem;
                     match d {
                         DType::F32 => {
-                            let dst_t = dst.as_f32_mut().unwrap();
+                            let dst_t = dst.as_typed_mut::<f32>().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
                             // Counted in elements, not bytes — same invariant.
                             guard_plane(
@@ -984,7 +984,7 @@ impl CPUProcessor {
                             }
                         }
                         DType::F16 => {
-                            let dst_t = dst.as_f16_mut().unwrap();
+                            let dst_t = dst.as_typed_mut::<half::f16>().unwrap();
                             let mut dst_map = dst_t.map_mut()?;
                             guard_plane(
                                 dst_map.as_slice().len(),
@@ -1509,6 +1509,22 @@ impl CPUProcessor {
             return Ok(());
         }
 
+        // Rank guard BEFORE indexing shape()[2]. `Segmentation.segmentation`
+        // is a `TensorDyn` with public fields, so a caller of the public
+        // `draw_decoded_masks` can hand over a rank-2 mask; under the former
+        // `Array3` that was structurally impossible. The guards inside the
+        // render functions are unreachable for bad rank because this dispatch
+        // indexes first.
+        if let Some(bad) = segmentation
+            .iter()
+            .find(|s| s.segmentation.shape().len() != 3)
+        {
+            return Err(crate::Error::InvalidShape(format!(
+                "segmentation must be [H, W, C], got {:?}",
+                bad.segmentation.shape()
+            )));
+        }
+
         // Semantic segmentation (e.g. ModelPack) has C > 1 (multi-class),
         // instance segmentation (e.g. YOLO) has C = 1 (binary per-instance).
         let is_semantic = segmentation[0].segmentation.shape()[2] > 1;
@@ -1604,17 +1620,20 @@ impl CPUProcessor {
         // Widen coefficients to f32 once; shape [N, num_protos].
         let coeff_f32: Vec<f32> = match proto_data.mask_coefficients.dtype() {
             DType::F32 => {
-                let t = proto_data.mask_coefficients.as_f32().expect("F32");
+                let t = proto_data.mask_coefficients.as_typed::<f32>().expect("F32");
                 let m = t.map_read()?;
                 m.as_slice().to_vec()
             }
             DType::F16 => {
-                let t = proto_data.mask_coefficients.as_f16().expect("F16");
+                let t = proto_data
+                    .mask_coefficients
+                    .as_typed::<half::f16>()
+                    .expect("F16");
                 let m = t.map_read()?;
                 m.as_slice().iter().map(|v| v.to_f32()).collect()
             }
             DType::I8 => {
-                let t = proto_data.mask_coefficients.as_i8().expect("I8");
+                let t = proto_data.mask_coefficients.as_typed::<i8>().expect("I8");
                 let m = t.map_read()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
@@ -1636,7 +1655,7 @@ impl CPUProcessor {
                 }
             }
             DType::I16 => {
-                let t = proto_data.mask_coefficients.as_i16().expect("I16");
+                let t = proto_data.mask_coefficients.as_typed::<i16>().expect("I16");
                 let m = t.map_read()?;
                 if let Some(q) = t.quantization() {
                     use edgefirst_tensor::QuantMode;
@@ -1674,7 +1693,7 @@ impl CPUProcessor {
         // with a dtype-specialized loader closure.
         match proto_data.protos.dtype() {
             DType::F32 => {
-                let t = proto_data.protos.as_f32().expect("F32");
+                let t = proto_data.protos.as_typed::<f32>().expect("F32");
                 let m = t.map_read()?;
                 self.draw_proto_masks_inner(
                     dst_slice,
@@ -1696,7 +1715,7 @@ impl CPUProcessor {
                 );
             }
             DType::F16 => {
-                let t = proto_data.protos.as_f16().expect("F16");
+                let t = proto_data.protos.as_typed::<half::f16>().expect("F16");
                 let m = t.map_read()?;
                 self.draw_proto_masks_inner(
                     dst_slice,
@@ -1719,7 +1738,7 @@ impl CPUProcessor {
             }
             DType::I8 => {
                 use edgefirst_tensor::QuantMode;
-                let t = proto_data.protos.as_i8().expect("I8");
+                let t = proto_data.protos.as_typed::<i8>().expect("I8");
                 let m = t.map_read()?;
                 let quant = t.quantization().ok_or_else(|| {
                     Error::InvalidShape("I8 protos require quantization metadata".into())

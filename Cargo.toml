@@ -1,10 +1,19 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# Standalone article / comparison harness — not part of the HAL dependency graph.
-exclude = ["benchmarks"]
+exclude = [
+    "benchmarks",
+    # The five modular C-API leaves are standalone packages: the static/dynamic
+    # feature switch (plans R3-R5) is mutually exclusive, and cargo unifies
+    # features across one invocation's package set. Built via --manifest-path
+    # with --target-dir target -- see the Makefile's capi lane.
+    "crates/tensor-capi",
+    "crates/image-capi",
+    "crates/codec-capi",
+    "crates/decoder-capi",
+    "crates/tracker-capi",
+]
 default-members = [
-    "crates/hal",
     "crates/tensor",
     "crates/codec",
     "crates/image",
@@ -17,8 +26,13 @@ authors = ["Au-Zone Technologies <support@au-zone.com>"]
 homepage = "https://edgefirst.ai"
 repository = "https://github.com/EdgeFirstAI/hal"
 license = "Apache-2.0"
-version = "0.28.3"
+version = "0.29.0"
 edition = "2021"
+# Minimum supported Rust version. Enforced by cargo, gated by CI, and
+# documented in README "Toolchain and Platform Floors" -- keep the three in
+# step. With resolver = "3" this also constrains dependency selection, so
+# raising it is a user-visible change, not just a build detail.
+rust-version = "1.94.0"
 readme = "README.md"
 
 [workspace.dependencies]
@@ -36,19 +50,56 @@ dma-heap = "0.4.1"
 # vendored from fast-math, preserving outputs — see crates/decoder/src/modelpack.rs.
 # Internal crates
 edgefirst-bench = { path = "crates/bench" }
-edgefirst-codec = { version = "0.28.3", path = "crates/codec" }
-edgefirst-hal = { version = "0.28.3", path = "crates/hal" }
-edgefirst-decoder = { version = "0.28.3", path = "crates/decoder" }
+edgefirst-codec = { version = "0.29.0", path = "crates/codec", default-features = false }
+edgefirst-decoder = { version = "0.29.0", path = "crates/decoder", default-features = false }
+edgefirst-decoder-abi = { version = "0.29.0", path = "crates/decoder-abi" }
 # Vendored maintained fork of the abandoned `khronos-egl` 6.0.0; imported as
 # `edgefirst_egl`. Lets us track libloading 0.9+ (see libloading below).
-edgefirst-egl = { version = "0.28.3", path = "crates/egl", features = ["dynamic"] }
+edgefirst-egl = { version = "0.29.0", path = "crates/egl", features = ["dynamic"] }
 # Vendored trimmed fork of the abandoned `gls`; imported as `edgefirst_gl`.
-edgefirst-gl = { version = "0.28.3", path = "crates/gl" }
-edgefirst-image = { version = "0.28.3", path = "crates/image" }
-edgefirst-tensor = { version = "0.28.3", path = "crates/tensor" }
-edgefirst-tracker = { version = "0.28.3", path = "crates/tracker" }
+edgefirst-gl = { version = "0.29.0", path = "crates/gl" }
+# `default-features = false`, same mechanic and same reason as
+# edgefirst-codec/edgefirst-decoder/edgefirst-tracker/edgefirst-tensor: a
+# member's own `default-features = false` on a `workspace = true` edge is a
+# silent no-op unless this root entry also states one. Without it,
+# edgefirst-image's own default (`["opengl", "static"]`) reaches every
+# `workspace = true` consumer regardless of what that consumer's own
+# dependency line says, so `static` lands on the same edgefirst-tensor unit
+# as whatever backend the real consumer asked for -- one hop further out
+# than the codec/tracker/tensor case, discovered while wiring the Python
+# extensions to `dynamic` (single-tensor-home, task P2). Two consumers
+# relied on the removed `opengl` default without stating it themselves
+# (`crates/python-common`) and have it spelled out
+# explicitly now, the same way `crates/image-capi` already does.
+edgefirst-image = { version = "0.29.0", path = "crates/image", default-features = false }
+edgefirst-python-common = { path = "crates/python-common" }
+edgefirst-tensor = { version = "0.29.0", path = "crates/tensor", default-features = false }
+edgefirst-tensor-abi = { version = "0.29.0", path = "crates/tensor-abi" }
+edgefirst-tensor-ffi = { version = "0.29.0", path = "crates/tensor-ffi" }
+# `default-features = false`, matching edgefirst-codec/edgefirst-tensor
+# above: a member depending via `workspace = true` cannot override
+# `default-features` on its own dependency line unless this root entry also
+# states one (a silent no-op otherwise -- Cargo warns "default-features is
+# ignored ... this could become a hard error in the future"). Needed so
+# `crates/decoder`'s own `edgefirst-tracker = { workspace = true, optional =
+# true, default-features = false }` (its `tracker` feature) actually drops
+# edgefirst-tracker's own `static` default -- left enabled, it silently
+# turns on `edgefirst-tensor/static` alongside whatever backend the real
+# consumer selected, tripping the static+dynamic compile_error! guard the
+# moment decoder-capi (task 9) requests `edgefirst-tensor/dynamic`. Every
+# workspace member that wants edgefirst-tracker's `static` feature still
+# gets it: `crates/tracker` is built directly as its own workspace package,
+# whose own `default = ["static"]` (its Cargo.toml) supplies it regardless
+# of this dependency-edge default.
+edgefirst-tracker = { version = "0.29.0", path = "crates/tracker", default-features = false }
 enum_dispatch = "0.3.13"
-env_logger = "0.11.10"
+# `regex` (a default feature, via env_filter) pulls regex + regex_syntax +
+# aho_corasick -- ~530 KB of every published wheel, to support regex RUST_LOG
+# filters. Substring filtering covers what the bindings actually need.
+env_logger = { version = "0.11.10", default-features = false, features = [
+    "auto-color",
+    "humantime",
+] }
 fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }
 four-char-code = "2.3.0"
 # Portable (platform-neutral) DRM FourCC enum — the same type `gbm` re-exports,
@@ -111,3 +162,13 @@ debug = false
 inherits = "release"
 strip = false
 debug = true
+
+# Not yet consumed by any member: opting in requires `[lints] workspace =
+# true` in the member's own manifest, and none does today (see
+# CONTRIBUTING.md). This table exists so a member can opt in with one line,
+# and so the five workspace-excluded C-API leaves -- which cannot inherit at
+# all, being outside this workspace -- have a canonical definition to copy by
+# hand into their own [lints.rust] tables rather than inventing one.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

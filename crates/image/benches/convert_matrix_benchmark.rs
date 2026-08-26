@@ -55,7 +55,7 @@ impl MemReq {
     fn to_request(self) -> Option<TensorMemory> {
         match self {
             MemReq::Auto => None,
-            MemReq::Dma => Some(TensorMemory::Dma),
+            MemReq::Dma => Some(TensorMemory::DmaBuf),
             MemReq::Mem => Some(TensorMemory::Mem),
         }
     }
@@ -63,10 +63,16 @@ impl MemReq {
 
 fn mem_name(m: TensorMemory) -> &'static str {
     match m {
-        TensorMemory::Dma => "dma",
+        TensorMemory::DmaBuf => "dma",
         TensorMemory::Mem => "mem",
         TensorMemory::Shm => "shm",
         TensorMemory::Pbo => "pbo",
+        // Never produced here. `TensorMemory` is `#[non_exhaustive]`, so the
+        // wildcard is required; the known-but-unused variants are still spelled
+        // out so their labels do not silently become "unknown".
+        TensorMemory::IoSurface => "iosurface",
+        TensorMemory::Cuda => "cuda",
+        _ => "unknown",
     }
 }
 
@@ -110,7 +116,13 @@ fn fill_src(t: &TensorDyn, fmt: PixelFormat) {
             }
         }
         _ => {
-            for (i, px) in buf.chunks_exact_mut(4).take(IN_W * IN_H).enumerate() {
+            for (i, px) in buf
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .take(IN_W * IN_H)
+                .enumerate()
+            {
                 px[0] = (i % 256) as u8;
                 px[1] = ((i / 256) % 256) as u8;
                 px[2] = ((i / 65536) % 256) as u8;

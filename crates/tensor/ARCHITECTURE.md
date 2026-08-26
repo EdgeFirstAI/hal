@@ -11,12 +11,12 @@ which backend is in use. A single `Tensor<T>` value is enough to feed CPU
 code, hand a buffer to a GPU shader, share an inference output with another
 process, or import a frame straight from a V4L2 camera.
 
-"Platform-native GPU buffer" is one enum variant, `TensorMemory::Dma`, with
+"Platform-native GPU buffer" is one enum variant, `TensorMemory::DmaBuf`, with
 three implementations behind it: a Linux DMA-heap DMA-BUF (`DmaTensor`), a
 macOS/iOS `IOSurfaceRef` (`IoSurfaceTensor`), or an Android NDK
-`AHardwareBuffer` (`AHardwareBufferTensor`). Callers ask for `Dma` and get
+`AHardwareBuffer` (`AHardwareBufferTensor`). Callers ask for `DmaBuf` and get
 whichever of the three the platform provides; see
-[`TensorMemory::Dma` is unified across platforms](#tensormemorydma-is-unified-across-platforms).
+[`TensorMemory::DmaBuf` is unified across platforms](#tensormemorydmabuf-is-unified-across-platforms).
 
 ## Module Map
 
@@ -50,9 +50,90 @@ whichever of the three the platform provides; see
 - [`BufferIdentity`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.BufferIdentity.html) — stable cache key (`id() -> u64`) plus a `Weak<()>` liveness guard for caches that need to detect stale entries.
 - [`PlaneDescriptor`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.PlaneDescriptor.html) — duplicated fd plus optional stride/offset, used for multi-plane DMA-BUF imports.
 - [`PixelFormat`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.PixelFormat.html) / [`DType`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.DType.html) — image metadata attached via `set_format` / `with_format`.
+- **`PlaneGeometry`** — `{ offset, stride, size }` for one plane, from `PixelFormat::plane_table(w, h, row_stride)`. Field-for-field with `TensorPlane.msg`. See [Shape, strides and planes](#shape-strides-and-planes).
 - [`CpuAccess`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.CpuAccess.html) — **required** on every image constructor: `None` / `Read` / `Write` / `ReadWrite`. Hardware access is always implied and never declared. See [CPU access declaration](#cpu-access-declaration-cpuaccess).
 - [`ImageDesc`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/struct.ImageDesc.html) — the full-featured image request (builder style), and the only way to ask for [`Compression`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/enum.Compression.html). `Tensor::image` is the shorthand for the common case.
 - [`Colorimetry`](https://docs.rs/edgefirst-tensor/latest/edgefirst_tensor/colorimetry/struct.Colorimetry.html) — the YUV↔RGB conversion contract (space, range, transfer, matrix weights) carried alongside the pixel format.
+
+## Shape, strides and planes
+
+Three things describe a tensor's layout, and conflating any two of them is the recurring bug in this area.
+
+| Concept | Accessor | Answers |
+|---|---|---|
+| **Addressing grid** | `PixelFormat::addressing_shape(w, h)` | How a consumer *indexes* the image |
+| **Allocation geometry** | `PixelFormat::allocation_shape(w, h)` | How large the *buffer* is |
+| **Plane table** | `PixelFormat::plane_table(w, h, row_stride)` | *Where* each plane's bytes are |
+
+For every non-subsampled multi-channel format the first two coincide, which is why NV12 is the case that catches a confusion between them:
+
+| Format | `addressing_shape` | `allocation_shape` | Planes |
+|---|---|---|---|
+| `rgb8` packed | `[h, w, 3]` | `[h, w, 3]` | 1 |
+| `mono8` | `[h, w]` | `[h, w, 1]` | 1 |
+| planar RGB | `[3, h, w]` | `[3, h, w]` | 3 |
+| `NV12` | `[h, w]` | `[h + ceil(h/2), w]` | 2 |
+| bitstream (`h264`) | `[byte_length]`, dtype `U8` | same | 1 |
+
+**Buffer extent comes from the plane table, never from the shape.** For a subsampled format `product(addressing_shape) * dtype_size` is *smaller* than the allocation: NV12 640×480 addresses a 640×480 luma grid inside a 460 800-byte buffer. Any validation asserting the two agree is correct only for single-plane packed formats and must be gated accordingly.
+
+`allocation_shape` was named `image_shape` until the two meanings were separated. Every caller of the old name sized a buffer with it (`Tensor::image`, `configure_image`, `view()`, `import_image`, and the two PBO helpers), so one function called "the shape" made picking the wrong meaning the default — and picking the grid there undersizes every NV12 allocation by a third. There is deliberately no longer any function with that name.
+
+**Strides are in bytes**, signed, on both `TensorDesc` and `PlaneGeometry`. Bytes rather than elements so a hardware row pitch is always representable: a pitch need not be a whole number of `dtype` elements, and a sub-byte dtype (int4 NPU weights) has no element size to divide by at all. The element-stride representation this replaced could not express such a pitch — it fell back to the packed stride and reported a pitch the buffer does not have, across an ABI boundary.
+
+**Chroma extent is derived, never recomputed.** `plane_table` takes its chroma row count from `combined_plane_height`, which is exact for odd heights (`H + ceil(H/2)`, e.g. 483 → 725) where a hand-written `H/2` is off by a row.
+
+### Agreement with the IPC schema
+
+`addressing_shape` and `plane_table` are the producer side of `edgefirst_msgs/Tensor.msg` and `TensorPlane.msg` (EdgeFirst schemas, merged `71b56ed`). The golden values are pinned in `format.rs`'s tests with `(golden)` citations; changing one without changing the schemas fixture breaks the `blob -> msg -> blob` round-trip.
+
+Two rules the schema validator enforces that an exporter here must satisfy:
+
+- **All planes inline, or none.** A frame mixing transport modes has no coherent meaning — one `storage_kind`, `pid` and `fence_fd` cover every plane.
+- **An inline plane** carries `size == data.len()`, `modifier == 0`, and empty `handle_bytes`.
+
+`fence_fd` is an **acquire** fence and is per-tensor, never per-plane: it is a point on the producer's submission timeline, not a property of a plane's bytes. `EGL_ANDROID_native_fence_sync` (`crates/image/src/gl/native_fence.rs`) fences the command stream and takes no buffer argument, so a per-plane fence could only ever be the same fd duplicated.
+
+`TensorDesc` deliberately still carries `allocation_shape`, not the grid: it has no plane table, so its `shape` is its only carrier of extent and `import_descriptor` reconstructs directly from it. The grid convention arrives with the blob format, where `planes[]` carry extent independently.
+
+## The tensor blob
+
+A size-prefixed, append-only serialization of a tensor: `blob::export(&TensorDyn, TransportMode)` and `blob::import(&[u8])`. It exists alongside `TensorDesc` because the descriptor is a fixed C struct with one handle and no plane table, so it cannot describe a multi-plane frame or travel by value.
+
+**Region order is permanent from first publication.** A field may only be appended, never inserted. `required_mask` covers the one case appending cannot: an addition that changes how existing fields are *interpreted*, where an unaware consumer must refuse rather than proceed. `SUPPORTED_REQUIRED_MASK` is 0 today, so any bit set is a refusal — checked before any other field is trusted.
+
+The fixed header is 72 bytes, widest-first so every scalar is naturally aligned. It carries the length of *every* variable region, which makes each region's offset a constant-time derivation rather than a sequential walk. That is the one thing CDR cannot do — it has no offset table — and it is why the blob is worth having next to the message rather than reusing it.
+
+Variable tail, in the same order as the message's tail so the two can be read side by side: `shape[]: u64` · `strides[]: i64` (bytes) · `quant_scales[]: f32` · `quant_zero_points[]: i32` · five length-prefixed strings · plane records.
+
+`strides_len` is carried rather than assumed, because empty strides are a *distinct* value — `Tensor.msg` defines them as "densely packed C-order", not as absent. Always writing `ndim` strides would break the reference-mode round-trip identity.
+
+Each plane record is a 56-byte scalar block (`handle: i64`, then five `u64`) plus `handle_bytes` and `data`, padded to 8 so the next record's scalars stay aligned. 56 matches the schemas spec's independently-stated `TensorPlane` minimum.
+
+### Ownership
+
+> **Export borrows. Import dups. Nobody shares.**
+
+Export writes the source tensor's own handles and performs no syscalls; they are valid only while it lives. Import dups every fd it retains, so the result is independent and the source may die. No keepalive protocol, and identical behaviour in-process, across `.so`s, and across processes.
+
+### Transport modes
+
+| Mode | Carried | Round-trip guarantee |
+|---|---|---|
+| **Reference** (`handle >= 0`) | handles, `pid`, `offset` | identity, handle included |
+| **Inline** (`handle == -1`) | the bytes | content, geometry and every metadata field; the result is a **new allocation**, so handle identity is *not* preserved and must not be asserted |
+
+Inline is not a fallback. `mem` and `pbo` have no shareable handle at all, and *any* storage kind must inline over a network, where an fd and a pid are meaningless. The choice is the application's; the HAL's job is to make it expressible, which is why `handle == -1` plus carried bytes is part of the format rather than a convention on top. Reference export of a `mem` tensor is refused rather than silently inlined — a caller who asked for a reference would otherwise get a copy without being told.
+
+An inline export clears `pid` and `fence_fd` and zeroes each plane's `offset`: none survives the bytes travelling, and a non-zero `offset` could be misread as pointing into a handle that is not there. Import rebuilds plane positions from the format's plane table rather than trusting the wire.
+
+### Parsing a blob is parsing hostile input
+
+A blob arrives from another wheel, another process, or a network, so every count and length in its header is attacker-controlled and validated against the real buffer length before any allocation. `plane_count` is bounded by how many minimum-size records fit in `planes_bytes`, not by a constant — a forged count is a denial-of-service and the honest ceiling is the bytes present.
+
+Two blanket tests walk every 4-byte word of the header and of a plane record through hostile values and assert the parser returns `Err` rather than panicking, since a panic on hostile input is itself a denial-of-service. Several individual bounds checks turn out to be redundant for *safety* — offsets increase monotonically, so a later check catches what an earlier one would have — but they are kept because they attribute the failure to the field that actually carried the bad value.
+
+`std::str::from_utf8`, never `from_utf8_lossy`: a replacement character would hide malformed input rather than report it.
 
 ## Internal Architecture
 
@@ -84,7 +165,7 @@ classDiagram
     TensorTrait <|.. PboTensor
 ```
 
-The first three are the per-platform faces of `TensorMemory::Dma`; exactly one
+The first three are the per-platform faces of `TensorMemory::DmaBuf`; exactly one
 of them is compiled in on any given target.
 
 Each backend provides its own map type implementing `TensorMapTrait<T>`:
@@ -133,7 +214,7 @@ lets a GPU-backed decoder output be sub-viewed without the earlier
 `InvalidOperation("subview only supported for Mem, Dma, and Shm tensors")`).
 
 `view`/`batch` return an **owned** handle (not a borrow) so the value flows
-unchanged through `convert(src, dst, …)`, the C ABI (`hal_tensor *`), and PyO3
+unchanged through `convert(src, dst, …)`, the C ABI (`ef_tensor *`), and PyO3
 (`#[pyclass]`) without a lifetime parameter rippling across three language
 surfaces. An out-of-bounds region or `n ≥ N` returns an error
 (`Error::RegionOutOfBounds` / `Error::BatchIndexOutOfBounds`) — `view`/`batch`
@@ -154,7 +235,7 @@ view to a sampling rectangle, never re-keying the EGLImage (see
 For plain CPU access a consumer maps a view, or maps the parent whole and slices
 the mapped `ArrayView` (the decoder reads batched model outputs this way). The
 Python binding mirrors this with `numpy` + the buffer protocol; the C API exposes
-first-class `hal_tensor_view` / `hal_tensor_batch` handles (it does not make
+first-class `ef_tensor_view` / `ef_tensor_batch` handles (it does not make
 callers hand-roll pixel→byte math).
 
 ### Memory selection logic
@@ -357,34 +438,30 @@ byte offset, or a multi-plane chroma plane), **not** batch tiling. Because the
 key carries the geometry, reconfiguring a reused source buffer to a new size
 re-keys to a fresh import rather than returning the previous frame's image.
 The cache does **not** rescue a pipeline that
-re-imports the same DMA-BUF every frame: each `hal_import_image` /
-`hal_tensor_from_fd` call mints a new `BufferIdentity` with a fresh
+re-imports the same DMA-BUF every frame: each `ef_tensor_builder_wrap`
+call mints a new `BufferIdentity` with a fresh
 ID, so re-imports always miss. The contract is:
 
 - Downstream caches (V4L2 / GStreamer adaptors) cache external
   DMA-BUFs by stable `(inode, plane_offset)` and hold each
-  `hal_tensor *` alive across frames.
+  `ef_tensor *` alive across frames.
 - That keeps `BufferIdentity.id()` constant for the same physical
   buffer, which in turn keeps the in-HAL EGL image cache hitting.
 
-**Android getId interning.** On Android the "every wrap mints a new
-identity" rule has one systematic exception: `from_hardware_buffer` (and
-the allocation paths, so export → re-import unifies) intern on
+**Android getId derivation.** `from_hardware_buffer` (and the allocation
+paths, so export → re-import unifies) derive the identity from
 `AHardwareBuffer_getId` — the system's stable 64-bit id for the
 allocation (API 31+, resolved lazily via `dlsym` to keep the API-26 link
-floor). Every re-wrap of the same physical buffer resolves to the same
-`BufferIdentity`, so CameraX/ImageReader pipelines that recycle a small
-buffer pool but re-wrap per frame hit the EGLImage import cache instead
-of re-importing every frame. getId is the intern KEY only — the
-identity's `id` is still minted from the process-wide counter, so
-id-space collision with non-AHB identities is impossible. Reuse requires
-the recorded guard to be live: a live guard means a tensor still holds
-its acquire-reference, so the system cannot have recycled the key (the
-ABA case is defused by construction — caches hold weaks, never guards).
-Dead entries are pruned on every insert. On API 26–30 the symbol is
-absent and every wrap keeps the fresh-identity behavior — correct but
-uncached, visible in the miss counters. The intern policy is host-tested
-(`IdentityInternTable` in `ahardwarebuffer_layout.rs`).
+floor) — via `BufferIdentity::derived(IdentityKind::AHardwareBufferId, id)`.
+Every re-wrap of the same physical buffer resolves to the same
+`BufferIdentity` without any per-process cache: CameraX/ImageReader
+pipelines that recycle a small buffer pool but re-wrap per frame hit the
+EGLImage import cache instead of re-importing every frame, and two
+independently-linked copies of this crate agree on the id without sharing
+state. On API 26–30 the symbol is absent, so the identity is derived from
+the `AHardwareBuffer*` pointer instead
+(`IdentityKind::AHardwareBufferPtr`) — unique among live buffers in this
+process, which is all the per-process cache needs.
 
 See
 [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
@@ -434,7 +511,7 @@ allocated (`Tensor::compression() -> Option<CompressionScheme>`, one of
   recorded scheme (physical layout, unlike colorimetry); views and
   composed planes inherit it.
 - `compression_support(format, dtype)` (capi
-  `hal_platform_compression_support`) reports whether a request can be
+  `ef_platform_compression_support`) reports whether a request can be
   honored on this platform.
 
 The recording is best knowledge: gralloc does not report its choice, so
@@ -542,7 +619,7 @@ touch the buffer without a copy.
    raw pointer, and neither involves a syscall. Pick this when no hardware
    accelerator will see the buffer.
 
-2. **Platform GPU buffer (`TensorMemory::Dma`)** — costs more to allocate and
+2. **Platform GPU buffer (`TensorMemory::DmaBuf`)** — costs more to allocate and
    more to map (cache maintenance on Linux, a lock/unlock pair on macOS and
    Android) and earns it back by being zero-copy for everything else in the
    pipeline:
@@ -573,14 +650,14 @@ all hit this path. The tensor crate also supports multi-plane formats
 allocations) via `Tensor::from_planes(luma, chroma, PixelFormat::Nv12)`.
 Each plane keeps its own DMA-BUF fd and per-plane stride / offset.
 
-The C API exposes this through
-[`hal_import_image(proc, y_pd, uv_pd, ...)`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/include/edgefirst/hal.h)
-which takes two `PlaneDescriptor`s and combines them via `from_planes`.
+The C API exposes this through `ef_tensor_from_planes` in
+[`edgefirst/tensor.h`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/include/edgefirst/tensor.h),
+which takes two plane tensors and combines them via `from_planes`.
 A downstream GStreamer source/transform element that wants to feed
 multi-plane buffers into the HAL detects them via
 `gst_buffer_n_memory() > 1` and extracts per-plane fds with
 `gst_dmabuf_memory_get_fd()` on each `GstMemory` block, then passes
-each fd into a separate `hal_plane_descriptor`.
+each fd into a separate `ef_tensor_builder_add_plane` call.
 
 See
 [`crates/image/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
@@ -590,7 +667,7 @@ via EGL attributes.
 ## Inter-Crate Interfaces
 
 The tensor crate is the foundation of the data-plane crates — image,
-decoder, capi, and gpu-probe all depend on it. The tracker and bench
+decoder, the C-API leaves, and gpu-probe all depend on it. The tracker and bench
 crates are independent of it (tracker operates on `DetectionBox` and
 `nalgebra`; bench is a thin `serde_json` wrapper for benchmark IO):
 
@@ -598,8 +675,7 @@ crates are independent of it (tracker operates on `DetectionBox` and
 |----------|-----------|---------|
 | [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) | `Tensor<u8>`, `TensorDyn`, `PboOps` impl | Image processor input/output buffers, PBO management |
 | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `Tensor<T>`, `TensorMap` | Reading model output tensors |
-| [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | `pub use edgefirst_tensor as tensor` | Re-export |
-| [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | `from_fd`, `clone_fd`, `from_planes` | Tensor lifetime across the FFI boundary |
+| [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) | `from_fd`, `clone_fd`, `from_planes` | Tensor lifetime across the FFI boundary |
 | [`gpu-probe`](https://github.com/EdgeFirstAI/hal/blob/main/crates/gpu-probe/) | `Tensor` allocation | Allocates the DMA-BUF round-trip buffer the probe verifies |
 
 `BufferIdentity` is the in-HAL cache contract: the image crate's EGL
@@ -609,7 +685,7 @@ libcamera / GStreamer adaptors) must not key on
 `buffer_identity().id()` —
 that id is regenerated on every HAL import. Downstream caches key on
 the stable kernel `(inode, plane_offset)` of the external DMA-BUF and
-then keep the resulting `hal_tensor *` alive across frames, which
+then keep the resulting `ef_tensor *` alive across frames, which
 keeps `buffer_identity().id()` stable and so keeps the image-side
 cache hitting. See
 [Appendix C: DMA-BUF Identity and Tensor Caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
@@ -625,10 +701,22 @@ in the project ARCHITECTURE.md for the full two-layer story.
 | Other Unix | No | Yes | Yes | No |
 | Windows | No | No | Yes | No |
 
-### `TensorMemory::Dma` is unified across platforms
+### Every `TensorMemory` variant exists on every platform
 
-`TensorMemory::Dma` is a single enum variant everywhere — same discriminant
-value, same `HalTensorMemory::Dma=1` over the C ABI — but the underlying
+`TensorMemory` is a namespace of storage codes, not a list of what the current build can allocate. Every variant is declared unconditionally — `Mem = 0`, `Shm = 1`, `DmaBuf = 2`, `IoSurface = 3`, `Pbo = 4`, `Cuda = 5` — through `ef_vocabulary!`, which makes the discriminants explicit and identical on every target. `Shm` used to be `#[cfg(unix)]`, which both shifted every variant declared after it on a non-unix build and made a cross-platform recording unreadable: a descriptor captured on Linux names `"dmabuf"`, and a macOS consumer has to be able to *name* that backing to report "cannot materialise here" rather than failing on an unrecognised code.
+
+What *is* platform-dependent is availability, and that is a runtime question — `/dev/dma_heap` can exist while this process lacks permission on it — so it lives in `TensorMemory::is_available()` rather than in a `cfg`. Requesting a backing this build cannot serve returns a "not supported by this build" error, never a panic.
+
+The enum is `#[non_exhaustive]`, like `DType`, `Compression` and `PixelFormat`: match it with a wildcard arm. The variant list is expected to keep growing — this change added two, and Windows backings and a real CUDA device backing are on the way — and the attribute is what keeps a consumer outside this repo compiling across those additions. It protects downstream, not the HAL: inside `edgefirst-tensor` the matches stay exhaustive and compile-enforced, so a new variant is still a build error here. Outside it (the C mapping, the Python mapping) the substitute is an `all()`-driven test that fails the day a variant is added without a decision made there.
+
+`IoSurface` and `Cuda` are defined as codes but no backend produces or accepts them yet: macOS/iOS allocate and report `DmaBuf`, as before. The C ABI's `ef_storage_kind` matches the Rust discriminants (`EF_STORAGE_KIND_MEM=0`, `SHM=1`, `DMA_BUF=2`, `IO_SURFACE=3`, `PBO=4`, `CUDA=5`) — it is no longer a remapped outlier. A backend that starts reporting `IoSurface` is visible to compiled C callers as `EF_STORAGE_KIND_IO_SURFACE`.
+
+This is also *not* `protocol::kind`, which stays a separate, narrower vocabulary: `kind` records what a `TensorDesc`'s `ptr` and `handle` mean to an importer, so `Mem` and `Shm` both map to `kind::HOST`. `protocol::kind_of()` is the only legitimate bridge between the two — never an integer cast.
+
+### `TensorMemory::DmaBuf` is unified across platforms
+
+`TensorMemory::DmaBuf` is a single enum variant everywhere — same discriminant
+value, same `EF_STORAGE_KIND_DMA_BUF=2` over the C ABI — but the underlying
 storage type differs:
 
 - **Linux**: `TensorStorage::Dma(DmaTensor<T>)` backed by a DMA-BUF fd
@@ -658,7 +746,7 @@ tensor's lifetime; the producer keeps its own retain count.
 
 ### AHardwareBuffer (Android)
 
-Android's `TensorMemory::Dma` is
+Android's `TensorMemory::DmaBuf` is
 `TensorStorage::Dma(AHardwareBufferTensor<T>)`, backed by an NDK
 `AHardwareBuffer` (stable C ABI since API 26 — the HAL's Android link
 floor). It mirrors the IOSurface story with Android-specific rules:
@@ -696,8 +784,9 @@ floor). It mirrors the IOSurface story with Android-specific rules:
 | `is_dma_available()` | Linux DMA-BUF heap is mountable. False on every other OS. |
 | `is_iosurface_available()` | macOS/iOS IOSurface framework is present. False on every other OS. |
 | `is_ahardwarebuffer_available()` | Android AHardwareBuffer allocation succeeds. False on every other OS. |
-| `is_gpu_buffer_available()` | Whichever of the three above applies to this target. The portable probe — prefer it when you only care whether `TensorMemory::Dma` will succeed, not which mechanism backs it. |
+| `is_gpu_buffer_available()` | Whichever of the three above applies to this target. The portable probe — prefer it when you only care whether `TensorMemory::DmaBuf` will succeed, not which mechanism backs it. |
 | `is_shm_available()` | `shm_open` works. True on Linux and macOS, false on Windows. |
+| `TensorMemory::is_available()` | Dispatches to the probe for that variant, so a caller holding a `TensorMemory` value can ask directly instead of picking a probe by hand. `IoSurface`, `Pbo` and `Cuda` answer `false` for now — the first two have no code of their own yet (macOS reports `DmaBuf`; PBOs come from `ImageProcessor::create_image`, whose GL context this crate cannot see), and the third has no backing at all. |
 
 The Linux-specific `dma-heap` and macOS-specific `IOSurface` /
 `CoreFoundation` framework links are gated by per-target sections in
@@ -708,4 +797,4 @@ The Linux-specific `dma-heap` and macOS-specific `IOSurface` /
 - Project architecture: [../../ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md)
 - DMA-BUF identity story: [ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-c-dma-buf-identity-and-tensor-caching)
 - Image-side EGL cache and PBO dispatch: [../image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md)
-- C API tensor lifetime: [../capi/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md)
+- C API tensor lifetime: [../tensor-capi/](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/)

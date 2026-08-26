@@ -199,7 +199,7 @@ def run_tflite(interp, input_data):
 
 def numpy_outputs_to_tensors(outputs):
     """Convert a list of numpy arrays to HAL Tensors for decode/draw_masks."""
-    from edgefirst_hal import Tensor  # noqa: F811
+    from edgefirst.codec import Tensor
 
     dtype_map = {
         np.dtype("int8"): "int8",
@@ -429,7 +429,7 @@ def run_opencv_pipeline(image_path, metadata, interp, save_path=None):
     timings["load"] = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
-    lb, scale, px, py = opencv_letterbox(img, 640)
+    lb, _scale, _px, _py = opencv_letterbox(img, 640)
     input_data = np.expand_dims(lb, 0).astype(np.uint8)[..., ::-1].copy()
     timings["letterbox"] = (time.perf_counter() - t0) * 1000
 
@@ -466,7 +466,8 @@ def run_hal_pipeline(image_path, metadata, interp, processor, save_path=None):
 
     Returns (bgr_640x640, boxes, scores, classes, elapsed_ms_dict).
     """
-    from edgefirst_hal import Tensor, PixelFormat, Decoder
+    from edgefirst.codec import PixelFormat, Tensor
+    from edgefirst.decoder import Decoder
 
     timings = {}
 
@@ -523,7 +524,8 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
 
     Returns elapsed_ms_dict (no visual output — uses HAL's built-in colors).
     """
-    from edgefirst_hal import Tensor, PixelFormat, Decoder
+    from edgefirst.codec import PixelFormat, Tensor
+    from edgefirst.decoder import Decoder
 
     timings = {}
 
@@ -547,7 +549,7 @@ def run_hal_pipeline_bench(image_path, metadata, interp, processor):
     render_dst = Tensor.image(640, 640, PixelFormat.Rgba, access="readwrite")
     processor.convert(dst_rgb, render_dst)
     decoder = Decoder(metadata, score_threshold=0.25, iou_threshold=0.45)
-    processor.draw_masks(decoder, outputs, render_dst)
+    decoder.draw_onto(processor, outputs, render_dst)
     timings["decode+render"] = (time.perf_counter() - t0) * 1000
 
     timings["total"] = sum(timings.values())
@@ -599,7 +601,7 @@ def main():
 
     hal_processor = None
     if run_hal:
-        from edgefirst_hal import ImageProcessor, probe_egl_displays
+        from edgefirst.image import ImageProcessor, probe_egl_displays
 
         displays = probe_egl_displays()
         gpu = displays[0].kind if displays else None

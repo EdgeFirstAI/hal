@@ -1,3 +1,6 @@
+#![cfg(feature = "png")]
+//! PNG decode tests. Gated: the decoder is absent without the `png` feature.
+
 // SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 // SPDX-License-Identifier: Apache-2.0
 

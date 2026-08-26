@@ -227,7 +227,7 @@ pipeline holds them flat after warmup.
 | `ConvertStats.src_uploads` (via `convert_stats()`) | GL backend | a convert fed its source by CPU map+upload instead of zero-copy import |
 | `egl_cache_stats().total_misses()` | GL backend | an EGLImage import was created rather than reused (per-frame re-import churn when it grows in steady state) |
 | `compression_fallback_count()` (mirror of `edgefirst_tensor::compression_fallback_count`) | process | a `Compression::Any` request resolved linear |
-| `edgefirst_tensor::unplanned_cpu_access_count()` (capi `hal_unplanned_cpu_access_count`) | process | a tensor map exceeded the buffer's declared `CpuAccess` (warn-once per buffer) |
+| `edgefirst_tensor::unplanned_cpu_access_count()` (capi `ef_unplanned_cpu_access_count`) | process | a tensor map exceeded the buffer's declared `CpuAccess` (warn-once per buffer) |
 
 The Device Farm bench cells assert `src_uploads == 0` and
 `cache_misses == 0` across their steady-state windows; the same
@@ -894,7 +894,7 @@ removal call.
 
 Key implications:
 
-- `hal_tensor_from_fd()` and `hal_import_image()` always allocate a new
+- `ef_tensor_builder_wrap()` always allocates a new
   `BufferIdentity`. Callers that re-wrap the same fd each frame will see a
   cache miss every `convert()`. **Hold the tensor alive across frames.**
 - Content written into a DMA-BUF between calls (e.g. by a V4L2 decoder) is
@@ -1289,7 +1289,7 @@ ignored on-demand `stress_parallel_processors_oracle` board tool.
 `ImageProcessor::convert()`, `materialize_masks()`, and `draw_decoded_masks()`
 emit a [`tracing::trace_span!`] tree describing the backend-dispatch decision
 and every internal pass. Spans are captured by
-[`edgefirst_hal::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/src/trace.rs)
+[`edgefirst_tensor::trace::start_tracing`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/src/trace.rs)
 into Chrome JSON for Perfetto and cost a single relaxed atomic load per call
 site when no subscriber is active.
 
@@ -1515,7 +1515,7 @@ single call and discarded.
 
 | Layer | API |
 |-------|-----|
-| C | `hal_colorimetry` struct (4 `int` axes, 0 = unknown; values are stable HAL constants, decoupled from V4L2); `hal_tensor_set_colorimetry` / `hal_tensor_colorimetry`; `hal_colorimetry_from_v4l2`; `hal_import_image` colorimetry parameter |
+| C | packed colorimetry via `ef_tensor_set_colorimetry` / `ef_tensor_builder_colorimetry`; wrap imported frames with `ef_tensor_builder_wrap` |
 | Python | `Colorimetry` class + enum constants; `tensor.colorimetry` property; `import_image(colorimetry=...)` |
 
 Client adaptors (GStreamer elements, libcamera pipelines, etc.) use the C or
@@ -1560,7 +1560,7 @@ in the project README for the user-facing rules and validation patterns.
 | Depends on (unconditional) | [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) | `DetectBox`, `Segmentation`, proto data for `draw_*` |
 | Depends on (feature `tracker`) | [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) | `Tracker<DetectBox>` for `draw_masks_tracked` |
 | Consumed by | [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) | re-export as `edgefirst_hal::image` |
-| Consumed by | [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) | C bindings for `ImageProcessor` and rendering APIs (does **not** bridge to Python) |
+| Consumed by | [`edgefirst-image-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image-capi/) | C bindings for `ImageProcessor` and rendering APIs (does **not** bridge to Python) |
 | Consumed by | [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) | PyO3 binding over the Rust umbrella crate (does not go through the C API) |
 
 ## Platform-Specific Notes

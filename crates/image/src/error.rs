@@ -9,6 +9,7 @@ pub enum Error {
     NotFound(String),
     Library(libloading::Error),
     JpegEncoding(jpeg_encoder::EncodingError),
+    #[cfg(feature = "codec")]
     Codec(edgefirst_codec::CodecError),
     ResizeImageBuffer(fast_image_resize::ImageBufferError),
     Resize(fast_image_resize::ResizeError),
@@ -60,6 +61,7 @@ impl From<jpeg_encoder::EncodingError> for Error {
     }
 }
 
+#[cfg(feature = "codec")]
 impl From<edgefirst_codec::CodecError> for Error {
     fn from(err: edgefirst_codec::CodecError) -> Self {
         Error::Codec(err)

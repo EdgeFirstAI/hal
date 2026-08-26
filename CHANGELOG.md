@@ -7,21 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-25
+
 ### Added
 
-- **Fused native-4:2:0→RGB JPEG decode** (`edgefirst-codec`): the opt-in
-  `set_output_format(Some(Rgb))` fused path (previously 4:4:4 sources only)
-  now also covers native 4:2:0 colour JPEGs — by far the dominant real-world
-  subsampling — via a 2×2 nearest-neighbour (box) chroma upsample fused into
-  the MCU write stage, reusing the existing `ycbcr_to_rgb_row` SIMD kernels
-  on the upsampled row. This is a deliberate speed-over-fancy-filtering
-  tradeoff (not libjpeg's triangle upsampling), measured at 44–50 dB PSNR /
-  max pixel delta 20–24 against a reference decode on the COCO-family test
-  fixtures — comparable to the already-documented accurate-vs-`DctMethod::Fast`
-  accuracy cost. 4:2:2 and other non-4:2:0/non-4:4:4 subsamplings now return
-  `CodecError::UnsupportedFormat` instead of silently falling back to native
-  output. No public API change beyond that: same `set_output_format` entry
-  point on Rust, C, and Python.
+- **Modular C API.** Five independently installable libraries: `libedgefirst_tensor.so` (`edgefirst/tensor.h`), `libedgefirst_codec.so`, `libedgefirst_image.so`, `libedgefirst_decoder.so`, `libedgefirst_tracker.so`. Siblings link `libedgefirst_tensor.so` at load time instead of embedding a second tensor copy. A JPEG-only C consumer ships tensor + codec only. Tracker takes detections as a plain `ef_detect_box` array and links neither tensor nor decoder.
+- **Modular Python wheels.** `edgefirst-tensor`, `edgefirst-codec`, `edgefirst-image`, `edgefirst-decoder`, and `edgefirst-tracker` under the `edgefirst.` namespace. Extensions link one shared `libedgefirst_tensor.so`; they do not embed it. A JPEG-only user installs `edgefirst-codec` + `edgefirst-tensor`.
+- **`static` / `dynamic` backend on `edgefirst-tensor`.** Mutually exclusive. `static` (default) is the real implementation for Rust consumers. `dynamic` wraps the opaque C handle so a cdylib can call `ef_tensor_*` instead of compiling a private copy. `--all-features` does not build this crate.
+- **GIL released** on long Python operations (`convert`, `decode`, `decode_image`, tiling finalize, and related). `ImageProcessor.convert` takes `&self` so concurrent calls on one processor do not fail the PyO3 borrow.
+- **Tiled inference C API** on `libedgefirst_decoder` (`ef_tiled_frame_accumulator`, `ef_lift_tile_boxes`, `ef_merge_tiled_detections`). Tile planning that needs an `ImageProcessor` stays on `libedgefirst_image`.
+- **Tensor blob** (`edgefirst_tensor::blob`) — size-prefixed, append-only serialization with reference and inline transport modes.
+- **`TensorDyn::from_iosurface_id`** — IOSurface counterpart to `from_fd`.
+
+### Changed
+
+- **BREAKING (C):** the monolithic `libedgefirst_hal` / `edgefirst/hal.h` is removed. Include the per-library header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`, `detect.h`) and link the matching `.so`.
+- **BREAKING:** `edgefirst-tensor` requires exactly one of `static` or `dynamic`. `--no-default-features` alone is a `compile_error!`.
+- **BREAKING (C):** `ef_tensor_builder_wrap` rejects plane fields it cannot represent (`offset` is carried; `used != size` is `EBADMSG`; non-zero `modifier` is `EDOM`; a second unrepresentable plane is `ENOTSUP`) instead of silently dropping them.
+- **BREAKING:** `TensorDesc` strides are bytes, not elements. `PixelFormat::image_shape` is renamed `allocation_shape`; `addressing_shape` / `plane_table` cover the logical grid and per-plane geometry.
+- **Python:** entry points accept any object implementing the `__edgefirst_tensor__` capsule, so a tensor from `edgefirst.image` can be decoded or converted from another package without a copy.
+- Detection boxes, masks, and related plain values are declared in header-only `edgefirst/detect.h` (crate `edgefirst-decoder-abi`). `decoder.h`, `image.h`, and `tracker.h` include it. Image draws those primitives; it does not depend on the model decoder.
+- **BREAKING (Python):** fused decode+draw is `Decoder.draw_onto(processor, ...)` so `edgefirst-image` no longer depends on `edgefirst-decoder`. ByteTrack lives in `edgefirst-tracker`.
+
+### Fixed
+
+- `HostView.numpy()` (and other tensor→numpy conversions) honour DMA row padding, matching `memoryview`.
+- Dynamic-backend gaps that returned a wrong answer or silently skipped DMA import (`as_dma()`, `create_image(dtype="int8")`, batch-NULL mapping).
+- pkg-config files derive `prefix` from `${pcfiledir}` so a tarball extracted outside `/usr` still compiles.
 
 ## [0.28.3] - 2026-08-15
 

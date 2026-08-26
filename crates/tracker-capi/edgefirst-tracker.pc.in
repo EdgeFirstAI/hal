@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# `Requires.private: edgefirst-decoder`, and NOT `Requires: edgefirst-tensor`.
+# Both halves of that are deliberate.
+#
+# This file previously read `Requires: edgefirst-tensor`, with a comment
+# explaining that "tracking consumes detection lists declared in tensor.h".
+# That was true once. `ef_detect_box` has since moved to `edgefirst-decoder-abi`
+# and is emitted into `decoder.h`, and this file was never updated to follow --
+# so it named a dependency this library does not have and omitted the one it
+# does. Nothing caught it because nothing has ever consumed these .pc files:
+# the modular C libraries are not yet released, so no compile has ever run
+# through this metadata.
+#
+# WHAT THIS LIBRARY ACTUALLY NEEDS:
+#
+#   * At COMPILE time, decoder's header. `tracker.h` includes
+#     <edgefirst/decoder.h> for `ef_detect_box`, so a consumer needs decoder's
+#     include path or the first `#include` fails. (decoder.h in turn includes
+#     tensor.h, so tensor's cflags arrive transitively through decoder's own
+#     Requires -- they do not need naming here.)
+#
+#   * At DYNAMIC LINK time, nothing. `libedgefirst_tracker.so` has no
+#     DT_NEEDED entry for either sibling: detections cross as a plain C array
+#     (`ef_detect_box_list_data`), which is exactly what lets the tracker read
+#     a list without linking the library that owns it. That separation is a
+#     design point, not an accident, and a plain `Requires:` would undo it by
+#     contributing decoder's `Libs:` to every dynamic consumer's link line.
+#
+# `Requires.private` is the construct that expresses precisely this: its
+# Cflags always apply, so the header resolves; its Libs apply only under
+# `pkg-config --static`, where a static link genuinely does need decoder's
+# symbols present. Correct in both modes rather than a compromise between
+# them.
+
+# RELOCATABLE, deliberately -- do NOT hardcode a prefix here.
+#
+# These libraries ship as tarballs, and a tarball is extracted wherever the
+# user wants it. This file previously read `prefix=/usr`, which meant
+# pkg-config emitted `-I/usr/include` and `-L/usr/lib` and then ELIDED both as
+# system defaults -- so `pkg-config --cflags --libs` returned bare `-l` flags
+# with no search paths at all. Extracted anywhere other than over `/usr`, the
+# consumer's very first `#include <edgefirst/...>` failed. Nothing caught it
+# because these libraries were not released, so no compile had ever run
+# through this metadata.
+#
+# `${pcfiledir}` is the directory holding this .pc file. It sits at
+# <prefix>/lib/pkgconfig, so `../..` is the prefix wherever the tarball
+# landed. Installing to /usr still works: prefix resolves to /usr and
+# pkg-config elides the system paths, which is correct there.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: edgefirst-tracker
+Description: EdgeFirst multi-object tracking
+Version: @VERSION@
+Requires.private: edgefirst-decoder
+Libs: -L${libdir} -ledgefirst_tracker
+Libs.private: -lm -ldl -lpthread
+Cflags: -I${includedir}

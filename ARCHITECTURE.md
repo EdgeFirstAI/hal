@@ -15,9 +15,8 @@ sub-crate's `ARCHITECTURE.md`:
 | `image` | [crates/image/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/ARCHITECTURE.md) — unified GL engine (one `GLProcessorST`; Linux DMA-BUF, macOS/iOS ANGLE + IOSurface, Android AHardwareBuffer), `GlPlatform` porting seam, EGL image cache, batch engine (`convert_deferred`/`flush`), G2D, CPU, Vivante workarounds, shutdown safety |
 | `decoder` | [crates/decoder/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/ARCHITECTURE.md) — model-type selection, dshape contract, per-scale framework, fused proto path |
 | `tracker` | [crates/tracker/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/ARCHITECTURE.md) — ByteTrack two-pass association, Kalman state |
-| `hal` (umbrella) | [crates/hal/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/ARCHITECTURE.md) — re-export layer + tracing subscriber |
-| `capi` (C API) | [crates/capi/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md) — opaque-handle ABI, performance recommendations, Delegate DMA-BUF framework, mobile zero-copy surface |
-| `python` | [crates/python/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/ARCHITECTURE.md) — PyO3 bindings, numpy 3-path copy strategy, abi3 wheels |
+| `tensor-capi` / `codec-capi` / `image-capi` / `decoder-capi` / `tracker-capi` | Five modular C libraries (`libedgefirst_{tensor,codec,image,decoder,tracker}`). Detection layouts live in header-only `edgefirst/detect.h`. |
+| `python-*` (five wheels) | [crates/python-common/ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/ARCHITECTURE.md) — PyO3 bindings, five extension modules linking `libedgefirst_tensor.so` (tracker does not), PEP 420 namespace, capsule handoff |
 
 The high-level system diagram lives at the top of
 [README.md § System Architecture](https://github.com/EdgeFirstAI/hal/blob/main/README.md#system-architecture);
@@ -29,14 +28,18 @@ this document does not reproduce it.
 
 Each sub-crate has a single responsibility in the inference pipeline:
 
-- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::Dma` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
+- [`edgefirst-tensor`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/) — the foundation. Provides `Tensor<T>` and `TensorDyn` with interchangeable backends — the `TensorMemory::DmaBuf` zero-copy slot maps to DMA-BUF on Linux, IOSurface on macOS/iOS, and AHardwareBuffer on Android, alongside SHM / Mem / PBO — plus multi-plane composition for V4L2 NV12M, the `BufferIdentity` cache key (interned on `AHardwareBuffer_getId` on Android), the required `CpuAccess` declaration and tile-compression metadata on image tensors, and the `PboOps` trait that lets the GL backend manage PBO lifetimes through a `WeakSender` channel.
 - [`edgefirst-codec`](https://github.com/EdgeFirstAI/hal/blob/main/crates/codec/) — Image decoding (JPEG, PNG) into pre-allocated tensor buffers with support for u8, u16, i8, i16, and f32 pixel types. Supports strided output for GPU pitch-aligned DMA-BUF/PBO tensors. Designed for the allocate-once, decode-in-loop pattern.
 - [`edgefirst-image`](https://github.com/EdgeFirstAI/hal/blob/main/crates/image/) — the GPU/G2D/CPU image processor. Owns the GL thread, EGL image caches, and shutdown defense layers. Provides format conversion, geometric transforms, and three mask-rendering pipelines (materialized, fused proto, tracked). The GL backend is a **single engine** (`GLProcessorST`) that runs on every supported OS: Linux uses native EGL + DMA-BUF import, macOS uses ANGLE + IOSurface, Android uses native EGL + AHardwareBuffer EGLImage import (iOS builds ride the ANGLE platform) — platform differences are confined to the `GlPlatform` compile-time porting contract (`gl/platform/`). Batch preprocessing is supported via `convert_deferred`/`flush`: sibling tiles share one EGLImage import (parent-keyed) and one GPU sync per batch. Also owns the input half of SAHI tiling (`tiling.rs`) — `TilingConfig`, `plan_tiles`, `alloc_tile_batch`, `tile_into`, `tile_one` — which rides that same batch engine to render an overlapping tile grid with one import and one flush.
 - [`edgefirst-decoder`](https://github.com/EdgeFirstAI/hal/blob/main/crates/decoder/) — model output post-processing. YOLOv5/v8/v11/v26 (incl. end-to-end) and ModelPack. NEON-optimized per-scale split-tensor framework. Validates `shape` / `dshape` declarations against the physical-memory-order contract at builder time. Owns the output half of SAHI tiling (`tiling` module) — `TilePlacement` (the record shared with `edgefirst-image`), `lift_tile_boxes`, GREEDYNMM `merge_tiled_detections`, and the streaming `TiledFrameAccumulator`.
 - [`edgefirst-tracker`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tracker/) — ByteTrack with Kalman-smoothed trajectories. Generic over the detection box type; the decoder's `DetectBox` plugs in via the `DetectionBox` trait.
-- [`edgefirst-hal`](https://github.com/EdgeFirstAI/hal/blob/main/crates/hal/) — umbrella crate. Re-exports the five functional crates and owns the optional Chrome JSON tracing subscriber.
-- [`edgefirst-hal-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/) — C ABI layer with cbindgen-generated header. Defines the [Delegate DMA-BUF framework](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#delegate-dma-buf-framework) ABI used by NXP Neutron, VxDelegate, and other TFLite delegates.
-- [`crates/python`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python/) — PyO3 bindings, published as `edgefirst-hal` on PyPI. Contains the three-path numpy copy dispatcher.
+- [`edgefirst-tensor-capi`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor-capi/) — C ABI for tensors (`libedgefirst_tensor`, `edgefirst/tensor.h`). Sibling leaves cover codec, image, decoder, and tracker. Detection layouts are header-only in `edgefirst/detect.h`.
+- [`crates/python-common`](https://github.com/EdgeFirstAI/hal/blob/main/crates/python-common/) — the shared PyO3 binding rlib, plus four thin `cdylib` crates (`python-tensor`, `python-codec`, `python-image`, `python-decoder`) published as the independent `edgefirst-tensor` / `edgefirst-codec` / `edgefirst-image` / `edgefirst-decoder` wheels under the `edgefirst.` PEP 420 namespace. Contains the three-path numpy copy dispatcher.
+
+There is no umbrella crate. `edgefirst-hal` was deleted in 0.29 — every
+crate is a real, independently-consumable library, and the optional Chrome
+JSON tracing subscriber moved into `edgefirst-tensor` behind its `tracing`
+feature.
 
 The internal dependency graph and external dependency list live in
 [README.md § Dependencies](https://github.com/EdgeFirstAI/hal/blob/main/README.md#dependencies).
@@ -54,7 +57,7 @@ the underlying storage and the GL transfer backend differ.
 |------------|--------------------------------------|------------------------|------------------------|--------------------|
 | `TensorMemory::Mem` | Heap | Heap | Heap | Heap |
 | `TensorMemory::Shm` | `shm_open` | `shm_open` | `shm_open` | Import-only — bionic has no `shm_open`, so allocation reports `NotImplemented`; `from_fd` works |
-| `TensorMemory::Dma` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) |
+| `TensorMemory::DmaBuf` | DMA-BUF heap (`/dev/dma_heap/*`) | DMA-BUF heap if mountable; PBO otherwise | IOSurface (CoreFoundation framework) | AHardwareBuffer (NDK, gralloc) |
 | `TensorMemory::Pbo` | GLES PBO | GLES PBO | — (no PBO on the macOS backend) | — (AHB covers the zero-copy roles) |
 | GL transfer backend | `TransferBackend::DmaBuf` (Vivante, Mali, V3D) | `DmaBuf` or `Pbo` (NVIDIA discrete uses `Pbo`) | `IOSurface` via ANGLE | AHardwareBuffer EGLImage (native EGL) |
 | GL → backend translation | Native EGL → driver (vendor blob or Mesa) | Native EGL → driver | ANGLE EGL → Metal | Native EGL → driver (Adreno/Mali/PowerVR/Xclipse) |
@@ -65,19 +68,19 @@ the underlying storage and the GL transfer backend differ.
 | Portable probe | `is_gpu_buffer_available()` — works on all four | | | |
 
 The portable `is_gpu_buffer_available()` is the recommended cross-platform
-gate when the question is "can I ask for `TensorMemory::Dma` and expect a
+gate when the question is "can I ask for `TensorMemory::DmaBuf` and expect a
 zero-copy GPU-importable buffer?" The platform-specific probes
 (`is_dma_available`, `is_iosurface_available`) remain when callers need
 to know *which* primitive is in use — e.g. to decide whether to call
-`hal_tensor_clone_fd` (Linux) vs `hal_tensor_iosurface_id` (macOS).
+`ef_tensor_clone_fd` (Linux) vs `ef_tensor_from_iosurface_id` / `ef_tensor_iosurface_ref` (macOS).
 
 **iOS (16+)** shares the macOS column's architecture — ANGLE (EGL→Metal)
-via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::Dma`
-tensors. CI builds and link-validates `aarch64-apple-ios` and
-`aarch64-apple-ios-sim` on every PR — `scripts/validate-ios-link.sh`
-links the production C API staticlib against the ANGLE + Apple
-frameworks; runtime execution on-device awaits the Swift app-shell
-effort.
+via the prebuilt xcframeworks and IOSurface-backed `TensorMemory::DmaBuf`
+tensors. CI builds and lints the native Rust API for `aarch64-apple-ios`
+and `aarch64-apple-ios-sim` on every PR; this repo's mobile
+responsibility ends at that — link-closure validation against the ANGLE
++ Apple frameworks and runtime execution on-device belong to
+`mobile-sdk`, which binds to these crates via boltffi.
 
 **Image allocation on every tier declares CPU access.** `Tensor::image`
 / `ImageProcessor::create_image` take a required `CpuAccess`
@@ -235,8 +238,8 @@ driver and is prevented by the ownership structure in
 | Language | Probe | Map | Handle |
 |----------|-------|-----|--------|
 | Rust | `is_cuda_available() -> bool` | `Tensor::cuda_map() -> Option<CudaMap>` | `CudaMap` — `device_ptr()`, `len()` |
-| C | `hal_is_cuda_available()` | `hal_tensor_cuda_map()` → `hal_tensor_cuda_device_ptr()` → `hal_tensor_cuda_unmap()` | opaque handle |
-| Python | `edgefirst_hal.is_cuda_available()` | `Tensor.cuda_map() -> CudaMap | None` | context manager — `.device_ptr`, `.size` |
+| C | `ef_is_cuda_available()` | `ef_tensor_cuda_map()` → `ef_tensor_cuda_device_ptr()` → `ef_tensor_cuda_unmap()` | opaque handle |
+| Python | `edgefirst.tensor.is_cuda_available()` | `Tensor.cuda_map() -> CudaMap | None` | context manager — `.device_ptr`, `.size` |
 
 See [`crates/tensor/README.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/tensor/README.md#cuda-tensor-mapping)
 for usage snippets and
@@ -350,7 +353,7 @@ the mechanism differs.
 Complex multi-parameter constructors use a fluent builder:
 [`DecoderBuilder`](https://docs.rs/edgefirst-decoder/latest/edgefirst_decoder/struct.DecoderBuilder.html),
 [`ByteTrackBuilder`](https://docs.rs/edgefirst-tracker/latest/edgefirst_tracker/bytetrack/struct.ByteTrackBuilder.html),
-and the `hal_decoder_params` C struct. Builders enforce invariants in
+and the `ef_decoder_params` C struct. Builders enforce invariants in
 `.build()` rather than scattering checks across setters.
 
 ### 4. Zero-copy operations
@@ -421,8 +424,8 @@ DMA-BUF / SHM syscalls. `DecoderError` does not, because the decoder
 crate never opens files or fds — its inputs are already-loaded tensors
 and JSON/YAML configuration strings.
 
-The C API translates all errors into POSIX `errno` codes; see
-[`crates/capi/ARCHITECTURE.md`](https://github.com/EdgeFirstAI/hal/blob/main/crates/capi/ARCHITECTURE.md#error-convention).
+The C API translates all errors into POSIX `errno` codes; see each leaf's
+header (`edgefirst/tensor.h`, `codec.h`, `image.h`, `decoder.h`, `tracker.h`).
 
 ---
 
@@ -520,7 +523,8 @@ Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
 ┌─────────────────────────────────────────────────────────┐
 │                    Application Code                      │
 ├─────────────────────────────────────────────────────────┤
-│  edgefirst-hal (subscriber install, start/stop API)      │
+│  edgefirst-tensor::trace                                 │
+│  (subscriber install, start/stop API)                    │
 │  ├─ tracing-chrome (Chrome JSON writer)                  │
 │  └─ tracing-subscriber (subscriber registry)             │
 ├─────────────────────────────────────────────────────────┤
@@ -538,10 +542,12 @@ Each per-crate `ARCHITECTURE.md` documents the spans that crate emits.
   `tracing` as a **required** (non-optional) dependency. The span
   macros are always compiled. Cost when disabled: one `Relaxed` atomic
   load per span site.
-- **Umbrella crate** (`edgefirst-hal`) gates `tracing-chrome` and
+- **`edgefirst-tensor::trace`** gates `tracing-chrome` and
   `tracing-subscriber` behind the `tracing` feature (default on). These
   provide the capture infrastructure — the subscriber that actually
-  writes the Chrome JSON file.
+  writes the Chrome JSON file. It lived in the `edgefirst-hal` umbrella
+  crate until 0.29; with that crate deleted, the subscriber moved down to
+  the one crate every other crate already depends on.
 - **Binding crates** (Python, C API) forward the feature flag and
   provide language-appropriate start/stop APIs.
 
@@ -643,14 +649,21 @@ hal/
 │   ├── image/              # edgefirst-image
 │   ├── decoder/            # edgefirst-decoder
 │   ├── tracker/            # edgefirst-tracker
-│   ├── hal/                # edgefirst-hal (umbrella)
-│   ├── capi/               # edgefirst-hal-capi (C ABI)
-│   ├── python/             # edgefirst_hal (PyO3 bindings)
+│   ├── tensor-capi/        # libedgefirst_tensor (C ABI; workspace-excluded)
+│   ├── codec-capi/         # libedgefirst_codec
+│   ├── image-capi/         # libedgefirst_image
+│   ├── decoder-capi/       # libedgefirst_decoder
+│   ├── tracker-capi/       # libedgefirst_tracker
+│   ├── python-common/      # shared PyO3 binding code (rlib)
+│   ├── python-tensor/      # -> edgefirst.tensor   wheel
+│   ├── python-codec/       # -> edgefirst.codec    wheel
+│   ├── python-image/       # -> edgefirst.image    wheel
+│   ├── python-decoder/     # -> edgefirst.decoder  wheel
 │   ├── egl/                # edgefirst-egl (trimmed khronos-egl fork, dynamic load only)
 │   ├── gl/                 # edgefirst-gl (trimmed gls fork)
 │   ├── bench/              # edgefirst-bench (workspace dev-dep)
 │   └── gpu-probe/          # internal CLI for GPU capability probing
-├── tests/                  # Project-level Python tests (C integration tests live under crates/capi/tests/)
+├── tests/                  # Project-level Python tests (C tests live under crates/*-capi/tests/)
 ├── testdata/               # Git LFS-tracked fixtures (images, model outputs)
 ├── benchmarks/             # Per-platform benchmark JSON results
 ├── scripts/                # Build / audit / release tooling
@@ -679,7 +692,7 @@ rather than in any single per-crate doc.
 
 A DMA-BUF is exported from the kernel as a file descriptor. Many callers
 assume the same fd number means the same buffer and use fd as the cache
-key for imported tensors (`hal_import_image`, EGL image creation, etc.).
+key for imported tensors (`ef_tensor_builder_wrap`, EGL image creation, etc.).
 **This assumption is wrong** and leads to cache misses or incorrect
 hits.
 
@@ -721,7 +734,7 @@ ino_t inode = st.st_ino;
 `fstat` is a cheap syscall (microseconds), but it does run on **every
 buffer handoff** because the inode is the lookup key — it must be
 computed before the cache table is consulted. The cache lookup itself
-is a hash-table probe; only the import path (`hal_import_image`) is
+is a hash-table probe; only the import path (`ef_tensor_builder_wrap`) is
 skipped on hits. If the per-frame `fstat` is undesirable on a
 particular pipeline, layer an fd-to-inode memoization above the cache
 (invalidated whenever an fd is closed). For a typical 4–16 buffer
@@ -763,19 +776,62 @@ where the pipeline never fully warms up.
 ### EGL image cache inside HAL
 
 The image backend maintains an EGL image cache keyed by the
-**tensor's** `BufferIdentity.id` — not by the DMA-BUF fd. Every call
-to `hal_import_image()` / `hal_tensor_from_fd()` allocates a fresh
-`BufferIdentity`, so calling those functions repeatedly with the same
-fd produces a new key each time and misses the cache on every call.
-The cache only hits when the **same tensor object** is reused across
-frames.
+**tensor's** `BufferIdentity.id`, which is derived from the buffer's
+system key — a DMA-BUF's `(st_dev, st_ino)`, an `IOSurfaceID`. Two
+tensors built independently over one buffer therefore derive the *same*
+id, so a pipeline that re-imports its camera buffers every frame
+(`ef_tensor_builder_wrap()`, or a `convert()` that
+crosses a package boundary) keys onto the entry the previous frame
+created instead of missing on every call.
 
-This means the cache cannot rescue a pipeline that re-imports its
-camera buffers every frame: each import is a brand-new identity.
-HAL emits a "swept dead entry" log line when a tensor is dropped
-while its EGL image is still in the cache; a steady stream of these
-in a running pipeline is a sign that the calling code is churning
-tensors.
+Cache entries are deliberately **retained past the lifetime of the
+tensor that produced them**, because a re-imported tensor is
+constructed, used and dropped within the call: an entry tied to that
+tensor would be destroyed before the next frame could hit it. Retention
+is safe — and is what closes the key-reuse hazard — because the cached
+entry owns the platform import object (an `EGLImage`, an ANGLE
+IOSurface pbuffer), which holds its own driver-side reference to the
+buffer. The buffer therefore cannot be freed, and its system key cannot
+be recycled onto a different buffer, while an entry that names it
+lives. Entries leave only by LRU eviction.
+
+#### Sizing the cache
+
+Capacity comes from `ImageProcessorConfig::egl_cache_capacity`, then
+`EDGEFIRST_EGL_CACHE_CAPACITY`, then a default of 16 — config first so a
+stray environment variable in a deployment cannot override an embedder
+that measured its own pool.
+
+The bound is **per `ImageProcessor`, times three caches** (source,
+destination, and the NV R8 source cache) — not per process and not per
+library. Two `ImageProcessor`s in one process have six independent
+caches and six independent capacities.
+
+It is a buffer **count**, not a size, and because a retained import pins
+its buffer the memory it holds depends entirely on how big the caller's
+buffers are:
+
+```text
+worst-case pinned bytes
+    = capacity x 3 caches x frame size x live ImageProcessors
+
+capacity 16, 640x640 RGB   (1.2 MB)  ->   59 MB per processor
+capacity 16, 1080p NV12    (3.1 MB)  ->  149 MB per processor
+capacity 16, 4K NV12      (12.4 MB)  ->  597 MB per processor
+```
+
+Those are worst cases, and whether one is approached is up to the
+caller. A pooled producer — V4L2 capture, typically 4–8 buffers over one
+or two sizes — settles at its pool size and never nears the bound; a
+stream that allocates a fresh buffer per frame holds the last `capacity`
+of them outright. That is the difference between "16 is free" and "16 is
+597 MB". (The three-cache multiplier is an upper bound rather than an
+exact total: the source and NV R8 caches often hold two imports of the
+*same* buffer, and two entries naming one buffer pin it once.)
+
+Size from measurement, not guesswork: `CacheStats::peak_entries` reports
+the working set actually reached, and `CacheStats::evictions` says when
+the bound is costing re-imports — it should be zero in a steady state.
 
 ### Android: AHardwareBuffer identity and getId interning
 
@@ -798,10 +854,10 @@ for the intern-table mechanics.
 
 **The fix is at the calling layer** (the GStreamer / V4L2 / libcamera
 adaptor that hands buffers to the HAL): maintain a cache of
-`hal_tensor *` objects keyed by `(inode, offset)`, and never free them
+`ef_tensor *` objects keyed by `(inode, offset)`, and never free them
 between frames. Holding the tensor alive keeps its `BufferIdentity`
 stable, which keeps the in-HAL EGL image cache hitting. This ensures
-`hal_import_image` is called exactly once per unique DMA-BUF over the
+`ef_tensor_builder_wrap` is called exactly once per unique DMA-BUF over the
 lifetime of the pipeline.
 
 For the per-tensor `BufferIdentity` mechanism that the EGL cache uses
@@ -827,10 +883,10 @@ struct stat st;
 fstat(fd, &st);
 InputCacheKey key = { .inode = st.st_ino, .offset = offset };
 
-hal_tensor *tensor = g_hash_table_lookup(input_cache, &key);
+ef_tensor *tensor = g_hash_table_lookup(input_cache, &key);
 if (!tensor) {
     // First time seeing this buffer — import and cache
-    tensor = hal_import_image(processor, pd, chroma, /* ... */);
+    tensor = ef_tensor_builder_wrap(builder /* planes already set */);
     g_hash_table_insert(input_cache,
                         g_memdup2(&key, sizeof key),
                         tensor);

@@ -259,14 +259,14 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
         let dst_bytes = (dst_pitch * dst_h) as usize;
 
         // Allocate DMA tensors for src and dst
-        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::Dma), None) {
+        let src_tensor = match Tensor::<u8>::new(&[src_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: src DMA allocation failed: {e}");
                 continue;
             }
         };
-        let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::Dma), None) {
+        let dst_tensor = match Tensor::<u8>::new(&[dst_bytes], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: dst DMA allocation failed: {e}");

@@ -191,7 +191,7 @@ pub(super) trait GlPlatform {
         fmt: PackedImportFormat,
     ) -> crate::Result<Self::Import>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync;
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element;
 
     /// The `Copy` handle for a cached import.
     fn import_handle(import: &Self::Import) -> Self::ImportHandle;

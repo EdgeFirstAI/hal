@@ -35,6 +35,8 @@ pub enum UnsupportedFeature {
         /// The unsupported component count reported in the SOF marker.
         components: u8,
     },
+    /// PNG data was recognised but the `png` feature is disabled in this build.
+    PngNotEnabled,
     /// JPEG chroma subsampling configuration where a chroma component is
     /// sampled at a higher rate than luma along some axis (rejected so the
     /// downstream upsampler does not divide by zero).
@@ -63,6 +65,10 @@ impl fmt::Display for UnsupportedFeature {
                     "JPEG component count {components} (only 1 or 3 are supported)"
                 )
             }
+            Self::PngNotEnabled => write!(
+                f,
+                "PNG decoding is not enabled in this build (enable the `png` feature)"
+            ),
             Self::JpegChromaSubsampling => {
                 write!(f, "JPEG chroma subsampling that exceeds luma sampling rate")
             }
@@ -141,6 +147,7 @@ impl From<edgefirst_tensor::Error> for CodecError {
     }
 }
 
+#[cfg(feature = "png")]
 impl From<zune_png::error::PngDecodeErrors> for CodecError {
     fn from(e: zune_png::error::PngDecodeErrors) -> Self {
         Self::InvalidData(format!("PNG: {e}"))

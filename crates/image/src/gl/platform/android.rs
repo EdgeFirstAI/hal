@@ -445,7 +445,12 @@ impl GlPlatform for AndroidEgl {
     }
 
     unsafe fn attach_tex_image_2d(_display: &AndroidGlContext, handle: egl::Image) -> Result<()> {
-        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, handle.as_ptr());
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -466,10 +471,12 @@ impl GlPlatform for AndroidEgl {
         _display: &AndroidGlContext,
         handle: egl::Image,
     ) -> Result<()> {
-        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
-            edgefirst_gl::gl::RENDERBUFFER,
-            handle.as_ptr(),
-        );
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+                edgefirst_gl::gl::RENDERBUFFER,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -550,7 +557,7 @@ impl GlPlatform for AndroidEgl {
         _fmt: super::PackedImportFormat,
     ) -> Result<AndroidEglImage>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         let ptr = tensor_ahb_ptr(img)?;
         // The AHardwareBuffer is self-describing — the import cannot

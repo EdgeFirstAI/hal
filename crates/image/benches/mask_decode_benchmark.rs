@@ -34,10 +34,9 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_decoder::{
-    configs, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Nms, ProtoData, ProtoLayout,
-};
+use edgefirst_decoder::{configs, ConfigOutput, Decoder, DecoderBuilder, Nms};
 use edgefirst_image::CPUProcessor;
+use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout};
 use edgefirst_tensor::{Tensor, TensorDyn, TensorMapTrait, TensorTrait};
 
 use std::path::Path;
@@ -224,7 +223,9 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     } else {
         // Legacy f32 format.
         let coeff_f32: Vec<f32> = coeff_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let t = Tensor::<f32>::from_slice(&coeff_f32, &coeff_shape)
@@ -236,7 +237,9 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let boxes_view = st.tensor("boxes").map_err(|e| format!("boxes: {e}"))?;
     let boxes_bytes = boxes_view.data();
     let boxes_f32: Vec<f32> = boxes_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -244,7 +247,9 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
     let scores_view = st.tensor("scores").map_err(|e| format!("scores: {e}"))?;
     let scores_bytes = scores_view.data();
     let scores_f32: Vec<f32> = scores_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -256,7 +261,7 @@ fn load_from_safetensors(path: &Path) -> Result<(Vec<DetectBox>, ProtoData), Str
         let xmax = boxes_f32[i * 4 + 2];
         let ymax = boxes_f32[i * 4 + 3];
         detect.push(DetectBox {
-            bbox: edgefirst_decoder::BoundingBox::new(xmin, ymin, xmax, ymax),
+            bbox: edgefirst_tensor::BoundingBox::new(xmin, ymin, xmax, ymax),
             score: scores_f32[i],
             label: 0, // class doesn't affect mask decode
         });

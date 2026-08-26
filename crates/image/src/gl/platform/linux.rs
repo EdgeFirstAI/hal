@@ -83,7 +83,12 @@ impl GlPlatform for LinuxEgl {
     }
 
     unsafe fn attach_tex_image_2d(_display: &GlContext, handle: egl::Image) -> crate::Result<()> {
-        edgefirst_gl::gl::EGLImageTargetTexture2DOES(edgefirst_gl::gl::TEXTURE_2D, handle.as_ptr());
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetTexture2DOES(
+                edgefirst_gl::gl::TEXTURE_2D,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -102,10 +107,12 @@ impl GlPlatform for LinuxEgl {
         _display: &GlContext,
         handle: egl::Image,
     ) -> crate::Result<()> {
-        edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
-            edgefirst_gl::gl::RENDERBUFFER,
-            handle.as_ptr(),
-        );
+        unsafe {
+            edgefirst_gl::gl::EGLImageTargetRenderbufferStorageOES(
+                edgefirst_gl::gl::RENDERBUFFER,
+                handle.as_ptr(),
+            );
+        }
         Ok(())
     }
 
@@ -133,7 +140,7 @@ impl GlPlatform for LinuxEgl {
         fmt: super::PackedImportFormat,
     ) -> crate::Result<EglImage>
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         use std::os::fd::AsRawFd;
         let drm_format = match fmt {
@@ -141,10 +148,17 @@ impl GlPlatform for LinuxEgl {
             super::PackedImportFormat::Rgba16161616F => drm_fourcc::DrmFourcc::Abgr16161616f,
         };
         let bpp = fmt.bytes_per_pixel();
-        let dma = img.as_dma().ok_or_else(|| {
-            crate::Error::NotImplemented("import_buffer_packed requires DMA tensor".to_string())
-        })?;
-        let fd = dma.fd.as_raw_fd();
+        // `dmabuf()`, not `as_dma().fd` -- see `gl/dma_import.rs`'s own
+        // note: `as_dma` is `None` on the `dynamic` backend for every
+        // tensor, DMA-backed or not.
+        let fd = img
+            .dmabuf()
+            .map_err(|e| {
+                crate::Error::NotImplemented(format!(
+                    "import_buffer_packed requires DMA tensor ({e})"
+                ))
+            })?
+            .as_raw_fd();
 
         // Use the tensor's stored stride when available (externally
         // allocated buffers with row padding), otherwise compute the

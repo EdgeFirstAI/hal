@@ -133,7 +133,7 @@ impl TensorMem {
         match self {
             TensorMem::Auto => None,
             #[cfg(target_os = "linux")]
-            TensorMem::Dma => Some(TensorMemory::Dma),
+            TensorMem::Dma => Some(TensorMemory::DmaBuf),
             #[cfg(not(target_os = "linux"))]
             TensorMem::Dma => None,
             TensorMem::Mem => Some(TensorMemory::Mem),

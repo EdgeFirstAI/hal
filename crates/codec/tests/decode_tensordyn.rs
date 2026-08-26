@@ -83,6 +83,7 @@ fn decode_tensordyn_unsupported_dtype() {
     assert!(result.is_err());
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn decode_tensordyn_png_f32() {
     // PNG still supports wide dtypes; exercise the TensorDyn F32 PNG decode.
@@ -103,6 +104,7 @@ fn decode_tensordyn_png_f32() {
     assert_eq!(info.format, PixelFormat::Rgb);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn decode_tensordyn_png_i16() {
     let png = testdata("zidane.png");

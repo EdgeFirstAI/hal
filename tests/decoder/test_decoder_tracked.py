@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-import edgefirst_hal
+import edgefirst.decoder as ef
 import numpy as np
+from edgefirst.tracker import ActiveTrackInfo, ByteTrack, TrackInfo
 
 
 def _t(arr):
@@ -12,7 +13,7 @@ def _t(arr):
 
 
 def numpy_to_tensor(arr, mem=None):
-    import edgefirst_hal
+    import edgefirst.decoder as ef
 
     dtype_map = {
         "int8": "int8",
@@ -32,7 +33,7 @@ def numpy_to_tensor(arr, mem=None):
     if hal_dtype is None:
         raise ValueError(f"Unsupported numpy dtype: {arr.dtype}")
     arr = np.ascontiguousarray(arr)
-    tensor = edgefirst_hal.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
+    tensor = ef.Tensor(list(arr.shape), dtype=hal_dtype, mem=mem)
     with tensor.map() as m:
         dst = np.frombuffer(m, dtype=arr.dtype).reshape(arr.shape)
         np.copyto(dst, arr)
@@ -54,11 +55,12 @@ def test_tracker():
         )
     )
 
-    config = open("testdata/modelpack_split.yaml").read()
+    with open("testdata/modelpack_split.yaml") as fh:
+        config = fh.read()
     # default settings for tracker, but with 0.96 score threshold
-    tracker = edgefirst_hal.ByteTrack(high_conf=0.96)
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    tracker = ByteTrack(high_conf=0.96)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    _boxes, _scores, _classes, _masks, tracks = decoder.decode_tracked(
         tracker, 1000_000_000, [output0, output1]
     )
     tracks_from_tracker = tracker.get_active_tracks()
@@ -82,10 +84,11 @@ def test_external_tracker_update():
         )
     )
 
-    config = open("testdata/modelpack_split.yaml").read()
+    with open("testdata/modelpack_split.yaml") as fh:
+        config = fh.read()
     # default settings for tracker, but with 0.96 score threshold
-    tracker = edgefirst_hal.ByteTrack(high_conf=0.96)
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(high_conf=0.96)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     _, _, _, _, tracks = decoder.decode_tracked(
         tracker, 1000_000_000, [output0, output1]
     )
@@ -113,9 +116,10 @@ def test_yolo_seg():
     ).reshape(1, 160, 160, 32)
     output0 = _t(output0_np)
     output1 = _t(output1_np)
-    config = open("testdata/yolov8_seg.yaml").read()
-    tracker = edgefirst_hal.ByteTrack(high_conf=0.2)
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    with open("testdata/yolov8_seg.yaml") as fh:
+        config = fh.read()
+    tracker = ByteTrack(high_conf=0.2)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
     boxes, scores, classes, masks, tracks = decoder.decode_tracked(
         tracker, 100_000_000, [output0, output1]
     )
@@ -188,7 +192,7 @@ def test_new_track_info():
     """
     Test creating a new TrackInfo object and verify its fields are set correctly.
     """
-    track_info = edgefirst_hal.TrackInfo(
+    track_info = TrackInfo(
         uuid="123e4567e89b12d3a456426614174000",
         tracked_location=(0.1, 0.2, 0.3, 0.4),
         count=1,
@@ -203,16 +207,14 @@ def test_new_track_info():
 
 
 def test_new_active_track_info():
-    track_info = edgefirst_hal.TrackInfo(
+    track_info = TrackInfo(
         uuid="123e4567e89b12d3a456426614174000",
         tracked_location=(0.1, 0.2, 0.3, 0.4),
         count=1,
         created=100_000_000,
         last_updated=100_000_000,
     )
-    active_track_info = edgefirst_hal.ActiveTrackInfo(
-        track_info, (0.1, 0.2, 0.3, 0.4), 0.3, 2
-    )
+    active_track_info = ActiveTrackInfo(track_info, (0.1, 0.2, 0.3, 0.4), 0.3, 2)
     assert active_track_info.info.uuid == "123e4567-e89b-12d3-a456-426614174000"
     assert np.allclose(active_track_info.last_box[0], [0.1, 0.2, 0.3, 0.4], atol=1e-5)
     assert np.isclose(active_track_info.last_box[1], 0.3, atol=1e-5)
@@ -240,11 +242,11 @@ outputs:
    normalized: true
 """
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.25, 0.1)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.3)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.25, 0.1)
+    tracker = ByteTrack(update=0.1, high_conf=0.3)
 
     # First frame - establish tracks
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(output)]
     )
     assert len(boxes) == 2
@@ -273,7 +275,7 @@ outputs:
         )
 
         timestamp = 100_000_000 * i // 3
-        boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+        boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
             tracker, timestamp, [_t(out)]
         )
         assert len(boxes) == 2, f"Frame {i}: expected 2 boxes, got {len(boxes)}"
@@ -300,12 +302,13 @@ def test_tracker_segdet_no_detection_prediction():
     output1 = np.fromfile(
         "testdata/yolov8_protos_160x160x32.bin", dtype=np.uint8
     ).reshape(1, 160, 160, 32)
-    config = open("testdata/yolov8_seg.yaml").read()
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    with open("testdata/yolov8_seg.yaml") as fh:
+        config = fh.read()
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
 
     # First frame - establish tracks
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(output0), _t(output1)]
     )
     assert len(boxes) == 2
@@ -320,7 +323,7 @@ def test_tracker_segdet_no_detection_prediction():
     output0_cleared = output0.copy()
     output0_cleared[0, 4:84, :] = 0  # zero out scores
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(output0_cleared), _t(output1)]
     )
 
@@ -355,11 +358,11 @@ outputs:
 """
     quant_scale = 0.0040811873
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.25, 0.1)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.3)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.25, 0.1)
+    tracker = ByteTrack(update=0.1, high_conf=0.3)
 
     # First frame
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(output)]
     )
     assert len(boxes) == 2
@@ -373,10 +376,10 @@ outputs:
     for i in range(1, 101):
         out = output.copy()
         # Introduce linear movement into X coordinates
-        out[0, 0, :] += int(round(i * 1e-3 / quant_scale))
+        out[0, 0, :] += round(i * 1e-3 / quant_scale)
 
         timestamp = 100_000_000 * i // 3
-        boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+        boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
             tracker, timestamp, [_t(out)]
         )
         assert len(boxes) == 2, f"Frame {i}: expected 2 boxes, got {len(boxes)}"
@@ -396,7 +399,7 @@ outputs:
     output_cleared = output.copy()
     output_cleared[0, 4:, :] = -128  # minimum value for int8
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 * 101 // 3, [_t(output_cleared)]
     )
     # Tracker should still produce boxes from prediction
@@ -429,11 +432,11 @@ outputs:
     detect[0, 0, 4] = 0.9876  # score
     detect[0, 0, 5] = 2.0  # class
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
     # First frame with detection
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, scores, classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(detect)]
     )
     assert len(boxes) == 1
@@ -445,7 +448,7 @@ outputs:
     detect_cleared = detect.copy()
     detect_cleared[0, :, 4] = 0.0  # zero all scores
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, scores, classes, _masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(detect_cleared)]
     )
     # Tracker should predict forward
@@ -485,29 +488,29 @@ outputs:
     # Quantized: val = round(float_val / scale)
     scale = 2.0 / 255.0
     detect = np.zeros((1, 10, 38), dtype=np.uint8)
-    detect[0, 0, 0] = int(round(0.1234 / scale))  # xmin
-    detect[0, 0, 1] = int(round(0.1234 / scale))  # ymin
-    detect[0, 0, 2] = int(round(0.2345 / scale))  # xmax
-    detect[0, 0, 3] = int(round(0.2345 / scale))  # ymax
-    detect[0, 0, 4] = int(round(0.9876 / scale))  # score
-    detect[0, 0, 5] = int(round(2.0 / scale))  # class
+    detect[0, 0, 0] = round(0.1234 / scale)  # xmin
+    detect[0, 0, 1] = round(0.1234 / scale)  # ymin
+    detect[0, 0, 2] = round(0.2345 / scale)  # xmax
+    detect[0, 0, 3] = round(0.2345 / scale)  # ymax
+    detect[0, 0, 4] = round(0.9876 / scale)  # score
+    detect[0, 0, 5] = round(2.0 / scale)  # class
 
     protos = np.zeros((1, 160, 160, 32), dtype=np.uint8)
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
     # First frame
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(detect), _t(protos)]
     )
     assert len(boxes) == 1
 
     # Expected values after quantization roundtrip
-    expected_xmin = int(round(0.1234 / scale)) * scale
-    expected_ymin = int(round(0.1234 / scale)) * scale
-    expected_xmax = int(round(0.2345 / scale)) * scale
-    expected_ymax = int(round(0.2345 / scale)) * scale
+    expected_xmin = round(0.1234 / scale) * scale
+    expected_ymin = round(0.1234 / scale) * scale
+    expected_xmax = round(0.2345 / scale) * scale
+    expected_ymax = round(0.2345 / scale) * scale
     assert np.allclose(
         boxes[0],
         [expected_xmin, expected_ymin, expected_xmax, expected_ymax],
@@ -518,7 +521,7 @@ outputs:
     detect_cleared = detect.copy()
     detect_cleared[0, :, 4] = 0
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(detect_cleared), _t(protos)]
     )
     assert len(boxes) == 1
@@ -562,10 +565,10 @@ outputs:
 
     protos = np.zeros((1, 160, 160, 32), dtype=np.float32)
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(detect), _t(protos)]
     )
     assert len(boxes) == 1
@@ -575,7 +578,7 @@ outputs:
     detect_cleared = detect.copy()
     detect_cleared[0, :, 4] = 0.0
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 100_000_000 // 3, [_t(detect_cleared), _t(protos)]
     )
     assert len(boxes) == 1
@@ -636,34 +639,34 @@ outputs:
     scale = 2.0 / 255.0
 
     boxes_arr = np.zeros((1, 10, 4), dtype=np.uint8)
-    boxes_arr[0, 0, 0] = int(round(0.1234 / scale))
-    boxes_arr[0, 0, 1] = int(round(0.1234 / scale))
-    boxes_arr[0, 0, 2] = int(round(0.2345 / scale))
-    boxes_arr[0, 0, 3] = int(round(0.2345 / scale))
+    boxes_arr[0, 0, 0] = round(0.1234 / scale)
+    boxes_arr[0, 0, 1] = round(0.1234 / scale)
+    boxes_arr[0, 0, 2] = round(0.2345 / scale)
+    boxes_arr[0, 0, 3] = round(0.2345 / scale)
 
     scores_arr = np.zeros((1, 10, 1), dtype=np.uint8)
-    scores_arr[0, 0, 0] = int(round(0.9876 / scale))
+    scores_arr[0, 0, 0] = round(0.9876 / scale)
 
     classes_arr = np.zeros((1, 10, 1), dtype=np.uint8)
-    classes_arr[0, 0, 0] = int(round(2.0 / scale))
+    classes_arr[0, 0, 0] = round(2.0 / scale)
 
     mask_arr = np.zeros((1, 10, 32), dtype=np.uint8)
     protos_arr = np.zeros((1, 160, 160, 32), dtype=np.uint8)
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker,
         0,
         [_t(boxes_arr), _t(scores_arr), _t(classes_arr), _t(mask_arr), _t(protos_arr)],
     )
     assert len(boxes) == 1
 
-    expected_xmin = int(round(0.1234 / scale)) * scale
-    expected_ymin = int(round(0.1234 / scale)) * scale
-    expected_xmax = int(round(0.2345 / scale)) * scale
-    expected_ymax = int(round(0.2345 / scale)) * scale
+    expected_xmin = round(0.1234 / scale) * scale
+    expected_ymin = round(0.1234 / scale) * scale
+    expected_xmax = round(0.2345 / scale) * scale
+    expected_ymax = round(0.2345 / scale) * scale
     assert np.allclose(
         boxes[0],
         [expected_xmin, expected_ymin, expected_xmax, expected_ymax],
@@ -673,7 +676,7 @@ outputs:
     # Clear scores to simulate no detections
     scores_cleared = np.zeros_like(scores_arr)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker,
         100_000_000 // 3,
         [
@@ -750,10 +753,10 @@ outputs:
     mask_arr = np.zeros((1, 10, 32), dtype=np.float64)
     protos_arr = np.zeros((1, 160, 160, 32), dtype=np.float64)
 
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker,
         0,
         [_t(boxes_arr), _t(scores_arr), _t(classes_arr), _t(mask_arr), _t(protos_arr)],
@@ -764,7 +767,7 @@ outputs:
     # Clear scores to simulate no detections
     scores_cleared = np.zeros_like(scores_arr)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker,
         100_000_000 // 3,
         [
@@ -835,10 +838,10 @@ outputs:
     - [width, 160]
     - [num_protos, 32]
 """
-    decoder = edgefirst_hal.Decoder.new_from_yaml_str(config, 0.45, 0.45)
-    tracker = edgefirst_hal.ByteTrack(update=0.1, high_conf=0.7)
+    decoder = ef.Decoder.new_from_yaml_str(config, 0.45, 0.45)
+    tracker = ByteTrack(update=0.1, high_conf=0.7)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker, 0, [_t(boxes_data), _t(scores_data), _t(mask_data), _t(protos)]
     )
     assert len(boxes) == 2
@@ -851,7 +854,7 @@ outputs:
     # Clear scores to simulate no detections
     scores_cleared = np.zeros_like(scores_data)
 
-    boxes, scores, classes, masks, tracks = decoder.decode_tracked(
+    boxes, _scores, _classes, masks, _tracks = decoder.decode_tracked(
         tracker,
         100_000_000 // 3,
         [_t(boxes_data), _t(scores_cleared), _t(mask_data), _t(protos)],

@@ -46,61 +46,63 @@ unsafe fn column_max_update_neon(
     class_idx: u8,
     signed: bool,
 ) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let class_vec = vdupq_n_u8(class_idx);
-    let chunks = n / 16;
-    let remainder = n % 16;
+        let class_vec = vdupq_n_u8(class_idx);
+        let chunks = n / 16;
+        let remainder = n % 16;
 
-    if signed {
-        // Signed i8 comparison: interpret bytes as i8.
-        for chunk in 0..chunks {
-            let offset = chunk * 16;
-            let col = vld1q_s8(col_ptr.add(offset) as *const i8);
-            let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
-            // mask[i] = 0xFF where col[i] >= cur_max[i], else 0x00
-            let mask = vcgeq_s8(col, cur_max);
-            // new_max = max(col, cur_max)
-            let new_max = vmaxq_s8(col, cur_max);
-            vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
-            // Select class_idx where mask is set, keep old class otherwise.
-            let cur_class = vld1q_u8(class_ptr.add(offset));
-            let new_class = vbslq_u8(mask, class_vec, cur_class);
-            vst1q_u8(class_ptr.add(offset), new_class);
-        }
-        // Scalar tail.
-        for i in (chunks * 16)..n {
-            let val = *(col_ptr.add(i) as *const i8);
-            let cur = *(max_ptr.add(i) as *const i8);
-            if val >= cur {
-                *(max_ptr.add(i) as *mut i8) = val;
-                *class_ptr.add(i) = class_idx;
+        if signed {
+            // Signed i8 comparison: interpret bytes as i8.
+            for chunk in 0..chunks {
+                let offset = chunk * 16;
+                let col = vld1q_s8(col_ptr.add(offset) as *const i8);
+                let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
+                // mask[i] = 0xFF where col[i] >= cur_max[i], else 0x00
+                let mask = vcgeq_s8(col, cur_max);
+                // new_max = max(col, cur_max)
+                let new_max = vmaxq_s8(col, cur_max);
+                vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
+                // Select class_idx where mask is set, keep old class otherwise.
+                let cur_class = vld1q_u8(class_ptr.add(offset));
+                let new_class = vbslq_u8(mask, class_vec, cur_class);
+                vst1q_u8(class_ptr.add(offset), new_class);
+            }
+            // Scalar tail.
+            for i in (chunks * 16)..n {
+                let val = *(col_ptr.add(i) as *const i8);
+                let cur = *(max_ptr.add(i) as *const i8);
+                if val >= cur {
+                    *(max_ptr.add(i) as *mut i8) = val;
+                    *class_ptr.add(i) = class_idx;
+                }
+            }
+        } else {
+            // Unsigned u8 comparison.
+            for chunk in 0..chunks {
+                let offset = chunk * 16;
+                let col = vld1q_u8(col_ptr.add(offset));
+                let cur_max = vld1q_u8(max_ptr.add(offset));
+                let mask = vcgeq_u8(col, cur_max);
+                let new_max = vmaxq_u8(col, cur_max);
+                vst1q_u8(max_ptr.add(offset), new_max);
+                let cur_class = vld1q_u8(class_ptr.add(offset));
+                let new_class = vbslq_u8(mask, class_vec, cur_class);
+                vst1q_u8(class_ptr.add(offset), new_class);
+            }
+            // Scalar tail.
+            for i in (chunks * 16)..n {
+                let val = *col_ptr.add(i);
+                let cur = *max_ptr.add(i);
+                if val >= cur {
+                    *max_ptr.add(i) = val;
+                    *class_ptr.add(i) = class_idx;
+                }
             }
         }
-    } else {
-        // Unsigned u8 comparison.
-        for chunk in 0..chunks {
-            let offset = chunk * 16;
-            let col = vld1q_u8(col_ptr.add(offset));
-            let cur_max = vld1q_u8(max_ptr.add(offset));
-            let mask = vcgeq_u8(col, cur_max);
-            let new_max = vmaxq_u8(col, cur_max);
-            vst1q_u8(max_ptr.add(offset), new_max);
-            let cur_class = vld1q_u8(class_ptr.add(offset));
-            let new_class = vbslq_u8(mask, class_vec, cur_class);
-            vst1q_u8(class_ptr.add(offset), new_class);
-        }
-        // Scalar tail.
-        for i in (chunks * 16)..n {
-            let val = *col_ptr.add(i);
-            let cur = *max_ptr.add(i);
-            if val >= cur {
-                *max_ptr.add(i) = val;
-                *class_ptr.add(i) = class_idx;
-            }
-        }
+        let _ = remainder; // suppress unused warning
     }
-    let _ = remainder; // suppress unused warning
 }
 
 /// NEON-accelerated column max update with software prefetch for DMA-BUF.
@@ -125,66 +127,68 @@ unsafe fn column_max_update_neon_prefetch(
     class_idx: u8,
     signed: bool,
 ) {
-    use std::arch::aarch64::*;
+    unsafe {
+        use std::arch::aarch64::*;
 
-    const PREFETCH_AHEAD: usize = 128; // 2 cache lines on A55 (64B each)
+        const PREFETCH_AHEAD: usize = 128; // 2 cache lines on A55 (64B each)
 
-    let class_vec = vdupq_n_u8(class_idx);
-    let chunks = n / 16;
+        let class_vec = vdupq_n_u8(class_idx);
+        let chunks = n / 16;
 
-    if signed {
-        for chunk in 0..chunks {
-            let offset = chunk * 16;
-            // Software prefetch: hint the next read 2 cache lines ahead.
-            if offset + PREFETCH_AHEAD < n {
-                core::arch::asm!(
-                    "prfm pldl1strm, [{ptr}]",
-                    ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
-                    options(nostack, preserves_flags),
-                );
+        if signed {
+            for chunk in 0..chunks {
+                let offset = chunk * 16;
+                // Software prefetch: hint the next read 2 cache lines ahead.
+                if offset + PREFETCH_AHEAD < n {
+                    core::arch::asm!(
+                        "prfm pldl1strm, [{ptr}]",
+                        ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
+                        options(nostack, preserves_flags),
+                    );
+                }
+                let col = vld1q_s8(col_ptr.add(offset) as *const i8);
+                let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
+                let mask = vcgeq_s8(col, cur_max);
+                let new_max = vmaxq_s8(col, cur_max);
+                vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
+                let cur_class = vld1q_u8(class_ptr.add(offset));
+                let new_class = vbslq_u8(mask, class_vec, cur_class);
+                vst1q_u8(class_ptr.add(offset), new_class);
             }
-            let col = vld1q_s8(col_ptr.add(offset) as *const i8);
-            let cur_max = vld1q_s8(max_ptr.add(offset) as *const i8);
-            let mask = vcgeq_s8(col, cur_max);
-            let new_max = vmaxq_s8(col, cur_max);
-            vst1q_s8(max_ptr.add(offset) as *mut i8, new_max);
-            let cur_class = vld1q_u8(class_ptr.add(offset));
-            let new_class = vbslq_u8(mask, class_vec, cur_class);
-            vst1q_u8(class_ptr.add(offset), new_class);
-        }
-        for i in (chunks * 16)..n {
-            let val = *(col_ptr.add(i) as *const i8);
-            let cur = *(max_ptr.add(i) as *const i8);
-            if val >= cur {
-                *(max_ptr.add(i) as *mut i8) = val;
-                *class_ptr.add(i) = class_idx;
+            for i in (chunks * 16)..n {
+                let val = *(col_ptr.add(i) as *const i8);
+                let cur = *(max_ptr.add(i) as *const i8);
+                if val >= cur {
+                    *(max_ptr.add(i) as *mut i8) = val;
+                    *class_ptr.add(i) = class_idx;
+                }
             }
-        }
-    } else {
-        for chunk in 0..chunks {
-            let offset = chunk * 16;
-            if offset + PREFETCH_AHEAD < n {
-                core::arch::asm!(
-                    "prfm pldl1strm, [{ptr}]",
-                    ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
-                    options(nostack, preserves_flags),
-                );
+        } else {
+            for chunk in 0..chunks {
+                let offset = chunk * 16;
+                if offset + PREFETCH_AHEAD < n {
+                    core::arch::asm!(
+                        "prfm pldl1strm, [{ptr}]",
+                        ptr = in(reg) col_ptr.add(offset + PREFETCH_AHEAD),
+                        options(nostack, preserves_flags),
+                    );
+                }
+                let col = vld1q_u8(col_ptr.add(offset));
+                let cur_max = vld1q_u8(max_ptr.add(offset));
+                let mask = vcgeq_u8(col, cur_max);
+                let new_max = vmaxq_u8(col, cur_max);
+                vst1q_u8(max_ptr.add(offset), new_max);
+                let cur_class = vld1q_u8(class_ptr.add(offset));
+                let new_class = vbslq_u8(mask, class_vec, cur_class);
+                vst1q_u8(class_ptr.add(offset), new_class);
             }
-            let col = vld1q_u8(col_ptr.add(offset));
-            let cur_max = vld1q_u8(max_ptr.add(offset));
-            let mask = vcgeq_u8(col, cur_max);
-            let new_max = vmaxq_u8(col, cur_max);
-            vst1q_u8(max_ptr.add(offset), new_max);
-            let cur_class = vld1q_u8(class_ptr.add(offset));
-            let new_class = vbslq_u8(mask, class_vec, cur_class);
-            vst1q_u8(class_ptr.add(offset), new_class);
-        }
-        for i in (chunks * 16)..n {
-            let val = *col_ptr.add(i);
-            let cur = *max_ptr.add(i);
-            if val >= cur {
-                *max_ptr.add(i) = val;
-                *class_ptr.add(i) = class_idx;
+            for i in (chunks * 16)..n {
+                let val = *col_ptr.add(i);
+                let cur = *max_ptr.add(i);
+                if val >= cur {
+                    *max_ptr.add(i) = val;
+                    *class_ptr.add(i) = class_idx;
+                }
             }
         }
     }

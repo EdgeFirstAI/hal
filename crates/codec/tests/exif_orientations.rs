@@ -153,6 +153,7 @@ fn jpeg_exif_orientation_8() {
 // PNG — native RGB; dims are the unrotated source dims.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "png")]
 fn check_png_orientation(o: u32) {
     let data = testdata(&format!("zidane_exif_{o}.png"));
 
@@ -195,41 +196,49 @@ fn check_png_orientation(o: u32) {
     );
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_1() {
     check_png_orientation(1);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_2() {
     check_png_orientation(2);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_3() {
     check_png_orientation(3);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_4() {
     check_png_orientation(4);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_5() {
     check_png_orientation(5);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_6() {
     check_png_orientation(6);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_7() {
     check_png_orientation(7);
 }
 
+#[cfg(feature = "png")]
 #[test]
 fn png_exif_orientation_8() {
     check_png_orientation(8);

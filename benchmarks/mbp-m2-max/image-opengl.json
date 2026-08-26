@@ -1,0 +1,75 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 2090,
+      "mean_us": 1730,
+      "median_us": 1712,
+      "min_us": 1630,
+      "name": "load/mem/RGBA/jaguar",
+      "p95_us": 1908,
+      "p99_us": 2037
+    },
+    {
+      "iterations": 100,
+      "max_us": 1843,
+      "mean_us": 1771,
+      "median_us": 1771,
+      "min_us": 1718,
+      "name": "load/mem/RGBA/giraffe",
+      "p95_us": 1806,
+      "p99_us": 1830
+    },
+    {
+      "iterations": 100,
+      "max_us": 1503,
+      "mean_us": 1453,
+      "median_us": 1451,
+      "min_us": 1443,
+      "name": "load/mem/RGBA/zidane",
+      "p95_us": 1467,
+      "p99_us": 1478
+    },
+    {
+      "iterations": 100,
+      "max_us": 1538,
+      "mean_us": 1455,
+      "median_us": 1453,
+      "min_us": 1409,
+      "name": "load/mem/RGBA/zidane",
+      "p95_us": 1491,
+      "p99_us": 1526
+    },
+    {
+      "iterations": 100,
+      "max_us": 1515,
+      "mean_us": 1423,
+      "median_us": 1419,
+      "min_us": 1380,
+      "name": "load/mem/RGB/zidane",
+      "p95_us": 1451,
+      "p99_us": 1461
+    },
+    {
+      "iterations": 100,
+      "max_us": 1198,
+      "mean_us": 1156,
+      "median_us": 1152,
+      "min_us": 1149,
+      "name": "load/mem/GREY/zidane",
+      "p95_us": 1179,
+      "p99_us": 1198
+    },
+    {
+      "iterations": 100,
+      "max_us": 484,
+      "mean_us": 336,
+      "median_us": 290,
+      "min_us": 268,
+      "name": "convert/1080p/YUYV->RGBA",
+      "p95_us": 429,
+      "p99_us": 466
+    }
+  ],
+  "timestamp": "unix:1779645869"
+}

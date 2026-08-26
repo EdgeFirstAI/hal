@@ -380,7 +380,7 @@ fn alloc_buffers(f: &NvFormat, w: usize, h: usize, dst_aligned: bool) -> Result<
         w,
         h,
         f.fmt,
-        Some(TensorMemory::Dma),
+        Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .map_err(|e| format!("src alloc: {e}"))?;
@@ -404,7 +404,7 @@ fn alloc_buffers(f: &NvFormat, w: usize, h: usize, dst_aligned: bool) -> Result<
         dst_h,
         PixelFormat::Rgba,
         dst_stride,
-        Some(TensorMemory::Dma),
+        Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .map_err(|e| format!("dst alloc (stride {dst_stride}): {e}"))?;
@@ -689,7 +689,7 @@ fn run_odd_dst_case(ctx: &GpuContext, w: usize, h: usize, preserved: bool) -> Re
         h,
         PixelFormat::Rgba,
         stride,
-        Some(TensorMemory::Dma),
+        Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .map_err(|e| format!("dst alloc: {e}"))?;

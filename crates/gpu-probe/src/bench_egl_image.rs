@@ -29,7 +29,7 @@ pub fn run(ctx: &GpuContext) -> Vec<BenchResult> {
         let byte_count = (pitch * h) as usize;
 
         // Allocate a DMA tensor for this resolution.
-        let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None) {
+        let tensor = match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None) {
             Ok(t) => t,
             Err(e) => {
                 println!("  SKIP {label}: DMA allocation failed: {e}");

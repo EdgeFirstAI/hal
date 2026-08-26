@@ -23,12 +23,10 @@ mod common;
 
 use common::{run_bench, BenchSuite};
 
-use edgefirst_decoder::{
-    configs, ConfigOutput, Decoder, DecoderBuilder, DetectBox, Nms, ProtoData, ProtoLayout,
-    Segmentation,
-};
+use edgefirst_decoder::{configs, ConfigOutput, Decoder, DecoderBuilder, Nms};
 use edgefirst_image::{CPUProcessor, ImageProcessor, ImageProcessorTrait, MaskResolution};
 use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorTrait};
+use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 use half::f16;
 use ndarray::s;
 use std::sync::LazyLock;
@@ -221,7 +219,9 @@ fn materialize_segmentations(detect: &[DetectBox], proto_data: &ProtoData) -> Ve
                 ymin: y0 as f32 / proto_h as f32,
                 xmax: x1 as f32 / proto_w as f32,
                 ymax: y1 as f32 / proto_h as f32,
-                segmentation: mask,
+                segmentation: edgefirst_tensor::Tensor::from_arrayview3(mask.view())
+                    .unwrap()
+                    .into(),
             }
         })
         .collect()
@@ -916,7 +916,7 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
     {
         let t = dst.as_u8_mut().expect("u8 dst");
         let mut m = t.map().expect("map dst");
-        for px in m.as_mut_slice().chunks_exact_mut(4) {
+        for px in m.as_mut_slice().as_chunks_mut::<4>().0 {
             px[0] = 0x42;
             px[1] = 0x42;
             px[2] = 0x42;
@@ -995,7 +995,7 @@ fn run_diagnostic(proc: &mut ImageProcessor) {
     {
         let t = dst2.as_u8_mut().expect("u8 dst2");
         let mut m = t.map().expect("map dst2");
-        for px in m.as_mut_slice().chunks_exact_mut(4) {
+        for px in m.as_mut_slice().as_chunks_mut::<4>().0 {
             px[0] = 0x42;
             px[1] = 0x42;
             px[2] = 0x42;

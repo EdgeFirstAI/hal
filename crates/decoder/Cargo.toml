@@ -2,6 +2,7 @@
 name = "edgefirst-decoder"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "ML model output decoding for YOLO and ModelPack object detection and segmentation"
 homepage.workspace = true
@@ -12,14 +13,35 @@ keywords = ["yolo", "object-detection", "segmentation", "nms", "edge-ai"]
 categories = ["multimedia::images", "science", "algorithms"]
 documentation = "https://docs.rs/edgefirst-decoder"
 
+[lints]
+workspace = true
+
 [features]
+default = ["static"]
 #default = ["tracker"]
-tracker = ["dep:edgefirst-tracker"]
+tracker = ["dep:edgefirst-tracker", "edgefirst-tracker/tensor-boxes"]
+# Forwards to edgefirst-tensor's own `static` feature instead of hard-coding
+# `features = ["static"]` on the dependency line below, so
+# `--no-default-features --features edgefirst-tensor/dynamic` still reaches
+# a real dynamic-backend build rather than tripping the static+dynamic
+# mutex guard against this crate's own request.
+static = ["edgefirst-tensor/static"]
 
 [dependencies]
 argminmax = { workspace = true }
-edgefirst-tensor = { workspace = true }
-edgefirst-tracker = { workspace = true, optional = true }
+# `ndarray` here is what lets the decoder materialise its
+# ndarray-computed masks into the TensorDyn that
+# `edgefirst_tensor::Segmentation` carries. Always on -- unlike `static`, it
+# has nothing to do with which tensor backend is selected.
+edgefirst-tensor = { workspace = true, default-features = false, features = ["ndarray"] }
+edgefirst-decoder-abi = { workspace = true }
+# `default-features = false`: edgefirst-tracker's own default is `static`
+# (-> `edgefirst-tensor/static`). Left on, enabling this crate's `tracker`
+# feature would silently turn on `static` alongside whatever backend the
+# actual consumer selected -- invisible under `static` builds (where it
+# already matches), but a real static+dynamic compile_error! collision for
+# decoder-capi once it switches to `edgefirst-tensor/dynamic` (task 9).
+edgefirst-tracker = { workspace = true, optional = true, default-features = false }
 half = { workspace = true }
 log = { workspace = true }
 ndarray = { workspace = true }
@@ -43,6 +65,3 @@ zip = { workspace = true }
 [[bench]]
 name = "decoder_benchmark"
 harness = false
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

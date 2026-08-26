@@ -8,7 +8,6 @@
 //! [`ImageLoad::load_image`](crate::ImageLoad::load_image).
 
 use edgefirst_tensor::DType;
-use std::fmt;
 
 /// Marker trait for pixel element types supported by image decoding.
 ///
@@ -25,7 +24,16 @@ use std::fmt;
 /// | `i8` | `XOR 0x80` | `(>> 8) XOR 0x80` | unsigned-to-signed via sign-bit flip |
 /// | `i16` | `* 257 XOR 0x8000` | `XOR 0x8000` | unsigned-to-signed via sign-bit flip |
 /// | `f32` | `/ 255.0` | `/ 65535.0` | normalised to `[0.0, 1.0]` |
-pub trait ImagePixel: num_traits::Num + Clone + fmt::Debug + Send + Sync + 'static {
+///
+/// `edgefirst_tensor::Element` is a supertrait: under the `dynamic` tensor
+/// backend, `Tensor<T>`'s own constructors need `T::DTYPE` at compile time
+/// (there is no per-variant enum to allocate through instead), so any `T`
+/// this crate builds a `Tensor<T>` over must already be one of the eleven
+/// element types `Element` is sealed to. Every `ImagePixel` impl below is
+/// one of those types, so this costs nothing real -- it just makes the
+/// existing constraint visible at the trait level instead of failing much
+/// later at a `Tensor<T>` call site.
+pub trait ImagePixel: edgefirst_tensor::Element {
     /// Convert a `[0, 255]` byte value to this pixel type.
     fn from_u8(v: u8) -> Self;
 

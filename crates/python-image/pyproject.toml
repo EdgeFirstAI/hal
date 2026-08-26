@@ -1,0 +1,46 @@
+[project]
+name = "edgefirst-image"
+dynamic = ["version"]
+description = "High-performance image processing with hardware acceleration for edge AI"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["image-processing", "computer-vision", "gpu", "edge-ai", "nv12"]
+authors = [{name = "Au-Zone Technologies", email = "support@au-zone.com"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "numpy",
+    "edgefirst-tensor ~= 0.29.0",
+]
+
+[project.urls]
+Homepage = "https://edgefirst.ai"
+Repository = "https://github.com/EdgeFirstAI/hal"
+Documentation = "https://github.com/EdgeFirstAI/hal/blob/main/crates/python-image/README.md"
+Changelog = "https://github.com/EdgeFirstAI/hal/blob/main/CHANGELOG.md"
+Issues = "https://github.com/EdgeFirstAI/hal/issues"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = "edgefirst.image._image"
+python-source = "python"

@@ -27,7 +27,7 @@ pub fn run() -> Vec<BenchResult> {
         let name = format!("dma_alloc/{label}");
 
         // Verify DMA is available before benchmarking.
-        match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None) {
+        match Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None) {
             Ok(_) => {}
             Err(e) => {
                 println!("  SKIP {label}: DMA allocation failed: {e}");
@@ -36,7 +36,7 @@ pub fn run() -> Vec<BenchResult> {
         }
 
         let r = run_bench(&name, 5, 100, || {
-            let t = Tensor::<u8>::new(&[byte_count], Some(TensorMemory::Dma), None);
+            let t = Tensor::<u8>::new(&[byte_count], Some(TensorMemory::DmaBuf), None);
             black_box(&t);
         });
         r.print_summary();
@@ -45,7 +45,7 @@ pub fn run() -> Vec<BenchResult> {
 
     // 2. fstat on DMA-buf fd
     {
-        let tensor_result = Tensor::<u8>::new(&[1920 * 1080 * 4], Some(TensorMemory::Dma), None);
+        let tensor_result = Tensor::<u8>::new(&[1920 * 1080 * 4], Some(TensorMemory::DmaBuf), None);
         match tensor_result {
             Ok(tensor) => {
                 let owned_fd = tensor.clone_fd().unwrap();

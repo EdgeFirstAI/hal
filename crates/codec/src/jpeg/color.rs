@@ -688,7 +688,7 @@ mod tests {
     #[test]
     fn block16_sse41_matches_scalar() {
         if !is_x86_feature_detected!("sse4.1") {
-            eprintln!("skip: host has no sse4.1");
+            log::warn!("skip: host has no sse4.1");
             return;
         }
         let mut y0 = [0u8; 64];
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn block_neon_kernels_match_scalar() {
         if !std::arch::is_aarch64_feature_detected!("neon") {
-            eprintln!("skip: host has no neon");
+            log::warn!("skip: host has no neon");
             return;
         }
         let mut y0 = [0u8; 64];

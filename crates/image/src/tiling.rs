@@ -11,14 +11,14 @@
 //! no flush-to-edge/clip configurability.
 //!
 //! The per-tile detections produced downstream are lifted to full-frame
-//! coordinates and merged by [`edgefirst_decoder::tiling`]; the shared
+//! coordinates and merged by `edgefirst_decoder::tiling`; the shared
 //! [`TilePlacement`] is produced here and consumed there.
 
 use crate::{Crop, Fit, ImageProcessor, ImageProcessorTrait, Result};
 use crate::{Error, Flip, Rotation};
 use edgefirst_tensor::{CpuAccess, DType, PixelFormat, Region, TensorDyn, TensorMemory};
 
-pub use edgefirst_decoder::tiling::TilePlacement;
+pub use edgefirst_decoder_abi::TilePlacement;
 
 /// One tile's native-frame crop rectangle and its grid coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +224,7 @@ impl ImageProcessor {
     /// surplus evenly, so allocate from `len()` rather than estimating.
     ///
     /// The returned placements are consumed by
-    /// [`edgefirst_decoder::tiling`] to lift per-tile detections back to
+    /// `edgefirst_decoder::tiling` to lift per-tile detections back to
     /// full-frame coordinates.
     ///
     /// # Errors

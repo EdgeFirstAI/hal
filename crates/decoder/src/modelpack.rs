@@ -353,7 +353,7 @@ pub(crate) fn postprocess_modelpack_split_quant<T: AsPrimitive<f32>>(
         }
         for ((p, g), anchor) in p
             .chunks_exact(nc + 5)
-            .zip(grid.chunks_exact(2))
+            .zip(grid.as_chunks::<2>().0)
             .zip(anchors.iter().cycle())
         {
             let (x, y) = (p[0], p[1]);
@@ -444,7 +444,7 @@ pub(crate) fn postprocess_modelpack_split_float<T: AsPrimitive<f32>>(
         }
         for ((p, g), anchor) in p
             .chunks_exact(nc + 5)
-            .zip(grid.chunks_exact(2))
+            .zip(grid.as_chunks::<2>().0)
             .zip(anchors.iter().cycle())
         {
             let (x, y) = (p[0], p[1]);

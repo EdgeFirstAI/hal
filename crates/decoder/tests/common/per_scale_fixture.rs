@@ -297,7 +297,7 @@ impl<'a> Intermediates<'a> {
             return None;
         }
         let mut out = Vec::with_capacity(raw.bytes.len() / 4);
-        for chunk in raw.bytes.chunks_exact(4) {
+        for chunk in raw.bytes.as_chunks::<4>().0 {
             out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Some(out)
@@ -375,15 +375,15 @@ impl PerScaleFixture {
         let n = boxes_raw.shape.first().copied().unwrap_or(0);
 
         let mut boxes_data = Vec::with_capacity(n * 4);
-        for chunk in boxes_raw.bytes.chunks_exact(4) {
+        for chunk in boxes_raw.bytes.as_chunks::<4>().0 {
             boxes_data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         let mut scores_data = Vec::with_capacity(n);
-        for chunk in scores_raw.bytes.chunks_exact(4) {
+        for chunk in scores_raw.bytes.as_chunks::<4>().0 {
             scores_data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         let mut classes_data = Vec::with_capacity(n);
-        for chunk in classes_raw.bytes.chunks_exact(4) {
+        for chunk in classes_raw.bytes.as_chunks::<4>().0 {
             classes_data.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
@@ -470,7 +470,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
             .into(),
         RawDtype::I16 => {
             let mut v: Vec<i16> = Vec::with_capacity(raw.bytes.len() / 2);
-            for c in raw.bytes.chunks_exact(2) {
+            for c in raw.bytes.as_chunks::<2>().0 {
                 v.push(i16::from_le_bytes([c[0], c[1]]));
             }
             Tensor::<i16>::from_slice(&v, &shape)
@@ -479,7 +479,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
         RawDtype::U16 => {
             let mut v: Vec<u16> = Vec::with_capacity(raw.bytes.len() / 2);
-            for c in raw.bytes.chunks_exact(2) {
+            for c in raw.bytes.as_chunks::<2>().0 {
                 v.push(u16::from_le_bytes([c[0], c[1]]));
             }
             Tensor::<u16>::from_slice(&v, &shape)
@@ -488,7 +488,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
         RawDtype::I32 => {
             let mut v: Vec<i32> = Vec::with_capacity(raw.bytes.len() / 4);
-            for c in raw.bytes.chunks_exact(4) {
+            for c in raw.bytes.as_chunks::<4>().0 {
                 v.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             Tensor::<i32>::from_slice(&v, &shape)
@@ -497,7 +497,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
         RawDtype::U32 => {
             let mut v: Vec<u32> = Vec::with_capacity(raw.bytes.len() / 4);
-            for c in raw.bytes.chunks_exact(4) {
+            for c in raw.bytes.as_chunks::<4>().0 {
                 v.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             Tensor::<u32>::from_slice(&v, &shape)
@@ -506,7 +506,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
         RawDtype::F16 => {
             let mut v: Vec<half::f16> = Vec::with_capacity(raw.bytes.len() / 2);
-            for c in raw.bytes.chunks_exact(2) {
+            for c in raw.bytes.as_chunks::<2>().0 {
                 v.push(half::f16::from_le_bytes([c[0], c[1]]));
             }
             Tensor::<half::f16>::from_slice(&v, &shape)
@@ -515,7 +515,7 @@ fn build_one_tensor(raw: &RawTensor, qp: Option<&QuantParams>) -> Result<TensorD
         }
         RawDtype::F32 => {
             let mut v: Vec<f32> = Vec::with_capacity(raw.bytes.len() / 4);
-            for c in raw.bytes.chunks_exact(4) {
+            for c in raw.bytes.as_chunks::<4>().0 {
                 v.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
             Tensor::<f32>::from_slice(&v, &shape)

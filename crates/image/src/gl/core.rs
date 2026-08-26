@@ -19,30 +19,32 @@ use std::ffi::CString;
 /// # Safety
 /// Requires a current GL context.
 unsafe fn compile_shader(kind: u32, src: &str) -> crate::Result<u32> {
-    let shader = edgefirst_gl::gl::CreateShader(kind);
-    let c = CString::new(src).map_err(|e| Error::OpenGl(format!("shader CString: {e}")))?;
-    let ptr = c.as_ptr();
-    let len = src.len() as i32;
-    edgefirst_gl::gl::ShaderSource(shader, 1, &ptr, &len);
-    edgefirst_gl::gl::CompileShader(shader);
-    let mut ok = 0i32;
-    edgefirst_gl::gl::GetShaderiv(shader, edgefirst_gl::gl::COMPILE_STATUS, &mut ok);
-    if ok == 0 {
-        let mut log = [0u8; 4096];
-        let mut log_len = 0i32;
-        edgefirst_gl::gl::GetShaderInfoLog(
-            shader,
-            log.len() as i32,
-            &mut log_len,
-            log.as_mut_ptr() as *mut _,
-        );
-        let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
-        edgefirst_gl::gl::DeleteShader(shader);
-        return Err(Error::OpenGl(format!(
-            "shader compile failed (kind=0x{kind:x}): {msg}"
-        )));
+    unsafe {
+        let shader = edgefirst_gl::gl::CreateShader(kind);
+        let c = CString::new(src).map_err(|e| Error::OpenGl(format!("shader CString: {e}")))?;
+        let ptr = c.as_ptr();
+        let len = src.len() as i32;
+        edgefirst_gl::gl::ShaderSource(shader, 1, &ptr, &len);
+        edgefirst_gl::gl::CompileShader(shader);
+        let mut ok = 0i32;
+        edgefirst_gl::gl::GetShaderiv(shader, edgefirst_gl::gl::COMPILE_STATUS, &mut ok);
+        if ok == 0 {
+            let mut log = [0u8; 4096];
+            let mut log_len = 0i32;
+            edgefirst_gl::gl::GetShaderInfoLog(
+                shader,
+                log.len() as i32,
+                &mut log_len,
+                log.as_mut_ptr() as *mut _,
+            );
+            let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
+            edgefirst_gl::gl::DeleteShader(shader);
+            return Err(Error::OpenGl(format!(
+                "shader compile failed (kind=0x{kind:x}): {msg}"
+            )));
+        }
+        Ok(shader)
     }
-    Ok(shader)
 }
 
 /// Compile + link a vertex/fragment program from source; returns the program id.
@@ -55,63 +57,65 @@ unsafe fn compile_shader(kind: u32, src: &str) -> crate::Result<u32> {
 /// # Safety
 /// Requires a current GL context.
 pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> crate::Result<u32> {
-    let vs = compile_shader(edgefirst_gl::gl::VERTEX_SHADER, vertex_src)?;
-    // Own `vs`/`fs`/`program` so any early return cleans them up.
-    struct ProgramBuild {
-        vs: Option<u32>,
-        fs: Option<u32>,
-        program: Option<u32>,
-    }
-    impl Drop for ProgramBuild {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(p) = self.program {
-                    edgefirst_gl::gl::DeleteProgram(p);
-                }
-                if let Some(s) = self.fs {
-                    edgefirst_gl::gl::DeleteShader(s);
-                }
-                if let Some(s) = self.vs {
-                    edgefirst_gl::gl::DeleteShader(s);
+    unsafe {
+        let vs = compile_shader(edgefirst_gl::gl::VERTEX_SHADER, vertex_src)?;
+        // Own `vs`/`fs`/`program` so any early return cleans them up.
+        struct ProgramBuild {
+            vs: Option<u32>,
+            fs: Option<u32>,
+            program: Option<u32>,
+        }
+        impl Drop for ProgramBuild {
+            fn drop(&mut self) {
+                unsafe {
+                    if let Some(p) = self.program {
+                        edgefirst_gl::gl::DeleteProgram(p);
+                    }
+                    if let Some(s) = self.fs {
+                        edgefirst_gl::gl::DeleteShader(s);
+                    }
+                    if let Some(s) = self.vs {
+                        edgefirst_gl::gl::DeleteShader(s);
+                    }
                 }
             }
         }
+        let mut state = ProgramBuild {
+            vs: Some(vs),
+            fs: None,
+            program: None,
+        };
+
+        let fs = compile_shader(edgefirst_gl::gl::FRAGMENT_SHADER, fragment_src)?;
+        state.fs = Some(fs);
+
+        let program = edgefirst_gl::gl::CreateProgram();
+        state.program = Some(program);
+        edgefirst_gl::gl::AttachShader(program, vs);
+        edgefirst_gl::gl::AttachShader(program, fs);
+        edgefirst_gl::gl::LinkProgram(program);
+        let mut ok = 0i32;
+        edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::LINK_STATUS, &mut ok);
+        if ok == 0 {
+            let mut log = [0u8; 4096];
+            let mut log_len = 0i32;
+            edgefirst_gl::gl::GetProgramInfoLog(
+                program,
+                log.len() as i32,
+                &mut log_len,
+                log.as_mut_ptr() as *mut _,
+            );
+            let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
+            return Err(Error::OpenGl(format!("program link failed: {msg}")));
+        }
+
+        // Success: detach + delete shaders, disarm cleanup, return the program.
+        edgefirst_gl::gl::DeleteShader(state.vs.take().unwrap());
+        edgefirst_gl::gl::DeleteShader(state.fs.take().unwrap());
+        let program = state.program.take().unwrap();
+        std::mem::forget(state);
+        Ok(program)
     }
-    let mut state = ProgramBuild {
-        vs: Some(vs),
-        fs: None,
-        program: None,
-    };
-
-    let fs = compile_shader(edgefirst_gl::gl::FRAGMENT_SHADER, fragment_src)?;
-    state.fs = Some(fs);
-
-    let program = edgefirst_gl::gl::CreateProgram();
-    state.program = Some(program);
-    edgefirst_gl::gl::AttachShader(program, vs);
-    edgefirst_gl::gl::AttachShader(program, fs);
-    edgefirst_gl::gl::LinkProgram(program);
-    let mut ok = 0i32;
-    edgefirst_gl::gl::GetProgramiv(program, edgefirst_gl::gl::LINK_STATUS, &mut ok);
-    if ok == 0 {
-        let mut log = [0u8; 4096];
-        let mut log_len = 0i32;
-        edgefirst_gl::gl::GetProgramInfoLog(
-            program,
-            log.len() as i32,
-            &mut log_len,
-            log.as_mut_ptr() as *mut _,
-        );
-        let msg = String::from_utf8_lossy(&log[..log_len.max(0) as usize]).into_owned();
-        return Err(Error::OpenGl(format!("program link failed: {msg}")));
-    }
-
-    // Success: detach + delete shaders, disarm cleanup, return the program.
-    edgefirst_gl::gl::DeleteShader(state.vs.take().unwrap());
-    edgefirst_gl::gl::DeleteShader(state.fs.take().unwrap());
-    let program = state.program.take().unwrap();
-    std::mem::forget(state);
-    Ok(program)
 }
 
 /// Set `MIN`/`MAG` filtering on the currently-bound texture of `target`.
@@ -123,8 +127,18 @@ pub(super) unsafe fn compile_program(vertex_src: &str, fragment_src: &str) -> cr
 /// # Safety
 /// Requires a current GL context and a bound texture on `target`.
 pub(super) unsafe fn set_tex_filter(target: u32, filter: u32) {
-    edgefirst_gl::gl::TexParameteri(target, edgefirst_gl::gl::TEXTURE_MIN_FILTER, filter as i32);
-    edgefirst_gl::gl::TexParameteri(target, edgefirst_gl::gl::TEXTURE_MAG_FILTER, filter as i32);
+    unsafe {
+        edgefirst_gl::gl::TexParameteri(
+            target,
+            edgefirst_gl::gl::TEXTURE_MIN_FILTER,
+            filter as i32,
+        );
+        edgefirst_gl::gl::TexParameteri(
+            target,
+            edgefirst_gl::gl::TEXTURE_MAG_FILTER,
+            filter as i32,
+        );
+    }
 }
 
 /// Set `MIN`/`MAG` filtering and `CLAMP_TO_EDGE` `WRAP_S`/`WRAP_T` on the
@@ -133,17 +147,19 @@ pub(super) unsafe fn set_tex_filter(target: u32, filter: u32) {
 /// # Safety
 /// Requires a current GL context and a bound texture on `target`.
 pub(super) unsafe fn set_tex_filter_clamp(target: u32, filter: u32) {
-    set_tex_filter(target, filter);
-    edgefirst_gl::gl::TexParameteri(
-        target,
-        edgefirst_gl::gl::TEXTURE_WRAP_S,
-        edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
-    );
-    edgefirst_gl::gl::TexParameteri(
-        target,
-        edgefirst_gl::gl::TEXTURE_WRAP_T,
-        edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
-    );
+    unsafe {
+        set_tex_filter(target, filter);
+        edgefirst_gl::gl::TexParameteri(
+            target,
+            edgefirst_gl::gl::TEXTURE_WRAP_S,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
+        );
+        edgefirst_gl::gl::TexParameteri(
+            target,
+            edgefirst_gl::gl::TEXTURE_WRAP_T,
+            edgefirst_gl::gl::CLAMP_TO_EDGE as i32,
+        );
+    }
 }
 
 /// Check that the currently-bound draw framebuffer is complete.
@@ -155,11 +171,13 @@ pub(super) unsafe fn set_tex_filter_clamp(target: u32, filter: u32) {
 /// # Safety
 /// Requires a current GL context with a framebuffer bound to `FRAMEBUFFER`.
 pub(super) unsafe fn check_framebuffer_complete() -> Result<(), u32> {
-    let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
-    if status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
-        Ok(())
-    } else {
-        Err(status)
+    unsafe {
+        let status = edgefirst_gl::gl::CheckFramebufferStatus(edgefirst_gl::gl::FRAMEBUFFER);
+        if status == edgefirst_gl::gl::FRAMEBUFFER_COMPLETE {
+            Ok(())
+        } else {
+            Err(status)
+        }
     }
 }
 

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
+# SPDX-License-Identifier: Apache-2.0
+#
+# Headers-only. There is no libedgefirst_detect.so. This file exists so
+# `image.h` and `decoder.h` can declare where `edgefirst/detect.h` comes from
+# (`Requires.private: edgefirst-decoder-abi`) instead of relying on every
+# header happening to land in the same includedir.
+
+# RELOCATABLE -- see the sibling edgefirst-*.pc.in files.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: edgefirst-decoder-abi
+Description: EdgeFirst detection vocabulary (header-only)
+Version: @VERSION@
+Cflags: -I${includedir}

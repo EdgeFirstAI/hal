@@ -2,5 +2,13 @@
     "sonarlint.connectedMode.project": {
         "connectionId": "edgefirstai",
         "projectKey": "EdgeFirstAI_hal"
-    }
+    },
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+        "crates/tensor-capi/Cargo.toml",
+        "crates/image-capi/Cargo.toml",
+        "crates/codec-capi/Cargo.toml",
+        "crates/decoder-capi/Cargo.toml",
+        "crates/tracker-capi/Cargo.toml"
+    ]
 }

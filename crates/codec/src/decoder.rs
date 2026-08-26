@@ -4,9 +4,11 @@
 //! [`ImageDecoder`] — reusable decoder state for zero-allocation hot loops.
 
 use crate::error::CodecError;
+#[cfg(not(feature = "png"))]
+use crate::error::UnsupportedFeature;
 use crate::options::ImageInfo;
 use crate::pixel::ImagePixel;
-use edgefirst_tensor::{Tensor, TensorDyn};
+use edgefirst_tensor::{DType, Tensor, TensorDyn};
 use std::io::Read;
 
 /// IDCT accuracy/speed selection for the software JPEG decoder.
@@ -169,7 +171,16 @@ impl ImageDecoder {
         if is_jpeg(data) {
             crate::jpeg::decode_jpeg_into(data, dst, &mut self.jpeg_state)
         } else if is_png(data) {
-            crate::png::decode_png_into(data, dst, &mut self.scratch)
+            {
+                #[cfg(feature = "png")]
+                {
+                    crate::png::decode_png_into(data, dst, &mut self.scratch)
+                }
+                #[cfg(not(feature = "png"))]
+                {
+                    Err(CodecError::Unsupported(UnsupportedFeature::PngNotEnabled))
+                }
+            }
         } else {
             Err(CodecError::InvalidData(
                 "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -183,13 +194,13 @@ impl ImageDecoder {
         data: &[u8],
         dst: &mut TensorDyn,
     ) -> crate::Result<ImageInfo> {
-        match dst {
-            TensorDyn::U8(t) => self.decode_into(data, t),
-            TensorDyn::I8(t) => self.decode_into(data, t),
-            TensorDyn::U16(t) => self.decode_into(data, t),
-            TensorDyn::I16(t) => self.decode_into(data, t),
-            TensorDyn::F32(t) => self.decode_into(data, t),
-            other => Err(CodecError::UnsupportedDtype(other.dtype())),
+        match dst.dtype() {
+            DType::U8 => self.decode_into(data, dst.as_typed_mut::<u8>().expect("dtype checked")),
+            DType::I8 => self.decode_into(data, dst.as_typed_mut::<i8>().expect("dtype checked")),
+            DType::U16 => self.decode_into(data, dst.as_typed_mut::<u16>().expect("dtype checked")),
+            DType::I16 => self.decode_into(data, dst.as_typed_mut::<i16>().expect("dtype checked")),
+            DType::F32 => self.decode_into(data, dst.as_typed_mut::<f32>().expect("dtype checked")),
+            other => Err(CodecError::UnsupportedDtype(other)),
         }
     }
 
@@ -240,7 +251,17 @@ pub(crate) fn decode_into_inner<T: ImagePixel>(
     if is_jpeg(data) {
         crate::jpeg::decode_jpeg_into(data, dst, jpeg_state)
     } else if is_png(data) {
-        crate::png::decode_png_into(data, dst, scratch)
+        {
+            #[cfg(feature = "png")]
+            {
+                crate::png::decode_png_into(data, dst, scratch)
+            }
+            #[cfg(not(feature = "png"))]
+            {
+                let _ = scratch;
+                Err(CodecError::Unsupported(UnsupportedFeature::PngNotEnabled))
+            }
+        }
     } else {
         Err(CodecError::InvalidData(
             "unrecognized image format (expected JPEG or PNG magic bytes)".into(),
@@ -254,13 +275,38 @@ pub(crate) fn decode_into_inner_dyn(
     data: &[u8],
     dst: &mut TensorDyn,
 ) -> crate::Result<ImageInfo> {
-    match dst {
-        TensorDyn::U8(t) => decode_into_inner(jpeg_state, scratch, data, t),
-        TensorDyn::I8(t) => decode_into_inner(jpeg_state, scratch, data, t),
-        TensorDyn::U16(t) => decode_into_inner(jpeg_state, scratch, data, t),
-        TensorDyn::I16(t) => decode_into_inner(jpeg_state, scratch, data, t),
-        TensorDyn::F32(t) => decode_into_inner(jpeg_state, scratch, data, t),
-        other => Err(CodecError::UnsupportedDtype(other.dtype())),
+    match dst.dtype() {
+        DType::U8 => decode_into_inner(
+            jpeg_state,
+            scratch,
+            data,
+            dst.as_typed_mut::<u8>().expect("dtype checked"),
+        ),
+        DType::I8 => decode_into_inner(
+            jpeg_state,
+            scratch,
+            data,
+            dst.as_typed_mut::<i8>().expect("dtype checked"),
+        ),
+        DType::U16 => decode_into_inner(
+            jpeg_state,
+            scratch,
+            data,
+            dst.as_typed_mut::<u16>().expect("dtype checked"),
+        ),
+        DType::I16 => decode_into_inner(
+            jpeg_state,
+            scratch,
+            data,
+            dst.as_typed_mut::<i16>().expect("dtype checked"),
+        ),
+        DType::F32 => decode_into_inner(
+            jpeg_state,
+            scratch,
+            data,
+            dst.as_typed_mut::<f32>().expect("dtype checked"),
+        ),
+        other => Err(CodecError::UnsupportedDtype(other)),
     }
 }
 
@@ -291,7 +337,16 @@ pub fn peek_info(data: &[u8]) -> crate::Result<ImageInfo> {
     if is_jpeg(data) {
         crate::jpeg::peek_jpeg_info(data)
     } else if is_png(data) {
-        crate::png::peek_png_info(data)
+        {
+            #[cfg(feature = "png")]
+            {
+                crate::png::peek_png_info(data)
+            }
+            #[cfg(not(feature = "png"))]
+            {
+                Err(CodecError::Unsupported(UnsupportedFeature::PngNotEnabled))
+            }
+        }
     } else {
         Err(CodecError::InvalidData(
             "unrecognized image format (expected JPEG or PNG magic bytes)".into(),

@@ -1144,7 +1144,7 @@ pub(crate) fn impl_yolo_split_segdet_process_masks<
             ymin: roi.ymin,
             xmax: roi.xmax,
             ymax: roi.ymax,
-            segmentation: m,
+            segmentation: crate::mask_to_tensor(m.view())?,
         });
     }
     Ok(())
@@ -1253,7 +1253,7 @@ pub(crate) fn impl_yolo_split_segdet_quant_process_masks<
             ymin: roi.ymin,
             xmax: roi.xmax,
             ymax: roi.ymax,
-            segmentation: m,
+            segmentation: crate::mask_to_tensor(m.view())?,
         });
     }
     Ok(())
@@ -1649,8 +1649,8 @@ pub(crate) fn extract_proto_data_quant<
             .with_quantization(tensor_quant)
             .expect("per-tensor quantization on protos tensor");
         return ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_tensor),
-            protos: TensorDyn::I8(protos_tensor),
+            mask_coefficients: coeff_tensor.into(),
+            protos: protos_tensor.into(),
             layout: proto_layout,
         };
     }
@@ -1686,7 +1686,7 @@ pub(crate) fn extract_proto_data_quant<
         let coeff_tensor = coeff_tensor
             .with_quantization(coeff_quant)
             .expect("per-tensor quantization on mask coefficients");
-        TensorDyn::I8(coeff_tensor)
+        coeff_tensor.into()
     } else if std::any::TypeId::of::<MASK>() == std::any::TypeId::of::<i16>() {
         // i16 path: preserve natively for the fast i16×i8→i32 integer kernel.
         // f32 has 24-bit mantissa, so all i16 values are exactly representable.
@@ -1713,7 +1713,7 @@ pub(crate) fn extract_proto_data_quant<
         let coeff_tensor = coeff_tensor
             .with_quantization(coeff_quant)
             .expect("per-tensor quantization on mask coefficients");
-        TensorDyn::I16(coeff_tensor)
+        coeff_tensor.into()
     } else {
         // Other types (u8, u16, etc.): dequantize to f32 to avoid lossy truncation.
         let scale = quant_masks.scale;
@@ -1736,7 +1736,7 @@ pub(crate) fn extract_proto_data_quant<
                 .expect("mapping mask_coefficients tensor");
             m.as_mut_slice().copy_from_slice(&coeff_f32);
         }
-        TensorDyn::F32(coeff_tensor)
+        coeff_tensor.into()
     };
 
     // Keep protos in raw i8 — consumers dequantize via protos.quantization().
@@ -1809,7 +1809,7 @@ pub(crate) fn extract_proto_data_quant<
 
     ProtoData {
         mask_coefficients,
-        protos: TensorDyn::I8(protos_tensor),
+        protos: protos_tensor.into(),
         layout: proto_layout,
     }
 }
@@ -1843,13 +1843,12 @@ impl FloatProtoElem for f32 {
         values: &[f32],
         shape: &[usize],
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        edgefirst_tensor::Tensor::<f32>::from_slice(values, shape)
-            .map(edgefirst_tensor::TensorDyn::F32)
+        edgefirst_tensor::Tensor::<f32>::from_slice(values, shape).map(Into::into)
     }
     fn arrayview3_into_tensor_dyn(
         view: ArrayView3<'_, f32>,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        edgefirst_tensor::Tensor::<f32>::from_arrayview3(view).map(edgefirst_tensor::TensorDyn::F32)
+        edgefirst_tensor::Tensor::<f32>::from_arrayview3(view).map(Into::into)
     }
 }
 
@@ -1858,14 +1857,12 @@ impl FloatProtoElem for half::f16 {
         values: &[half::f16],
         shape: &[usize],
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        edgefirst_tensor::Tensor::<half::f16>::from_slice(values, shape)
-            .map(edgefirst_tensor::TensorDyn::F16)
+        edgefirst_tensor::Tensor::<half::f16>::from_slice(values, shape).map(Into::into)
     }
     fn arrayview3_into_tensor_dyn(
         view: ArrayView3<'_, half::f16>,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
-        edgefirst_tensor::Tensor::<half::f16>::from_arrayview3(view)
-            .map(edgefirst_tensor::TensorDyn::F16)
+        edgefirst_tensor::Tensor::<half::f16>::from_arrayview3(view).map(Into::into)
     }
 }
 
@@ -1876,15 +1873,13 @@ impl FloatProtoElem for f64 {
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
         // Narrow to f32 — no native f64 kernel path.
         let narrowed: Vec<f32> = values.iter().map(|&v| v as f32).collect();
-        edgefirst_tensor::Tensor::<f32>::from_slice(&narrowed, shape)
-            .map(edgefirst_tensor::TensorDyn::F32)
+        edgefirst_tensor::Tensor::<f32>::from_slice(&narrowed, shape).map(Into::into)
     }
     fn arrayview3_into_tensor_dyn(
         view: ArrayView3<'_, f64>,
     ) -> edgefirst_tensor::Result<edgefirst_tensor::TensorDyn> {
         let narrowed: ndarray::Array3<f32> = view.mapv(|v| v as f32);
-        edgefirst_tensor::Tensor::<f32>::from_arrayview3(narrowed.view())
-            .map(edgefirst_tensor::TensorDyn::F32)
+        edgefirst_tensor::Tensor::<f32>::from_arrayview3(narrowed.view()).map(Into::into)
     }
 }
 
@@ -2963,7 +2958,10 @@ mod tests {
         for (b, m) in boxes.iter().zip(masks.iter()) {
             let cx = (b.bbox.xmin + b.bbox.xmax) * 0.5;
             let mean = {
-                let s = &m.segmentation;
+                use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+                let t = m.segmentation.as_u8().expect("mask must be U8");
+                let map = t.map_read().expect("map mask");
+                let s = map.as_slice();
                 let total: u32 = s.iter().map(|&v| v as u32).sum();
                 total as f32 / s.len() as f32
             };

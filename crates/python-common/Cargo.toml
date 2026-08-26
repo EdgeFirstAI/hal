@@ -1,0 +1,95 @@
+[package]
+name = "edgefirst-python-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+# An rlib, deliberately: every extension module statically links its own copy,
+# so each gets its own PyO3 type objects. Cross-module handoff therefore goes
+# through the capsule protocol (edgefirst_tensor::EfTensorDesc), never through
+# a shared Python type. That is the A3 contract.
+[lints]
+workspace = true
+
+[lib]
+name = "edgefirst_python_common"
+# The doc comments in this crate are PyO3 docstrings: they become Python
+# `__doc__` and are written in reStructuredText for Sphinx, with `::`-indented
+# PYTHON examples. rustdoc treats an indented block as Rust and tries to
+# compile it, so `cargo test --doc` fails on seven of them with parse errors
+# on ordinary Python. They are not Rust documentation and should not be
+# compiled as Rust.
+doctest = false
+
+[features]
+# Each extension enables only its own domain so the linker can discard the
+# rest.
+default = []
+tensor = ["dep:edgefirst-tensor"]
+codec = ["tensor", "dep:edgefirst-codec"]
+# Image processing only: tensor + image. No decoder, no tracker, no codec.
+image = ["tensor", "dep:edgefirst-image"]
+decoder = ["tensor", "dep:edgefirst-decoder", "dep:edgefirst-decoder-abi"]
+# Tracker consumes plain boxes; it does not enable tensor, so _tracker.so
+# has no DT_NEEDED on libedgefirst_tensor.
+tracker = ["dep:edgefirst-tracker"]
+abi3-py38 = ["pyo3/abi3-py38"]
+abi3-py311 = ["pyo3/abi3-py311"]
+# Forwards to edgefirst-tensor's own static/dynamic features instead of
+# pinning one on the dependency line below (single-tensor-home, Python side,
+# task P2), the same pattern edgefirst-tracker/-image/-decoder/-codec
+# already use: a pinned `features = ["static"]` here would mean any consumer
+# that asks python-common for `dynamic` still activates `edgefirst-tensor/
+# static` too (Cargo unifies features per crate across one build graph), and
+# `static`+`dynamic` together trip the mutual-exclusion guard at
+# crates/tensor/src/lib.rs:47 on THIS crate's own manifest request, not on a
+# deliberate choice by whoever is actually building.
+static = ["edgefirst-tensor?/static"]
+dynamic = ["edgefirst-tensor?/dynamic"]
+
+[dependencies]
+edgefirst-tensor = { workspace = true, default-features = false, optional = true }
+# `default-features = false` on all four below, for the same reason as
+# `edgefirst-tensor` above: each of these crates' own default feature set
+# includes ITS OWN `static` (a forwarding feature identical in shape to the
+# one this crate now has), which would activate `edgefirst-tensor/static`
+# the same way the old hardcoded pin did, just one hop further out --
+# reachable the moment any of `codec`/`image`/`decoder`'s features above
+# pull one of these in. None of these crates' `static`/`dynamic` features do
+# anything beyond that one forward, so simply not selecting either is
+# correct: whichever the actual top-level consumer (python-tensor et al.)
+# requests directly settles it for the whole unified build.
+edgefirst-codec = { workspace = true, optional = true, default-features = false, features = ["v4l2", "nvjpeg", "png"] }
+# `opengl` here for a different reason than `tracker`: `tracker` is this
+# crate's own real requirement (drawing tracked masks); `opengl` used to
+# reach this crate through edgefirst-image's own default (`["opengl",
+# "static"]`), now suppressed workspace-wide (see the root Cargo.toml's
+# edgefirst-image entry) -- spelled out explicitly so the Python image
+# bindings' GPU convert path does not silently fall back to CPU with
+# nothing failing to compile or import.
+edgefirst-image = { workspace = true, optional = true, default-features = false, features = [
+    "opengl",
+] }
+edgefirst-decoder = { workspace = true, optional = true, default-features = false }
+edgefirst-decoder-abi = { workspace = true, optional = true }
+edgefirst-tracker = { workspace = true, optional = true, default-features = false }
+env_logger = { workspace = true }
+four-char-code = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+ndarray = { workspace = true }
+num-traits = { workspace = true }
+numpy = { workspace = true }
+pyo3 = { workspace = true, features = ["extension-module"] }
+pythonize = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true, features = ["resolve-config"] }
+rustc_version = { workspace = true }

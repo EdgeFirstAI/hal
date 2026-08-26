@@ -57,7 +57,16 @@ jobs:
 
       - name: Build benchmark binaries
         run: |
-          cargo bench --workspace --all-features --no-run 2>&1
+          # NOT --all-features: edgefirst-tensor's `static`/`dynamic` backend
+          # features are mutually exclusive by design (see the
+          # `compile_error!` guards in crates/tensor/src/lib.rs), so
+          # --all-features -- which enables every feature of every workspace
+          # crate at once -- is not merely wrong here, it can never work
+          # again. `opengl,ndarray` is the same feature set the Makefile's
+          # own workspace-wide commands use (see RUST_FEATURES in Makefile);
+          # tensor's own default features (`static` included) stay enabled
+          # since --no-default-features is never passed.
+          cargo bench --workspace --features opengl,ndarray --no-run 2>&1
           mkdir -p benchmark-binaries
           for name in decoder_benchmark image_benchmark pipeline_benchmark tensor_benchmark; do
             find target/release/deps -maxdepth 1 -type f -executable -name "${name}-*" \
@@ -76,10 +85,13 @@ jobs:
           python3 -m venv venv
           venv/bin/pip install --upgrade pip setuptools wheel maturin[patchelf]
           echo "PYO3_PYTHON=$(which python3)" >> $GITHUB_ENV
-          venv/bin/maturin build \
-            --manifest-path crates/python/Cargo.toml \
-            --out target/wheels \
-            --release
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --release \
+              --auditwheel skip
+          done
 
       - name: Upload benchmark binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -191,7 +203,12 @@ jobs:
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
           venv/bin/pip install pytest pytest-benchmark numpy pillow psutil
-          venv/bin/pip install wheels/*.whl
+          # --no-deps: every edgefirst-* sibling is in this same wheel set, built
+          # from this commit. Resolving the `~=` pins would let pip fetch a
+          # PUBLISHED sibling from PyPI over the locally built one, so the suite
+          # would silently test released code instead of this branch. Third-party
+          # runtime deps are installed by the steps above.
+          venv/bin/pip install --no-deps --force-reinstall wheels/*.whl
 
       - name: Run Python benchmarks
         run: |

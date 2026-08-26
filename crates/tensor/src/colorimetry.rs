@@ -81,6 +81,22 @@ pub enum ColorRange {
 }
 
 impl ColorSpace {
+    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
+    ///
+    /// Returns `None` for `""` and for any label this build does not know.
+    /// Colorimetry is descriptive metadata: a consumer that cannot name one
+    /// axis can still use the pixels, so an unknown label degrades to
+    /// "unspecified" rather than failing the whole import.
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        match s {
+            "bt709" => Some(Self::Bt709),
+            "bt2020" => Some(Self::Bt2020),
+            "srgb" => Some(Self::Srgb),
+            "smpte170m" => Some(Self::Smpte170m),
+            _ => None,
+        }
+    }
+
     /// Short string label matching the EdgeFirst schema.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -109,6 +125,23 @@ impl ColorSpace {
 }
 
 impl ColorTransfer {
+    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
+    ///
+    /// Returns `None` for `""` and for any label this build does not know.
+    /// Colorimetry is descriptive metadata: a consumer that cannot name one
+    /// axis can still use the pixels, so an unknown label degrades to
+    /// "unspecified" rather than failing the whole import.
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        match s {
+            "bt709" => Some(Self::Bt709),
+            "srgb" => Some(Self::Srgb),
+            "pq" => Some(Self::Pq),
+            "hlg" => Some(Self::Hlg),
+            "linear" => Some(Self::Linear),
+            _ => None,
+        }
+    }
+
     /// Short string label matching the EdgeFirst schema.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -140,6 +173,21 @@ impl ColorTransfer {
 }
 
 impl ColorEncoding {
+    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
+    ///
+    /// Returns `None` for `""` and for any label this build does not know.
+    /// Colorimetry is descriptive metadata: a consumer that cannot name one
+    /// axis can still use the pixels, so an unknown label degrades to
+    /// "unspecified" rather than failing the whole import.
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        match s {
+            "bt601" => Some(Self::Bt601),
+            "bt709" => Some(Self::Bt709),
+            "bt2020" => Some(Self::Bt2020),
+            _ => None,
+        }
+    }
+
     /// Short string label matching the EdgeFirst schema.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -164,6 +212,20 @@ impl ColorEncoding {
 }
 
 impl ColorRange {
+    /// Parse the schema's short string label — the inverse of [`Self::as_str`].
+    ///
+    /// Returns `None` for `""` and for any label this build does not know.
+    /// Colorimetry is descriptive metadata: a consumer that cannot name one
+    /// axis can still use the pixels, so an unknown label degrades to
+    /// "unspecified" rather than failing the whole import.
+    pub fn from_str_code(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(Self::Full),
+            "limited" => Some(Self::Limited),
+            _ => None,
+        }
+    }
+
     /// Short string label matching the EdgeFirst schema.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -381,6 +443,91 @@ impl Colorimetry {
         self.range = Some(r);
         self
     }
+
+    /// Pack all four axes into one `u32` for
+    /// [`crate::protocol::TensorDesc::colorimetry`].
+    ///
+    /// One byte per axis, `space` in the low byte through `range` in the
+    /// high byte; `0` on an axis means "undefined", so an all-`None`
+    /// `Colorimetry` packs to `0`. The per-axis codes are the same "stable
+    /// HAL constants" the C API's `ef_colorimetry` documents
+    /// — duplicated rather than shared
+    /// because the C leaves depend on this crate, not the reverse, but kept in
+    /// sync deliberately so a value means the same thing on both
+    /// boundaries. This crosses a package boundary like `TensorDesc`
+    /// itself: codes are appended, never renumbered.
+    pub fn pack(&self) -> u32 {
+        let space: u32 = match self.space {
+            None => 0,
+            Some(ColorSpace::Bt709) => 1,
+            Some(ColorSpace::Bt2020) => 2,
+            Some(ColorSpace::Srgb) => 3,
+            Some(ColorSpace::Smpte170m) => 4,
+        };
+        let transfer: u32 = match self.transfer {
+            None => 0,
+            Some(ColorTransfer::Bt709) => 1,
+            Some(ColorTransfer::Srgb) => 2,
+            Some(ColorTransfer::Pq) => 3,
+            Some(ColorTransfer::Hlg) => 4,
+            Some(ColorTransfer::Linear) => 5,
+        };
+        let encoding: u32 = match self.encoding {
+            None => 0,
+            Some(ColorEncoding::Bt601) => 1,
+            Some(ColorEncoding::Bt709) => 2,
+            Some(ColorEncoding::Bt2020) => 3,
+        };
+        let range: u32 = match self.range {
+            None => 0,
+            Some(ColorRange::Full) => 1,
+            Some(ColorRange::Limited) => 2,
+        };
+        space | (transfer << 8) | (encoding << 16) | (range << 24)
+    }
+
+    /// Inverse of [`Self::pack`]: rebuild a `Colorimetry` from a packed
+    /// `u32`, e.g. [`crate::protocol::TensorDesc::colorimetry`] on
+    /// import. `0` on an axis byte (undefined, including a build that
+    /// predates the axis) maps to `None` rather than erroring, the same
+    /// forward-compatibility rule [`crate::protocol::dtype_to_dtype`]
+    /// applies to another wire-coded axis -- a code this build does not
+    /// recognise (e.g. one a newer producer added) also maps to `None`
+    /// instead of guessing.
+    pub fn unpack(bits: u32) -> Self {
+        let space = match bits & 0xFF {
+            1 => Some(ColorSpace::Bt709),
+            2 => Some(ColorSpace::Bt2020),
+            3 => Some(ColorSpace::Srgb),
+            4 => Some(ColorSpace::Smpte170m),
+            _ => None,
+        };
+        let transfer = match (bits >> 8) & 0xFF {
+            1 => Some(ColorTransfer::Bt709),
+            2 => Some(ColorTransfer::Srgb),
+            3 => Some(ColorTransfer::Pq),
+            4 => Some(ColorTransfer::Hlg),
+            5 => Some(ColorTransfer::Linear),
+            _ => None,
+        };
+        let encoding = match (bits >> 16) & 0xFF {
+            1 => Some(ColorEncoding::Bt601),
+            2 => Some(ColorEncoding::Bt709),
+            3 => Some(ColorEncoding::Bt2020),
+            _ => None,
+        };
+        let range = match (bits >> 24) & 0xFF {
+            1 => Some(ColorRange::Full),
+            2 => Some(ColorRange::Limited),
+            _ => None,
+        };
+        Colorimetry {
+            space,
+            transfer,
+            encoding,
+            range,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -514,11 +661,88 @@ mod tests {
     }
 
     #[test]
+    fn as_str_and_from_str_code_are_inverses_for_every_variant() {
+        // The wire round-trip depends on this, and `as_str` alone cannot show
+        // it: a parser missing one arm silently degrades that axis to None.
+        for v in [
+            ColorSpace::Bt709,
+            ColorSpace::Bt2020,
+            ColorSpace::Srgb,
+            ColorSpace::Smpte170m,
+        ] {
+            assert_eq!(ColorSpace::from_str_code(v.as_str()), Some(v), "{v:?}");
+        }
+        for v in [
+            ColorTransfer::Bt709,
+            ColorTransfer::Srgb,
+            ColorTransfer::Pq,
+            ColorTransfer::Hlg,
+            ColorTransfer::Linear,
+        ] {
+            assert_eq!(ColorTransfer::from_str_code(v.as_str()), Some(v), "{v:?}");
+        }
+        for v in [
+            ColorEncoding::Bt601,
+            ColorEncoding::Bt709,
+            ColorEncoding::Bt2020,
+        ] {
+            assert_eq!(ColorEncoding::from_str_code(v.as_str()), Some(v), "{v:?}");
+        }
+        for v in [ColorRange::Full, ColorRange::Limited] {
+            assert_eq!(ColorRange::from_str_code(v.as_str()), Some(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_empty_label_is_unspecified_not_an_error() {
+        assert_eq!(ColorSpace::from_str_code(""), None);
+        assert_eq!(ColorSpace::from_str_code("not-a-colour-space"), None);
+        assert_eq!(
+            ColorRange::from_str_code("FULL"),
+            None,
+            "labels are case-sensitive"
+        );
+    }
+
+    #[test]
     fn as_str_matches_schema() {
         assert_eq!(ColorEncoding::Bt601.as_str(), "bt601");
         assert_eq!(ColorRange::Full.as_str(), "full");
         assert_eq!(ColorSpace::Smpte170m.as_str(), "smpte170m");
         assert_eq!(ColorTransfer::Pq.as_str(), "pq");
         assert_eq!(ColorTransfer::Hlg.as_str(), "hlg");
+    }
+
+    #[test]
+    fn pack_unpack_round_trips() {
+        // The exact round trip the cross-package import path relies on:
+        // `TensorDyn::import_descriptor` unpacks what `descriptor_pinned`
+        // packed. All-None must round-trip through 0, and every populated
+        // axis must survive.
+        assert_eq!(
+            Colorimetry::unpack(Colorimetry::default().pack()),
+            Colorimetry::default()
+        );
+        assert_eq!(Colorimetry::default().pack(), 0);
+
+        let jfif = Colorimetry::jfif();
+        assert_eq!(Colorimetry::unpack(jfif.pack()), jfif);
+
+        let full = Colorimetry {
+            space: Some(ColorSpace::Bt2020),
+            transfer: Some(ColorTransfer::Hlg),
+            encoding: Some(ColorEncoding::Bt2020),
+            range: Some(ColorRange::Limited),
+        };
+        assert_eq!(Colorimetry::unpack(full.pack()), full);
+    }
+
+    #[test]
+    fn unpack_maps_unrecognised_codes_to_none() {
+        // A code this build does not recognise (e.g. from a newer producer)
+        // must not panic or guess -- same forward-compat rule as
+        // `dtype_to_dtype`/`format_from_code`.
+        let bits = 0xFFu32 | (0xFFu32 << 8) | (0xFFu32 << 16) | (0xFFu32 << 24);
+        assert_eq!(Colorimetry::unpack(bits), Colorimetry::default());
     }
 }

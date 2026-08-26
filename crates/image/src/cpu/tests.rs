@@ -9,7 +9,125 @@ mod cpu_tests {
     use crate::{
         CPUProcessor, Crop, Error, Flip, ImageProcessorTrait, Rect, Region, Result, Rotation,
     };
-    use edgefirst_decoder::DetectBox;
+    use edgefirst_tensor::DetectBox;
+
+    /// A `C > 1` mask routed to the INSTANCE renderer must read channel 0.
+    ///
+    /// The semantic/instance split is decided from `segmentation[0]` ALONE
+    /// (`cpu/mod.rs`), so a list whose FIRST mask is `C == 1` sends every
+    /// later mask to `render_yolo_segmentation` regardless of its own channel
+    /// count — which is why this test needs two detections, the first with a
+    /// `C == 1` mask. With a `C == 3` mask in slot 0 the dispatcher would pick
+    /// the semantic renderer instead and never exercise the read under test.
+    ///
+    /// The former `Array3` read `.get([y, x, 0])` was correct for any `C`; a
+    /// flat `y * W + x` index is correct only for `C == 1` and, because it
+    /// stays in bounds, silently renders the wrong bytes for anything else.
+    ///
+    /// The oracle replaces the `C == 3` mask with a `C == 1` mask holding
+    /// exactly its channel 0, so correct channel extraction must give
+    /// byte-identical output. A weaker "something was drawn" assertion does
+    /// NOT catch the bug — a strided misread still lands on a set byte one
+    /// time in three.
+    #[test]
+    fn instance_renderer_reads_channel_zero_of_a_multi_channel_mask() {
+        use edgefirst_tensor::Segmentation;
+
+        const W: usize = 8;
+        const H: usize = 8;
+
+        // Non-uniform: a uniform mask makes a wrong-channel read
+        // coincidentally correct.
+        let chan0: Vec<u8> = (0..H * W)
+            .map(|i| if i % 3 == 0 { 255 } else { 0 })
+            .collect();
+        // C == 3 with channel 0 == chan0 and the others inverted, so reading
+        // the wrong channel gives visibly different coverage.
+        let mut wide = vec![0u8; H * W * 3];
+        for (px, &v) in chan0.iter().enumerate() {
+            wide[px * 3] = v;
+            wide[px * 3 + 1] = 255 - v;
+            wide[px * 3 + 2] = 255 - v;
+        }
+        // Slot 0 is always C == 1: it is what pins the dispatch to instance.
+        let first: Vec<u8> = (0..H * W)
+            .map(|i| if i % 2 == 0 { 255 } else { 0 })
+            .collect();
+
+        let build = |bytes: &[u8], shape: &[usize]| {
+            let t = Tensor::<u8>::new(shape, Some(TensorMemory::Mem), None).expect("alloc mask");
+            t.map_mut().unwrap().as_mut_slice().copy_from_slice(bytes);
+            TensorDyn::from(t)
+        };
+        let seg = |m: TensorDyn| Segmentation {
+            segmentation: m,
+            xmin: 0.0,
+            ymin: 0.0,
+            xmax: 1.0,
+            ymax: 1.0,
+        };
+
+        let render = |second: TensorDyn| -> crate::Result<Vec<u8>> {
+            let mut dst = TensorDyn::image(
+                16,
+                16,
+                PixelFormat::Rgba,
+                DType::U8,
+                None,
+                edgefirst_tensor::CpuAccess::ReadWrite,
+            )
+            .expect("dst");
+            {
+                let t = dst.as_u8_mut().unwrap();
+                t.map_mut().unwrap().as_mut_slice().fill(0);
+            }
+            let det = [
+                DetectBox {
+                    bbox: [0.0, 0.0, 0.5, 1.0].into(),
+                    score: 0.9,
+                    label: 0,
+                },
+                DetectBox {
+                    bbox: [0.5, 0.0, 1.0, 1.0].into(),
+                    score: 0.9,
+                    label: 1,
+                },
+            ];
+            let segs = [seg(build(&first, &[H, W, 1])), seg(second)];
+            let mut cpu = CPUProcessor::new();
+            cpu.draw_decoded_masks(&mut dst, &det, &segs, Default::default())?;
+            let t = dst.as_u8().unwrap();
+            let m = t.map_read().unwrap();
+            Ok(m.as_slice().to_vec())
+        };
+
+        // The C == 1 list renders normally, and non-vacuously.
+        let want = render(build(&chan0, &[H, W, 1])).expect("C=1 list must render");
+        assert!(want.iter().any(|&v| v != 0), "oracle drew nothing");
+
+        // The mixed list is rejected rather than silently rendering the wrong
+        // bytes. Before this was a `debug_assert_eq!(classes, 1)`, which meant
+        // release builds read a flat `y * W + x` index -- in bounds, wrong
+        // channel, no diagnostic.
+        let err = render(build(&wide, &[H, W, 3])).expect_err("C=3 must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("instance mask must be"),
+            "expected a shape error naming the constraint, got {msg}"
+        );
+    }
+
+    /// The mask bytes of a `Segmentation`, as a flat `Vec<u8>`.
+    ///
+    /// `Segmentation::segmentation` is a `TensorDyn` rather than an
+    /// `ndarray::Array3<u8>`, so tests that used to call `.iter()` on it map
+    /// through this instead.
+    fn seg_bytes(s: &edgefirst_tensor::Segmentation) -> Vec<u8> {
+        let t = s.segmentation.as_u8().expect("segmentation must be U8");
+        let m = t.map_read().expect("map segmentation");
+        m.as_slice().to_vec()
+    }
+
     use edgefirst_tensor::{
         DType, PixelFormat, Tensor, TensorDyn, TensorMapTrait, TensorMemory, TensorTrait,
     };
@@ -1193,7 +1311,7 @@ mod cpu_tests {
 
     #[test]
     fn test_segmentation() {
-        use edgefirst_decoder::Segmentation;
+        use edgefirst_tensor::Segmentation;
         use ndarray::Array3;
 
         let image = crate::load_image_test_helper(
@@ -1214,7 +1332,9 @@ mod cpu_tests {
         let segmentation = segmentation.as_standard_layout().to_owned();
 
         let seg = Segmentation {
-            segmentation,
+            segmentation: edgefirst_tensor::Tensor::from_arrayview3(segmentation.view())
+                .unwrap()
+                .into(),
             xmin: 0.0,
             ymin: 0.0,
             xmax: 1.0,
@@ -1236,7 +1356,7 @@ mod cpu_tests {
 
     #[test]
     fn test_segmentation_yolo() {
-        use edgefirst_decoder::Segmentation;
+        use edgefirst_tensor::Segmentation;
         use ndarray::Array3;
 
         // draw_decoded_masks fully writes dst: we must pass the camera
@@ -1270,7 +1390,9 @@ mod cpu_tests {
         };
 
         let seg = Segmentation {
-            segmentation,
+            segmentation: edgefirst_tensor::Tensor::from_arrayview3(segmentation.view())
+                .unwrap()
+                .into(),
             xmin: 0.59375,
             ymin: 0.25,
             xmax: 0.9375,
@@ -2023,8 +2145,10 @@ mod cpu_tests {
 
         assert_eq!(bgra_buf.len(), rgba_buf.len());
         for (i, (bc, rc)) in bgra_buf
-            .chunks_exact(4)
-            .zip(rgba_buf.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgba_buf.as_chunks::<4>().0)
             .enumerate()
         {
             assert_eq!(bc[0], rc[2], "pixel {i}: B(bgra) != B(rgba)");
@@ -2285,7 +2409,7 @@ mod cpu_tests {
         proto_values: Vec<f32>,
         coefficients: Vec<Vec<f32>>,
     ) -> crate::ProtoData {
-        use edgefirst_tensor::{Tensor, TensorDyn};
+        use edgefirst_tensor::Tensor;
         assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
         let n = coefficients.len();
         let row_len = coefficients.first().map(|r| r.len()).unwrap_or(num_protos);
@@ -2297,15 +2421,15 @@ mod cpu_tests {
         let protos_t =
             Tensor::<f32>::from_slice(&proto_values, &[proto_h, proto_w, num_protos]).unwrap();
         crate::ProtoData {
-            mask_coefficients: TensorDyn::F32(coeff_t),
-            protos: TensorDyn::F32(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nhwc,
         }
     }
 
     fn make_detect_box(xmin: f32, ymin: f32, xmax: f32, ymax: f32) -> crate::DetectBox {
         crate::DetectBox {
-            bbox: edgefirst_decoder::BoundingBox {
+            bbox: edgefirst_tensor::BoundingBox {
                 xmin,
                 ymin,
                 xmax,
@@ -2460,13 +2584,14 @@ mod cpu_tests {
         let shape = segs[0].segmentation.shape();
         assert!(shape[0] > 0 && shape[1] > 0);
         assert_eq!(shape[2], 1);
-        assert!(
-            segs[0]
-                .segmentation
-                .iter()
-                .all(|&v| matches!(v, 0_u8 | 255_u8)),
-            "scaled path output must remain binarized u8"
-        );
+        {
+            use edgefirst_tensor::{TensorMapTrait as _, TensorTrait as _};
+            let m = segs[0].segmentation.as_u8().unwrap().map_read().unwrap();
+            assert!(
+                m.as_slice().iter().all(|&v| matches!(v, 0_u8 | 255_u8)),
+                "scaled path output must remain binarized u8"
+            );
+        }
     }
 
     #[test]
@@ -2494,7 +2619,7 @@ mod cpu_tests {
         assert_eq!(shape[1], 16);
         assert_eq!(shape[2], 1);
         assert!(
-            seg.segmentation.iter().all(|&v| v == 255),
+            seg_bytes(seg).iter().all(|&v| v == 255),
             "positive logits should remain foreground after scaled letterbox mapping"
         );
     }
@@ -2523,7 +2648,7 @@ mod cpu_tests {
         // Coefficient [+1, +1] → dot > 0 for all pixels (positive + negative = 0,
         // but with symmetric scale the sum should still be evaluated correctly).
         // Use coefficients [1, 0] to select only channel 0 → all positive → 255.
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
         // NCHW physical: [K=2, H=4, W=4] → flat = [ch0 16 values, ch1 16 values]
@@ -2545,9 +2670,9 @@ mod cpu_tests {
             .set_quantization(Quantization::per_tensor(1.0, 0))
             .unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
@@ -2556,7 +2681,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // All pixels should be 255 (positive dot product from channel 0)
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW proto with positive channel selected should yield all-255 mask"
         );
     }
@@ -2564,16 +2689,16 @@ mod cpu_tests {
     #[test]
     fn test_materialize_nchw_float_rejected() {
         // NCHW layout with non-i8 protos should return NotSupported error.
-        use edgefirst_tensor::{Tensor, TensorDyn};
+        use edgefirst_tensor::Tensor;
         let cpu = CPUProcessor::new();
         let proto_values = vec![1.0_f32; 2 * 4 * 4];
         let protos_t = Tensor::<f32>::from_slice(&proto_values, &[2, 4, 4]).unwrap();
         let coeff_values = vec![1.0_f32; 2];
         let coeff_t = Tensor::<f32>::from_slice(&coeff_values, &[1, 2]).unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::F32(coeff_t),
-            protos: TensorDyn::F32(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let result = cpu.materialize_segmentations(&det, &proto_data, None);
@@ -2588,16 +2713,16 @@ mod cpu_tests {
     #[test]
     fn test_materialize_scaled_nchw_float_rejected() {
         // NCHW layout with non-i8 protos on the scaled path should also error.
-        use edgefirst_tensor::{Tensor, TensorDyn};
+        use edgefirst_tensor::Tensor;
         let cpu = CPUProcessor::new();
         let proto_values = vec![1.0_f32; 2 * 4 * 4];
         let protos_t = Tensor::<f32>::from_slice(&proto_values, &[2, 4, 4]).unwrap();
         let coeff_values = vec![1.0_f32; 2];
         let coeff_t = Tensor::<f32>::from_slice(&coeff_values, &[1, 2]).unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::F32(coeff_t),
-            protos: TensorDyn::F32(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.1, 0.1, 0.9, 0.9)];
         let result = cpu.materialize_scaled_segmentations(&det, &proto_data, None, 64, 64);
@@ -2612,7 +2737,7 @@ mod cpu_tests {
     #[test]
     fn test_materialize_scaled_nchw_i8_produces_correct_mask() {
         // Verify that the scaled path handles NCHW i8 layout correctly.
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
         // NCHW physical: [K=2, H=4, W=4]
@@ -2634,9 +2759,9 @@ mod cpu_tests {
             .set_quantization(Quantization::per_tensor(1.0, 0))
             .unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
@@ -2645,7 +2770,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // All pixels should be 255 (positive dot product from channel 0)
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW i8 scaled path with positive channel should yield all-255 mask"
         );
     }
@@ -2660,7 +2785,7 @@ mod cpu_tests {
         // With K=2 channels: proto ch0=15 (→1.0), proto ch1=5 (→0.0)
         // coeff = [12, 10] (→[1.0, 0.0])
         // dot = 1.0*1.0 + 0.0*0.0 = 1.0 > 0 → mask = 255
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
 
@@ -2689,9 +2814,9 @@ mod cpu_tests {
             .unwrap();
 
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
@@ -2700,7 +2825,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // Dot product = 1.0 > 0 → all 255
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "NCHW i8 with non-zero zero-points: positive dot should yield all-255"
         );
 
@@ -2721,9 +2846,9 @@ mod cpu_tests {
             .unwrap();
 
         let proto_data_neg = crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t_neg),
-            protos: TensorDyn::I8(protos_t2),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t_neg.into(),
+            protos: protos_t2.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let segs_neg = cpu
             .materialize_segmentations(&det, &proto_data_neg, None)
@@ -2731,7 +2856,7 @@ mod cpu_tests {
         assert_eq!(segs_neg.len(), 1);
         // dot = 0 → NOT > 0 → mask should be 0
         assert!(
-            segs_neg[0].segmentation.iter().all(|&v| v == 0),
+            seg_bytes(&segs_neg[0]).iter().all(|&v| v == 0),
             "NCHW i8 with non-zero zero-points: zero dot should yield all-0"
         );
     }
@@ -2742,7 +2867,7 @@ mod cpu_tests {
         // from the i8×i8 fast path to the general f32 dequant path.
         // This tests the regression fix: previously the i8 fast path returned
         // NotSupported without falling back.
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
 
@@ -2772,9 +2897,9 @@ mod cpu_tests {
             .unwrap();
 
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nhwc,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
@@ -2783,7 +2908,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // Channel 0 is positive (10 * 0.1 = 1.0), coeff selects it → dot > 0 → 255
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "per-channel i8 fallback: positive dot should yield all-255"
         );
     }
@@ -2804,23 +2929,24 @@ mod cpu_tests {
     /// the resulting file; subsequent runs verify bit-exact.
     #[test]
     fn test_materialize_golden_i8_cached_model() {
-        use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, DetectBox, Nms, ProtoData};
+        use edgefirst_decoder::{configs, ConfigOutput, DecoderBuilder, Nms};
+        use edgefirst_tensor::{DetectBox, ProtoData};
         use edgefirst_tensor::{Tensor, TensorDyn};
 
         let boxes_raw = edgefirst_bench::testdata::read("yolov8_boxes_116x8400.bin");
         let boxes_i8 =
             unsafe { std::slice::from_raw_parts(boxes_raw.as_ptr() as *const i8, boxes_raw.len()) };
-        let boxes_tensor = TensorDyn::I8(
-            Tensor::<i8>::from_slice(boxes_i8, &[1, 116, 8400]).expect("boxes tensor"),
-        );
+        let boxes_tensor: TensorDyn = Tensor::<i8>::from_slice(boxes_i8, &[1, 116, 8400])
+            .expect("boxes tensor")
+            .into();
 
         let protos_raw = edgefirst_bench::testdata::read("yolov8_protos_160x160x32.bin");
         let protos_i8 = unsafe {
             std::slice::from_raw_parts(protos_raw.as_ptr() as *const i8, protos_raw.len())
         };
-        let protos_tensor = TensorDyn::I8(
-            Tensor::<i8>::from_slice(protos_i8, &[1, 160, 160, 32]).expect("protos tensor"),
-        );
+        let protos_tensor: TensorDyn = Tensor::<i8>::from_slice(protos_i8, &[1, 160, 160, 32])
+            .expect("protos tensor")
+            .into();
 
         let detection_cfg = configs::Detection {
             decoder: configs::DecoderType::Ultralytics,
@@ -2872,8 +2998,10 @@ mod cpu_tests {
         let mut actual: Vec<u8> = Vec::with_capacity(4 + roi_h * roi_w);
         actual.extend_from_slice(&(roi_h as u16).to_le_bytes());
         actual.extend_from_slice(&(roi_w as u16).to_le_bytes());
-        let det0_contig = det0_seg.as_standard_layout();
-        actual.extend_from_slice(det0_contig.as_slice().expect("standard layout gives slice"));
+        // A TensorDyn is contiguous by construction; no as_standard_layout()
+        // copy is needed before taking the bytes.
+        let det0_map = det0_seg.as_u8().expect("U8 mask").map_read().unwrap();
+        actual.extend_from_slice(det0_map.as_slice());
 
         // Resolve testdata via EDGEFIRST_TESTDATA_DIR when set (on-target runs use
         // a deployed copy; the compile-time manifest path does not exist there),
@@ -2947,7 +3075,7 @@ mod cpu_tests {
         coeff_quant: (f32, i32),
         num_detections: usize,
     ) -> crate::ProtoData {
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
         assert_eq!(coeff_values.len(), num_detections * num_protos);
 
@@ -2964,9 +3092,9 @@ mod cpu_tests {
             .unwrap();
 
         crate::ProtoData {
-            mask_coefficients: TensorDyn::I8(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nhwc,
         }
     }
 
@@ -2981,7 +3109,7 @@ mod cpu_tests {
         coeff_quant: (f32, i32),
         num_detections: usize,
     ) -> crate::ProtoData {
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         assert_eq!(proto_values.len(), proto_h * proto_w * num_protos);
         assert_eq!(coeff_values.len(), num_detections * num_protos);
 
@@ -2998,9 +3126,9 @@ mod cpu_tests {
             .unwrap();
 
         crate::ProtoData {
-            mask_coefficients: TensorDyn::I16(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nhwc,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nhwc,
         }
     }
 
@@ -3032,7 +3160,7 @@ mod cpu_tests {
         // All protos positive, all coeffs positive → dot products positive
         // → all mask pixels should be 255.
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "uniform positive protos+coeffs should produce all-255 mask"
         );
     }
@@ -3063,7 +3191,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // Negative dot products → all mask pixels should be 0.
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 0),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 0),
             "positive protos + negative coeffs should produce all-0 mask"
         );
     }
@@ -3099,10 +3227,10 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("i8×i8 with mixed-sign protos should succeed");
         assert_eq!(segs.len(), 1);
-        let mask = &segs[0].segmentation;
+        let mask = seg_bytes(&segs[0]);
         // Mask should have both 0 and 255 values (left half ≈ 255, right ≈ 0).
-        let has_255 = mask.iter().any(|&v| v == 255);
-        let has_0 = mask.iter().any(|&v| v == 0);
+        let has_255 = mask.contains(&255);
+        let has_0 = mask.contains(&0);
         assert!(
             has_255 && has_0,
             "mixed-sign proto field should produce mixed mask"
@@ -3144,7 +3272,7 @@ mod cpu_tests {
         assert_eq!(segs.len(), 1);
         // Dequantized values are both positive → all 255.
         assert!(
-            segs[0].segmentation.iter().all(|&v| v == 255),
+            seg_bytes(&segs[0]).iter().all(|&v| v == 255),
             "positive dequantized values should produce all-255 mask"
         );
     }
@@ -3207,8 +3335,8 @@ mod cpu_tests {
 
         // With symmetric quantization (zp=0, scale=1.0), the sign of the
         // dot product is identical, so binarized masks must match exactly.
-        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
-        let i8_mask: Vec<u8> = segs_i8[0].segmentation.iter().copied().collect();
+        let f32_mask: Vec<u8> = seg_bytes(&segs_f32[0]).to_vec();
+        let i8_mask: Vec<u8> = seg_bytes(&segs_i8[0]).to_vec();
         assert_eq!(
             f32_mask, i8_mask,
             "i8×i8 integer path must produce identical binarized mask as f32 path (symmetric quant)"
@@ -3258,8 +3386,8 @@ mod cpu_tests {
             .materialize_segmentations(&det, &proto_data_i16, None)
             .expect("i16 path");
 
-        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
-        let i16_mask: Vec<u8> = segs_i16[0].segmentation.iter().copied().collect();
+        let f32_mask: Vec<u8> = seg_bytes(&segs_f32[0]).to_vec();
+        let i16_mask: Vec<u8> = seg_bytes(&segs_i16[0]).to_vec();
         assert_eq!(
             f32_mask, i16_mask,
             "i16×i8 proto path should match f32 fallback"
@@ -3309,8 +3437,8 @@ mod cpu_tests {
             .materialize_scaled_segmentations(&det, &proto_data_i16, None, 32, 32)
             .expect("i16 path");
 
-        let f32_mask: Vec<u8> = segs_f32[0].segmentation.iter().copied().collect();
-        let i16_mask: Vec<u8> = segs_i16[0].segmentation.iter().copied().collect();
+        let f32_mask: Vec<u8> = seg_bytes(&segs_f32[0]).to_vec();
+        let i16_mask: Vec<u8> = seg_bytes(&segs_i16[0]).to_vec();
         assert_eq!(
             f32_mask, i16_mask,
             "scaled i16×i8 path should match f32 fallback"
@@ -3319,7 +3447,7 @@ mod cpu_tests {
 
     #[test]
     fn test_materialize_nchw_i8_f32_coefficients_use_fallback() {
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
         let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
@@ -3334,20 +3462,20 @@ mod cpu_tests {
             .unwrap();
         let coeff_t = Tensor::<f32>::from_slice(&[1.0_f32, 0.0], &[1, num_protos]).unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::F32(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
             .materialize_segmentations(&det, &proto_data, None)
             .expect("NCHW i8 protos should transpose in f32 fallback");
-        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
+        assert!(seg_bytes(&segs[0]).iter().all(|&v| v == 255));
     }
 
     #[test]
     fn test_materialize_scaled_nchw_i8_f32_coefficients_use_fallback() {
-        use edgefirst_tensor::{Quantization, Tensor, TensorDyn};
+        use edgefirst_tensor::{Quantization, Tensor};
         let cpu = CPUProcessor::new();
         let (proto_h, proto_w, num_protos) = (4, 4, 2);
         let mut proto_values = vec![0_i8; num_protos * proto_h * proto_w];
@@ -3362,15 +3490,15 @@ mod cpu_tests {
             .unwrap();
         let coeff_t = Tensor::<f32>::from_slice(&[1.0_f32, 0.0], &[1, num_protos]).unwrap();
         let proto_data = crate::ProtoData {
-            mask_coefficients: TensorDyn::F32(coeff_t),
-            protos: TensorDyn::I8(protos_t),
-            layout: edgefirst_decoder::ProtoLayout::Nchw,
+            mask_coefficients: coeff_t.into(),
+            protos: protos_t.into(),
+            layout: edgefirst_tensor::ProtoLayout::Nchw,
         };
         let det = [make_detect_box(0.0, 0.0, 1.0, 1.0)];
         let segs = cpu
             .materialize_scaled_segmentations(&det, &proto_data, None, 16, 16)
             .expect("NCHW i8 protos should transpose in scaled f32 fallback");
-        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
+        assert!(seg_bytes(&segs[0]).iter().all(|&v| v == 255));
     }
 
     #[test]
@@ -3403,9 +3531,9 @@ mod cpu_tests {
             .expect("multiple detections i8×i8 should succeed");
         assert_eq!(segs.len(), 2);
         // Det 0: positive coeffs → all 255.
-        assert!(segs[0].segmentation.iter().all(|&v| v == 255));
+        assert!(seg_bytes(&segs[0]).iter().all(|&v| v == 255));
         // Det 1: negative coeffs → all 0.
-        assert!(segs[1].segmentation.iter().all(|&v| v == 0));
+        assert!(seg_bytes(&segs[1]).iter().all(|&v| v == 0));
     }
 
     // ── Multiplane PixelFormat::Nv12 tests ───────────────────────────────────────
@@ -4063,7 +4191,7 @@ mod cpu_tests {
             {
                 let mut map = src.as_u8().unwrap().map()?;
                 let data = map.as_mut_slice();
-                for (i, px) in data.chunks_exact_mut(4).enumerate() {
+                for (i, px) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     px[0] = (i * 7) as u8;
                     px[1] = (i * 7 + 1) as u8;
                     px[2] = (i * 7 + 2) as u8;

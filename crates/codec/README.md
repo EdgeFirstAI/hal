@@ -326,6 +326,27 @@ Every decode entry point returns `Result<ImageInfo, CodecError>`:
 | `CodecError::Io` | The `load_image_file` / `load_image_read` source failed |
 | `CodecError::Tensor` | The destination tensor rejected the reconfigure or map |
 
+## Footprint
+
+`edgefirst-codec` is a lightweight dependency. Installing the Python package (`edgefirst-codec` plus its `edgefirst-tensor` dependency) costs roughly **1.5 MB to download and ~5 MB installed**, excluding NumPy.
+
+Approximate marginal cost of adding JPEG decode to a Python project, over and above the NumPy every option requires:
+
+| Package | Approx. download | Notes |
+|---|---|---|
+| PyTurboJPEG | ~0.5 MB | `ctypes` wrapper; the wheel is tiny but `libturbojpeg` must be installed separately as a system package |
+| simplejpeg | ~0.4 MB | JPEG only; bundles libjpeg-turbo |
+| **edgefirst-codec** | **~1.5 MB** | JPEG + PNG + EXIF, V4L2 and nvJPEG hardware backends, zero-copy decode into DMA tensors |
+| Pillow | ~6–7 MB | Bundles AVIF, WebP, TIFF, OpenJPEG, freetype and harfbuzz alongside libjpeg |
+| opencv-python-headless | ~40–60 MB | Full computer-vision library |
+| opencv-python | ~50–75 MB | Adds GUI backends |
+
+Two things to read from this. Against Pillow and OpenCV — the libraries most projects actually reach for when they need to decode a JPEG — we are smaller by roughly an order of magnitude, because neither is a codec: their bulk is formats and subsystems a decode-only pipeline never touches. Against the dedicated JPEG wrappers we are a few times larger, but in absolute terms the gap is around a megabyte, and it buys PNG, EXIF, the hardware backends, and a self-contained wheel with no system libraries to install.
+
+For scale, NumPy itself is ~16 MB to download and dominates every row above, so the choice between any of these has little effect on total install size.
+
+These figures are approximate and vary by platform and version; they are here to convey magnitude, not to be exact.
+
 ## License
 
 Apache-2.0

@@ -133,7 +133,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            segmentation: seg,
+            segmentation: crate::mask_to_tensor(seg.view())?,
         });
         Ok(())
     }
@@ -590,7 +590,7 @@ impl Decoder {
             ymin: 0.0,
             xmax: 1.0,
             ymax: 1.0,
-            segmentation: seg,
+            segmentation: crate::mask_to_tensor(seg.view())?,
         });
         Ok(())
     }
@@ -1689,19 +1689,6 @@ impl Decoder {
             self.score_threshold,
             output_boxes,
         )
-    }
-}
-
-#[cfg(feature = "tracker")]
-impl edgefirst_tracker::DetectionBox for DetectBox {
-    fn bbox(&self) -> [f32; 4] {
-        self.bbox.into()
-    }
-    fn score(&self) -> f32 {
-        self.score
-    }
-    fn label(&self) -> usize {
-        self.label
     }
 }
 

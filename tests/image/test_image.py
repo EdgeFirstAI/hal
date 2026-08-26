@@ -1,27 +1,25 @@
 # SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 
-from edgefirst_hal import (
-    ColorMode,
-    Colorimetry,
-    ColorEncoding,
-    ColorRange,
-    Decoder,
-    ImageInfo,
-    ImageProcessor,
-    Flip,
-    PixelFormat,
-    Normalization,
-    Rotation,
-    Tensor,
-    TensorMemory,
-)
-import numpy as np
-from PIL import Image
 import math
 import os
 import sys
+
+import numpy as np
 import pytest
+from edgefirst.codec import ImageInfo, decode_file_into, decode_into
+from edgefirst.decoder import Decoder
+from edgefirst.image import (
+    ColorMode,
+    Flip,
+    ImageProcessor,
+    Normalization,
+    PixelFormat,
+    Rotation,
+    Tensor,
+)
+from edgefirst.tensor import ColorEncoding, Colorimetry, ColorRange, TensorMemory
+from PIL import Image
 
 
 def load_image(image, format="RGBA", resize=None):
@@ -66,7 +64,7 @@ def test_flip(monkeypatch):
     w, h = _image_size("testdata/zidane.jpg")
     # JPEG decodes to its native NV12; convert downstream produces RGBA.
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(1280, 720, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst, flip=Flip.Horizontal)
@@ -89,7 +87,7 @@ def test_grey_load():
 
     # A greyscale JPEG decodes to its native Grey format.
     grey_ = Tensor.image(w, h, format=PixelFormat.Grey, access="readwrite")
-    info = grey_.decode_image_file("testdata/grey.jpg")
+    info = decode_file_into(grey_, "testdata/grey.jpg")
     assert info.format == PixelFormat.Grey
     grey = np.zeros((h, w, 1), dtype=np.uint8)
     grey_.normalize_to_numpy(grey)
@@ -113,7 +111,7 @@ def test_grey_load():
 def test_normalize():
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
@@ -132,7 +130,7 @@ def test_render():
     converter = ImageProcessor()
     # Decode the JPEG to its native NV12, then convert to an RGBA background.
     bg_native = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    bg_native.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(bg_native, "testdata/giraffe.jpg")
     bg = Tensor.image(w, h, format=PixelFormat.Rgba, access="readwrite")
     converter.convert(bg_native, bg)
     seg = np.fromfile("testdata/yolov8_seg_crop_76x55.bin", dtype=np.uint8).reshape(
@@ -151,7 +149,7 @@ def test_render():
     expected_gl = load_image("testdata/output_render_gl.jpg", "RGBA")
     expected_cpu = load_image("testdata/output_render_cpu.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
+        img = np.asarray(m.numpy())
         # Threshold 0.95: GPU smoothstep anti-aliasing at mask edges produces
         # small differences across platforms (x86 Mesa vs Vivante GC7000UL),
         # and the background now arrives via an NV12->RGBA conversion that
@@ -167,12 +165,12 @@ def test_rgb_resize(monkeypatch):
     monkeypatch.setenv("EDGEFIRST_COLORIMETRY", "exact")
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     with dst.map() as m:
-        n = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
+        n = np.asarray(m.numpy())
         expected = load_image("testdata/zidane.jpg", "RGBA", resize=(640, 640))
         # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
@@ -184,7 +182,7 @@ def test_rgba_to_rgb(monkeypatch):
     w, h = _image_size("testdata/zidane.jpg")
     # Decode the JPEG to native NV12, then convert to RGB (3-channel) output.
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
     converter = ImageProcessor()
     dst = converter.create_image(w, h, PixelFormat.Rgb, access="readwrite")
     # Whole-image convert (the former Rect(0,0,w,h) was a no-op crop; the
@@ -192,7 +190,7 @@ def test_rgba_to_rgb(monkeypatch):
     converter.convert(src, dst, Rotation.Rotate0, Flip.NoFlip)
 
     with dst.map() as m:
-        n = np.array(m.numpy()).reshape((dst.height, dst.width, 3))
+        n = np.asarray(m.numpy())
         expected = load_image("testdata/zidane.jpg", "RGB")
         # JFIF (BT.601 full) NV12->RGB matches PIL's JPEG decode; 0.98 holds.
         assert calculate_similarity_rms_u8(n, expected) > 0.98
@@ -215,7 +213,7 @@ def test_decode_native_nv16_nv24(fixture, fmt):
     w, h = _image_size(fixture)
     src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
-    info = src.decode_image_file(fixture)
+    info = decode_file_into(src, fixture)
     # The decoder reports (and configures) the native semi-planar format.
     assert info.format == fmt
     assert (info.width, info.height) == (w, h)
@@ -262,7 +260,7 @@ def test_decode_native_odd_dimensions(fixture, fmt):
 
     src = Tensor.image(w, h, format=fmt, access="readwrite")
     assert src.format == fmt
-    info = src.decode_image_file(fixture)
+    info = decode_file_into(src, fixture)
     # The decoder selects + configures the native format and keeps the true
     # (odd) logical dimensions — no even-rounding leaks into the reported size.
     assert info.format == fmt
@@ -287,7 +285,7 @@ def test_set_output_format_fused_rgb():
     """set_output_format(PixelFormat.Rgb) fuses colour conversion into the
     JPEG MCU write stage for a 4:4:4 source; the decoder reports Rgb
     directly instead of the native Nv24, and pixels match PIL's decode."""
-    import edgefirst_hal as hal
+    import edgefirst.codec as hal
 
     fixture = "testdata/zidane_444.jpg"
     if not os.path.exists(fixture):
@@ -296,7 +294,7 @@ def test_set_output_format_fused_rgb():
     hal.set_output_format(PixelFormat.Rgb)
     try:
         src = Tensor.image(w, h, format=PixelFormat.Rgb, access="readwrite")
-        info = src.decode_image_file(fixture)
+        info = decode_file_into(src, fixture)
         assert info.format == PixelFormat.Rgb
         assert (info.width, info.height) == (w, h)
         n = np.zeros((h, w, 3), dtype=np.uint8)
@@ -313,13 +311,13 @@ def test_set_dct_method_fast_decodes():
     still succeeds and reports the same native format and dimensions as the
     default Accurate kernel (accuracy is measured on-target, see
     CHANGELOG.md)."""
-    import edgefirst_hal as hal
+    import edgefirst.codec as hal
 
     w, h = _image_size("testdata/zidane.jpg")
     hal.set_dct_method(hal.DctMethod.Fast)
     try:
         src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-        info = src.decode_image_file("testdata/zidane.jpg")
+        info = decode_file_into(src, "testdata/zidane.jpg")
     finally:
         hal.set_dct_method(hal.DctMethod.Accurate)
     assert info.format == PixelFormat.Nv12
@@ -328,7 +326,7 @@ def test_set_dct_method_fast_decodes():
 
 def test_is_v4l2_available_returns_bool():
     """is_v4l2_available() must be callable and return a bool (True or False)."""
-    import edgefirst_hal as hal
+    import edgefirst.codec as hal
 
     assert isinstance(hal.is_v4l2_available(), bool)
 
@@ -352,10 +350,10 @@ def test_is_v4l2_available_returns_bool():
 def _dma_image_or_skip(w, h, fmt):
     """Allocate a DMA-backed image tensor, or skip when DMA is unavailable."""
     try:
-        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMA, access="readwrite")
+        t = Tensor.image(w, h, format=fmt, mem=TensorMemory.DMABUF, access="readwrite")
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
-    if t.memory != TensorMemory.DMA:
+    if t.memory != TensorMemory.DMABUF:
         pytest.skip("DMA requested but backend substituted another memory type")
     return t
 
@@ -468,21 +466,24 @@ def test_enum_cmp():
 )
 def test_from_fd_dma():
     try:
-        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMA)
+        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
-    tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMA)
+    tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.DMABUF)
     with tensor.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8).fill(233)
+        np.asarray(m.numpy()).fill(233)
 
     fd = tensor.fd
+    # finally, not `except Exception` -- the old form caught the AssertionError
+    # below and closed the fd, so a wrong-data failure reported as a PASS. It
+    # also never closed the fd on success.
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(720, 1280, 4)
+            data = np.asarray(m.numpy())
             assert (data == 233).all()
-    except Exception:
+    finally:
         os.close(fd)
 
 
@@ -494,15 +495,18 @@ def test_from_fd_shm():
 
     tensor = Tensor([720, 1280, 4], dtype="uint8", mem=TensorMemory.SHM)
     with tensor.map() as m:
-        np.frombuffer(m.numpy(), dtype=np.uint8).fill(233)
+        np.asarray(m.numpy()).fill(233)
 
     fd = tensor.fd
+    # finally, not `except Exception` -- the old form caught the AssertionError
+    # below and closed the fd, so a wrong-data failure reported as a PASS. It
+    # also never closed the fd on success.
     try:
         img = Tensor.from_fd(fd, [720, 1280, 4], dtype="uint8")
         with img.map() as m:
-            data = np.frombuffer(m.numpy(), dtype=np.uint8).reshape(720, 1280, 4)
+            data = np.asarray(m.numpy())
             assert (data == 233).all()
-    except Exception:
+    finally:
         os.close(fd)
 
 
@@ -516,8 +520,8 @@ def test_create_image():
 
     # Image should be mappable
     with img.map() as m:
-        data = np.frombuffer(m.numpy(), dtype=np.uint8)
-        assert len(data) == 320 * 240 * 4
+        data = np.asarray(m.numpy())
+        assert data.size == 320 * 240 * 4
 
 
 def test_create_image_formats():
@@ -533,8 +537,8 @@ def test_create_image_formats():
         assert img.height == 120
         assert img.format == fmt
         with img.map() as m:
-            data = np.frombuffer(m.numpy(), dtype=np.uint8)
-            assert len(data) == 160 * 120 * channels
+            data = np.asarray(m.numpy())
+            assert data.size == 160 * 120 * channels
 
 
 def test_create_image_dtype_i8():
@@ -551,7 +555,7 @@ def test_create_image_dtype_i8():
     # Convert into i8 destination should succeed
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
     dst = converter.create_image(
         640, 640, PixelFormat.Rgb, dtype="int8", access="readwrite"
     )
@@ -565,7 +569,7 @@ def test_create_image_convert():
     # Load a source image normally (native NV12 from the JPEG)
     w, h = _image_size("testdata/zidane.jpg")
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
 
     # Create destination via create_image (may use PBO, DMA, or Mem)
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
@@ -594,12 +598,11 @@ def test_create_image_roundtrip():
     # Create source via create_image and fill it
     src = converter.create_image(640, 480, PixelFormat.Rgba, access="readwrite")
     with src.map() as m:
-        data = np.frombuffer(m.numpy(), dtype=np.uint8).copy()
-        # Fill with a gradient pattern
-        data[:] = np.tile(np.arange(256, dtype=np.uint8), len(data) // 256 + 1)[
-            : len(data)
+        arr = np.asarray(m.numpy())
+        pattern = np.tile(np.arange(256, dtype=np.uint8), arr.size // 256 + 1)[
+            : arr.size
         ]
-        m.numpy()[:] = data
+        arr.flat[:] = pattern
 
     # Create destination via create_image
     dst = converter.create_image(320, 240, PixelFormat.Rgba, access="readwrite")
@@ -609,7 +612,7 @@ def test_create_image_roundtrip():
 
     # Verify destination has data (not zeros)
     with dst.map() as m:
-        result = np.frombuffer(m.numpy(), dtype=np.uint8)
+        result = np.asarray(m.numpy())
         assert result.any(), "Destination is all zeros after roundtrip convert"
 
 
@@ -655,7 +658,7 @@ def test_import_image_chroma_with_packed_format():
 def test_import_image_dma_success():
     """import_image succeeds with a real DMA-BUF fd (skipped if DMA unavailable)."""
     try:
-        src = Tensor([480, 640, 4], dtype="uint8", mem=TensorMemory.DMA)
+        src = Tensor([480, 640, 4], dtype="uint8", mem=TensorMemory.DMABUF)
     except RuntimeError:
         pytest.skip("DMA allocation not available on this platform")
     fd = src.fd
@@ -675,7 +678,7 @@ def test_draw_decoded_masks_empty():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     bg_native = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    bg_native.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(bg_native, "testdata/giraffe.jpg")
     bg = Tensor.image(w, h, format=PixelFormat.Rgba, access="readwrite")
     converter.convert(bg_native, bg)
     dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
@@ -692,7 +695,7 @@ def test_draw_decoded_masks_empty():
     expected = np.zeros((h, w, 4), dtype=np.uint8)
     bg.normalize_to_numpy(expected)
     with dst.map() as m:
-        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
+        img = np.asarray(m.numpy())
         assert calculate_similarity_rms_u8(img, expected) > 0.99
 
 
@@ -701,7 +704,7 @@ def test_draw_decoded_masks_multiple_boxes():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(src, "testdata/giraffe.jpg")
     dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     converter.draw_decoded_masks(
@@ -721,7 +724,7 @@ def test_draw_decoded_masks_multiple_boxes():
     # but verify it didn't crash and image was modified.
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
+        img = np.asarray(m.numpy())
         # The image should be different from original (boxes drawn on it)
         assert calculate_similarity_rms_u8(img, original) < 0.999
 
@@ -731,7 +734,7 @@ def test_draw_decoded_masks_instance_color_mode():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(src, "testdata/giraffe.jpg")
     dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
     # Two detections with same class but Instance coloring
@@ -748,7 +751,7 @@ def test_draw_decoded_masks_instance_color_mode():
     # Verify it didn't crash and image was modified
     original = load_image("testdata/giraffe.jpg", "RGBA")
     with dst.map() as m:
-        img = np.array(m.numpy()).reshape((dst.height, dst.width, 4))
+        img = np.asarray(m.numpy())
         assert calculate_similarity_rms_u8(img, original) < 0.999
 
 
@@ -757,7 +760,7 @@ def test_draw_decoded_masks_with_opacity():
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(src, "testdata/giraffe.jpg")
     dst_full = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst_full)
     dst_half = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
@@ -804,16 +807,16 @@ outputs:
     data[0, 0, :] = [0.1, 0.1, 0.3, 0.3, 0.9, 2.0]  # box + score + class
     model_output_tensor = Tensor([1, 10, 6], dtype="float32")
     with model_output_tensor.map() as m:
-        buf = np.frombuffer(m.numpy(), dtype=np.float32).reshape((1, 10, 6))
+        buf = np.asarray(m.numpy())
         buf[:] = data
 
     w, h = _image_size("testdata/giraffe.jpg")
     converter = ImageProcessor()
     src = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/giraffe.jpg")
+    decode_file_into(src, "testdata/giraffe.jpg")
     dst = converter.create_image(w, h, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
-    result = converter.draw_masks(decoder, [model_output_tensor], dst)
+    result = decoder.draw_onto(converter, [model_output_tensor], dst)
 
     # Should return (boxes, scores, classes)
     assert len(result) == 3
@@ -825,12 +828,13 @@ outputs:
 
 def test_decode_image_from_bytes():
     """Test decode_image with raw bytes into oversized tensor (strided)."""
-    data = open("testdata/zidane.jpg", "rb").read()
+    with open("testdata/zidane.jpg", "rb") as fh:
+        data = fh.read()
     # Color JPEG decodes to its native NV12; the tensor is reconfigured to match.
     tensor = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
-    info: ImageInfo = tensor.decode_image(data)
+    info: ImageInfo = decode_into(tensor, data)
     assert info.width == 1280
     assert info.height == 720
     assert info.format == PixelFormat.Nv12
@@ -857,16 +861,23 @@ def test_decode_image_reuse():
     )
 
     # First decode: zidane.jpg (1280x720) — native NV12, strided into 1920x1080
-    info1 = tensor.decode_image_file("testdata/zidane.jpg")
+    info1 = decode_file_into(tensor, "testdata/zidane.jpg")
     assert info1.width == 1280
     assert info1.height == 720
     assert info1.format == PixelFormat.Nv12
+    # `tensor` crosses packages (edgefirst.image.Tensor into edgefirst.codec's
+    # decode_file_into): the foreign write-back must leave it in the same
+    # state a same-module decode would, not just report it via ImageInfo.
+    assert tensor.format == PixelFormat.Nv12
+    assert (tensor.width, tensor.height) == (1280, 720)
 
     # Second decode: grey.jpg (1024x681) — native Grey, reconfigured in place
-    info2 = tensor.decode_image_file("testdata/grey.jpg")
+    info2 = decode_file_into(tensor, "testdata/grey.jpg")
     assert info2.width == 1024
     assert info2.height == 681
     assert info2.format == PixelFormat.Grey
+    assert tensor.format == PixelFormat.Grey
+    assert (tensor.width, tensor.height) == (1024, 681)
 
 
 def test_decode_image_native_format():
@@ -874,7 +885,7 @@ def test_decode_image_native_format():
     tensor = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
-    info = tensor.decode_image_file("testdata/zidane.jpg")
+    info = decode_file_into(tensor, "testdata/zidane.jpg")
     assert info.width == 1280
     assert info.height == 720
     assert info.format == PixelFormat.Nv12
@@ -885,7 +896,7 @@ def test_decode_image_grey():
     tensor = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Grey, access="readwrite"
     )
-    info = tensor.decode_image_file("testdata/grey.jpg")
+    info = decode_file_into(tensor, "testdata/grey.jpg")
     assert info.width == 1024
     assert info.height == 681
     assert info.format == PixelFormat.Grey
@@ -899,7 +910,7 @@ def test_decode_image_pipeline():
     # image. Decode emits native NV12; convert produces the RGBA result.
     w, h = _image_size("testdata/zidane.jpg")
     src = converter.create_image(w, h, PixelFormat.Nv12, access="readwrite")
-    src.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(src, "testdata/zidane.jpg")
 
     dst = converter.create_image(640, 640, PixelFormat.Rgba, access="readwrite")
     converter.convert(src, dst)
@@ -920,7 +931,7 @@ def test_decode_image_exact_size():
     # the NV12 luma plane is one byte per pixel, so an exact-size tensor has
     # row_stride == width (no padding).
     tensor = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    info = tensor.decode_image_file("testdata/zidane.jpg")
+    info = decode_file_into(tensor, "testdata/zidane.jpg")
     assert info.width == w
     assert info.height == h
     assert info.format == PixelFormat.Nv12
@@ -934,7 +945,7 @@ def test_decode_image_exact_size_png():
 
     # zidane.png is a 3-channel RGB PNG; decode emits its native RGB format.
     tensor = Tensor.image(w, h, format=PixelFormat.Rgb, access="readwrite")
-    info = tensor.decode_image_file("testdata/zidane.png")
+    info = decode_file_into(tensor, "testdata/zidane.png")
     assert info.width == w
     assert info.height == h
     assert info.format == PixelFormat.Rgb
@@ -945,21 +956,21 @@ def test_decode_image_tensor_too_small_width():
     """Decoding into a tensor narrower than the image should raise an error."""
     tensor = Tensor.image(320, 720, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Ww]idth|[Ss]tride"):
-        tensor.decode_image_file("testdata/zidane.jpg")
+        decode_file_into(tensor, "testdata/zidane.jpg")
 
 
 def test_decode_image_tensor_too_small_height():
     """Decoding into a tensor shorter than the image should raise an error."""
     tensor = Tensor.image(1280, 360, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError, match="[Cc]apacity|[Ss]ize|[Hh]eight|[Rr]ow"):
-        tensor.decode_image_file("testdata/zidane.jpg")
+        decode_file_into(tensor, "testdata/zidane.jpg")
 
 
 def test_decode_image_tensor_too_small_both():
     """Decoding into a tensor smaller in both dimensions should raise an error."""
     tensor = Tensor.image(100, 100, format=PixelFormat.Nv12, access="readwrite")
     with pytest.raises(RuntimeError):
-        tensor.decode_image_file("testdata/zidane.jpg")
+        decode_file_into(tensor, "testdata/zidane.jpg")
 
 
 def test_decode_image_strided_pixel_correctness():
@@ -972,24 +983,22 @@ def test_decode_image_strided_pixel_correctness():
     # Exact-size decode (no stride padding) — luma stride == width.
     w, h = _image_size("testdata/zidane.jpg")
     exact = Tensor.image(w, h, format=PixelFormat.Nv12, access="readwrite")
-    exact.decode_image_file("testdata/zidane.jpg")
+    decode_file_into(exact, "testdata/zidane.jpg")
     with exact.map() as m:
-        exact_y = np.frombuffer(m.numpy(), dtype=np.uint8)[: w * h].reshape(h, w).copy()
+        arr = np.asarray(memoryview(m))
+        exact_y = np.array(arr[:h, :w], copy=True)
 
     # Oversized decode (strided — the common real-world path).
     big = Tensor.image(
         MAX_SRC_W, MAX_SRC_H, format=PixelFormat.Nv12, access="readwrite"
     )
-    info = big.decode_image_file("testdata/zidane.jpg")
+    info = decode_file_into(big, "testdata/zidane.jpg")
 
     # Extract the decoded luma sub-region via map() and the reported row stride.
     with big.map() as m:
-        raw = np.frombuffer(m.numpy(), dtype=np.uint8)
-        stride = info.row_stride
-        big_y = np.zeros((h, w), dtype=np.uint8)
-        for row in range(h):
-            start = row * stride
-            big_y[row] = raw[start : start + w]
+        arr = np.asarray(memoryview(m))
+        assert arr.strides[0] == info.row_stride
+        big_y = np.array(arr[:h, :w], copy=True)
 
     # Pixels must match exactly — strided decode must not corrupt data.
     assert np.array_equal(exact_y, big_y), (
@@ -1050,9 +1059,9 @@ def test_from_numpy_grey_unaligned_width_stride_bug(width, height):
     # exits; touching it afterwards (including via pytest saferepr on
     # assertion failure) segfaults.
     with img.map() as m:
-        raw = np.frombuffer(m.numpy(), dtype=np.uint8)
-        assert len(raw) == width * height, (
-            f"mapped view length {len(raw)} != Image.size {width * height}"
+        raw = np.asarray(m.numpy())
+        assert raw.size == width * height, (
+            f"mapped view size {raw.size} != Image.size {width * height}"
         )
 
 

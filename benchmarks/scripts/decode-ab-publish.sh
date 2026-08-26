@@ -11,7 +11,7 @@
 # Build/run provenance for each host is captured to provenance.txt.
 #
 # Usage:
-#   EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
+#   EDGEFIRST_BENCH_ORIN_FALLBACK=<ssh-host> \
 #     ./benchmarks/scripts/decode-ab-publish.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 #
 # Env:

@@ -69,8 +69,8 @@ fn attach_per_tensor_quant_by_shape(
         if t.shape() == expected_shape {
             // Try to attach to integer variants; silently skip floats.
             macro_rules! try_attach {
-                ($variant:ident) => {
-                    if let TensorDyn::$variant(inner) = &mut **t {
+                ($ty:ty) => {
+                    if let Some(inner) = t.as_typed_mut::<$ty>() {
                         let tq = TQ::per_tensor(scale, zp);
                         inner.set_quantization(tq).map_err(|e| {
                             DecoderError::Internal(format!(
@@ -81,10 +81,10 @@ fn attach_per_tensor_quant_by_shape(
                     }
                 };
             }
-            try_attach!(I8);
-            try_attach!(U8);
-            try_attach!(I16);
-            try_attach!(U16);
+            try_attach!(i8);
+            try_attach!(u8);
+            try_attach!(i16);
+            try_attach!(u16);
             // Float / other dtypes silently skipped.
             return Ok(());
         }
@@ -111,7 +111,7 @@ mod tests {
         // The yolov8n schema's first box child has shape [1, 80, 80, 64].
         let t = Tensor::<i8>::new(&[1, 80, 80, 64], Some(TensorMemory::Mem), None).unwrap();
         assert!(t.quantization().is_none(), "fresh tensor has no quant");
-        let mut td = TensorDyn::I8(t);
+        let mut td: TensorDyn = t.into();
         let mut tensors: Vec<&mut TensorDyn> = vec![&mut td];
 
         apply_schema_quant(&schema, &mut tensors).unwrap_err();
@@ -140,7 +140,11 @@ mod tests {
         ];
         let mut owned: Vec<TensorDyn> = shapes_int8
             .iter()
-            .map(|s| TensorDyn::I8(Tensor::<i8>::new(s, Some(TensorMemory::Mem), None).unwrap()))
+            .map(|s| {
+                Tensor::<i8>::new(s, Some(TensorMemory::Mem), None)
+                    .unwrap()
+                    .into()
+            })
             .collect();
         let mut refs: Vec<&mut TensorDyn> = owned.iter_mut().collect();
 
@@ -148,7 +152,7 @@ mod tests {
 
         // All 10 tensors should now carry quant.
         for td in &owned {
-            if let TensorDyn::I8(t) = td {
+            if let Some(t) = td.as_typed::<i8>() {
                 assert!(
                     t.quantization().is_some(),
                     "tensor missing quant after apply"
@@ -169,8 +173,9 @@ mod tests {
             axis: None,
             dtype: Some(DType::Int8),
         };
-        let mut td =
-            TensorDyn::I8(Tensor::<i8>::new(&[1, 2, 3], Some(TensorMemory::Mem), None).unwrap());
+        let mut td: TensorDyn = Tensor::<i8>::new(&[1, 2, 3], Some(TensorMemory::Mem), None)
+            .unwrap()
+            .into();
         let mut refs: Vec<&mut TensorDyn> = vec![&mut td];
 
         let err = attach_per_tensor_quant_by_shape(&mut refs, &[1, 2, 3], &bad_q)
@@ -192,7 +197,7 @@ mod tests {
         // Build float tensors instead of int8.
         let shape = vec![1, 80, 80, 64];
         let t = Tensor::<f32>::new(&shape, Some(TensorMemory::Mem), None).unwrap();
-        let mut td = TensorDyn::F32(t);
+        let mut td: TensorDyn = t.into();
         let mut refs: Vec<&mut TensorDyn> = vec![&mut td];
 
         // Float tensors don't take quant; the helper returns Ok and the schema
@@ -202,10 +207,6 @@ mod tests {
         let r = apply_schema_quant(&schema, &mut refs);
         assert!(r.is_err());
         // What we're really testing: float tensors don't crash.
-        if let TensorDyn::F32(_) = &td {
-            // OK — still F32, no panic
-        } else {
-            panic!("unexpected dtype");
-        }
+        assert_eq!(td.dtype(), edgefirst_tensor::DType::F32, "unexpected dtype");
     }
 }

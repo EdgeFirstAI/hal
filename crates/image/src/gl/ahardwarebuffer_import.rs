@@ -143,33 +143,36 @@ pub(super) unsafe fn create_ahardwarebuffer_eglimage(
         tracing::trace_span!("image.convert.gl.egl_import", target = "ahardwarebuffer").entered();
     let fns = fns(egl)?;
 
-    let client_buffer_raw = (fns.get_native_client_buffer)(buffer_ptr);
-    if client_buffer_raw.is_null() {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "eglGetNativeClientBufferANDROID returned NULL (EGL error {:?})",
-            egl.get_error()
-        ))));
-    }
+    unsafe {
+        let client_buffer_raw = (fns.get_native_client_buffer)(buffer_ptr);
+        if client_buffer_raw.is_null() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "eglGetNativeClientBufferANDROID returned NULL (EGL error {:?})",
+                egl.get_error()
+            ))));
+        }
 
-    // EGL_IMAGE_PRESERVED = TRUE: the buffer's existing contents MUST
-    // survive the import (see module docs — absence is silent garbage).
-    // EGLint-typed per the KHR signature — see the FnCreateImageKHR note.
-    let attribs: [egl::Int; 3] = [egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE];
-    let image_raw = (fns.create_image_khr)(
-        display.as_ptr(),
-        egl::NO_CONTEXT,
-        EGL_NATIVE_BUFFER_ANDROID,
-        client_buffer_raw,
-        attribs.as_ptr(),
-    );
-    if image_raw == egl::NO_IMAGE {
-        return Err(Error::Io(std::io::Error::other(format!(
-            "eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) returned NO_IMAGE (EGL error {:?})",
-            egl.get_error()
-        ))));
+        // EGL_IMAGE_PRESERVED = TRUE: the buffer's existing contents MUST
+        // survive the import (see module docs — absence is silent garbage).
+        // EGLint-typed per the KHR signature — see the FnCreateImageKHR note.
+        let attribs: [egl::Int; 3] = [egl::IMAGE_PRESERVED, egl::TRUE as egl::Int, egl::NONE];
+        let image_raw = (fns.create_image_khr)(
+            display.as_ptr(),
+            egl::NO_CONTEXT,
+            EGL_NATIVE_BUFFER_ANDROID,
+            client_buffer_raw,
+            attribs.as_ptr(),
+        );
+        if image_raw == egl::NO_IMAGE {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID) returned NO_IMAGE (EGL error {:?})",
+                egl.get_error()
+            ))));
+        }
+        // SAFETY: image_raw is a valid, non-NO_IMAGE EGLImage per the check above;
+        // the enclosing `unsafe` block is the one that covers `from_ptr`.
+        Ok(egl::Image::from_ptr(image_raw))
     }
-    // SAFETY: image_raw is a valid, non-NO_IMAGE EGLImage per the check above.
-    Ok(egl::Image::from_ptr(image_raw))
 }
 
 /// Destroy an EGLImage created by [`create_ahardwarebuffer_eglimage`].

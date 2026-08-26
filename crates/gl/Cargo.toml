@@ -6,6 +6,7 @@ authors = [
     "Au-Zone Technologies <support@au-zone.com>",
 ]
 edition = "2021"
+rust-version.workspace = true
 description = "Minimal OpenGL ES bindings — a trimmed, maintained fork of `gls`"
 documentation = "https://docs.rs/edgefirst-gl"
 repository.workspace = true
@@ -13,6 +14,9 @@ readme = "README.md"
 keywords = ["opengl", "opengles", "graphics", "gl"]
 license = "MIT OR Apache-2.0"
 build = "build.rs"
+
+[lints]
+workspace = true
 
 [lib]
 name = "edgefirst_gl"

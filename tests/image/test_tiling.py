@@ -9,15 +9,13 @@ The grid geometry and config validation are pure (no GPU). The
 
 import numpy as np
 import pytest
-
-from edgefirst_hal import (
+from edgefirst.image import (
     Fit,
     ImageProcessor,
     PixelFormat,
     TilingConfig,
     tile_grid,
 )
-
 
 # --- grid geometry (pure, no GPU) ----------------------------------------
 
@@ -59,11 +57,11 @@ def test_tile_grid_frame_smaller_than_tile_single():
 def test_tile_grid_rejects_bad_config():
     # Same validation as TilingConfig / the C API: a degenerate overlap or tile
     # size raises instead of generating an enormous grid.
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
         tile_grid(1920, 1080, 640, 640, 1.0)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
         tile_grid(1920, 1080, 640, 640, -0.1)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="tile size must be non-zero"):
         tile_grid(1920, 1080, 0, 640, 0.2)
 
 
@@ -109,15 +107,15 @@ def test_plan_tiles_counts_match_grid():
 
 def test_plan_tiles_rejects_bad_overlap():
     proc = ImageProcessor()
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
         proc.plan_tiles(1920, 1080, TilingConfig(640, 640, overlap=1.0))
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="overlap_ratio must be in"):
         proc.plan_tiles(1920, 1080, TilingConfig(640, 640, overlap=-0.1))
 
 
 def test_alloc_tile_batch_rejects_zero_tile_size():
     proc = ImageProcessor()
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="tile size must be non-zero"):
         proc.alloc_tile_batch(4, TilingConfig(0, 640))
 
 
@@ -151,8 +149,8 @@ def test_tile_into_round_trip():
     # buffer may be row-padded); otherwise this backend can't run the render.
     try:
         with src.map() as m:
-            buf = np.frombuffer(m.numpy(), dtype=np.uint8)
-            assert len(buf) >= 128 * 64 * 4
+            buf = np.asarray(m.numpy())
+            assert buf.size >= 128 * 64 * 4
     except (RuntimeError, NotImplementedError) as e:
         pytest.skip(f"source not CPU-mappable: {e}")
 

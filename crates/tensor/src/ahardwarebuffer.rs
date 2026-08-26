@@ -7,7 +7,7 @@
 //! on Linux and `IoSurfaceTensor<T>` on macOS/iOS: a zero-copy GPU↔CPU
 //! buffer that the OpenGL backend imports directly via
 //! `EGL_ANDROID_image_native_buffer` (`eglGetNativeClientBufferANDROID` →
-//! `eglCreateImageKHR`). All three fit into the `TensorMemory::Dma` slot —
+//! `eglCreateImageKHR`). All three fit into the `TensorMemory::DmaBuf` slot —
 //! the variant name is shared, the inner storage type differs per platform.
 //!
 //! ## Bindings approach
@@ -73,13 +73,11 @@
 
 use crate::{
     ahardwarebuffer_layout::{
-        checked_shape_bytes, desc_layout, image_format_and_bpe, lock_usage_for,
-        AHardwareBufferDesc, LockDecision, FORMAT_BLOB, USAGE_CPU_READ_MASK, USAGE_CPU_READ_OFTEN,
-        USAGE_CPU_WRITE_MASK, USAGE_CPU_WRITE_OFTEN,
+        checked_shape_bytes, desc_layout, image_format_and_bpe, AHardwareBufferDesc, FORMAT_BLOB,
+        USAGE_CPU_READ_MASK, USAGE_CPU_READ_OFTEN, USAGE_CPU_WRITE_MASK, USAGE_CPU_WRITE_OFTEN,
     },
     error::{Error, Result},
-    packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMap, TensorMapTrait,
-    TensorMemory, TensorTrait,
+    packed_rgba16f_layout, BufferIdentity, DType, PixelFormat, TensorMemory, TensorTrait,
 };
 use log::trace;
 use num_traits::Num;
@@ -87,8 +85,6 @@ use std::{
     ffi::c_void,
     fmt,
     marker::PhantomData,
-    ops::{Deref, DerefMut},
-    ptr::NonNull,
     sync::{Arc, Mutex},
 };
 
@@ -199,43 +195,26 @@ fn ahardwarebuffer_get_id(buffer: AHardwareBufferRef) -> Option<u64> {
     (unsafe { get_id(buffer, &mut id) } == 0).then_some(id)
 }
 
-/// Resolve the [`BufferIdentity`] for `buffer`, interning on the
-/// system's `AHardwareBuffer_getId` so every wrap of the same
-/// allocation (CameraX/ImageReader re-wraps, export → re-import) shares
-/// one identity — and therefore hits the GL backend's EGLImage import
-/// cache instead of re-importing per frame.
+/// Derive the [`BufferIdentity`] for `buffer`.
 ///
-/// The intern KEY is the system id; the identity's own `id` is still
-/// minted from the process-wide counter (id-space collision with
-/// non-AHB identities is impossible). Reuse requires the recorded guard
-/// to be live — a live guard means a tensor still holds its
-/// acquire-reference, so the system cannot have recycled the key (see
-/// `IdentityInternTable`). Without `getId` (API 26–30) every wrap gets
-/// a fresh identity, exactly the pre-interning behavior.
-fn interned_identity(buffer: &OwnedAHardwareBuffer) -> BufferIdentity {
-    let Some(key) = ahardwarebuffer_get_id(buffer.as_ptr()) else {
-        return BufferIdentity::new();
-    };
-    static INTERN: std::sync::LazyLock<Mutex<crate::ahardwarebuffer_layout::IdentityInternTable>> =
-        std::sync::LazyLock::new(|| {
-            Mutex::new(crate::ahardwarebuffer_layout::IdentityInternTable::new())
-        });
-    let mut table = match INTERN.lock() {
-        Ok(t) => t,
-        // A poisoned table only means some thread panicked mid-resolve;
-        // the map itself is still structurally sound (resolve never
-        // leaves partial state) — keep interning rather than degrading
-        // every future wrap to fresh identities.
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let (id, guard, reused) = table.resolve(key, || {
-        let fresh = BufferIdentity::new();
-        (fresh.id(), fresh.guard_arc())
-    });
-    if reused {
-        trace!("AHardwareBuffer getId={key:#x} interned → identity {id} (EGL cache hit)");
-    }
-    BufferIdentity::from_parts(id, guard)
+/// API 31+: derive from `AHardwareBuffer_getId`, the system's own id for the
+/// allocation. It is stable across every wrap of the same buffer (CameraX/
+/// ImageReader re-wraps, export → re-import), so two independently-linked
+/// copies of this crate agree on it — without this, a re-wrap crossing a
+/// library boundary would mint a fresh identity and the GL backend's
+/// EGLImage import cache would miss (and re-import) every frame instead of
+/// reusing the bound import.
+///
+/// Pre-API-31: no system-wide id exists. The buffer POINTER is unique among
+/// live buffers in this process, which is all a per-process cache needs. A
+/// shared constant would give every pre-31 buffer the same identity and let
+/// the cache match one buffer's texture to another's — `derived` is
+/// `(kind << 56) ^ key`, so a constant key is a constant id.
+fn buffer_identity(buffer: &OwnedAHardwareBuffer) -> BufferIdentity {
+    crate::ahardwarebuffer_layout::identity_from_parts(
+        ahardwarebuffer_get_id(buffer.as_ptr()),
+        buffer.as_ptr() as usize as u64,
+    )
 }
 
 /// The device's native tile-compression scheme, classified from the
@@ -284,6 +263,25 @@ pub(crate) struct OwnedAHardwareBuffer {
 /// the FFI lock, further concurrent maps of the same buffer (a parent
 /// tensor and its `view()` siblings share this handle) reuse the recorded
 /// base address, and only the last unmap issues the FFI unlock. Nested
+/// Keepalive holding an AHardwareBuffer's CPU lock for a [`HostPin`]'s life.
+///
+/// The NDK gives no address outside `AHardwareBuffer_lock`, so — as with a PBO
+/// — the lock IS the lifetime. Releasing here, when the last clone of the pin
+/// drops, reproduces `AHardwareBufferMap`'s unlock through `Arc`.
+// Staged for the HostView collapse (Plan 2b Task 4): constructed once
+// map_with migrates to HostView. Kept compiling and reviewable rather than
+// landing the whole collapse in one unverifiable change.
+#[allow(dead_code)]
+pub(crate) struct AhbMapLock {
+    buffer: OwnedAHardwareBuffer,
+}
+
+impl Drop for AhbMapLock {
+    fn drop(&mut self) {
+        self.buffer.unlock_shared();
+    }
+}
+
 /// maps reuse the live lock only when its usage direction covers theirs
 /// (the lock cannot be widened while held — see `lock_shared`).
 #[derive(Debug)]
@@ -359,29 +357,31 @@ impl OwnedAHardwareBuffer {
     ///
     /// `ptr` must be a valid live AHardwareBuffer pointer.
     unsafe fn from_external(ptr: AHardwareBufferRef) -> Result<(Self, AHardwareBufferDesc)> {
-        if ptr.is_null() {
-            return Err(Error::InvalidArgument(
-                "from_external: null AHardwareBuffer".into(),
-            ));
+        unsafe {
+            if ptr.is_null() {
+                return Err(Error::InvalidArgument(
+                    "from_external: null AHardwareBuffer".into(),
+                ));
+            }
+            AHardwareBuffer_acquire(ptr);
+            let mut desc = AHardwareBufferDesc {
+                width: 0,
+                height: 0,
+                layers: 0,
+                format: 0,
+                usage: 0,
+                stride: 0,
+                rfu0: 0,
+                rfu1: 0,
+            };
+            AHardwareBuffer_describe(ptr, &mut desc);
+            Ok((
+                Self {
+                    inner: Arc::new(AhbHandle::new(ptr)),
+                },
+                desc,
+            ))
         }
-        AHardwareBuffer_acquire(ptr);
-        let mut desc = AHardwareBufferDesc {
-            width: 0,
-            height: 0,
-            layers: 0,
-            format: 0,
-            usage: 0,
-            stride: 0,
-            rfu0: 0,
-            rfu1: 0,
-        };
-        AHardwareBuffer_describe(ptr, &mut desc);
-        Ok((
-            Self {
-                inner: Arc::new(AhbHandle::new(ptr)),
-            },
-            desc,
-        ))
     }
 
     pub(crate) fn as_ptr(&self) -> AHardwareBufferRef {
@@ -487,6 +487,32 @@ where
     pub(crate) view_offset: usize,
 }
 
+impl<T> AHardwareBufferTensor<T>
+where
+    T: Num + Clone + fmt::Debug + Send + Sync,
+{
+    /// Acquire a host address valid for as long as the returned pin lives.
+    ///
+    /// Private on purpose: this is NOT `pin_host`, which refuses
+    /// AHardwareBuffer precisely because the address cannot outlive the lock.
+    #[allow(dead_code)]
+    pub(crate) fn scoped_pin<'a>(&self, access: crate::CpuAccess) -> Result<crate::pin::HostPin<'a>>
+    where
+        T: 'a,
+    {
+        let base = self.buffer.lock_shared(cpu_usage_bits_for(access))?;
+        let data = unsafe { (base as *mut u8).add(self.view_offset) };
+        let len = self.buf_size.saturating_sub(self.view_offset);
+        Ok(crate::pin::HostPin::new(
+            std::sync::Arc::new(AhbMapLock {
+                buffer: self.buffer.clone(),
+            }),
+            data,
+            len,
+        ))
+    }
+}
+
 impl<T> TensorTrait<T> for AHardwareBufferTensor<T>
 where
     T: Num + Clone + fmt::Debug + Send + Sync,
@@ -516,7 +542,7 @@ where
         // Unified variant: Android reports Dma, same as Linux DMA-BUF and
         // macOS IOSurface. The variant name is shared; the inner storage
         // type differs per platform.
-        TensorMemory::Dma
+        TensorMemory::DmaBuf
     }
 
     fn name(&self) -> String {
@@ -543,19 +569,13 @@ where
         Ok(())
     }
 
-    fn map_with(&self, access: crate::CpuAccess) -> Result<TensorMap<T>> {
+    fn map_with<'a>(&self, access: crate::CpuAccess) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
         let _span =
             tracing::trace_span!("tensor.map", memory = "ahardwarebuffer", ?access).entered();
-        let m = AHardwareBufferMap::new(
-            self.buffer.clone(),
-            self.shape.clone(),
-            self.buf_size,
-            self.cpu_usage,
-            self.view_offset,
-            access,
-            self.identity.id(),
-        )?;
-        Ok(TensorMap::HardwareBuffer(m))
+        self.map_inner(None, access)
     }
 
     fn buffer_identity(&self) -> &BufferIdentity {
@@ -673,7 +693,7 @@ where
 
         Ok(Self {
             name,
-            identity: interned_identity(&buffer),
+            identity: buffer_identity(&buffer),
             buffer,
             shape: shape.to_vec(),
             _marker: PhantomData,
@@ -822,7 +842,7 @@ where
 
         Ok(Self {
             name,
-            identity: interned_identity(&buffer),
+            identity: buffer_identity(&buffer),
             buffer,
             shape: shape.to_vec(),
             _marker: PhantomData,
@@ -863,43 +883,45 @@ where
         shape: &[usize],
         name: Option<&str>,
     ) -> Result<Self> {
-        let (buffer, desc) = OwnedAHardwareBuffer::from_external(buffer_ptr)?;
-        let (bytes_per_row, buf_size) = desc_layout(&desc).ok_or_else(|| {
-            Error::NotImplemented(format!(
-                "from_hardware_buffer: AHardwareBuffer format 0x{:x} has no linear CPU \
+        unsafe {
+            let (buffer, desc) = OwnedAHardwareBuffer::from_external(buffer_ptr)?;
+            let (bytes_per_row, buf_size) = desc_layout(&desc).ok_or_else(|| {
+                Error::NotImplemented(format!(
+                    "from_hardware_buffer: AHardwareBuffer format 0x{:x} has no linear CPU \
                  layout the HAL supports (multi-planar YUV import is a planned follow-up)",
-                desc.format
-            ))
-        })?;
+                    desc.format
+                ))
+            })?;
 
-        // Overflow-checked: the element product itself can wrap before a
-        // checked byte multiply would notice.
-        let requested = checked_shape_bytes::<T>(shape)?;
-        if requested > buf_size {
-            return Err(Error::InvalidShape(format!(
-                "from_hardware_buffer: shape requires {requested} bytes but the buffer only \
+            // Overflow-checked: the element product itself can wrap before a
+            // checked byte multiply would notice.
+            let requested = checked_shape_bytes::<T>(shape)?;
+            if requested > buf_size {
+                return Err(Error::InvalidShape(format!(
+                    "from_hardware_buffer: shape requires {requested} bytes but the buffer only \
                  has {buf_size} (shape={shape:?}, sizeof T={})",
-                std::mem::size_of::<T>(),
-            )));
-        }
+                    std::mem::size_of::<T>(),
+                )));
+            }
 
-        let name = match name {
-            Some(s) => s.to_owned(),
-            None => format!("ahardwarebuffer-imported-{}", uuid::Uuid::new_v4()),
-        };
-        Ok(Self {
-            name,
-            identity: interned_identity(&buffer),
-            buffer,
-            shape: shape.to_vec(),
-            _marker: PhantomData,
-            buf_size,
-            bytes_per_row,
-            physical_dims: (desc.width as usize, desc.height as usize),
-            cpu_usage: desc.usage & (USAGE_CPU_READ_MASK | USAGE_CPU_WRITE_MASK),
-            is_imported: true,
-            view_offset: 0,
-        })
+            let name = match name {
+                Some(s) => s.to_owned(),
+                None => format!("ahardwarebuffer-imported-{}", uuid::Uuid::new_v4()),
+            };
+            Ok(Self {
+                name,
+                identity: buffer_identity(&buffer),
+                buffer,
+                shape: shape.to_vec(),
+                _marker: PhantomData,
+                buf_size,
+                bytes_per_row,
+                physical_dims: (desc.width as usize, desc.height as usize),
+                cpu_usage: desc.usage & (USAGE_CPU_READ_MASK | USAGE_CPU_WRITE_MASK),
+                is_imported: true,
+                view_offset: 0,
+            })
+        }
     }
 
     /// Row pitch in bytes derived from the allocator-chosen `desc.stride`
@@ -931,22 +953,48 @@ where
     /// strided row iteration. The caller (`Tensor::map`) validates
     /// `byte_size <= buf_size` first. The lock yields the full buffer base
     /// address, so the strided view is genuinely zero-copy.
-    pub(crate) fn map_with_byte_size(
+    pub(crate) fn map_with_byte_size<'a>(
         &self,
         byte_size: usize,
         access: crate::CpuAccess,
-    ) -> Result<TensorMap<T>> {
-        let m = AHardwareBufferMap::new_with_byte_size(
-            self.buffer.clone(),
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        self.map_inner(Some(byte_size), access)
+    }
+
+    /// Shared map constructor. Keeps the window check the map types performed
+    /// and acquires the CPU lock through `scoped_pin`, whose keepalive unlocks
+    /// on drop.
+    fn map_inner<'a>(
+        &self,
+        byte_size_override: Option<usize>,
+        access: crate::CpuAccess,
+    ) -> Result<crate::view::HostView<'a, T>>
+    where
+        T: 'a,
+    {
+        let exposed = match byte_size_override {
+            Some(bytes) => bytes,
+            None => self.shape.iter().product::<usize>() * std::mem::size_of::<T>(),
+        };
+        let end = self
+            .view_offset
+            .checked_add(exposed)
+            .ok_or(Error::InvalidSize(exposed))?;
+        if end > self.buf_size {
+            return Err(Error::InsufficientCapacity {
+                needed: end,
+                capacity: self.buf_size,
+            });
+        }
+        Ok(crate::view::HostView::new(
+            self.scoped_pin(access)?,
             self.shape.clone(),
-            self.buf_size,
-            byte_size,
-            self.cpu_usage,
-            self.view_offset,
+            byte_size_override,
             access,
-            self.identity.id(),
-        )?;
-        Ok(TensorMap::HardwareBuffer(m))
+        ))
     }
 
     /// Raw AHardwareBuffer pointer for the GL backend
@@ -966,7 +1014,7 @@ where
 {
     /// Borrow the underlying AHardwareBuffer pointer for this tensor
     /// (Android only). Returns `Some(ptr)` when the tensor is backed by an
-    /// AHardwareBuffer (i.e. `TensorMemory::Dma` on Android), `None`
+    /// AHardwareBuffer (i.e. `TensorMemory::DmaBuf` on Android), `None`
     /// otherwise. The pointer is borrowed — its lifetime is tied to the
     /// tensor.
     pub fn hardware_buffer_ptr(&self) -> Option<*mut c_void> {
@@ -1030,264 +1078,6 @@ where
 // ---------------------------------------------------------------------------
 // AHardwareBufferMap — locked-for-CPU view.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    buffer: OwnedAHardwareBuffer,
-    shape: Vec<usize>,
-    base_ptr: NonNull<c_void>,
-    buf_size: usize,
-    /// When `Some(bytes)`, `as_slice()` exposes `bytes / sizeof(T)`
-    /// elements (the full row-padded buffer) instead of `shape.product()`.
-    /// Mirrors `DmaMap`/`IoSurfaceMap`: used for strided tensors so CPU
-    /// callers iterate rows via `effective_row_stride()` without running
-    /// past the locked region.
-    byte_size_override: Option<usize>,
-    _marker: PhantomData<T>,
-    locked: bool,
-    /// Whether the buffer's CPU usage includes a write flag. Writing
-    /// through a lock without CPU_WRITE is undefined behaviour per the
-    /// NDK contract, so the mutable accessors panic instead (a read-only
-    /// imported camera buffer maps fine for reading).
-    writable: bool,
-}
-
-// SAFETY: the locked base address stays valid until unlock, and
-// AHardwareBuffer itself is thread-safe (same contract as `IoSurfaceMap`).
-unsafe impl<T> Send for AHardwareBufferMap<T> where T: Num + Clone + fmt::Debug {}
-unsafe impl<T> Sync for AHardwareBufferMap<T> where T: Num + Clone + fmt::Debug {}
-
-impl<T> AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        buffer: OwnedAHardwareBuffer,
-        shape: Vec<usize>,
-        buf_size: usize,
-        cpu_usage: u64,
-        view_offset: usize,
-        access: crate::CpuAccess,
-        identity_id: u64,
-    ) -> Result<Self> {
-        Self::new_inner(
-            buffer,
-            shape,
-            buf_size,
-            None,
-            cpu_usage,
-            view_offset,
-            access,
-            identity_id,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_byte_size(
-        buffer: OwnedAHardwareBuffer,
-        shape: Vec<usize>,
-        buf_size: usize,
-        byte_size: usize,
-        cpu_usage: u64,
-        view_offset: usize,
-        access: crate::CpuAccess,
-        identity_id: u64,
-    ) -> Result<Self> {
-        Self::new_inner(
-            buffer,
-            shape,
-            buf_size,
-            Some(byte_size),
-            cpu_usage,
-            view_offset,
-            access,
-            identity_id,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_inner(
-        buffer: OwnedAHardwareBuffer,
-        shape: Vec<usize>,
-        buf_size: usize,
-        byte_size_override: Option<usize>,
-        cpu_usage: u64,
-        view_offset: usize,
-        access: crate::CpuAccess,
-        identity_id: u64,
-    ) -> Result<Self> {
-        // Lock usage flags must be a subset of the allocation-time CPU
-        // flags — the decision (direction vs declared values, refusal for
-        // CpuAccess::None buffers) is the host-tested `lock_usage_for`.
-        let declared_writes = cpu_usage & USAGE_CPU_WRITE_MASK != 0;
-        let lock_usage = match lock_usage_for(cpu_usage, access.reads(), access.writes()) {
-            LockDecision::Refuse => {
-                // Counted at the Tensor wrapper level (declared-vs-
-                // requested); this is the platform-enforced refusal.
-                let _ = identity_id;
-                return Err(Error::InvalidOperation(
-                    "AHardwareBuffer was allocated without CPU access \
-                     (CpuAccess::None) — allocate with CpuAccess::Read/Write/\
-                     ReadWrite to map it on the CPU"
-                        .into(),
-                ));
-            }
-            LockDecision::Covered(bits) => bits,
-            LockDecision::Unplanned(bits) => {
-                // Counted at the Tensor wrapper level; replaying the full
-                // declared flags is the pre-CpuAccess behavior.
-                log::debug!(
-                    "AHardwareBuffer map exceeds declared access; replaying \
-                     allocated usage {bits:#x}"
-                );
-                bits
-            }
-        };
-        // Validate the exposed window BEFORE locking: the slice handed out
-        // by `deref` is `elem_count()` elements starting `view_offset`
-        // bytes in, so both the override and the shape-derived length must
-        // fit `buf_size − view_offset`. Callers pre-validate, but the
-        // release-mode `deref` has only a `debug_assert` — this is the
-        // load-bearing bounds check (mirrors `DmaMap`).
-        if view_offset > buf_size {
-            return Err(Error::InsufficientCapacity {
-                needed: view_offset,
-                capacity: buf_size,
-            });
-        }
-        let window = buf_size - view_offset;
-        let exposed_bytes = match byte_size_override {
-            Some(bytes) => bytes,
-            None => checked_shape_bytes::<T>(&shape)?,
-        };
-        if exposed_bytes > window {
-            return Err(Error::InsufficientCapacity {
-                needed: exposed_bytes,
-                capacity: window,
-            });
-        }
-        // Refcounted lock (see `AhbHandle`): the first live map issues the
-        // FFI lock; nested maps of the same buffer reuse its base address
-        // (only when its direction covers theirs).
-        let base = buffer.lock_shared(lock_usage)?;
-        let base_ptr = NonNull::new(base).expect("lock_shared validates the base address");
-        // A sub-view window starts `view_offset` bytes into the locked
-        // buffer (bounds-checked above). Advance the exposed base and
-        // shrink the remaining-window bound so the `deref` length check is
-        // against the window.
-        let base_ptr = NonNull::new(unsafe { base_ptr.as_ptr().byte_add(view_offset) })
-            .expect("offset base within locked buffer is non-null");
-        Ok(Self {
-            buffer,
-            shape,
-            base_ptr,
-            buf_size: buf_size - view_offset,
-            byte_size_override,
-            _marker: PhantomData,
-            locked: true,
-            // Mutable access needs BOTH the request and the declaration to
-            // include writes: a map_read() on a writable buffer is
-            // read-only by intent; an RW request on a read-only import
-            // must not write through a lock without CPU_WRITE (undefined
-            // behaviour per the NDK contract).
-            writable: access.writes() && declared_writes,
-        })
-    }
-
-    fn elem_count(&self) -> usize {
-        match self.byte_size_override {
-            Some(bytes) => bytes / std::mem::size_of::<T>(),
-            None => self.shape.iter().product(),
-        }
-    }
-}
-
-impl<T> TensorMapTrait<T> for AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn shape(&self) -> &[usize] {
-        &self.shape
-    }
-
-    fn len(&self) -> usize {
-        self.elem_count()
-    }
-
-    fn unmap(&mut self) {
-        if self.locked {
-            // Releases one refcount; the last live map performs the
-            // synchronous FFI unlock (flushing CPU caches).
-            self.buffer.unlock_shared();
-            self.locked = false;
-        }
-    }
-
-    fn as_slice(&self) -> &[T] {
-        self.deref()
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [T] {
-        self.deref_mut()
-    }
-}
-
-impl<T> Deref for AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        let ptr = self.base_ptr.as_ptr() as *const T;
-        let len = self.elem_count();
-        debug_assert!(
-            len * std::mem::size_of::<T>() <= self.buf_size,
-            "AHardwareBufferMap deref: {} elems × {} bytes > buf_size {}",
-            len,
-            std::mem::size_of::<T>(),
-            self.buf_size,
-        );
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
-}
-
-impl<T> DerefMut for AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn deref_mut(&mut self) -> &mut [T] {
-        // Writing through a read-only lock (a `map_read()` map, or a
-        // buffer allocated/imported without CPU_WRITE usage) is undefined
-        // behaviour per the NDK contract — fail uniformly like every
-        // other backend instead.
-        crate::assert_map_writable(self.writable, "AHardwareBuffer");
-        let ptr = self.base_ptr.as_ptr() as *mut T;
-        let len = self.elem_count();
-        // Symmetric with `Deref::deref` — an oversized mutable write must
-        // be caught the same way an oversized read would be.
-        debug_assert!(
-            len * std::mem::size_of::<T>() <= self.buf_size,
-            "AHardwareBufferMap deref_mut: {} elems × {} bytes > buf_size {}",
-            len,
-            std::mem::size_of::<T>(),
-            self.buf_size,
-        );
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
-    }
-}
-
-impl<T> Drop for AHardwareBufferMap<T>
-where
-    T: Num + Clone + fmt::Debug,
-{
-    fn drop(&mut self) {
-        self.unmap();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // (PixelFormat, DType) → AHardwareBuffer format mapping

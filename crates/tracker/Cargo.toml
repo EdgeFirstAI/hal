@@ -2,6 +2,7 @@
 name = "edgefirst-tracker"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Multi-object tracking with ByteTrack for edge AI video analytics"
 homepage.workspace = true
@@ -12,7 +13,22 @@ keywords = ["tracking", "bytetrack", "object-tracking", "kalman-filter", "edge-a
 categories = ["multimedia::images", "science", "algorithms"]
 documentation = "https://docs.rs/edgefirst-tracker"
 
+[lints]
+workspace = true
+
+[features]
+default = ["static", "tensor-boxes"]
+# Forwards to edgefirst-tensor's `static` backend. Off for the C leaf, which
+# never names a Tensor — it takes plain `ef_detect_box` values.
+static = ["dep:edgefirst-tensor", "edgefirst-tensor/static"]
+# The `impl DetectionBox for DetectBox` (orphan-rule home). Optional so
+# libedgefirst_tracker.so does not link tensor.
+tensor-boxes = ["dep:edgefirst-tensor"]
+
 [dependencies]
+# Optional: only the DetectBox type for `impl DetectionBox`. The C API
+# converts `ef_detect_box` into a local type instead.
+edgefirst-tensor = { workspace = true, default-features = false, optional = true }
 enum_dispatch = { workspace = true }
 lapjv = { workspace = true }
 log = { workspace = true }

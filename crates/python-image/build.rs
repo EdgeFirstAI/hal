@@ -1,0 +1,138 @@
+// SPDX-FileCopyrightText: Copyright 2025 Au-Zone Technologies
+// SPDX-License-Identifier: Apache-2.0
+
+use std::env;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    pyo3_build_config::use_pyo3_cfgs();
+
+    // Declare the custom cfg to avoid warnings
+    println!("cargo::rustc-check-cfg=cfg(nightly)");
+
+    // Detect if we're using nightly Rust
+    let is_nightly = rustc_version::version_meta()
+        .map(|meta| meta.channel == rustc_version::Channel::Nightly)
+        .unwrap_or(false);
+
+    if is_nightly {
+        println!("cargo:rustc-cfg=nightly");
+    }
+
+    // Coverage-capture resilience: detect -Cinstrument-coverage and set
+    // the `coverage` cfg so the SIGABRT handler ctor is compiled in.
+    println!("cargo::rustc-check-cfg=cfg(coverage)");
+    let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if rustflags.contains("instrument-coverage") {
+        println!("cargo::rustc-cfg=coverage");
+    }
+    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // PyO3's `extension-module` normally emits this, but it does not reach a
+    // cdylib whose PyO3 surface arrives via an rlib dependency. Extension
+    // modules resolve CPython symbols from the interpreter at load time, so
+    // the undefined references are expected and must be allowed through.
+    if target_os == "macos" {
+        println!("cargo:rustc-link-arg=-Wl,-undefined,dynamic_lookup");
+    }
+
+    // Only when "dynamic" is active -- under "static" (G13's comparison
+    // build, see this crate's own Cargo.toml) this crate embeds
+    // edgefirst-tensor's implementation directly, and there is nothing
+    // external to link against. Cargo sets CARGO_FEATURE_<NAME>=1 for a
+    // crate's own active features, visible to its build script.
+    if env::var_os("CARGO_FEATURE_DYNAMIC").is_some() {
+        link_tensor(&target_os);
+    }
+}
+
+/// Single-tensor-home, Python side (task P2): `_image` links
+/// `libedgefirst_tensor.so` (via python-common's own `ef_tensor_*` FFI
+/// calls) instead of embedding `edgefirst-tensor`'s implementation.
+/// Unlike `crates/python-tensor/build.rs`, this crate does NOT bundle a
+/// copy into its own wheel -- `crates/python-tensor`'s wheel is the sole
+/// carrier of `libedgefirst_tensor.so`; this one only needs to find it at
+/// load time via RPATH `$ORIGIN/../tensor`, reaching across the shared
+/// `edgefirst/` namespace package the way the four C leaves' `.so` files
+/// reach `libedgefirst_tensor.so` in the same directory as themselves.
+fn link_tensor(target_os: &str) {
+    let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let tensor_capi_manifest = crate_dir.join("../tensor-capi/Cargo.toml");
+    println!("cargo:rerun-if-changed={}", tensor_capi_manifest.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        crate_dir.join("../tensor-capi/src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        crate_dir.join("../tensor/src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        crate_dir.join("../tensor/Cargo.toml").display()
+    );
+
+    // Same dedicated target-dir crates/python-tensor/build.rs uses, and
+    // deliberately the SAME one (not a private one of this crate's own):
+    // a `cargo build` against an up-to-date target-dir is a fast no-op, so
+    // building all four Python extensions in one session compiles
+    // edgefirst-tensor into this directory once, not four times. Still not
+    // the shared root `target/` the C leaves use -- this build script runs
+    // inside an outer cargo/maturin invocation already holding a lock on
+    // that directory; see crates/python-tensor/build.rs's own comment for
+    // why a nested build needs a different one.
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let target = env::var("TARGET").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    let nested_target_dir = crate_dir.join("../../target/python-tensor-capi");
+
+    let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
+    cmd.arg("build")
+        .arg("--manifest-path")
+        .arg(&tensor_capi_manifest)
+        .arg("--target-dir")
+        .arg(&nested_target_dir);
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    if !target.is_empty() && target != host {
+        cmd.arg("--target").arg(&target);
+    }
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn `cargo build` for tensor-capi: {e}"));
+    if !status.success() {
+        panic!(
+            "`cargo build --manifest-path {}` failed (status {status}) -- libedgefirst_tensor.so could not be built",
+            tensor_capi_manifest.display()
+        );
+    }
+
+    let mut built_dir = nested_target_dir;
+    if !target.is_empty() && target != host {
+        built_dir = built_dir.join(&target);
+    }
+    let built_dir = built_dir.join(&profile);
+
+    println!("cargo:rustc-link-search=native={}", built_dir.display());
+    println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+
+    // `$ORIGIN/../tensor` (Linux) / `@loader_path/../tensor` (macOS):
+    // unlike the four C leaves (siblings in the same directory), this
+    // extension and `_tensor.cpython-*.so` install into DIFFERENT
+    // directories within the shared `edgefirst/` namespace package
+    // (`edgefirst/image/_image...` vs. `edgefirst/tensor/_tensor...`),
+    // so the relative step has to cross into the sibling package
+    // directory rather than stay in the same one. RUNPATH is not
+    // transitive, so this extension needs its own rpath regardless of
+    // what `edgefirst-python-common` (an rlib, no rpath of its own) or
+    // anything else in the process might carry.
+    if target_os == "macos" {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,@loader_path/../tensor");
+    } else {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-rpath,$ORIGIN/../tensor");
+    }
+}

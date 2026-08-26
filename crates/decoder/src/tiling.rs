@@ -52,6 +52,12 @@
 
 use crate::float::{box_area, intersection_area, ios_value, iou_value};
 use crate::{BoundingBox, DetectBox};
+// `pub use`: TilePlacement is part of this module's public surface --
+// `lift_tile_boxes` and `push_tile` take one, and the doctests below
+// import it from here. A private import compiles but leaves the type
+// unnameable by callers.
+pub use edgefirst_decoder_abi::TilePlacement;
+use edgefirst_tensor::unletter_norm;
 
 /// Overlap metric used by the tiled-detection merge to decide whether two boxes
 /// belong to the same object.
@@ -74,28 +80,6 @@ impl MatchMetric {
             MatchMetric::Ios => ios_value(a, b),
         }
     }
-}
-
-/// How one tile was cut from the full frame and fed to the model. Produced by
-/// the input side (the `edgefirst-image` tiling API), consumed by
-/// [`lift_tile_boxes`]. All fields are native full-frame **pixels** except
-/// `letterbox`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TilePlacement {
-    /// Tile index within the frame grid, `0..count`.
-    pub index: usize,
-    /// Total tiles for this frame (the streaming fan-in fence).
-    pub count: usize,
-    /// Native crop origin `(ox, oy)` in full-frame pixels.
-    pub origin: (f32, f32),
-    /// Native crop size `(cw, ch)` in full-frame pixels. Equals the tile size
-    /// for the full-size tiles the EvenDist grid produces.
-    pub crop_size: (f32, f32),
-    /// Normalized letterbox content bounds `[lx0, ly0, lx1, ly1]` on the model
-    /// input, or `None` when the crop was stretched to fill it (the hot path).
-    pub letterbox: Option<[f32; 4]>,
-    /// Full-frame dimensions `(frame_w, frame_h)` in pixels.
-    pub frame_dims: (f32, f32),
 }
 
 /// Configuration for the tiled-detection merge.
@@ -123,31 +107,6 @@ impl Default for MergeConfig {
             max_det: 300,
             score_threshold: 0.0,
         }
-    }
-}
-
-/// Invert a letterbox: map a [`BoundingBox`] normalized over the model input
-/// back to normalized-over-the-crop, given the content bounds
-/// `[lx0, ly0, lx1, ly1]`. The box is canonicalised first, a degenerate
-/// (zero-span) letterbox axis maps with unit scale (no divide-by-zero), and the
-/// result is clamped to `[0, 1]`.
-///
-/// This is the single home for the inverse-letterbox transform;
-/// `edgefirst_image::unletter_bbox` is a thin wrapper around it (the `image`
-/// crate depends on `decoder`, so the shared math lives here, in the lower
-/// crate).
-#[must_use]
-#[inline]
-pub fn unletter_norm(b: BoundingBox, lb: [f32; 4]) -> BoundingBox {
-    let b = b.to_canonical();
-    let [lx0, ly0, lx1, ly1] = lb;
-    let inv_w = if lx1 > lx0 { 1.0 / (lx1 - lx0) } else { 1.0 };
-    let inv_h = if ly1 > ly0 { 1.0 / (ly1 - ly0) } else { 1.0 };
-    BoundingBox {
-        xmin: ((b.xmin - lx0) * inv_w).clamp(0.0, 1.0),
-        ymin: ((b.ymin - ly0) * inv_h).clamp(0.0, 1.0),
-        xmax: ((b.xmax - lx0) * inv_w).clamp(0.0, 1.0),
-        ymax: ((b.ymax - ly0) * inv_h).clamp(0.0, 1.0),
     }
 }
 

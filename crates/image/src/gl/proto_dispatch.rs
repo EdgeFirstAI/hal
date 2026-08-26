@@ -12,7 +12,7 @@
 //! integer mask-coefficient dtypes (the GL shaders consume f32 uniforms
 //! regardless of source dtype).
 
-use edgefirst_decoder::ProtoLayout;
+use edgefirst_tensor::ProtoLayout;
 use edgefirst_tensor::{DType, QuantMode};
 
 use super::Int8InterpolationMode;
@@ -352,7 +352,9 @@ mod tests {
         let (bytes, num_layers) = repack_rgba_f16_layers(view, half::f16::from_f32);
         assert_eq!(num_layers, 2);
         let halves: Vec<half::f16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])))
             .collect();
         let layer_stride = 2 * 4; // H*W*4 per layer

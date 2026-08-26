@@ -1,0 +1,175 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 34,
+      "mean_us": 29,
+      "median_us": 29,
+      "min_us": 27,
+      "name": "decoder/yolo/quant",
+      "p95_us": 30,
+      "p99_us": 31
+    },
+    {
+      "iterations": 100,
+      "max_us": 391,
+      "mean_us": 223,
+      "median_us": 221,
+      "min_us": 114,
+      "name": "decoder/yolo/f32",
+      "p95_us": 351,
+      "p99_us": 365
+    },
+    {
+      "iterations": 100,
+      "max_us": 29,
+      "mean_us": 25,
+      "median_us": 25,
+      "min_us": 24,
+      "name": "decoder/quant/decode_boxes",
+      "p95_us": 26,
+      "p99_us": 26
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 1,
+      "name": "decoder/quant/nms",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 429,
+      "mean_us": 381,
+      "median_us": 376,
+      "min_us": 370,
+      "name": "decoder/dequantize/i8",
+      "p95_us": 405,
+      "p99_us": 416
+    },
+    {
+      "iterations": 100,
+      "max_us": 455,
+      "mean_us": 403,
+      "median_us": 399,
+      "min_us": 389,
+      "name": "decoder/dequantize/i8_chunked",
+      "p95_us": 438,
+      "p99_us": 444
+    },
+    {
+      "iterations": 100,
+      "max_us": 348,
+      "mean_us": 290,
+      "median_us": 287,
+      "min_us": 280,
+      "name": "decoder/dequantize/i16",
+      "p95_us": 326,
+      "p99_us": 330
+    },
+    {
+      "iterations": 100,
+      "max_us": 429,
+      "mean_us": 390,
+      "median_us": 388,
+      "min_us": 384,
+      "name": "decoder/dequantize/i16_chunked",
+      "p95_us": 398,
+      "p99_us": 423
+    },
+    {
+      "iterations": 100,
+      "max_us": 656,
+      "mean_us": 442,
+      "median_us": 431,
+      "min_us": 339,
+      "name": "decoder/f32/decode_boxes",
+      "p95_us": 557,
+      "p99_us": 585
+    },
+    {
+      "iterations": 100,
+      "max_us": 2,
+      "mean_us": 2,
+      "median_us": 2,
+      "min_us": 2,
+      "name": "decoder/f32/nms",
+      "p95_us": 2,
+      "p99_us": 2
+    },
+    {
+      "iterations": 100,
+      "max_us": 182,
+      "mean_us": 87,
+      "median_us": 80,
+      "min_us": 34,
+      "name": "decoder/modelpack/u8",
+      "p95_us": 150,
+      "p99_us": 162
+    },
+    {
+      "iterations": 100,
+      "max_us": 272,
+      "mean_us": 118,
+      "median_us": 103,
+      "min_us": 56,
+      "name": "decoder/modelpack/split_u8",
+      "p95_us": 210,
+      "p99_us": 250
+    },
+    {
+      "iterations": 100,
+      "max_us": 604,
+      "mean_us": 422,
+      "median_us": 413,
+      "min_us": 300,
+      "name": "decoder/masks/f32",
+      "p95_us": 515,
+      "p99_us": 555
+    },
+    {
+      "iterations": 100,
+      "max_us": 273,
+      "mean_us": 248,
+      "median_us": 246,
+      "min_us": 243,
+      "name": "decoder/masks/i8",
+      "p95_us": 261,
+      "p99_us": 271
+    },
+    {
+      "iterations": 100,
+      "max_us": 1248,
+      "mean_us": 1148,
+      "median_us": 1149,
+      "min_us": 1040,
+      "name": "decoder/per_scale/dfl_i8_to_f32",
+      "p95_us": 1230,
+      "p99_us": 1246
+    },
+    {
+      "iterations": 100,
+      "max_us": 3419,
+      "mean_us": 3192,
+      "median_us": 3176,
+      "min_us": 3057,
+      "name": "decoder/per_scale/dfl_i8_to_f16",
+      "p95_us": 3348,
+      "p99_us": 3405
+    },
+    {
+      "iterations": 100,
+      "max_us": 928,
+      "mean_us": 797,
+      "median_us": 787,
+      "min_us": 718,
+      "name": "decoder/per_scale/ltrb_i8_to_f32",
+      "p95_us": 889,
+      "p99_us": 924
+    }
+  ],
+  "timestamp": "unix:1779646139"
+}

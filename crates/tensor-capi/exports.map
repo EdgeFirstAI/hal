@@ -1,0 +1,4 @@
+{
+  global: ef_*;
+  local: *;
+};

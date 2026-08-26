@@ -214,7 +214,7 @@ The image is the portable OSS contract. How you schedule it on cloud CPUs
 ./benchmarks/scripts/decode-ab-matrix.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
 # Published decoder A/B (release, interleaved rounds, median-of-3 + spread, n=200)
-CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=adis-uav1 \
+CARGO_PROFILE=release EDGEFIRST_BENCH_ORIN_FALLBACK=<ssh-host> \
   ./benchmarks/scripts/decode-ab-publish.sh imx8mp-frdm imx95-pro rpi5-hailo orin-nano
 
 # Full HAL COCO matrix (decode + letterbox convert, all HAL backends)

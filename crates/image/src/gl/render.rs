@@ -55,7 +55,7 @@ pub(super) enum DstLowering {
 /// missing) degrades to the mapped texture path rather than failing.
 pub(super) fn lower_dst(zero_copy_import: bool, dst_mem: TensorMemory) -> DstLowering {
     match dst_mem {
-        TensorMemory::Dma if zero_copy_import => DstLowering::ZeroCopy,
+        TensorMemory::DmaBuf if zero_copy_import => DstLowering::ZeroCopy,
         TensorMemory::Pbo => DstLowering::TexturePbo,
         _ => DstLowering::TextureMem,
     }
@@ -477,13 +477,13 @@ mod tests {
         use TensorMemory::*;
         // With zero-copy import: only a DMA destination is zero-copy; PBO
         // keeps its PACK readback; Mem/Shm read back through the map.
-        assert_eq!(lower_dst(true, Dma), DstLowering::ZeroCopy);
+        assert_eq!(lower_dst(true, DmaBuf), DstLowering::ZeroCopy);
         assert_eq!(lower_dst(true, Pbo), DstLowering::TexturePbo);
         assert_eq!(lower_dst(true, Mem), DstLowering::TextureMem);
         assert_eq!(lower_dst(true, Shm), DstLowering::TextureMem);
         // Without import support a DMA destination degrades to the mapped
         // texture path (dma-heap without EGL dma_buf_import) — never an error.
-        assert_eq!(lower_dst(false, Dma), DstLowering::TextureMem);
+        assert_eq!(lower_dst(false, DmaBuf), DstLowering::TextureMem);
         assert_eq!(lower_dst(false, Pbo), DstLowering::TexturePbo);
         assert_eq!(lower_dst(false, Mem), DstLowering::TextureMem);
         assert_eq!(lower_dst(false, Shm), DstLowering::TextureMem);

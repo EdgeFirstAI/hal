@@ -1,0 +1,95 @@
+{
+  "benchmarks": [
+    {
+      "iterations": 100,
+      "max_us": 191,
+      "mean_us": 121,
+      "median_us": 119,
+      "min_us": 108,
+      "name": "materialize_masks/proto_res/i8",
+      "p95_us": 131,
+      "p99_us": 144
+    },
+    {
+      "iterations": 100,
+      "max_us": 146,
+      "mean_us": 109,
+      "median_us": 106,
+      "min_us": 96,
+      "name": "materialize_masks/proto_res/f32",
+      "p95_us": 128,
+      "p99_us": 141
+    },
+    {
+      "iterations": 100,
+      "max_us": 140,
+      "mean_us": 117,
+      "median_us": 114,
+      "min_us": 104,
+      "name": "materialize_masks/proto_res/f16",
+      "p95_us": 136,
+      "p99_us": 139
+    },
+    {
+      "iterations": 100,
+      "max_us": 474,
+      "mean_us": 431,
+      "median_us": 428,
+      "min_us": 418,
+      "name": "materialize_masks/scaled_640x640/i8",
+      "p95_us": 452,
+      "p99_us": 474
+    },
+    {
+      "iterations": 100,
+      "max_us": 250,
+      "mean_us": 221,
+      "median_us": 219,
+      "min_us": 209,
+      "name": "materialize_masks/scaled_640x640/f32",
+      "p95_us": 239,
+      "p99_us": 246
+    },
+    {
+      "iterations": 100,
+      "max_us": 248,
+      "mean_us": 227,
+      "median_us": 224,
+      "min_us": 215,
+      "name": "materialize_masks/scaled_640x640/f16",
+      "p95_us": 241,
+      "p99_us": 245
+    },
+    {
+      "iterations": 100,
+      "max_us": 67,
+      "mean_us": 47,
+      "median_us": 47,
+      "min_us": 46,
+      "name": "decode_masks/proto",
+      "p95_us": 48,
+      "p99_us": 50
+    },
+    {
+      "iterations": 100,
+      "max_us": 277,
+      "mean_us": 248,
+      "median_us": 245,
+      "min_us": 243,
+      "name": "decode_masks/materialize",
+      "p95_us": 261,
+      "p99_us": 272
+    },
+    {
+      "iterations": 100,
+      "max_us": 43,
+      "mean_us": 42,
+      "median_us": 42,
+      "min_us": 42,
+      "name": "proto_extraction",
+      "p95_us": 43,
+      "p99_us": 43
+    }
+  ],
+  "timestamp": "unix:1779645878"
+}

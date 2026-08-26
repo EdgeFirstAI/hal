@@ -1,0 +1,104 @@
+# Differential (Static vs. Dynamic Backend) workflow for EdgeFirst HAL
+#
+# Builds two comparison venvs from the SAME commit -- one with every Python
+# extension statically linking edgefirst-tensor, one with every Python
+# extension dynamically linking a shared libedgefirst_tensor.so -- and runs
+# the full Python test suite against both (G13, via `make test-differential`).
+# A single test outcome differing between the two backends is a real defect:
+# the two builds are supposed to be behaviorally identical.
+#
+# NOT run on every push/PR: G13 runs the suite twice, and up to four times
+# when anything diverges (a second full pass confirms a divergence survives
+# before it is reported, since some tests are flaky under load). Two full
+# wheel builds plus up to four full suite runs is too slow and too expensive
+# to gate every PR on, so this runs nightly and on demand instead. See
+# Makefile's `# DIFFERENTIAL TESTING (G13)` section for the target definitions
+# this workflow calls into, and scripts/check-single-home.sh for G13 itself.
+#
+# Action Versions (hash-pinned per SPS v2.1):
+# - actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd (v6.0.2)
+# - actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 (v6.2.0)
+# - actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a (v7.0.1)
+# - dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 (v1)
+# - Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 (v2.9.1)
+
+name: Differential (Static vs Dynamic Backend)
+
+on:
+  schedule:
+    # 03:17 UTC daily -- off the hour, clear of the release/tag-release
+    # workflows' own scheduled/triggered load.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: differential-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -e -o pipefail {0}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PYTHON_VERSION: '3.11'
+  RUST_STABLE_VERSION: '1.94.0'
+
+jobs:
+  test-differential:
+    name: G13 (static vs. dynamic, test for test)
+    runs-on: ubuntu-22.04-xlarge
+    # Two full wheel builds + up to four full suite passes; give it real
+    # headroom rather than tripping the default 6h limit on a bad day.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # G13's staleness guard needs real history for `git log -- crates/`
+          lfs: true
+
+      - name: Checkout LFS objects
+        run: git lfs checkout
+
+      - name: Install OpenCV build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libopencv-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up base Python virtual environment
+        # Only used to spawn the two comparison venvs (`venv/bin/python -m venv ...`
+        # in the Makefile) -- the comparison venvs get their own maturin/pytest/etc.
+        run: python3 -m venv venv
+
+      - name: Set up Rust stable toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          shared-key: rust-differential
+          cache-on-failure: true
+
+      - name: Run G13 (make test-differential)
+        run: make test-differential
+
+      - name: Upload differential wheels on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: differential-wheels
+          path: |
+            target/differential-wheels-static/
+            target/differential-wheels-dynamic/
+          retention-days: 7
+          if-no-files-found: ignore

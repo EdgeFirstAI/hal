@@ -27,7 +27,7 @@ use super::super::core::float_crop_uniforms;
 use super::super::platform::GlPlatform;
 use super::{check_gl_error, dyn_to_u8_src, GLProcessorST};
 use crate::{Error, Flip, ResolvedCrop, Rotation};
-use edgefirst_tensor::{PixelFormat, Tensor, TensorDyn, TensorMemory, TensorTrait};
+use edgefirst_tensor::{DType, PixelFormat, Tensor, TensorDyn, TensorMemory, TensorTrait};
 
 // The float render-path decision (`FloatRenderPath` + `classify_float_render`)
 // is defined once in the cfg-agnostic `gl::float_dispatch` module so the Linux
@@ -114,7 +114,7 @@ pub(in super::super) fn dma_f16_packed_layout(w: u32, h: u32) -> Option<(u32, u3
 /// the tensor is not PBO-backed) and rejects a currently-mapped PBO.
 fn float_pbo_buffer_id<T>(t: &edgefirst_tensor::Tensor<T>) -> crate::Result<u32>
 where
-    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+    T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
 {
     let pbo = t.as_pbo().ok_or_else(|| {
         crate::Error::OpenGl("convert_float_to_pbo: dst is not a PBO tensor".to_string())
@@ -145,27 +145,29 @@ where
 /// # Safety
 /// Must be called on the thread owning the current GL context.
 pub(super) unsafe fn finish_via_fence() {
-    // 1 second, in nanoseconds — generous; a healthy convert completes in well
-    // under a millisecond and never reaches the timeout.
-    const TIMEOUT_NS: u64 = 1_000_000_000;
-    let sync = edgefirst_gl::gl::FenceSync(edgefirst_gl::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
-    if sync.is_null() {
-        // Fence could not be created; preserve the completion guarantee.
-        edgefirst_gl::gl::Finish();
-        return;
-    }
-    let status = edgefirst_gl::gl::ClientWaitSync(
-        sync,
-        edgefirst_gl::gl::SYNC_FLUSH_COMMANDS_BIT,
-        TIMEOUT_NS,
-    );
-    edgefirst_gl::gl::DeleteSync(sync);
-    match status {
-        s if s == edgefirst_gl::gl::ALREADY_SIGNALED
-            || s == edgefirst_gl::gl::CONDITION_SATISFIED => {}
-        // Timeout expired or the wait failed: fall back to a blocking drain so
-        // the caller never proceeds on an incomplete readback/render.
-        _ => edgefirst_gl::gl::Finish(),
+    unsafe {
+        // 1 second, in nanoseconds — generous; a healthy convert completes in well
+        // under a millisecond and never reaches the timeout.
+        const TIMEOUT_NS: u64 = 1_000_000_000;
+        let sync = edgefirst_gl::gl::FenceSync(edgefirst_gl::gl::SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if sync.is_null() {
+            // Fence could not be created; preserve the completion guarantee.
+            edgefirst_gl::gl::Finish();
+            return;
+        }
+        let status = edgefirst_gl::gl::ClientWaitSync(
+            sync,
+            edgefirst_gl::gl::SYNC_FLUSH_COMMANDS_BIT,
+            TIMEOUT_NS,
+        );
+        edgefirst_gl::gl::DeleteSync(sync);
+        match status {
+            s if s == edgefirst_gl::gl::ALREADY_SIGNALED
+                || s == edgefirst_gl::gl::CONDITION_SATISFIED => {}
+            // Timeout expired or the wait failed: fall back to a blocking drain so
+            // the caller never proceeds on an incomplete readback/render.
+            _ => edgefirst_gl::gl::Finish(),
+        }
     }
 }
 
@@ -174,7 +176,7 @@ impl GLProcessorST {
     /// render paths (PBO and zero-copy F16), preferring zero-copy.
     ///
     /// Feed order:
-    /// 1. **Import** — a `TensorMemory::Dma` source on a zero-copy backend
+    /// 1. **Import** — a `TensorMemory::DmaBuf` source on a zero-copy backend
     ///    is attached as the texture's storage (EGLImage on Linux/Android,
     ///    IOSurface pbuffer bind on macOS) through the same
     ///    `get_or_create_egl_image(CacheKind::Src)` cache the u8 engine
@@ -253,7 +255,7 @@ impl GLProcessorST {
         // ── Arm 1: zero-copy import of a Dma-backed source ──
         if !float_src_import_disabled()
             && self.gl_context.transfer_backend.is_zero_copy()
-            && src_u8.memory() == TensorMemory::Dma
+            && src_u8.memory() == TensorMemory::DmaBuf
         {
             let key = BufferImportKey::from_tensor(src_u8, PixelFormat::Rgba, false);
             match self.get_or_create_egl_image(CacheKind::Src, src_u8, PixelFormat::Rgba) {
@@ -607,13 +609,12 @@ impl GLProcessorST {
         // Destination dimensions and PBO buffer id, by dtype.
         let dst_w = dst.width().ok_or(Error::NotAnImage)?;
         let dst_h = dst.height().ok_or(Error::NotAnImage)?;
-        let dst_buffer_id = match dst {
-            TensorDyn::F32(t) => float_pbo_buffer_id(t)?,
-            TensorDyn::F16(t) => float_pbo_buffer_id(t)?,
+        let dst_buffer_id = match dst.dtype() {
+            DType::F32 => float_pbo_buffer_id(dst.as_typed::<f32>().expect("dtype checked"))?,
+            DType::F16 => float_pbo_buffer_id(dst.as_typed::<half::f16>().expect("dtype checked"))?,
             other => {
                 return Err(crate::Error::NotSupported(format!(
-                    "GL float render-to-PBO: dst dtype must be F32 or F16, got {:?}",
-                    other.dtype()
+                    "GL float render-to-PBO: dst dtype must be F32 or F16, got {other:?}"
                 )));
             }
         };
@@ -854,16 +855,15 @@ impl GLProcessorST {
                  using CPU fallback"
             )));
         }
-        let dst_f16 = match dst {
-            TensorDyn::F16(t) => t,
+        let dst_f16 = match dst.dtype() {
+            DType::F16 => dst.as_typed_mut::<half::f16>().expect("dtype checked"),
             other => {
                 return Err(crate::Error::NotSupported(format!(
-                    "GL float render-to-DMA: dst dtype must be F16, got {:?}; using CPU fallback",
-                    other.dtype()
+                    "GL float render-to-DMA: dst dtype must be F16, got {other:?}; using CPU fallback"
                 )));
             }
         };
-        if dst_f16.memory() != edgefirst_tensor::TensorMemory::Dma {
+        if dst_f16.memory() != edgefirst_tensor::TensorMemory::DmaBuf {
             return Err(crate::Error::NotSupported(
                 "GL float render-to-DMA: dst is not a zero-copy GPU buffer; using CPU fallback"
                     .to_string(),

@@ -2,6 +2,7 @@
 name = "gpu-probe"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Low-level GPU platform exploration and benchmarking tool"
 homepage.workspace = true
@@ -11,7 +12,7 @@ publish = false
 
 [dependencies]
 edgefirst-bench = { workspace = true }
-edgefirst-tensor = { workspace = true }
+edgefirst-tensor = { workspace = true, features = ["static"] }
 gbm = { workspace = true }
 edgefirst-gl = { workspace = true }
 edgefirst-egl = { workspace = true }

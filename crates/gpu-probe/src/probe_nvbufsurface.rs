@@ -5,7 +5,7 @@
 //! NvBufSurface dma-buf interop probe — Jetson only (O1–O3).
 //!
 //! Validates the hypothesis that on Jetson we can keep the existing
-//! `TensorMemory::Dma` contract by swapping the allocator from `/dev/dma_heap`
+//! `TensorMemory::DmaBuf` contract by swapping the allocator from `/dev/dma_heap`
 //! (absent on this L4T R36.4 image) to **NvBufSurface** (dlopen'd at runtime).
 //!
 //! The probe is fully **gated**: if `libnvbufsurface.so` cannot be dlopen'd

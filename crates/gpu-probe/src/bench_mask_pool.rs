@@ -851,7 +851,12 @@ fn compare_paths(
         // transparency. Max theoretical per-pixel sum is 4 × 255 = 1020.
         let mut diff_pixels = 0u32;
         let mut max_diff = 0u32;
-        for (a, b) in img_a.chunks_exact(4).zip(img_b.chunks_exact(4)) {
+        for (a, b) in img_a
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(img_b.as_chunks::<4>().0)
+        {
             let d = ((a[0] as i32 - b[0] as i32).abs()
                 + (a[1] as i32 - b[1] as i32).abs()
                 + (a[2] as i32 - b[2] as i32).abs()

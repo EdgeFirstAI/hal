@@ -71,10 +71,16 @@ fn make_nv12_src(proc: &ImageProcessor) -> Option<TensorDyn> {
 
 fn mem_name(m: TensorMemory) -> &'static str {
     match m {
-        TensorMemory::Dma => "dma",
+        TensorMemory::DmaBuf => "dma",
         TensorMemory::Mem => "mem",
         TensorMemory::Shm => "shm",
         TensorMemory::Pbo => "pbo",
+        // Never produced here. `TensorMemory` is `#[non_exhaustive]`, so the
+        // wildcard is required; the known-but-unused variants are still spelled
+        // out so their labels do not silently become "unknown".
+        TensorMemory::IoSurface => "iosurface",
+        TensorMemory::Cuda => "cuda",
+        _ => "unknown",
     }
 }
 
@@ -116,7 +122,7 @@ fn main() {
             n * TILE_H,
             PixelFormat::Rgba,
             DType::U8,
-            Some(TensorMemory::Dma),
+            Some(TensorMemory::DmaBuf),
             edgefirst_tensor::CpuAccess::ReadWrite,
         )
         .or_else(|_| {

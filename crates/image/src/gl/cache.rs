@@ -10,15 +10,40 @@ pub(super) enum CacheKind {
     Dst,
 }
 
-/// A cached buffer import with a weak reference to the source tensor's guard.
+/// A cached buffer import, retained until evicted by the LRU bound.
 ///
 /// Generic over the platform's owned import object `I` — an `EglImage`
 /// (DMA-BUF) on Linux, an IOSurface-backed EGL pbuffer on macOS. Dropping
 /// the entry drops `I`, which releases the platform object.
+///
+/// **`import` is the anchor, and it is load-bearing for correctness, not
+/// only for speed.** The entry deliberately outlives the tensor it was built
+/// from: a cross-package `convert()` constructs a fresh tensor over the
+/// producer's buffer, uses it, and drops it within the call, so an entry tied
+/// to that tensor's lifetime would be created and destroyed every frame and
+/// never hit (measured: 0 hits / 50 misses, against 49/1 for a native
+/// source). Outliving the tensor is safe because the platform import holds
+/// its own driver-side reference to the buffer, so a cached entry keeps the
+/// underlying object alive even after every userspace handle is closed — the
+/// system key it is identified by (a dma-buf `(st_dev, st_ino)`, an
+/// `IOSurfaceID`) therefore cannot be recycled onto a *different* buffer
+/// while the entry lives, which is what makes a stale key impossible rather
+/// than merely unlikely. Verified on hardware, both directions: on Linux the
+/// buffer's inode is still listed in `/sys/kernel/debug/dma_buf/bufinfo`
+/// after the tensor drops (Vivante/imx8mp, Mali/imx95, V3D/rpi5) and
+/// disappears the moment the cache drops; on macOS the `IOSurfaceID` still
+/// resolves after the tensor drops and stops resolving once the cache drops.
+///
+/// The consequence for any future refactor: the cache must keep owning `I`.
+/// Storing only the raw handle (`Platform::import_handle`) would keep the
+/// key-matching behaviour and silently lose the anchor.
+///
+/// Only DMA-BUF/IOSurface-backed tensors ever reach here — both
+/// `Platform::import_buffer*` implementations reject anything else — so the
+/// process-local identity kinds that genuinely could be recycled
+/// (`IdentityKind::HostPtr`, `Pbo`) are never cached.
 pub(super) struct CachedImport<I> {
     pub(super) import: I,
-    /// Weak reference to the source Tensor's BufferIdentity guard.
-    pub(super) guard: std::sync::Weak<()>,
     /// Optional GL renderbuffer backed by this import (used by direct RGB path).
     pub(super) renderbuffer: Option<u32>,
     /// Monotonic access counter for LRU eviction.
@@ -53,7 +78,10 @@ pub struct ConvertStats {
 ///
 /// Uses a HashMap with a monotonic counter for LRU eviction: each access
 /// updates the entry's `last_used` timestamp, and eviction removes the entry
-/// with the smallest `last_used` value.
+/// with the smallest `last_used` value. Recency is the *only* eviction
+/// signal — entries are retained past the lifetime of the tensor that
+/// produced them, which is what lets a re-imported buffer hit (see
+/// [`CachedImport`]), so `capacity` is the sole bound.
 /// Identity + geometry that uniquely determine an imported GPU buffer
 /// (an EGLImage over a DMA-BUF on Linux; an EGL pbuffer over an IOSurface
 /// on macOS — the key fields are platform-neutral).
@@ -95,7 +123,7 @@ impl BufferImportKey {
     /// binding-skip.
     pub(super) fn from_tensor<T>(img: &Tensor<T>, format: PixelFormat, for_dst: bool) -> Self
     where
-        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync,
+        T: num_traits::Num + Clone + std::fmt::Debug + Send + Sync + edgefirst_tensor::Element,
     {
         // A DESTINATION view()/batch() sub-region keys on its PARENT so all
         // siblings of one buffer collapse to a single import; the view's offset is
@@ -140,6 +168,30 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub entries: usize,
+    /// High-water mark of `entries`.
+    ///
+    /// Since entries are retained past the lifetime of the tensor that
+    /// produced them (the retention that `CachedImport` documents), each one
+    /// pins its buffer, so
+    /// occupancy — not hit rate — is what says how much memory a workload
+    /// holds. Below `capacity` this is the workload's true working-set size,
+    /// and the number to size `EDGEFIRST_EGL_CACHE_CAPACITY` against.
+    ///
+    /// It **saturates at `capacity`**, so on its own it cannot tell a
+    /// workload that exactly fits from one that is thrashing — both report
+    /// `peak_entries == capacity`. Read it together with [`evictions`], which
+    /// is what distinguishes them.
+    ///
+    /// [`evictions`]: Self::evictions
+    pub peak_entries: usize,
+    /// Entries evicted to stay within `capacity`.
+    ///
+    /// The signal that `capacity` is too small for the workload: every
+    /// eviction discards an import that is likely to be asked for again, so
+    /// a steady-state pipeline should reach zero. Nonzero-and-climbing with
+    /// `peak_entries == capacity` is thrashing — raise
+    /// `EDGEFIRST_EGL_CACHE_CAPACITY`, at the cost of pinning more buffers.
+    pub evictions: u64,
 }
 
 /// Combined snapshot of every EGLImage cache on the GL processor
@@ -157,6 +209,20 @@ impl GlCacheStats {
     pub fn total_misses(&self) -> u64 {
         self.src.misses + self.dst.misses + self.nv_r8.misses
     }
+
+    /// Peak entries summed across all caches — an UPPER bound on how many
+    /// buffers were pinned at once, not an exact count: `src` and `nv_r8`
+    /// routinely name the *same* source buffer (one NV12 tensor imported
+    /// two ways), and two entries over one buffer pin that buffer once.
+    /// Use the per-cache peaks to size capacity; use this to bound memory.
+    pub fn total_peak_entries(&self) -> usize {
+        self.src.peak_entries + self.dst.peak_entries + self.nv_r8.peak_entries
+    }
+
+    /// Evictions across all caches — zero in a correctly sized steady state.
+    pub fn total_evictions(&self) -> u64 {
+        self.src.evictions + self.dst.evictions + self.nv_r8.evictions
+    }
 }
 
 pub(super) struct ImportCache<I> {
@@ -166,6 +232,11 @@ pub(super) struct ImportCache<I> {
     pub(super) misses: u64,
     /// Monotonic counter incremented on each access for LRU tracking.
     pub(super) access_counter: u64,
+    /// High-water mark of `entries.len()`. See [`CacheStats::peak_entries`].
+    peak_entries: usize,
+    /// Count of entries evicted to stay within `capacity`. See
+    /// [`CacheStats::evictions`].
+    evictions: u64,
 }
 
 impl<I> ImportCache<I> {
@@ -176,6 +247,8 @@ impl<I> ImportCache<I> {
             hits: 0,
             misses: 0,
             access_counter: 0,
+            peak_entries: 0,
+            evictions: 0,
         }
     }
 
@@ -185,7 +258,36 @@ impl<I> ImportCache<I> {
             hits: self.hits,
             misses: self.misses,
             entries: self.entries.len(),
+            peak_entries: self.peak_entries,
+            evictions: self.evictions,
         }
+    }
+
+    /// Insert a freshly created import, evicting the least recently used
+    /// entry first if the cache is at capacity.
+    ///
+    /// Every insert site goes through here so that the capacity bound and the
+    /// high-water mark cannot drift apart from each other — a site that
+    /// inserted directly would silently raise the real peak above the number
+    /// [`stats`](Self::stats) reports, which is the number capacity is tuned
+    /// against.
+    ///
+    /// Eviction happens *after* the caller has successfully created the
+    /// import: a failed import must not cost the cache a live entry.
+    pub(super) fn insert(&mut self, key: BufferImportKey, import: I, renderbuffer: Option<u32>) {
+        if self.entries.len() >= self.capacity {
+            self.evict_lru();
+        }
+        let last_used = self.next_timestamp();
+        self.entries.insert(
+            key,
+            CachedImport {
+                import,
+                renderbuffer,
+                last_used,
+            },
+        );
+        self.peak_entries = self.peak_entries.max(self.entries.len());
     }
 
     /// Allocate a new LRU timestamp.
@@ -198,32 +300,13 @@ impl<I> ImportCache<I> {
     pub(super) fn evict_lru(&mut self) -> bool {
         if let Some((&evict_id, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used) {
             let evicted = self.entries.remove(&evict_id).expect("key just found");
+            self.evictions += 1;
             if let Some(rbo) = evicted.renderbuffer {
                 unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
             }
             return true;
         }
         false
-    }
-
-    /// Sweep dead entries (tensor dropped, Weak is dead).
-    /// Returns `true` if any entries were removed.
-    pub(super) fn sweep(&mut self) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|_id, entry| {
-            let alive = entry.guard.upgrade().is_some();
-            if !alive {
-                if let Some(rbo) = entry.renderbuffer {
-                    unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
-                }
-            }
-            alive
-        });
-        let swept = before - self.entries.len();
-        if swept > 0 {
-            log::debug!("ImportCache: swept {swept} dead entries");
-        }
-        swept > 0
     }
 }
 
@@ -234,11 +317,20 @@ impl<I> Drop for ImportCache<I> {
                 unsafe { edgefirst_gl::gl::DeleteRenderbuffers(1, &rbo) };
             }
         }
+        // peak/evictions are the two numbers the capacity story rests on, and
+        // they were previously reachable only through the API -- so a field
+        // report of "GPU memory pressure" could not be diagnosed from a log.
+        // `peak < capacity` with zero evictions means correctly sized;
+        // evictions climbing means the producer's pool is deeper than the bound.
         log::debug!(
-            "ImportCache stats: {} hits, {} misses, {} entries remaining",
+            "ImportCache stats: {} hits, {} misses, {} entries remaining, \
+             peak {}/{}, {} evictions",
             self.hits,
             self.misses,
-            self.entries.len()
+            self.entries.len(),
+            self.peak_entries,
+            self.capacity,
+            self.evictions
         );
     }
 }
@@ -266,6 +358,36 @@ mod tests {
             row_stride,
             format,
         }
+    }
+
+    /// The two numbers Task 7 (capacity sizing) reads, and the LRU order they
+    /// describe. Runs without a GL context: `evict_lru` only touches GL for an
+    /// entry that carries a renderbuffer, and these carry none.
+    #[test]
+    fn peak_and_evictions_report_capacity_pressure() {
+        use super::ImportCache;
+        let k = |id| key(id, 0, 64, 64, 64, PixelFormat::Grey);
+        let mut cache: ImportCache<u32> = ImportCache::new(2);
+
+        cache.insert(k(1), 10, None);
+        cache.insert(k(2), 20, None);
+        let full = cache.stats();
+        assert_eq!((full.entries, full.peak_entries), (2, 2));
+        assert_eq!(full.evictions, 0, "a cache within capacity must not evict");
+
+        // Third distinct buffer at capacity: the LRU entry (k(1)) goes.
+        cache.insert(k(3), 30, None);
+        let pressed = cache.stats();
+        assert_eq!(pressed.entries, 2, "capacity is enforced");
+        assert_eq!(
+            pressed.evictions, 1,
+            "an over-capacity insert must record an eviction — this is the \
+             signal that separates a workload that fits from one that thrashes, \
+             since peak_entries saturates at capacity in both cases"
+        );
+        assert_eq!(pressed.peak_entries, 2, "peak saturates at capacity");
+        assert!(!cache.entries.contains_key(&k(1)), "LRU entry was evicted");
+        assert!(cache.entries.contains_key(&k(3)), "new entry was inserted");
     }
 
     #[test]

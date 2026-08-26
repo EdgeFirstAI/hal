@@ -36,7 +36,7 @@ pub fn dma_available() -> bool {
         64,
         PixelFormat::Rgba,
         DType::U8,
-        Some(TensorMemory::Dma),
+        Some(TensorMemory::DmaBuf),
         edgefirst_tensor::CpuAccess::ReadWrite,
     )
     .is_ok()
