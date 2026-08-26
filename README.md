@@ -48,7 +48,8 @@ cargo add edgefirst-codec
 cargo add edgefirst-image   # add only what you use
 ```
 
-C: download `edgefirst-hal-<version>-<target>.tar.gz` from
+C: download `edgefirst-hal-<version>-<target>.tar.gz` (Linux) or `.zip`
+(Windows, macOS) from
 [GitHub Releases](https://github.com/EdgeFirstAI/hal/releases). The archive is
 relocatable — see [`packaging/c/INSTALL.txt`](packaging/c/INSTALL.txt) for
 pkg-config, runtime search path, and a JPEG→tensor example. Link

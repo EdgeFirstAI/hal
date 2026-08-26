@@ -544,6 +544,17 @@ jobs:
       - name: Two-library C user
         run: make test-two-library-user
 
+      - name: Package and smoke the C archive (macOS)
+        # PR gate for the macOS zip path (dylib names inside a .zip).
+        # release.yml's build-capi macOS rows would otherwise be the first
+        # time that branch of package-capi.sh ever ran — after a tag.
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkgconf
+          fi
+          make package
+          ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
+
       - name: Coverage summary (macOS)
         # Tool-free per-lane visibility: overall lines plus the GL-engine
         # slice (the number the GL-tests-on-ANGLE port moves), straight
@@ -820,7 +831,7 @@ jobs:
         run: |
           mkdir -p dist
           ./scripts/package-capi.sh --target x86_64-windows --libdir target/release --outdir dist
-          ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.tar.gz
+          ./scripts/smoke-capi-archive-windows.sh dist/edgefirst-hal-*-x86_64-windows.zip
 
   # ===========================================================================
   # Software-GL coverage (Mesa llvmpipe)

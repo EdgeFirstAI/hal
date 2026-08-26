@@ -28,13 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Python:** entry points accept any object implementing the `__edgefirst_tensor__` capsule, so a tensor from `edgefirst.image` can be decoded or converted from another package without a copy.
 - Detection boxes, masks, and related plain values are declared in header-only `edgefirst/detect.h` (crate `edgefirst-decoder-abi`). `decoder.h`, `image.h`, and `tracker.h` include it. Image draws those primitives; it does not depend on the model decoder.
 - **BREAKING (Python):** fused decode+draw is `Decoder.draw_onto(processor, ...)` so `edgefirst-image` no longer depends on `edgefirst-decoder`. ByteTrack lives in `edgefirst-tracker`.
-- **C archive:** shared libraries only — no `libedgefirst_*.a`. Windows layout is `bin/edgefirst_*.dll` plus `lib/edgefirst_*.lib` import libraries (cargo's `*.dll.lib` and the Rust staticlib stay in `target/` and are not published).
+- **C archive:** shared libraries only — no `libedgefirst_*.a`. Linux is `edgefirst-hal-<version>-<target>.tar.gz`; Windows and macOS are `.zip`. Windows layout is `bin/edgefirst_*.dll` plus `lib/edgefirst_*.lib` import libraries (cargo's `*.dll.lib` and the Rust staticlib stay in `target/` and are not published).
 
 ### Fixed
 
 - `HostView.numpy()` (and other tensor→numpy conversions) honour DMA row padding, matching `memoryview`.
 - Dynamic-backend gaps that returned a wrong answer or silently skipped DMA import (`as_dma()`, `create_image(dtype="int8")`, batch-NULL mapping).
-- pkg-config files derive `prefix` from `${pcfiledir}` so a tarball extracted outside `/usr` still compiles.
+- pkg-config files derive `prefix` from `${pcfiledir}` so an archive extracted outside `/usr` still compiles.
 
 ## [0.28.3] - 2026-08-15
 

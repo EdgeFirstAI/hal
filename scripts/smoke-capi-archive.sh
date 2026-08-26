@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Extract a packaged edgefirst-hal tarball and compile+run one consumer per
+# Extract a packaged edgefirst-hal archive and compile+run one consumer per
 # library using ONLY pkg-config (no source-tree -I). This is the test that
 # catches a missing detect.h, a broken .pc Requires line, or a SONAME that
 # does not resolve at runtime.
@@ -11,9 +11,9 @@
 # the two cannot drift. The archive is shared-library only (no
 # libedgefirst_*.a); static linking is not part of the package contract.
 #
-# Usage: scripts/smoke-capi-archive.sh <archive.tar.gz>
+# Usage: scripts/smoke-capi-archive.sh <archive.tar.gz|archive.zip>
 set -euo pipefail
-ARCHIVE="${1:?usage: $0 <archive.tar.gz>}"
+ARCHIVE="${1:?usage: $0 <archive.tar.gz|archive.zip>}"
 CC="${CC:-cc}"
 
 if [[ ! -f "${ARCHIVE}" ]]; then
@@ -32,7 +32,11 @@ fi
 WORKDIR="${TMPDIR:-/tmp}/smoke-capi.$$"
 mkdir -p "${WORKDIR}"
 trap 'rm -rf "${WORKDIR}"' EXIT
-tar xzf "${ARCHIVE}" -C "${WORKDIR}"
+case "${ARCHIVE}" in
+  *.tar.gz|*.tgz) tar xzf "${ARCHIVE}" -C "${WORKDIR}" ;;
+  *.zip) python3 -m zipfile -e "${ARCHIVE}" "${WORKDIR}" ;;
+  *) echo "FAIL: unknown archive type ${ARCHIVE} (want .tar.gz or .zip)" >&2; exit 1 ;;
+esac
 # The archive has exactly one top-level directory.
 PREFIX="$(find "${WORKDIR}" -mindepth 1 -maxdepth 1 -type d | head -1)"
 if [[ -z "${PREFIX}" ]] || [[ ! -d "${PREFIX}/lib/pkgconfig" ]]; then

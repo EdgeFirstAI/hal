@@ -242,9 +242,10 @@ capi-symlinks:
 		done; \
 	done
 
-# One relocatable tarball: headers, soversioned libraries, pkg-config,
-# LICENSE, INSTALL.txt. The same script release.yml's build-capi job runs,
-# so local `make package` and CI cannot drift.
+# One relocatable archive: headers, soversioned libraries, pkg-config,
+# LICENSE, INSTALL.txt. tar.gz on Linux, zip on Windows and macOS. The same
+# script release.yml's build-capi job runs, so local `make package` and CI
+# cannot drift.
 .PHONY: package
 package: capi-libs-release
 	@mkdir -p dist

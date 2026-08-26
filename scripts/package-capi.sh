@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright 2026 Au-Zone Technologies
 # SPDX-License-Identifier: Apache-2.0
 #
-# Package the five modular C libraries into one relocatable tarball:
+# Package the five modular C libraries into one relocatable archive:
 #
-#   edgefirst-hal-<version>-<target>.tar.gz
+#   edgefirst-hal-<version>-<target>.tar.gz   (Linux)
+#   edgefirst-hal-<version>-<target>.zip      (Windows, macOS)
 #
 # Usage:
 #   scripts/package-capi.sh [--version V] [--target LABEL] [--libdir DIR] [--outdir DIR]
@@ -81,7 +82,7 @@ MAJOR="${VERSION%%.*}"
 rest="${VERSION#*.}"
 MINOR="${rest%%.*}"
 PATCH="${rest#*.}"
-PATCH="${PATCH%%[!0-9]*}"  # drop +metadata / -rcN from the tarball filename piece
+PATCH="${PATCH%%[!0-9]*}"  # drop +metadata / -rcN from the archive filename piece
 
 PKG_NAME="edgefirst-hal-${VERSION}-${TARGET}"
 STAGE="${OUTDIR}/${PKG_NAME}"
@@ -180,7 +181,33 @@ elif [[ "${TARGET}" == *-windows ]]; then
 fi
 
 mkdir -p "${OUTDIR}"
-# GNU tar follows the directory argument; produce a tarball whose root is PKG_NAME.
-tar -C "${OUTDIR}" -czf "${OUTDIR}/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+# Archive root is PKG_NAME. Linux: tar.gz (keeps the SONAME symlink chain).
+# Windows and macOS: zip. zipfile.write follows dylib symlinks, so the macOS
+# zip contains both the versioned and unversioned names as regular files —
+# extractable with Explorer / Archive Utility / python -m zipfile.
+if [[ "${TARGET}" == *-linux ]]; then
+  ARCHIVE="${OUTDIR}/${PKG_NAME}.tar.gz"
+  tar -C "${OUTDIR}" -czf "${ARCHIVE}" "${PKG_NAME}"
+else
+  ARCHIVE="${OUTDIR}/${PKG_NAME}.zip"
+  python3 - "${OUTDIR}" "${PKG_NAME}" <<'PY'
+import os, sys, zipfile
+
+outdir, pkg_name = sys.argv[1], sys.argv[2]
+src = os.path.join(outdir, pkg_name)
+zip_path = os.path.join(outdir, pkg_name + ".zip")
+parent = os.path.abspath(outdir)
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, _, filenames in os.walk(src):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            arcname = os.path.relpath(path, parent).replace("\\", "/")
+            zf.write(path, arcname)
+PY
+fi
+if [[ ! -s "${ARCHIVE}" ]]; then
+  echo "FAIL: did not write ${ARCHIVE}" >&2
+  exit 1
+fi
 rm -rf "${STAGE}"
-echo "${OUTDIR}/${PKG_NAME}.tar.gz"
+echo "${ARCHIVE}"

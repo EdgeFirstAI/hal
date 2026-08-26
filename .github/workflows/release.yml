@@ -224,10 +224,11 @@ jobs:
 
   # THE C RELEASE PATH SHIPS ONE ARCHIVE PER TARGET.
   #
-  # One tarball, not five. Modularity is the pkg-config graph and DT_NEEDED,
-  # both of which survive inside a single relocatable prefix. A consumer who
-  # needs only JPEG decode still links only tensor + codec; they just extract
-  # one archive instead of two.
+  # One archive, not five (tar.gz on Linux, zip on Windows and macOS).
+  # Modularity is the pkg-config graph and DT_NEEDED, both of which survive
+  # inside a single relocatable prefix. A consumer who needs only JPEG decode
+  # still links only tensor + codec; they just extract one archive instead of
+  # two.
   build-capi:
     name: Build modular C API (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -306,7 +307,12 @@ jobs:
           fi
           python3 .github/scripts/verify_version.py "${VERSION}" >/dev/null
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "archive=edgefirst-hal-${VERSION}-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+          TARGET="${{ matrix.target }}"
+          case "${TARGET}" in
+            *-linux) EXT=tar.gz ;;
+            *) EXT=zip ;;
+          esac
+          echo "archive=edgefirst-hal-${VERSION}-${TARGET}.${EXT}" >> "$GITHUB_OUTPUT"
 
       - name: Package one archive
         shell: bash
@@ -349,7 +355,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: capi-${{ matrix.target }}
-          path: staged/*.tar.gz
+          path: staged/${{ steps.ver.outputs.archive }}
 
   publish-tensor:
     name: Publish edgefirst-tensor

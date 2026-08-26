@@ -4,7 +4,8 @@ EdgeFirst HAL — C libraries
 This archive is relocatable. Extract it anywhere; the pkg-config files derive
 `prefix` from their own location, so they work from an arbitrary directory.
 
-  tar xzf edgefirst-hal-<version>-<target>.tar.gz
+  tar xzf edgefirst-hal-<version>-<target>.tar.gz   # Linux
+  unzip edgefirst-hal-<version>-<target>.zip        # Windows, macOS
   cd edgefirst-hal-<version>-<target>
 
 Point pkg-config at the extracted tree:

@@ -6,12 +6,12 @@
 # the Windows archive contract; this compiles one `#include` consumer per
 # library against the packaged headers and import libs.
 #
-# Usage: scripts/smoke-capi-archive-windows.sh <archive.tar.gz>
+# Usage: scripts/smoke-capi-archive-windows.sh <archive.zip>
 #
 # Requires a C compiler on PATH: cl (after vcvars), clang-cl, or clang.
 # The GitHub windows-latest job sources MSVC via ilammy/msvc-dev-cmd.
 set -euo pipefail
-ARCHIVE="${1:?usage: $0 <archive.tar.gz>}"
+ARCHIVE="${1:?usage: $0 <archive.zip>}"
 
 if [[ ! -f "${ARCHIVE}" ]]; then
   echo "FAIL: ${ARCHIVE} not found" >&2
@@ -21,7 +21,10 @@ fi
 WORKDIR="${TMPDIR:-/tmp}/smoke-capi-win.$$"
 mkdir -p "${WORKDIR}"
 trap 'rm -rf "${WORKDIR}"' EXIT
-tar xzf "${ARCHIVE}" -C "${WORKDIR}"
+case "${ARCHIVE}" in
+  *.zip) python3 -m zipfile -e "${ARCHIVE}" "${WORKDIR}" ;;
+  *) echo "FAIL: unknown archive type ${ARCHIVE} (want .zip)" >&2; exit 1 ;;
+esac
 PREFIX="$(find "${WORKDIR}" -mindepth 1 -maxdepth 1 -type d | head -1)"
 if [[ -z "${PREFIX}" ]] || [[ ! -d "${PREFIX}/include/edgefirst" ]]; then
   echo "FAIL: archive has no include/edgefirst — cannot measure" >&2
