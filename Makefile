@@ -226,16 +226,19 @@ capi-libs-release:
 	@echo "✓ Modular C-API release build complete"
 	@$(MAKE) capi-symlinks
 
-# build.rs sets `-soname libedgefirst_X.so.0` for each leaf, but cargo only
-# ever writes the unversioned `libedgefirst_X.so`, so no C binary can load
-# one via its DT_NEEDED entry. Cargo never writes the versioned symlink, so
-# this target creates `libedgefirst_X.so.0` next to each leaf.
+# build.rs sets `-soname libedgefirst_X.so.0` / install_name
+# `libedgefirst_X.0.dylib`, but cargo only ever writes the unversioned
+# name, so no C binary (or Rust test harness) can load one via DT_NEEDED /
+# @rpath. Cargo never writes the versioned symlink, so this target creates
+# it next to each leaf.
 .PHONY: capi-symlinks
 capi-symlinks:
 	@for l in tensor image codec decoder tracker; do \
-		for d in target/debug target/release; do \
+		for d in target/debug target/release target/profiling; do \
 			[ -f $$d/libedgefirst_$$l.so ] && \
 				ln -sf libedgefirst_$$l.so $$d/libedgefirst_$$l.so.0 || true; \
+			[ -f $$d/libedgefirst_$$l.dylib ] && \
+				ln -sf libedgefirst_$$l.dylib $$d/libedgefirst_$$l.0.dylib || true; \
 		done; \
 	done
 

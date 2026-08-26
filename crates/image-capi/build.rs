@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -62,7 +62,7 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         tensor_lib_dir.display()
     );
-    println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    link_tensor_cdylib(&target_os, &tensor_lib_dir);
 
     // A consumer of THIS library that never itself calls an ef_tensor_*
     // function directly (the common case: a caller of ef_image_processor_*
@@ -89,4 +89,23 @@ fn main() {
     // is validating a stale artifact. (Learned the hard way in Plan 2.)
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=cbindgen.toml");
+}
+
+/// Link `libedgefirst_tensor` as a DLL/so/dylib, never as the Rust staticlib.
+///
+/// On MSVC, `dylib=edgefirst_tensor` still resolves `edgefirst_tensor.lib`,
+/// which is the staticlib cargo writes next to the DLL. Linking that
+/// staticlib into this Rust cdylib duplicates rust std (LNK2005:
+/// `rust_panic`, alloc hooks, …). The import library is
+/// `edgefirst_tensor.dll.lib`.
+fn link_tensor_cdylib(target_os: &str, tensor_lib_dir: &Path) {
+    if target_os == "windows" {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            tensor_lib_dir.join("deps").display()
+        );
+        println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+    }
 }

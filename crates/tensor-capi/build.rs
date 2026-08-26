@@ -3,14 +3,41 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
-fn coverage_instrumentation_active() -> bool {
-    fn has_cov(s: &str) -> bool {
-        s.contains("instrument-coverage")
-    }
+fn rustflags() -> String {
+    format!(
+        "{} {}",
+        env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default(),
+        env::var("RUSTFLAGS").unwrap_or_default()
+    )
+}
+
+fn skip_exports_map() -> bool {
+    let flags = rustflags();
+    // rustc 1.94 injects its own `--version-script=.../list` for Linux
+    // cdylibs (`--no-undefined-version`). A second script is
+    // `ld: anonymous version tag cannot be combined with other version tags`
+    // on aarch64 bfd. Coverage rustflags carry the same collision.
     env::var_os("EF_SKIP_VERSION_SCRIPT").is_some()
-        || has_cov(&env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default())
-        || has_cov(&env::var("RUSTFLAGS").unwrap_or_default())
+        || flags.contains("instrument-coverage")
+        || flags.contains("version-script")
+}
+
+fn rust_lld() -> Option<PathBuf> {
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8(output.stdout).ok()?;
+    let sysroot = sysroot.trim();
+    let target = env::var("TARGET").ok()?;
+    let lld = PathBuf::from(format!("{sysroot}/lib/rustlib/{target}/bin/gcc-ld/ld.lld"));
+    lld.is_file().then_some(lld)
 }
 
 fn main() {
@@ -35,14 +62,17 @@ fn main() {
     if target_os == "linux" {
         let major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap();
         println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libedgefirst_tensor.so.{major}");
-        // Coverage instrumentation injects its own `--version-script=.../list`.
-        // Combining that with `exports.map` is `ld: anonymous version tag
-        // cannot be combined with other version tags` on aarch64.
-        // Nested `cargo` from python-tensor's build.rs strips
-        // CARGO_ENCODED_RUSTFLAGS but still inherits shell RUSTFLAGS from
-        // cargo-llvm-cov show-env -- so both env vars (and an explicit
-        // skip from the parent build.rs) must be consulted.
-        if !coverage_instrumentation_active() {
+        // aarch64 GNU bfd rejects rustc's injected version script combined
+        // with exports.map. lld concatenates them, which keeps the ef_*
+        // export set G1 measures.
+        if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("aarch64") {
+            if let Some(lld) = rust_lld() {
+                println!("cargo:rustc-cdylib-link-arg=-fuse-ld={}", lld.display());
+            } else {
+                println!("cargo:rustc-cdylib-link-arg=-fuse-ld=lld");
+            }
+        }
+        if !skip_exports_map() {
             println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={crate_dir}/exports.map");
         }
         println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");

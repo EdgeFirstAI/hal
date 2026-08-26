@@ -54,6 +54,26 @@ fn bare_u8(shape: &[usize]) -> Tensor<u8> {
     Tensor::<u8>::new(shape, None, None).expect("bare tensor allocation")
 }
 
+/// Host has no usable dma-heap / shm device. The C builder wraps the OS
+/// error in `io::ErrorKind::Other` (`builder_alloc: IoError(Os { kind:
+/// PermissionDenied, ... })`), so matching only `e.kind()` misses the
+/// GitHub-hosted runner case and panics as "unexpected".
+fn platform_resource_absent(err: &Error) -> bool {
+    match err {
+        Error::IoError(e) => {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || e.to_string().contains("Permission denied")
+                || e.to_string().contains("No such file or directory")
+        }
+        Error::NotImplemented(msg) => {
+            msg.contains("Permission denied") || msg.contains("errno 13") || msg.contains("errno 2")
+        }
+        _ => false,
+    }
+}
+
 // --- Family 1: set_format / set_row_stride / set_plane_offset -------------
 //
 // Real caller: `edgefirst-image`'s `import_image` (single-plane path), which
@@ -1056,15 +1076,7 @@ fn dmabuf_clone_refuses_host_memory_and_dups_a_real_dma_fd() {
 
     let dma = match Tensor::<u8>::new(&[64, 64], Some(TensorMemory::DmaBuf), None) {
         Ok(t) => t,
-        // Same host-capability skip the protocol round-trip tests use: an
-        // absent or unopenable /dev/dma_heap is a platform fact, not a
-        // failure of this code.
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        Err(e) if platform_resource_absent(&e) => {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
@@ -1297,16 +1309,7 @@ fn clone_fd_works_for_shm_not_only_dma() {
     const SHAPE: [usize; 2] = [64, 64];
     let shm = match Tensor::<u8>::new(&SHAPE, Some(TensorMemory::Shm), None) {
         Ok(t) => t,
-        // Only a genuine platform absence is a skip. Any other error is this
-        // code failing and must not be swallowed -- the same discrimination
-        // the DMA tests above apply, rather than a blanket catch that turns
-        // every failure into a silent pass.
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        Err(e) if platform_resource_absent(&e) => {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
