@@ -5,13 +5,15 @@
 //! Registered on `edgefirst.decoder`. TilePlacement is accepted by attribute
 //! so an `edgefirst.image.TilePlacement` works without sharing a PyO3 type.
 
-use crate::detect_boxes::{convert_detect_box, numpy_to_detect_boxes, PyDetOutput};
+use crate::detect_boxes::{
+    convert_detect_box, numpy_to_detect_boxes, views_to_detect_boxes, PyDetOutput,
+};
 use edgefirst_decoder::tiling::{
     lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, TiledFrameAccumulator,
 };
 use edgefirst_decoder_abi::TilePlacement;
-use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 /// Overlap metric used by the tiled-detection merge.
@@ -166,9 +168,22 @@ impl PyTiledFrameAccumulator {
         classes: PyReadonlyArray1<usize>,
         placement: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        let dets = numpy_to_detect_boxes(&bbox, &scores, &classes)?;
+        if bbox.shape()[1] != 4 {
+            return Err(PyValueError::new_err("bbox shape must be (N, 4)"));
+        }
+        if bbox.shape()[0] != scores.shape()[0] || bbox.shape()[0] != classes.shape()[0] {
+            return Err(PyValueError::new_err(
+                "bbox, scores, classes must have the same length",
+            ));
+        }
+        // Copy out of the caller's numpy arrays so the O(N) DetectBox
+        // conversion and the accumulator update can run with the GIL released.
+        let bbox = bbox.as_array().to_owned();
+        let scores = scores.as_array().to_owned();
+        let classes = classes.as_array().to_owned();
         let placement = extract_placement(placement)?;
         py.detach(move || {
+            let dets = views_to_detect_boxes(bbox.view(), scores.view(), classes.view());
             let acc = self
                 .0
                 .as_mut()

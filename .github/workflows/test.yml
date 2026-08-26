@@ -555,6 +555,34 @@ jobs:
           make package
           ./scripts/smoke-capi-archive.sh dist/edgefirst-hal-*.zip
 
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Run GPU Python tests
+        # Linux pytest skips @pytest.mark.gpu (no real GPU; software GL is
+        # opted out). macOS must run and pass via ANGLE. Codesign the venv
+        # interpreter with disable-library-validation so dlopen of ANGLE
+        # does not SIGKILL the process (same entitlement as test-macos.sh).
+        env:
+          HAL_TEST_REQUIRE_GL: "1"
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          venv/bin/pip install maturin pytest numpy pillow
+          for pkg in tensor codec image decoder tracker; do
+            venv/bin/maturin build \
+              --manifest-path "crates/python-$pkg/Cargo.toml" \
+              --out target/wheels \
+              --release \
+              --features abi3-py311
+          done
+          venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
+          PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")
+          codesign --force --sign - --entitlements entitlements.plist "$PY"
+          venv/bin/python -m pytest tests/ -m gpu -v --tb=short
+
       - name: Coverage summary (macOS)
         # Tool-free per-lane visibility: overall lines plus the GL-engine
         # slice (the number the GL-tests-on-ANGLE port moves), straight

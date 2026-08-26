@@ -31,5 +31,6 @@ target-version = "py38"
 testpaths = ["tests"]
 markers = [
     "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
+    "gpu: GPU-backed tests (skipped on Linux/Windows CI; required on macOS)",
 ]
 addopts = "-m 'not benchmark'"

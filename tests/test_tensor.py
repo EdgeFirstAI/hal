@@ -8,6 +8,7 @@ import sys
 
 import numpy as np
 import pytest
+from tests.dma_skip import image_or_skip_dma, tensor_or_skip_dma
 from edgefirst.tensor import PixelFormat, Tensor, TensorMemory
 
 # fmt: off
@@ -66,7 +67,7 @@ def test_dtype(dtype, size, fmt, itemsize, val1, val2):
 )
 def test_from_fd_dma():
     try:
-        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
+        tensor = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
@@ -94,7 +95,7 @@ def test_from_fd_dma():
 )
 def test_dma_zero_copy_perf():
     try:
-        tensor = Tensor([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
+        tensor = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=TensorMemory.DMABUF)
     except (AttributeError, RuntimeError):
         pytest.skip("DMA memory not supported on this platform")
 
@@ -210,7 +211,7 @@ def test_shm_zero_copy_perf():
 
 def tensor_fd_func(mem_type: TensorMemory):
     try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        original = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=mem_type)
         del original
     except (AttributeError, RuntimeError):
         pytest.skip(f"{mem_type} memory not supported on this platform")
@@ -262,7 +263,7 @@ def test_shm_no_fd_leaks():
 
 def tensor_from_fd_func(mem_type: TensorMemory):
     try:
-        original = Tensor([100, 100, 3], dtype="uint8", mem=mem_type)
+        original = tensor_or_skip_dma([100, 100, 3], dtype="uint8", mem=mem_type)
         # Probe .fd here too: some backends for this memory type construct
         # fine but have no fd (e.g. macOS DMA is IOSurface-backed, whose
         # clone_fd is NotImplemented — use surface_id() instead).
@@ -820,7 +821,7 @@ def test_map_read_yields_a_readonly_view(mem):
     a non-coherent backing. Advertising it read-only is what turns that
     silent data loss into an exception at the point of the mistake.
     """
-    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     with t.map("read") as view:
         assert memoryview(view).readonly is True
         arr = np.asarray(view)
@@ -891,7 +892,7 @@ def test_map_rejects_access_none_and_garbage():
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_numpy_of_a_read_map_is_not_writable(mem):
-    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("read")
     arr = np.asarray(m.numpy())
     assert not arr.flags.writeable, (
@@ -903,7 +904,7 @@ def test_numpy_of_a_read_map_is_not_writable(mem):
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_numpy_of_a_readwrite_map_is_writable(mem):
     """The other half: the guard must not have broken the normal path."""
-    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("readwrite")
     arr = np.asarray(m.numpy())
     assert arr.flags.writeable
@@ -915,7 +916,7 @@ def test_numpy_of_a_readwrite_map_is_writable(mem):
 def test_setitem_on_a_read_map_raises_a_catchable_error(mem):
     """Not a PanicException: that derives from BaseException, so an ordinary
     `except Exception` would not catch it and a frame loop would die."""
-    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("read")
     with pytest.raises(Exception) as excinfo:
         m[0] = 7
@@ -925,7 +926,7 @@ def test_setitem_on_a_read_map_raises_a_catchable_error(mem):
 
 @pytest.mark.parametrize("mem", [TensorMemory.MEM, TensorMemory.DMABUF])
 def test_setitem_on_a_readwrite_map_still_works(mem):
-    t = Tensor.image(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
+    t = image_or_skip_dma(8, 4, format=PixelFormat.Rgb, mem=mem, access="readwrite")
     m = t.map("readwrite")
     m[0] = 7
     assert m[0] == 7

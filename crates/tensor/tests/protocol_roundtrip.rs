@@ -16,6 +16,7 @@ use edgefirst_tensor::{
 /// Host has no usable dma-heap. The dynamic backend wraps the OS error in
 /// `io::ErrorKind::Other` (`image_alloc: IoError(Os { kind: PermissionDenied })`),
 /// so matching only `e.kind()` panics on GitHub-hosted runners.
+#[cfg(target_os = "linux")]
 fn platform_resource_absent(err: &Error) -> bool {
     match err {
         Error::IoError(e) => {

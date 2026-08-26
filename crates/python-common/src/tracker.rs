@@ -10,7 +10,7 @@ use edgefirst_tracker::{
     ActiveTrackInfo, ByteTrack, ByteTrackBuilder, DetectionBox, TrackInfo, Tracker,
 };
 use numpy::{PyArrayLike1, PyArrayLike2};
-use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
+use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult, Python};
 use uuid::Uuid;
 
 /// Local box type so this module does not depend on `edgefirst-tensor`.
@@ -205,37 +205,46 @@ impl PyByteTrack {
 
     pub fn update(
         &mut self,
+        py: Python<'_>,
         boxes: PyArrayLike2<f32>,
         scores: PyArrayLike1<f32>,
         labels: PyArrayLike1<usize>,
         timestamp_ns: u64,
     ) -> Vec<Option<PyTrackInfo>> {
-        let boxes = boxes.as_array();
-        let scores = scores.as_array();
-        let labels = labels.as_array();
-
-        let boxes = boxes
-            .rows()
-            .into_iter()
-            .zip(scores.iter())
-            .zip(labels.iter())
-            .map(|((bbox, score), label)| TrackBox {
-                bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
-                score: *score,
-                label: *label,
-            })
-            .collect::<Vec<_>>();
-
-        let tracks = <Self as Tracker<TrackBox>>::update(self, &boxes, timestamp_ns);
-
-        tracks
-            .into_iter()
-            .map(|t| t.map(|ti| PyTrackInfo { track: ti }))
-            .collect()
+        let boxes = boxes.as_array().to_owned();
+        let scores = scores.as_array().to_owned();
+        let labels = labels.as_array().to_owned();
+        let tracker = Arc::clone(&self.tracker);
+        py.detach(move || {
+            let boxes: Vec<TrackBox> = boxes
+                .rows()
+                .into_iter()
+                .zip(scores.iter())
+                .zip(labels.iter())
+                .map(|((bbox, score), label)| TrackBox {
+                    bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
+                    score: *score,
+                    label: *label,
+                })
+                .collect();
+            let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker
+                .update(&boxes, timestamp_ns)
+                .into_iter()
+                .map(|t| t.map(|ti| PyTrackInfo { track: ti }))
+                .collect()
+        })
     }
 
-    pub fn get_active_tracks(&self) -> Vec<PyActiveTrackInfo> {
-        let tracks = <Self as Tracker<TrackBox>>::get_active_tracks(self);
-        tracks.into_iter().map(|ti| ti.into()).collect()
+    pub fn get_active_tracks(&self, py: Python<'_>) -> Vec<PyActiveTrackInfo> {
+        let tracker = Arc::clone(&self.tracker);
+        py.detach(move || {
+            let tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker
+                .get_active_tracks()
+                .into_iter()
+                .map(|ti| ti.into())
+                .collect()
+        })
     }
 }

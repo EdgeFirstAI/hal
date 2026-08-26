@@ -61,6 +61,10 @@ if [[ -z "${CC}" ]]; then
 fi
 echo "using compiler: ${CC}"
 
+winpath() {
+  cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
+}
+
 find_implib() {
   local leaf="$1"
   local f="${LIB}/edgefirst_${leaf}.lib"
@@ -84,16 +88,19 @@ for leaf in tensor image codec decoder tracker; do
   case "${CC}" in
     cl)
       # Git bash converts `/nologo` into `C:/Program Files/Git/nologo`.
-      # MSYS_NO_PATHCONV keeps MSVC's slash flags intact.
-      if ! MSYS_NO_PATHCONV=1 cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
-          /link /LIBPATH:"${LIB}" "$(cygpath -w "${implib}" 2>/dev/null || echo "${implib}")"; then
+      # MSYS_NO_PATHCONV keeps MSVC's slash flags intact. File arguments
+      # must still be Windows paths: `/tmp/foo.c` is a cl option, not a source.
+      if ! MSYS_NO_PATHCONV=1 cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
+          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
+          /link /LIBPATH:"$(winpath "${LIB}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (cl)" >&2
         exit 1
       fi
       ;;
     clang-cl)
-      if ! MSYS_NO_PATHCONV=1 clang-cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
-          /link /LIBPATH:"${LIB}" "${implib}"; then
+      if ! MSYS_NO_PATHCONV=1 clang-cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
+          /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
+          /link /LIBPATH:"$(winpath "${LIB}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (clang-cl)" >&2
         exit 1
       fi

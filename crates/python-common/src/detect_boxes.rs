@@ -38,7 +38,18 @@ pub(crate) fn numpy_to_detect_boxes(
     let bbox: ArrayView2<f32> = bbox.as_array();
     let scores: ArrayView1<f32> = scores.as_array();
     let classes: ArrayView1<usize> = classes.as_array();
-    Ok(Zip::from(bbox.rows())
+    Ok(views_to_detect_boxes(bbox, scores, classes))
+}
+
+/// GIL-free conversion from owned/viewed arrays. Callers that need to
+/// release the GIL must copy out of numpy first, then call this inside
+/// [`Python::detach`].
+pub(crate) fn views_to_detect_boxes(
+    bbox: ArrayView2<f32>,
+    scores: ArrayView1<f32>,
+    classes: ArrayView1<usize>,
+) -> Vec<DetectBox> {
+    Zip::from(bbox.rows())
         .and(scores)
         .and(classes)
         .into_par_iter()
@@ -47,7 +58,7 @@ pub(crate) fn numpy_to_detect_boxes(
             score: *s,
             label: *c,
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(feature = "decoder")]

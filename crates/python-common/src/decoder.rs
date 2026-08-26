@@ -930,6 +930,8 @@ impl PyDecoder {
     ) -> PyResult<PySegDetTrackedOutput<'py>> {
         let py = self_.py();
         let (boxes, scores, classes, masks) = Self::decode(self_, model_output, max_boxes)?;
+        // ByteTrack.update is PyO3: it copies the arrays then releases the
+        // GIL for the Kalman association. Keep this a thin Python call.
         let update_tracks =
             tracker.call_method1("update", (&boxes, &scores, &classes, timestamp))?;
 

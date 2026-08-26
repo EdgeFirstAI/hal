@@ -21,6 +21,7 @@ import sys
 
 import pytest
 from edgefirst.tensor import PixelFormat, Tensor
+from tests.gpu_policy import skip_unless_gpu_backed
 
 
 def test_capsule_defaults_to_no_pin():
@@ -182,6 +183,7 @@ def test_access_negotiation_retries_mem_backed_destination():
         assert out[4, 4].tolist() != [0, 0, 0], "converted image is blank"
 
 
+@pytest.mark.gpu
 def test_gpu_backed_destination_skips_the_retry():
     """The retry added above must stay conditional on a HOST-kind
     descriptor with no address -- a GPU-importable destination
@@ -213,6 +215,7 @@ def test_gpu_backed_destination_skips_the_retry():
 
     proc = ImageProcessor()
     dst = proc.create_image(8, 8, ImgFmt.Rgb, "uint8", "readwrite")
+    skip_unless_gpu_backed(dst)
     assert str(dst.memory) not in ("TensorMemory.MEM", "TensorMemory.SHM"), (
         f"create_image() yielded {dst.memory!r} -- the retry-skip guarantee "
         "this test protects is vacuous unless the destination is GPU-backed"
@@ -241,6 +244,7 @@ def test_access_none_never_pins_bypasses_gate_loudly_if_skipped():
     assert t.memory == TensorMemory.MEM
 
 
+@pytest.mark.gpu
 def test_decode_into_gpu_backed_tensor_from_another_package():
     """The documented zero-copy pipeline: allocate GPU-backed, decode into
     it, convert. `decode_file_into` is `edgefirst.codec`'s free-function
@@ -260,6 +264,7 @@ def test_decode_into_gpu_backed_tensor_from_another_package():
     proc = ImageProcessor()
     info = CodecTensor.peek_image_info_file("testdata/zidane.jpg")
     src = proc.create_image(info.width, info.height, ImgFmt.Nv12, "uint8", "readwrite")
+    skip_unless_gpu_backed(src)
 
     got = decode_file_into(src, "testdata/zidane.jpg")
     assert (got.width, got.height) == (info.width, info.height)

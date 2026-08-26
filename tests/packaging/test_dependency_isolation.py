@@ -1,16 +1,22 @@
-"""Each wheel must link only what it needs.
+"""Isolation of the five libraries: Rust crates via cargo tree, Python
+wheels via the DT_NEEDED / otool of the installed extension.
 
-These assert the *dependency graph*, not sizes: a coupling can be re-added by
-one unconditional reference and shrink to nothing under dead-code elimination,
-so it is invisible in a size baseline while still being wrong. `cargo tree` is
-the honest check.
+A coupling can be re-added by one unconditional reference and shrink to
+nothing under dead-code elimination, so it is invisible in a size baseline
+while still being wrong. `cargo tree --prefix none --format {p}` is the
+honest check for Rust. Python wheels do not cargo-depend on the sibling
+Rust crates (they are python-common + a C library from build.rs), so
+isolation for those is measured on the built ``.so`` / ``.dylib``.
 """
 
 # `set[str]` in a runtime annotation is evaluated at def time; the project
 # floor is Python 3.8, where the builtin is not subscriptable.
 from __future__ import annotations
 
+import importlib
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -32,29 +38,40 @@ INTERNAL = (
     "edgefirst-tracker",
 )
 
+CARGO_TREE = [
+    "cargo",
+    "tree",
+    "-e",
+    "normal",
+    "--prefix",
+    "none",
+    "--format",
+    "{p}",
+]
+
 
 def _crate_names(tree_output: str) -> set[str]:
-    """The set of crate names `cargo tree` printed, one per line.
+    """The set of crate names `cargo tree --prefix none --format {p}` printed.
 
-    Real per-line parsing, not a substring scan of the whole blob: each line
-    is `<tree-drawing prefix><name> v<version> (<path or "*">)`, e.g.
-    `│   └── edgefirst-decoder-abi v0.29.0 (/repo/crates/decoder-abi)`. The
-    box-drawing prefix (`├── `, `│   `, `└── `, plain indentation) is made up
-    entirely of `│├└─` and spaces, so stripping those from the left leaves
-    the name as the first whitespace-delimited token; the version, path, and
-    any `(*)` dedup marker that follow are irrelevant here and ignored.
+    Each line is ``<name> v<version>`` (stable; no box-drawing prefix). The
+    first whitespace-delimited token is the crate name. A substring scan of
+    the whole blob would report ``edgefirst-decoder`` whenever only
+    ``edgefirst-decoder-abi`` is present.
     """
     names = set()
     for line in tree_output.splitlines():
-        name = line.lstrip(" │├└─").split(" ", 1)[0]
+        name = line.split(" ", 1)[0]
         if name:
             names.add(name)
     return names
 
 
-def links(package: str) -> set[str]:
+def links(package: str, extra: list[str] | None = None) -> set[str]:
+    cmd = [*CARGO_TREE, "-p", package]
+    if extra:
+        cmd.extend(extra)
     out = subprocess.run(
-        ["cargo", "tree", "-p", package, "-e", "normal"],
+        cmd,
         capture_output=True,
         text=True,
         check=True,
@@ -62,18 +79,17 @@ def links(package: str) -> set[str]:
     return _crate_names(out) & set(INTERNAL)
 
 
-# Captured, trimmed `cargo tree` output shaped like a real python wheel's
-# tree (tree-drawing prefixes, nesting, versions, absolute paths, a `(*)`
-# dedup marker) with one dependency whose name is a different INTERNAL
-# crate's name plus a suffix -- exactly the `edgefirst-decoder`/
-# `edgefirst-decoder-abi` shape that broke the substring version of `links()`.
+# Captured `cargo tree --prefix none --format {p}` output with one
+# dependency whose name is a different INTERNAL crate's name plus a suffix
+# -- exactly the `edgefirst-decoder` / `edgefirst-decoder-abi` shape that
+# broke the substring version of `links()`.
 _DECODER_ABI_ONLY_FIXTURE = (
-    "edgefirst-python-image v0.29.0 (/repo/crates/python-image)\n"
-    "├── edgefirst-image v0.29.0 (/repo/crates/image)\n"
-    "│   ├── edgefirst-codec v0.29.0 (/repo/crates/codec)\n"
-    "│   │   └── edgefirst-tensor v0.29.0 (/repo/crates/tensor)\n"
-    "│   └── edgefirst-decoder-abi v0.29.0 (/repo/crates/decoder-abi)\n"
-    "└── edgefirst-tensor v0.29.0 (/repo/crates/tensor) (*)\n"
+    "edgefirst-python-image v0.29.0\n"
+    "edgefirst-image v0.29.0\n"
+    "edgefirst-codec v0.29.0\n"
+    "edgefirst-tensor v0.29.0\n"
+    "edgefirst-decoder-abi v0.29.0\n"
+    "edgefirst-tensor v0.29.0\n"
 )
 
 
@@ -96,22 +112,76 @@ def test_links_reports_a_crate_only_when_it_is_actually_in_the_graph(monkeypatch
     assert "edgefirst-decoder" not in linked
 
 
-def test_tensor_wheel_links_only_the_tensor_crate():
-    """The smallest wheel must not carry a decoder.
+SIBLING_C_LIBS = (
+    "libedgefirst_codec",
+    "libedgefirst_image",
+    "libedgefirst_decoder",
+    "libedgefirst_tracker",
+)
 
-    It did until 0.29: python-common's tensor.rs referenced edgefirst_codec
-    unconditionally, so `tensor = ["dep:edgefirst-codec"]` was load-bearing and
-    every edgefirst-tensor install shipped a JPEG/PNG decoder it never exposed.
+
+def _wheel_extension(leaf: str) -> Path:
+    name = f"edgefirst.{leaf}._{leaf}"
+    try:
+        mod = importlib.import_module(name)
+    except ImportError as exc:
+        pytest.fail(
+            f"{name} is not installed; packaging tests measure the built "
+            f"wheels, not `cargo tree -p edgefirst-python-*`: {exc}"
+        )
+    path = Path(mod.__file__)
+    if not path.is_file():
+        pytest.fail(f"{name}.__file__ is not a file: {path}")
+    return path
+
+
+def _needed_text(so: Path) -> str:
+    if sys.platform == "darwin":
+        r = subprocess.run(
+            ["otool", "-L", str(so)], capture_output=True, text=True, check=True
+        )
+        return r.stdout
+    r = subprocess.run(
+        ["readelf", "-d", str(so)], capture_output=True, text=True, check=True
+    )
+    return r.stdout
+
+
+def _links_libedgefirst_tensor(so: Path) -> bool:
+    return "libedgefirst_tensor" in _needed_text(so)
+
+
+def _embedded_sibling_c_libs(so: Path) -> list[str]:
+    text = _needed_text(so)
+    return [lib for lib in SIBLING_C_LIBS if lib in text]
+
+
+@pytest.mark.parametrize("leaf", ["tensor", "codec", "image", "decoder"])
+def test_python_wheel_dt_needed_libedgefirst_tensor(leaf):
+    """Four wheels dynamically link libedgefirst_tensor; they must not
+    embed a sibling C library (G12).
     """
-    assert links("edgefirst-python-tensor") == {"edgefirst-tensor"}
+    so = _wheel_extension(leaf)
+    assert _links_libedgefirst_tensor(so), (
+        f"{so} has no DT_NEEDED/otool entry for libedgefirst_tensor"
+    )
+    siblings = _embedded_sibling_c_libs(so)
+    assert not siblings, (
+        f"{so} dynamically links sibling C libraries {siblings}; "
+        "python wheels must not DT_NEEDED those implementations"
+    )
 
 
-def test_codec_wheel_does_not_pull_the_image_stack():
-    assert links("edgefirst-python-codec") == {"edgefirst-tensor", "edgefirst-codec"}
-
-
-def test_decoder_wheel_does_not_pull_the_image_stack():
-    assert "edgefirst-image" not in links("edgefirst-python-decoder")
+def test_tracker_wheel_does_not_link_tensor():
+    """Tracker detections cross as a plain array; _tracker.so must not
+    DT_NEEDED libedgefirst_tensor.
+    """
+    so = _wheel_extension("tracker")
+    assert not _links_libedgefirst_tensor(so), (
+        f"{so} unexpectedly links libedgefirst_tensor"
+    )
+    siblings = _embedded_sibling_c_libs(so)
+    assert not siblings, f"{so} dynamically links sibling C libraries {siblings}"
 
 
 # `edgefirst-tensor`'s feature set, from its own Cargo.toml: `static` and
@@ -214,6 +284,10 @@ def test_decode_feature_restores_the_decoder():
             "edgefirst-image",
             "-e",
             "normal",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
             "--features",
             "decode",
         ],
