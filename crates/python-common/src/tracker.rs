@@ -173,6 +173,14 @@ pub struct PyByteTrack {
 unsafe impl Send for PyByteTrack {}
 unsafe impl Sync for PyByteTrack {}
 
+type AssociatedDetections = (
+    Vec<[f32; 4]>,
+    Vec<f32>,
+    Vec<usize>,
+    Vec<PyTrackInfo>,
+    Vec<usize>,
+);
+
 impl Tracker<TrackBox> for PyByteTrack {
     fn update(&mut self, boxes: &[TrackBox], timestamp_ns: u64) -> Vec<Option<TrackInfo>> {
         let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
@@ -201,6 +209,55 @@ impl PyByteTrack {
                     .build(),
             )),
         }
+    }
+
+    /// Decode-tracked fast path: Kalman update plus the live/coasting rewrite
+    /// in one `py.detach`. Returns tracked boxes/scores/classes, `TrackInfo`
+    /// objects, and the detection indices whose masks to keep. `Decoder.
+    /// decode_tracked` calls this via `getattr` so a duck-typed tracker
+    /// without it still works through `update` / `get_active_tracks`.
+    pub fn _associate_detections(
+        &mut self,
+        py: Python<'_>,
+        boxes: Vec<[f32; 4]>,
+        scores: Vec<f32>,
+        labels: Vec<usize>,
+        timestamp_ns: u64,
+    ) -> AssociatedDetections {
+        let tracker = Arc::clone(&self.tracker);
+        py.detach(move || {
+            let detections: Vec<TrackBox> = boxes
+                .into_iter()
+                .zip(scores)
+                .zip(labels)
+                .map(|((bbox, score), label)| TrackBox { bbox, score, label })
+                .collect();
+            let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            let live = tracker.update(&detections, timestamp_ns);
+            let mut out_boxes = Vec::new();
+            let mut out_scores = Vec::new();
+            let mut out_classes = Vec::new();
+            let mut out_tracks = Vec::new();
+            let mut mask_idx = Vec::new();
+            for (i, (det, track)) in detections.iter().zip(live).enumerate() {
+                let Some(ti) = track else { continue };
+                out_boxes.push(ti.tracked_location);
+                out_scores.push(det.score);
+                out_classes.push(det.label);
+                out_tracks.push(PyTrackInfo { track: ti });
+                mask_idx.push(i);
+            }
+            for at in tracker.get_active_tracks() {
+                if at.info.last_updated == timestamp_ns {
+                    continue;
+                }
+                out_boxes.push(at.info.tracked_location);
+                out_scores.push(at.last_box.score);
+                out_classes.push(at.last_box.label);
+                out_tracks.push(PyTrackInfo { track: at.info });
+            }
+            (out_boxes, out_scores, out_classes, out_tracks, mask_idx)
+        })
     }
 
     pub fn update(

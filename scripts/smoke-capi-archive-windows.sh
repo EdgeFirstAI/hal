@@ -78,15 +78,6 @@ find_implib() {
   return 1
 }
 
-# Git bash converts PATH-like env vars to POSIX. link.exe needs Windows
-# LIB/INCLUDE, otherwise LNK1104 cannot open LIBCMT.lib.
-if command -v cygpath >/dev/null 2>&1; then
-  [[ -n "${LIB:-}" ]] && export LIB="$(cygpath -wp "$LIB")"
-  [[ -n "${INCLUDE:-}" ]] && export INCLUDE="$(cygpath -wp "$INCLUDE")"
-  [[ -n "${LIBPATH:-}" ]] && export LIBPATH="$(cygpath -wp "$LIBPATH")"
-fi
-export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+${MSYS2_ENV_CONV_EXCL};}LIB;INCLUDE;LIBPATH"
-
 ran=0
 for leaf in tensor image codec decoder tracker; do
   src="${WORKDIR}/${leaf}.c"

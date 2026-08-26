@@ -4,7 +4,7 @@
 use edgefirst_decoder::{
     configs, configs::Nms, schema::SchemaV2, ConfigOutput, ConfigOutputs, Decoder, DecoderBuilder,
 };
-use edgefirst_tensor::{ProtoData, ProtoLayout};
+use edgefirst_tensor::{DetectBox, ProtoData, ProtoLayout, Segmentation};
 
 /// NMS (Non-Maximum Suppression) mode for filtering overlapping detections.
 ///
@@ -471,6 +471,59 @@ pub type PySegDetTrackedOutput<'py> = (
     Bound<'py, PyAny>,
 );
 
+type PyAssociatedDetections<'py> = (
+    Vec<[f32; 4]>,
+    Vec<f32>,
+    Vec<usize>,
+    Vec<Bound<'py, PyAny>>,
+    Vec<usize>,
+);
+
+/// Decode to Rust boxes/masks. `self_` stays on the caller's stack so the
+/// PyO3 borrow flag remains set across `py.detach` (see `decode`).
+fn decode_native(
+    decoder: &Decoder,
+    py: Python<'_>,
+    model_output: Vec<Bound<'_, PyAny>>,
+    max_boxes: usize,
+) -> PyResult<(Vec<DetectBox>, Vec<Segmentation>)> {
+    let model_output: Vec<crate::interop::TensorArg> = model_output
+        .iter()
+        .map(|o| crate::interop::TensorArg::extract(o, None))
+        .collect::<PyResult<_>>()?;
+    let (mut output_boxes, mut output_masks) = if model_output
+        .iter()
+        .all(crate::interop::TensorArg::can_detach)
+    {
+        let raw_inputs: Vec<crate::interop::RawTensorAccess> = model_output
+            .into_iter()
+            .map(|t| t.into_raw_access())
+            .collect::<PyResult<_>>()?;
+        py.detach(move || {
+            let tensor_refs: Vec<&edgefirst_tensor::TensorDyn> =
+                raw_inputs.iter().map(|t| t.as_ref()).collect();
+            let mut output_boxes = Vec::with_capacity(max_boxes);
+            let mut output_masks = Vec::with_capacity(max_boxes);
+            decoder
+                .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+            Ok::<_, PyErr>((output_boxes, output_masks))
+        })?
+    } else {
+        let tensor_refs: Vec<&edgefirst_tensor::TensorDyn> =
+            model_output.iter().map(|t| t.as_ref()).collect();
+        let mut output_boxes = Vec::with_capacity(max_boxes);
+        let mut output_masks = Vec::with_capacity(max_boxes);
+        decoder
+            .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
+        (output_boxes, output_masks)
+    };
+    output_boxes.truncate(max_boxes);
+    output_masks.truncate(max_boxes);
+    Ok((output_boxes, output_masks))
+}
+
 /// Opaque prototype data from a segmentation model's decode step.
 ///
 /// Holds raw mask coefficients and prototype tensors produced by
@@ -854,67 +907,12 @@ impl PyDecoder {
             tracing::trace_span!("python.decode", n_tensors = model_output.len(), max_boxes)
                 .entered();
         let py = self_.py();
-        // Model outputs are read here, never written.
-        let model_output: Vec<crate::interop::TensorArg> = model_output
-            .iter()
-            .map(|o| crate::interop::TensorArg::extract(o, None))
-            .collect::<PyResult<_>>()?;
-        let (mut output_boxes, mut output_masks) = if model_output
-            .iter()
-            .all(crate::interop::TensorArg::can_detach)
-        {
-            // Every input tensor's Python guard is gone by this point, so
-            // the decode itself (which fans out over rayon underneath) can
-            // run with the GIL released. `self_`'s own guard is kept alive
-            // right here on this stack frame -- deliberately *not* moved
-            // into the closure, unlike `raw_inputs` -- for the whole
-            // detached region below, so PyO3's runtime borrow flag for this
-            // `PyDecoder` stays set throughout. See `Decoder`'s field docs
-            // on `per_scale`: its `&mut self` property setters
-            // (`set_score_threshold` and friends) write plain fields with
-            // no interior mutability of their own, so a second Python
-            // thread reaching one of them while this detached region reads
-            // `*decoder` would otherwise materialize an aliasing `&mut
-            // Decoder` -- undefined behaviour, not merely a data race, for
-            // the same reason `TensorArg::into_raw_access`'s native path
-            // used to be unsound (see its doc comment). Keeping the borrow
-            // flag set turns that into PyO3's ordinary "already borrowed"
-            // `PyResult` error instead: `decoder`, a plain `&Decoder`, is
-            // the only thing the closure below actually captures, and nothing
-            // reachable from it needs `&mut` for the duration of the call.
-            let raw_inputs: Vec<crate::interop::RawTensorAccess> = model_output
-                .into_iter()
-                .map(|t| t.into_raw_access())
-                .collect::<PyResult<_>>()?;
-            let decoder: &Decoder = &self_.decoder;
-            py.detach(move || {
-                let tensor_refs: Vec<&edgefirst_tensor::TensorDyn> =
-                    raw_inputs.iter().map(|t| t.as_ref()).collect();
-                let mut output_boxes = Vec::with_capacity(max_boxes);
-                let mut output_masks = Vec::with_capacity(max_boxes);
-                decoder
-                    .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
-                Ok::<_, PyErr>((output_boxes, output_masks))
-            })?
-        } else {
-            // A GL-PBO-backed model output tensor: `TensorArg::can_detach`
-            // (see its docs) cannot reconstruct an independent `TensorDyn`
-            // for it, so this call keeps the GIL held for its whole
-            // duration, exactly this crate's behaviour before GIL
-            // release existed for tensors at all.
-            let tensor_refs: Vec<&edgefirst_tensor::TensorDyn> =
-                model_output.iter().map(|t| t.as_ref()).collect();
-            let mut output_boxes = Vec::with_capacity(max_boxes);
-            let mut output_masks = Vec::with_capacity(max_boxes);
-            self_
-                .decoder
-                .decode(&tensor_refs, &mut output_boxes, &mut output_masks)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#?}")))?;
-            (output_boxes, output_masks)
-        };
-        output_boxes.truncate(max_boxes);
-        output_masks.truncate(max_boxes);
+        // Model outputs are read here, never written. `self_` stays on this
+        // stack so the PyO3 borrow flag remains set across `py.detach`
+        // inside `decode_native` — a concurrent setter would otherwise
+        // alias `&mut Decoder` (see `TensorArg::into_raw_access`).
+        let (output_boxes, output_masks) =
+            decode_native(&self_.decoder, py, model_output, max_boxes)?;
         let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
         let masks = convert_seg_mask(py, &output_masks);
         Ok((boxes, scores, classes, masks))
@@ -929,21 +927,53 @@ impl PyDecoder {
         max_boxes: usize,
     ) -> PyResult<PySegDetTrackedOutput<'py>> {
         let py = self_.py();
-        let (boxes, scores, classes, masks) = Self::decode(self_, model_output, max_boxes)?;
-        // ByteTrack.update is PyO3: it copies the arrays then releases the
-        // GIL for the Kalman association. Keep this a thin Python call.
+        let (output_boxes, output_masks) =
+            decode_native(&self_.decoder, py, model_output, max_boxes)?;
+
+        // ByteTrack._associate_detections runs Kalman + the live/coasting
+        // rewrite off the GIL. Duck-typed trackers without that method keep
+        // the Python `update` / getattr rewrite path.
+        let boxes: Vec<[f32; 4]> = output_boxes
+            .iter()
+            .map(|b| <[f32; 4]>::from(b.bbox))
+            .collect();
+        let scores: Vec<f32> = output_boxes.iter().map(|b| b.score).collect();
+        let classes: Vec<usize> = output_boxes.iter().map(|b| b.label).collect();
+        if let Ok(assoc) = tracker.getattr("_associate_detections") {
+            let result = assoc.call1((boxes, scores, classes, timestamp))?;
+            let (out_boxes, out_scores, out_classes, track_objs, mask_idx): PyAssociatedDetections<
+                'py,
+            > = result.extract()?;
+            let mut out_masks = Vec::new();
+            for i in mask_idx {
+                if i < output_masks.len() {
+                    out_masks.extend(convert_seg_mask(py, std::slice::from_ref(&output_masks[i])));
+                }
+            }
+            let num = out_scores.len();
+            let boxes_flat: Vec<f32> = out_boxes.into_iter().flatten().collect();
+            let boxes_arr = Array2::from_shape_vec((num, 4), boxes_flat).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("tracked boxes reshape: {e}"))
+            })?;
+            let tracks_out = PyList::new(py, track_objs)?;
+            return Ok((
+                boxes_arr.into_pyarray(py),
+                Array1::from_vec(out_scores).into_pyarray(py),
+                Array1::from_vec(out_classes).into_pyarray(py),
+                out_masks,
+                tracks_out.into_any(),
+            ));
+        }
+
+        let (boxes, scores, classes) = convert_detect_box(py, &output_boxes);
+        let masks = convert_seg_mask(py, &output_masks);
         let update_tracks =
             tracker.call_method1("update", (&boxes, &scores, &classes, timestamp))?;
 
-        // Without get_active_tracks the caller only asked for per-detection
-        // associations; return decode + update as-is.
         let Ok(active) = tracker.call_method0("get_active_tracks") else {
             return Ok((boxes, scores, classes, masks, update_tracks));
         };
 
-        // Match Decoder::decode_tracked: rewrite detections to live tracks
-        // (Kalman tracked_location, masks kept) plus unmatched coasting
-        // tracks (no masks). See crates/decoder/README.md.
         let b: PyReadonlyArray2<f32> = boxes.extract()?;
         let s: PyReadonlyArray1<f32> = scores.extract()?;
         let c: PyReadonlyArray1<usize> = classes.extract()?;
