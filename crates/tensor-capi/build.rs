@@ -3,7 +3,6 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn rustflags() -> String {
     format!(
@@ -22,22 +21,6 @@ fn skip_exports_map() -> bool {
     env::var_os("EF_SKIP_VERSION_SCRIPT").is_some()
         || flags.contains("instrument-coverage")
         || flags.contains("version-script")
-}
-
-fn rust_lld() -> Option<PathBuf> {
-    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let output = Command::new(rustc)
-        .args(["--print", "sysroot"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sysroot = String::from_utf8(output.stdout).ok()?;
-    let sysroot = sysroot.trim();
-    let target = env::var("TARGET").ok()?;
-    let lld = PathBuf::from(format!("{sysroot}/lib/rustlib/{target}/bin/gcc-ld/ld.lld"));
-    lld.is_file().then_some(lld)
 }
 
 fn main() {
@@ -64,13 +47,14 @@ fn main() {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libedgefirst_tensor.so.{major}");
         // aarch64 GNU bfd rejects rustc's injected version script combined
         // with exports.map. lld concatenates them, which keeps the ef_*
-        // export set G1 measures.
-        if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("aarch64") {
-            if let Some(lld) = rust_lld() {
-                println!("cargo:rustc-cdylib-link-arg=-fuse-ld={}", lld.display());
-            } else {
-                println!("cargo:rustc-cdylib-link-arg=-fuse-ld=lld");
-            }
+        // export set G1 measures. Only force lld when we actually pass
+        // exports.map: coverage builds skip the map, and gcc 11 (Ubuntu
+        // 22.04 ARM) rejects `-fuse-ld=/absolute/rust-lld` from rustc's
+        // sysroot.
+        if env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() == Some("aarch64")
+            && !skip_exports_map()
+        {
+            println!("cargo:rustc-cdylib-link-arg=-fuse-ld=lld");
         }
         if !skip_exports_map() {
             println!("cargo:rustc-cdylib-link-arg=-Wl,--version-script={crate_dir}/exports.map");

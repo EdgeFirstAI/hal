@@ -13,6 +13,25 @@ use edgefirst_tensor::{
     TensorTrait,
 };
 
+/// Host has no usable dma-heap. The dynamic backend wraps the OS error in
+/// `io::ErrorKind::Other` (`image_alloc: IoError(Os { kind: PermissionDenied })`),
+/// so matching only `e.kind()` panics on GitHub-hosted runners.
+fn platform_resource_absent(err: &Error) -> bool {
+    match err {
+        Error::IoError(e) => {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) || e.to_string().contains("Permission denied")
+                || e.to_string().contains("No such file or directory")
+        }
+        Error::NotImplemented(msg) => {
+            msg.contains("Permission denied") || msg.contains("errno 13") || msg.contains("errno 2")
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn host_roundtrip_sees_the_same_bytes() {
     let t = Tensor::<u8>::image(
@@ -326,12 +345,7 @@ fn dmabuf_roundtrip_sees_the_same_bytes() {
         // a code failure -- which then has to be re-diagnosed on every
         // on-target run. Any other error kind still fails this test below
         // via the match's final arm.
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        Err(e) if platform_resource_absent(&e) => {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
@@ -387,12 +401,7 @@ fn imported_dmabuf_with_a_recorded_stride_is_still_cpu_mappable() {
         CpuAccess::ReadWrite,
     ) {
         Ok(t) => t,
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        Err(e) if platform_resource_absent(&e) => {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
@@ -455,12 +464,7 @@ fn dmabuf_import_preserves_the_producers_row_stride_for_pool_reuse() {
         CpuAccess::ReadWrite,
     ) {
         Ok(t) => t,
-        Err(Error::IoError(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
+        Err(e) if platform_resource_absent(&e) => {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),

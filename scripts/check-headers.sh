@@ -67,7 +67,10 @@ for l in tensor image codec decoder tracker; do
     fails=$((fails+1))
     continue
   fi
-  so="${LIBDIR}/libedgefirst_${l}.so"
+  case "$(uname -s)" in
+    Darwin) so="${LIBDIR}/libedgefirst_${l}.dylib" ;;
+    *) so="${LIBDIR}/libedgefirst_${l}.so" ;;
+  esac
   if [ ! -s "${so}" ] || [ ! -r "${so}" ]; then
     echo "FAIL ${l}: ${so} is missing, empty, or unreadable -- cannot link"
     fails=$((fails+1))

@@ -83,15 +83,16 @@ for leaf in tensor image codec decoder tracker; do
   }
   case "${CC}" in
     cl)
-      # cl writes the exe next to the source unless /Fe is given.
-      if ! cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
+      # Git bash converts `/nologo` into `C:/Program Files/Git/nologo`.
+      # MSYS_NO_PATHCONV keeps MSVC's slash flags intact.
+      if ! MSYS_NO_PATHCONV=1 cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
           /link /LIBPATH:"${LIB}" "$(cygpath -w "${implib}" 2>/dev/null || echo "${implib}")"; then
         echo "FAIL: compile ${leaf} (cl)" >&2
         exit 1
       fi
       ;;
     clang-cl)
-      if ! clang-cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
+      if ! MSYS_NO_PATHCONV=1 clang-cl /nologo /W3 /WX /TC "${src}" /I "${INC}" /Fe"${exe}" \
           /link /LIBPATH:"${LIB}" "${implib}"; then
         echo "FAIL: compile ${leaf} (clang-cl)" >&2
         exit 1
