@@ -106,11 +106,13 @@ fn link_tensor_cdylib(target_os: &str, tensor_lib_dir: &Path) {
         );
         println!("cargo:rustc-link-lib=dylib:+verbatim=edgefirst_tensor.dll.lib");
     } else if target_os == "linux" {
-        // rustc-link-arg (not cdylib-link-arg): crate *tests* also need
-        // ef_tensor_* from the cdylib. aarch64 bfd --as-needed drops
-        // -ledgefirst_tensor when it appears before the dynamic rlib.
+        // rustc-link-arg (not rustc-link-lib, not cdylib-link-arg): cargo
+        // emits rustc-link-lib *before* the crate's rlibs, so aarch64 bfd
+        // --as-needed drops -ledgefirst_tensor. Trailing link-args land
+        // after those rlibs; --no-as-needed keeps the cdylib even if the
+        // test binary's own objects do not mention ef_tensor_*.
         println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-        println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");
+        println!("cargo:rustc-link-arg=-ledgefirst_tensor");
         println!("cargo:rustc-link-arg=-Wl,--as-needed");
     } else {
         println!("cargo:rustc-link-lib=dylib=edgefirst_tensor");

@@ -5,13 +5,12 @@
 //! Registered on `edgefirst.decoder`. TilePlacement is accepted by attribute
 //! so an `edgefirst.image.TilePlacement` works without sharing a PyO3 type.
 
-use crate::detect_boxes::{
-    convert_detect_box, numpy_to_detect_boxes, views_to_detect_boxes, PyDetOutput,
-};
+use crate::detect_boxes::{convert_detect_box, numpy_to_detect_boxes, PyDetOutput};
 use edgefirst_decoder::tiling::{
     lift_tile_boxes, merge_tiled_detections, MatchMetric, MergeConfig, TiledFrameAccumulator,
 };
 use edgefirst_decoder_abi::TilePlacement;
+use edgefirst_tensor::{BoundingBox, DetectBox};
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -61,6 +60,18 @@ impl From<MatchMetric> for PyMatchMetric {
 }
 
 fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
+    if let Ok(packed) = obj.call_method0("__getnewargs__") {
+        if let Ok((index, count, origin, crop_size, frame_dims, letterbox)) = packed.extract() {
+            return Ok(TilePlacement {
+                index,
+                count,
+                origin,
+                crop_size,
+                letterbox,
+                frame_dims,
+            });
+        }
+    }
     let letterbox = match obj
         .getattr("letterbox")?
         .extract::<Option<(f32, f32, f32, f32)>>()?
@@ -76,6 +87,22 @@ fn extract_placement(obj: &Bound<'_, PyAny>) -> PyResult<TilePlacement> {
         letterbox,
         frame_dims: obj.getattr("frame_dims")?.extract()?,
     })
+}
+
+fn flat_to_detect_boxes(bbox: &[f32], scores: &[f32], classes: &[usize]) -> Vec<DetectBox> {
+    scores
+        .iter()
+        .zip(classes)
+        .enumerate()
+        .map(|(i, (score, label))| {
+            let o = i * 4;
+            DetectBox {
+                bbox: BoundingBox::new(bbox[o], bbox[o + 1], bbox[o + 2], bbox[o + 3]),
+                score: *score,
+                label: *label,
+            }
+        })
+        .collect()
 }
 
 /// Configuration for the tiled-detection merge (GREEDYNMM).
@@ -176,14 +203,25 @@ impl PyTiledFrameAccumulator {
                 "bbox, scores, classes must have the same length",
             ));
         }
-        // Copy out of the caller's numpy arrays so the O(N) DetectBox
-        // conversion and the accumulator update can run with the GIL released.
-        let bbox = bbox.as_array().to_owned();
-        let scores = scores.as_array().to_owned();
-        let classes = classes.as_array().to_owned();
+        // Memcpy out of the caller's numpy buffers (contiguous fast path)
+        // so DetectBox construction and lift_tile_boxes run with the GIL
+        // released. `to_owned()` on a numpy view iterates under the GIL
+        // and is what kept `test_push_tile_releases_the_gil` at 68%.
+        let bbox = match bbox.as_array().as_slice() {
+            Some(s) => s.to_vec(),
+            None => bbox.as_array().iter().copied().collect(),
+        };
+        let scores = match scores.as_array().as_slice() {
+            Some(s) => s.to_vec(),
+            None => scores.as_array().iter().copied().collect(),
+        };
+        let classes = match classes.as_array().as_slice() {
+            Some(s) => s.to_vec(),
+            None => classes.as_array().iter().copied().collect(),
+        };
         let placement = extract_placement(placement)?;
         py.detach(move || {
-            let dets = views_to_detect_boxes(bbox.view(), scores.view(), classes.view());
+            let dets = flat_to_detect_boxes(&bbox, &scores, &classes);
             let acc = self
                 .0
                 .as_mut()

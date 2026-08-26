@@ -229,6 +229,28 @@ impl PyTilePlacement {
             self.0.index, self.0.count, self.0.origin, self.0.crop_size, self.0.letterbox, self.0.frame_dims,
         )
     }
+
+    /// Constructor args as a single tuple so a decoder in another extension
+    /// can extract placement without six cross-module ``getattr`` hops.
+    fn __getnewargs__(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        (f32, f32),
+        (f32, f32),
+        (f32, f32),
+        Option<[f32; 4]>,
+    ) {
+        (
+            self.0.index,
+            self.0.count,
+            self.0.origin,
+            self.0.crop_size,
+            self.0.frame_dims,
+            self.0.letterbox,
+        )
+    }
 }
 
 /// Uniform overlapping EvenDist tile grid covering a ``frame_w``×``frame_h``

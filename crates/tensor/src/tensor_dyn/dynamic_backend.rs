@@ -1772,6 +1772,39 @@ impl TensorDyn {
         }
     }
 
+    /// Wrap a live `IOSurfaceRef` (macOS/iOS). Looks up the surface's
+    /// `IOSurfaceID` and drives [`Self::from_iosurface_id`]: the C ABI
+    /// does not take a raw ref, so the id is the portable handle.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub unsafe fn from_iosurface(
+        surface_ref: *mut std::ffi::c_void,
+        shape: &[usize],
+        dtype: DType,
+        name: Option<&str>,
+    ) -> Result<Self> {
+        if surface_ref.is_null() {
+            return Err(Error::InvalidArgument(
+                "from_iosurface: surface_ref is null".into(),
+            ));
+        }
+        // SAFETY: caller guarantees `surface_ref` is a live IOSurfaceRef.
+        let id = unsafe { IOSurfaceGetID(surface_ref) };
+        Self::from_iosurface_id(id, shape, dtype, name)
+    }
+
+    /// IOSurfaceID for cross-process sharing. `None` when this handle has
+    /// no IOSurface (wrong backing, or `IOSurfaceGetID` returned 0).
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn iosurface_id(&self) -> Option<u32> {
+        let surface = self.iosurface_ref()?;
+        let id = unsafe { IOSurfaceGetID(surface) };
+        if id == 0 {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
     /// Wrap a live IOSurface named by its cross-process `IOSurfaceID`
     /// (macOS/iOS only) -- the consumer half of the capsule protocol's
     /// [`crate::protocol::kind::IOSURFACE`].
@@ -2351,4 +2384,5 @@ impl fmt::Debug for TensorDyn {
 extern "C" {
     fn IOSurfaceGetWidth(surface: *mut std::ffi::c_void) -> usize;
     fn IOSurfaceGetHeight(surface: *mut std::ffi::c_void) -> usize;
+    fn IOSurfaceGetID(surface: *mut std::ffi::c_void) -> u32;
 }
