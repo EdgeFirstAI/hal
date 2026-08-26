@@ -14,11 +14,19 @@ isolation for those is measured on the built ``.so`` / ``.dylib``.
 from __future__ import annotations
 
 import importlib
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# Hardware runners (imx8mp) install wheels and run pytest without a
+# Rust toolchain. Crate-graph isolation is the hosted-CI job.
+needs_cargo = pytest.mark.skipif(
+    shutil.which("cargo") is None,
+    reason="cargo is not on PATH; crate-graph checks run on hosted CI",
+)
 
 # Exact crate names only. This list will keep growing as more leaves are
 # split out (it already did once: `edgefirst-decoder-abi`, `edgefirst-tensor-
@@ -211,6 +219,7 @@ FEATURE_SETS = [
 ]
 
 
+@needs_cargo
 @pytest.mark.parametrize("extra", FEATURE_SETS, ids=lambda e: e[1])
 def test_tensor_compiles_across_feature_sets(extra):
     """edgefirst-tensor must build under any *legal* combination of its
@@ -248,6 +257,7 @@ SHED_BY_DECOUPLING = (
 )
 
 
+@needs_cargo
 def test_image_does_not_link_a_decoder_by_default():
     """Drawing masks must not require a model-postprocessing crate.
 
@@ -264,6 +274,7 @@ def test_image_does_not_link_a_decoder_by_default():
     )
 
 
+@needs_cargo
 def test_decode_feature_restores_the_decoder():
     """The gate must be a gate, not a deletion.
 

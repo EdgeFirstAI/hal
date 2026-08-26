@@ -7,6 +7,7 @@ statically linked consumer keeps only what it calls.
 
 import json
 import pathlib
+import shutil
 import subprocess
 
 import pytest
@@ -14,6 +15,10 @@ import pytest
 BASELINE = pathlib.Path("docs/baselines/2026-08-15-phase1-baseline.json")
 
 
+@pytest.mark.skipif(
+    shutil.which("git") is None or shutil.which("rustc") is None,
+    reason="size_baseline.sh records git and rustc; hardware runners have neither",
+)
 def test_baseline_script_emits_required_keys(tmp_path):
     out = tmp_path / "b.json"
     subprocess.run(["bash", "scripts/size_baseline.sh", str(out)], check=True)

@@ -565,6 +565,9 @@ jobs:
         # opted out). macOS must run and pass via ANGLE. Codesign the venv
         # interpreter with disable-library-validation so dlopen of ANGLE
         # does not SIGKILL the process (same entitlement as test-macos.sh).
+        # --auditwheel skip matches the x86/aarch64 lanes: on macOS it
+        # skips delocate, which cannot locate @rpath/libedgefirst_tensor.N.dylib
+        # (the copy is bundled via python-source, not on the dyld search path).
         env:
           HAL_TEST_REQUIRE_GL: "1"
         run: |
@@ -576,7 +579,8 @@ jobs:
               --manifest-path "crates/python-$pkg/Cargo.toml" \
               --out target/wheels \
               --release \
-              --features abi3-py311
+              --features abi3-py311 \
+              --auditwheel skip
           done
           venv/bin/pip install --no-deps --force-reinstall target/wheels/*.whl
           PY=$(python3 -c "import os; print(os.path.realpath('venv/bin/python3'))")

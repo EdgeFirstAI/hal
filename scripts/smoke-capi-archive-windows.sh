@@ -32,7 +32,10 @@ if [[ -z "${PREFIX}" ]] || [[ ! -d "${PREFIX}/include/edgefirst" ]]; then
 fi
 
 INC="${PREFIX}/include"
-LIB="${PREFIX}/lib"
+# LIBDIR, not LIB: MSVC's linker reads the LIB environment variable for
+# default libs (LIBCMT.lib). Clobbering it with the archive path made cl
+# compile and then fail at link with LNK1104.
+LIBDIR="${PREFIX}/lib"
 BIN="${PREFIX}/bin"
 
 if [[ ! -d "${BIN}" ]]; then
@@ -67,7 +70,7 @@ winpath() {
 
 find_implib() {
   local leaf="$1"
-  local f="${LIB}/edgefirst_${leaf}.lib"
+  local f="${LIBDIR}/edgefirst_${leaf}.lib"
   if [[ -f "${f}" ]]; then
     printf '%s' "${f}"
     return 0
@@ -75,14 +78,23 @@ find_implib() {
   return 1
 }
 
+# Git bash converts PATH-like env vars to POSIX. link.exe needs Windows
+# LIB/INCLUDE, otherwise LNK1104 cannot open LIBCMT.lib.
+if command -v cygpath >/dev/null 2>&1; then
+  [[ -n "${LIB:-}" ]] && export LIB="$(cygpath -wp "$LIB")"
+  [[ -n "${INCLUDE:-}" ]] && export INCLUDE="$(cygpath -wp "$INCLUDE")"
+  [[ -n "${LIBPATH:-}" ]] && export LIBPATH="$(cygpath -wp "$LIBPATH")"
+fi
+export MSYS2_ENV_CONV_EXCL="${MSYS2_ENV_CONV_EXCL:+${MSYS2_ENV_CONV_EXCL};}LIB;INCLUDE;LIBPATH"
+
 ran=0
 for leaf in tensor image codec decoder tracker; do
   src="${WORKDIR}/${leaf}.c"
   exe="${WORKDIR}/${leaf}.exe"
   printf '#include <edgefirst/%s.h>\nint main(void){return 0;}\n' "${leaf}" > "${src}"
   implib="$(find_implib "${leaf}")" || {
-    echo "FAIL: no import library for ${leaf} in ${LIB}" >&2
-    ls -la "${LIB}" >&2 || true
+    echo "FAIL: no import library for ${leaf} in ${LIBDIR}" >&2
+    ls -la "${LIBDIR}" >&2 || true
     exit 1
   }
   case "${CC}" in
@@ -92,7 +104,7 @@ for leaf in tensor image codec decoder tracker; do
       # must still be Windows paths: `/tmp/foo.c` is a cl option, not a source.
       if ! MSYS_NO_PATHCONV=1 cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
           /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
-          /link /LIBPATH:"$(winpath "${LIB}")" "$(winpath "${implib}")"; then
+          /link /LIBPATH:"$(winpath "${LIBDIR}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (cl)" >&2
         exit 1
       fi
@@ -100,7 +112,7 @@ for leaf in tensor image codec decoder tracker; do
     clang-cl)
       if ! MSYS_NO_PATHCONV=1 clang-cl /nologo /W3 /WX /TC "$(winpath "${src}")" \
           /I "$(winpath "${INC}")" /Fe"$(winpath "${exe}")" \
-          /link /LIBPATH:"$(winpath "${LIB}")" "$(winpath "${implib}")"; then
+          /link /LIBPATH:"$(winpath "${LIBDIR}")" "$(winpath "${implib}")"; then
         echo "FAIL: compile ${leaf} (clang-cl)" >&2
         exit 1
       fi
