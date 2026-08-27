@@ -305,6 +305,14 @@ mod tests {
     }
 
     #[test]
+    fn view_origin_layout_is_pinned() {
+        // Five `u64`s plus a trailing `u32` pad out to 48 at align 8. Same
+        // freeze as the C golden: a field reorder is a new suffixed struct.
+        assert_eq!(std::mem::size_of::<EfViewOrigin>(), 48);
+        assert_eq!(std::mem::align_of::<EfViewOrigin>(), 8);
+    }
+
+    #[test]
     fn error_class_is_u32_and_unspecified_is_zero() {
         assert_eq!(std::mem::size_of::<EfErrorClass>(), 4);
         // 0 must be the "nothing recorded" answer: a zeroed or never-set

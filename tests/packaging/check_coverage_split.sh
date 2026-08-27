@@ -27,9 +27,11 @@ done
 # cannot usefully instrument a cdylib. Their bindings live in python-common,
 # which IS measured, so assert that rather than the shims.
 if grep -q "crates/python-common/src" "$REPORT"; then
-    echo "  python-common covered (the shims are excluded by design)"
+    n=$(grep -c "crates/python-common/src" "$REPORT")
+    printf '  %-9s %s records\n' "python-common" "$n"
 else
-    echo "  WARNING: no coverage for crates/python-common/src"
+    echo "  ERROR: no coverage recorded for crates/python-common/src"
+    fail=1
 fi
 
 [ "$fail" -eq 0 ] && echo "✓ coverage attributes to all five crates after the split"

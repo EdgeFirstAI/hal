@@ -133,10 +133,10 @@ mod tests {
 
     #[test]
     fn the_layout_goldens_hold() {
-        // `ef_detect_box`'s size and field offsets are the drift class no
+        // By-value structs in `detect.h` (`ef_detect_box`, `ef_segmentation`,
+        // `ef_merge_config`, `ef_tile_placement`) are the drift class no
         // name-level check can see, and are identical on every LP64 target
-        // this header ships for. Lives here, not in tensor-capi, because
-        // `ef_detect_box` is declared in this header now.
+        // this header ships for.
         let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/test_layout_goldens.c");
         let Some(out) = cc_syntax_check_c11(src) else {
             return;

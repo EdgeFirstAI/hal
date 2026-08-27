@@ -189,4 +189,25 @@ mod tests {
         assert_eq!(std::mem::size_of::<EfDetectBox>(), 24);
         assert_eq!(std::mem::align_of::<EfDetectBox>(), 4);
     }
+
+    #[test]
+    fn segmentation_layout_is_pinned() {
+        assert_eq!(std::mem::size_of::<EfSegmentation>(), 32);
+        assert_eq!(std::mem::align_of::<EfSegmentation>(), 8);
+    }
+
+    #[test]
+    fn merge_config_layout_is_pinned() {
+        // `max_det: usize` forces 8-byte alignment and 4 bytes of pad after
+        // `class_agnostic`; the trailing `f32` pads 28 -> 32.
+        assert_eq!(std::mem::size_of::<EfMergeConfig>(), 32);
+        assert_eq!(std::mem::align_of::<EfMergeConfig>(), 8);
+    }
+
+    #[test]
+    fn tile_placement_layout_is_pinned() {
+        // 60 bytes of fields, align 8 -> 64. Matches `detect.h`.
+        assert_eq!(std::mem::size_of::<EfTilePlacement>(), 64);
+        assert_eq!(std::mem::align_of::<EfTilePlacement>(), 8);
+    }
 }
